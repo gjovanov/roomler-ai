@@ -204,6 +204,62 @@ fn resolve_direct_candidates(direct_ctx: Option<&DirectCtx>, cfg: &PeerConfig) -
     DirectCandidates { lan, public, srflx }
 }
 
+/// bind-to-interface-by-route (Phase 1, `OVERLAY_BIND_BY_ROUTE`) — pick the
+/// egress socket for a LAN direct carrier/probe to `dst`. Tailscale's
+/// `net/netns` `bindToInterfaceByRoute` adapted to roomler's per-interface
+/// sockets: when the gate is on, the OS route table is consulted via the
+/// `connect()`-trick ([`direct::os_src_ip_for`]) + [`direct::classify_egress`]
+/// so the chosen socket matches the interface that actually reaches `dst` (an
+/// on-link `/24` beats a full-tunnel VPN's `/1` split-default), and it is
+/// re-pinned to its CURRENT ifindex (fresh — a VPN connect since startup can't
+/// leave a stale `IP_UNICAST_IF` pin). Falls back to the same-subnet pick
+/// (today's behaviour) when the gate is off, the query is inconclusive, or the
+/// OS routes `dst` off our interfaces; the working relay + the MBB probe
+/// machinery catch a one-way path from there, so this never skips direct.
+/// `None` only when no socket is bound for the subnet at all.
+async fn lan_egress_socket(
+    ctx: &DirectCtx,
+    local_ip: Ipv4Addr,
+    dst: std::net::SocketAddr,
+) -> Option<Arc<UdpSocket>> {
+    let pick = |ip: Ipv4Addr| {
+        ctx.socks
+            .iter()
+            .find(|(i, _)| *i == ip)
+            .map(|(_, s)| s.clone())
+    };
+    let same_subnet = pick(local_ip);
+    if !direct::bind_by_route_enabled() {
+        return same_subnet;
+    }
+    let socket_ips: Vec<Ipv4Addr> = ctx.socks.iter().map(|(ip, _)| *ip).collect();
+    let chosen_ip = match direct::classify_egress(direct::os_src_ip_for(dst).await, &socket_ips) {
+        direct::Egress::Use(ip) => {
+            if ip != local_ip {
+                info!(%local_ip, chosen = %ip, %dst, "overlay: bind-by-route picked the OS-routed egress interface (≠ the same-subnet pick)");
+            }
+            ip
+        }
+        direct::Egress::Foreign => {
+            info!(%local_ip, %dst, "overlay: bind-by-route — OS routes this LAN dst off our interfaces (VPN-captured?); keeping same-subnet socket (relay/MBB catches a one-way path)");
+            local_ip
+        }
+        direct::Egress::Loop => {
+            info!(%local_ip, %dst, "overlay: bind-by-route — route resolves into our own overlay TUN; keeping same-subnet socket");
+            local_ip
+        }
+        direct::Egress::Unknown => local_ip,
+    };
+    let sock = pick(chosen_ip).or(same_subnet)?;
+    // Re-pin egress to the CURRENT ifindex of the chosen interface (freshly
+    // read — the pin computed at `setup_direct` can go stale after a VPN
+    // connect). No-op off Windows / when `if-addrs` supplies no index.
+    if let Some(ix) = direct::ifindex_for(chosen_ip) {
+        direct::force_egress_interface(&sock, ix);
+    }
+    Some(sock)
+}
+
 // P2 — `DirectTier`, the lifecycle deadlines/constants, and the carrier/probe
 // transition fns live in the sibling `lifecycle` module (one place for every
 // rule that can kill a carrier). Glob-imported so this module — and its test
@@ -3062,23 +3118,20 @@ impl OverlayRuntime {
                         // destructive path. Skip if a probe is already in flight.
                         let probe_target = if wg.has_direct_probe(&pk) {
                             None
+                        } else if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst)
+                        {
+                            // LAN tier — bind-by-route egress selection (Phase 1).
+                            lan_egress_socket(ctx, local_ip, dst)
+                                .await
+                                .map(|s| (s, dst, DirectTier::Lan))
+                        } else if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
+                            ctx.public_sock
+                                .clone()
+                                .map(|s| (s, dst, DirectTier::Public))
+                        } else if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
+                            ctx.punch.clone().map(|(_, s)| (s, dst, DirectTier::Srflx))
                         } else {
-                            direct_ctx.and_then(|ctx| {
-                                if let Some((local_ip, dst)) = direct_dst {
-                                    ctx.socks
-                                        .iter()
-                                        .find(|(ip, _)| *ip == local_ip)
-                                        .map(|(_, s)| (s.clone(), dst, DirectTier::Lan))
-                                } else if let Some(dst) = phase_a_dst {
-                                    ctx.public_sock
-                                        .clone()
-                                        .map(|s| (s, dst, DirectTier::Public))
-                                } else if let Some(dst) = srflx_dst {
-                                    ctx.punch.clone().map(|(_, s)| (s, dst, DirectTier::Srflx))
-                                } else {
-                                    None
-                                }
-                            })
+                            None
                         };
                         if let Some((sock, dst, tier)) = probe_target {
                             record("install_peers:upgrade", path::PathAction::Probe(tier));
@@ -3513,6 +3566,11 @@ impl OverlayRuntime {
     /// "one direct peer" cap). Both ends initiate (bilateral hole-punch,
     /// rc.133). Adds the `/32` route + records it as `direct` in `by_node`.
     #[allow(clippy::too_many_arguments)]
+    /// rc.134 — install a peer over the shared, interface-bound direct-LAN
+    /// socket (source-demuxed, so any number of same-subnet peers coexist).
+    /// The egress socket is chosen by [`lan_egress_socket`] (bind-by-route when
+    /// enabled). Both ends initiate (bilateral hole-punch); records the `/32`
+    /// route + `by_node` as `direct` / `Lan`.
     async fn install_direct(
         &self,
         wg: &mut WgDevice,
@@ -3526,7 +3584,9 @@ impl OverlayRuntime {
     ) {
         // Use the socket bound to the interface that shares the peer's subnet
         // (rc.143) so send/receive stay on the right NIC past a full-tunnel VPN.
-        let Some((_, sock)) = ctx.socks.iter().find(|(ip, _)| *ip == local_ip) else {
+        // With `OVERLAY_BIND_BY_ROUTE` on, `lan_egress_socket` instead consults
+        // the OS route table per-destination and re-pins the socket fresh.
+        let Some(sock) = lan_egress_socket(ctx, local_ip, dst).await else {
             warn!(peer = %node_id, %local_ip, "overlay: no socket bound for the matching LAN interface; skipping direct");
             return;
         };
@@ -5749,6 +5809,61 @@ mod tests {
             cooldowns.srflx.is_empty() && cooldowns.srflx_fails.is_empty(),
             "no failure is booked for a healthy carrier"
         );
+    }
+
+    /// bind-to-interface-by-route (Phase 1): with the gate OFF, `lan_egress_socket`
+    /// returns the same-subnet socket unchanged (byte-identical to pre-change).
+    /// With the gate ON and a loopback ctx, the connect()-trick resolves the
+    /// loopback source, `classify_egress` says `Use`, and the matching socket is
+    /// returned — exercising the OS-routed selection path end to end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lan_egress_socket_gate_off_then_on_selects_socket() {
+        let n = "ROOMLER_NODE_OVERLAY_BIND_BY_ROUTE";
+        let a = "ROOMLER_AGENT_OVERLAY_BIND_BY_ROUTE";
+        let (rn, ra) = (std::env::var(n).ok(), std::env::var(a).ok());
+        let lo = Ipv4Addr::LOCALHOST;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let want = sock.local_addr().unwrap();
+        let ctx = DirectCtx {
+            socks: vec![(lo, sock)],
+            my_ips: vec![lo],
+            endpoints: vec![],
+            public_sock: None,
+            punch: None,
+            my_nat: None,
+        };
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        // Gate OFF → the same-subnet socket, no route query.
+        unsafe {
+            std::env::remove_var(n);
+            std::env::remove_var(a);
+        }
+        let off = lan_egress_socket(&ctx, lo, dst).await.expect("same-subnet");
+        assert_eq!(
+            off.local_addr().unwrap(),
+            want,
+            "gate off → same-subnet pick"
+        );
+
+        // Gate ON → connect-trick to a loopback dst sources from 127.0.0.1,
+        // which is in our socket set → Use(127.0.0.1) → the same socket.
+        unsafe { std::env::set_var(n, "1") };
+        let on = lan_egress_socket(&ctx, lo, dst)
+            .await
+            .expect("os-routed socket");
+        assert_eq!(on.local_addr().unwrap(), want, "gate on → OS-routed socket");
+
+        unsafe {
+            match rn {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+            match ra {
+                Some(v) => std::env::set_var(a, v),
+                None => std::env::remove_var(a),
+            }
+        }
     }
 
     /// rc.204 — the same-subnet LAN tier must scan ONLY the provenance-pure
