@@ -707,6 +707,11 @@ impl RelayCoordinator {
         let std_sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
         std_sock.set_nonblocking(true).ok()?;
         let sock = tokio::net::UdpSocket::from_std(std_sock).ok()?;
+        // VPN-bypass: pin the single-relay dialer's egress to the physical
+        // uplink so coturn is reached via the real NIC, not a captured VPN.
+        if let Some(ix) = crate::overlay::direct::vpn_bypass_ifindex() {
+            crate::overlay::direct::force_egress_interface(&sock, ix);
+        }
         let conn: Arc<dyn RelayConn> = Arc::new(crate::transport::relay::UdpRelayConn(sock));
         let carrier = Carrier::relay(conn.clone(), r);
         let link = ReadyLink {

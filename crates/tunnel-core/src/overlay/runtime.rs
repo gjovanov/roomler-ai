@@ -2782,6 +2782,16 @@ impl OverlayRuntime {
         let public_sock = if direct::public_direct_enabled() || direct::srflx_enabled() {
             match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
                 Ok(s) => {
+                    // VPN-bypass: pin this `0.0.0.0` public/srflx dialer's egress
+                    // to the physical uplink so it leaves the real NIC instead
+                    // of a full-tunnel corp VPN's captured default.
+                    if let Some(ix) = direct::vpn_bypass_ifindex() {
+                        direct::force_egress_interface(&s, ix);
+                        info!(
+                            ifindex = ix,
+                            "overlay: VPN-bypass — public-dial egress pinned to the physical uplink"
+                        );
+                    }
                     info!(
                         public_direct = direct::public_direct_enabled(),
                         srflx = direct::srflx_enabled(),
