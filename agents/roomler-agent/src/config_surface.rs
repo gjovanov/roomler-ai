@@ -92,6 +92,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Make-before-break overlay carrier upgrades. Built-in default: on.",
     ),
     (
+        "overlay_lan_iface_filter",
+        "tribool",
+        "LAN-gather virtual-interface filter (skip WSL/Hyper-V/other-VPN adapters). Built-in default: on.",
+    ),
+    (
         "local_turn",
         "tribool",
         "Loopback-TURN relay for controllers on the same corporate network. Built-in default: on.",
@@ -212,6 +217,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_direct" => cfg.overlay_direct.map(fmt_bool),
         "overlay_derp" => cfg.overlay_derp.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
+        "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
@@ -283,6 +289,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_direct" => cfg.overlay_direct = parse_tribool(value)?,
         "overlay_derp" => cfg.overlay_derp = parse_tribool(value)?,
         "overlay_mbb" => cfg.overlay_mbb = parse_tribool(value)?,
+        "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
@@ -443,6 +450,27 @@ mod tests {
         apply(&mut cfg, "overlay_quic", None).unwrap();
         assert_eq!(cfg.overlay_quic, None);
         assert!(apply(&mut cfg, "overlay_quic", Some("maybe")).is_err());
+    }
+
+    /// rc.275 — the LAN-gather virtual-interface filter key set/echo/clear
+    /// (per the every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_lan_iface_filter_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_lan_iface_filter", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_lan_iface_filter, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_lan_iface_filter")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_lan_iface_filter", Some("1")).unwrap();
+        assert_eq!(cfg.overlay_lan_iface_filter, Some(true));
+        apply(&mut cfg, "overlay_lan_iface_filter", None).unwrap();
+        assert_eq!(cfg.overlay_lan_iface_filter, None);
+        assert!(apply(&mut cfg, "overlay_lan_iface_filter", Some("maybe")).is_err());
     }
 
     #[test]
