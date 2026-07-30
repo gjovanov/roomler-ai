@@ -90,6 +90,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_lan_iface_filter: None,
         overlay_pathmon: None,
         overlay_route_events: None,
+        overlay_relay_tls: None,
         local_turn: None,
         dns_aaaa: None,
         auto_update: None,
