@@ -2252,6 +2252,9 @@ impl OverlayRuntime {
                             for ip in ips {
                                 tun2.add_peer_route(ip).await.ok();
                             }
+                            // rc.278 — defend our OWN /32 too (a full-tunnel VPN
+                            // hijacks it exactly like it hijacks peer /32s).
+                            tun2.defend_self_route(self_v4).await;
                         });
                     }
                     // P5 — the exit split-default /1 re-assert stays INLINE (NOT
@@ -2308,6 +2311,11 @@ impl OverlayRuntime {
                                         for ip in ips {
                                             tun2.add_peer_route(ip).await.ok();
                                         }
+                                        // rc.278 — a VPN connect is exactly the
+                                        // route storm that re-adds the hijacking
+                                        // /32 for our own address; evict it now
+                                        // rather than waiting for the 2 s tick.
+                                        tun2.defend_self_route(self_v4).await;
                                     });
                                 }
                                 // P5 exit /1 — INLINE for the same teardown-
@@ -5281,6 +5289,44 @@ mod tests {
         async fn del_peer_route(&self, ip: Ipv4Addr) {
             self.routes.lock().unwrap().push(("del", ip));
         }
+        async fn defend_self_route(&self, ip: Ipv4Addr) {
+            self.routes.lock().unwrap().push(("defend", ip));
+        }
+    }
+
+    /// rc.278 — the route-guard re-assert must cover our OWN overlay `/32`, not
+    /// just peers'. A full-tunnel VPN (Check Point) installs a metric-1 `/32`
+    /// for our own address that out-ranks Windows' metric-256 on-link route, so
+    /// every packet addressed to us — including the REPLY to everything we
+    /// initiate — is forwarded into the corp tunnel instead of delivered
+    /// locally (field: CORPLAP-1, 100 % IPv4 loss both ways while its WireGuard
+    /// carriers were healthy and IPv6 worked). This locks the sweep shape the
+    /// select-loop arms use: every peer re-asserted, then our own defended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_reassert_covers_self_and_peers() {
+        let tun = RouteRecordingTun::new();
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let peers = [Ipv4Addr::new(100, 64, 0, 2), Ipv4Addr::new(100, 64, 0, 4)];
+
+        // Mirrors the guard-tick / RouteWatch arms verbatim.
+        let t: Arc<dyn TunIo> = tun.clone();
+        for ip in peers {
+            t.add_peer_route(ip).await.ok();
+        }
+        t.defend_self_route(self_v4).await;
+
+        let got = tun.calls();
+        assert_eq!(
+            got,
+            vec![("add", peers[0]), ("add", peers[1]), ("defend", self_v4),],
+            "peers re-asserted, then our own /32 defended"
+        );
+        assert!(
+            !got.iter().any(|(op, ip)| *op == "add" && *ip == self_v4),
+            "our own address must be EVICTION-only — never re-added via the TUN \
+             (the on-link route already serves local delivery; adding a /32 to \
+             ourselves risks a forwarding loop)"
+        );
     }
 
     /// The off-loop ALLOCATE queue's test twin (see `test_relay_bq`).
