@@ -330,6 +330,7 @@ mod tests {
             rtt_ms: None,
             last_seen_ms: None,
             agent_id: None,
+            debug: None,
         }
     }
 
