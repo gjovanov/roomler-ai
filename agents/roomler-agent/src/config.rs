@@ -98,6 +98,17 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_LAN_IFACE_FILTER`). Built-in default: on.
     #[serde(default)]
     pub overlay_lan_iface_filter: Option<bool>,
+    /// Overlay PathMonitor engagement (`ROOMLER_NODE_OVERLAY_PATHMON`):
+    /// `on` (authoritative — the built-in default since PR-D's two green
+    /// soaks) | `shadow` (fed + compared, legacy decides — the per-host
+    /// revert rail) | `off`. Multi-state, so a string key, not a tribool.
+    #[serde(default)]
+    pub overlay_pathmon: Option<String>,
+    /// P4 — event-driven route guard (OS route-table change subscription:
+    /// NotifyRouteChange2 / `ip monitor route`)
+    /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVENTS`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_route_events: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -695,6 +706,8 @@ mod tests {
             overlay_derp: None,
             overlay_mbb: None,
             overlay_lan_iface_filter: None,
+            overlay_pathmon: None,
+            overlay_route_events: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,
