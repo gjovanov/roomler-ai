@@ -1250,12 +1250,13 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // "1"/"0" strings every read-site parser already accepts.
     {
         let mut fallbacks = std::collections::HashMap::new();
-        let pairs: [(&str, Option<bool>); 10] = [
+        let pairs: [(&str, Option<bool>); 11] = [
             ("OVERLAY_QUIC", cfg.overlay_quic),
             ("OVERLAY_DIRECT", cfg.overlay_direct),
             ("OVERLAY_DERP", cfg.overlay_derp),
             ("OVERLAY_MBB", cfg.overlay_mbb),
             ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
+            ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
             ("LOCAL_TURN", cfg.local_turn),
             ("DNS_AAAA", cfg.dns_aaaa),
             ("AUTO_UPDATE", cfg.auto_update),
@@ -1278,6 +1279,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             if let Some(v) = value {
                 fallbacks.insert(suffix.to_string(), v.to_string());
             }
+        }
+        // PR-D — overlay_pathmon is multi-state (on|shadow|off), so it rides
+        // the fallback map as a string, not the bool pairs above.
+        if let Some(mode) = &cfg.overlay_pathmon {
+            fallbacks.insert("OVERLAY_PATHMON".to_string(), mode.clone());
         }
         if !fallbacks.is_empty() {
             tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),
