@@ -69,17 +69,134 @@ pub fn gather_lan_ips() -> Vec<Ipv4Addr> {
 /// back to rc.143 source-IP binding only). Deduped by IP.
 pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
     let mut out: Vec<(Ipv4Addr, Option<u32>)> = Vec::new();
+    let filter = lan_iface_filter_enabled();
     if let Ok(addrs) = if_addrs::get_if_addrs() {
         for a in addrs {
             if let std::net::IpAddr::V4(ip) = a.ip()
                 && is_usable_lan_ipv4(ip)
                 && !out.iter().any(|(existing, _)| *existing == ip)
             {
+                // rc.275 hygiene — skip virtual / host-only / other-VPN
+                // interfaces (see `lan_iface_denied`). Field: pc50045
+                // advertised its WSL vEthernet `172.31.176.1` (a host-only
+                // NAT address no peer can ever reach) and its Check Point
+                // VPN `172.30.x` as "LAN" endpoints, each with a pinned
+                // per-interface socket — poisoning the same-/24 match for
+                // every peer that happens to share those private ranges.
+                if filter {
+                    let desc = a.index.and_then(iface_description).unwrap_or_default();
+                    if lan_iface_denied(&a.name, &desc) {
+                        tracing::debug!(
+                            iface = %a.name, %ip, desc = %desc,
+                            "overlay: LAN gather — skipping virtual/host-only interface"
+                        );
+                        continue;
+                    }
+                }
                 out.push((ip, a.index));
             }
         }
     }
     out
+}
+
+/// rc.275 hygiene — gate for the LAN-gather virtual-interface filter
+/// (`ROOMLER_NODE_OVERLAY_LAN_IFACE_FILTER`; legacy `ROOMLER_AGENT_…` alias
+/// honoured — see [`crate::env::node_env`]). Default **ON**; set
+/// `0`/`false`/`no`/`off` to restore the unfiltered pre-rc.275 gather if the
+/// deny-list ever misclassifies a real NIC in the field (the failure mode is
+/// benign either way — a skipped interface just isn't advertised, and the
+/// relay path still works).
+pub fn lan_iface_filter_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_LAN_IFACE_FILTER") {
+        Some(v) => {
+            let t = v.trim();
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
+        }
+        None => true,
+    }
+}
+
+/// rc.275 hygiene — `true` when an interface must NOT be advertised as a LAN
+/// endpoint (nor given a pinned per-interface direct socket): virtual
+/// switches, host-only NATs, container bridges, and OTHER VPNs' adapters.
+/// Their addresses are unreachable by any real peer, and advertising them
+/// poisons the same-/24 LAN match (rc.204 family). Matched case-insensitively
+/// against the interface NAME and (Windows) the driver DESCRIPTION — the
+/// Check Point adapter's friendly name is just "Ethernet"; only its
+/// description ("Check Point Virtual Network Adapter …") gives it away.
+/// webrtc-ice solves this with an application `interface_filter` callback;
+/// the overlay gathers directly, so the deny-list lives here. Pure.
+pub fn lan_iface_denied(name: &str, description: &str) -> bool {
+    // Substring matches — vendor-grade names/descriptions (either field).
+    const SUBSTRING: &[&str] = &[
+        "vethernet", // Hyper-V "vEthernet (WSL …)" / "vEthernet (Default Switch)"
+        "hyper-v",   // "Hyper-V Virtual Ethernet Adapter"
+        "wsl",       // WSL switch names
+        "virtual",   // "… Virtual Network Adapter" (Check Point, VMware, …)
+        "vmware",
+        "vmnet",
+        "virtualbox",
+        "vbox",
+        "wintun", // stale/orphaned Wintun stubs ("Wintun Userspace Tunnel")
+        "wireguard",
+        "tailscale",
+        "zerotier",
+        "openvpn",
+        "ovpn",
+        "tap-windows",
+        "check point",
+        "pangp",
+        "fortissl",
+        "juniper",
+        "loopback",
+    ];
+    // Prefix matches on the NAME — kernel/driver naming conventions
+    // (Linux/macOS/BSD: docker0, veth*, virbr0, br-*, tun0, tap0, utun3,
+    // wg0, ppp0, bridge100). Prefix (not substring) so real adapters whose
+    // names merely CONTAIN these stay allowed.
+    const NAME_PREFIX: &[&str] = &[
+        "docker", "veth", "virbr", "br-", "bridge", "tun", "tap", "utun", "wg", "ppp", "roomler",
+    ];
+    let n = name.to_ascii_lowercase();
+    let d = description.to_ascii_lowercase();
+    SUBSTRING.iter().any(|s| n.contains(s) || d.contains(s))
+        || NAME_PREFIX.iter().any(|p| n.starts_with(p))
+}
+
+/// Windows — the interface DESCRIPTION for an OS ifindex via `GetIfEntry2`
+/// (`MIB_IF_ROW2.Description`, e.g. "Check Point Virtual Network Adapter For
+/// Endpoint VPN Client"). The friendly name alone can't classify these — the
+/// Check Point adapter is named just "Ethernet". `None` on lookup failure
+/// (then the name-only checks still apply).
+#[cfg(all(windows, feature = "overlay-l3"))]
+fn iface_description(ifindex: u32) -> Option<String> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIfEntry2, MIB_IF_ROW2};
+    // SAFETY: zeroed row + InterfaceIndex is the documented lookup-by-index
+    // call shape; GetIfEntry2 fills the row on NO_ERROR (0).
+    unsafe {
+        let mut row: MIB_IF_ROW2 = std::mem::zeroed();
+        row.InterfaceIndex = ifindex;
+        if GetIfEntry2(&mut row) != 0 {
+            return None;
+        }
+        let len = row
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(row.Description.len());
+        Some(String::from_utf16_lossy(&row.Description[..len]))
+    }
+}
+
+/// No-op off Windows — Linux/macOS interface NAMES already follow the
+/// conventions the prefix list catches (docker0, veth*, utun*, wg*…).
+#[cfg(not(all(windows, feature = "overlay-l3")))]
+fn iface_description(_ifindex: u32) -> Option<String> {
+    None
 }
 
 /// rc.144 — force outbound datagrams on `sock` out the interface with OS index
@@ -794,6 +911,96 @@ mod tests {
         for v in ["0", "false", "FALSE", "No", "off", " off "] {
             unsafe { std::env::set_var(n, v) };
             assert!(!make_before_break_enabled(), "{v:?} → kill-switch OFF");
+        }
+        unsafe {
+            match rn {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+            match ra {
+                Some(v) => std::env::set_var(a, v),
+                None => std::env::remove_var(a),
+            }
+        }
+    }
+
+    /// rc.275 hygiene — the LAN-gather deny-list over the field-observed
+    /// interface inventory: pc50045's WSL vEthernet + Check Point adapter
+    /// (whose friendly name is just "Ethernet" — only the DESCRIPTION gives
+    /// it away) must be denied; every real physical NIC stays allowed.
+    #[test]
+    fn lan_iface_denied_matrix() {
+        // (name, description, denied) — descriptions verbatim from the field.
+        let cases: &[(&str, &str, bool)] = &[
+            // pc50045's poison trio (2026-07-30):
+            (
+                "vEthernet (WSL (Hyper-V firewall))",
+                "Hyper-V Virtual Ethernet Adapter",
+                true,
+            ),
+            (
+                "Ethernet",
+                "Check Point Virtual Network Adapter For Endpoint VPN Client",
+                true,
+            ),
+            ("LAN-Verbindung", "Wintun Userspace Tunnel", true),
+            // Real NICs across the fleet — must stay allowed:
+            ("WLAN", "Intel(R) Wi-Fi 6E AX211 160MHz", false),
+            ("WLAN", "Intel(R) Wi-Fi 7 BE200 320MHz", false),
+            ("Ethernet", "Intel(R) Ethernet Controller I226-LM", false),
+            ("Ethernet", "Realtek PCIe GbE Family Controller", false),
+            ("Local Area Connection", "Broadcom NetXtreme Gigabit", false),
+            ("Mobilfunk", "Intel(R)XMM(TM)7560R+ LTE-A Pro", false),
+            // Unix naming conventions (no description available):
+            ("eth0", "", false),
+            ("enp3s0", "", false),
+            ("wlp2s0", "", false),
+            ("wlan0", "", false),
+            ("en0", "", false),
+            ("docker0", "", true),
+            ("veth1a2b3c", "", true),
+            ("virbr0", "", true),
+            ("br-4f5e6d", "", true),
+            ("bridge100", "", true),
+            ("tun0", "", true),
+            ("tap0", "", true),
+            ("utun3", "", true),
+            ("wg0", "", true),
+            ("ppp0", "", true),
+            ("roomler0", "", true),
+            ("tailscale0", "", true),
+            // TAP/OpenVPN on Windows hides behind a generic name too:
+            ("Ethernet 2", "TAP-Windows Adapter V9", true),
+        ];
+        for (name, desc, want) in cases {
+            assert_eq!(
+                lan_iface_denied(name, desc),
+                *want,
+                "name={name:?} desc={desc:?}"
+            );
+        }
+    }
+
+    /// rc.275 hygiene — the filter is DEFAULT-ON with an explicit kill-switch,
+    /// mirroring `direct_enabled`. (Serialises env mutation; the overlay-l3
+    /// suite runs `--test-threads=1`.)
+    #[test]
+    fn lan_iface_filter_defaults_on_with_kill_switch() {
+        let n = "ROOMLER_NODE_OVERLAY_LAN_IFACE_FILTER";
+        let a = "ROOMLER_AGENT_OVERLAY_LAN_IFACE_FILTER";
+        let (rn, ra) = (std::env::var(n).ok(), std::env::var(a).ok());
+        unsafe {
+            std::env::remove_var(n);
+            std::env::remove_var(a);
+        }
+        assert!(lan_iface_filter_enabled(), "unset → default ON");
+        for v in ["1", "true", "on", "yes", "", "  ", "anything"] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(lan_iface_filter_enabled(), "{v:?} → ON");
+        }
+        for v in ["0", "false", "FALSE", "No", "off", " off "] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(!lan_iface_filter_enabled(), "{v:?} → kill-switch OFF");
         }
         unsafe {
             match rn {
