@@ -55,6 +55,36 @@ pub trait TunIo: Send + Sync {
     /// mesh). Best-effort; never fails the caller.
     async fn del_peer_route(&self, _peer: std::net::Ipv4Addr) {}
 
+    /// rc.278 — evict any FOREIGN `/32` for **our own** overlay address.
+    ///
+    /// [`add_peer_route`] has evicted VPN-installed competing `/32`s for every
+    /// PEER since rc.208, but our own address was never defended — and a
+    /// full-tunnel VPN installs a `/32` for it too. Field (pc50045, Check Point
+    /// Endpoint, 2026-07-31):
+    ///
+    /// ```text
+    /// 100.64.0.28/32  ifIndex 46 (roomler)      0.0.0.0          metric 256
+    /// 100.64.0.28/32  ifIndex 17 (Check Point)  172.30.226.132   metric 1   ← WINS
+    /// ```
+    ///
+    /// Ours is only Windows' auto-generated on-link entry (metric 256) derived
+    /// from the interface address, so the VPN's metric-1 `/32` out-ranks it at
+    /// equal prefix length. Every packet destined to our own overlay IP — i.e.
+    /// **the reply to everything we initiate**, plus every inbound packet — is
+    /// then FORWARDED INTO THE CORP TUNNEL instead of delivered locally. The
+    /// host looks totally dead on IPv4 (100 % loss both directions) while its
+    /// WireGuard carriers are perfectly healthy and IPv6 works fine, which is
+    /// exactly how it evaded six wrong diagnoses. Deleting that one route
+    /// restored connectivity instantly with the VPN still connected.
+    ///
+    /// Eviction ONLY — we deliberately do NOT add our own `/32`: the on-link
+    /// route Windows derives from the interface address already serves local
+    /// delivery once the competitor is gone (field-proven), and installing a
+    /// route to our own address via the TUN risks a forwarding loop.
+    /// Best-effort, idempotent, called from the route guard + route-change
+    /// events, so a VPN that re-adds its `/32` loses it again within ~2 s.
+    async fn defend_self_route(&self, _self_ip: std::net::Ipv4Addr) {}
+
     /// Phase 1 — install an OS route for a subnet `cidr` (e.g. `"192.168.1.0/24"`)
     /// via this device, so LAN behind a router-peer is reachable over the
     /// overlay. Default no-op; best-effort.
@@ -643,6 +673,18 @@ mod system {
                 let _ = peer;
                 Ok(())
             }
+        }
+
+        /// rc.278 — see [`TunIo::defend_self_route`]. Windows-only: a VPN's
+        /// metric-1 `/32` for OUR OWN overlay address out-ranks the metric-256
+        /// on-link route Windows derives from the interface address, diverting
+        /// every packet meant for us into the corp tunnel. Same eviction the
+        /// peer path has used since rc.208, now applied to our own address.
+        async fn defend_self_route(&self, self_ip: Ipv4Addr) {
+            #[cfg(target_os = "windows")]
+            winroute::evict_competing_v4(self.dev.tun_luid(), self_ip, 32);
+            #[cfg(not(target_os = "windows"))]
+            let _ = self_ip;
         }
 
         async fn del_peer_route(&self, peer: Ipv4Addr) {
