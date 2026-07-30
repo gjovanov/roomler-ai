@@ -156,6 +156,13 @@ pub struct PeerInfo {
     /// daemons (serde default) and for non-relay peers.
     #[serde(default)]
     pub upgrading: bool,
+    /// rc.275 honesty — the carrier is installed but SILENTLY ONE-WAY (no
+    /// completed WG handshake past the warm-up grace, or the one-way strike
+    /// counter accumulating). The CLI renders `stalled` instead of a
+    /// healthy-looking `direct`/`relay`. `#[serde(default)]` — absent from a
+    /// pre-rc.275 daemon ⇒ `false` (wire-compatible both ways).
+    #[serde(default)]
+    pub stalled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1455,6 +1462,7 @@ mod tests {
                     online: true,
                     connection: ConnectionType::Tunnel,
                     upgrading: false,
+                    stalled: false,
                     rtt_ms: Some(52),
                     last_seen_ms: Some(1000),
                     agent_id: Some("6a074fe5ef3ba556ab041966".into()),
@@ -1469,6 +1477,7 @@ mod tests {
                     online: true,
                     connection: ConnectionType::Direct,
                     upgrading: false,
+                    stalled: false,
                     rtt_ms: Some(3),
                     last_seen_ms: Some(1200),
                     agent_id: None,
@@ -1682,6 +1691,24 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"t":"peers"}"#).unwrap(),
             Request::Peers
         );
+    }
+
+    /// rc.275 — `PeerInfo.stalled` is wire-compatible in both directions: a
+    /// pre-rc.275 daemon's JSON (no `stalled` key) deserialises to `false`,
+    /// and a set flag round-trips.
+    #[test]
+    fn peer_info_stalled_wire_compat() {
+        // Absent → default false (an old daemon talking to a new CLI).
+        let old = r#"{"node_id":"n1","name":"pc","overlay_ip":null,"overlay_ip6":null,
+                      "online":true,"connection":"relay","upgrading":false}"#;
+        let p: PeerInfo = serde_json::from_str(old).unwrap();
+        assert!(!p.stalled);
+        // Set → survives a round-trip.
+        let mut p2 = p.clone();
+        p2.stalled = true;
+        let s = serde_json::to_string(&p2).unwrap();
+        assert!(s.contains(r#""stalled":true"#));
+        assert!(serde_json::from_str::<PeerInfo>(&s).unwrap().stalled);
     }
 
     #[tokio::test]
