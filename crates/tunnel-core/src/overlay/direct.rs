@@ -511,6 +511,38 @@ pub fn relay_single_enabled() -> bool {
     }
 }
 
+/// rc.276 (B-probe) — force ALL overlay coturn allocations onto the
+/// **TURNS/TCP (TLS) tier** (`ROOMLER_NODE_OVERLAY_RELAY_TLS`; legacy
+/// `ROOMLER_AGENT_…` alias honoured). **Default OFF** opt-in (positive truthy
+/// only), mirroring `public_direct_enabled` — this is the field-diagnostic
+/// twin of remote-control's `ROOMLER_AGENT_ICE_RELAY_TCP`: the WebRTC
+/// screen-share survives corp endpoint VPNs via `turns:coturn:443?tcp`
+/// (real TLS + SNI, OS-native trust — indistinguishable from HTTPS), while
+/// the overlay's Tier-2 UDP allocate "succeeds" and then runs silently
+/// one-way, so the TLS tier never engages on its own. Forcing it answers
+/// the gating question for the auto-demotion follow-up: does a WG handshake
+/// complete over a TLS-TURN carrier on the affected host at all? (DERP —
+/// also WG-in-TLS — did NOT survive there, so this is a genuine experiment,
+/// not a foregone conclusion.)
+///
+/// Side effect: while forced, the node also advertises
+/// `supports_relay_single=false` and turns its local single-relay flag off —
+/// the raw-UDP DIALER role is exactly the flow shape the affected hosts
+/// can't send, and both ends must compute the same strategy (the peer reads
+/// our capability from the join, so the veto stays pair-symmetric).
+pub fn relay_tls_forced() -> bool {
+    match crate::env::node_env("OVERLAY_RELAY_TLS") {
+        Some(v) => {
+            let t = v.trim();
+            t.eq_ignore_ascii_case("1")
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        None => false,
+    }
+}
+
 /// Phase D (DERP) — is the pubkey-addressed `/derp` relay carrier ENABLED?
 /// (`ROOMLER_NODE_OVERLAY_DERP`; legacy `ROOMLER_AGENT_…` alias honoured.)
 /// **Default ON** since 2026-07-21 (field-proven). DERP is the last-resort
@@ -1001,6 +1033,39 @@ mod tests {
         for v in ["0", "false", "FALSE", "No", "off", " off "] {
             unsafe { std::env::set_var(n, v) };
             assert!(!lan_iface_filter_enabled(), "{v:?} → kill-switch OFF");
+        }
+        unsafe {
+            match rn {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+            match ra {
+                Some(v) => std::env::set_var(a, v),
+                None => std::env::remove_var(a),
+            }
+        }
+    }
+
+    /// rc.276 (B-probe) — forced TLS-relay is DEFAULT-OFF opt-in (positive
+    /// truthy only), mirroring `public_direct_enabled`. (Serialises env
+    /// mutation; the overlay-l3 suite runs `--test-threads=1`.)
+    #[test]
+    fn relay_tls_forced_defaults_off_with_opt_in() {
+        let n = "ROOMLER_NODE_OVERLAY_RELAY_TLS";
+        let a = "ROOMLER_AGENT_OVERLAY_RELAY_TLS";
+        let (rn, ra) = (std::env::var(n).ok(), std::env::var(a).ok());
+        unsafe {
+            std::env::remove_var(n);
+            std::env::remove_var(a);
+        }
+        assert!(!relay_tls_forced(), "unset → default OFF");
+        for v in ["1", "true", "On", "yes"] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(relay_tls_forced(), "{v:?} → opt-in ON");
+        }
+        for v in ["0", "false", "off", "", "  ", "anything"] {
+            unsafe { std::env::set_var(n, v) };
+            assert!(!relay_tls_forced(), "{v:?} → stays OFF");
         }
         unsafe {
             match rn {

@@ -182,6 +182,45 @@ pub struct PeerInfo {
     pub relay_local: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_dst: Option<String>,
+    /// rc.276 diagnostics — the installed carrier's forensic snapshot (which
+    /// flow each peer rides + whether it actually works), for `peers --json`
+    /// only. `None` for a peer with no installed carrier or from a pre-rc.276
+    /// daemon (wire-compatible both ways).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<PeerCarrierDebug>,
+}
+
+/// rc.276 — per-carrier forensic fields (see [`PeerInfo::debug`]). Built for
+/// the pc50045-class corp-VPN investigations: two `peers --json` snapshots
+/// 30 s apart show exactly which carriers move which counters, which flows
+/// were initiated by whom, and whether the WG session ever completed —
+/// one-shot field captures instead of multi-session log archaeology.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PeerCarrierDebug {
+    /// Carrier tier: `lan` / `public` / `srflx` / `relay`.
+    pub tier: String,
+    /// `true` = we initiated this flow (outbound dial / our allocation);
+    /// `false` = adopted from the peer's authenticated inbound dial.
+    pub initiated: bool,
+    /// The WG session latch (either role) as of the last health sweep.
+    pub hs_done: bool,
+    /// Carrier socket's local address (relay: our relayed address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
+    /// Carrier send destination (direct: dial dst / accepted src; relay: the
+    /// peer's relayed address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<String>,
+    /// IP-data packets sent / received over this carrier (handshakes and
+    /// keepalives touch NEITHER — `tx>0, rx==0` past the grace = one-way).
+    pub tx: u64,
+    pub rx: u64,
+    /// Seconds since we last heard ANY authenticated packet (keepalives
+    /// included) from this peer.
+    pub last_rx_age_s: u64,
+    /// Relay flavor (`turn` / `derp`); `None` for direct carriers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_kind: Option<String>,
 }
 
 /// Whether a forward is a static `--remote` forward or a SOCKS5 listener.
@@ -1468,6 +1507,7 @@ mod tests {
                     agent_id: Some("6a074fe5ef3ba556ab041966".into()),
                     relay_local: Some("94.130.141.74:10850".into()),
                     relay_dst: Some("5.9.157.226:12728".into()),
+                    debug: None,
                 },
                 PeerInfo {
                     node_id: "n3".into(),
@@ -1483,6 +1523,7 @@ mod tests {
                     agent_id: None,
                     relay_local: None,
                     relay_dst: None,
+                    debug: None,
                 },
             ]
         }
@@ -1691,6 +1732,31 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"t":"peers"}"#).unwrap(),
             Request::Peers
         );
+    }
+
+    /// rc.276 — `PeerInfo.debug` is wire-compatible: absent (pre-rc.276
+    /// daemon) ⇒ `None`; a populated snapshot round-trips.
+    #[test]
+    fn peer_info_debug_wire_compat() {
+        let old = r#"{"node_id":"n1","name":"pc","online":true,"connection":"relay"}"#;
+        let p: PeerInfo = serde_json::from_str(old).unwrap();
+        assert!(p.debug.is_none());
+        let mut p2 = p.clone();
+        p2.debug = Some(PeerCarrierDebug {
+            tier: "relay".into(),
+            initiated: true,
+            hs_done: false,
+            local: Some("94.130.141.74:10850".into()),
+            dst: Some("5.9.157.226:12728".into()),
+            tx: 42,
+            rx: 0,
+            last_rx_age_s: 7,
+            relay_kind: Some("turn".into()),
+        });
+        let s = serde_json::to_string(&p2).unwrap();
+        assert!(s.contains(r#""tier":"relay""#) && s.contains(r#""tx":42"#));
+        let back: PeerInfo = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.debug, p2.debug);
     }
 
     /// rc.275 — `PeerInfo.stalled` is wire-compatible in both directions: a

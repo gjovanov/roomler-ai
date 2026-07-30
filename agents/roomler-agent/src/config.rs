@@ -109,6 +109,11 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVENTS`). Built-in default: on.
     #[serde(default)]
     pub overlay_route_events: Option<bool>,
+    /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
+    /// the corp-VPN field probe (`ROOMLER_NODE_OVERLAY_RELAY_TLS`).
+    /// Built-in default: off.
+    #[serde(default)]
+    pub overlay_relay_tls: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -708,6 +713,7 @@ mod tests {
             overlay_lan_iface_filter: None,
             overlay_pathmon: None,
             overlay_route_events: None,
+            overlay_relay_tls: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,
