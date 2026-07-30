@@ -402,13 +402,14 @@ impl PathShadow {
         self.refused
             .retain(|_, &mut at| now.duration_since(at) <= SHADOW_HARM_WINDOW);
         info!(
+            mode = self.mode.as_str(),
             decisions = self.stats.decisions,
             diverged = self.stats.diverged,
             harmful = self.stats.harmful,
             post_death_eligible = self.stats.post_death_eligible,
             d10_redials = self.stats.d10_redials,
             classes = %self.stats.classes_line(),
-            "overlay pathmon[shadow]: 10-min summary (soak gate: steady <0.1% diverged, harmful = 0)"
+            "overlay pathmon: 10-min summary (soak gate: steady <0.1% diverged, harmful = 0)"
         );
     }
 }

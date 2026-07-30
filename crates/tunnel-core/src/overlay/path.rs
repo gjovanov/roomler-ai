@@ -100,14 +100,27 @@ pub(crate) enum PathMonMode {
 }
 
 impl PathMonMode {
-    /// `off|0|false` → Off, `on|1|true` → On, anything else (incl. unset /
-    /// `shadow`) → Shadow. Default-shadow at PR-A: observability with zero
-    /// behaviour change.
+    /// PR-D — `off|0|false` → Off, `shadow` → Shadow (the per-host revert
+    /// rail), anything else (incl. unset, `on`, `1`, `true`) → **On**: the
+    /// monitor is authoritative by default after two green 48 h soaks
+    /// (soak #1 shadow-parity on rc.246; soak #2 fleet shadow + neo16
+    /// ON-pilot on rc.271/272 — harmful 0, steady 0–0.05 % throughout,
+    /// incl. a fleet-wide server-churn incident absorbed mid-soak).
     pub(crate) fn parse(v: Option<&str>) -> Self {
         match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
             Some("off") | Some("0") | Some("false") => PathMonMode::Off,
-            Some("on") | Some("1") | Some("true") => PathMonMode::On,
-            _ => PathMonMode::Shadow,
+            Some("shadow") => PathMonMode::Shadow,
+            _ => PathMonMode::On,
+        }
+    }
+
+    /// Lowercase name for logs (the 10-min summary prints it — pre-PR-D the
+    /// summary said `[shadow]` unconditionally, which lied on the ON pilot).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PathMonMode::Off => "off",
+            PathMonMode::Shadow => "shadow",
+            PathMonMode::On => "on",
         }
     }
 }
@@ -864,15 +877,20 @@ mod tests {
         }
     }
 
+    /// PR-D — unset (and anything unrecognized) defaults to ON; `shadow` is
+    /// the explicit per-host revert; `off` still kills the monitor.
     #[test]
-    fn mode_parse_defaults_to_shadow() {
-        assert_eq!(PathMonMode::parse(None), PathMonMode::Shadow);
+    fn mode_parse_defaults_to_on() {
+        assert_eq!(PathMonMode::parse(None), PathMonMode::On);
+        assert_eq!(PathMonMode::parse(Some("on")), PathMonMode::On);
+        assert_eq!(PathMonMode::parse(Some("1")), PathMonMode::On);
+        assert_eq!(PathMonMode::parse(Some("bogus")), PathMonMode::On);
         assert_eq!(PathMonMode::parse(Some("shadow")), PathMonMode::Shadow);
-        assert_eq!(PathMonMode::parse(Some("bogus")), PathMonMode::Shadow);
+        assert_eq!(PathMonMode::parse(Some("SHADOW")), PathMonMode::Shadow);
         assert_eq!(PathMonMode::parse(Some("off")), PathMonMode::Off);
         assert_eq!(PathMonMode::parse(Some("0")), PathMonMode::Off);
-        assert_eq!(PathMonMode::parse(Some("ON")), PathMonMode::On);
-        assert_eq!(PathMonMode::parse(Some("1")), PathMonMode::On);
+        assert_eq!(PathMonMode::On.as_str(), "on");
+        assert_eq!(PathMonMode::Shadow.as_str(), "shadow");
     }
 
     #[test]
