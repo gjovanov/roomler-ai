@@ -1250,35 +1250,15 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // "1"/"0" strings every read-site parser already accepts.
     {
         let mut fallbacks = std::collections::HashMap::new();
-        let pairs: [(&str, Option<bool>); 14] = [
-            ("OVERLAY_QUIC", cfg.overlay_quic),
-            ("OVERLAY_DIRECT", cfg.overlay_direct),
-            ("OVERLAY_DERP", cfg.overlay_derp),
-            ("OVERLAY_MBB", cfg.overlay_mbb),
-            ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
-            ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
-            ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
-            ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
-            ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
-            ("LOCAL_TURN", cfg.local_turn),
-            ("DNS_AAAA", cfg.dns_aaaa),
-            ("AUTO_UPDATE", cfg.auto_update),
-            ("LOGS_UPLOAD_DISABLED", cfg.logs_upload_disabled),
-            ("OVERLAY_TIER_DETECT", cfg.overlay_tier_detect),
-        ];
-        for (suffix, value) in pairs {
+        // rc.280 — the pair lists live in `config::env_bridge_*` (one source,
+        // parity-tested against the editable surface) instead of literals here.
+        for (suffix, value) in config::env_bridge_bools(&cfg) {
             if let Some(v) = value {
                 fallbacks.insert(suffix.to_string(), if v { "1" } else { "0" }.to_string());
             }
         }
         // Numeric knobs ride the same map as their decimal strings.
-        let numeric: [(&str, Option<u32>); 4] = [
-            ("RATE_FACTOR_H264", cfg.rate_factor_h264),
-            ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
-            ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
-            ("RATE_FACTOR_AV1", cfg.rate_factor_av1),
-        ];
-        for (suffix, value) in numeric {
+        for (suffix, value) in config::env_bridge_numerics(&cfg) {
             if let Some(v) = value {
                 fallbacks.insert(suffix.to_string(), v.to_string());
             }
