@@ -244,6 +244,14 @@ mod system {
         /// overlay peer). Snapshots the v4 FIB (in-memory, ~µs) and deletes the
         /// competing entries so our wintun route wins.
         pub fn evict_competing_v4(ours: u64, dest: Ipv4Addr, plen: u8) {
+            // rc.279 kill-switch — deleting ANOTHER product's routes is the
+            // right default (the overlay is unusable under a hostile
+            // full-tunnel VPN without it), but some managed sites alarm on
+            // route deletion; `overlay_route_evict=0` trades overlay
+            // reachability under such VPNs for leaving foreign routes alone.
+            if !super::route_evict_enabled() {
+                return;
+            }
             let want = u32::from_ne_bytes(dest.octets());
             // SAFETY: GetIpForwardTable2 allocates a snapshot we iterate then
             // free; every union read is guarded by the `si_family` check.
@@ -260,7 +268,23 @@ mod system {
                         && r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr == want
                         && r.InterfaceLuid.Value != ours
                     {
-                        DeleteIpForwardEntry2(r);
+                        // rc.279 — the route war used to be completely
+                        // silent: an operator could not tell "healthy" from
+                        // "winning an eviction fight on every VPN reconnect"
+                        // (the invisibility that fed the pc50045 hunt's six
+                        // wrong diagnoses). WARN only on an ACTUAL deletion,
+                        // so the every-2s no-op guard ticks stay quiet and
+                        // the log is self-limiting (a VPN re-adds at most
+                        // once per connect).
+                        if DeleteIpForwardEntry2(r) == NO_ERROR {
+                            tracing::warn!(
+                                dest = %dest,
+                                plen,
+                                competitor_ifindex = r.InterfaceIndex,
+                                competitor_luid = format_args!("{:#x}", r.InterfaceLuid.Value),
+                                "overlay: evicted a competing route installed by another product"
+                            );
+                        }
                     }
                 }
                 FreeMibTable(table as *const core::ffi::c_void);
@@ -494,6 +518,17 @@ mod system {
     #[cfg(target_os = "windows")]
     fn stable_guid_enabled() -> bool {
         crate::env::flag("OVERLAY_TUN_STABLE_GUID", true)
+    }
+
+    /// rc.279 — kill-switch for the route-war eviction (peer `/32`s since
+    /// rc.208, our own `/32` since rc.278): `ROOMLER_NODE_OVERLAY_ROUTE_EVICT`
+    /// (legacy `ROOMLER_AGENT_…` honoured; config key `overlay_route_evict`).
+    /// Default **ON** — without it the overlay is unusable under a hostile
+    /// full-tunnel VPN — but managed sites whose security tooling alarms on
+    /// route deletion can turn it off and accept that trade.
+    #[cfg(windows)]
+    fn route_evict_enabled() -> bool {
+        crate::env::flag("OVERLAY_ROUTE_EVICT", true)
     }
 
     /// rc.279 — one-shot per process: remove stray roomler Wintun devices
