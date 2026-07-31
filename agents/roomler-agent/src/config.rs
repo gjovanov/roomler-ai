@@ -114,6 +114,11 @@ pub struct AgentConfig {
     /// Built-in default: off.
     #[serde(default)]
     pub overlay_relay_tls: Option<bool>,
+    /// Stable Wintun adapter identity — constant requested GUID + boot
+    /// stray-adapter sweep, Windows only
+    /// (`ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_tun_stable_guid: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -714,6 +719,7 @@ mod tests {
             overlay_pathmon: None,
             overlay_route_events: None,
             overlay_relay_tls: None,
+            overlay_tun_stable_guid: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,
