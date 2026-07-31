@@ -582,6 +582,21 @@ mod system {
     }
 
     impl SystemTun {
+        /// rc.280 — cheap liveness probe for the process-lifetime TUN cache:
+        /// does the OS still know our LUID? A user disabling/removing the
+        /// adapter out from under a cached device must force a fresh create
+        /// instead of wedging every future session on a dead handle.
+        pub fn is_alive(&self) -> bool {
+            #[cfg(target_os = "windows")]
+            {
+                winroute::identity(self.dev.tun_luid()).0 != 0
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                true
+            }
+        }
+
         /// Create the device, assign `self_ip` with `netmask`, set `mtu`,
         /// and bring it up. `netmask` is the overlay *network* mask (e.g.
         /// `/10` → `255.192.0.0`) so the whole overlay CIDR routes here
