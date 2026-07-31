@@ -170,9 +170,24 @@ that window un-elevated, or use the Windows Security Attention Sequence
 Uninstall
 ---------
 Settings -> Apps -> Installed apps -> Roomler Agent -> Uninstall.
-Or from PowerShell:
 
-    msiexec /x {product-code-here}
+NOTE (per-User MSI): the Add/Remove record lives ONLY in the HKCU hive
+of the account that ran the install. If the install ran from an
+elevated shell using a DIFFERENT admin account (over-the-shoulder UAC),
+your Settings > Apps will not show it — look under that admin account,
+or use one of the account-independent routes below.
+
+From PowerShell (either finds the product code for you):
+
+    # one-shot, removes every Roomler install this account can see:
+    & ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Uninstall
+
+    # or manually:
+    Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall,
+                  HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall |
+        Get-ItemProperty | Where-Object DisplayName -like 'Roomler Agent*' |
+        Select-Object DisplayName, DisplayVersion, PSChildName
+    msiexec /x {product-code-from-PSChildName}
 
 Logs
 ----
