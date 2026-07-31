@@ -22,16 +22,30 @@
 #
 # Roles (same vocabulary as the roomler-setup wizard):
 #   daemon-user     perUser MSI -- Scheduled-Task autostart, no UAC. Default.
+#                   Run from a NORMAL (non-elevated) shell -- see -AllowElevated.
 #   daemon-machine  perMachine MSI -- SCM service 'Roomler'. ELEVATED shell required.
 #   daemon-system   perMachine MSI + SystemContext (pre-logon / lock screen /
 #                   UAC control). ELEVATED shell required.
 #   tunnel-client   the roomler CLI only ("reach others") -- zip + user PATH.
+#                   Run from a NORMAL (non-elevated) shell -- see -AllowElevated.
 #
 # Switches:
 #   -DownloadOnly   resolve + download + verify, print what WOULD run,
 #                   touch nothing else (safe on any box).
 #   -NoEnroll       install without enrolling (no token needed).
 #   -SkipDesktop    daemon roles: don't fetch roomler-desktop.exe.
+#   -Uninstall      remove Roomler from this box: every 'Roomler Agent' MSI
+#                   product registered for this user (HKCU) or machine-wide
+#                   (HKLM; needs elevation), plus the tunnel-client archive
+#                   install and script-copied leftovers. Ignores -Role.
+#   -AllowElevated  skip the elevated-shell refusal for the per-user roles.
+#                   A per-user install from an elevated shell registers in
+#                   the ELEVATING account's profile (HKCU + %LOCALAPPDATA%):
+#                   under over-the-shoulder elevation that is the ADMIN's
+#                   profile, so the interactive user's Settings > Apps never
+#                   shows it and the autostart lands in the wrong account.
+#                   Only use this on UAC-disabled boxes where the shell is
+#                   unavoidably full-token.
 #
 # The enrollment token is single-use and is never echoed.
 
@@ -44,7 +58,9 @@ param(
     [string]$Name = $env:COMPUTERNAME,
     [switch]$DownloadOnly,
     [switch]$NoEnroll,
-    [switch]$SkipDesktop
+    [switch]$SkipDesktop,
+    [switch]$Uninstall,
+    [switch]$AllowElevated
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,8 +121,11 @@ function Ensure-VcRuntime {
     Say ("VC++ 2015-2022 x64 runtime is missing or incomplete (no " + ($missing -join ', ') + ")")
     if (-not (Test-Elevated)) {
         Warn "cannot install the VC++ runtime without elevation. If the daemon fails to start with a"
-        Warn "missing-DLL error, run this in an ELEVATED PowerShell, then re-run this installer:"
+        Warn "missing-DLL error, install JUST the runtime from an ELEVATED PowerShell:"
         Warn "  winget install --id Microsoft.VCRedist.2015+.x64 -e"
+        Warn "then re-run this installer back in THIS (non-elevated) shell -- do NOT re-run the"
+        Warn "installer itself elevated: a per-user install would land in the elevating account's"
+        Warn "profile instead of yours."
         return
     }
     $redist = Join-Path $stage 'vc_redist.x64.exe'
@@ -127,8 +146,28 @@ $stage = Join-Path $env:TEMP ("roomler-install-" + [guid]::NewGuid().ToString('N
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 $machineRole = $Role -in @('daemon-machine', 'daemon-system')
-if ($machineRole -and -not $DownloadOnly -and -not (Test-Elevated)) {
+if ($machineRole -and -not $DownloadOnly -and -not $Uninstall -and -not (Test-Elevated)) {
     throw "role '$Role' installs the perMachine MSI -- run this script from an ELEVATED PowerShell (Terminal (Admin))."
+}
+
+# Mirror-image guard: the per-user roles must NOT run elevated. A perUser
+# MSI registers its Add/Remove record ONLY in the installing account's HKCU
+# (WiX InstallScope='perUser' emits no ALLUSERS), and %LOCALAPPDATA% follows
+# the same token -- under over-the-shoulder elevation (admin credentials for
+# a standard user's UAC prompt, the norm on corp boxes) BOTH land in the
+# ADMIN's profile: the interactive user's Settings > Apps never shows the
+# install and the Scheduled Task autostart belongs to the wrong account.
+# Field report 2026-07-31 (CORPLAP-1): invisible daemon-user install ->
+# blind re-install -> two flavours on one box. -AllowElevated overrides for
+# UAC-disabled boxes where every shell is unavoidably full-token.
+if (-not $machineRole -and -not $DownloadOnly -and -not $Uninstall -and -not $AllowElevated -and (Test-Elevated)) {
+    Warn "role '$Role' is a PER-USER install, but this shell is ELEVATED."
+    Warn "If this elevation used a different admin account, the install would register under"
+    Warn "THAT account's profile and never appear in your Settings > Apps / Programs & Features."
+    Warn "Re-run from a normal (non-elevated) PowerShell. If the VC++ runtime is missing,"
+    Warn "install just that part from an elevated shell first:"
+    Warn "  winget install --id Microsoft.VCRedist.2015+.x64 -e"
+    throw "refusing an elevated '$Role' install (use -AllowElevated only on a UAC-disabled box)."
 }
 
 # Pre-rendered hint fragment for enroll commands. S1b: ONLY the
@@ -175,6 +214,24 @@ function Install-Daemon {
     if ($proc.ExitCode -ne 0) { throw "msiexec exited $($proc.ExitCode)" }
     if (-not (Test-Path $daemon)) { throw "install finished but $daemon is missing" }
     Say "installed: $installDir (roomlerd.exe + roomler.exe on PATH for new shells)"
+
+    # Surface WHERE this install registered + the uninstall escape hatch. A
+    # perUser MSI's Add/Remove record lives ONLY in the installing account's
+    # HKCU, so print the product code here -- removal must never depend on
+    # the user finding an entry in Settings > Apps.
+    $uninstRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    if ($Role -eq 'daemon-user') { $uninstRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' }
+    $arp = Get-ChildItem $uninstRoot -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+        Where-Object { $_.DisplayName -like 'Roomler Agent*' } |
+        Select-Object -First 1
+    if ($arp) {
+        $hive = ($uninstRoot -split ':')[0]
+        Say ("registered: '" + $arp.DisplayName + "' " + $arp.DisplayVersion + " in " + $hive + " (account: " + $env:USERNAME + ")")
+        Say ("uninstall later with: msiexec /x " + $arp.PSChildName + "  (or re-run this script with -Uninstall)")
+    } else {
+        Warn "no 'Roomler Agent' record found in $uninstRoot after install -- uninstall via: install.ps1 -Uninstall"
+    }
 
     if (-not $SkipDesktop) { Install-Desktop -InstallDir $installDir }
 
@@ -279,10 +336,86 @@ function Install-TunnelClient {
     if ($LASTEXITCODE -ne 0) { throw "enrollment failed (exit $LASTEXITCODE)" }
 }
 
+# --- uninstall: every Roomler install this account can see ------------------
+
+function Uninstall-Roomler {
+    # 1) MSI products, both hives. HKCU = perUser flavour (visible only to
+    #    the account that installed it -- the reason -Uninstall exists);
+    #    HKLM = perMachine flavours (need elevation to remove).
+    $roots = @(
+        @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' },
+        @{ Hive = 'HKLM'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' }
+    )
+    $found = @()
+    foreach ($r in $roots) {
+        Get-ChildItem $r.Path -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+            Where-Object { $_.DisplayName -like 'Roomler Agent*' -and $_.PSChildName -like '{*}' } |
+            ForEach-Object {
+                $found += @{ Hive = $r.Hive; Code = $_.PSChildName; Name = $_.DisplayName; Version = $_.DisplayVersion }
+            }
+    }
+    if ($found.Count -eq 0) {
+        Say "no 'Roomler Agent' MSI products registered for this account or machine-wide."
+    }
+    foreach ($p in $found) {
+        if ($p.Hive -eq 'HKLM' -and -not (Test-Elevated)) {
+            Warn ("'" + $p.Name + "' " + $p.Version + " is a perMachine install -- re-run -Uninstall from an")
+            Warn ("ELEVATED PowerShell to remove it, or run: msiexec /x " + $p.Code + " /qn")
+            continue
+        }
+        # Best-effort pre-stop so msiexec's FilesInUse never wedges a /qn
+        # uninstall (the rc.236 self-update lesson): the MSI's own custom
+        # actions also stop these, this just makes it deterministic.
+        if ($p.Hive -eq 'HKCU') { schtasks /End /TN Roomler 2>$null | Out-Null }
+        else { try { Stop-Service -Name Roomler -Force -ErrorAction SilentlyContinue } catch {} }
+        Say ("uninstalling '" + $p.Name + "' " + $p.Version + " (" + $p.Code + ", " + $p.Hive + ")")
+        $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList ("/x " + $p.Code + " /qn /norestart") -Wait -PassThru
+        if ($proc.ExitCode -ne 0) { Warn ("msiexec /x exited " + $proc.ExitCode) } else { Say "uninstalled." }
+    }
+
+    # 2) Script-copied leftovers the MSI never owned: roomler-desktop.exe
+    #    (placed by Install-Desktop) + the then-empty install dir.
+    foreach ($dir in @((Join-Path $env:ProgramFiles 'Roomler'), (Join-Path $env:LOCALAPPDATA 'Programs\Roomler'))) {
+        $desk = Join-Path $dir 'roomler-desktop.exe'
+        if (Test-Path $desk) {
+            try {
+                Get-Process -Name 'roomler-desktop' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Path -like ($dir + '*') } | Stop-Process -Force -ErrorAction SilentlyContinue
+                Remove-Item $desk -Force
+                Say "removed leftover $desk"
+                if (-not (Get-ChildItem $dir -ErrorAction SilentlyContinue)) { Remove-Item $dir -Force }
+            } catch { Warn "could not remove ${desk}: $_" }
+        }
+    }
+
+    # 3) The tunnel-client role (archive install -- by construction it has
+    #    NO Add/Remove record anywhere): dir + its user-PATH entry.
+    $tcRoot = Join-Path $env:LOCALAPPDATA 'roomler\roomler-tunnel'
+    if (Test-Path $tcRoot) {
+        try {
+            Get-Process -Name 'roomler', 'roomler-tunnel' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -like ($tcRoot + '*') } | Stop-Process -Force -ErrorAction SilentlyContinue
+            $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+            if ($userPath) {
+                $kept = ($userPath -split ';' | Where-Object { $_ -and ($_ -notlike ($tcRoot + '*')) }) -join ';'
+                if ($kept -ne $userPath) {
+                    [Environment]::SetEnvironmentVariable('PATH', $kept, 'User')
+                    Say "removed the tunnel-client entry from the user PATH"
+                }
+            }
+            Remove-Item -Recurse -Force $tcRoot
+            Say "removed $tcRoot"
+        } catch { Warn "tunnel-client cleanup: $_" }
+    }
+}
+
 # --- main -------------------------------------------------------------------
 
 try {
-    if ($Role -eq 'tunnel-client') { Install-TunnelClient } else { Install-Daemon }
+    if ($Uninstall) { Uninstall-Roomler }
+    elseif ($Role -eq 'tunnel-client') { Install-TunnelClient }
+    else { Install-Daemon }
     Say "done."
 } finally {
     Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
