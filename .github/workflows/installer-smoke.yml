@@ -189,8 +189,14 @@ jobs:
           # MSI install lands BOTH an Uninstall entry AND the
           # UpgradeCodes entry; checking the former is sufficient
           # for "the MSI installed and the system sees it").
-          $uninstallRoots = @(
-            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+          # rc.279: assert the EXACT hive, not "any hive". The perUser MSI
+          # must register in HKCU ONLY -- the daemon-user "invisible in
+          # Programs & Features" class (HKCU-only ARP record x over-the-
+          # shoulder elevation) regresses silently if a machine-wide
+          # registration, or a scope flip, still passes this check (it
+          # did until rc.279).
+          $userRoot = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+          $machineRoots = @(
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
           )
@@ -201,23 +207,15 @@ jobs:
           # insensitive regex against "roomler" + "agent". Run
           # #26377062833 diag confirmed: the installed entry reads
           # `DisplayName = "Roomler Agent"`.
-          $found = $null
-          foreach ($root in $uninstallRoots) {
-            if (-not (Test-Path $root)) { continue }
-            $found = Get-ChildItem $root -ErrorAction SilentlyContinue |
-                       Get-ItemProperty -ErrorAction SilentlyContinue |
-                       Where-Object {
-                         $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
-                       } |
-                       Select-Object -First 1
-            if ($found) {
-              Write-Host "Found install record under $root"
-              break
-            }
-          }
+          $found = Get-ChildItem $userRoot -ErrorAction SilentlyContinue |
+                     Get-ItemProperty -ErrorAction SilentlyContinue |
+                     Where-Object {
+                       $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
+                     } |
+                     Select-Object -First 1
           if (-not $found) {
             Write-Host '--- Roomler entries in any Uninstall hive ---'
-            foreach ($root in $uninstallRoots) {
+            foreach ($root in @($userRoot) + $machineRoots) {
               if (-not (Test-Path $root)) { continue }
               Get-ChildItem $root -ErrorAction SilentlyContinue |
                 Get-ItemProperty -ErrorAction SilentlyContinue |
@@ -225,9 +223,21 @@ jobs:
                 Select-Object DisplayName, DisplayVersion, UninstallString |
                 Format-Table -AutoSize
             }
-            throw 'roomler-agent install record not found in any Uninstall registry hive'
+            throw 'perUser MSI install record not found in HKCU (the flavour must register per-user)'
           }
-          Write-Host "Installed: $($found.DisplayName) $($found.DisplayVersion)"
+          Write-Host "Installed: $($found.DisplayName) $($found.DisplayVersion) (HKCU)"
+          foreach ($root in $machineRoots) {
+            if (-not (Test-Path $root)) { continue }
+            $leak = Get-ChildItem $root -ErrorAction SilentlyContinue |
+                      Get-ItemProperty -ErrorAction SilentlyContinue |
+                      Where-Object {
+                        $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
+                      } |
+                      Select-Object -First 1
+            if ($leak) {
+              throw "perUser MSI unexpectedly registered machine-wide under ${root}: $($leak.DisplayName)"
+            }
+          }
           'INSTALLED_PRODUCT_CODE=' + $found.PSChildName | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Assert install payload at the canonical path (P4b)
