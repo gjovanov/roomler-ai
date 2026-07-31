@@ -291,6 +291,43 @@ mod system {
             }
         }
 
+        /// rc.281 — v6 twin of [`evict_competing_v4`]: same route war, ULA
+        /// prefixes. Shares the `overlay_route_evict` kill-switch and the
+        /// WARN-on-actual-deletion observability contract.
+        pub fn evict_competing_v6(ours: u64, dest: std::net::Ipv6Addr, plen: u8) {
+            if !super::route_evict_enabled() {
+                return;
+            }
+            let want = dest.octets();
+            // SAFETY: same snapshot-iterate-free shape as the v4 walk; every
+            // union read is guarded by the `si_family` check.
+            unsafe {
+                let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                if GetIpForwardTable2(AF_INET6, &mut table) != NO_ERROR || table.is_null() {
+                    return;
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for r in rows {
+                    if r.DestinationPrefix.PrefixLength == plen
+                        && r.DestinationPrefix.Prefix.si_family == AF_INET6
+                        && r.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte == want
+                        && r.InterfaceLuid.Value != ours
+                        && DeleteIpForwardEntry2(r) == NO_ERROR
+                    {
+                        tracing::warn!(
+                            dest = %dest,
+                            plen,
+                            competitor_ifindex = r.InterfaceIndex,
+                            competitor_luid = format_args!("{:#x}", r.InterfaceLuid.Value),
+                            "overlay: evicted a competing route installed by another product"
+                        );
+                    }
+                }
+                FreeMibTable(table as *const core::ffi::c_void);
+            }
+        }
+
         /// rc.279 — the OS-observed identity for our adapter LUID:
         /// `(ifIndex, "{GUID}")`. Diagnostics only (the bring-up identity
         /// log); `0` / `"?"` on conversion failure.
@@ -876,7 +913,21 @@ mod system {
         /// peer path has used since rc.208, now applied to our own address.
         async fn defend_self_route(&self, self_ip: Ipv4Addr) {
             #[cfg(target_os = "windows")]
-            winroute::evict_competing_v4(self.dev.tun_luid(), self_ip, 32);
+            {
+                let luid = self.dev.tun_luid();
+                winroute::evict_competing_v4(luid, self_ip, 32);
+                // rc.281 — the v6 twin. IPv6 survived the pc50045 hijack only
+                // because that VPN didn't claim ULA space — an assumption, not
+                // a guarantee (the v4 CGNAT hijack was "impossible" too), and
+                // v6 was the diagnostic control channel that cracked the case;
+                // losing it to the same trick would hurt twice. Defend our own
+                // derived `/128` AND the connected `/96` (v6 has no per-peer
+                // routes — the `/96` IS the peer path).
+                let self_v6 = crate::overlay::router::derive_overlay_v6(self_ip);
+                winroute::evict_competing_v6(luid, self_v6, 128);
+                let ula_net = crate::overlay::router::derive_overlay_v6(Ipv4Addr::UNSPECIFIED);
+                winroute::evict_competing_v6(luid, ula_net, 96);
+            }
             #[cfg(not(target_os = "windows"))]
             let _ = self_ip;
         }

@@ -84,10 +84,21 @@ pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
                 // per-interface socket — poisoning the same-/24 match for
                 // every peer that happens to share those private ranges.
                 if filter {
-                    let desc = a.index.and_then(iface_description).unwrap_or_default();
-                    if lan_iface_denied(&a.name, &desc) {
+                    let info = a.index.and_then(iface_info);
+                    let desc = info.as_ref().map(|(d, _)| d.as_str()).unwrap_or_default();
+                    let hardware = info.as_ref().map(|(_, h)| *h);
+                    // rc.281 — `hardware == Some(false)` fails CLOSED for VPN
+                    // vendors the deny-list has never heard of (the list only
+                    // grows after a field incident; the hardware bit needs no
+                    // vendor knowledge). Caveat: NIC-teaming/VLAN child
+                    // adapters also report non-hardware and would be skipped —
+                    // rare on the fleet, benign direction (not advertised ⇒
+                    // relay still works), and `overlay_lan_iface_filter=0`
+                    // restores the unfiltered gather. `None` (lookup failed /
+                    // non-Windows) keeps the name-only checks as the deciders.
+                    if lan_iface_denied(&a.name, desc) || hardware == Some(false) {
                         tracing::debug!(
-                            iface = %a.name, %ip, desc = %desc,
+                            iface = %a.name, %ip, desc = %desc, hardware = ?hardware,
                             "overlay: LAN gather — skipping virtual/host-only interface"
                         );
                         continue;
@@ -167,13 +178,17 @@ pub fn lan_iface_denied(name: &str, description: &str) -> bool {
         || NAME_PREFIX.iter().any(|p| n.starts_with(p))
 }
 
-/// Windows — the interface DESCRIPTION for an OS ifindex via `GetIfEntry2`
-/// (`MIB_IF_ROW2.Description`, e.g. "Check Point Virtual Network Adapter For
-/// Endpoint VPN Client"). The friendly name alone can't classify these — the
-/// Check Point adapter is named just "Ethernet". `None` on lookup failure
-/// (then the name-only checks still apply).
+/// Windows — the interface DESCRIPTION + hardware bit for an OS ifindex via
+/// `GetIfEntry2`. The description ("Check Point Virtual Network Adapter For
+/// Endpoint VPN Client") feeds the deny-list — the friendly name alone can't
+/// classify these (the Check Point adapter is named just "Ethernet"). The
+/// `HardwareInterface` flag (rc.281) is the STRUCTURAL signal the deny-list
+/// can't be: every virtual adapter — Wintun, Hyper-V vSwitch, any VPN vendor
+/// we've never heard of — reports `false`, while physical Ethernet/Wi-Fi
+/// report `true`, so unknown vendors now fail CLOSED instead of open.
+/// `None` on lookup failure (then the name-only checks still apply).
 #[cfg(all(windows, feature = "overlay-l3"))]
-fn iface_description(ifindex: u32) -> Option<String> {
+fn iface_info(ifindex: u32) -> Option<(String, bool)> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{GetIfEntry2, MIB_IF_ROW2};
     // SAFETY: zeroed row + InterfaceIndex is the documented lookup-by-index
     // call shape; GetIfEntry2 fills the row on NO_ERROR (0).
@@ -188,14 +203,18 @@ fn iface_description(ifindex: u32) -> Option<String> {
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(row.Description.len());
-        Some(String::from_utf16_lossy(&row.Description[..len]))
+        // `InterfaceAndOperStatusFlags` is a packed C bitfield byte;
+        // `HardwareInterface` is its FIRST member, and MSVC allocates
+        // bitfields low-to-high ⇒ bit 0.
+        let hardware = row.InterfaceAndOperStatusFlags._bitfield & 0x01 != 0;
+        Some((String::from_utf16_lossy(&row.Description[..len]), hardware))
     }
 }
 
 /// No-op off Windows — Linux/macOS interface NAMES already follow the
 /// conventions the prefix list catches (docker0, veth*, utun*, wg*…).
 #[cfg(not(all(windows, feature = "overlay-l3")))]
-fn iface_description(_ifindex: u32) -> Option<String> {
+fn iface_info(_ifindex: u32) -> Option<(String, bool)> {
     None
 }
 
