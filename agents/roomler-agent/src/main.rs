@@ -1250,7 +1250,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // "1"/"0" strings every read-site parser already accepts.
     {
         let mut fallbacks = std::collections::HashMap::new();
-        let pairs: [(&str, Option<bool>); 13] = [
+        let pairs: [(&str, Option<bool>); 14] = [
             ("OVERLAY_QUIC", cfg.overlay_quic),
             ("OVERLAY_DIRECT", cfg.overlay_direct),
             ("OVERLAY_DERP", cfg.overlay_derp),
@@ -1259,6 +1259,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
             ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
             ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
+            ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
             ("LOCAL_TURN", cfg.local_turn),
             ("DNS_AAAA", cfg.dns_aaaa),
             ("AUTO_UPDATE", cfg.auto_update),
