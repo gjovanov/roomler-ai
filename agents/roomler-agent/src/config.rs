@@ -114,6 +114,16 @@ pub struct AgentConfig {
     /// Built-in default: off.
     #[serde(default)]
     pub overlay_relay_tls: Option<bool>,
+    /// Stable Wintun adapter identity — constant requested GUID + boot
+    /// stray-adapter sweep, Windows only
+    /// (`ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_tun_stable_guid: Option<bool>,
+    /// Route-war eviction — delete competing VPN-installed routes for
+    /// overlay prefixes (peer + own `/32`s), Windows only
+    /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVICT`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_route_evict: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -714,6 +724,8 @@ mod tests {
             overlay_pathmon: None,
             overlay_route_events: None,
             overlay_relay_tls: None,
+            overlay_tun_stable_guid: None,
+            overlay_route_evict: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,
