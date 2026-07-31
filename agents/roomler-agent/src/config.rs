@@ -124,6 +124,11 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVICT`). Built-in default: on.
     #[serde(default)]
     pub overlay_route_evict: Option<bool>,
+    /// Keep the overlay TUN device alive across signaling reconnects
+    /// (process-lifetime cache in the agent's TUN factory)
+    /// (`ROOMLER_NODE_OVERLAY_TUN_PERSIST`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_tun_persist: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -569,6 +574,45 @@ pub fn test_fixture() -> AgentConfig {
     tests::fixture()
 }
 
+/// rc.280 — the operator-grade bool knobs bridged config→env (the S2
+/// fallback map), ONE source: `main.rs` feeds
+/// `tunnel_core::env::register_config_fallbacks` from this, and the
+/// config-surface parity test (`env_bridge_pairs_have_surface_parity`) walks
+/// it against the editable key list. Before this the list was a literal in
+/// `main.rs` — a key added to the surface but missed there silently didn't
+/// bridge (`roomler config set` wrote TOML the daemon then ignored).
+/// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 15] {
+    [
+        ("OVERLAY_QUIC", cfg.overlay_quic),
+        ("OVERLAY_DIRECT", cfg.overlay_direct),
+        ("OVERLAY_DERP", cfg.overlay_derp),
+        ("OVERLAY_MBB", cfg.overlay_mbb),
+        ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
+        ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
+        ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
+        ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
+        ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
+        ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
+        ("LOCAL_TURN", cfg.local_turn),
+        ("DNS_AAAA", cfg.dns_aaaa),
+        ("AUTO_UPDATE", cfg.auto_update),
+        ("LOGS_UPLOAD_DISABLED", cfg.logs_upload_disabled),
+        ("OVERLAY_TIER_DETECT", cfg.overlay_tier_detect),
+    ]
+}
+
+/// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
+/// same fallback map).
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 4] {
+    [
+        ("RATE_FACTOR_H264", cfg.rate_factor_h264),
+        ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
+        ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
+        ("RATE_FACTOR_AV1", cfg.rate_factor_av1),
+    ]
+}
+
 pub fn default_config_path() -> Result<PathBuf> {
     let dirs =
         crate::appdirs::project_dirs().context("could not resolve a platform config directory")?;
@@ -726,6 +770,7 @@ mod tests {
             overlay_relay_tls: None,
             overlay_tun_stable_guid: None,
             overlay_route_evict: None,
+            overlay_tun_persist: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,

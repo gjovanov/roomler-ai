@@ -189,12 +189,52 @@ fn netstack_socks_port() -> Option<u16> {
         .filter(|p| *p != 0)
 }
 
+/// rc.280 — process-lifetime TUN cache. The runtime builds its device per WS
+/// SESSION (first netmap) and drops it when `run()` returns, which used to
+/// REMOVE the Wintun adapter on every reconnect (wintun's close-of-created
+/// removes) and re-create it seconds later — the ifIndex/NLA churn multiplier
+/// on top of the per-create random GUID (fixed in rc.279), and the source of
+/// the rc.209 "device installation mutex" race between a dying session's
+/// release and the next session's create. Caching the `Arc` here keeps the
+/// device alive across sessions: a reconnect with the same `(ip, netmask,
+/// mtu)` reuses it (metric pin, derived v6, WFP guard, Private profile all
+/// still in place); a changed tuple (re-IP / re-enroll) drops the old device
+/// first, then builds fresh. The static itself is never dropped, so even a
+/// clean process exit leaves the adapter installed — the next process opens
+/// it by name or re-forms the same identity via the rc.279 stable GUID.
+#[cfg(feature = "overlay-l3")]
+#[allow(clippy::type_complexity)]
+static SYSTUN_CACHE: std::sync::Mutex<
+    Option<(
+        (std::net::Ipv4Addr, std::net::Ipv4Addr, u16),
+        Arc<SystemTun>,
+    )>,
+> = std::sync::Mutex::new(None);
+
 /// OS-TUN factory (`overlay-l3`). The agent is privileged, so the device +
-/// routes come up directly in `SystemTun::up`.
+/// routes come up directly in `SystemTun::up`. Kill-switch for the cache:
+/// `overlay_tun_persist` / `ROOMLER_NODE_OVERLAY_TUN_PERSIST`, default ON —
+/// `0` restores the per-session create/remove cycle.
 #[cfg(feature = "overlay-l3")]
 fn systun_tun_factory() -> Option<TunFactory> {
     Some(Box::new(|ip, nm, mtu| {
-        SystemTun::up(ip, nm, mtu).map(|t| Arc::new(t) as Arc<dyn TunIo>)
+        if !tunnel_core::env::flag("OVERLAY_TUN_PERSIST", true) {
+            return SystemTun::up(ip, nm, mtu).map(|t| Arc::new(t) as Arc<dyn TunIo>);
+        }
+        let mut cache = SYSTUN_CACHE.lock().unwrap();
+        if let Some((params, dev)) = cache.as_ref() {
+            if *params == (ip, nm, mtu) && dev.is_alive() {
+                info!("overlay: reusing the process-lifetime TUN device (reconnect)");
+                return Ok(dev.clone() as Arc<dyn TunIo>);
+            }
+        }
+        // Param change (re-IP) or dead device: release the old one BEFORE the
+        // new create so the adapter's device-install lock frees up (the
+        // rc.209 mutex retry inside `up` covers the release latency).
+        *cache = None;
+        let dev = Arc::new(SystemTun::up(ip, nm, mtu)?);
+        *cache = Some(((ip, nm, mtu), dev.clone()));
+        Ok(dev as Arc<dyn TunIo>)
     }))
 }
 #[cfg(not(feature = "overlay-l3"))]

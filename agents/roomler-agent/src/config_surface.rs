@@ -20,6 +20,12 @@ use tunnel_core::localapi::ConfigEntry;
 
 /// `(key, kind, description)` for the whole surface, in display order.
 /// `kind` is the client-side editor hint contract — see [`ConfigEntry`].
+/// CONTRACT (rc.280): a key whose daemon read goes through
+/// `tunnel_core::env::node_env` must ALSO appear in
+/// [`crate::config::env_bridge_bools`] / `env_bridge_numerics`, else
+/// `roomler config set <key>` writes TOML the daemon ignores. The parity
+/// test `env_bridge_pairs_have_surface_parity` locks the mapping (and
+/// covers set/echo for every bridged key, replacing per-key boilerplate).
 const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_enabled",
@@ -120,6 +126,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "overlay_route_evict",
         "tribool",
         "Route-war eviction of competing VPN-installed routes for overlay prefixes (Windows). Built-in default: on.",
+    ),
+    (
+        "overlay_tun_persist",
+        "tribool",
+        "Keep the overlay TUN device alive across signaling reconnects (process-lifetime cache). Built-in default: on.",
     ),
     (
         "local_turn",
@@ -248,6 +259,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
+        "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
@@ -336,6 +348,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_relay_tls" => cfg.overlay_relay_tls = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
+        "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
@@ -580,6 +593,48 @@ mod tests {
         apply(&mut cfg, "overlay_route_evict", None).unwrap();
         assert_eq!(cfg.overlay_route_evict, None);
         assert!(apply(&mut cfg, "overlay_route_evict", Some("maybe")).is_err());
+    }
+
+    /// rc.280 — parity lock between the editable surface and the config→env
+    /// bridge (the S2 fallback map). Asserts (1) every bridged suffix maps
+    /// back to an editable surface key of the right kind (no orphan bridge
+    /// entries), and (2) a surface write is visible to the bridge — the mass
+    /// set/echo that replaces per-key boilerplate tests for bridged keys.
+    /// The inverse (every tribool key must be bridged) is deliberately NOT
+    /// asserted: some tribool keys are read straight from config by agent
+    /// code rather than via `node_env`.
+    #[test]
+    fn env_bridge_pairs_have_surface_parity() {
+        let mut cfg = crate::config::test_fixture();
+        let bool_suffixes: Vec<&'static str> = crate::config::env_bridge_bools(&cfg)
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        for suffix in &bool_suffixes {
+            let key = suffix.to_ascii_lowercase();
+            let entry = entry_for(&cfg, &key)
+                .unwrap_or_else(|| panic!("bridged suffix {suffix} has no surface key '{key}'"));
+            assert_eq!(
+                entry.kind, "tribool",
+                "bridged bool '{key}' must be a tribool key"
+            );
+            apply(&mut cfg, &key, Some("1")).unwrap_or_else(|e| panic!("set {key}: {e}"));
+        }
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .all(|(_, v)| *v == Some(true)),
+            "every bridged bool must reflect the surface write"
+        );
+        for (suffix, _) in crate::config::env_bridge_numerics(&cfg) {
+            let key = suffix.to_ascii_lowercase();
+            let entry = entry_for(&cfg, &key)
+                .unwrap_or_else(|| panic!("bridged suffix {suffix} has no surface key '{key}'"));
+            assert_eq!(
+                entry.kind, "string",
+                "bridged numeric '{key}' rides the surface as a validated string"
+            );
+        }
     }
 
     /// PR-D — the PathMonitor mode key: multi-state (on|shadow|off), so a
