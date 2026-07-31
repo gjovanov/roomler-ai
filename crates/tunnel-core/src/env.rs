@@ -49,6 +49,33 @@ pub fn node_env(suffix: &str) -> Option<String> {
         .or_else(|| config_fallback(suffix))
 }
 
+/// Parse a boolean gate the way every overlay kill-switch does. With
+/// `default = true` (default-ON keys) anything except `0`/`false`/`no`/`off`
+/// keeps the gate on; with `default = false` (opt-in keys) only
+/// `1`/`true`/`yes`/`on` turns it on. Reads via [`node_env`] (both prefixes +
+/// config fallback). Extracted in rc.279 — the fourth hand-rolled copy of
+/// this parser was about to land; new gates use this, existing gates keep
+/// their in-place parsers until touched.
+pub fn flag(suffix: &str, default: bool) -> bool {
+    match node_env(suffix) {
+        Some(v) => {
+            let t = v.trim();
+            if default {
+                !(t.eq_ignore_ascii_case("0")
+                    || t.eq_ignore_ascii_case("false")
+                    || t.eq_ignore_ascii_case("no")
+                    || t.eq_ignore_ascii_case("off"))
+            } else {
+                t.eq_ignore_ascii_case("1")
+                    || t.eq_ignore_ascii_case("true")
+                    || t.eq_ignore_ascii_case("yes")
+                    || t.eq_ignore_ascii_case("on")
+            }
+        }
+        None => default,
+    }
+}
+
 /// OsString twin of [`node_env`] for reads that must tolerate non-Unicode
 /// values (`std::env::var_os` semantics). Prefers `ROOMLER_NODE_<suffix>`,
 /// falls back to the legacy `ROOMLER_AGENT_<suffix>`, then to a registered
@@ -139,6 +166,37 @@ mod tests {
             std::env::remove_var(nk());
             std::env::remove_var(ak());
         }
+    }
+
+    #[test]
+    fn flag_parses_default_on_and_opt_in() {
+        // Unique suffixes; all mutations inside this one test (no races).
+        const ON: &str = "UNIFY_TEST_FLAG_DEFAULT_ON";
+        const OPT: &str = "UNIFY_TEST_FLAG_OPT_IN";
+
+        // default-ON: unset → true; only an explicit falsy turns it off.
+        assert!(flag(ON, true));
+        // SAFETY (edition 2024): unique suffix, no concurrent access.
+        unsafe { std::env::set_var(format!("ROOMLER_NODE_{ON}"), "off") };
+        assert!(!flag(ON, true));
+        unsafe { std::env::set_var(format!("ROOMLER_NODE_{ON}"), "weird") };
+        assert!(
+            flag(ON, true),
+            "unrecognised value keeps a default-ON gate on"
+        );
+        unsafe { std::env::remove_var(format!("ROOMLER_NODE_{ON}")) };
+
+        // opt-in: unset → false; only an explicit truthy turns it on (the
+        // legacy ROOMLER_AGENT_ prefix must work too).
+        assert!(!flag(OPT, false));
+        unsafe { std::env::set_var(format!("ROOMLER_AGENT_{OPT}"), "YES") };
+        assert!(flag(OPT, false));
+        unsafe { std::env::set_var(format!("ROOMLER_AGENT_{OPT}"), "weird") };
+        assert!(
+            !flag(OPT, false),
+            "unrecognised value keeps an opt-in gate off"
+        );
+        unsafe { std::env::remove_var(format!("ROOMLER_AGENT_{OPT}")) };
     }
 
     // A distinct unique suffix so this test can't race the String-variant one.

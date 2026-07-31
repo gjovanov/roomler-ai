@@ -174,8 +174,9 @@ mod system {
         use std::net::{IpAddr, Ipv4Addr};
         use windows_sys::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2,
-            InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+            ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
+            DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, InitializeIpForwardEntry,
+            MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
         };
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
@@ -263,6 +264,41 @@ mod system {
                     }
                 }
                 FreeMibTable(table as *const core::ffi::c_void);
+            }
+        }
+
+        /// rc.279 — the OS-observed identity for our adapter LUID:
+        /// `(ifIndex, "{GUID}")`. Diagnostics only (the bring-up identity
+        /// log); `0` / `"?"` on conversion failure.
+        pub fn identity(luid: u64) -> (u32, String) {
+            let l = NET_LUID_LH { Value: luid };
+            let mut idx: u32 = 0;
+            // SAFETY: out-params written by the APIs; inputs are plain
+            // values. Failure leaves the zeroed defaults — fine for a log.
+            unsafe {
+                ConvertInterfaceLuidToIndex(&l, &mut idx);
+                let mut g: windows_sys::core::GUID = std::mem::zeroed();
+                if ConvertInterfaceLuidToGuid(&l, &mut g) == NO_ERROR {
+                    (
+                        idx,
+                        format!(
+                            "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+                            g.data1,
+                            g.data2,
+                            g.data3,
+                            g.data4[0],
+                            g.data4[1],
+                            g.data4[2],
+                            g.data4[3],
+                            g.data4[4],
+                            g.data4[5],
+                            g.data4[6],
+                            g.data4[7]
+                        ),
+                    )
+                } else {
+                    (idx, "?".to_string())
+                }
             }
         }
     }
@@ -440,6 +476,76 @@ mod system {
         });
     }
 
+    /// rc.279 — the roomler overlay adapter's constant requested GUID (see
+    /// the `device_guid` call in [`SystemTun::up`]). The value is arbitrary
+    /// but MUST stay fixed forever: Windows keys the interface's persistent
+    /// identity on it (the ifIndex/LUID mapping and the NLA network
+    /// signature that decides the firewall profile).
+    #[cfg(target_os = "windows")]
+    const ROOMLER_TUN_GUID: u128 = 0xB5A7_D160_53F8_4E2D_9A6B_2C4E_71A0_D5C3;
+
+    /// rc.279 — kill-switch for the stable adapter identity (constant
+    /// requested GUID + boot stray-adapter sweep):
+    /// `ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID` (legacy `ROOMLER_AGENT_…`
+    /// honoured; config key `overlay_tun_stable_guid`). Default **ON**;
+    /// `0`/`false`/`no`/`off` reverts to the pre-rc.279 random-GUID
+    /// adapters if the undocumented requested-GUID path ever misbehaves on
+    /// some host (the wintun README flags sysprep/clone interop).
+    #[cfg(target_os = "windows")]
+    fn stable_guid_enabled() -> bool {
+        crate::env::flag("OVERLAY_TUN_STABLE_GUID", true)
+    }
+
+    /// rc.279 — one-shot per process: remove stray roomler Wintun devices
+    /// left by crashed prior runs (hard exits skip `Drop`, so
+    /// close-of-created never removed them; the boot reconciler cleans
+    /// routes/DNS only). `Status -ne 'Up'` protects any LIVE adapter (an
+    /// orphan with no owning process reports Disconnected), and
+    /// once-per-process means a WS-reconnect bring-up can't touch the
+    /// previous session's still-closing adapter. With the stable requested
+    /// GUID, remove-and-recreate re-binds the same interface identity, so
+    /// sweeping even our own crash-orphan is harmless — while a leftover
+    /// suffixed dupe ("roomler 2") would otherwise capture the
+    /// alias-targeted config (the metric pin, derived v6, and
+    /// Private-profile set all address the NAME). Best-effort:
+    /// `pnputil /remove-device` needs admin; unelevated it just leaves the
+    /// strays in place.
+    #[cfg(target_os = "windows")]
+    fn sweep_stray_adapters_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let script = "Get-NetAdapter -IncludeHidden | Where-Object { \
+                          $_.PnPDeviceID -like 'SWD\\WINTUN\\*' -and \
+                          $_.Name -match '^roomler' -and $_.Status -ne 'Up' } | \
+                          ForEach-Object { \
+                          pnputil /remove-device \"$($_.PnPDeviceID)\" > $null 2>&1; \
+                          if ($LASTEXITCODE -eq 0) { $_.Name } }";
+            match std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                Ok(o) => {
+                    let removed: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    if !removed.is_empty() {
+                        tracing::info!(
+                            ?removed,
+                            "overlay: swept stray roomler Wintun adapters from prior runs"
+                        );
+                    }
+                }
+                Err(e) => tracing::debug!(%e, "overlay: stray-adapter sweep unavailable"),
+            }
+        });
+    }
+
     impl SystemTun {
         /// Create the device, assign `self_ip` with `netmask`, set `mtu`,
         /// and bring it up. `netmask` is the overlay *network* mask (e.g.
@@ -462,10 +568,24 @@ mod system {
             let mut config = tun::Configuration::default();
             config.address(self_ip).netmask(netmask).mtu(mtu).up();
 
-            // Stable adapter name so a reconnect reuses the same NIC
-            // (Wintun keys adapters by name) instead of accreting copies.
+            // Stable adapter name (Wintun's `open` keys by name) + a STABLE
+            // requested GUID. The name alone never gave reuse: a clean
+            // teardown REMOVES a created adapter (Wintun contract), so every
+            // bring-up re-created it — and without a requested GUID wintun
+            // rolls a RANDOM one per create, minting a brand-new interface
+            // identity each time: a new ifIndex/LUID (the CORPLAP-1
+            // 83→70→46→75→29→46 trail) and a brand-new "Unidentified
+            // network" landing in the Public firewall profile (why the
+            // Private-profile retry + WFP permit below exist). A constant
+            // GUID makes Windows re-bind the SAME interface identity across
+            // recreation — Tailscale ships the same pattern.
             #[cfg(target_os = "windows")]
-            config.tun_name("roomler");
+            {
+                config.tun_name("roomler");
+                if stable_guid_enabled() {
+                    config.platform_config(|p| p.device_guid(ROOMLER_TUN_GUID));
+                }
+            }
             #[cfg(target_os = "linux")]
             config.tun_name("roomler0");
 
@@ -484,6 +604,14 @@ mod system {
             const CREATE_ATTEMPTS: usize = 5;
             #[cfg(not(target_os = "windows"))]
             const CREATE_ATTEMPTS: usize = 1;
+            // rc.279 — before this process's first create, sweep stray
+            // roomler Wintun devices left by crashed prior runs; see
+            // [`sweep_stray_adapters_once`].
+            #[cfg(target_os = "windows")]
+            if stable_guid_enabled() {
+                sweep_stray_adapters_once();
+            }
+
             let dev = retry_create(
                 CREATE_ATTEMPTS,
                 std::time::Duration::from_millis(400),
@@ -554,6 +682,22 @@ mod system {
             // Fire-and-forget; see `spawn_windows_net_hygiene`.
             #[cfg(windows)]
             spawn_windows_net_hygiene();
+
+            // rc.279 — log the OS-observed adapter identity. Nothing logged
+            // this before (the ifIndex-churn hunt had to reconstruct it from
+            // route dumps); with the stable requested GUID above, this line
+            // should repeat identical values across restarts.
+            #[cfg(windows)]
+            {
+                let luid = dev.tun_luid();
+                let (ifindex, guid) = winroute::identity(luid);
+                tracing::info!(
+                    luid = format_args!("{luid:#x}"),
+                    ifindex,
+                    guid = %guid,
+                    "overlay: TUN adapter identity"
+                );
+            }
 
             // P5 — snapshot the host's original default route NOW, before any
             // overlay route is installed, so exit-node exemptions can later pin
