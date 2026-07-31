@@ -112,6 +112,16 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Force overlay coturn allocations onto the TURNS/TCP (TLS) tier — corp-VPN probe. Built-in default: off.",
     ),
     (
+        "overlay_tun_stable_guid",
+        "tribool",
+        "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
+    ),
+    (
+        "overlay_route_evict",
+        "tribool",
+        "Route-war eviction of competing VPN-installed routes for overlay prefixes (Windows). Built-in default: on.",
+    ),
+    (
         "local_turn",
         "tribool",
         "Loopback-TURN relay for controllers on the same corporate network. Built-in default: on.",
@@ -236,6 +246,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
+        "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
+        "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
@@ -322,6 +334,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "overlay_route_events" => cfg.overlay_route_events = parse_tribool(value)?,
         "overlay_relay_tls" => cfg.overlay_relay_tls = parse_tribool(value)?,
+        "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
+        "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
@@ -524,6 +538,48 @@ mod tests {
         apply(&mut cfg, "overlay_lan_iface_filter", None).unwrap();
         assert_eq!(cfg.overlay_lan_iface_filter, None);
         assert!(apply(&mut cfg, "overlay_lan_iface_filter", Some("maybe")).is_err());
+    }
+
+    /// rc.279 — the stable-Wintun-identity key set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_tun_stable_guid_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_tun_stable_guid", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_tun_stable_guid, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_tun_stable_guid")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_tun_stable_guid", Some("1")).unwrap();
+        assert_eq!(cfg.overlay_tun_stable_guid, Some(true));
+        apply(&mut cfg, "overlay_tun_stable_guid", None).unwrap();
+        assert_eq!(cfg.overlay_tun_stable_guid, None);
+        assert!(apply(&mut cfg, "overlay_tun_stable_guid", Some("maybe")).is_err());
+    }
+
+    /// rc.279 — the route-war eviction kill-switch key set/echo/clear (per
+    /// the every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_route_evict_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_route_evict", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_route_evict, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_route_evict")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_route_evict", Some("1")).unwrap();
+        assert_eq!(cfg.overlay_route_evict, Some(true));
+        apply(&mut cfg, "overlay_route_evict", None).unwrap();
+        assert_eq!(cfg.overlay_route_evict, None);
+        assert!(apply(&mut cfg, "overlay_route_evict", Some("maybe")).is_err());
     }
 
     /// PR-D — the PathMonitor mode key: multi-state (on|shadow|off), so a

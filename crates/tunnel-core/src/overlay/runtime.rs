@@ -498,6 +498,37 @@ struct Installed {
     relay_kind_dbg: Option<&'static str>,
 }
 
+impl Installed {
+    /// rc.279 — every field's inert default in ONE place. Install sites
+    /// override only what they actually decide (`..Installed::base(…)`
+    /// struct-update), so a new diagnostics field lands HERE instead of in
+    /// every literal (adding `stalled`, then `initiated`, each swept ~20
+    /// literals in this file and broke E0063 twice in a single session).
+    /// `is_direct` is derived (`tier != Relay`) — every site agreed on that
+    /// mapping, including the two that computed `tier` FROM `is_direct`.
+    fn base(pubkey: [u8; 32], overlay_ip: Ipv4Addr, tier: DirectTier, now: Instant) -> Self {
+        Installed {
+            pubkey,
+            overlay_ip,
+            is_direct: !matches!(tier, DirectTier::Relay),
+            since: now,
+            last_traffic: (0, 0),
+            bad_sweeps: 0,
+            stalled: false,
+            initiated: false,
+            hs_done: false,
+            carrier_local: None,
+            carrier_dst: None,
+            relay_kind_dbg: None,
+            last_rx_at: now,
+            relay_local: None,
+            relay_dst: None,
+            public_direct_dst: None,
+            tier,
+        }
+    }
+}
+
 /// rc.208 — an in-flight make-before-break upgrade probe. The candidate direct
 /// carrier lives as a shadow `Tunn` in [`WgDevice::probes`] (keyed by `pubkey`);
 /// THIS is the runtime-side metadata the promote/expire sweep needs. While it is
@@ -3580,23 +3611,12 @@ impl OverlayRuntime {
                     by_node.insert(
                         *nid,
                         Installed {
-                            pubkey: p.pubkey,
-                            overlay_ip: p.overlay_ip,
-                            is_direct: true,
-                            since: now,
-                            last_traffic: (0, 0),
-                            bad_sweeps: 0,
-                            stalled: false,
                             initiated: p.initiated,
                             hs_done: true, // promote fires on the latched handshake
                             carrier_local: p.local,
                             carrier_dst: Some(p.dst),
-                            relay_kind_dbg: None,
-                            last_rx_at: now,
-                            relay_local: None,
-                            relay_dst: None,
                             public_direct_dst: off_link.then_some(p.dst),
-                            tier: p.tier,
+                            ..Installed::base(p.pubkey, p.overlay_ip, p.tier, now)
                         },
                     );
                     tun.add_peer_route(p.overlay_ip).await.ok();
@@ -3703,23 +3723,15 @@ impl OverlayRuntime {
         by_node.insert(
             node_id,
             Installed {
-                pubkey: cfg.public_key,
-                overlay_ip: cfg.overlay_ip,
-                is_direct: true,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
                 initiated: true,
-                hs_done: false,
                 carrier_local: sock.local_addr().ok(),
                 carrier_dst: Some(dst),
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
-                public_direct_dst: None,
-                tier: DirectTier::Lan,
+                ..Installed::base(
+                    cfg.public_key,
+                    cfg.overlay_ip,
+                    DirectTier::Lan,
+                    Instant::now(),
+                )
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -3768,23 +3780,16 @@ impl OverlayRuntime {
         by_node.insert(
             node_id,
             Installed {
-                pubkey: cfg.public_key,
-                overlay_ip: cfg.overlay_ip,
-                is_direct: true,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
                 initiated: true,
-                hs_done: false,
                 carrier_local,
                 carrier_dst: Some(dst),
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
                 public_direct_dst: Some(dst),
-                tier: DirectTier::Public,
+                ..Installed::base(
+                    cfg.public_key,
+                    cfg.overlay_ip,
+                    DirectTier::Public,
+                    Instant::now(),
+                )
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -3834,23 +3839,16 @@ impl OverlayRuntime {
         by_node.insert(
             node_id,
             Installed {
-                pubkey: cfg.public_key,
-                overlay_ip: cfg.overlay_ip,
-                is_direct: true,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
                 initiated: true,
-                hs_done: false,
                 carrier_local,
                 carrier_dst: Some(dst),
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
                 public_direct_dst: Some(dst),
-                tier: DirectTier::Srflx,
+                ..Installed::base(
+                    cfg.public_key,
+                    cfg.overlay_ip,
+                    DirectTier::Srflx,
+                    Instant::now(),
+                )
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -4060,30 +4058,19 @@ impl OverlayRuntime {
         by_node.insert(
             node_id,
             Installed {
-                pubkey,
-                overlay_ip: cfg.overlay_ip,
-                is_direct: true,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
                 // rc.276 — adopted from an authenticated INBOUND dial: the
                 // flow was initiated by the peer (the pc50045-class rescue
-                // path a stateful corp firewall permits).
-                initiated: false,
+                // path a stateful corp firewall permits); `initiated: false`
+                // is base's default.
                 hs_done: true, // authenticate_init proved the session
                 carrier_local: inb.sock.local_addr().ok(),
                 carrier_dst: Some(inb.src),
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
                 // Any OFF-LINK public inbound source is an exit-exemption; a
                 // private source is an on-link LAN roam (no exemption). The tier
                 // (Srflx punch vs Public dial vs Lan roam) drives cooldown +
                 // deadline.
                 public_direct_dst: is_public_src.then_some(inb.src),
-                tier,
+                ..Installed::base(pubkey, cfg.overlay_ip, tier, Instant::now())
             },
         );
         if let Err(e) = tun.add_peer_route(cfg.overlay_ip).await {
@@ -4261,35 +4248,30 @@ impl OverlayRuntime {
         by_node.insert(
             link.node_id,
             Installed {
-                pubkey: link.public_key,
-                overlay_ip: link.overlay_ip,
-                is_direct,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
                 // rc.276 — every install_ready carrier is a flow WE built
                 // (our allocation / dialer socket / DERP WS / loopback).
                 initiated: true,
-                hs_done: false,
                 carrier_local: relay_local,
                 carrier_dst: relay_dst,
                 relay_kind_dbg: (!is_direct).then_some(match link.relay_kind {
                     super::relay_link::RelayKind::Turn => "turn",
                     super::relay_link::RelayKind::Derp => "derp",
                 }),
-                last_rx_at: Instant::now(),
                 relay_local,
                 relay_dst,
-                public_direct_dst: None,
                 // A relay carrier, or the loopback carrier used in Direct/test
                 // mode. Test loopback carriers are direct → Lan (no off-link
                 // handshake deadline); coturn carriers → Relay.
-                tier: if is_direct {
-                    DirectTier::Lan
-                } else {
-                    DirectTier::Relay
-                },
+                ..Installed::base(
+                    link.public_key,
+                    link.overlay_ip,
+                    if is_direct {
+                        DirectTier::Lan
+                    } else {
+                        DirectTier::Relay
+                    },
+                    Instant::now(),
+                )
             },
         );
         // Host `/32` so overlay traffic to this peer beats any colliding
@@ -4842,25 +4824,12 @@ mod tests {
             lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
             by_node.insert(
                 lan_peer.node_id,
-                Installed {
-                    pubkey: peer_kp.public.to_bytes(),
-                    overlay_ip: "100.64.0.7".parse().unwrap(),
-                    is_direct: false,
-                    since: Instant::now(),
-                    last_traffic: (0, 0),
-                    bad_sweeps: 0,
-                    stalled: false,
-                    initiated: false,
-                    hs_done: false,
-                    carrier_local: None,
-                    carrier_dst: None,
-                    relay_kind_dbg: None,
-                    last_rx_at: Instant::now(),
-                    relay_local: None,
-                    relay_dst: None,
-                    public_direct_dst: None,
-                    tier: DirectTier::Relay,
-                },
+                Installed::base(
+                    peer_kp.public.to_bytes(),
+                    "100.64.0.7".parse().unwrap(),
+                    DirectTier::Relay,
+                    Instant::now(),
+                ),
             );
             rt.path_shadow.lock().unwrap().mon.on_death(
                 &lan_peer.node_id,
@@ -5092,26 +5061,17 @@ mod tests {
         by_node.insert(
             nid,
             Installed {
-                pubkey: peer_kp.public.to_bytes(),
-                overlay_ip,
-                is_direct: true,
                 // Installed past the srflx handshake deadline (and the grace).
                 since: Instant::now()
                     .checked_sub(Duration::from_secs(SRFLX_HANDSHAKE_DEADLINE.as_secs() + 3))
                     .unwrap(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
                 public_direct_dst: Some(dead),
-                tier: DirectTier::Srflx,
+                ..Installed::base(
+                    peer_kp.public.to_bytes(),
+                    overlay_ip,
+                    DirectTier::Srflx,
+                    Instant::now(),
+                )
             },
         );
 
@@ -5200,26 +5160,16 @@ mod tests {
         by_node.insert(
             nid,
             Installed {
-                pubkey: peer_kp.public.to_bytes(),
-                overlay_ip,
-                is_direct: true,
                 // Installed past the LAN handshake deadline (and the grace).
                 since: Instant::now()
                     .checked_sub(Duration::from_secs(LAN_HANDSHAKE_DEADLINE.as_secs() + 3))
                     .unwrap(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
-                public_direct_dst: None,
-                tier: DirectTier::Lan,
+                ..Installed::base(
+                    peer_kp.public.to_bytes(),
+                    overlay_ip,
+                    DirectTier::Lan,
+                    Instant::now(),
+                )
             },
         );
 
@@ -5341,25 +5291,7 @@ mod tests {
 
     /// Build an `Installed` for a peer whose carrier details don't matter.
     fn installed_at(pubkey: [u8; 32], overlay_ip: Ipv4Addr) -> Installed {
-        Installed {
-            pubkey,
-            overlay_ip,
-            is_direct: true,
-            since: Instant::now(),
-            last_traffic: (0, 0),
-            bad_sweeps: 0,
-            stalled: false,
-            initiated: false,
-            hs_done: false,
-            carrier_local: None,
-            carrier_dst: None,
-            relay_kind_dbg: None,
-            last_rx_at: Instant::now(),
-            relay_local: None,
-            relay_dst: None,
-            public_direct_dst: None,
-            tier: DirectTier::Lan,
-        }
+        Installed::base(pubkey, overlay_ip, DirectTier::Lan, Instant::now())
     }
 
     /// The full netmap is authoritative: a peer it no longer lists loses its WG
@@ -5542,25 +5474,7 @@ mod tests {
         // The peer routes over RELAY while the probe runs (make-before-break).
         by_node.insert(
             nid,
-            Installed {
-                pubkey: pk,
-                overlay_ip,
-                is_direct: false,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
-                public_direct_dst: None,
-                tier: DirectTier::Relay,
-            },
+            Installed::base(pk, overlay_ip, DirectTier::Relay, Instant::now()),
         );
         let mut upgrade_probes = HashMap::new();
         upgrade_probes.insert(
@@ -5749,24 +5663,13 @@ mod tests {
         let nid = np.node_id;
         let mut current_peers = HashMap::new();
         current_peers.insert(nid, np);
-        let relay_installed = || Installed {
-            pubkey: peer_kp.public.to_bytes(),
-            overlay_ip: Ipv4Addr::new(100, 64, 0, 7),
-            is_direct: false,
-            since: Instant::now(),
-            last_traffic: (0, 0),
-            bad_sweeps: 0,
-            stalled: false,
-            initiated: false,
-            hs_done: false,
-            carrier_local: None,
-            carrier_dst: None,
-            relay_kind_dbg: None,
-            last_rx_at: Instant::now(),
-            relay_local: None,
-            relay_dst: None,
-            public_direct_dst: None,
-            tier: DirectTier::Relay,
+        let relay_installed = || {
+            Installed::base(
+                peer_kp.public.to_bytes(),
+                Ipv4Addr::new(100, 64, 0, 7),
+                DirectTier::Relay,
+                Instant::now(),
+            )
         };
         let mut cooldowns = DirectCooldowns::default();
         let mut relay: Option<RelayCoordinator> = None;
@@ -5899,23 +5802,14 @@ mod tests {
         by_node.insert(
             nid,
             Installed {
-                pubkey: peer_kp.public.to_bytes(),
-                overlay_ip,
-                is_direct: true,
-                since: stale,
                 last_traffic: snap,
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: stale,
-                relay_local: None,
-                relay_dst: None,
                 public_direct_dst: Some(dst),
-                tier: DirectTier::Srflx,
+                ..Installed::base(
+                    peer_kp.public.to_bytes(),
+                    overlay_ip,
+                    DirectTier::Srflx,
+                    stale,
+                )
             },
         );
 
@@ -5996,23 +5890,14 @@ mod tests {
         by_node.insert(
             nid,
             Installed {
-                pubkey: peer_kp.public.to_bytes(),
-                overlay_ip,
-                is_direct: true,
-                since: old,
                 last_traffic: snap,
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: old,
-                relay_local: None,
-                relay_dst: None,
                 public_direct_dst: Some(dst),
-                tier: DirectTier::Srflx,
+                ..Installed::base(
+                    peer_kp.public.to_bytes(),
+                    overlay_ip,
+                    DirectTier::Srflx,
+                    old,
+                )
             },
         );
 
@@ -6488,27 +6373,19 @@ mod tests {
             relay: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
         ) -> Installed {
             Installed {
-                pubkey: [0u8; 32],
-                overlay_ip: ip,
-                is_direct,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
                 last_rx_at,
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
-                public_direct_dst: None,
-                tier: if is_direct {
-                    DirectTier::Lan
-                } else {
-                    DirectTier::Relay
-                },
+                ..Installed::base(
+                    [0u8; 32],
+                    ip,
+                    if is_direct {
+                        DirectTier::Lan
+                    } else {
+                        DirectTier::Relay
+                    },
+                    Instant::now(),
+                )
             }
         }
 
@@ -7112,27 +6989,18 @@ mod tests {
     fn exit_exemption_set_unions_server_and_relay_workers() {
         fn inst(is_direct: bool, relay: Option<(SocketAddr, SocketAddr)>) -> Installed {
             Installed {
-                pubkey: [0u8; 32],
-                overlay_ip: Ipv4Addr::new(100, 64, 0, 1),
-                is_direct,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
                 relay_local: relay.map(|(l, _)| l),
                 relay_dst: relay.map(|(_, d)| d),
-                public_direct_dst: None,
-                tier: if is_direct {
-                    DirectTier::Lan
-                } else {
-                    DirectTier::Relay
-                },
+                ..Installed::base(
+                    [0u8; 32],
+                    Ipv4Addr::new(100, 64, 0, 1),
+                    if is_direct {
+                        DirectTier::Lan
+                    } else {
+                        DirectTier::Relay
+                    },
+                    Instant::now(),
+                )
             }
         }
         // Server A + AAAA (S3b — the v6 AAAA rides the set too; reconcile
@@ -7178,23 +7046,13 @@ mod tests {
         by_node.insert(
             exit_oid(9),
             Installed {
-                pubkey: [1u8; 32],
-                overlay_ip: Ipv4Addr::new(100, 64, 0, 9),
-                is_direct: true,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
                 public_direct_dst: Some(pd),
-                tier: DirectTier::Public,
+                ..Installed::base(
+                    [1u8; 32],
+                    Ipv4Addr::new(100, 64, 0, 9),
+                    DirectTier::Public,
+                    Instant::now(),
+                )
             },
         );
         let set = exit_exemption_set(&[], &by_node);
@@ -7269,25 +7127,12 @@ mod tests {
         let mut carriered = HashMap::new();
         carriered.insert(
             id,
-            Installed {
-                pubkey: [7u8; 32],
-                overlay_ip: Ipv4Addr::new(100, 64, 0, 1),
-                is_direct: true,
-                since: Instant::now(),
-                last_traffic: (0, 0),
-                bad_sweeps: 0,
-                stalled: false,
-                initiated: false,
-                hs_done: false,
-                carrier_local: None,
-                carrier_dst: None,
-                relay_kind_dbg: None,
-                last_rx_at: Instant::now(),
-                relay_local: None,
-                relay_dst: None,
-                public_direct_dst: None,
-                tier: DirectTier::Lan,
-            },
+            Installed::base(
+                [7u8; 32],
+                Ipv4Addr::new(100, 64, 0, 1),
+                DirectTier::Lan,
+                Instant::now(),
+            ),
         );
         let (rid, _np, pk) = exit_readiness("jupiter", &approved, &carriered).unwrap();
         assert_eq!(rid, id);
