@@ -135,7 +135,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_route_metric0",
         "tribool",
-        "Install defended peer /32s (and the ULA /96) at route metric 0 so they outrank a corp VPN's metric-1 mirror routes (Windows). Built-in default: on.",
+        "Install defended peer /32s (and the ULA /96 + connected /10) at route metric 0 so they outrank a corp VPN's metric-1 mirror routes (Windows). Built-in default: off — an opt-in experiment that auto-yields to metric 1 where a VPN route monitor deletes routes that would win.",
     ),
     (
         "local_turn",
