@@ -14,6 +14,7 @@ use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::signaling::IceServer;
+use crate::worker_pick::pick_index_fnv1a;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -70,27 +71,15 @@ impl TurnConfig {
     /// this is exactly [`Self::issue`].
     pub fn issue_for_session(&self, user_id: &str, session_key: &str) -> IceServer {
         let mut server = self.issue(user_id);
-        if self.workers.len() >= 2 {
-            let idx = (fnv1a(session_key.as_bytes()) % self.workers.len() as u64) as usize;
+        if self.workers.len() >= 2
+            && let Some(idx) = pick_index_fnv1a(session_key, self.workers.len())
+        {
             let mut urls = self.workers[idx].clone();
             urls.extend(server.urls);
             server.urls = urls;
         }
         server
     }
-}
-
-/// FNV-1a — tiny, dependency-free stable hash for the per-session worker
-/// pick. NOT security-sensitive (load spreading only); must simply agree
-/// between the two `issue_for_session` calls for one session, which it does
-/// trivially by being deterministic.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 /// Convenience: also include public STUN servers so trickle ICE has something
@@ -154,6 +143,17 @@ mod tests {
         assert!(a.urls[0].contains("coturn-"), "worker URL must come first");
         // Generic hostname retained as the fallback tail.
         assert_eq!(a.urls.last().unwrap(), "turn:coturn.example:3478");
+    }
+
+    /// worker-pick golden vector — the exact literals pinned in
+    /// `worker_pick::tests::worker_pick_golden_vector` (invariant I6),
+    /// re-asserted through this consumer's call path.
+    #[test]
+    fn session_worker_pick_matches_golden_vector() {
+        let cfg = affinity_cfg();
+        // FNV-1a("6a54bf440b4fd609a7356f97") % 3 == 0 → worker 1 first.
+        let s = cfg.issue_for_session("u", "6a54bf440b4fd609a7356f97");
+        assert_eq!(s.urls[0], "turn:coturn-1.example:3478");
     }
 
     #[test]
