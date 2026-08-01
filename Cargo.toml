@@ -81,7 +81,7 @@ webrtc = { path = "crates/vendored/webrtc" }
 wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 
 [workspace.package]
-version = "0.3.0-rc.288"
+version = "0.3.0-rc.289"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 license = "MIT"
