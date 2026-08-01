@@ -94,6 +94,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_tun_stable_guid: None,
         overlay_route_evict: None,
         overlay_tun_persist: None,
+        overlay_route_metric0: None,
         local_turn: None,
         dns_aaaa: None,
         auto_update: None,
