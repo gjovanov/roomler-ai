@@ -258,15 +258,80 @@ mod system {
         /// Delete-then-add remains the fallback for the (unexpected) case
         /// where `Set` fails, and a failure to restore is WARNed rather than
         /// swallowed.
+        /// rc.289 — latched once a metric-0 write has repeatedly failed to
+        /// STICK (see [`note_absent`]): every later `ensure` silently
+        /// downgrades to metric 1, the pre-rc.287 behaviour that a
+        /// route-monitoring VPN tolerates.
+        static METRIC0_REJECTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        /// Per-prefix count of "we wrote it, it is gone again" observations.
+        static WRITE_STRIKES: std::sync::Mutex<
+            Option<std::collections::HashMap<(IpAddr, u8), u32>>,
+        > = std::sync::Mutex::new(None);
+
+        /// Consecutive guard waves that may find a written prefix missing
+        /// before metric-0 is abandoned. Three waves ≈ 6 s — long enough to
+        /// ride out a single VPN route storm, short enough that a host never
+        /// spends a minute unrouted.
+        const METRIC0_STRIKES_TO_YIELD: u32 = 3;
+
+        /// Record that `key` is ABSENT on a wave that follows a successful
+        /// write. Latches [`METRIC0_REJECTED`] on the third strike.
+        fn note_absent(key: (IpAddr, u8)) {
+            let mut g = WRITE_STRIKES.lock().unwrap();
+            let map = g.get_or_insert_with(std::collections::HashMap::new);
+            let n = map.entry(key).or_insert(0);
+            *n += 1;
+            if *n >= METRIC0_STRIKES_TO_YIELD
+                && !METRIC0_REJECTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    dest = %key.0, plen = key.1,
+                    "overlay: metric-0 defended routes do NOT survive on this host — a VPN \
+                     route monitor deletes them as soon as they would win. Yielding to \
+                     metric 1 (pre-rc.287 behaviour: the overlay loses node-initiated \
+                     egress to the VPN but stays reachable INBOUND). Ask the VPN's \
+                     administrator to split-exclude the overlay prefixes."
+                );
+            }
+        }
+
+        /// Clear `key`'s strikes — the row is present as written.
+        fn note_present(key: (IpAddr, u8)) {
+            if let Ok(mut g) = WRITE_STRIKES.lock()
+                && let Some(map) = g.as_mut()
+            {
+                map.remove(&key);
+            }
+        }
+
         pub fn ensure(luid: u64, dest: IpAddr, plen: u8, metric: u32) -> std::io::Result<()> {
+            // rc.289 — once metric 0 has proven not to stick on this host,
+            // every defended route falls back to the metric the VPN tolerates.
+            let metric =
+                if metric == 0 && METRIC0_REJECTED.load(std::sync::atomic::Ordering::Relaxed) {
+                    1
+                } else {
+                    metric
+                };
+            let key = (dest, plen);
             let mut probe = make_row(luid, dest, plen, 0);
             // SAFETY: GetIpForwardEntry2 matches on LUID + prefix + next-hop
             // and fills the row on success.
             let rc = unsafe { GetIpForwardEntry2(&mut probe) };
             if rc != NO_ERROR {
-                // No row of ours yet — plain create.
+                // Absent. Normal on the FIRST install; a STRIKE afterwards —
+                // something outside this process deleted a row we wrote (CLK
+                // 2026-08-01: AnyConnect's monitor removes any route that
+                // would out-rank its own, leaving the prefix unrouted and
+                // killing even inbound REPLIES).
+                if metric == 0 {
+                    note_absent(key);
+                }
                 return add(luid, dest, plen, metric);
             }
+            note_present(key);
             if probe.Metric == metric {
                 return Ok(());
             }
@@ -763,9 +828,21 @@ mod system {
         crate::env::flag("OVERLAY_ROUTE_EVICT", true)
     }
 
-    /// rc.287 — install defended peer `/32`s (and assert the ULA `/96`) at
-    /// route metric **0** instead of 1: `ROOMLER_NODE_OVERLAY_ROUTE_METRIC0`
-    /// (config key `overlay_route_metric0`), default **ON**.
+    /// rc.287 — install defended peer `/32`s (and assert the ULA `/96` + the
+    /// connected `/10`) at route metric **0** instead of 1:
+    /// `ROOMLER_NODE_OVERLAY_ROUTE_METRIC0` (config key
+    /// `overlay_route_metric0`).
+    ///
+    /// **rc.289: default flipped to OFF.** Field result on the only host that
+    /// motivated it (CLK00017265, Cisco AnyConnect): the VPN's route monitor
+    /// DELETES any route of ours that would out-rank its own, so metric 0
+    /// bought nothing there — and left the prefix unrouted, which broke even
+    /// INBOUND replies (remote support into the host stopped working). No
+    /// host has yet been shown to benefit: the Check Point fleet
+    /// (pc50045/pc55331) already wins with eviction at metric 1. A default
+    /// with zero demonstrated benefit and one demonstrated regression does
+    /// not belong on the fleet — it stays as an opt-in experiment, now
+    /// protected by the [`METRIC0_REJECTED`] auto-yield.
     ///
     /// Windows picks routes by `route metric + interface metric`. Cisco
     /// AnyConnect MIRRORS every peer `/32` we install (plus the `/10` and our
@@ -779,7 +856,7 @@ mod system {
     /// tie-break, no deletion race. Inert on hosts with no competing routes.
     #[cfg(windows)]
     fn route_metric0_enabled() -> bool {
-        crate::env::flag("OVERLAY_ROUTE_METRIC0", true)
+        crate::env::flag("OVERLAY_ROUTE_METRIC0", false)
     }
 
     /// The defended-route metric under the rc.287 gate.
