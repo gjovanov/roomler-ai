@@ -175,8 +175,8 @@ mod system {
         use windows_sys::Win32::Foundation::{ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
-            DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2, InitializeIpForwardEntry,
-            MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+            DeleteIpForwardEntry2, FreeMibTable, GetIpForwardEntry2, GetIpForwardTable2,
+            InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
         };
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
@@ -239,6 +239,90 @@ mod system {
             unsafe { DeleteIpForwardEntry2(&r) };
         }
 
+        /// rc.287 — add-or-RECONCILE our `dest/plen` on `luid` to `metric`.
+        ///
+        /// `add` alone can never CHANGE an existing row's metric —
+        /// `CreateIpForwardEntry2` returns ALREADY_EXISTS and the old metric
+        /// silently masks the new one (exactly the trap the rc.208 constancy
+        /// comment predicted). Read the current row first; delete-then-re-add
+        /// ONLY on a metric mismatch, so the steady state is one in-memory
+        /// `Get` (~µs) with zero route churn.
+        pub fn ensure(luid: u64, dest: IpAddr, plen: u8, metric: u32) -> std::io::Result<()> {
+            let mut probe = make_row(luid, dest, plen, 0);
+            // SAFETY: GetIpForwardEntry2 matches on LUID + prefix + next-hop
+            // and fills the row on success.
+            let rc = unsafe { GetIpForwardEntry2(&mut probe) };
+            if rc == NO_ERROR {
+                if probe.Metric == metric {
+                    return Ok(());
+                }
+                del(luid, dest, plen);
+            }
+            add(luid, dest, plen, metric)
+        }
+
+        /// rc.287 — eviction-WARN throttle state. The rc.279 WARN assumed a
+        /// competitor re-adds at most once per VPN connect ("self-limiting");
+        /// Cisco AnyConnect's route monitor re-adds within MILLISECONDS of
+        /// every deletion (CORPLAP-3, 2026-08-01: 25,197 WARNs in one day).
+        /// Emit at most one WARN per prefix per minute, carrying the count of
+        /// evictions suppressed since the last one — the war stays visible,
+        /// the log stays readable.
+        struct EvictThrottle {
+            last: std::collections::HashMap<(IpAddr, u8), (std::time::Instant, u64)>,
+        }
+
+        impl EvictThrottle {
+            /// Record one ACTUAL eviction of `key`. `Some(suppressed)` when a
+            /// WARN should be emitted now; `None` inside the quiet window.
+            fn note(&mut self, key: (IpAddr, u8), now: std::time::Instant) -> Option<u64> {
+                const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+                match self.last.get_mut(&key) {
+                    Some((at, n)) if now.duration_since(*at) < WINDOW => {
+                        *n += 1;
+                        None
+                    }
+                    Some((at, n)) => {
+                        let suppressed = *n;
+                        *at = now;
+                        *n = 0;
+                        Some(suppressed)
+                    }
+                    None => {
+                        self.last.insert(key, (now, 0));
+                        Some(0)
+                    }
+                }
+            }
+        }
+
+        static EVICT_THROTTLE: std::sync::Mutex<Option<EvictThrottle>> =
+            std::sync::Mutex::new(None);
+
+        /// Emit the eviction WARN (or a throttled `debug!`) for one actual
+        /// deletion of a competing route.
+        fn evict_warn(dest: IpAddr, plen: u8, ifindex: u32, luid_val: u64) {
+            let mut g = EVICT_THROTTLE.lock().unwrap();
+            let t = g.get_or_insert_with(|| EvictThrottle {
+                last: std::collections::HashMap::new(),
+            });
+            match t.note((dest, plen), std::time::Instant::now()) {
+                Some(suppressed) => tracing::warn!(
+                    dest = %dest,
+                    plen,
+                    competitor_ifindex = ifindex,
+                    competitor_luid = format_args!("{:#x}", luid_val),
+                    suppressed_since_last = suppressed,
+                    "overlay: evicted a competing route installed by another product"
+                ),
+                None => tracing::debug!(
+                    dest = %dest,
+                    plen,
+                    "overlay: evicted a competing route (WARN throttled, 1/min/prefix)"
+                ),
+            }
+        }
+
         /// Evict any `dest/plen` route on an interface OTHER than `ours` — the
         /// full-tunnel-VPN route war (Check Point installs a competing `/32` per
         /// overlay peer). Snapshots the v4 FIB (in-memory, ~µs) and deletes the
@@ -272,17 +356,16 @@ mod system {
                         // silent: an operator could not tell "healthy" from
                         // "winning an eviction fight on every VPN reconnect"
                         // (the invisibility that fed the CORPLAP-1 hunt's six
-                        // wrong diagnoses). WARN only on an ACTUAL deletion,
-                        // so the every-2s no-op guard ticks stay quiet and
-                        // the log is self-limiting (a VPN re-adds at most
-                        // once per connect).
+                        // wrong diagnoses). Emit only on an ACTUAL deletion,
+                        // so the every-2s no-op guard ticks stay quiet;
+                        // rc.287 throttles the emit to 1 WARN/min/prefix
+                        // because AnyConnect re-adds within milliseconds.
                         if DeleteIpForwardEntry2(r) == NO_ERROR {
-                            tracing::warn!(
-                                dest = %dest,
+                            evict_warn(
+                                IpAddr::V4(dest),
                                 plen,
-                                competitor_ifindex = r.InterfaceIndex,
-                                competitor_luid = format_args!("{:#x}", r.InterfaceLuid.Value),
-                                "overlay: evicted a competing route installed by another product"
+                                r.InterfaceIndex,
+                                r.InterfaceLuid.Value,
                             );
                         }
                     }
@@ -315,12 +398,11 @@ mod system {
                         && r.InterfaceLuid.Value != ours
                         && DeleteIpForwardEntry2(r) == NO_ERROR
                     {
-                        tracing::warn!(
-                            dest = %dest,
+                        evict_warn(
+                            IpAddr::V6(dest),
                             plen,
-                            competitor_ifindex = r.InterfaceIndex,
-                            competitor_luid = format_args!("{:#x}", r.InterfaceLuid.Value),
-                            "overlay: evicted a competing route installed by another product"
+                            r.InterfaceIndex,
+                            r.InterfaceLuid.Value,
                         );
                     }
                 }
@@ -360,6 +442,40 @@ mod system {
                 } else {
                     (idx, "?".to_string())
                 }
+            }
+        }
+
+        #[cfg(test)]
+        mod evict_throttle_tests {
+            use super::*;
+            use std::time::{Duration, Instant};
+
+            /// First eviction WARNs; the flood inside the window is counted,
+            /// not logged; the first eviction past the window WARNs again and
+            /// carries the suppressed count.
+            #[test]
+            fn throttle_warns_once_per_window_and_carries_the_count() {
+                let mut t = EvictThrottle {
+                    last: std::collections::HashMap::new(),
+                };
+                let k = (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)), 32u8);
+                let t0 = Instant::now();
+                assert_eq!(t.note(k, t0), Some(0), "first eviction always WARNs");
+                for i in 1..=500u64 {
+                    assert_eq!(
+                        t.note(k, t0 + Duration::from_millis(i * 100)),
+                        None,
+                        "inside the window: suppressed"
+                    );
+                }
+                assert_eq!(
+                    t.note(k, t0 + Duration::from_secs(61)),
+                    Some(500),
+                    "past the window: WARN with the suppressed count"
+                );
+                // A different prefix throttles independently.
+                let k2 = (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 4)), 32u8);
+                assert_eq!(t.note(k2, t0 + Duration::from_secs(61)), Some(0));
             }
         }
     }
@@ -566,6 +682,31 @@ mod system {
     #[cfg(windows)]
     fn route_evict_enabled() -> bool {
         crate::env::flag("OVERLAY_ROUTE_EVICT", true)
+    }
+
+    /// rc.287 — install defended peer `/32`s (and assert the ULA `/96`) at
+    /// route metric **0** instead of 1: `ROOMLER_NODE_OVERLAY_ROUTE_METRIC0`
+    /// (config key `overlay_route_metric0`), default **ON**.
+    ///
+    /// Windows picks routes by `route metric + interface metric`. Cisco
+    /// AnyConnect MIRRORS every peer `/32` we install (plus the `/10` and our
+    /// ULA `/96`) at metric 1 on its own miniport, whose interface metric is
+    /// 1 — a FULL tie against our metric-1 rows that Windows breaks in
+    /// Cisco's favor (lower ifIndex), and its route monitor re-adds within
+    /// milliseconds of an eviction, so the 2 s guard can never hold the FIB
+    /// (CORPLAP-3, 2026-08-01: 25,197 evictions in one day; node-initiated
+    /// egress 100 % captured while REPLIES escaped via strong-host
+    /// source-constrained routing). Metric 0 wins outright (0+1 < 1+1): no
+    /// tie-break, no deletion race. Inert on hosts with no competing routes.
+    #[cfg(windows)]
+    fn route_metric0_enabled() -> bool {
+        crate::env::flag("OVERLAY_ROUTE_METRIC0", true)
+    }
+
+    /// The defended-route metric under the rc.287 gate.
+    #[cfg(windows)]
+    fn defended_route_metric() -> u32 {
+        if route_metric0_enabled() { 0 } else { 1 }
     }
 
     /// rc.279 — one-shot per process: remove stray roomler Wintun devices
@@ -877,13 +1018,20 @@ mod system {
                 // head-of-line-stall the data plane.
                 let luid = self.dev.tun_luid();
                 winroute::evict_competing_v4(luid, peer, 32);
-                // The metric MUST stay constant here: `add` is idempotent and
-                // SKIPS on ALREADY_EXISTS, and nothing else writes routes on our
-                // private wintun LUID (eviction only touches FOREIGN LUIDs), so a
-                // re-assert of an already-present route is a legitimate no-op. If
-                // the per-peer metric ever becomes dynamic, this path would need a
-                // delete-first like `add_cidr_route`, else the change is masked.
-                winroute::add(luid, std::net::IpAddr::V4(peer), 32, 1)
+                // rc.287 — the metric became dynamic (0 under the metric0
+                // gate, 1 with it off), which is exactly the case the old
+                // constancy comment warned about: `add` skips on
+                // ALREADY_EXISTS, so a metric change would be silently
+                // MASKED by the pre-existing row. `ensure` reconciles —
+                // one in-memory Get per wave, delete-then-re-add only on an
+                // actual mismatch (i.e. once, when the gate flips or an old
+                // agent's metric-1 rows are inherited).
+                winroute::ensure(
+                    luid,
+                    std::net::IpAddr::V4(peer),
+                    32,
+                    defended_route_metric(),
+                )
             }
             #[cfg(target_os = "linux")]
             {
@@ -927,6 +1075,20 @@ mod system {
                 winroute::evict_competing_v6(luid, self_v6, 128);
                 let ula_net = crate::overlay::router::derive_overlay_v6(Ipv4Addr::UNSPECIFIED);
                 winroute::evict_competing_v6(luid, ula_net, 96);
+                // rc.287 — ASSERT the ULA /96 at metric 0, don't just evict
+                // competitors for it. AnyConnect mirrors the /96 on its
+                // miniport at effective metric 2; our auto CONNECTED route
+                // sits at 256+1 and loses outright, so v6 node-initiated
+                // egress was captured exactly like v4 (CORPLAP-3: v6 ping
+                // "Allgemeiner Fehler"). A metric-0 row wins with no
+                // tie-break. Reconciled every wave. Gate OFF reconciles to
+                // 256 — the connected-route default — NOT `del`: the auto
+                // connected row shares the exact (LUID, prefix, on-link)
+                // key, so a delete would take the CONNECTED route with it
+                // and kill v6 entirely; metric-256 restores stock
+                // precedence without that risk.
+                let ula_metric = if route_metric0_enabled() { 0 } else { 256 };
+                winroute::ensure(luid, std::net::IpAddr::V6(ula_net), 96, ula_metric).ok();
             }
             #[cfg(not(target_os = "windows"))]
             let _ = self_ip;
