@@ -484,6 +484,13 @@ assets = [
     # (ExecStart drives /usr/bin/roomlerd). The install DIR (usr/lib/roomler-agent,
     # usr/share/doc/roomler-agent) stays as-is — out of scope for the rename.
     ["packaging/linux/roomler.service", "usr/lib/systemd/user/roomler.service", "644"],
+    # Opt-in SYSTEM unit for headless nodes (root: self-update + overlay TUN
+    # both need privileges the per-user unit doesn't have). Deliberately a
+    # DISTINCT filename from the user unit so `systemctl enable roomlerd` and
+    # `systemctl --user enable roomler` can never be confused for each other.
+    # Nothing enables it — the .deb ships no maintainer scripts, so it is inert
+    # until an operator opts in (`install.sh --role daemon --system`).
+    ["packaging/linux/roomlerd.service", "usr/lib/systemd/system/roomlerd.service", "644"],
     ["packaging/linux/README.Debian", "usr/share/doc/roomler-agent/README.Debian", "644"],
 ]
 
