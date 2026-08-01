@@ -196,6 +196,15 @@ jobs:
           # and every release until 07-30 ran fully cold (+~14 min each).
           # Tag runs are unaffected (save-if above already gates them off).
           cache-on-failure: true
+          # No env-hash in the key: rc.282 (run 30707448990) proved the
+          # windows-latest runner-image mix flips rust-cache's environment
+          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
+          # same lockfile) — warm/cold alternated with the image lottery,
+          # and toolchain bumps orphaned seeds the same way (07-23). With
+          # the toolchain pinned via dtolnay + the key's platform + the
+          # lockfile hash, the env hash only ever ADDED instability; a
+          # stale-toolchain restore just makes cargo rebuild what differs.
+          add-rust-environment-hash-key: false
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -532,6 +541,15 @@ jobs:
           # and every release until 07-30 ran fully cold (+~14 min each).
           # Tag runs are unaffected (save-if above already gates them off).
           cache-on-failure: true
+          # No env-hash in the key: rc.282 (run 30707448990) proved the
+          # windows-latest runner-image mix flips rust-cache's environment
+          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
+          # same lockfile) — warm/cold alternated with the image lottery,
+          # and toolchain bumps orphaned seeds the same way (07-23). With
+          # the toolchain pinned via dtolnay + the key's platform + the
+          # lockfile hash, the env hash only ever ADDED instability; a
+          # stale-toolchain restore just makes cargo rebuild what differs.
+          add-rust-environment-hash-key: false
 
       - name: Install WiX Toolset v3
         shell: pwsh
@@ -917,6 +935,15 @@ jobs:
           # and every release until 07-30 ran fully cold (+~14 min each).
           # Tag runs are unaffected (save-if above already gates them off).
           cache-on-failure: true
+          # No env-hash in the key: rc.282 (run 30707448990) proved the
+          # windows-latest runner-image mix flips rust-cache's environment
+          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
+          # same lockfile) — warm/cold alternated with the image lottery,
+          # and toolchain bumps orphaned seeds the same way (07-23). With
+          # the toolchain pinned via dtolnay + the key's platform + the
+          # lockfile hash, the env hash only ever ADDED instability; a
+          # stale-toolchain restore just makes cargo rebuild what differs.
+          add-rust-environment-hash-key: false
 
       # rc.18: the Tauri tray companion. Tray's Cargo.toml uses
       # `frontendDist: "../src/front"` pointing at static HTML/CSS/JS —
@@ -1057,6 +1084,15 @@ jobs:
           # and every release until 07-30 ran fully cold (+~14 min each).
           # Tag runs are unaffected (save-if above already gates them off).
           cache-on-failure: true
+          # No env-hash in the key: rc.282 (run 30707448990) proved the
+          # windows-latest runner-image mix flips rust-cache's environment
+          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
+          # same lockfile) — warm/cold alternated with the image lottery,
+          # and toolchain bumps orphaned seeds the same way (07-23). With
+          # the toolchain pinned via dtolnay + the key's platform + the
+          # lockfile hash, the env hash only ever ADDED instability; a
+          # stale-toolchain restore just makes cargo rebuild what differs.
+          add-rust-environment-hash-key: false
 
       - name: Install system deps
         # libvpx for the `vp9-444` feature; pkg-config for the
@@ -1366,3 +1402,52 @@ jobs:
           gh issue create --repo "${{ github.repository }}" \
             --title "Seed rehearsal failed — release-lane caches NOT refreshed ($(date -u +%F))" \
             --body "$(printf 'The artifacts-only release-agent rehearsal (weekly cron or seed-release-caches.yml dispatch) failed: %s\n\nUntil a rehearsal succeeds on master, agent tag builds run with cold cargo caches (~+14 min on the Windows MSI job). cache-on-failure means partial seeds may still have been saved, but the failure itself needs fixing.\n\nRe-run after fixing:\n\n    gh workflow run release-agent.yml --ref master -f version=<workspace version> -f publish_release=false\n' "$run_url")"
+
+  # ---------------------------------------------------------------------------
+  # 6. Post-release re-seed — after every successful TAG release, dispatch
+  #    the artifacts-only rehearsal so the master-ref seed (a) always
+  #    matches the just-released Cargo.lock exactly and (b) is always the
+  #    NEWEST cache in the repo pool, which LRU eviction therefore never
+  #    touches ahead of the PR/CI churn. Together with the weekly cron,
+  #    the toolchain/workflow-change dispatcher, cache-on-failure, and
+  #    the seed-failure alert, every observed way the lane has gone cold
+  #    (failed seed 07-28, env-hash rotation 07-23 + 08-01, pool eviction
+  #    07-30) is now covered by an automatic re-seed within one cycle.
+  #    Recursion-safe: rehearsals run with is_release=false, so they
+  #    never trigger this job.
+  # ---------------------------------------------------------------------------
+  reseed:
+    name: Re-seed master caches (post-release)
+    if: needs.validate-version.outputs.is_release == 'true'
+    needs: [validate-version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Dispatch artifacts-only rehearsal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Read the version from MASTER (not the tag) — if another bump
+          # already landed, the rehearsal should build that state; if the
+          # version races mid-dispatch, validate-version fails loudly in
+          # ~30 s and the next release's reseed (or the cron) covers it.
+          version=$(awk '
+            /^\[workspace\.package\]/ {in_section=1; next}
+            /^\[/ {in_section=0}
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)
+          echo "Dispatching post-release seed rehearsal for ${version}"
+          gh workflow run release-agent.yml --ref master \
+            -f version="${version}" -f publish_release=false
