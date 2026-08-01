@@ -1,0 +1,67 @@
+name: Cache janitor
+
+# Keeps the repo's 10 GB Actions-cache pool under budget so LRU eviction
+# never gets to choose a victim — historically it chose the release-lane
+# seeds (2026-07-30: pool at 11.8 GB of PR/CI churn evicted the seeds
+# within days and every agent release ran ~14 min slower until someone
+# noticed). GitHub's own policy (7-day unused expiry + LRU over 10 GB)
+# is too slow for this repo's cadence: several releases and PR merges a
+# day each save 0.5–1.5 GB.
+#
+# Policy per cache entry:
+#   - PR merge-ref caches idle > 48 h  → delete (the PR run that made
+#     them restores from master anyway; they exist only for same-PR
+#     re-pushes)
+#   - ANY cache idle > 96 h            → delete (half GitHub's 7-day
+#     expiry; anything load-bearing is touched daily by CI or releases)
+#   - tag-ref caches                   → delete (never restorable by any
+#     other run; release workflows no longer create them, this catches
+#     stragglers from branches that predate the save-if gates)
+#
+# Master-ref seeds survive indefinitely: every tag build restores them
+# (access refresh) and the post-release reseed job replaces them anyway.
+
+on:
+  schedule:
+    - cron: '43 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+jobs:
+  sweep:
+    name: Sweep stale caches
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Delete stale entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          now=$(date +%s)
+          gh api --paginate 'repos/${{ github.repository }}/actions/caches?per_page=100' \
+            --jq '.actions_caches[] | [.id, .ref, .last_accessed_at, .size_in_bytes, .key] | @tsv' > /tmp/caches.tsv
+          before=$(awk -F'\t' '{s+=$4} END{printf "%d", s/1048576}' /tmp/caches.tsv)
+          deleted=0
+          freed=0
+          while IFS=$'\t' read -r id ref last size key; do
+            last_s=$(date -d "$last" +%s)
+            idle=$(( now - last_s ))
+            del=""
+            case "$ref" in
+              refs/pull/*) [ "$idle" -gt 172800 ] && del="pr-idle" ;;
+              refs/tags/*|refs/heads/refs/tags/*) del="tag-ref" ;;
+            esac
+            [ -z "$del" ] && [ "$idle" -gt 345600 ] && del="idle-96h"
+            if [ -n "$del" ]; then
+              if gh api -X DELETE "repos/${{ github.repository }}/actions/caches/$id" >/dev/null 2>&1; then
+                deleted=$((deleted + 1))
+                freed=$((freed + size))
+                echo "deleted [$del] $key ($ref, $((size / 1048576)) MB)"
+              fi
+            fi
+          done < /tmp/caches.tsv
+          echo "---"
+          echo "pool before: ${before} MB; deleted ${deleted} entries; freed $((freed / 1048576)) MB"
