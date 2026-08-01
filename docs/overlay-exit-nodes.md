@@ -104,7 +104,7 @@ client: overlay_exit_node="mars"
           install split-default:  v4 0.0.0.0/1 + 128.0.0.0/1  → exit peer (wg allowed_ips + OS routes)
                                   v6 ::/1 + 8000::/1           → overlay NIC (crypto-router → v6_exit peer)
           steer DNS "." → local resolver / upstream  (captured by split-default → resolves from exit)
-          route-guard re-asserts the /1s + DNS every ~2 s
+          route-guard re-asserts the /1s + DNS on OS route events + a 2 s heartbeat
 ```
 
 The **split-default** is two `/1` halves rather than a literal `/0`. A `/1`
@@ -133,9 +133,13 @@ Four layers, each defending against a different way to cut yourself off:
   you *explicitly chose* via `overlay_exit_node` **and** that is admin-approved
   gets the split-default. A stray advertised `/0` from any other peer can never
   wedge a client.
-- **Route-guard (A7).** A 2-second tick re-asserts the split-default `/1`s (and
-  re-evaluates DNS steering) so a transient flap or a competing route-write
-  can't silently drop egress.
+- **Route-guard (A7).** OS route-change events (Windows `NotifyRouteChange2`,
+  Linux `ip monitor route`) trigger an immediate re-assert of the
+  split-default `/1`s (and a DNS-steering re-evaluation) the moment a
+  competing route-write lands, with the legacy 2-second tick retained as a
+  belt-and-braces heartbeat until the event path is soak-proven — so a
+  transient flap or a VPN client's route grab can't silently drop egress.
+  Kill-switch: `ROOMLER_NODE_OVERLAY_ROUTE_EVENTS=0` reverts to tick-only.
 
 Teardown is symmetric: a clean exit reverts everything; an unclean exit
 self-heals because the OS default route is *never deleted* (the `/1`s just
