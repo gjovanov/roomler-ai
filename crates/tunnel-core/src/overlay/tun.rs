@@ -276,23 +276,53 @@ mod system {
         /// spends a minute unrouted.
         const METRIC0_STRIKES_TO_YIELD: u32 = 3;
 
+        /// Consecutive waves finding a written prefix missing before the
+        /// route-reaping WARN fires. One more than the yield threshold so a
+        /// metric-0 host reports the specific remedy (yield) before the
+        /// general one.
+        const STRIKES_TO_WARN: u32 = 4;
+
         /// Record that `key` is ABSENT on a wave that follows a successful
-        /// write. Latches [`METRIC0_REJECTED`] on the third strike.
-        fn note_absent(key: (IpAddr, u8)) {
+        /// write.
+        ///
+        /// rc.291 — this fires for EVERY metric, not just 0. Field
+        /// (CLK00017265 / Cisco AnyConnect, 2026-08-02): `New-NetRoute`
+        /// succeeds and the row is gone within ~1 s, for both a v4 `/32` and a
+        /// v6 `/128`. The agent's own adds meet the same fate, and because
+        /// `add_peer_route`'s result is `.ok()`d by the caller, the host
+        /// simply went quiet — no error, no route, no clue. That silence cost
+        /// a multi-hour hunt, so the condition now NAMES ITSELF once per
+        /// prefix per streak. The metric-0 yield below is the narrower,
+        /// automatic remedy layered on top.
+        fn note_absent(key: (IpAddr, u8), metric: u32) {
             let mut g = WRITE_STRIKES.lock().unwrap();
             let map = g.get_or_insert_with(std::collections::HashMap::new);
             let n = map.entry(key).or_insert(0);
             *n += 1;
-            if *n >= METRIC0_STRIKES_TO_YIELD
+            // `==` so a permanently-reaped prefix warns ONCE per streak;
+            // `note_present` clears the entry, which re-arms it if the route
+            // ever survives again (e.g. the VPN disconnects).
+            if *n == STRIKES_TO_WARN {
+                tracing::warn!(
+                    dest = %key.0, plen = key.1, metric,
+                    "overlay: a defended route we install keeps DISAPPEARING within \
+                     seconds — something outside this agent (typically a corp VPN's \
+                     route monitor, e.g. Cisco AnyConnect) is deleting routes to the \
+                     overlay prefixes. Node-INITIATED traffic to this peer falls through \
+                     to the VPN; INBOUND and source-bound traffic (bind to the overlay \
+                     address) still work. Remedy: ask the VPN administrator to \
+                     split-exclude the overlay prefixes."
+                );
+            }
+            if metric == 0
+                && *n >= METRIC0_STRIKES_TO_YIELD
                 && !METRIC0_REJECTED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 tracing::warn!(
                     dest = %key.0, plen = key.1,
-                    "overlay: metric-0 defended routes do NOT survive on this host — a VPN \
-                     route monitor deletes them as soon as they would win. Yielding to \
-                     metric 1 (pre-rc.287 behaviour: the overlay loses node-initiated \
-                     egress to the VPN but stays reachable INBOUND). Ask the VPN's \
-                     administrator to split-exclude the overlay prefixes."
+                    "overlay: metric-0 defended routes do NOT survive on this host — \
+                     yielding to metric 1 for the rest of this process (the metric a \
+                     route-monitoring VPN has been observed to tolerate)."
                 );
             }
         }
@@ -326,9 +356,7 @@ mod system {
                 // 2026-08-01: AnyConnect's monitor removes any route that
                 // would out-rank its own, leaving the prefix unrouted and
                 // killing even inbound REPLIES).
-                if metric == 0 {
-                    note_absent(key);
-                }
+                note_absent(key, metric);
                 return add(luid, dest, plen, metric);
             }
             note_present(key);
