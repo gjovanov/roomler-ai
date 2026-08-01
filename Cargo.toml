@@ -32,6 +32,9 @@ exclude = [
     # Needed for roomler-tunnel native-to-native peers to advertise
     # 8 MiB so DC throughput stays link-bound at high BDP.
     "crates/vendored/webrtc",
+    # Vendored upstream minus the on-drop NetworkList registry deletion —
+    # see the wintun-bindings patch note above [patch.crates-io].
+    "crates/vendored/wintun-bindings",
 ]
 
 # Patch webrtc-rs's rtp-0.12.0 dependency with our local vendored copy
@@ -60,10 +63,22 @@ exclude = [
 # vendored copy adds set_sctp_max_receive_buffer_size to
 # SettingEngine and threads it through the SCTP `Config` constructor.
 # See crates/vendored/webrtc/Cargo.toml for the full patch notes.
+#
+# wintun-bindings-0.7.39 (windows-only, via `tun` 0.8.10): upstream's
+# `winreg` feature — which `tun` hard-requests — deletes every
+# `NetworkList\Profiles` / `NetworkList\Signatures\Unmanaged` registry
+# entry whose ProfileName/Description matches the adapter NAME, on every
+# adapter drop. That erases the roomler network's NLA identity (and the
+# operator's Private-profile firewall categorization) that the constant
+# requested GUID (rc.279) exists to keep stable across sessions. Our
+# vendored copy removes the deletion; the feature flag stays declared so
+# `tun`'s dependency request resolves. One canonical diff:
+# crates/vendored/wintun-bindings.patch (scripts/revendor-wintun-bindings.sh).
 [patch.crates-io]
 rtp = { path = "crates/vendored/rtp" }
 webrtc-ice = { path = "crates/vendored/webrtc-ice" }
 webrtc = { path = "crates/vendored/webrtc" }
+wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 
 [workspace.package]
 version = "0.3.0-rc.282"
