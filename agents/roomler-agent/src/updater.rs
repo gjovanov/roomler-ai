@@ -1068,6 +1068,96 @@ pub fn spawn_installer_for_flavour_with_properties(
     }
 }
 
+/// The ordered `.deb` install commands to try, for a given effective uid.
+///
+/// Pure so the ordering is unit-testable without spawning anything (same
+/// shape as [`msiexec_argv`] on the Windows side).
+///
+/// * **root** — install directly. No polkit, no sudo, nothing that can
+///   prompt. `apt-get` first because it resolves the package's `depends`;
+///   `dpkg` as the offline fallback when apt's lists are unusable.
+/// * **non-root** — escalate. `pkexec` needs a polkit *authentication
+///   agent*, which does NOT exist in a systemd service / headless / WSL
+///   context; `sudo -n` needs a passwordless rule. Both routinely fail,
+///   which is exactly why the caller must check the exit status.
+///
+/// The historical bug this replaces: the old code did `pkexec …spawn()`
+/// and treated a successful *spawn* as a successful *install*, falling
+/// back to `dpkg` only when the pkexec BINARY was missing. On any host
+/// with pkexec installed but no polkit agent (every headless box), the
+/// spawn succeeded, pkexec died immediately, nothing was installed, and
+/// the agent exited anyway — a silent no-op that left field hosts pinned
+/// to an old build across many update attempts.
+#[cfg(any(target_os = "linux", test))]
+fn linux_install_candidates(euid: u32, path: &str) -> Vec<(&'static str, Vec<String>)> {
+    let apt = |prefix: Vec<&str>| {
+        let mut a: Vec<String> = prefix.into_iter().map(String::from).collect();
+        a.extend(["apt-get", "install", "-y", path].map(String::from));
+        a
+    };
+    if euid == 0 {
+        vec![
+            ("apt-get", vec!["install".into(), "-y".into(), path.into()]),
+            ("dpkg", vec!["--install".into(), path.into()]),
+        ]
+    } else {
+        vec![("pkexec", apt(vec![])), ("sudo", apt(vec!["-n"]))]
+    }
+}
+
+/// Run [`linux_install_candidates`] in order and return the pid of the
+/// first one that exits 0.
+///
+/// Deliberately WAITS on each child instead of firing and forgetting:
+/// dpkg replacing a running `/usr/bin/roomlerd` is safe on Linux (it
+/// unlinks and recreates) and takes seconds, and waiting is the only way
+/// to know the install actually happened. The returned pid belongs to an
+/// already-exited process, which is what the post-install watcher expects
+/// on Unix anyway: `wait_pid_unix` reads `ESRCH`, reports `Exited(0)`, and
+/// `verify_new_binary` re-runs `--version` — now a truthful check, because
+/// the install really did finish before we got here.
+///
+/// Every candidate failing is a hard `Err`, so `run_periodic`'s existing
+/// "installer spawn failed; will retry next cycle" branch keeps the
+/// daemon ALIVE rather than exiting into a pointless restart.
+#[cfg(target_os = "linux")]
+fn run_linux_install_candidates(euid: u32, path: &str) -> Result<u32> {
+    let mut attempts: Vec<String> = Vec::new();
+    for (bin, args) in linux_install_candidates(euid, path) {
+        let mut child = match std::process::Command::new(bin).args(&args).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(bin, error = %e, "update install: candidate not spawnable");
+                attempts.push(format!("{bin}: not spawnable ({e})"));
+                continue;
+            }
+        };
+        let pid = child.id();
+        match child.wait() {
+            Ok(st) if st.success() => {
+                tracing::info!(bin, euid, "update install: package installed");
+                return Ok(pid);
+            }
+            Ok(st) => {
+                // pkexec exits 127 when it cannot find an authentication
+                // agent — the headless case that used to pass silently.
+                tracing::warn!(bin, code = st.code(), "update install: candidate failed");
+                attempts.push(format!("{bin}: exit {:?}", st.code()));
+            }
+            Err(e) => {
+                tracing::warn!(bin, error = %e, "update install: wait failed");
+                attempts.push(format!("{bin}: wait failed ({e})"));
+            }
+        }
+    }
+    bail!(
+        "no usable way to install the .deb as uid {euid} (tried {}). \
+         Run the daemon as root via the packaged `roomlerd.service` system \
+         unit, or install manually: sudo dpkg -i {path}",
+        attempts.join("; ")
+    )
+}
+
 /// Linux + macOS spawn body shared between
 /// [`spawn_installer_inner`] and [`spawn_installer_for_flavour`].
 /// Flavour is irrelevant outside Windows.
@@ -1076,21 +1166,9 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
     #[cfg(target_os = "linux")]
     {
         let path_str = installer_path.to_string_lossy().into_owned();
-        // Try pkexec first for an interactive password prompt; fall
-        // back to direct dpkg if pkexec isn't installed.
-        match std::process::Command::new("pkexec")
-            .args(["apt-get", "install", "-y", &path_str])
-            .spawn()
-        {
-            Ok(child) => Ok(child.id()),
-            Err(_) => {
-                let child = std::process::Command::new("dpkg")
-                    .args(["--install", &path_str])
-                    .spawn()
-                    .context("spawning dpkg")?;
-                Ok(child.id())
-            }
-        }
+        // SAFETY: `geteuid` is always-succeeding and takes no arguments.
+        let euid = unsafe { libc::geteuid() };
+        run_linux_install_candidates(euid, &path_str)
     }
     #[cfg(target_os = "macos")]
     {
@@ -1318,6 +1396,13 @@ fn act_on_outcome(outcome: CheckOutcome, shutdown_tx: &tokio::sync::watch::Sende
             );
             if let Err(e) = spawn_installer_with_watch(&installer_path, Some(&latest)) {
                 tracing::error!(error = %e, "installer spawn failed; will retry next cycle");
+                // A failed install is otherwise INVISIBLE: the version the
+                // server sees simply never moves, which reads as "the update
+                // button does nothing". Raise the same operator sentinel the
+                // fatal-Goodbye path uses so the host says why.
+                let _ = crate::notify::raise_attention_machine_aware(&format!(
+                    "Self-update to {latest} failed and this node is still on {current}. {e}"
+                ));
                 return false;
             }
             let _ = shutdown_tx.send(true);
@@ -1741,6 +1826,51 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert!(name.ends_with(".pkg"));
         let _ = name; // silence unused warning on non-matched targets
+    }
+
+    // ── Linux .deb install candidates ───────────────────────────────
+    // The regression these lock: a non-root daemon must not be able to
+    // conclude "installed" from pkexec merely being spawnable, and a
+    // root daemon must never route through an escalator that can block
+    // on a polkit agent that does not exist on a headless host.
+
+    const DEB: &str = "/tmp/roomler-agent-update/roomler-agent.deb";
+
+    #[test]
+    fn linux_install_root_never_escalates() {
+        let c = linux_install_candidates(0, DEB);
+        assert!(
+            c.iter().all(|(bin, _)| *bin != "pkexec" && *bin != "sudo"),
+            "root must install directly — an escalator can hang on a \
+             missing polkit agent: {c:?}"
+        );
+        assert_eq!(c[0].0, "apt-get", "apt-get first — it resolves depends");
+        assert_eq!(c[1].0, "dpkg", "dpkg is the offline fallback");
+    }
+
+    #[test]
+    fn linux_install_non_root_escalates_pkexec_then_sudo() {
+        let c = linux_install_candidates(1000, DEB);
+        let bins: Vec<&str> = c.iter().map(|(b, _)| *b).collect();
+        assert_eq!(bins, vec!["pkexec", "sudo"]);
+        assert_eq!(
+            c[1].1.first().map(String::as_str),
+            Some("-n"),
+            "sudo must be non-interactive — a service has no tty to prompt on"
+        );
+    }
+
+    #[test]
+    fn linux_install_candidates_always_end_with_the_package_path() {
+        for euid in [0, 1000] {
+            for (bin, args) in linux_install_candidates(euid, DEB) {
+                assert_eq!(
+                    args.last().map(String::as_str),
+                    Some(DEB),
+                    "{bin} must receive the .deb path as its last argument"
+                );
+            }
+        }
     }
 
     fn mk_release(tag: &str, draft: bool, prerelease: bool) -> GithubRelease {
