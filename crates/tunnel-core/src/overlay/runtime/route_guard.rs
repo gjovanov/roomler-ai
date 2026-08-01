@@ -17,6 +17,63 @@ use super::*;
 /// window to a couple of dropped pings.
 pub(super) const ROUTE_GUARD_TICK: Duration = Duration::from_secs(2);
 
+/// rc.285 — one entry of the DEFENDED SET: a prefix the overlay owns and
+/// keeps re-asserting against a competing full-tunnel VPN. The set is
+/// composed ONLY by [`defended_routes`] and executed ONLY by
+/// [`run_defense_wave`]; every route-guard trigger (the 2 s tick, a
+/// RouteWatch event) runs exactly that list, so a new defended class is
+/// added in one place or not at all. Grew ad hoc before this: peer `/32`s
+/// (rc.208) → own `/32` (rc.278) → own v6 `/128` + `/96` (rc.281), each
+/// spliced into both select-loop arms by hand.
+///
+/// Deliberately NOT in the set: the P5 exit split-default `/1`s. Their
+/// re-assert must stay INLINE on the select! loop — this wave runs DETACHED,
+/// and a detached task with a stale snapshot could re-install a `/1` that
+/// `teardown_exit_routing` (on that same loop) had just purged, black-holing
+/// the host's whole egress (the self-wedge the P5 design forbids).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Defend {
+    /// An installed peer's `/32`: evict foreign competitors, then (re-)add
+    /// ours at metric 1 via the overlay NIC ([`TunIo::add_peer_route`]).
+    AssertPeer(Ipv4Addr),
+    /// Our OWN addresses — the self `/32` plus (on Windows) the derived v6
+    /// `/128` and the connected ULA `/96`: EVICTION-ONLY
+    /// ([`TunIo::defend_self_route`]). Re-adding our own address via the TUN
+    /// risks a forwarding loop; Windows' on-link route serves local delivery
+    /// the moment the competitor is gone (field-proven on pc50045).
+    EvictSelf(Ipv4Addr),
+}
+
+/// Compose the defended set from the live peer table + our own address.
+/// Peers first, self LAST — the shape the arms have used since rc.278,
+/// locked by `route_reassert_covers_self_and_peers`.
+pub(super) fn defended_routes(
+    by_node: &HashMap<ObjectId, Installed>,
+    self_v4: Ipv4Addr,
+) -> Vec<Defend> {
+    by_node
+        .values()
+        .map(|e| Defend::AssertPeer(e.overlay_ip))
+        .chain(std::iter::once(Defend::EvictSelf(self_v4)))
+        .collect()
+}
+
+/// Execute one defense wave — the ONLY consumer of [`defended_routes`].
+/// Runs detached from the select! loop under the caller's owned re-assert
+/// lock (rc.206: a slow Windows route batch must never stack concurrent
+/// delete-then-add on the same prefix, and awaiting it inline would stall
+/// the outbound TUN arm).
+pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
+    for entry in set {
+        match entry {
+            Defend::AssertPeer(ip) => {
+                tun.add_peer_route(ip).await.ok();
+            }
+            Defend::EvictSelf(ip) => tun.defend_self_route(ip).await,
+        }
+    }
+}
+
 /// Whether a teardown should also drop the peer's OS `/32`. `Keep` is for a
 /// RE-INSTALL of the SAME node (a WG key rotation): the route is about to be
 /// re-added for the same address, so dropping it only flaps the host route —
