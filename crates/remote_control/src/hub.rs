@@ -1036,10 +1036,10 @@ mod tests {
         // A's Request, then B's — plus a Terminate for A somewhere between.
         let mut saw_terminate_for_a = false;
         while let Ok(msg) = agent_rx.try_recv() {
-            if let ServerMsg::Terminate { session_id, .. } = msg {
-                if session_id == sid_a {
-                    saw_terminate_for_a = true;
-                }
+            if let ServerMsg::Terminate { session_id, .. } = msg
+                && session_id == sid_a
+            {
+                saw_terminate_for_a = true;
             }
         }
         assert!(

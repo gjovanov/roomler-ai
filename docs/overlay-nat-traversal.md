@@ -195,6 +195,47 @@ carrier itself: relay-to-relay hairpin and full WG over two same-worker
 allocations both verify green. Single-relay avoids it by using one allocation;
 DERP avoids coturn entirely.
 
+## Worker co-location — one pick, everywhere (invariant I6)
+
+Any two ends that must meet on a coturn worker MUST select that worker with
+the **same function over the same key**. This is an *invariant*, not an
+optimisation, for two reasons:
+
+1. **SNAT asymmetry drops cross-worker traffic.** The coturn generic hostname
+   is one A record per worker, so each side resolving independently routinely
+   lands the two allocations of one pair on different workers. Relay↔relay
+   traffic between workers then straddles their public interfaces — and the
+   dual-public-IP worker's SNAT asymmetry (mars answers from a different
+   source IP than the one dialed) breaks it outright: that is the
+   both-allocate `REKEY_TIMEOUT` above, and the same failure seen on
+   corp↔corp double-relay remote-control sessions (2026-07-14 stall-bursts).
+2. **Even where it survives, cross-worker adds a public-internet hop** to a
+   path that is already the slowest tier.
+
+Three subsystems make this selection, and since P6 of the overlay
+consolidation they share **one implementation** —
+`crates/remote_control/src/worker_pick.rs` (`pick_worker_fnv1a`: retain
+IPv4 → sort → dedup → FNV-1a 64 of the key `% len`; `pick_index_fnv1a` for
+fixed configured lists):
+
+- **overlay broker** (`crates/api/src/ws/overlay.rs`): computes the pick
+  authoritatively over a 300 s-cached resolve of the worker set, appends it
+  as `&pin=<ip>` to the granted TURN URLs, and hands the *same* result to
+  both ends of the pair (the `pair_key` is symmetric by construction);
+- **overlay client** (`tunnel-core` `relay_link::pick_worker`): recomputes
+  the same pick over its own DNS resolve as the fallback when a grant
+  carries no pin;
+- **remote-control TURN creds** (`turn_creds::issue_for_session`): orders one
+  session-picked worker's URLs first in the creds issued independently to
+  controller and agent, so both ICE stacks converge on it.
+
+Agreement is byte-pinned: the shared module and every consumer carry
+**golden-vector tests** asserting the same literal picks (grep
+`worker-pick golden vector`), so a drifted or re-localised implementation
+fails CI rather than splitting pairs in the field. Ops note: source-routing
+mars's dual-IP SNAT would de-risk failure mode 1 but not obsolete the
+invariant — the extra hop (reason 2) remains.
+
 ## NAT lab (for field-validating Phase C)
 
 The direct-tier failure modes only reproduce behind real NATs. The lab uses two

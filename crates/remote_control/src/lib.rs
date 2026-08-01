@@ -30,6 +30,7 @@ pub mod serde_helpers;
 pub mod session;
 pub mod signaling;
 pub mod turn_creds;
+pub mod worker_pick;
 
 pub use error::{Error, Result};
 pub use hub::Hub;

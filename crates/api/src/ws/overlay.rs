@@ -37,6 +37,7 @@ use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode, overlay_ip},
     signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo, ServerMsg},
     turn_creds,
+    worker_pick::pick_worker_fnv1a,
 };
 use roomler_ai_services::dao::base::DaoError;
 use tokio::net::lookup_host;
@@ -1320,7 +1321,7 @@ fn stun_urls_from_turn_urls(turn_urls: &[String]) -> Vec<String> {
 /// (cross-worker traffic drops under mars's dual-public-IP SNAT). But
 /// `lookup_host` can return a rotating subset/order per call, so two grants for
 /// the same pair seconds apart could resolve **different-sized** IP sets and
-/// `pick_worker_idx` (FNV `% len`) would then pick DIFFERENT workers — exactly
+/// `pick_worker_fnv1a` (FNV `% len`) would then pick DIFFERENT workers — exactly
 /// the field split (NEO16 on one worker, the VPN'd peer on another → 100% loss).
 /// Resolving ONCE and caching for a short TTL makes every grant in the window
 /// share one stable set → one pin. On a transient resolve failure we reuse the
@@ -1369,31 +1370,11 @@ async fn resolve_workers_cached(host: &str) -> Vec<IpAddr> {
 /// hairpin.
 async fn resolve_pick_worker(host: &str, pair_key: &str) -> Option<IpAddr> {
     let ips = resolve_workers_cached(host).await;
-    pick_worker_idx(pair_key, ips)
-}
-
-/// Pure pick: sort+dedup the IPv4 candidates and index by a stable hash of
-/// `pair_key`. Both peers of a pair share the `pair_key`, and the broker
-/// hands them the SAME single result, so they co-locate.
-fn pick_worker_idx(pair_key: &str, mut ips: Vec<IpAddr>) -> Option<IpAddr> {
-    ips.retain(IpAddr::is_ipv4);
-    ips.sort();
-    ips.dedup();
-    if ips.is_empty() {
-        return None;
-    }
-    let idx = (fnv1a(pair_key.as_bytes()) % ips.len() as u64) as usize;
-    Some(ips[idx])
-}
-
-/// Stable 64-bit FNV-1a (process-independent, unlike the stdlib hasher).
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    // Both peers of a pair share the `pair_key`, and the broker hands them
+    // the SAME single result, so they co-locate. The pick is the ONE shared
+    // `remote_control::worker_pick` implementation (invariant I6) — the
+    // overlay client computes its own fallback pick with the same fn.
+    pick_worker_fnv1a(pair_key, ips)
 }
 
 #[cfg(test)]
@@ -1502,23 +1483,23 @@ mod tests {
         );
     }
 
+    /// worker-pick golden vector (invariant I6): the broker's pick is
+    /// byte-pinned to the exact value the shared `remote_control::worker_pick`
+    /// suite pins — the overlay client's fallback pick asserts the same
+    /// literals, so broker↔client agreement can't silently drift.
     #[test]
-    fn worker_pick_is_deterministic_and_order_independent() {
-        // The broker hands BOTH peers the same single result, so it just has
-        // to be stable per pair_key regardless of DNS ordering.
+    fn worker_pick_agrees_with_golden_vector() {
         let a: IpAddr = "5.9.157.221".parse().unwrap();
         let b: IpAddr = "5.9.157.226".parse().unwrap();
         let c: IpAddr = "94.130.141.74".parse().unwrap();
         let key = "507f1f77bcf86cd799439011:507f1f77bcf86cd799439012";
-        let p = pick_worker_idx(key, vec![a, b, c]).unwrap();
-        assert_eq!(p, pick_worker_idx(key, vec![c, a, b]).unwrap()); // shuffled
-        assert_eq!(p, pick_worker_idx(key, vec![b, a, c, b]).unwrap()); // +dup
-        assert!([a, b, c].contains(&p));
+        // FNV-1a(key) = 0xad37_bde0_cdd9_5470; % 3 = 2 → third sorted IPv4.
+        assert_eq!(pick_worker_fnv1a(key, vec![a, b, c]), Some(c));
+        assert_eq!(pick_worker_fnv1a(key, vec![c, a, b, b]), Some(c)); // shuffled + dup
         // ipv6 filtered; empty → None
         let v6: IpAddr = "::1".parse().unwrap();
-        assert_eq!(pick_worker_idx(key, vec![v6, a]).unwrap(), a);
-        assert!(pick_worker_idx(key, vec![v6]).is_none());
-        assert!(pick_worker_idx(key, vec![]).is_none());
+        assert_eq!(pick_worker_fnv1a(key, vec![v6, a]), Some(a));
+        assert!(pick_worker_fnv1a(key, vec![]).is_none());
     }
 
     /// P7 — the churn detector's arithmetic: only grant→re-request cycles
