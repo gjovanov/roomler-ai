@@ -138,10 +138,11 @@ stays optimistic — the tight deadline bounds a wasted try).
 
 ### 5. Retry without waiting for a netmap
 
-A lapsed cooldown otherwise only takes effect on the next netmap; a quiet mesh
-would never re-attempt direct after a fallback. A re-upgrade tick (~every 30 s)
-re-runs the tier evaluation over the current netmap, retrying a lapsed direct
-tier and driving punch convergence at large install skew.
+A decayed failure penalty otherwise only takes effect on the next netmap; a
+quiet mesh would never re-attempt direct after a fallback. A re-upgrade tick
+(~every 30 s) re-runs the path-monitor decision over the current netmap,
+retrying a tier whose penalty has decayed back under the eligibility bar and
+driving punch convergence at large install skew.
 
 ### The accept side
 
@@ -151,18 +152,52 @@ unknown-source WG **handshake INIT** to the runtime, which **cryptographically
 authenticates** it (a throwaway `Tunn` performs the full Noise-IK validation —
 `parse_handshake_anon` alone proves only a *claimed* key) before installing or
 re-pointing the peer onto the arriving socket + source. An authenticated INIT
-that traversed both NATs is proof the pair can reach each other, so it bypasses
-the srflx cooldown and clears that peer's strikes.
+that traversed both NATs is proof the pair can reach each other, so it clears
+the peer's srflx penalty and strikes and books a strong inbound credit on the
+path monitor — the packet's arrival is itself the measurement.
 
-## Cooldowns and the never-poison rule (CC1)
+## Path selection: the two-plane PathMonitor (CC1 lives on)
 
-Each direct tier (LAN / public / srflx) has its **own** failure cooldown, so a
-routinely-missing punch can never poison the proven LAN or public-NIC path. LAN
-and public escalate to a 24 h session-sticky deny after 2 failures (a false /24
-— a VPN client pool — or an unreachable "public" endpoint). srflx uses a
-**shorter 15 min** deny after 3 failures: a punch reflects the *current* NAT
-pair, which changes when a host roams, so a day-long deny would wrongly outlive
-it.
+Since the overlay consolidation (shadow rc.245 → consumed rc.271 → default
+rc.276 → only implementation rc.282), tier selection is a measured decision by
+the **PathMonitor** (`tunnel-core/src/overlay/path.rs`), a pure clock-free
+module fed at every decision surface: netmap, health sweep, authenticated
+inbound INIT, resume, and the ~30 s re-upgrade tick. It keeps the legacy
+cascade's guarantees while replacing its reactive counters:
+
+- **Eligibility plane — parity-exact with the legacy cooldowns.** Each tier
+  carries a prior `B` (LAN 400 / public 330 / srflx 260 / relay 200). A
+  failure books a decaying penalty `W = 2×(B − B_relay)` (400/260/120) with
+  half-life **60 s** ordinarily and **900 s** after repeated failures
+  (2 strikes for LAN/public, 3 for srflx) — reproducing the old 60 s cooldown
+  and 15 min escalated deny bit-for-bit at the decision boundaries. A tier is
+  probe-eligible iff `B − P ≥ B_relay`, and because penalties always decay to
+  zero, **every tier retries eventually — lockout is impossible by
+  construction**. Penalties are keyed per-(peer, tier), so CC1 — a routinely
+  missing punch can never poison a proven LAN or public-NIC path — holds
+  structurally, not by convention.
+- **Ranking plane — advisory.** A quality score `Q` (EWMA, clamped ±100)
+  ranks among *already-eligible* tiers: a latched probe credits by measured
+  handshake latency, healthy traffic credits slowly, bad sweeps and typed
+  carrier deaths debit, an authenticated inbound INIT credits strongly (the
+  packet itself is proof of reachability). `Q` may reorder probing among
+  eligible tiers but can never delay or advance eligibility itself — locked
+  by the `no_q_state_can_delay_or_advance_eligibility` test family.
+- **Hysteresis.** Upgrades require a latched shadow-handshake probe
+  (promote-on-latch); demotion happens only on a typed `DeathReason` from the
+  lifecycle module; voluntary switches are ≥30 s apart per peer. The
+  bilateral 60 s LAN punch cadence is pinned in the probe scheduler
+  independent of any score (the hibernate-recovery cadence survives mixed
+  fleets by construction).
+- **Resets.** An endpoint change (roam) clears penalties, strikes, and `Q` —
+  new endpoints make old evidence stale. Forced-DERP remains a **server
+  override**: the monitor annotates the pinned window and never selects
+  against it, because only the server can flip both ends of a pair
+  atomically.
+
+`ROOMLER_NODE_OVERLAY_PATHMON` (default `on`) now governs only telemetry
+verbosity (the 10-min decision summaries); selection is always
+monitor-driven — rollback is a release revert, not an env flip.
 
 ## Phase D: the relay tiers
 
