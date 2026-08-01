@@ -129,6 +129,12 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_TUN_PERSIST`). Built-in default: on.
     #[serde(default)]
     pub overlay_tun_persist: Option<bool>,
+    /// Install defended peer `/32`s (and assert the ULA `/96`) at route
+    /// metric 0 so they outrank a corp VPN's metric-1 mirror routes
+    /// (Cisco AnyConnect), Windows only
+    /// (`ROOMLER_NODE_OVERLAY_ROUTE_METRIC0`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_route_metric0: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -582,7 +588,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 15] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 16] {
     [
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
@@ -594,6 +600,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 15]
         ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
         ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
+        ("OVERLAY_ROUTE_METRIC0", cfg.overlay_route_metric0),
         ("LOCAL_TURN", cfg.local_turn),
         ("DNS_AAAA", cfg.dns_aaaa),
         ("AUTO_UPDATE", cfg.auto_update),
@@ -771,6 +778,7 @@ mod tests {
             overlay_tun_stable_guid: None,
             overlay_route_evict: None,
             overlay_tun_persist: None,
+            overlay_route_metric0: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,

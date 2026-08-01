@@ -133,6 +133,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Keep the overlay TUN device alive across signaling reconnects (process-lifetime cache). Built-in default: on.",
     ),
     (
+        "overlay_route_metric0",
+        "tribool",
+        "Install defended peer /32s (and the ULA /96) at route metric 0 so they outrank a corp VPN's metric-1 mirror routes (Windows). Built-in default: on.",
+    ),
+    (
         "local_turn",
         "tribool",
         "Loopback-TURN relay for controllers on the same corporate network. Built-in default: on.",
@@ -260,6 +265,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
+        "overlay_route_metric0" => cfg.overlay_route_metric0.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
         "dns_aaaa" => cfg.dns_aaaa.map(fmt_bool),
         "auto_update" => cfg.auto_update.map(fmt_bool),
@@ -349,6 +355,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
+        "overlay_route_metric0" => cfg.overlay_route_metric0 = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,
         "dns_aaaa" => cfg.dns_aaaa = parse_tribool(value)?,
         "auto_update" => cfg.auto_update = parse_tribool(value)?,
