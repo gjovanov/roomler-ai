@@ -165,9 +165,12 @@ another `RelayConn`.
 
 ## 3. The carrier cascade
 
-The runtime evaluates tiers **in priority order** on every netmap and on a ~30 s
-re-upgrade tick, demoting only when a tier can't establish. Best latency first,
-server-dependency last.
+The **PathMonitor** (`overlay/path.rs`, the one selection implementation since
+rc.282) decides the tier on every netmap, health sweep, authenticated inbound
+INIT, resume, and a ~30 s re-upgrade tick. Cold-start the decision follows the
+priority order below (tier priors); after that, measured evidence — decaying
+failure penalties, probe latencies, traffic credits — refines it, demoting
+only on a typed carrier death. Best latency first, server-dependency last.
 
 ```mermaid
 flowchart TD
@@ -204,8 +207,11 @@ flowchart TD
 | 5 | **DERP** | `/derp` WSS, pubkey-addressed | **both** UDP-blocked | `DERP` (**on**, rc.203) |
 | — | both-allocate | 2 coturn allocations | mixed capability / fall-through | always available |
 
-Every gate accepts `0`/`false`/`no`/`off` to disable. Each direct tier keeps its
-**own** cooldown so a failing punch can never poison a proven LAN path.
+Every gate accepts `0`/`false`/`no`/`off` to disable. Each direct tier carries
+its **own** per-peer decaying failure penalty on the PathMonitor, so a failing
+punch can never poison a proven LAN path (the CC1 rule — mechanics in
+[`docs/overlay-nat-traversal.md`](./overlay-nat-traversal.md), "Path
+selection: the two-plane PathMonitor").
 
 ---
 
@@ -531,8 +537,16 @@ all.
   established with and re-evaluates it on every netmap, forgetting and
   re-establishing the link if it changed. Without this a pair could deadlock
   with both sides having chosen "dialer".
-* **Cooldowns** — per-tier, never shared, so a routinely-failing punch cannot
-  poison a proven LAN or public path.
+* **Decaying penalties** — per-(peer, tier) on the PathMonitor, never shared,
+  so a routinely-failing punch cannot poison a proven LAN or public path.
+  Repeated failures stretch the penalty half-life (60 s → 900 s) instead of
+  hard-denying, so every tier retries eventually — lockout is impossible by
+  construction.
+* **Route erasure** — the route guard reacts to OS route-change events
+  (Windows `NotifyRouteChange2`, Linux `ip monitor route`) with an immediate
+  re-assert of the per-peer `/32`s and any exit `/1`s (waves rate-limited to
+  ≥3 s apart), with the 2 s tick retained as a belt-and-braces heartbeat
+  until the event path is soak-proven enough to demote it.
 
 ---
 
@@ -549,6 +563,8 @@ prefix is still honoured.
 | `…_SRFLX_KEEPALIVE_SECS` | 20 | STUN keepalive holding the mapping open |
 | `…_RELAY_SINGLE` | on | single-relay tier |
 | `…_DERP` | **on** since rc.203 | DERP tier |
+| `…_PATHMON` | **on** | path-monitor telemetry (`on`/`shadow`/`off`). Selection is always monitor-driven since rc.282 — non-`on` values only silence the 10-min decision summaries |
+| `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts (the 2 s tick stays as heartbeat) |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 
 Joining the mesh at all additionally requires `overlay_enabled = true` in the
