@@ -1714,16 +1714,13 @@ impl OverlayRuntime {
                     // there drops anyway; `store=active` clears on reboot).
                     if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
                         let tun2 = tun.clone();
-                        let ips: Vec<Ipv4Addr> =
-                            by_node.values().map(|e| e.overlay_ip).collect();
+                        // rc.285 — the wave runs the DECLARATIVE defended set
+                        // (every peer /32, then our own /32 + v6 twins —
+                        // composed in one place, `route_guard::defended_routes`).
+                        let set = defended_routes(&by_node, self_v4);
                         tokio::spawn(async move {
                             let _guard = guard;
-                            for ip in ips {
-                                tun2.add_peer_route(ip).await.ok();
-                            }
-                            // rc.278 — defend our OWN /32 too (a full-tunnel VPN
-                            // hijacks it exactly like it hijacks peer /32s).
-                            tun2.defend_self_route(self_v4).await;
+                            run_defense_wave(tun2, set).await;
                         });
                     }
                     // P5 — the exit split-default /1 re-assert stays INLINE (NOT
@@ -1773,18 +1770,15 @@ impl OverlayRuntime {
                                 );
                                 if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
                                     let tun2 = tun.clone();
-                                    let ips: Vec<Ipv4Addr> =
-                                        by_node.values().map(|e| e.overlay_ip).collect();
+                                    // rc.285 — the same declarative set as the
+                                    // tick arm. A VPN connect is exactly the
+                                    // route storm that re-adds the hijacking
+                                    // /32 for our own address; evict it NOW
+                                    // rather than waiting for the 2 s tick.
+                                    let set = defended_routes(&by_node, self_v4);
                                     tokio::spawn(async move {
                                         let _guard = guard;
-                                        for ip in ips {
-                                            tun2.add_peer_route(ip).await.ok();
-                                        }
-                                        // rc.278 — a VPN connect is exactly the
-                                        // route storm that re-adds the hijacking
-                                        // /32 for our own address; evict it now
-                                        // rather than waiting for the 2 s tick.
-                                        tun2.defend_self_route(self_v4).await;
+                                        run_defense_wave(tun2, set).await;
                                     });
                                 }
                                 // P5 exit /1 — INLINE for the same teardown-
@@ -2634,32 +2628,80 @@ mod tests {
     /// every packet addressed to us — including the REPLY to everything we
     /// initiate — is forwarded into the corp tunnel instead of delivered
     /// locally (field: CORPLAP-1, 100 % IPv4 loss both ways while its WireGuard
-    /// carriers were healthy and IPv6 worked). This locks the sweep shape the
-    /// select-loop arms use: every peer re-asserted, then our own defended.
+    /// carriers were healthy and IPv6 worked). rc.285 — the test now drives the
+    /// REAL wave (`defended_routes` → `run_defense_wave`, the exact code both
+    /// select-loop arms spawn) instead of a hand-mirrored copy of the arms.
     #[tokio::test(flavor = "multi_thread")]
     async fn route_reassert_covers_self_and_peers() {
         let tun = RouteRecordingTun::new();
         let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
         let peers = [Ipv4Addr::new(100, 64, 0, 2), Ipv4Addr::new(100, 64, 0, 4)];
-
-        // Mirrors the guard-tick / RouteWatch arms verbatim.
-        let t: Arc<dyn TunIo> = tun.clone();
-        for ip in peers {
-            t.add_peer_route(ip).await.ok();
+        let mut by_node = HashMap::new();
+        for (i, ip) in peers.iter().enumerate() {
+            by_node.insert(ObjectId::new(), installed_at([i as u8 + 1; 32], *ip));
         }
-        t.defend_self_route(self_v4).await;
+
+        let t: Arc<dyn TunIo> = tun.clone();
+        run_defense_wave(t, defended_routes(&by_node, self_v4)).await;
 
         let got = tun.calls();
+        assert_eq!(got.len(), peers.len() + 1);
         assert_eq!(
-            got,
-            vec![("add", peers[0]), ("add", peers[1]), ("defend", self_v4),],
-            "peers re-asserted, then our own /32 defended"
+            got.last(),
+            Some(&("defend", self_v4)),
+            "our own address defended LAST, after every peer re-assert"
+        );
+        let added: HashSet<Ipv4Addr> = got
+            .iter()
+            .filter(|(op, _)| *op == "add")
+            .map(|(_, ip)| *ip)
+            .collect();
+        assert_eq!(
+            added,
+            peers.iter().copied().collect::<HashSet<_>>(),
+            "every installed peer re-asserted exactly once"
         );
         assert!(
             !got.iter().any(|(op, ip)| *op == "add" && *ip == self_v4),
             "our own address must be EVICTION-only — never re-added via the TUN \
              (the on-link route already serves local delivery; adding a /32 to \
              ourselves risks a forwarding loop)"
+        );
+    }
+
+    /// rc.285 — the defended-set composition is declarative: every installed
+    /// peer exactly once, self exactly once and LAST, and nothing else. (The
+    /// P5 exit `/1`s are deliberately ABSENT — their re-assert is inline-only
+    /// for the teardown mutual-exclusion; see [`Defend`].)
+    #[test]
+    fn defended_set_lists_every_peer_once_and_self_last() {
+        let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
+        let ips = [
+            Ipv4Addr::new(100, 64, 0, 2),
+            Ipv4Addr::new(100, 64, 0, 4),
+            Ipv4Addr::new(100, 64, 0, 9),
+        ];
+        let mut by_node = HashMap::new();
+        for (i, ip) in ips.iter().enumerate() {
+            by_node.insert(ObjectId::new(), installed_at([i as u8 + 1; 32], *ip));
+        }
+
+        let set = defended_routes(&by_node, self_v4);
+        assert_eq!(set.len(), ips.len() + 1);
+        assert_eq!(set.last(), Some(&Defend::EvictSelf(self_v4)));
+        let asserted: HashSet<Ipv4Addr> = set
+            .iter()
+            .filter_map(|d| match d {
+                Defend::AssertPeer(ip) => Some(*ip),
+                Defend::EvictSelf(_) => None,
+            })
+            .collect();
+        assert_eq!(asserted, ips.iter().copied().collect::<HashSet<_>>());
+
+        // An empty mesh still defends our own address.
+        assert_eq!(
+            defended_routes(&HashMap::new(), self_v4),
+            vec![Defend::EvictSelf(self_v4)]
         );
     }
 
