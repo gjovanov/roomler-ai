@@ -46,6 +46,7 @@ use super::wg::Carrier;
 use crate::transport::derp::DerpMux;
 use crate::transport::relay::RelayConn;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
+use roomler_ai_remote_control::worker_pick::pick_worker_fnv1a;
 
 /// Which relay carrier a [`ReadyLink`] rides. `install_ready` gates the
 /// QUIC-over-relay upgrade on `Turn`: a `Derp` link is RAW WG over the
@@ -831,36 +832,12 @@ fn turn_host(ice: &[IceServer]) -> Option<String> {
     })
 }
 
-/// Stable 64-bit FNV-1a — deterministic across nodes (unlike the stdlib
-/// `DefaultHasher`, which is seeded per-process). Both peers MUST compute the
-/// same worker index for the same `pair_key`, so the hash has to be fixed.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// Pick ONE coturn worker IP from the (sorted, deduped) candidate set,
-/// indexed by `pair_key`. Pure + deterministic — the testable core of
-/// [`pick_worker`].
-fn pick_from_ips(pair_key: &str, mut ips: Vec<IpAddr>) -> Option<IpAddr> {
-    ips.retain(IpAddr::is_ipv4);
-    ips.sort();
-    ips.dedup();
-    if ips.is_empty() {
-        return None;
-    }
-    let idx = (fnv1a(pair_key.as_bytes()) % ips.len() as u64) as usize;
-    Some(ips[idx])
-}
-
 /// Resolve the coturn host from the ICE creds and pick ONE worker IP
 /// deterministically from `pair_key`, so both peers of the pair independently
 /// choose the same worker (intra-worker relay hairpin — no cross-worker
-/// SNAT). `None` (→ no pin → round-robin) when there's no TURN url or DNS
+/// SNAT). The pick itself is `remote_control::worker_pick` — the ONE
+/// implementation the api broker and TURN creds also use (invariant I6).
+/// `None` (→ no pin → round-robin) when there's no TURN url or DNS
 /// resolution fails, which degrades to the pre-rc.125 behaviour rather than
 /// failing the allocation.
 async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
@@ -872,7 +849,7 @@ async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
             return None;
         }
     };
-    let pick = pick_from_ips(pair_key, ips);
+    let pick = pick_worker_fnv1a(pair_key, ips);
     if let Some(ip) = pick {
         debug!(%host, worker = %ip, "overlay relay: deterministic worker picked");
     }
@@ -959,28 +936,24 @@ mod tests {
         );
     }
 
+    /// worker-pick golden vector (invariant I6): this end and the api broker
+    /// hash the same `pair_key` over independently-resolved worker sets, so
+    /// the pick is byte-pinned here to the exact value the shared
+    /// `remote_control::worker_pick` suite pins — any drift between the two
+    /// call paths fails one of the golden tests.
     #[test]
-    fn deterministic_worker_pick_is_stable_and_symmetric() {
-        // The same pair_key always selects the same worker, regardless of the
-        // order DNS returned the IPs (both peers MUST agree).
+    fn deterministic_worker_pick_agrees_with_golden_vector() {
         let a = "5.9.157.221".parse().unwrap();
         let b = "5.9.157.226".parse().unwrap();
-        let c = "94.130.141.74".parse().unwrap();
+        let c: IpAddr = "94.130.141.74".parse().unwrap();
         let key = "507f1f77bcf86cd799439011:507f1f77bcf86cd799439012";
-        let p1 = pick_from_ips(key, vec![a, b, c]).unwrap();
-        let p2 = pick_from_ips(key, vec![c, a, b]).unwrap(); // shuffled
-        let p3 = pick_from_ips(key, vec![b, c, a, b]).unwrap(); // dup + shuffled
-        assert_eq!(p1, p2, "order must not change the pick (sorted internally)");
-        assert_eq!(p1, p3, "dups must not change the pick");
-        assert!([a, b, c].contains(&p1));
-        // a different pair_key may land elsewhere but is itself stable
-        let other = pick_from_ips("aaa:bbb", vec![a, b, c]).unwrap();
-        assert_eq!(other, pick_from_ips("aaa:bbb", vec![b, a, c]).unwrap());
-        // ipv6 entries are filtered out
+        // FNV-1a(key) = 0xad37_bde0_cdd9_5470; % 3 = 2 → third sorted IPv4.
+        assert_eq!(pick_worker_fnv1a(key, vec![a, b, c]), Some(c));
+        assert_eq!(pick_worker_fnv1a(key, vec![c, b, a, b]), Some(c)); // shuffled + dup
+        // ipv6 filtered; empty → None (→ unpinned fallback upstream)
         let v6: IpAddr = "::1".parse().unwrap();
-        assert_eq!(pick_from_ips(key, vec![v6, a]).unwrap(), a);
-        assert!(pick_from_ips(key, vec![v6]).is_none());
-        assert!(pick_from_ips(key, vec![]).is_none());
+        assert_eq!(pick_worker_fnv1a(key, vec![v6, a]), Some(a));
+        assert_eq!(pick_worker_fnv1a(key, vec![v6]), None);
     }
 
     #[tokio::test]
