@@ -222,11 +222,12 @@ fn systun_tun_factory() -> Option<TunFactory> {
             return SystemTun::up(ip, nm, mtu).map(|t| Arc::new(t) as Arc<dyn TunIo>);
         }
         let mut cache = SYSTUN_CACHE.lock().unwrap();
-        if let Some((params, dev)) = cache.as_ref() {
-            if *params == (ip, nm, mtu) && dev.is_alive() {
-                info!("overlay: reusing the process-lifetime TUN device (reconnect)");
-                return Ok(dev.clone() as Arc<dyn TunIo>);
-            }
+        if let Some((params, dev)) = cache.as_ref()
+            && *params == (ip, nm, mtu)
+            && dev.is_alive()
+        {
+            info!("overlay: reusing the process-lifetime TUN device (reconnect)");
+            return Ok(dev.clone() as Arc<dyn TunIo>);
         }
         // Param change (re-IP) or dead device: release the old one BEFORE the
         // new create so the adapter's device-install lock frees up (the
