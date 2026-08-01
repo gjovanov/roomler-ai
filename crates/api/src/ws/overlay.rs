@@ -422,7 +422,21 @@ pub async fn handle_overlay_leave(state: &AppState, ident: NodeIdentity) {
         .mark_status(self_id, AgentStatus::Offline)
         .await;
     let epoch = next_epoch();
-    fan_delta_to_peers(state, &self_node, epoch, vec![], vec![self_id]).await;
+    // Grey the row out; do NOT delete it. A `removes` delta made every
+    // connected peer drop the node from `current_peers` entirely, so a host
+    // that merely restarted VANISHED from `roomler peers` — while a host that
+    // was already down when you joined rendered a normal `offline` row (it
+    // arrives in the full netmap with P9 presence). Same server state, two
+    // renderings, decided purely by when you happened to join.
+    //
+    // An offline upsert is also strictly less work for the receiver than the
+    // remove was: `peer_config_from_netmap` drops `reachable = false` peers,
+    // so peers stop dialing/probing this node IMMEDIATELY rather than at
+    // their next rejoin — which is the same goal P9 pursued from the join
+    // side. `removes` keeps its one honest producer, `release_overlay_node`:
+    // a device that was actually released does disappear.
+    let upsert = to_netmap_peer(&self_node, false);
+    fan_delta_to_peers(state, &self_node, epoch, vec![upsert], vec![]).await;
 }
 
 /// Mint symmetric coturn creds for a relay leg to `peer_node_id`.
@@ -1385,6 +1399,71 @@ mod tests {
     // `roomler_ai_remote_control::models` (the free pool needs the inverse, and
     // the model crate is shared with `services` and the agent). Their tests —
     // including the round-trip that pins the two together — moved with them.
+
+    /// A node row with just enough shape for `to_netmap_peer`.
+    fn node(name: &str, ip: &str) -> OverlayNode {
+        let now = bson::DateTime::now();
+        OverlayNode {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            tenant_id: ObjectId::new(),
+            node_ref: NodeRef::Agent {
+                agent_id: ObjectId::new(),
+            },
+            network_id: ObjectId::new(),
+            machine_id: "machine".into(),
+            name: name.into(),
+            overlay_ip: ip.into(),
+            wg_public_key: "cHVia2V5".into(),
+            key_epoch: 0,
+            endpoints: vec!["1.2.3.4:1234".into()],
+            lan_endpoints: vec!["192.168.1.5:41641".into()],
+            srflx_endpoints: vec!["5.6.7.8:5678".into()],
+            srflx_nat: Some("cone".into()),
+            relay_home: None,
+            supports_quic: true,
+            supports_relay_single: true,
+            supports_derp: true,
+            supports_forced_derp: true,
+            advertised_routes: vec![],
+            approved_routes: vec![],
+            is_exit_node: false,
+            status: AgentStatus::Online,
+            last_seen_at: now,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        }
+    }
+
+    /// The leave path fans THIS shape. `reachable = false` is what makes a
+    /// receiving peer render the row `offline` (`online: np.reachable`) and
+    /// stop dialing it (`peer_config_from_netmap` drops unreachable peers) —
+    /// instead of the row vanishing, which is what a `removes` delta did.
+    #[test]
+    fn leave_upsert_is_the_same_row_marked_unreachable() {
+        let n = node("clk00017265-wsl", "100.64.0.7");
+        let peer = to_netmap_peer(&n, false);
+
+        assert!(
+            !peer.reachable,
+            "a node that just left must not be dialable"
+        );
+        // Identity must survive, or the receiver can't match it to the row it
+        // already holds and the delta silently creates a duplicate/no-op.
+        assert_eq!(peer.node_id, n.id.unwrap());
+        assert_eq!(peer.overlay_ip, "100.64.0.7");
+        assert_eq!(peer.name, "clk00017265-wsl");
+        assert_eq!(peer.wg_public_key, "cHVia2V5");
+    }
+
+    /// Guards the join path against regressing to a blanket `true`: presence
+    /// is the caller's verdict, and both verdicts must be expressible.
+    #[test]
+    fn to_netmap_peer_carries_presence_verbatim() {
+        let n = node("mars", "100.64.0.14");
+        assert!(to_netmap_peer(&n, true).reachable);
+        assert!(!to_netmap_peer(&n, false).reachable);
+    }
 
     #[test]
     fn pair_key_is_symmetric() {
