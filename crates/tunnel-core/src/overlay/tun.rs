@@ -176,7 +176,7 @@ mod system {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
             DeleteIpForwardEntry2, FreeMibTable, GetIpForwardEntry2, GetIpForwardTable2,
-            InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+            InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, SetIpForwardEntry2,
         };
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
@@ -244,21 +244,52 @@ mod system {
         /// `add` alone can never CHANGE an existing row's metric —
         /// `CreateIpForwardEntry2` returns ALREADY_EXISTS and the old metric
         /// silently masks the new one (exactly the trap the rc.208 constancy
-        /// comment predicted). Read the current row first; delete-then-re-add
-        /// ONLY on a metric mismatch, so the steady state is one in-memory
-        /// `Get` (~µs) with zero route churn.
+        /// comment predicted). Read the current row first; the steady state is
+        /// one in-memory `Get` (~µs) with zero route churn.
+        ///
+        /// rc.288 — a metric mismatch is fixed **IN PLACE** via
+        /// `SetIpForwardEntry2`, NOT delete-then-re-add. The delete opened a
+        /// window with NO route for the prefix, and on a host whose corp VPN
+        /// runs a route monitor that window is fatal: CORPLAP-3 (AnyConnect)
+        /// came back from the rc.287 update with **no `/32` at all** for any
+        /// peer — ours never got re-added and Cisco withdrew its mirrors once
+        /// ours vanished — so every peer fell through to Cisco's captured
+        /// `100.64.0.0/10`. In-place metric update never unroutes the prefix.
+        /// Delete-then-add remains the fallback for the (unexpected) case
+        /// where `Set` fails, and a failure to restore is WARNed rather than
+        /// swallowed.
         pub fn ensure(luid: u64, dest: IpAddr, plen: u8, metric: u32) -> std::io::Result<()> {
             let mut probe = make_row(luid, dest, plen, 0);
             // SAFETY: GetIpForwardEntry2 matches on LUID + prefix + next-hop
             // and fills the row on success.
             let rc = unsafe { GetIpForwardEntry2(&mut probe) };
-            if rc == NO_ERROR {
-                if probe.Metric == metric {
-                    return Ok(());
-                }
-                del(luid, dest, plen);
+            if rc != NO_ERROR {
+                // No row of ours yet — plain create.
+                return add(luid, dest, plen, metric);
             }
-            add(luid, dest, plen, metric)
+            if probe.Metric == metric {
+                return Ok(());
+            }
+            probe.Metric = metric;
+            // SAFETY: `probe` is an OS-filled row we only re-metric; the API
+            // matches it by LUID + prefix + next-hop.
+            let set_rc = unsafe { SetIpForwardEntry2(&probe) };
+            if set_rc == NO_ERROR {
+                return Ok(());
+            }
+            // Fallback: the old delete-then-add. Never silent — losing the
+            // route here is exactly the CORPLAP-3 failure mode.
+            del(luid, dest, plen);
+            let re = add(luid, dest, plen, metric);
+            if let Err(e) = &re {
+                tracing::warn!(
+                    dest = %dest, plen, metric, %e,
+                    set_error = set_rc,
+                    "overlay: route metric reconcile FAILED and the route could not be \
+                     restored — this prefix is now unrouted via the overlay NIC"
+                );
+            }
+            re
         }
 
         /// rc.287 — eviction-WARN throttle state. The rc.279 WARN assumed a
@@ -450,6 +481,30 @@ mod system {
             use super::*;
             use std::time::{Duration, Instant};
 
+            /// rc.288 — the netmask→prefix-length derivation behind the
+            /// defended connected route. A wrong length would defend the
+            /// WRONG prefix, so the contiguity check is part of the contract.
+            #[test]
+            fn prefix_len_of_mask_handles_the_overlay_masks() {
+                use super::super::prefix_len_of_mask;
+                assert_eq!(
+                    prefix_len_of_mask(Ipv4Addr::new(255, 192, 0, 0)),
+                    Some(10),
+                    "the overlay's 100.64.0.0/10"
+                );
+                assert_eq!(
+                    prefix_len_of_mask(Ipv4Addr::new(255, 255, 255, 255)),
+                    Some(32)
+                );
+                assert_eq!(prefix_len_of_mask(Ipv4Addr::new(0, 0, 0, 0)), Some(0));
+                assert_eq!(prefix_len_of_mask(Ipv4Addr::new(255, 255, 0, 0)), Some(16));
+                assert_eq!(
+                    prefix_len_of_mask(Ipv4Addr::new(255, 0, 255, 0)),
+                    None,
+                    "non-contiguous masks are rejected, never guessed"
+                );
+            }
+
             /// First eviction WARNs; the flood inside the window is counted,
             /// not logged; the first eviction past the window WARNs again and
             /// carries the suppressed count.
@@ -480,11 +535,29 @@ mod system {
         }
     }
 
+    /// rc.288 — prefix length of an IPv4 netmask, e.g. `255.192.0.0` yields
+    /// `Some(10)`. Pure. `None` for a non-contiguous mask (never produced by
+    /// the server's CIDR, but a wrong guess would mis-target a defended
+    /// route, so it is rejected rather than approximated).
+    fn prefix_len_of_mask(mask: Ipv4Addr) -> Option<u8> {
+        let m = u32::from_be_bytes(mask.octets());
+        let ones = m.leading_ones();
+        (m == if ones == 0 { 0 } else { !0u32 << (32 - ones) }).then_some(ones as u8)
+    }
+
     /// A live OS TUN device. `tun::AsyncDevice::{recv,send}` take `&self`,
     /// so a single `Arc<AsyncDevice>` backs the bridge's concurrent read
     /// + write loops.
     pub struct SystemTun {
         dev: Arc<tun::AsyncDevice>,
+        /// rc.288 — the CONNECTED overlay prefix (`100.64.0.0/10`), derived at
+        /// bring-up from the assigned address + netmask. Defended at metric 0
+        /// alongside the peer `/32`s: when a `/32` is momentarily missing,
+        /// traffic falls through to this prefix, and a corp VPN that mirrors
+        /// the whole `/10` (AnyConnect) otherwise captures it — the CORPLAP-3
+        /// failure mode. `None` on a non-contiguous mask.
+        #[cfg(windows)]
+        connected_v4: Option<(Ipv4Addr, u8)>,
         /// P5 — the host's ORIGINAL default route (gateway + interface), captured
         /// at bring-up BEFORE any overlay route can shadow it. Used to pin
         /// exit-node carrier-endpoint exemption `/32`s via the real uplink (see
@@ -966,6 +1039,12 @@ mod system {
 
             Ok(Self {
                 dev,
+                #[cfg(windows)]
+                connected_v4: prefix_len_of_mask(netmask).map(|plen| {
+                    let net =
+                        u32::from_be_bytes(self_ip.octets()) & u32::from_be_bytes(netmask.octets());
+                    (Ipv4Addr::from(net), plen)
+                }),
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 orig_default,
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1089,6 +1168,18 @@ mod system {
                 // precedence without that risk.
                 let ula_metric = if route_metric0_enabled() { 0 } else { 256 };
                 winroute::ensure(luid, std::net::IpAddr::V6(ula_net), 96, ula_metric).ok();
+                // rc.288 — defend the CONNECTED v4 prefix (100.64.0.0/10) the
+                // same way. A peer /32 that is momentarily absent (install
+                // order, a reap, a failed reconcile) falls through to this
+                // prefix — and AnyConnect mirrors the whole /10 at effective
+                // metric 2 while our connected route sits at 257, so the
+                // fall-through lands in the corp tunnel. That is exactly how
+                // CORPLAP-3 looked after rc.287: no /32 anywhere, every
+                // peer resolving to Cisco's /10. Metric 0 makes the overlay
+                // win the fall-through too; gate-off restores 256.
+                if let Some((net, plen)) = self.connected_v4 {
+                    winroute::ensure(luid, std::net::IpAddr::V4(net), plen, ula_metric).ok();
+                }
             }
             #[cfg(not(target_os = "windows"))]
             let _ = self_ip;
