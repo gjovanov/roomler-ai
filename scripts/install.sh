@@ -17,6 +17,15 @@
 #     tunnel  — the roomler CLI only ("reach others"): enrolls with a TUNNEL
 #               enrollment token (Admin → Tunnels).
 #
+#   --system          (daemon role, Linux only) install as a ROOT systemd
+#                     SYSTEM service instead of the per-user unit. Pick this
+#                     for a headless / server / WSL node: root is what makes
+#                     unattended self-update work (installing a .deb needs it,
+#                     and pkexec cannot authenticate with no polkit agent) and
+#                     what lets the overlay bring up its TUN. You lose screen
+#                     capture + input injection, which need a logged-in X
+#                     session. Config goes to /etc/roomler/config.toml.
+#
 #   --download-only   resolve + download + verify, print what WOULD run, touch
 #                     nothing else (safe on any box).
 #   --no-enroll       install without enrolling (no token needed); prints the
@@ -36,11 +45,17 @@ ROLE=""
 TOKEN=""
 NAME="$(hostname 2>/dev/null || echo roomler-device)"
 DOWNLOAD_ONLY=0
+SYSTEM=0
+# Machine-global config for the --system (root) flow. The system unit starts
+# at boot before any login, so a $HOME-derived path would be unreachable —
+# and as root $HOME is /root, where the agent's appdirs resolver would look
+# in the wrong tree entirely. Must match roomlerd.service's ROOMLERD_CONFIG.
+SYSTEM_CONFIG="/etc/roomler/config.toml"
 NO_ENROLL=0
 
 usage() {
     sed -n '2,30p' "$0" 2>/dev/null || true
-    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME] [--download-only] [--no-enroll]"
+    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME] [--system] [--download-only] [--no-enroll]"
     exit 1
 }
 
@@ -50,6 +65,7 @@ while [ $# -gt 0 ]; do
         --server) SERVER="$2"; shift 2 ;;
         --token) TOKEN="$2"; shift 2 ;;
         --name) NAME="$2"; shift 2 ;;
+        --system) SYSTEM=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --no-enroll) NO_ENROLL=1; shift ;;
         -h|--help) usage ;;
@@ -68,6 +84,11 @@ case "$OS" in
     Linux|Darwin) ;;
     *) echo "error: unsupported OS '$OS' — use install.ps1 on Windows" >&2; exit 1 ;;
 esac
+
+if [ "$SYSTEM" = 1 ] && { [ "$ROLE" != daemon ] || [ "$OS" != Linux ]; }; then
+    echo "error: --system applies to '--role daemon' on Linux only (macOS autostarts via a LaunchAgent; the tunnel role installs a CLI, not a service)" >&2
+    exit 1
+fi
 
 STAGE="$(mktemp -d /tmp/roomler-install.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -129,8 +150,13 @@ install_daemon_linux() {
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo dpkg -i $deb"
-        say "download-only: would run: roomlerd enroll --server $SERVER --token <token> --name $NAME"
-        say "download-only: would run: systemctl --user enable --now roomler.service"
+        if [ "$SYSTEM" = 1 ]; then
+            say "download-only: would run: sudo roomlerd --config $SYSTEM_CONFIG enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: sudo systemctl enable --now roomlerd.service"
+        else
+            say "download-only: would run: roomlerd enroll --server $SERVER --token <token> --name $NAME"
+            say "download-only: would run: systemctl --user enable --now roomler.service"
+        fi
         return 0
     fi
 
@@ -139,11 +165,20 @@ install_daemon_linux() {
 
     enroll_daemon /usr/bin/roomlerd
 
-    say "enabling the systemd user unit (autostart, this login session's user)"
-    systemctl --user daemon-reload || true
-    systemctl --user enable --now roomler.service
-    say "daemon status: $(systemctl --user is-active roomler.service || true)"
-    say "NOTE: on a headless host, run 'sudo loginctl enable-linger $USER' so the user unit runs without an open session."
+    if [ "$SYSTEM" = 1 ]; then
+        say "enabling the systemd SYSTEM unit (root — self-update + overlay TUN work; no screen capture)"
+        sudo systemctl daemon-reload || true
+        sudo systemctl enable --now roomlerd.service
+        say "daemon status: $(sudo systemctl is-active roomlerd.service || true)"
+        say "logs: sudo journalctl -u roomlerd.service -f"
+    else
+        say "enabling the systemd user unit (autostart, this login session's user)"
+        systemctl --user daemon-reload || true
+        systemctl --user enable --now roomler.service
+        say "daemon status: $(systemctl --user is-active roomler.service || true)"
+        say "NOTE: on a headless host, run 'sudo loginctl enable-linger $USER' so the user unit runs without an open session."
+        say "NOTE: a per-user daemon cannot install its own updates (a .deb needs root). Re-run with --system for unattended self-update."
+    fi
 }
 
 install_daemon_macos() {
@@ -186,13 +221,23 @@ install_daemon_macos() {
 
 enroll_daemon() {
     daemon_bin="$1"
+    # --system enrolls as root into the machine-global path the system unit
+    # runs with; the per-user flow keeps the caller's own profile.
+    if [ "$SYSTEM" = 1 ]; then
+        enroll_pre="sudo $daemon_bin --config $SYSTEM_CONFIG"
+    else
+        enroll_pre="$daemon_bin"
+    fi
     if [ "$NO_ENROLL" = 1 ] || [ -z "$TOKEN" ]; then
         [ "$NO_ENROLL" = 1 ] || warn "no --token given — skipping enrollment"
-        say "enroll later with: $daemon_bin enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\""
+        say "enroll later with: $enroll_pre enroll --server $SERVER --token <agent-enrollment-jwt> --name \"$NAME\""
         return 0
     fi
     say "enrolling this machine as '$NAME' against $SERVER (token is single-use, never echoed)"
-    "$daemon_bin" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    # Unquoted on purpose: $enroll_pre is a word list we built ourselves
+    # (sudo + binary + --config + path), none of which contain whitespace.
+    # shellcheck disable=SC2086
+    $enroll_pre enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
 }
 
 # ─── tunnel role ────────────────────────────────────────────────────────────
