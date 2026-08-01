@@ -11,8 +11,16 @@ PartOf=graphical-session.target
 Type=simple
 # P3d Slice B: the daemon binary is now `roomlerd` (was `roomler-agent`).
 ExecStart=/usr/bin/roomlerd run
-Restart=on-failure
+# `always`, not `on-failure`: a self-update exits 0 on purpose (the agent
+# hands off to the installer and shuts down cleanly), and `on-failure`
+# would leave the node stopped until the next login — a successful
+# upgrade would read as the host going offline. Codes come from
+# `watchdog.rs`: 2 = STALL (watchdog forced exit) MUST come back;
+# 7 = AGENT_DELETED (row deleted / quarantined server-side) must NOT —
+# restarting only hammers a server that already said no.
+Restart=always
 RestartSec=5
+RestartPreventExitStatus=7
 Environment=RUST_LOG=roomler_agent=info,warn
 
 # Sandboxing — conservative defaults appropriate for a user unit.

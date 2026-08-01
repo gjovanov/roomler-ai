@@ -1,0 +1,58 @@
+[Unit]
+# Opt-in SYSTEM unit for headless nodes (servers, WSL, containers-on-metal).
+# The default install uses the per-user unit `roomler.service` instead — see
+# README.Debian for which one you want. Nothing enables this automatically.
+#
+# Why a root unit exists at all:
+#   * self-update — installing the new .deb needs root. An unprivileged
+#     daemon has to escalate, and pkexec cannot authenticate without a
+#     polkit agent, which a headless host does not have. As root the
+#     daemon installs directly and upgrades itself unattended.
+#   * overlay mesh — bringing up the `roomler0` TUN and its routes needs
+#     CAP_NET_ADMIN.
+# What you give up: screen capture and input injection, which need the
+# logged-in user's X session. A remote-desktop host wants roomler.service.
+Description=Roomler Daemon (system) — headless mesh node
+Documentation=https://roomler.ai/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+
+# Machine-global config, deliberately NOT a user profile: this unit starts at
+# boot, before any login, so a $HOME-derived path would be unreachable (as
+# root, $HOME is /root and the agent's appdirs resolver would look in the
+# wrong tree entirely). Enroll against the SAME path:
+#
+#   sudo roomlerd --config /etc/roomler/config.toml \
+#        enroll --server https://roomler.ai --token <jwt> --name "$(hostname)"
+#
+# `enroll` creates the directory and writes the file 0600 (it holds a bearer
+# token). NOTE: this variable is consumed by systemd to build the argv — it is
+# NOT an agent env var and has no config-surface key; the daemon only ever
+# sees `--config`.
+Environment=ROOMLERD_CONFIG=/etc/roomler/config.toml
+EnvironmentFile=-/etc/default/roomlerd
+ExecStart=/usr/bin/roomlerd --config ${ROOMLERD_CONFIG} run
+
+Environment=RUST_LOG=roomler_agent=info,warn
+
+# `always`, not `on-failure`: a self-update exits 0 on purpose (the agent
+# hands off to the installer and shuts down cleanly), and `on-failure` would
+# leave the node stopped after a SUCCESSFUL upgrade. Codes from `watchdog.rs`:
+# 2 = STALL (watchdog forced exit) MUST come back; 7 = AGENT_DELETED (row
+# deleted / quarantined server-side) must NOT — restarting only hammers a
+# server that already said no.
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=7
+
+# No ProtectSystem / ProtectHome / NoNewPrivileges here: this unit's whole
+# purpose is doing the privileged things the user unit cannot — writing the
+# TUN + routes, and running dpkg (which writes /usr and runs maintainer
+# scripts) during self-update.
+
+[Install]
+WantedBy=multi-user.target
