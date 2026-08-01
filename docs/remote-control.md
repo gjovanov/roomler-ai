@@ -329,6 +329,7 @@ crates/
 │   │   ├── permissions.rs    # what a controller is allowed to do this session
 │   │   ├── sfu_bridge.rs     # publishes agent stream into mediasoup for N-watcher case
 │   │   ├── turn_creds.rs     # REST API short-lived TURN creds (HMAC over coturn shared secret)
+│   │   ├── worker_pick.rs    # THE shared FNV-1a coturn worker pick (invariant I6)
 │   │   └── audit.rs
 │   └── Cargo.toml
 ├── routes/
@@ -339,6 +340,17 @@ crates/
         └── ws/
             └── rc.rs         # rc:* dispatcher → remote_control::hub
 ```
+
+> **Same-worker TURN affinity (invariant I6).** With ≥2 coturn workers
+> configured (`ROOMLER__TURN__WORKER_URLS`), `turn_creds::issue_for_session`
+> puts one session-picked worker's URLs first in the creds issued
+> independently to controller and agent, so both ICE stacks converge on the
+> same worker — cross-worker relay↔relay drops under the dual-public-IP
+> worker's SNAT asymmetry. The pick is the ONE shared `worker_pick`
+> implementation (FNV-1a over the session key), also used by the overlay
+> broker and overlay client; rationale + golden-vector locks:
+> [`docs/overlay-nat-traversal.md`](./overlay-nat-traversal.md), "Worker
+> co-location".
 
 ### 9.1 REST surface
 
