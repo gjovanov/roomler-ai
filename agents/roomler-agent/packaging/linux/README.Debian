@@ -1,34 +1,87 @@
 roomler-agent for Debian/Ubuntu
 ===============================
 
-First-time setup
-----------------
+The daemon binary is /usr/bin/roomlerd.
 
-  # 1. Generate an enrollment JWT at http://roomler.ai/ (Admin -> Agents).
-  # 2. Enroll this machine (as your normal user, NOT root):
-  roomler-agent enroll --server http://roomler.ai/ \
-                       --token <paste-enrollment-jwt> \
-                       --name "$(hostname)"
+Which unit do I want?
+---------------------
 
-  # 3. Run once in the foreground to confirm capture + signalling work.
-  #    You need an active X11 session — tty login won't capture anything.
-  RUST_LOG=roomler_agent=debug,webrtc=info roomler-agent run
+The package ships TWO units. Pick ONE — running both enrolls the same host
+twice and they fight over the same identity.
 
-Autostart (systemd --user)
---------------------------
+  roomler.service   (systemd --user, runs as YOU)   -> desktop host
+  roomlerd.service  (systemd system, runs as root)  -> headless / server / WSL
 
-The package ships a systemd user unit at
-/usr/lib/systemd/user/roomler-agent.service. Enable it as your own user:
+                            | roomler.service | roomlerd.service
+  --------------------------+-----------------+------------------
+  screen capture + input    | yes             | no  (needs your X session)
+  overlay mesh (roomler0)   | no              | yes (TUN needs CAP_NET_ADMIN)
+  unattended self-update    | no              | yes (installing a .deb needs root)
+  starts before login       | no              | yes
+
+Want remote desktop? Use the user unit. Want a mesh node that keeps itself
+up to date with nobody logged in? Use the system unit.
+
+Desktop host (systemd --user)
+-----------------------------
+
+  # 1. Generate an enrollment JWT at https://roomler.ai/ (Admin -> Agents).
+  # 2. Enroll as your normal user, NOT root:
+  roomlerd enroll --server https://roomler.ai \
+                  --token <paste-enrollment-jwt> \
+                  --name "$(hostname)"
+
+  # 3. Optional smoke test — needs an active X11 session; a tty login
+  #    won't capture anything.
+  RUST_LOG=roomler_agent=debug,webrtc=info roomlerd run
 
   systemctl --user daemon-reload
-  systemctl --user enable --now roomler-agent.service
-  systemctl --user status roomler-agent.service
+  systemctl --user enable --now roomler.service
+  journalctl --user -u roomler.service -f
 
-Logs:
-  journalctl --user -u roomler-agent.service -f
+  # A headless host additionally needs lingering, or the user manager
+  # (and the agent with it) exits when you log out:
+  sudo loginctl enable-linger "$USER"
 
-Disable:
-  systemctl --user disable --now roomler-agent.service
+Self-update note: an unprivileged daemon cannot install a .deb. It logs an
+error, raises ~/.config/roomler/needs-attention.txt, and KEEPS RUNNING —
+upgrade by hand with `sudo dpkg -i`, or move to the system unit.
+
+Headless / server / WSL (systemd system)
+----------------------------------------
+
+Config lives at a machine-global path, not in a home directory, because the
+unit starts at boot before any login. Enroll against the SAME path you run
+with — `enroll` creates the directory and writes the file 0600 (it holds a
+bearer token):
+
+  sudo roomlerd --config /etc/roomler/config.toml \
+       enroll --server https://roomler.ai \
+              --token <paste-enrollment-jwt> \
+              --name "$(hostname)"
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now roomlerd.service
+  sudo journalctl -u roomlerd.service -f
+
+For a different config path, drop ROOMLERD_CONFIG=/path/to/config.toml into
+/etc/default/roomlerd.
+
+Both flows above are what `install.sh --role daemon [--system]` automates.
+
+Enabling the overlay mesh
+-------------------------
+
+Set `overlay_enabled = true` at the TOP LEVEL of config.toml — it is a
+root-level key, so do not append it at the end of the file, where it would
+land inside a [table] — then restart the daemon. The node generates and
+persists its WireGuard key on the first overlay-enabled start.
+
+The OS TUN needs CAP_NET_ADMIN, so this works under roomlerd.service (root)
+and not under roomler.service. On a host that cannot run as root, set
+ROOMLER_NODE_OVERLAY_NETSTACK_SOCKS=<port> for the userspace netstack
+instead: outbound mesh access through a loopback SOCKS5 proxy, no TUN and no
+routes — but other nodes cannot reach services on this host.
 
 Wayland note
 ------------
