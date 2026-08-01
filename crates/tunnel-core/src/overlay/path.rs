@@ -1,13 +1,14 @@
 //! P3 — PathMonitor: measured path selection (consolidation invariant I3).
 //!
-//! One probe-and-score model for *which carrier tier to run a peer on*,
-//! replacing the reactive cooldown/deny/strike machinery accreted across
+//! One probe-and-score model for *which carrier tier to run a peer on*. It
+//! REPLACED the reactive cooldown/deny/strike machinery accreted across
 //! rc.136→rc.225 (`DirectCooldowns`, `direct_retry_cooldown`, the sticky
-//! denies) — WITHOUT changing behaviour until the staged flip. PR-A ships the
-//! pure model + shadow instrumentation only: the legacy machinery stays
-//! authoritative, every legacy decision is compared against
-//! [`PathMonitor::decide`], and divergences are counted + logged (see the
-//! `PathShadow` harness in `runtime.rs`).
+//! denies) through a staged rollout — PR-A shadow compare, PR-B instrument
+//! fidelity, PR-C consumed decisions, PR-D default-on, and PR-E deleted the
+//! legacy machinery outright after three green soaks (48 h shadow parity,
+//! 48 h fleet shadow + ON pilot, ~42 h fleet-wide ON). Since PR-E this
+//! module IS path selection; the `PathShadow` harness in `runtime.rs` is
+//! telemetry.
 //!
 //! ## The two-plane design (adversarial-critique findings F1+F2)
 //!
@@ -85,17 +86,21 @@ use super::lifecycle::{DeathReason, DirectTier};
 /// `ROOMLER_NODE_OVERLAY_PATHMON` — how far the monitor is engaged.
 /// Parsed by [`PathMonMode::parse`]; the env READ lives with the caller
 /// (`runtime.rs`) so this module stays env-free.
+/// PR-E — the legacy selection machinery is DELETED: the monitor is the one
+/// and only path selector, unconditionally. This enum now gates TELEMETRY
+/// only (the 10-min summaries + divergence-style execution logs); it is kept
+/// so `ROOMLER_NODE_OVERLAY_PATHMON=shadow|off` set on a pre-PR-E host keeps
+/// parsing — the runtime warns once at startup that those values no longer
+/// change selection (rollback to legacy = deploy a pre-PR-E rc).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PathMonMode {
-    /// Not fed at all — zero overhead, no logs.
+    /// Telemetry off (summaries and comparison logs suppressed). Selection
+    /// is still the monitor — there is nothing else.
     Off,
-    /// Fed + compared + logged; legacy stays authoritative (PR-A default).
+    /// Vestigial (pre-PR-E: legacy authoritative). Telemetry on; selection
+    /// is the monitor.
     Shadow,
-    /// PR-C — decisions CONSUMED: the monitor's `decide`/`inbound_init`
-    /// verdicts gate `install_peers` and the inbound accept, while the legacy
-    /// cooldown state keeps being written as the safety rail (flipping back
-    /// to `shadow` is seamless). Pilot hosts opt in via env; the fleet
-    /// default stays `shadow` until PR-D.
+    /// The default: telemetry on, monitor authoritative.
     On,
 }
 
@@ -588,6 +593,26 @@ impl PathMonitor {
         let p = self.peers.entry(*peer).or_default();
         p.forced_derp_until = Some(now + ttl);
         p.relay_q = Ewma::default();
+    }
+
+    /// PR-E — the current strike count on a direct tier. The sweep's sticky-
+    /// pin log line keys off this now that the legacy fail maps are gone.
+    pub(crate) fn strikes(&self, peer: &ObjectId, tier: DirectTier) -> u32 {
+        tier_idx(tier)
+            .and_then(|idx| self.peers.get(peer).map(|p| p.tiers[idx].fails))
+            .unwrap_or(0)
+    }
+
+    /// PR-E — is `tier` in its escalated (sticky) suppression regime for this
+    /// peer? Mirrors [`suppression_half_life`]'s table, including the P8
+    /// LAN-under-MBB never-sticky rule.
+    pub(crate) fn is_sticky(&self, peer: &ObjectId, tier: DirectTier, mbb: bool) -> bool {
+        let max = match tier {
+            DirectTier::Srflx => MAX_FAILURES_SRFLX,
+            DirectTier::Lan if mbb => return false,
+            _ => MAX_FAILURES_LAN_PUBLIC,
+        };
+        self.strikes(peer, tier) >= max
     }
 
     /// Is the server's forced-DERP pin active for this peer? Consumed by the
