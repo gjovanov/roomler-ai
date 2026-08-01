@@ -539,6 +539,12 @@ mod system {
     /// `Some(10)`. Pure. `None` for a non-contiguous mask (never produced by
     /// the server's CIDR, but a wrong guess would mis-target a defended
     /// route, so it is rejected rather than approximated).
+    ///
+    /// `cfg(windows)`: the only caller is the Windows connected-route
+    /// defense, so an ungated definition is dead code on Linux — which the
+    /// Linux-only clippy lane rejects and a Windows-only local gate can never
+    /// see (the inverse of the usual "CI never compiles cfg(windows)" trap).
+    #[cfg(windows)]
     fn prefix_len_of_mask(mask: Ipv4Addr) -> Option<u8> {
         let m = u32::from_be_bytes(mask.octets());
         let ones = m.leading_ones();
