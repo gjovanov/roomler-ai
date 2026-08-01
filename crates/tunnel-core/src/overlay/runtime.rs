@@ -86,76 +86,21 @@ struct DirectCtx {
     my_nat: Option<String>,
 }
 
-/// CC1 (NAT-traversal plan) — per-peer direct-carrier failure bookkeeping, kept
-/// **split by tier** so a failing public-direct attempt can NEVER poison the
-/// proven same-LAN direct path (or vice-versa). Each tier has its own retry
-/// cooldown + consecutive-failure count; the escalation rule
-/// ([`direct_retry_cooldown`]) is shared. The original code threaded two bare
-/// maps; folding the second tier into a struct keeps the hot-path signatures
-/// from growing another pair of args.
-#[derive(Default)]
-struct DirectCooldowns {
-    /// Same-LAN direct tier (rc.136) — `until`-instant per peer.
-    lan: HashMap<ObjectId, Instant>,
-    /// Same-LAN direct consecutive-failure count (VPN-pool false /24 detector).
-    lan_fails: HashMap<ObjectId, u32>,
-    /// Public-direct tier (Phase A) — `until`-instant per peer. A firewalled /
-    /// unreachable public endpoint escalates to the session-sticky deny exactly
-    /// like the LAN tier, but on its OWN counter.
-    public: HashMap<ObjectId, Instant>,
-    /// Public-direct consecutive-failure count.
-    public_fails: HashMap<ObjectId, u32>,
-    /// Phase C — srflx hole-punch tier — `until`-instant per peer. Its OWN
-    /// counter so a punch failure (routine for stricter NATs) never poisons the
-    /// LAN or public-direct tiers (CC1). Escalates to a SHORTER deny than the
-    /// LAN/public 24 h ([`SRFLX_DENY_COOLDOWN`], 15 min) — NAT conditions change
-    /// when a host roams, so a permanent deny would wrongly outlive them.
-    srflx: HashMap<ObjectId, Instant>,
-    /// srflx consecutive-failure count.
-    srflx_fails: HashMap<ObjectId, u32>,
-}
-
-impl DirectCooldowns {
-    /// Is `nid` currently cooling down on the given tier?
-    fn cooling(map: &HashMap<ObjectId, Instant>, nid: &ObjectId, now: Instant) -> bool {
-        map.get(nid).is_some_and(|&until| until > now)
-    }
-
-    /// rc.225 — clear EVERY tier's cooldown + strike count for one peer. Fired
-    /// when the peer's advertised direct endpoints CHANGE in the netmap (its
-    /// daemon restarted / it roamed — new ports or a new address): the old
-    /// failures were measured against dial conditions that no longer exist, so
-    /// holding the deny converts a healed pair into a stuck one. Field
-    /// 2026-07-25: sequential service restarts could NEVER recover LAN-direct —
-    /// each freshly-restarted side dialed a peer whose sticky deny (burned
-    /// against the pre-restart endpoints) stopped it dialing back, so the
-    /// bilateral UDP punch never happened and the pair sat on the ~100 ms
-    /// relay/DERP tier indefinitely.
-    fn reset_peer(&mut self, nid: &ObjectId) {
-        self.lan.remove(nid);
-        self.lan_fails.remove(nid);
-        self.public.remove(nid);
-        self.public_fails.remove(nid);
-        self.srflx.remove(nid);
-        self.srflx_fails.remove(nid);
-    }
-}
-
 /// rc.225 — did a netmap upsert change the peer's DIRECT-dial endpoints (its
 /// LAN addresses or srflx mappings)? Deliberately ignores `endpoints` (the
 /// relay-advert bucket — it churns on every re-allocation and says nothing
-/// about direct reachability). A `true` here resets the peer's direct-tier
-/// cooldowns ([`DirectCooldowns::reset_peer`]): new ports/addresses = new dial
-/// conditions, so the old strike counts are stale evidence. Pure.
+/// about direct reachability). A `true` here resets the peer's monitor state
+/// (`PathMonitor::on_endpoint_change` — penalties, strikes AND quality): new
+/// ports/addresses = new dial conditions, so the old evidence is stale. Pure.
 fn direct_endpoints_changed(old: &NetmapPeer, new: &NetmapPeer) -> bool {
     old.lan_endpoints != new.lan_endpoints || old.srflx_endpoints != new.srflx_endpoints
 }
 
 /// P3 PR-B — one peer's direct-tier candidates (extracted verbatim from
-/// `install_peers`, where PR-A computed them inline). UNGATED by the legacy
-/// cooldowns: the caller applies those on top, and the ungated triple is the
-/// PathMonitor's AVAILABILITY input. Endpoint / feature-flag / hairpin checks
-/// are eligibility, never score. Pure reads.
+/// `install_peers`, where PR-A computed them inline). PR-E: these ARE the
+/// dial targets now — the monitor's `decide()` is the only selection filter
+/// on top. Endpoint / feature-flag / hairpin checks are availability, never
+/// score. Pure reads.
 struct DirectCandidates {
     /// Same-subnet LAN endpoint (highest-priority tier): (our matching
     /// interface IP, the peer's dst). rc.204 — scans the provenance-pure
@@ -302,8 +247,18 @@ const SHADOW_SUMMARY_EVERY: Duration = Duration::from_secs(600);
 
 impl PathShadow {
     fn new() -> Self {
+        let mode = path::PathMonMode::parse(crate::env::node_env("OVERLAY_PATHMON").as_deref());
+        if mode != path::PathMonMode::On {
+            // PR-E — the legacy selection machinery is deleted; there is no
+            // shadow/off SELECTION to revert to any more. One startup warn so
+            // an operator holding the old env understands what it now does.
+            warn!(
+                mode = mode.as_str(),
+                "overlay pathmon: legacy selection removed (PR-E) — this mode now affects telemetry only; selection is always the monitor (rollback = deploy a pre-PR-E release)"
+            );
+        }
         Self {
-            mode: path::PathMonMode::parse(crate::env::node_env("OVERLAY_PATHMON").as_deref()),
+            mode,
             mon: path::PathMonitor::default(),
             stats: path::ShadowStats::default(),
             last_div_log: HashMap::new(),
@@ -396,6 +351,10 @@ impl PathShadow {
 
     /// The 10-minute rolling summary (driven from the 5 s health sweep).
     fn maybe_summary(&mut self, now: Instant) {
+        // PR-E — `off` silences telemetry only (the monitor still selects).
+        if self.mode == path::PathMonMode::Off {
+            return;
+        }
         if now.duration_since(self.last_summary) < SHADOW_SUMMARY_EVERY {
             return;
         }
@@ -556,95 +515,12 @@ struct UpgradeProbe {
     local: Option<std::net::SocketAddr>,
 }
 
-/// After a direct carrier fails, don't retry direct for this peer for this
-/// long — it stays on relay, then re-attempts direct (auto-recovers when the
-/// blocking condition clears, e.g. the VPN disconnects).
-const DIRECT_COOLDOWN: Duration = Duration::from_secs(60);
-/// After this many consecutive direct-carrier failures for a peer, stop
-/// retrying direct for the rest of the session (escalate to
-/// [`DIRECT_DENY_COOLDOWN`]). The "same /24" was a false LAN signal that never
-/// actually reaches — the classic case is two hosts sharing a corp full-tunnel
-/// VPN's client pool (e.g. Check Point hands both a `192.168.0.x`) where the
-/// VPN isolates clients from each other. Without this, the 60 s
-/// [`DIRECT_COOLDOWN`] lapses and the next netmap re-upgrades the WORKING relay
-/// to a direct carrier that can never complete — an endless relay↔direct flap
-/// (field-observed: clean 44 ms relay pings interleaved with multi-second
-/// stalls + total route-drop windows). A genuine transient (real-LAN blip) still
-/// gets `DIRECT_MAX_FAILURES` attempts; a direct carrier that later proves
-/// healthy clears the strike count.
-const DIRECT_MAX_FAILURES: u32 = 2;
-/// The sticky "give up on direct for this peer" cooldown, applied once a peer
-/// hits [`DIRECT_MAX_FAILURES`].
-///
-/// rc.225 — was 24 h ("session-sticky"), which predates make-before-break: a
-/// direct retry then meant tearing down the working relay, so retrying a
-/// hopeless peer was expensive and the deny had to outlive the session. With
-/// MBB default-on (rc.210) a retry is a SHADOW probe — the relay keeps
-/// routing and a failed probe costs nothing — so a permanent deny only has
-/// downside: it converts transient turbulence (a VPN flap, a firewall being
-/// fixed, a roam) into an hours-long 100 ms pin on a pair whose LAN works
-/// again (field 2026-07-25: restart/VPN churn left same-desk pairs stuck on
-/// the relay tier with no path back). 15 min matches [`SRFLX_DENY_COOLDOWN`]:
-/// long enough to stop the relay↔direct flap the deny exists for, short
-/// enough that healed conditions get re-tried the same sitting; an
-/// endpoint-change ([`direct_endpoints_changed`]) still resets it instantly.
-const DIRECT_DENY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
-/// Phase C — srflx consecutive failures before the session-sticky deny. One
-/// more than the LAN/public [`DIRECT_MAX_FAILURES`] — a punch legitimately
-/// misses more often (timing/NAT), so give it an extra try before pinning.
-const SRFLX_MAX_FAILURES: u32 = 3;
-/// Phase C — the srflx deny cooldown once [`SRFLX_MAX_FAILURES`] is hit. Much
-/// SHORTER than the LAN/public 24 h: a punch failure reflects the CURRENT NAT
-/// pair, which changes when a host roams networks, so a day-long deny would
-/// wrongly outlive the condition. 15 min re-attempts within a session.
-const SRFLX_DENY_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// Phase C (D8) — re-run the direct-upgrade evaluation every Nth fallback tick
-/// (6 × [`FALLBACK_TICK`] ≈ 30 s). A lapsed cooldown otherwise only matters when
-/// the next netmap happens to arrive, so a quiet mesh would never re-attempt
-/// direct after a fallback; this drives that retry (and Phase C punch
-/// convergence at large install skew) without a netmap.
+/// (6 × [`FALLBACK_TICK`] ≈ 30 s). A lapsed suppression penalty otherwise only
+/// matters when the next netmap happens to arrive, so a quiet mesh would never
+/// re-attempt direct after a fallback; this drives that retry (and Phase C
+/// punch convergence at large install skew) without a netmap.
 const REUPGRADE_EVERY_N_TICKS: u32 = 6;
-
-/// The cooldown to apply after a direct-carrier failure, keyed by tier (CC1).
-/// Escalates to the tier's session-sticky deny once a peer has failed that tier
-/// [`DIRECT_MAX_FAILURES`] / [`SRFLX_MAX_FAILURES`] times (a persistent false
-/// match — a VPN client pool for LAN, an unpunchable NAT pair for srflx —
-/// rather than a transient blip). `fails` is the running failure count INCLUDING
-/// the current failure.
-fn direct_retry_cooldown(tier: DirectTier, fails: u32) -> Duration {
-    let (max, deny) = match tier {
-        DirectTier::Srflx => (SRFLX_MAX_FAILURES, SRFLX_DENY_COOLDOWN),
-        // P8 — the LAN tier NEVER escalates while make-before-break is on:
-        // a LAN retry is a zero-disruption shadow probe (one UDP dial + a
-        // 12 s handshake attempt from an already-bound socket; the relay
-        // keeps routing), so giving up only delays convergence. Field
-        // 2026-07-25: after a hibernate wake-up, both ends' 2-strike denies
-        // de-synchronized their probe windows and two willing same-desk
-        // peers missed each other for hours. With a fixed 60 s spacing on
-        // BOTH ends, bilateral punch alignment is guaranteed within ~1-2
-        // cycles (dial pinholes outlive the probe window). The pre-MBB
-        // escalation is kept when MBB is env-disabled — there a retry
-        // still tears down the working relay, and the VPN-pool false-/24
-        // flap the deny was built for (rc.204) would return.
-        DirectTier::Lan if super::direct::make_before_break_enabled() => {
-            return DIRECT_COOLDOWN;
-        }
-        _ => (DIRECT_MAX_FAILURES, DIRECT_DENY_COOLDOWN),
-    };
-    if fails >= max { deny } else { DIRECT_COOLDOWN }
-}
-
-/// The consecutive-failure count at which a tier escalates to its session-sticky
-/// deny (the `sticky` log/decision in the sweep). Mirrors [`direct_retry_cooldown`].
-/// P8 — `u32::MAX` for the LAN tier under MBB: it never sticks (see
-/// [`direct_retry_cooldown`]).
-fn direct_max_failures(tier: DirectTier) -> u32 {
-    match tier {
-        DirectTier::Srflx => SRFLX_MAX_FAILURES,
-        DirectTier::Lan if super::direct::make_before_break_enabled() => u32::MAX,
-        _ => DIRECT_MAX_FAILURES,
-    }
-}
 /// rc.139 — a dead RELAY carrier (one-way, same `tx>rx` signal) is usually a
 /// STALE coturn port: the peer re-allocated (restart/churn → new port) and we
 /// kept dialing the old one. Refresh it (re-request → fresh allocation, re-dial
@@ -1450,16 +1326,15 @@ impl OverlayRuntime {
         }
     }
 
-    /// P3 PR-A — run a SYNC closure against the shadow monitor, or nothing at
-    /// all when `ROOMLER_NODE_OVERLAY_PATHMON=off`. The lock/drop pair lives
-    /// entirely inside this call, so no caller can hold the guard across an
-    /// await; the closure being `FnOnce(&mut PathShadow) -> R` (not async)
-    /// makes that structural.
+    /// P3 PR-A (re-scoped by PR-E) — run a SYNC closure against the path
+    /// monitor. Always runs: the monitor IS the selector now, so `off` can no
+    /// longer skip the feed (it only silences telemetry inside PathShadow's
+    /// own methods). The lock/drop pair lives entirely inside this call, so
+    /// no caller can hold the guard across an await; the closure being
+    /// `FnOnce(&mut PathShadow) -> R` (not async) makes that structural.
+    /// Returns `Option` purely for call-site compatibility — always `Some`.
     fn shadow<R>(&self, f: impl FnOnce(&mut PathShadow) -> R) -> Option<R> {
         let mut s = self.path_shadow.lock().unwrap_or_else(|p| p.into_inner());
-        if s.mode == path::PathMonMode::Off {
-            return None;
-        }
         Some(f(&mut s))
     }
 
@@ -1639,13 +1514,6 @@ impl OverlayRuntime {
 
         // node_id → installed carrier (pubkey/IP/kind/install-time).
         let mut by_node: HashMap<ObjectId, Installed> = HashMap::new();
-        // rc.136 + CC1 — peers whose DIRECT carrier just failed: don't retry
-        // that tier until its `until` Instant (they stay on relay). Split by
-        // tier (LAN / public) so a public-direct failure never poisons the
-        // proven same-LAN path; each tier auto-expires → direct retried, and
-        // escalates to a session-sticky deny after DIRECT_MAX_FAILURES (a
-        // VPN-pool false /24, or a persistently-firewalled public endpoint).
-        let mut cooldowns = DirectCooldowns::default();
         // rc.139 — peers whose stale relay was just refreshed (anti-ping-pong).
         let mut relay_refresh_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
         // rc.208 — in-flight make-before-break upgrade probes (node → metadata).
@@ -1950,7 +1818,6 @@ impl OverlayRuntime {
             &tun,
             &first_peers,
             direct_ctx.as_ref(),
-            &cooldowns,
             &mut upgrade_probes,
             &mut relay_bq,
             "initial",
@@ -2174,7 +2041,7 @@ impl OverlayRuntime {
                     if resumed_from_suspend(mono_elapsed, wall_elapsed) {
                         warn!(
                             slept_s = wall_elapsed.as_secs(),
-                            "overlay: resume from suspend — dropping all carriers + cooldowns for fresh re-coordination"
+                            "overlay: resume from suspend — dropping all carriers + path penalties for fresh re-coordination"
                         );
                         let nids: Vec<ObjectId> = by_node.keys().copied().collect();
                         for nid in nids {
@@ -2188,7 +2055,6 @@ impl OverlayRuntime {
                                 PeerRoute::Drop,
                             ).await;
                         }
-                        cooldowns = DirectCooldowns::default();
                         relay_refresh_cooldown.clear();
                         // P3 PR-A — same clean slate in the monitor (probe
                         // bookkeeping survives, like `upgrade_probes` does).
@@ -2196,7 +2062,7 @@ impl OverlayRuntime {
                         let peers_now: Vec<NetmapPeer> = current_peers.values().cloned().collect();
                         self.install_peers(
                             &mut wg, &mut by_node, &mut relay, &tun, &peers_now,
-                            direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq,
+                            direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq,
                             "resume",
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
@@ -2205,7 +2071,7 @@ impl OverlayRuntime {
                     let t0 = Instant::now();
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut cooldowns, &mut relay_refresh_cooldown, &current_peers,
+                        &mut relay_refresh_cooldown, &current_peers,
                     ).await;
                     warn_if_slow("sweep_carrier_health", t0);
                     // rc.208 — make-before-break: promote any upgrade probe whose
@@ -2215,7 +2081,7 @@ impl OverlayRuntime {
                     let t0 = Instant::now();
                     self.sweep_upgrade_probes(
                         &mut wg, &mut by_node, &mut relay, &tun,
-                        &mut upgrade_probes, &mut cooldowns, &mut relay_bq,
+                        &mut upgrade_probes, &mut relay_bq,
                     ).await;
                     warn_if_slow("sweep_upgrade_probes", t0);
                     // D8 — periodic direct re-upgrade (~every 6th tick ≈ 30 s).
@@ -2232,7 +2098,7 @@ impl OverlayRuntime {
                         let t0 = Instant::now();
                         self.install_peers(
                             &mut wg, &mut by_node, &mut relay, &tun,
-                            &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes,
+                            &peers, direct_ctx.as_ref(), &mut upgrade_probes,
                             &mut relay_bq, "reupgrade",
                         ).await;
                         warn_if_slow("install_peers(reupgrade)", t0);
@@ -2381,7 +2247,7 @@ impl OverlayRuntime {
                         let t_arm = Instant::now();
                         self.handle_direct_inbound(
                             &mut wg, &mut by_node, &mut relay, &tun,
-                            &current_peers, &mut cooldowns, &mut upgrade_probes,
+                            &current_peers, &mut upgrade_probes,
                             &mut relay_bq, inb,
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
@@ -2410,11 +2276,10 @@ impl OverlayRuntime {
                             if let Some(old) = old_peers.get(&p.node_id)
                                 && direct_endpoints_changed(old, p)
                             {
-                                cooldowns.reset_peer(&p.node_id);
                                 // P3 PR-A — same clean slate in the monitor
                                 // (penalties, strikes AND quality — F1).
                                 self.shadow(|s| s.mon.on_endpoint_change(&p.node_id));
-                                debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its direct-tier cooldowns");
+                                debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its path-monitor evidence");
                             }
                         }
                         // The full netmap is AUTHORITATIVE: anything we still
@@ -2458,12 +2323,12 @@ impl OverlayRuntime {
                             self.evict_peer(
                                 nid, &mut wg, &mut by_node, &tun, &mut relay, &mut relay_bq,
                                 &mut alloc_q, &mut upgrade_probes, &mut current_peers,
-                                &mut cooldowns, &mut relay_refresh_cooldown,
+                                &mut relay_refresh_cooldown,
                             ).await;
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         let t0 = Instant::now();
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq, "netmap").await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq, "netmap").await;
                         warn_if_slow("install_peers(netmap)", t0);
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
@@ -2477,21 +2342,20 @@ impl OverlayRuntime {
                             if let Some(old) = current_peers.insert(p.node_id, p.clone())
                                 && direct_endpoints_changed(&old, p)
                             {
-                                cooldowns.reset_peer(&p.node_id);
                                 // P3 PR-A — same clean slate in the monitor
                                 // (penalties, strikes AND quality — F1).
                                 self.shadow(|s| s.mon.on_endpoint_change(&p.node_id));
-                                debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its direct-tier cooldowns");
+                                debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its path-monitor evidence");
                             }
                         }
                         let t0 = Instant::now();
-                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &cooldowns, &mut upgrade_probes, &mut relay_bq, "delta").await;
+                        self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq, "delta").await;
                         warn_if_slow("install_peers(delta)", t0);
                         for node_id in removes {
                             self.evict_peer(
                                 node_id, &mut wg, &mut by_node, &tun, &mut relay, &mut relay_bq,
                                 &mut alloc_q, &mut upgrade_probes, &mut current_peers,
-                                &mut cooldowns, &mut relay_refresh_cooldown,
+                                &mut relay_refresh_cooldown,
                             ).await;
                         }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
@@ -2608,7 +2472,8 @@ impl OverlayRuntime {
     /// sending, nothing comes back). The repair depends on the carrier kind:
     /// - **direct** → fall back to relay (the LAN path only LOOKED viable —
     ///   corp VPN route hijack, Wi-Fi AP/client isolation, asymmetric firewall);
-    ///   [`DIRECT_COOLDOWN`] keeps the next netmap from re-upgrading it.
+    ///   the monitor's suppression penalty keeps the next netmap from
+    ///   re-upgrading it (PR-E: `PathMonitor::on_death` is the bookkeeping).
     /// - **relay** (rc.139) → refresh it: the peer almost certainly
     ///   re-allocated its coturn port (restart/churn) and we're dialing a stale
     ///   one. Re-request so we re-allocate + re-dial the peer's CURRENT address
@@ -2620,7 +2485,6 @@ impl OverlayRuntime {
         by_node: &mut HashMap<ObjectId, Installed>,
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
-        cooldowns: &mut DirectCooldowns,
         relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
     ) {
@@ -2701,22 +2565,8 @@ impl OverlayRuntime {
                 super::lifecycle::carrier_stalled(e.since.elapsed(), handshake_done, v.bad_sweeps);
             // rc.276 diagnostics — mirror the latch for the peers debug view.
             e.hs_done = handshake_done;
-            if v.clear_tier_strikes {
-                // Clear the count on the carrier's OWN tier (CC1 — never
-                // cross-clear) so old failures don't accumulate across a long
-                // healthy period and prematurely pin a real peer to relay.
-                match e.tier {
-                    DirectTier::Srflx => {
-                        cooldowns.srflx_fails.remove(nid);
-                    }
-                    DirectTier::Public => {
-                        cooldowns.public_fails.remove(nid);
-                    }
-                    _ => {
-                        cooldowns.lan_fails.remove(nid);
-                    }
-                }
-            }
+            // PR-E — the strike-clear (CC1: the carrier's OWN tier only)
+            // lives in the monitor now (`on_healthy_rx`, fed just above).
             if let Some(reason) = v.death {
                 dead.push((*nid, e.tier, reason));
             }
@@ -2741,39 +2591,27 @@ impl OverlayRuntime {
             wg.remove_peer(&e.pubkey).await;
             // A carrier REPAIR, not an eviction (the relay is re-requested
             // below), so it deliberately does NOT go through `evict_peer` —
-            // forgetting the cooldowns/probe here would undo proven behaviour.
+            // forgetting the monitor evidence/probe here would undo proven behaviour.
             // It does need the recycled-address guard.
             del_peer_route_if_unowned(tun, by_node, e.overlay_ip).await;
             if tier.is_direct() {
-                // Escalating cooldown on the carrier's OWN tier (CC1). LAN: the
-                // "same /24" was a VPN client pool, not a reachable LAN. Public:
-                // the peer's advertised public endpoint isn't actually reachable
-                // (host firewall / not truly public). Srflx: the pair couldn't
-                // punch (one side symmetric / hostile filter). Either way, after
-                // that tier's max failures pin this peer to relay for the session
-                // (srflx: only 15 min — NAT conditions change on roam) so a false
-                // match can't flap the working relay.
-                let (count_map, cooldown_map, tier_name) = match tier {
-                    DirectTier::Srflx => {
-                        (&mut cooldowns.srflx_fails, &mut cooldowns.srflx, "srflx")
-                    }
-                    DirectTier::Public => {
-                        (&mut cooldowns.public_fails, &mut cooldowns.public, "public")
-                    }
-                    _ => (&mut cooldowns.lan_fails, &mut cooldowns.lan, "LAN"),
+                // PR-E — `PathMonitor::on_death` (fed above) IS the failure
+                // bookkeeping now: strike + suppression penalty on the
+                // carrier's OWN tier (CC1), escalating to the sticky regime
+                // at the same thresholds the legacy maps used. Only the
+                // operator-greppable log lines remain here, keyed off the
+                // monitor's strike state — strings preserved verbatim.
+                let tier_name = match tier {
+                    DirectTier::Srflx => "srflx",
+                    DirectTier::Public => "public",
+                    _ => "LAN",
                 };
-                let fails = count_map.entry(nid).or_insert(0);
-                *fails += 1;
-                let sticky = *fails >= direct_max_failures(tier);
-                cooldown_map.insert(nid, now + direct_retry_cooldown(tier, *fails));
-                // P2 — the (reason, tier, sticky)→string mapping is NOT 1:1
-                // and is deliberately preserved verbatim: on the direct side
-                // `HandshakeDeadline` and `OneWay` share the "didn't
-                // establish" line (the pre-P2 tuple only carried
-                // hard_dead/rx_stale), with sticky > RxStale > else priority.
+                let (fails, sticky) = self
+                    .shadow(|s| (s.mon.strikes(&nid, tier), s.mon.is_sticky(&nid, tier, mbb)))
+                    .unwrap_or((0, false));
                 if sticky {
                     warn!(
-                        peer = %nid, tier = tier_name, fails = *fails,
+                        peer = %nid, tier = tier_name, fails,
                         "overlay: direct carrier failed repeatedly — pinning this peer to relay for the session"
                     );
                 } else if reason == DeathReason::RxStale {
@@ -2978,9 +2816,9 @@ impl OverlayRuntime {
         removed
     }
 
-    /// A full EVICTION: [`Self::remove_peer_state`] plus the netmap/monitor/
-    /// cooldown bookkeeping that only makes sense when the peer is GONE (as
-    /// opposed to being re-installed).
+    /// A full EVICTION: [`Self::remove_peer_state`] plus the netmap/monitor
+    /// bookkeeping that only makes sense when the peer is GONE (as opposed to
+    /// being re-installed).
     #[allow(clippy::too_many_arguments)]
     async fn evict_peer(
         &self,
@@ -2993,7 +2831,6 @@ impl OverlayRuntime {
         alloc_q: &mut RelayAllocQueue,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
         current_peers: &mut HashMap<ObjectId, NetmapPeer>,
-        cooldowns: &mut DirectCooldowns,
         relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
     ) {
         current_peers.remove(&node_id);
@@ -3012,9 +2849,9 @@ impl OverlayRuntime {
                 PeerRoute::Drop,
             )
             .await;
-        // These two are keyed by node id and were never pruned, so a long-lived
-        // daemon accumulated an entry per peer that ever churned.
-        cooldowns.reset_peer(&node_id);
+        // Keyed by node id and never pruned otherwise, so a long-lived daemon
+        // accumulated an entry per peer that ever churned (the monitor's
+        // per-peer state is dropped by `on_peer_removed` above).
         relay_refresh_cooldown.remove(&node_id);
         if removed.is_some() {
             info!(peer = %node_id, "overlay: peer removed");
@@ -3028,7 +2865,7 @@ impl OverlayRuntime {
     /// coturn relay coordination. ALREADY-installed on RELAY but a same-subnet
     /// endpoint has since appeared → UPGRADE to direct (rc.134 re-evaluation:
     /// a peer first seen before its endpoint arrived would otherwise stay on
-    /// relay forever). A peer in a [`DIRECT_COOLDOWN`] (its direct carrier just
+    /// relay forever). A peer whose direct tier is monitor-suppressed (it just
     /// failed — rc.136) is kept on relay regardless of a same-subnet endpoint.
     #[allow(clippy::too_many_arguments)]
     async fn install_peers(
@@ -3039,7 +2876,6 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         peers: &[NetmapPeer],
         direct_ctx: Option<&DirectCtx>,
-        cooldowns: &DirectCooldowns,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
         relay_bq: &mut RelayBuildQueue,
         trigger: &'static str,
@@ -3060,24 +2896,17 @@ impl OverlayRuntime {
             let Some(cfg) = peer_config_from_netmap(np) else {
                 continue;
             };
-            // rc.136 + CC1 — suppress a direct TIER while this peer is cooling
-            // down from a failure on THAT tier (treat as if no such endpoint →
-            // fall through). Expired entries lapse, so the tier is retried. The
-            // LAN / public / srflx cooldowns are all independent (a punch
-            // failure never poisons the LAN or public-NIC tiers).
-            let lan_cooling = DirectCooldowns::cooling(&cooldowns.lan, &np.node_id, now);
-            let public_cooling = DirectCooldowns::cooling(&cooldowns.public, &np.node_id, now);
-            let srflx_cooling = DirectCooldowns::cooling(&cooldowns.srflx, &np.node_id, now);
-            // P3 PR-B — the ungated candidate walk lives in
-            // `resolve_direct_candidates`; the legacy cooldown gates apply on
-            // top here, and the ungated triple is the shadow monitor's
-            // AVAILABILITY input (cooling is the monitor's own penalty plane,
-            // so gating its inputs by the legacy cooldowns would make the
-            // comparison circular).
+            // PR-E — the candidates ARE the dial targets: tier suppression
+            // (rc.136 + CC1 in monitor form — per-tier penalties that never
+            // cross-poison, escalating at the same thresholds) lives entirely
+            // in `decide()`'s eligibility plane, applied via the action
+            // gating below. This also closes the soak-#2 residual coupling
+            // (a legacy cooldown withholding a dst the monitor held
+            // eligible).
             let cands = resolve_direct_candidates(direct_ctx, &cfg);
-            let direct_dst = if lan_cooling { None } else { cands.lan };
-            let phase_a_dst = if public_cooling { None } else { cands.public };
-            let srflx_dst = if srflx_cooling { None } else { cands.srflx };
+            let direct_dst = cands.lan;
+            let phase_a_dst = cands.public;
+            let srflx_dst = cands.srflx;
 
             // Copy-out the installed carrier's shape (all Copy), so the by_node
             // borrow ends before any mutation below.
@@ -3161,11 +2990,10 @@ impl OverlayRuntime {
             // volume shows in the summaries (compares are monitor-vs-monitor
             // there — the fleet's shadow mode carries the real divergence
             // telemetry until PR-D).
-            let pathmon_on = monitor_action.is_some()
-                && self
-                    .shadow(|s| s.mode == path::PathMonMode::On)
-                    .unwrap_or(false);
-            let (direct_dst, phase_a_dst, srflx_dst) = if pathmon_on {
+            // PR-E — the monitor's decision gates the walk UNCONDITIONALLY
+            // (there is no legacy selector any more; `PathMonMode` is
+            // telemetry-only).
+            let (direct_dst, phase_a_dst, srflx_dst) = if monitor_action.is_some() {
                 match (incumbent, monitor_action) {
                     (path::Incumbent::Direct(_), _) => (direct_dst, phase_a_dst, srflx_dst),
                     (path::Incumbent::None, Some(path::PathAction::Probe(DirectTier::Lan))) => {
@@ -3556,7 +3384,6 @@ impl OverlayRuntime {
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
-        cooldowns: &mut DirectCooldowns,
         relay_bq: &mut RelayBuildQueue,
     ) {
         if upgrade_probes.is_empty() {
@@ -3620,18 +3447,8 @@ impl OverlayRuntime {
                         },
                     );
                     tun.add_peer_route(p.overlay_ip).await.ok();
-                    // Success clears this tier's accumulated strikes (CC1).
-                    match p.tier {
-                        DirectTier::Srflx => {
-                            cooldowns.srflx_fails.remove(nid);
-                        }
-                        DirectTier::Public => {
-                            cooldowns.public_fails.remove(nid);
-                        }
-                        _ => {
-                            cooldowns.lan_fails.remove(nid);
-                        }
-                    }
+                    // PR-E — the latch already cleared the tier's strikes in
+                    // the monitor (`on_probe_result(Latched)`, fed above).
                     info!(
                         peer = %nid, overlay_ip = %p.overlay_ip, tier = ?p.tier,
                         "overlay: make-before-break — direct carrier promoted (relay held throughout; zero stall)"
@@ -3659,18 +3476,11 @@ impl OverlayRuntime {
                     s.assert_ineligible(nid, p.tier, now);
                 });
                 wg.drop_direct_probe(&p.pubkey).await;
-                let (count_map, cooldown_map, tier_name) = match p.tier {
-                    DirectTier::Srflx => {
-                        (&mut cooldowns.srflx_fails, &mut cooldowns.srflx, "srflx")
-                    }
-                    DirectTier::Public => {
-                        (&mut cooldowns.public_fails, &mut cooldowns.public, "public")
-                    }
-                    _ => (&mut cooldowns.lan_fails, &mut cooldowns.lan, "LAN"),
+                let tier_name = match p.tier {
+                    DirectTier::Srflx => "srflx",
+                    DirectTier::Public => "public",
+                    _ => "LAN",
                 };
-                let fails = count_map.entry(*nid).or_insert(0);
-                *fails += 1;
-                cooldown_map.insert(*nid, now + direct_retry_cooldown(p.tier, *fails));
                 info!(
                     peer = %nid, tier = tier_name,
                     "overlay: make-before-break — direct probe did not handshake within deadline; kept relay (no stall)"
@@ -3872,7 +3682,8 @@ impl OverlayRuntime {
     /// the claimed key's private half (a forger copying a public key fails), so
     /// this can't be used to hijack a healthy peer's route. Only a pubkey that
     /// maps to a CURRENT netmap peer (server-ACL-authorised) is acted on. A peer
-    /// cooling down on the matching tier is left on relay (anti-thrash).
+    /// suppressed on the matching tier (monitor penalty) is left on relay
+    /// (anti-thrash).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     async fn handle_direct_inbound(
@@ -3882,7 +3693,6 @@ impl OverlayRuntime {
         relay: &mut Option<RelayCoordinator>,
         tun: &Arc<dyn TunIo>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
-        cooldowns: &mut DirectCooldowns,
         upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
         relay_bq: &mut RelayBuildQueue,
         inb: crate::overlay::wg::DirectInbound,
@@ -3946,33 +3756,11 @@ impl OverlayRuntime {
             }
         };
 
-        // Anti-thrash: honour the matching tier's cooldown — EXCEPT for a srflx
-        // punch (D9). An authenticated init that traversed BOTH NATs is proof the
-        // pair CAN punch right now, so it overrides the srflx cooldown (which
-        // exists only because punches routinely miss) and clears this peer's
-        // stale srflx strikes. The LAN/public gates are unchanged.
-        let cooling = match tier {
-            DirectTier::Srflx => {
-                cooldowns.srflx.remove(&node_id);
-                cooldowns.srflx_fails.remove(&node_id);
-                false
-            }
-            DirectTier::Public => DirectCooldowns::cooling(&cooldowns.public, &node_id, now),
-            _ => DirectCooldowns::cooling(&cooldowns.lan, &node_id, now),
-        };
-        // P3 PR-C — ON mode: the monitor's inbound verdict is the gate (its
-        // penalty plane replaces the legacy cooldown check; D9 and the Q
-        // evidence were already fed inside `inbound_init`). The legacy
-        // cooldown state was still consulted above and keeps being written
-        // by the sweeps — the shadow-revert safety rail.
-        let refuse = match (
-            self.shadow(|s| s.mode == path::PathMonMode::On)
-                .unwrap_or(false),
-            monitor_inbound,
-        ) {
-            (true, Some(verdict)) => verdict.is_none(),
-            _ => cooling,
-        };
+        // PR-E — the monitor's inbound verdict IS the gate (anti-thrash via
+        // its penalty plane; the D9 srflx override — an authenticated init
+        // that traversed BOTH NATs proves the pair can punch right now — and
+        // the Q evidence were already applied inside `inbound_init`).
+        let refuse = monitor_inbound.map(|v| v.is_none()).unwrap_or(false);
         if refuse {
             record_inbound(None);
             return;
@@ -4647,240 +4435,148 @@ mod tests {
         assert!(q.take_if_current(&n, e3), "current allocate commits");
     }
 
-    #[test]
-    fn direct_cooldown_escalates_to_sticky_after_repeated_failures() {
-        // The VPN-pool relay↔direct anti-flap fix: the 1st direct failure gets
-        // the normal 60 s retry, but once a peer hits DIRECT_MAX_FAILURES the
-        // cooldown becomes session-sticky so it stops re-upgrading the working
-        // relay to a direct carrier that can never complete.
-        // `direct_retry_cooldown(_, 1) == DIRECT_COOLDOWN` only holds when
-        // DIRECT_MAX_FAILURES >= 2, so this also guards that invariant (at least
-        // one plain retry before the sticky pin).
-        assert_eq!(
-            direct_retry_cooldown(DirectTier::Public, 1),
-            DIRECT_COOLDOWN
-        );
-        assert_eq!(
-            direct_retry_cooldown(DirectTier::Public, DIRECT_MAX_FAILURES),
-            DIRECT_DENY_COOLDOWN
-        );
-        // P8 — LAN under MBB (the default) never escalates; the sticky pin is
-        // Public/srflx-only now (see `lan_tier_never_escalates_under_mbb`).
-        assert_eq!(
-            direct_retry_cooldown(DirectTier::Lan, DIRECT_MAX_FAILURES + 3),
-            DIRECT_COOLDOWN
-        );
-        // Phase C — the srflx tier has its OWN thresholds: one MORE plain retry
-        // (SRFLX_MAX_FAILURES = 3 > 2), and a SHORTER, non-24 h deny (NAT
-        // conditions change on roam).
-        assert_eq!(direct_retry_cooldown(DirectTier::Srflx, 1), DIRECT_COOLDOWN);
-        assert_eq!(
-            direct_retry_cooldown(DirectTier::Srflx, SRFLX_MAX_FAILURES - 1),
-            DIRECT_COOLDOWN,
-            "srflx gets an extra plain retry vs LAN/public"
-        );
-        assert_eq!(
-            direct_retry_cooldown(DirectTier::Srflx, SRFLX_MAX_FAILURES),
-            SRFLX_DENY_COOLDOWN
-        );
-        // rc.225 — the LAN/public deny is TTL-bounded now (MBB shadow probes
-        // make retries free); srflx stays ≤ it, and both must comfortably
-        // outlast the plain retry cooldown so escalation still means something.
-        assert!(SRFLX_DENY_COOLDOWN <= DIRECT_DENY_COOLDOWN);
-        assert!(DIRECT_DENY_COOLDOWN > DIRECT_COOLDOWN * 5);
-    }
-
-    /// P3 PR-A — the shadow monitor's suppression table must mirror the
-    /// legacy cooldown constants EXACTLY until PR-E deletes the legacy side;
-    /// a drift here would silently skew the shadow comparison the 48 h soak
-    /// gate reads. (The monitor's numbers are pinned by its own parity-curve
-    /// tests too — this cross-check catches someone editing only one side.)
-    #[test]
-    fn pathmon_constants_mirror_legacy_cooldowns() {
-        assert_eq!(path::H_ORDINARY, DIRECT_COOLDOWN);
-        assert_eq!(path::H_ESCALATED, DIRECT_DENY_COOLDOWN);
-        assert_eq!(path::H_ESCALATED, SRFLX_DENY_COOLDOWN);
-        assert_eq!(path::MAX_FAILURES_LAN_PUBLIC, DIRECT_MAX_FAILURES);
-        assert_eq!(path::MAX_FAILURES_SRFLX, SRFLX_MAX_FAILURES);
-        assert_eq!(path::LAN_PROBE_SPACING, DIRECT_COOLDOWN);
-    }
-
-    /// P3 PR-C (soak #1 Class A) — ON mode: a FRESH peer with a probe already
-    /// in flight must NOT get a destructive direct install raced over the
-    /// probe (legacy did exactly that: a sweep death leaves `upgrade_probes`
-    /// dangling and the fresh walk ignored it, so a late promote could
-    /// clobber the fresh carrier); the monitor rides relay until the probe
-    /// settles. Shadow mode preserves the legacy behaviour bit-for-bit.
+    /// P3 PR-E (was PR-C's ON-leg; the legacy control leg is gone with the
+    /// legacy) — a FRESH peer with a probe already in flight rides relay
+    /// instead of racing a destructive direct install over the probe (the
+    /// soak-#1 Class-A fix, now the only behaviour).
     #[tokio::test(flavor = "multi_thread")]
-    async fn on_mode_fresh_with_probe_in_flight_rides_relay_not_installing() {
-        for (mode, expect_install) in [
-            (path::PathMonMode::On, false),
-            (path::PathMonMode::Shadow, true),
-        ] {
-            let kp = WgKeypair::generate();
-            let peer_kp = WgKeypair::generate();
-            let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
-            let (tun_mock, _inj, _del) = MockTun::new();
-            let tf: TunFactory = {
-                let m = tun_mock.clone();
-                Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
-            };
-            let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
-            rt.path_shadow.lock().unwrap().mode = mode;
-            let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
-            let tun: Arc<dyn TunIo> = tun_mock;
-            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
-            let ctx = DirectCtx {
-                socks: vec![(my_ip, sock)],
-                my_ips: vec![my_ip],
-                endpoints: vec![],
-                public_sock: None,
-                punch: None,
-                my_nat: None,
-            };
-            let cooldowns = DirectCooldowns::default();
-            let mut relay: Option<RelayCoordinator> = None;
-            let mut by_node = HashMap::new();
-            let mut upgrade_probes = HashMap::new();
-            let mut lan_peer = peer(&peer_kp, "100.64.0.7");
-            lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
+    async fn fresh_peer_with_probe_in_flight_rides_relay_not_installing() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+        let ctx = DirectCtx {
+            socks: vec![(my_ip, sock)],
+            my_ips: vec![my_ip],
+            endpoints: vec![],
+            public_sock: None,
+            punch: None,
+            my_nat: None,
+        };
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut by_node = HashMap::new();
+        let mut upgrade_probes = HashMap::new();
+        let mut lan_peer = peer(&peer_kp, "100.64.0.7");
+        lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
 
-            // The Class-A shape: a probe survives its peer's carrier death.
-            let probe_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            wg.start_direct_probe(
-                probe_sock,
-                peer_kp.public.to_bytes(),
-                "100.64.0.7".parse().unwrap(),
-                "127.0.0.1:9".parse().unwrap(),
-                false,
-            )
-            .await;
-            rt.path_shadow.lock().unwrap().mon.on_probe_started(
-                &lan_peer.node_id,
-                DirectTier::Srflx,
-                Instant::now(),
-            );
+        // The Class-A shape: a probe survives its peer's carrier death.
+        let probe_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.start_direct_probe(
+            probe_sock,
+            peer_kp.public.to_bytes(),
+            "100.64.0.7".parse().unwrap(),
+            "127.0.0.1:9".parse().unwrap(),
+            false,
+        )
+        .await;
+        rt.path_shadow.lock().unwrap().mon.on_probe_started(
+            &lan_peer.node_id,
+            DirectTier::Srflx,
+            Instant::now(),
+        );
 
-            rt.install_peers(
-                &mut wg,
-                &mut by_node,
-                &mut relay,
-                &tun,
-                std::slice::from_ref(&lan_peer),
-                Some(&ctx),
-                &cooldowns,
-                &mut upgrade_probes,
-                &mut test_relay_bq(),
-                "test",
-            )
-            .await;
-            assert_eq!(
-                by_node.contains_key(&lan_peer.node_id),
-                expect_install,
-                "mode {mode:?}: fresh install while a probe is in flight"
-            );
-        }
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&lan_peer),
+            Some(&ctx),
+            &mut upgrade_probes,
+            &mut test_relay_bq(),
+            "test",
+        )
+        .await;
+        assert!(
+            !by_node.contains_key(&lan_peer.node_id),
+            "no fresh install while a probe is in flight (rides relay)"
+        );
     }
 
-    /// P3 PR-C — ON mode: the upgrade arm probes only what the monitor holds
-    /// ELIGIBLE. A monitor-penalized LAN tier (its suppression plane — the
-    /// legacy cooldowns stay EMPTY here) yields Keep → no probe; shadow mode
-    /// still probes per legacy precedence, proving the gate flipped the
-    /// behaviour and nothing else.
+    /// P3 PR-E — a monitor-penalized tier is not probed by the upgrade arm
+    /// (the eligibility plane is the ONE suppression system now).
     #[tokio::test(flavor = "multi_thread")]
-    async fn on_mode_upgrade_arm_respects_monitor_penalty() {
-        for (mode, expect_probe) in [
-            (path::PathMonMode::On, false),
-            (path::PathMonMode::Shadow, true),
-        ] {
-            let kp = WgKeypair::generate();
-            let peer_kp = WgKeypair::generate();
-            let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
-            let (tun_mock, _inj, _del) = MockTun::new();
-            let tf: TunFactory = {
-                let m = tun_mock.clone();
-                Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
-            };
-            let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
-            rt.path_shadow.lock().unwrap().mode = mode;
-            let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
-            let tun: Arc<dyn TunIo> = tun_mock;
-            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
-            let ctx = DirectCtx {
-                socks: vec![(my_ip, sock)],
-                my_ips: vec![my_ip],
-                endpoints: vec![],
-                public_sock: None,
-                punch: None,
-                my_nat: None,
-            };
-            let cooldowns = DirectCooldowns::default();
-            let mut relay: Option<RelayCoordinator> = None;
-            let mut by_node = HashMap::new();
-            let mut upgrade_probes = HashMap::new();
-            let mut lan_peer = peer(&peer_kp, "100.64.0.7");
-            lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
-            by_node.insert(
-                lan_peer.node_id,
-                Installed::base(
+    async fn upgrade_arm_respects_monitor_penalty() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let my_ip: Ipv4Addr = "10.1.2.9".parse().unwrap();
+        let ctx = DirectCtx {
+            socks: vec![(my_ip, sock)],
+            my_ips: vec![my_ip],
+            endpoints: vec![],
+            public_sock: None,
+            punch: None,
+            my_nat: None,
+        };
+        let mut relay: Option<RelayCoordinator> = None;
+        let mut by_node = HashMap::new();
+        let mut upgrade_probes = HashMap::new();
+        let mut lan_peer = peer(&peer_kp, "100.64.0.7");
+        lan_peer.lan_endpoints = vec!["10.1.2.3:1000".into()];
+        by_node.insert(
+            lan_peer.node_id,
+            Installed {
+                is_direct: false,
+                ..Installed::base(
                     peer_kp.public.to_bytes(),
                     "100.64.0.7".parse().unwrap(),
                     DirectTier::Relay,
                     Instant::now(),
-                ),
-            );
-            rt.path_shadow.lock().unwrap().mon.on_death(
-                &lan_peer.node_id,
-                DirectTier::Lan,
-                DeathReason::HandshakeDeadline,
-                true,
-                Instant::now(),
-            );
+                )
+            },
+        );
+        rt.path_shadow.lock().unwrap().mon.on_death(
+            &lan_peer.node_id,
+            DirectTier::Lan,
+            DeathReason::HandshakeDeadline,
+            true,
+            Instant::now(),
+        );
 
-            rt.install_peers(
-                &mut wg,
-                &mut by_node,
-                &mut relay,
-                &tun,
-                std::slice::from_ref(&lan_peer),
-                Some(&ctx),
-                &cooldowns,
-                &mut upgrade_probes,
-                &mut test_relay_bq(),
-                "test",
-            )
-            .await;
-            assert_eq!(
-                upgrade_probes.contains_key(&lan_peer.node_id),
-                expect_probe,
-                "mode {mode:?}: upgrade probe against a monitor-penalized tier"
-            );
-        }
-    }
-
-    /// P8 — with MBB on (the default), the LAN tier NEVER escalates to a
-    /// deny: shadow probes are free, so the retry cadence stays fixed at the
-    /// plain cooldown no matter the strike count; and the sticky threshold is
-    /// unreachable. (Env untouched — MBB defaults on; the kill-switch path is
-    /// covered by direct.rs's env-serialised test.)
-    #[test]
-    fn lan_tier_never_escalates_under_mbb() {
-        assert!(super::super::direct::make_before_break_enabled());
-        for fails in [0, 1, 2, 10, 1000] {
-            assert_eq!(
-                direct_retry_cooldown(DirectTier::Lan, fails),
-                DIRECT_COOLDOWN,
-                "LAN retry spacing must stay fixed at fails={fails}"
-            );
-        }
-        assert_eq!(direct_max_failures(DirectTier::Lan), u32::MAX);
-        // Public keeps the escalation (probing a dead public endpoint across
-        // the internet forever is a different cost profile).
+        rt.install_peers(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            std::slice::from_ref(&lan_peer),
+            Some(&ctx),
+            &mut upgrade_probes,
+            &mut test_relay_bq(),
+            "test",
+        )
+        .await;
+        assert!(
+            !upgrade_probes.contains_key(&lan_peer.node_id),
+            "no upgrade probe against a monitor-penalized tier"
+        );
+        // The suppression lapses (H_ORDINARY) — locked by path.rs's parity
+        // curves; here we just confirm the monitor still holds the strike.
         assert_eq!(
-            direct_retry_cooldown(DirectTier::Public, DIRECT_MAX_FAILURES),
-            DIRECT_DENY_COOLDOWN
+            rt.path_shadow
+                .lock()
+                .unwrap()
+                .mon
+                .strikes(&lan_peer.node_id, DirectTier::Lan),
+            1
         );
     }
 
@@ -4905,34 +4601,13 @@ mod tests {
         );
     }
 
-    /// rc.225 — an endpoint change wipes every tier's cooldown + strike count
-    /// for that peer (and only that peer), and the change predicate reacts to
-    /// LAN/srflx buckets but NOT the churny relay-advert bucket.
+    /// rc.225 (re-scoped by PR-E) — the endpoint-change PREDICATE reacts to
+    /// the LAN/srflx buckets but NOT the churny relay-advert bucket (the
+    /// wipe itself is `PathMonitor::on_endpoint_change`, locked by path.rs's
+    /// `endpoint_change_resets_penalties_strikes_and_q`).
     #[test]
-    fn endpoint_change_resets_direct_cooldowns() {
-        let now = Instant::now();
+    fn endpoint_change_predicate_tracks_direct_buckets_only() {
         let a = ObjectId::from_bytes([1; 12]);
-        let b = ObjectId::from_bytes([2; 12]);
-        let mut cd = DirectCooldowns::default();
-        for nid in [a, b] {
-            cd.lan.insert(nid, now + DIRECT_DENY_COOLDOWN);
-            cd.lan_fails.insert(nid, 3);
-            cd.public.insert(nid, now + DIRECT_DENY_COOLDOWN);
-            cd.public_fails.insert(nid, 2);
-            cd.srflx.insert(nid, now + SRFLX_DENY_COOLDOWN);
-            cd.srflx_fails.insert(nid, 3);
-        }
-        cd.reset_peer(&a);
-        assert!(!DirectCooldowns::cooling(&cd.lan, &a, now));
-        assert!(!DirectCooldowns::cooling(&cd.public, &a, now));
-        assert!(!DirectCooldowns::cooling(&cd.srflx, &a, now));
-        assert!(!cd.lan_fails.contains_key(&a), "strike count cleared");
-        assert!(
-            DirectCooldowns::cooling(&cd.lan, &b, now),
-            "other peers untouched"
-        );
-        assert_eq!(cd.lan_fails.get(&b), Some(&3));
-
         let mk = |lan: &[&str], srflx: &[&str], relay: &[&str]| NetmapPeer {
             node_id: a,
             overlay_ip: "100.64.0.9".into(),
@@ -5015,8 +4690,13 @@ mod tests {
             DirectTier::Relay.handshake_deadline(),
             RELAY_HANDSHAKE_DEADLINE
         );
-        assert_eq!(direct_max_failures(DirectTier::Srflx), SRFLX_MAX_FAILURES);
-        assert_eq!(direct_max_failures(DirectTier::Public), DIRECT_MAX_FAILURES);
+        // PR-E — the escalation thresholds live in the monitor now; keep the
+        // cross-tier relationships the deleted legacy tests guarded (const
+        // blocks: these are compile-time invariants, which is the point).
+        const {
+            assert!(path::MAX_FAILURES_SRFLX > path::MAX_FAILURES_LAN_PUBLIC);
+        }
+        assert!(path::H_ESCALATED.as_secs() > path::H_ORDINARY.as_secs() * 5);
     }
 
     /// Phase C (D7 + CC1) — the health sweep tears down a zombie srflx punch (a
@@ -5076,7 +4756,6 @@ mod tests {
         );
 
         let tun: Arc<dyn TunIo> = tun_mock;
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
         let mut relay: Option<RelayCoordinator> = None;
         let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
@@ -5086,7 +4765,6 @@ mod tests {
             &mut by_node,
             &mut relay,
             &tun,
-            &mut cooldowns,
             &mut relay_refresh,
             &current_peers,
         )
@@ -5096,21 +4774,25 @@ mod tests {
             !by_node.contains_key(&nid),
             "the zombie srflx carrier is torn down"
         );
+        // PR-E — the failure bookkeeping is the monitor's suppression plane.
+        let now = Instant::now();
+        let s = rt.path_shadow.lock().unwrap();
         assert!(
-            cooldowns.srflx.contains_key(&nid),
-            "the srflx cooldown is set"
+            !s.mon.eligible(&nid, DirectTier::Srflx, now),
+            "the srflx suppression penalty is booked"
         );
         assert_eq!(
-            cooldowns.srflx_fails.get(&nid),
-            Some(&1),
+            s.mon.strikes(&nid, DirectTier::Srflx),
+            1,
             "one srflx strike"
         );
         assert!(
-            !cooldowns.lan.contains_key(&nid) && !cooldowns.lan_fails.contains_key(&nid),
+            s.mon.eligible(&nid, DirectTier::Lan, now) && s.mon.strikes(&nid, DirectTier::Lan) == 0,
             "CC1: the LAN tier is NOT poisoned"
         );
         assert!(
-            !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
+            s.mon.eligible(&nid, DirectTier::Public, now)
+                && s.mon.strikes(&nid, DirectTier::Public) == 0,
             "CC1: the public-direct tier is NOT poisoned"
         );
     }
@@ -5174,7 +4856,6 @@ mod tests {
         );
 
         let tun: Arc<dyn TunIo> = tun_mock;
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
         let mut relay: Option<RelayCoordinator> = None;
         let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
@@ -5184,7 +4865,6 @@ mod tests {
             &mut by_node,
             &mut relay,
             &tun,
-            &mut cooldowns,
             &mut relay_refresh,
             &current_peers,
         )
@@ -5194,14 +4874,22 @@ mod tests {
             !by_node.contains_key(&nid),
             "the zombie LAN carrier is torn down"
         );
-        assert!(cooldowns.lan.contains_key(&nid), "the LAN cooldown is set");
-        assert_eq!(cooldowns.lan_fails.get(&nid), Some(&1), "one LAN strike");
+        // PR-E — the failure bookkeeping is the monitor's suppression plane.
+        let now = Instant::now();
+        let s = rt.path_shadow.lock().unwrap();
         assert!(
-            !cooldowns.srflx.contains_key(&nid) && !cooldowns.srflx_fails.contains_key(&nid),
+            !s.mon.eligible(&nid, DirectTier::Lan, now),
+            "the LAN suppression penalty is booked"
+        );
+        assert_eq!(s.mon.strikes(&nid, DirectTier::Lan), 1, "one LAN strike");
+        assert!(
+            s.mon.eligible(&nid, DirectTier::Srflx, now)
+                && s.mon.strikes(&nid, DirectTier::Srflx) == 0,
             "CC1: the srflx tier is NOT poisoned"
         );
         assert!(
-            !cooldowns.public.contains_key(&nid) && !cooldowns.public_fails.contains_key(&nid),
+            s.mon.eligible(&nid, DirectTier::Public, now)
+                && s.mon.strikes(&nid, DirectTier::Public) == 0,
             "CC1: the public-direct tier is NOT poisoned"
         );
     }
@@ -5327,7 +5015,6 @@ mod tests {
         let mut upgrade_probes: HashMap<ObjectId, UpgradeProbe> = HashMap::new();
         // The peer is NOT in the incoming netmap — i.e. it vanished.
         let mut current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
 
         rt.evict_peer(
@@ -5340,7 +5027,6 @@ mod tests {
             &mut alloc_q,
             &mut upgrade_probes,
             &mut current_peers,
-            &mut cooldowns,
             &mut relay_refresh,
         )
         .await;
@@ -5398,7 +5084,6 @@ mod tests {
         let mut alloc_q = test_alloc_q();
         let mut upgrade_probes: HashMap<ObjectId, UpgradeProbe> = HashMap::new();
         let mut current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
 
         rt.evict_peer(
@@ -5411,7 +5096,6 @@ mod tests {
             &mut alloc_q,
             &mut upgrade_probes,
             &mut current_peers,
-            &mut cooldowns,
             &mut relay_refresh,
         )
         .await;
@@ -5504,8 +5188,14 @@ mod tests {
         // The direct handshake completed (peer's response reached us).
         wg.test_latch_probe_handshake_done(&pk);
 
-        let mut cooldowns = DirectCooldowns::default();
-        cooldowns.srflx_fails.insert(nid, 2); // stale strikes, should clear on success
+        // Stale strikes in the monitor — the latch must clear them (CC1).
+        rt.path_shadow.lock().unwrap().mon.on_death(
+            &nid,
+            DirectTier::Srflx,
+            DeathReason::HandshakeDeadline,
+            true,
+            Instant::now() - Duration::from_secs(3600),
+        );
         let mut relay: Option<RelayCoordinator> = None;
 
         rt.sweep_upgrade_probes(
@@ -5514,7 +5204,6 @@ mod tests {
             &mut relay,
             &tun,
             &mut upgrade_probes,
-            &mut cooldowns,
             &mut test_relay_bq(),
         )
         .await;
@@ -5529,8 +5218,13 @@ mod tests {
             Some("127.0.0.1:9".into()),
             "off-link tier records its exit-exemption dst"
         );
-        assert!(
-            !cooldowns.srflx_fails.contains_key(&nid),
+        assert_eq!(
+            rt.path_shadow
+                .lock()
+                .unwrap()
+                .mon
+                .strikes(&nid, DirectTier::Srflx),
+            0,
             "success clears the tier's strikes"
         );
     }
@@ -5576,7 +5270,6 @@ mod tests {
         assert_eq!(wg.probe_count(), 1);
         // NOT latched — the direct path never handshook.
 
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay: Option<RelayCoordinator> = None;
 
         rt.sweep_upgrade_probes(
@@ -5585,7 +5278,6 @@ mod tests {
             &mut relay,
             &tun,
             &mut upgrade_probes,
-            &mut cooldowns,
             &mut test_relay_bq(),
         )
         .await;
@@ -5595,14 +5287,15 @@ mod tests {
         let inst = by_node.get(&nid).expect("relay carrier kept");
         assert!(!inst.is_direct, "the RELAY carrier is untouched (no stall)");
         assert_eq!(inst.tier, DirectTier::Relay);
+        let s = rt.path_shadow.lock().unwrap();
         assert_eq!(
-            cooldowns.srflx_fails.get(&nid),
-            Some(&1),
+            s.mon.strikes(&nid, DirectTier::Srflx),
+            1,
             "one srflx strike booked"
         );
         assert!(
-            cooldowns.srflx.contains_key(&nid),
-            "the srflx cooldown is set"
+            !s.mon.eligible(&nid, DirectTier::Srflx, Instant::now()),
+            "the srflx suppression penalty is set"
         );
     }
 
@@ -5613,7 +5306,6 @@ mod tests {
     async fn mbb_holds_relay_while_probe_in_flight() {
         let (rt, mut wg, tun, mut by_node, mut upgrade_probes, nid, _pk) =
             mbb_fixture(DirectTier::Srflx, Instant::now()).await;
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay: Option<RelayCoordinator> = None;
 
         rt.sweep_upgrade_probes(
@@ -5622,7 +5314,6 @@ mod tests {
             &mut relay,
             &tun,
             &mut upgrade_probes,
-            &mut cooldowns,
             &mut test_relay_bq(),
         )
         .await;
@@ -5633,8 +5324,13 @@ mod tests {
             !by_node.get(&nid).unwrap().is_direct,
             "the relay is still the routing carrier"
         );
-        assert!(
-            cooldowns.srflx_fails.is_empty(),
+        assert_eq!(
+            rt.path_shadow
+                .lock()
+                .unwrap()
+                .mon
+                .strikes(&nid, DirectTier::Srflx),
+            0,
             "no strike while the probe is still pending"
         );
     }
@@ -5671,7 +5367,6 @@ mod tests {
                 Instant::now(),
             )
         };
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay: Option<RelayCoordinator> = None;
 
         // Serialize env mutation (the CI overlay-l3 suite runs --test-threads=1).
@@ -5694,7 +5389,6 @@ mod tests {
             &mut relay,
             &tun,
             &current_peers,
-            &mut cooldowns,
             &mut probes,
             &mut test_relay_bq(),
             inb,
@@ -5726,7 +5420,6 @@ mod tests {
             &mut relay,
             &tun,
             &current_peers,
-            &mut cooldowns,
             &mut probes2,
             &mut test_relay_bq(),
             inb2,
@@ -5814,7 +5507,6 @@ mod tests {
         );
 
         let tun: Arc<dyn TunIo> = tun_mock;
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
         let mut relay: Option<RelayCoordinator> = None;
         let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
@@ -5824,7 +5516,6 @@ mod tests {
             &mut by_node,
             &mut relay,
             &tun,
-            &mut cooldowns,
             &mut relay_refresh,
             &current_peers,
         )
@@ -5835,7 +5526,11 @@ mod tests {
             "the silent established carrier is torn down via rx-staleness"
         );
         assert!(
-            cooldowns.srflx.contains_key(&nid),
+            !rt.path_shadow
+                .lock()
+                .unwrap()
+                .mon
+                .eligible(&nid, DirectTier::Srflx, Instant::now()),
             "the failure books on the carrier's own tier → relay fallback"
         );
     }
@@ -5902,7 +5597,6 @@ mod tests {
         );
 
         let tun: Arc<dyn TunIo> = tun_mock;
-        let mut cooldowns = DirectCooldowns::default();
         let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
         let mut relay: Option<RelayCoordinator> = None;
         let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
@@ -5912,7 +5606,6 @@ mod tests {
             &mut by_node,
             &mut relay,
             &tun,
-            &mut cooldowns,
             &mut relay_refresh,
             &current_peers,
         )
@@ -5926,10 +5619,14 @@ mod tests {
             by_node.get(&nid).unwrap().last_rx_at > old,
             "the sweep refreshed last_rx_at from the keepalive (rx_any), not rx"
         );
-        assert!(
-            cooldowns.srflx.is_empty() && cooldowns.srflx_fails.is_empty(),
-            "no failure is booked for a healthy carrier"
-        );
+        {
+            let s = rt.path_shadow.lock().unwrap();
+            assert!(
+                s.mon.eligible(&nid, DirectTier::Srflx, Instant::now())
+                    && s.mon.strikes(&nid, DirectTier::Srflx) == 0,
+                "no failure is booked for a healthy carrier"
+            );
+        }
     }
 
     /// bind-to-interface-by-route (Phase 1): with the gate OFF, `lan_egress_socket`
@@ -6018,7 +5715,6 @@ mod tests {
             punch: None,
             my_nat: None,
         };
-        let cooldowns = DirectCooldowns::default();
         let mut relay: Option<RelayCoordinator> = None;
         let mut by_node = HashMap::new();
 
@@ -6033,7 +5729,6 @@ mod tests {
             &tun,
             std::slice::from_ref(&tainted),
             Some(&ctx),
-            &cooldowns,
             &mut HashMap::new(),
             &mut test_relay_bq(),
             "test",
@@ -6055,7 +5750,6 @@ mod tests {
             &tun,
             std::slice::from_ref(&lan_peer),
             Some(&ctx),
-            &cooldowns,
             &mut HashMap::new(),
             &mut test_relay_bq(),
             "test",
@@ -6102,7 +5796,6 @@ mod tests {
             punch: Some(("93.184.216.90:5555".into(), punch_sock)),
             my_nat: None,
         };
-        let cooldowns = DirectCooldowns::default();
         let mut relay: Option<RelayCoordinator> = None;
         let mut by_node = HashMap::new();
         let mut upgrade_probes = HashMap::new();
@@ -6118,7 +5811,6 @@ mod tests {
             &tun,
             std::slice::from_ref(&p),
             Some(&ctx),
-            &cooldowns,
             &mut upgrade_probes,
             &mut test_relay_bq(),
             "test",
@@ -6149,7 +5841,6 @@ mod tests {
             &tun,
             std::slice::from_ref(&p),
             Some(&ctx),
-            &cooldowns,
             &mut upgrade_probes,
             &mut test_relay_bq(),
             "test",
@@ -6186,7 +5877,6 @@ mod tests {
             punch: None,
             my_nat: None,
         };
-        let cooldowns = DirectCooldowns::default();
         let mut relay: Option<RelayCoordinator> = None;
         let mut by_node = HashMap::new();
         let mut upgrade_probes = HashMap::new();
@@ -6201,7 +5891,6 @@ mod tests {
             &tun,
             std::slice::from_ref(&p),
             Some(&ctx),
-            &cooldowns,
             &mut upgrade_probes,
             &mut test_relay_bq(),
             "test",
