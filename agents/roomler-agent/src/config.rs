@@ -129,10 +129,12 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_TUN_PERSIST`). Built-in default: on.
     #[serde(default)]
     pub overlay_tun_persist: Option<bool>,
-    /// Install defended peer `/32`s (and assert the ULA `/96`) at route
-    /// metric 0 so they outrank a corp VPN's metric-1 mirror routes
-    /// (Cisco AnyConnect), Windows only
-    /// (`ROOMLER_NODE_OVERLAY_ROUTE_METRIC0`). Built-in default: on.
+    /// Install defended peer `/32`s (and the ULA `/96` + connected `/10`) at
+    /// route metric 0 so they outrank a corp VPN's metric-1 mirror routes,
+    /// Windows only (`ROOMLER_NODE_OVERLAY_ROUTE_METRIC0`). Built-in
+    /// default: **off** — AnyConnect's route monitor deletes routes that
+    /// would out-rank its own, which leaves the prefix unrouted (rc.289);
+    /// opt-in experiment, auto-yields to metric 1 when it doesn't stick.
     #[serde(default)]
     pub overlay_route_metric0: Option<bool>,
     /// Loopback-TURN corp-relay for co-located controllers
