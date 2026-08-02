@@ -448,6 +448,9 @@ impl AppState {
                         .map(|s| !s.is_empty())
                         .unwrap_or(false);
                     let nudged = hub.nudge_agent_if_idle(aid, tunnel_busy);
+                    if nudged {
+                        crate::cluster::metrics::bump(&crate::cluster::metrics::AGENT_NUDGE_TOTAL);
+                    }
                     Ok(serde_json::json!({ "nudged": nudged }))
                 })
             });
@@ -849,10 +852,10 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
 /// in time. Agents see a plain socket close (never a Goodbye — those are
 /// fatal client-side) and reconnect with backoff through the LB.
 pub async fn shutdown_cleanup(state: &AppState) {
-    // C-4 — release media-room claims FIRST (before the agent sweep's
-    // early return): a graceful deploy hands each conference off with a
-    // ZERO-length ownerless window — the next join re-claims on a live
-    // pod instead of waiting out the 30 s TTL.
+    // C-4/C-6 — release directory records for every locally-owned class
+    // FIRST (before the agent sweep's early return): a graceful deploy
+    // hands each entity off with a ZERO-length ownerless window instead
+    // of waiting out the TTLs (media 30 s, tunnel/derp 90 s).
     if let Some(dir) = &state.cluster_directory {
         let held: Vec<(bson::oid::ObjectId, String)> = state
             .media_claim_tokens
@@ -866,6 +869,45 @@ pub async fn shutdown_cleanup(state: &AppState) {
                 .await
             {
                 tracing::debug!(room = %rid, %e, "shutdown: media claim release failed");
+            }
+        }
+        // C-6 — tunnel session records (their sessions die with this
+        // pod; the CLI redials and re-opens on the survivor).
+        let held: Vec<(bson::oid::ObjectId, String)> = state
+            .tunnel_presence_tokens
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        for (sid, token) in held {
+            state.tunnel_presence_tokens.remove(&sid);
+            let _ = dir
+                .release(
+                    &crate::cluster::directory::tunnel_key(&sid.to_hex()),
+                    &token,
+                )
+                .await;
+        }
+        // C-6 — derp registrations (+ the per-network member index, so
+        // the survivor's convergence sweep sees a clean roster).
+        let held: Vec<(crate::ws::derp::DerpKey, String)> = state
+            .derp_presence_tokens
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        for ((net, pk), token) in held {
+            state.derp_presence_tokens.remove(&(net, pk));
+            let net_hex = net.to_hex();
+            let member = crate::ws::derp_cluster::pk_hex(&pk);
+            if let Ok(true) = dir
+                .release(
+                    &crate::cluster::directory::derp_key(&net_hex, &member),
+                    &token,
+                )
+                .await
+            {
+                let _ = dir
+                    .set_remove(&crate::cluster::directory::derpnet_key(&net_hex), &member)
+                    .await;
             }
         }
     }
