@@ -45,6 +45,17 @@ const TUNNEL_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// backoff loop handles them like any other connection failure.
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Receive-liveness deadline for the ESTABLISHED control WS. The server
+/// auto-pongs our 25 s keepalive Pings, so a healthy link never goes this
+/// long (3 keepalive periods + margin) without SOME inbound frame. Send
+/// success alone proves nothing: a TLS-inspecting corp middlebox terminates
+/// TCP locally and keeps ACKing our Pings after its upstream leg has died —
+/// field case PC50045 2026-08-02, where the agent sat "connected" for 45+
+/// minutes after a server pod roll while registered on no pod (heartbeats,
+/// log uploads and overlay all fine; rc/tunnel dead). Reconnect must key on
+/// frames RECEIVED, not frames sent.
+const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
+
 /// rc.58: format an error chain by walking `source()` so the top-level
 /// `Display` (which `tokio_tungstenite::Error` keeps deliberately
 /// terse) doesn't hide the root cause — TLS handshake error,
@@ -594,6 +605,12 @@ async fn connect_once(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // Swallow the immediate first tick.
 
+    // Receive-liveness stamp: refreshed on EVERY inbound frame (the Pongs the
+    // server auto-sends for our keepalive Pings count), checked against
+    // `WS_RX_DEADLINE` on the keepalive tick. See the const's doc for why
+    // send-success is not a liveness signal.
+    let mut last_rx = std::time::Instant::now();
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -607,6 +624,20 @@ async fn connect_once(
                 }
             }
             _ = keepalive.tick() => {
+                if last_rx.elapsed() > WS_RX_DEADLINE {
+                    warn!(
+                        silent_s = last_rx.elapsed().as_secs(),
+                        "no inbound WS frames within the RX deadline — half-open socket \
+                         (middlebox still ACKs our pings); reconnecting"
+                    );
+                    close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    return Err(ConnectError::Transient(anyhow::anyhow!(
+                        "ws rx deadline: no inbound frames for {} s",
+                        last_rx.elapsed().as_secs()
+                    )));
+                }
                 if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
                     warn!(%e, "keepalive ping failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
@@ -667,6 +698,7 @@ async fn connect_once(
             }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
+                    last_rx = std::time::Instant::now();
                     watchdog::tick("signaling");
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
@@ -715,6 +747,7 @@ async fn connect_once(
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
+                    last_rx = std::time::Instant::now();
                     let _ = ws.send(Message::Pong(data)).await;
                     watchdog::tick("signaling");
                 }
@@ -731,7 +764,11 @@ async fn connect_once(
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
-                _ => {}
+                // Pong (the server's auto-reply to our keepalive), Binary,
+                // raw frames — any inbound frame proves the link is alive.
+                Some(Ok(_)) => {
+                    last_rx = std::time::Instant::now();
+                }
             }
         }
     }

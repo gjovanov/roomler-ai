@@ -53,6 +53,16 @@ const WS_OUT_CHANNEL_DEPTH: usize = 256;
 /// ~5 min. Well under any real idle-reap window.
 const WS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Receive-liveness deadline (3 keepalive periods) for the established WS.
+/// The server auto-pongs our keepalive Pings, so a healthy link delivers an
+/// inbound frame at least every `WS_KEEPALIVE`. Send-success alone proves
+/// nothing: a TLS-inspecting corp middlebox (Check Point et al.) terminates
+/// TCP locally and keeps ACKing our Pings after its upstream leg has died —
+/// field case PC50045 2026-08-02 (agent twin of this loop sat half-open for
+/// 45+ min after a server pod roll). `WsSource::recv` treats the deadline as
+/// link-gone (`None`), which drives the normal reconnect path.
+const WS_RX_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Auto-reconnect backoff bounds. Start short (a session that ran then dropped
 /// usually reconnects instantly) and cap so a persistently-offline agent isn't
 /// hammered.
@@ -95,7 +105,19 @@ struct WsSource {
 #[async_trait]
 impl TunnelSignalingSource for WsSource {
     async fn recv(&mut self) -> Option<ServerMsg> {
-        while let Some(item) = self.inner.next().await {
+        // The timeout IS the receive-liveness check (see `WS_RX_DEADLINE`):
+        // a healthy link delivers at least the auto-pongs to our keepalive
+        // Pings, so `next()` never legitimately blocks this long. On expiry
+        // report link-gone and let the driver reconnect.
+        while let Ok(Some(item)) = tokio::time::timeout(WS_RX_DEADLINE, self.inner.next())
+            .await
+            .map_err(|_| {
+                warn!(
+                    deadline_s = WS_RX_DEADLINE.as_secs(),
+                    "no inbound WS frames within the RX deadline — half-open socket; ending source"
+                );
+            })
+        {
             match item {
                 Ok(Message::Text(t)) => match serde_json::from_str::<ServerMsg>(t.as_str()) {
                     Ok(m) => return Some(m),
