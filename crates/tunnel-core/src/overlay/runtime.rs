@@ -1891,17 +1891,34 @@ impl OverlayRuntime {
                             }
                         }
                         // The full netmap is AUTHORITATIVE: anything we still
-                        // hold that it does not list is gone — it left while we
-                        // were disconnected, or an admin evicted it. Before
-                        // this, only deltas drove removals, so a peer that
-                        // vanished unseen kept its Tunn, its crypto-route and
-                        // its OS /32 until the process exited. Now that the
-                        // server RECYCLES overlay addresses, that stale entry
-                        // blackholes the address's NEW owner the moment it is
-                        // finally reaped. This arm is also the RECONNECT path (a
-                        // WS re-join replies with a full netmap), which is
-                        // exactly when a peer is most likely to have vanished
-                        // unseen.
+                        // hold that it does not list is gone — released, or
+                        // ACL'd out.
+                        //
+                        // DEFENSIVE ONLY — do not read this as fixing a live
+                        // leak. `run()` sends ONE `OverlayJoin` and consumes the
+                        // first full netmap before this loop starts, and the
+                        // server only emits a full `OverlayNetmap` in reply to a
+                        // join, so today a second full netmap never reaches a
+                        // running loop. The runtime is scoped to ONE WS session
+                        // (`overlay::maybe_start` runs per connection and the
+                        // runtime ends when `overlay_evt_tx` drops), so a
+                        // disconnect tears down `by_node`, the WgDevice and the
+                        // TUN wholesale and the reconnect rebuilds from empty —
+                        // which already covers "a peer vanished while we were
+                        // away", more thoroughly than a diff could. Field-checked
+                        // 2026-08-02: cutting an agent's WS produced a second
+                        // `node runtime started` / `rc:overlay.join sent` /
+                        // `TUN up` and a full reinstall of every peer.
+                        //
+                        // It stays because it is cheap and it is the correct
+                        // behaviour the day anything does re-push a full netmap
+                        // into a live loop (a server-side re-fan, or a re-join
+                        // that keeps the connection). The removal paths that
+                        // actually run today are the delta `removes` arm and
+                        // `sweep_carrier_health` — those are what make
+                        // `Router::remove_by_pubkey` and
+                        // `del_peer_route_if_unowned` load-bearing under
+                        // address recycling, NOT this arm.
                         //
                         // MEMBERSHIP, not presence: P9 ghost rows are still
                         // LISTED (with `reachable = false`), so they are not
