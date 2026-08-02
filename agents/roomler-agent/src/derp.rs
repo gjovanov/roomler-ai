@@ -121,11 +121,27 @@ async fn run(
                 keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 keepalive.tick().await; // swallow the immediate first tick
                 let mut last_rx = std::time::Instant::now();
+                // A5 — resume detection (see signaling.rs RESUME_SKEW_MIN):
+                // monotonic timers exclude suspend, so a nap leaves a dead
+                // socket trusted for up to another RX-deadline window.
+                let mut skew_wall = std::time::SystemTime::now();
+                let mut skew_mono = std::time::Instant::now();
 
                 // Pump until either half dies (or the mux is torn down).
                 loop {
                     tokio::select! {
                         _ = keepalive.tick() => {
+                            let wall_gap = skew_wall.elapsed().unwrap_or_default();
+                            let mono_gap = skew_mono.elapsed();
+                            skew_wall = std::time::SystemTime::now();
+                            skew_mono = std::time::Instant::now();
+                            if wall_gap > mono_gap + std::time::Duration::from_secs(120) {
+                                warn!(
+                                    napped_s = (wall_gap - mono_gap).as_secs(),
+                                    "overlay derp: suspend/resume detected — cycling the /derp WS"
+                                );
+                                break;
+                            }
                             if last_rx.elapsed() > DERP_RX_DEADLINE {
                                 warn!(
                                     silent_s = last_rx.elapsed().as_secs(),
