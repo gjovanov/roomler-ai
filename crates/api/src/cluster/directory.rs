@@ -237,3 +237,11 @@ mod tests {
 pub fn tunnel_key(session_hex: &str) -> String {
     format!("roomler:own:tunnel:{session_hex}")
 }
+
+/// C-4 — media room claims: the SET-NX namespace (creation is mutually
+/// exclusive — see `ws/media_cluster.rs`). Short TTL: a crashed owner's
+/// room is unusable, so the claim must free fast for the rejoin path.
+pub const MEDIA_TTL_SECS: u64 = 30;
+pub fn media_key(room_hex: &str) -> String {
+    format!("roomler:own:media:{room_hex}")
+}
