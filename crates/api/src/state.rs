@@ -100,6 +100,15 @@ pub struct AppState {
     /// never explicitly released — the 90 s TTL reaps ≤90 s after any of
     /// the four teardown paths drops the map entry.
     pub tunnel_presence_tokens: Arc<DashMap<ObjectId, String>>,
+    /// C-4 — directory owner-tokens for LOCAL media rooms
+    /// (`roomler:own:media:<room>`, the SET-NX namespace). Written when a
+    /// claim is won (call/start or media:join); refreshed every 10 s by
+    /// the media claim heartbeat; released on room close / shutdown.
+    pub media_claim_tokens: Arc<DashMap<ObjectId, String>>,
+    /// C-4 — LOCAL viewer connections joined to a REMOTE media room
+    /// (conn_id → room). On WS close the owner pod is told to drop the
+    /// participant's transports (`ws::media_cluster::forward_close_leave`).
+    pub remote_media_conns: Arc<DashMap<String, ObjectId>>,
 
     // C-1 — cluster foundation (None without Redis; consumers fail soft).
     /// Stable pod identity + process epoch.
@@ -299,6 +308,8 @@ impl AppState {
         // owns the reaction.
         let agent_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
         let tunnel_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
+        let media_claim_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
+        let remote_media_conns: Arc<DashMap<String, ObjectId>> = Arc::new(DashMap::new());
         let tunnel_clients_by_session: TunnelClientOutbound = Arc::new(DashMap::new());
         let tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
             Arc::new(DashMap::new());
@@ -337,6 +348,20 @@ impl AppState {
                             // applies locally; the one holding the entity acts.
                             if let Some(ctrl) = envelope.get("ctrl") {
                                 crate::ws::remote_control::apply_rc_ctrl(&ctrl_hub, ctrl);
+                                continue;
+                            }
+                            // C-4 — conn-addressed delivery (media replies +
+                            // pushes from a room's owner pod): whichever pod
+                            // holds the socket delivers; everyone else drops.
+                            if let Some(conn) = envelope["conn"].as_str() {
+                                if let Some(message) = envelope.get("message") {
+                                    crate::ws::dispatcher::send_to_connection(
+                                        &fwd_storage,
+                                        conn,
+                                        message,
+                                    )
+                                    .await;
+                                }
                                 continue;
                             }
                             // S6 broadcast envelopes (presence fan-out): each
@@ -485,7 +510,7 @@ impl AppState {
         let overlay_networks = Arc::new(OverlayNetworkDao::new(&db));
         let overlay_nodes = Arc::new(OverlayNodeDao::new(&db));
 
-        Ok(Self {
+        let state = Self {
             db,
             settings,
             pod,
@@ -525,6 +550,8 @@ impl AppState {
             rc_hub,
             agent_presence_tokens,
             tunnel_presence_tokens: tunnel_presence_tokens.clone(),
+            media_claim_tokens,
+            remote_media_conns,
             tunnel_clients,
             tunnel_policies,
             tunnel_audit,
@@ -538,7 +565,14 @@ impl AppState {
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
             tunnel_release_cache: crate::routes::tunnel_release::LatestTunnelReleaseCache::new(),
             setup_release_cache: crate::routes::setup_release::LatestSetupReleaseCache::new(),
-        })
+        };
+
+        // C-4 — media claim-or-route: bus handlers (owner-side command
+        // execution) + the 10 s claim heartbeat. Registered on the built
+        // state because the handlers need the full AppState.
+        crate::ws::media_cluster::wire_media_cluster(&state);
+
+        Ok(state)
     }
 }
 
@@ -773,6 +807,27 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
 /// in time. Agents see a plain socket close (never a Goodbye — those are
 /// fatal client-side) and reconnect with backoff through the LB.
 pub async fn shutdown_cleanup(state: &AppState) {
+    // C-4 — release media-room claims FIRST (before the agent sweep's
+    // early return): a graceful deploy hands each conference off with a
+    // ZERO-length ownerless window — the next join re-claims on a live
+    // pod instead of waiting out the 30 s TTL.
+    if let Some(dir) = &state.cluster_directory {
+        let held: Vec<(bson::oid::ObjectId, String)> = state
+            .media_claim_tokens
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        for (rid, token) in held {
+            state.media_claim_tokens.remove(&rid);
+            if let Err(e) = dir
+                .release(&crate::cluster::directory::media_key(&rid.to_hex()), &token)
+                .await
+            {
+                tracing::debug!(room = %rid, %e, "shutdown: media claim release failed");
+            }
+        }
+    }
+
     let ids = state.rc_hub.cancel_all_agents();
     if ids.is_empty() {
         return;
