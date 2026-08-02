@@ -30,6 +30,17 @@ use tunnel_core::transport::derp::DerpMux;
 const DERP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Reconnect backoff ceiling.
 const DERP_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Keepalive Ping cadence on the established `/derp` WS. An idle DERP socket
+/// is legitimately silent (frames only flow while a both-UDP-blocked pair is
+/// relaying), so WITHOUT our own pings the RX deadline below would false-fire
+/// on healthy idle links. The server auto-pongs, giving a healthy link an
+/// inbound frame at least this often.
+const DERP_KEEPALIVE: Duration = Duration::from_secs(25);
+/// Receive-liveness deadline (3 keepalive periods + margin). Same rationale
+/// as `signaling::WS_RX_DEADLINE`: a TLS-inspecting corp middlebox keeps
+/// ACKing our pings after its upstream leg died, so send-success proves
+/// nothing — reconnect must key on frames RECEIVED.
+const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
 
 /// Derive the `/derp` WSS URL from the control `ws_url` (`wss://host/ws`).
 fn derp_url_from_ws(ws_url: &str) -> String {
@@ -106,9 +117,27 @@ async fn run(
                 }
                 info!("overlay derp: /derp WS connected + registered");
 
+                let mut keepalive = tokio::time::interval(DERP_KEEPALIVE);
+                keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                keepalive.tick().await; // swallow the immediate first tick
+                let mut last_rx = std::time::Instant::now();
+
                 // Pump until either half dies (or the mux is torn down).
                 loop {
                     tokio::select! {
+                        _ = keepalive.tick() => {
+                            if last_rx.elapsed() > DERP_RX_DEADLINE {
+                                warn!(
+                                    silent_s = last_rx.elapsed().as_secs(),
+                                    "overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting"
+                                );
+                                break;
+                            }
+                            if tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                warn!("overlay derp: keepalive ping failed; reconnecting");
+                                break;
+                            }
+                        }
                         out = outbound_rx.recv() => match out {
                             // A carrier frame to relay: [peer_pubkey||payload].
                             Some(frame) => {
@@ -124,15 +153,23 @@ async fn run(
                             }
                         },
                         inb = rx.next() => match inb {
-                            Some(Ok(Message::Binary(data))) => match mux.upgrade() {
-                                Some(m) => m.deliver(&data[..]),
-                                None => return,
-                            },
+                            Some(Ok(Message::Binary(data))) => {
+                                last_rx = std::time::Instant::now();
+                                match mux.upgrade() {
+                                    Some(m) => m.deliver(&data[..]),
+                                    None => return,
+                                }
+                            }
                             // Keep the corp middlebox happy; ignore text.
                             Some(Ok(Message::Ping(p))) => {
+                                last_rx = std::time::Instant::now();
                                 let _ = tx.send(Message::Pong(p)).await;
                             }
-                            Some(Ok(_)) => {}
+                            // Pong (auto-reply to our keepalive) et al. — any
+                            // inbound frame proves the link is alive.
+                            Some(Ok(_)) => {
+                                last_rx = std::time::Instant::now();
+                            }
                             Some(Err(_)) | None => break,
                         },
                     }
