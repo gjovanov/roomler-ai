@@ -138,10 +138,18 @@ Two consequences worth knowing:
   deliberately no per-machine overlay denylist.
 
 Because addresses are reused, the client keys every routing teardown by
-**pubkey**, never by address, drops an OS `/32` only when no surviving peer
-still claims it, and prunes anything the full netmap no longer lists. A *name*
-in `overlay_exit_node` is pinned to the node it first resolved to — see
+**pubkey**, never by address, and drops an OS `/32` only when no surviving peer
+still claims it. Those two rules are what stop a late reap of a stale peer from
+blackholing the address's new owner; the paths that exercise them are the delta
+`removes` arm and `sweep_carrier_health`'s lazy reap. A *name* in
+`overlay_exit_node` is pinned to the node it first resolved to — see
 `docs/overlay-exit-nodes.md`.
+
+Note that a **disconnect needs no pruning**: the node runtime is scoped to one
+control-WS session, so losing the WS tears down `by_node`, the WireGuard device
+and the TUN, and the reconnect rebuilds from an empty state. (There is a
+defensive diff-and-prune on the full-netmap arm, but a second full netmap never
+reaches a live runtime today — the server only sends one in reply to a join.)
 
 ---
 
