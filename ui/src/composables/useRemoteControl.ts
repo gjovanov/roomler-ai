@@ -2352,6 +2352,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    */
   let lastConnectArgs: { agentId: string; permissions: string } | null = null
   const reconnectAttempt = ref(0)
+  // C-2 — one-shot rehome guard: `agent_on_other_pod` triggers a forced
+  // WS redial (the LB re-hashes the fresh dial onto the agent's pod) and
+  // ONE retry. The cap prevents ping-pong on a stale directory record.
+  let rehomedOnce = false
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   // Ã¢ÂÂÃ¢ÂÂ S3 viewer resilience state Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -4972,6 +4976,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // C-2 rehome: the server says the agent's socket is registered on
+      // ANOTHER pod (our WS parked on a stale hash). Force-redial the WS
+      // (the LB re-hashes the fresh dial) and retry exactly once — the
+      // cap prevents ping-pong on a stale directory record.
+      if (msg.code === 'agent_on_other_pod' && !rehomedOnce && lastConnectArgs) {
+        rehomedOnce = true
+        console.info('[rc] agent is homed on another pod; re-dialing the WS and retrying once')
+        ws.forceRedial()
+        scheduleReconnect({ notifyServer: false })
+        return
+      }
       // Mid-ladder transients (agent_busy while the old slot frees,
       // agent_offline while the agent WS flaps back) advance the
       // ladder instead of killing it. First-connect errors still fail
@@ -5015,6 +5030,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       reconnectTimer = null
     }
     reconnectAttempt.value = 0
+    rehomedOnce = false
   }
 
   /**

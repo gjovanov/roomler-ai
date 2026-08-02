@@ -386,7 +386,7 @@ pub async fn pump_server_messages(
 
 /// Route a parsed `rc:*` message coming from a controller browser tab.
 /// Returns `true` if the message was handled, `false` if it wasn't rc:*.
-pub fn dispatch_controller_rc(
+pub async fn dispatch_controller_rc(
     state: &AppState,
     user_id: ObjectId,
     controller_name: &str,
@@ -399,6 +399,7 @@ pub fn dispatch_controller_rc(
     let Ok(parsed) = serde_json::from_str::<ClientMsg>(text) else {
         return false;
     };
+    let is_session_request = matches!(&parsed, ClientMsg::SessionRequest { .. });
     let ctx = DispatchCtx {
         role: Role::Controller,
         user_id: Some(user_id),
@@ -410,10 +411,55 @@ pub fn dispatch_controller_rc(
     };
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
-        // Phase A-1 split-evidence probe: a LOCAL "agent offline" while
-        // another pod holds a fresh presence record = a live cross-pod
-        // split — the exact green-but-unreachable incident class. Counted
-        // + logged; gates the Phase A-2 rehome work.
+        // C-2 rehome: a SessionRequest that missed the LOCAL hub while a
+        // FOREIGN pod holds a fresh presence record is a cross-pod split,
+        // not a real offline. Tell the controller which state it's in
+        // (`agent_on_other_pod` → the UI force-redials its WS and retries
+        // once) and nudge the owning pod to cycle the agent's WS if idle —
+        // both ends then re-land at the current LB hash. Probe budget
+        // 250 ms; on any probe failure fall through to the honest
+        // `agent_offline`.
+        if is_session_request
+            && let roomler_ai_remote_control::error::Error::AgentOffline(agent_hex) = &e
+            && let Some(redis) = &state.redis_pubsub
+            && let Ok(Ok(Some(owner))) = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                redis.agent_presence_foreign(agent_hex),
+            )
+            .await
+        {
+            note_agent_offline_evidence(state, agent_hex.clone(), "controller_session");
+            let owner_pod = crate::cluster::directory::OwnerRecord::parse(&owner)
+                .map(|r| r.pod_id)
+                .unwrap_or_default();
+            let _ = controller_tx.try_send(ServerMsg::Error {
+                session_id: None,
+                code: "agent_on_other_pod".to_string(),
+                message: format!("agent is homed on pod {owner_pod}; re-dial and retry"),
+                open_nonce: None,
+            });
+            // Fire-and-forget idle nudge at the owner.
+            if let (Some(bus), false) = (&state.cluster_bus, owner_pod.is_empty()) {
+                let bus = bus.clone();
+                let agent_hex = agent_hex.clone();
+                tokio::spawn(async move {
+                    match bus
+                        .request(
+                            &owner_pod,
+                            "rc.agent_nudge",
+                            serde_json::json!({ "agent_id": agent_hex }),
+                        )
+                        .await
+                    {
+                        Ok(rep) => debug!(agent = %agent_hex, ?rep, "rc rehome nudge sent"),
+                        Err(e) => debug!(agent = %agent_hex, %e, "rc rehome nudge failed"),
+                    }
+                });
+            }
+            return true;
+        }
+        // Phase A-1 split-evidence probe for the remaining offline paths
+        // (non-session-request messages, probe timeouts).
         if let roomler_ai_remote_control::error::Error::AgentOffline(agent_hex) = &e {
             note_agent_offline_evidence(state, agent_hex.clone(), "controller_session");
         }
@@ -539,6 +585,59 @@ pub async fn resolve_session_authz(
         return Ok(SessionAuthz::allow(mode));
     }
     Err("you're not on this device's control allowlist".to_string())
+}
+
+/// C-2 — publish an rc control event on the global channel. Control
+/// events are IDEMPOTENT hub operations every pod applies locally (the
+/// one holding the session/agent acts; the rest no-op), which makes
+/// consent delivery and admin kicks location-transparent: the HTTP
+/// request can land on any pod. The publisher already applied locally —
+/// the self-echo guard in the forwarder skips its own envelope.
+pub async fn publish_rc_ctrl(state: &AppState, evt: &str, mut fields: serde_json::Value) {
+    let Some(redis) = &state.redis_pubsub else {
+        return;
+    };
+    if let Some(obj) = fields.as_object_mut() {
+        obj.insert("class".into(), serde_json::json!("rc"));
+        obj.insert("evt".into(), serde_json::json!(evt));
+    }
+    let env = serde_json::json!({ "origin": redis.instance_id(), "ctrl": fields });
+    if let Err(e) = redis.publish(&env.to_string()).await {
+        debug!(%evt, %e, "rc ctrl publish failed (cross-pod delivery degraded)");
+    }
+}
+
+/// C-2 — apply a received rc control event to THIS pod's hub. Idempotent:
+/// misses are no-ops (the entity lives elsewhere or is already gone).
+pub fn apply_rc_ctrl(hub: &roomler_ai_remote_control::Hub, ctrl: &serde_json::Value) {
+    match ctrl.get("evt").and_then(|v| v.as_str()) {
+        Some("consent") => {
+            let (Some(sid), Some(granted)) = (
+                ctrl.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok()),
+                ctrl.get("granted").and_then(|v| v.as_bool()),
+            ) else {
+                return;
+            };
+            if hub.deliver_consent(sid, granted).is_ok() {
+                info!(session = %sid, granted, "rc ctrl: consent applied from another pod");
+            }
+        }
+        Some("kick") => {
+            let Some(aid) = ctrl
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| ObjectId::parse_str(s).ok())
+            else {
+                return;
+            };
+            if hub.unregister_agent(aid, None) {
+                info!(agent = %aid, "rc ctrl: kick applied from another pod");
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Phase A-1 split-evidence probe (A2b): fired on a LOCAL hub miss; if
