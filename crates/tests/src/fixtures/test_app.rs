@@ -92,15 +92,20 @@ impl TestApp {
     /// liveness deadlines.
     pub async fn spawn_pair(mutator: fn(&mut Settings)) -> (Self, Self) {
         let shared_db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
-        let db1 = shared_db.clone();
+        let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        let (db1, pod1) = (shared_db.clone(), format!("testpod1-{run}"));
         let app1 = Self::spawn_with_settings(move |s| {
             s.database.name = db1.clone();
+            // C-1: distinct stable pod identities per in-process app (env
+            // vars are process-global, so identity must ride Settings).
+            s.app.pod_id = Some(pod1.clone());
             mutator(s);
         })
         .await;
-        let db2 = shared_db.clone();
+        let (db2, pod2) = (shared_db.clone(), format!("testpod2-{run}"));
         let app2 = Self::spawn_with_settings(move |s| {
             s.database.name = db2.clone();
+            s.app.pod_id = Some(pod2.clone());
             mutator(s);
         })
         .await;
@@ -285,6 +290,7 @@ fn test_settings() -> Settings {
             cors_origins: vec![],
             frontend_url: "http://localhost:5173".to_string(),
             environment: "development".to_string(),
+            pod_id: None,
         },
         database: roomler_ai_config::DatabaseSettings {
             url: "mongodb://localhost:27019".to_string(),

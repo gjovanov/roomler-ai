@@ -84,6 +84,14 @@ pub struct AppSettings {
     /// `ROOMLER__APP__ENVIRONMENT=production` in the configmap.
     #[serde(default = "default_environment")]
     pub environment: String,
+    /// C-1 — explicit stable pod identity override
+    /// (`ROOMLER__APP__POD_ID`). Unset (the default) resolves through
+    /// `ROOMLER__POD_HOST_IP` (hostNetwork ⇒ ≤1 pod/node, so the node IP
+    /// IS the pod identity — the same key the LB upstream list and the
+    /// mediasoup announced-ip map use) → hostname → a random dev id.
+    /// Tests inject distinct values per in-process TestApp.
+    #[serde(default)]
+    pub pod_id: Option<String>,
     /// Sustained per-client-IP rate for `/api`, in **requests per second**.
     /// Default 1. The e2e overlay bumps this so a Playwright Job's single
     /// pod IP doesn't trip 429s during the suite.
@@ -390,6 +398,7 @@ mod rate_limit_tests {
             cors_origins: vec![],
             frontend_url: "http://localhost".into(),
             environment: "development".into(),
+            pod_id: None,
             rate_limit_per_sec: per_sec,
             rate_limit_burst: 60,
             rate_limit_trusted_hops: 1,
