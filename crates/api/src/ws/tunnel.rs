@@ -934,6 +934,11 @@ async fn handle_forward_request(
                 Err(e) => {
                     // Agent not online or its channel is wedged.
                     warn!(origin = %orig.log_id(), %flow_id, agent = %s.agent_id, %e, "agent relay failed");
+                    crate::ws::remote_control::note_agent_offline_evidence(
+                        state,
+                        s.agent_id.to_hex(),
+                        "tunnel_forward",
+                    );
                     audit_tcp_reject(
                         state,
                         s,
@@ -1262,6 +1267,11 @@ async fn relay_ice_to_agent(
         },
     ) {
         debug!(%request_session_id, %e, "tunnel ICE relay to agent failed");
+        crate::ws::remote_control::note_agent_offline_evidence(
+            state,
+            s.agent_id.to_hex(),
+            "tunnel_ice",
+        );
     }
 }
 

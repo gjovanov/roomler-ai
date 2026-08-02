@@ -500,7 +500,7 @@ async fn handle_client_message(
                 }
             };
         let handled = crate::ws::remote_control::dispatch_controller_rc(
-            &state.rc_hub,
+            state,
             *user_id,
             username,
             rc_controller_tx,

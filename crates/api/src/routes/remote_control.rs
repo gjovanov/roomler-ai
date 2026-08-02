@@ -181,6 +181,17 @@ pub async fn enroll_agent(
 // Agent CRUD
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Phase A-1 three-state presence (see `to_agent_response`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPresence {
+    /// An rc socket is registered on some pod — Connect will work.
+    Online,
+    /// Heartbeat trail fresh but no pod claims the socket — amber.
+    Stale,
+    Offline,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgentResponse {
     pub id: String,
@@ -191,8 +202,11 @@ pub struct AgentResponse {
     pub os: OsKind,
     pub agent_version: String,
     pub status: AgentStatus,
-    /// Live `true` when the Hub holds an active WS to this agent, independent
-    /// of the persisted `status` field (which can drift across restarts).
+    /// Three-state truth: `online` | `stale` | `offline` (Phase A-1).
+    pub presence: AgentPresence,
+    /// Back-compat bool = `presence == online` (a socket is actually
+    /// registered; pre-A-1 this also counted heartbeat-only agents,
+    /// which is what showed green on dead sockets).
     pub is_online: bool,
     pub last_seen_at: String,
     pub access_policy: AccessPolicy,
@@ -225,10 +239,14 @@ pub async fn list_agents(
     }
 
     let page = state.agents.list_for_tenant(tid, &params).await?;
+    let redis_fresh = agent_presence_batch(&state, &page.items).await;
     let items: Vec<AgentResponse> = page
         .items
         .into_iter()
-        .map(|a| to_agent_response(&state, a))
+        .map(|a| {
+            let fresh = a.id.map(|i| redis_fresh.contains(&i)).unwrap_or(false);
+            to_agent_response(&state, a, fresh)
+        })
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -255,7 +273,9 @@ pub async fn get_agent(
     }
 
     let agent = state.agents.find_in_tenant(tid, aid).await?;
-    Ok(Json(to_agent_response(&state, agent)))
+    let redis_fresh = agent_presence_batch(&state, std::slice::from_ref(&agent)).await;
+    let fresh = agent.id.map(|i| redis_fresh.contains(&i)).unwrap_or(false);
+    Ok(Json(to_agent_response(&state, agent, fresh)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -660,20 +680,58 @@ pub async fn turn_credentials(
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Batched cross-pod presence read for the listing (Phase A-1): one MGET
+/// under a 200 ms budget. Returns the set of agent ids with a FRESH
+/// (TTL-enforced) directory record on ANY pod. Redis down / timeout ⇒
+/// empty set — `to_agent_response` then degrades to the pre-A-1
+/// heartbeat disjunction, never to hard-offline.
+async fn agent_presence_batch(
+    state: &AppState,
+    agents: &[roomler_ai_remote_control::models::Agent],
+) -> std::collections::HashSet<ObjectId> {
+    let Some(redis) = &state.redis_pubsub else {
+        return Default::default();
+    };
+    let ids: Vec<ObjectId> = agents.iter().filter_map(|a| a.id).collect();
+    let hexes: Vec<String> = ids.iter().map(|i| i.to_hex()).collect();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        redis.agent_presence_get_many(&hexes),
+    )
+    .await
+    {
+        Ok(Ok(vals)) => ids
+            .into_iter()
+            .zip(vals)
+            .filter_map(|(id, v)| v.map(|_| id))
+            .collect(),
+        Ok(Err(e)) => {
+            tracing::debug!(%e, "agent presence MGET failed; degrading to heartbeat disjunction");
+            Default::default()
+        }
+        Err(_) => {
+            tracing::debug!("agent presence MGET timed out; degrading to heartbeat disjunction");
+            Default::default()
+        }
+    }
+}
+
 fn to_agent_response(
     state: &AppState,
     a: roomler_ai_remote_control::models::Agent,
+    redis_fresh: bool,
 ) -> AgentResponse {
     let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
-    // S6 — the rc-hub only knows agents whose WS lands on THIS pod. For
-    // listings, an agent whose Mongo row says `status: Online` with a
-    // heartbeat in the last 90 s counts as online even when its socket
-    // lives on the other pod (hello sets Online, heartbeats bump
-    // `last_seen_at` every 30 s, a clean WS close marks Offline, and a
-    // crashed agent ages out via the 90 s window). The status gate keeps
-    // a freshly-enrolled never-connected agent (status: Offline,
-    // last_seen_at = enrollment time) honestly offline. Hub-local
-    // presence still wins instantly for the common case.
+    // Phase A-1 three-state presence. "online" = an rc socket is
+    // REGISTERED somewhere (this pod's hub, or any pod's fresh Redis
+    // directory record) — the state in which Connect will actually work.
+    // "stale" = the Mongo heartbeat trail is fresh but no pod claims the
+    // socket (half-open middlebox leg, directory outage, or a pod that
+    // died without cleanup) — visible, amber, Connect disabled. "offline"
+    // = neither. With Redis down `redis_fresh` is always false, so the
+    // presence degrades to the pre-A-1 heartbeat disjunction (a cross-pod
+    // agent shows "stale" instead of "online" — degraded, never lying
+    // green on a dead socket ONLY, and never hard-offline).
     let hub_online =
         a.id.map(|i| state.rc_hub.is_agent_online(i))
             .unwrap_or(false);
@@ -684,8 +742,18 @@ fn to_agent_response(
         let age_ms = bson::DateTime::now().timestamp_millis() - a.last_seen_at.timestamp_millis();
         age_ms < 90_000
     };
-    let is_online = hub_online || recently_seen;
+    let presence = if hub_online || redis_fresh {
+        AgentPresence::Online
+    } else if recently_seen {
+        AgentPresence::Stale
+    } else {
+        AgentPresence::Offline
+    };
+    // Back-compat: `is_online` = the reachable state only. (Pre-A-1 it
+    // was `hub_online || recently_seen`, which is what lied green.)
+    let is_online = matches!(presence, AgentPresence::Online);
     AgentResponse {
+        presence,
         id,
         tenant_id: a.tenant_id.to_hex(),
         owner_user_id: a.owner_user_id.to_hex(),

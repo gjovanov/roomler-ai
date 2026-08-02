@@ -148,11 +148,12 @@
             <td>
               <div class="d-flex align-center">
                 <v-icon
-                  :color="a.is_online ? 'success' : 'grey'"
+                  :color="presenceColor(a)"
                   size="small"
                   class="mr-2"
+                  :title="presenceTitle(a)"
                 >
-                  {{ a.is_online ? 'mdi-circle' : 'mdi-circle-outline' }}
+                  {{ presenceIcon(a) }}
                 </v-icon>
                 <span class="font-weight-medium">{{ a.name }}</span>
                 <v-btn
@@ -178,8 +179,13 @@
               </div>
             </td>
             <td>
-              <v-chip size="small" :color="statusColor(a)" variant="flat">
-                {{ a.is_online ? 'Online' : a.status }}
+              <v-chip
+                size="small"
+                :color="statusColor(a)"
+                variant="flat"
+                :title="presenceTitle(a)"
+              >
+                {{ statusLabel(a) }}
               </v-chip>
             </td>
             <td>
@@ -260,11 +266,12 @@
           <v-card-text class="pa-3">
             <div class="d-flex align-center mb-1">
               <v-icon
-                :color="a.is_online ? 'success' : 'grey'"
+                :color="presenceColor(a)"
                 size="small"
                 class="mr-2"
+                :title="presenceTitle(a)"
               >
-                {{ a.is_online ? 'mdi-circle' : 'mdi-circle-outline' }}
+                {{ presenceIcon(a) }}
               </v-icon>
               <span class="font-weight-medium">{{ a.name }}</span>
               <v-btn
@@ -290,8 +297,13 @@
                 title="Update agent now"
               />
               <v-spacer />
-              <v-chip size="x-small" :color="statusColor(a)" variant="flat">
-                {{ a.is_online ? 'Online' : a.status }}
+              <v-chip
+                size="x-small"
+                :color="statusColor(a)"
+                variant="flat"
+                :title="presenceTitle(a)"
+              >
+                {{ statusLabel(a) }}
               </v-chip>
             </div>
             <div class="text-caption text-medium-emphasis mb-2">
@@ -734,10 +746,47 @@ function osIcon(os: string) {
   }
 }
 
+/** Phase A-1 — tolerate older API responses without `presence`. */
+function presenceOf(a: Agent): 'online' | 'stale' | 'offline' {
+  return a.presence ?? (a.is_online ? 'online' : 'offline')
+}
+
+function presenceColor(a: Agent) {
+  const p = presenceOf(a)
+  if (p === 'online') return 'success'
+  if (p === 'stale') return 'warning'
+  return 'grey'
+}
+
+function presenceIcon(a: Agent) {
+  const p = presenceOf(a)
+  if (p === 'online') return 'mdi-circle'
+  if (p === 'stale') return 'mdi-circle-half-full'
+  return 'mdi-circle-outline'
+}
+
+function presenceTitle(a: Agent): string {
+  if (presenceOf(a) !== 'stale') return ''
+  return (
+    'Socket stale — the agent heartbeats but no server holds its live connection ' +
+    '(half-open network leg or a recent server roll). It should self-heal within ' +
+    'minutes; otherwise restart the Roomler service on the machine.'
+  )
+}
+
 function statusColor(a: Agent) {
-  if (a.is_online) return 'success'
+  const p = presenceOf(a)
+  if (p === 'online') return 'success'
+  if (p === 'stale') return 'warning'
   if (a.status === 'quarantined') return 'error'
   return 'grey'
+}
+
+function statusLabel(a: Agent): string {
+  const p = presenceOf(a)
+  if (p === 'online') return 'Online'
+  if (p === 'stale') return 'Stale'
+  return a.status
 }
 
 function fmtDate(iso: string): string {

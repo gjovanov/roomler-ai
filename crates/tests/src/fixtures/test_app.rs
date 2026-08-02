@@ -12,6 +12,9 @@ pub struct TestApp {
     pub db: Database,
     pub settings: Settings,
     pub client: reqwest::Client,
+    /// The server's own state — lets tests drive in-process surfaces the
+    /// HTTP API doesn't expose (rc-hub introspection, `shutdown_cleanup`).
+    pub state: AppState,
 }
 
 impl TestApp {
@@ -45,6 +48,7 @@ impl TestApp {
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
             .expect("Failed to create AppState");
+        let state = app_state.clone();
         let app = build_router(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -73,11 +77,34 @@ impl TestApp {
             db,
             settings,
             client,
+            state,
         }
     }
 
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    /// Phase A-1 — model TWO pods: two servers over ONE database (and the
+    /// one shared Redis at :6379), each with its own pod-local in-memory
+    /// state (rc-hub, room manager, …). The second app shortens nothing;
+    /// pass a `mutator` applied to BOTH apps' settings for e.g. short
+    /// liveness deadlines.
+    pub async fn spawn_pair(mutator: fn(&mut Settings)) -> (Self, Self) {
+        let shared_db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
+        let db1 = shared_db.clone();
+        let app1 = Self::spawn_with_settings(move |s| {
+            s.database.name = db1.clone();
+            mutator(s);
+        })
+        .await;
+        let db2 = shared_db.clone();
+        let app2 = Self::spawn_with_settings(move |s| {
+            s.database.name = db2.clone();
+            mutator(s);
+        })
+        .await;
+        (app1, app2)
     }
 
     /// Spawn a test server with customized settings.
@@ -101,13 +128,18 @@ impl TestApp {
             .expect("Failed to parse MongoDB URL");
         let mongo_client =
             Client::with_options(client_options).expect("Failed to create MongoDB client");
-        let db = mongo_client.database(&db_name);
+        // Phase A-1: honor a mutator-overridden db name — `spawn_pair`
+        // models two pods by pointing two TestApps at ONE database (+ the
+        // already-shared Redis). Pre-A-1 this line used the local
+        // `db_name`, silently ignoring the override.
+        let db = mongo_client.database(&settings.database.name);
 
         ensure_indexes(&db).await.expect("Failed to create indexes");
 
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
             .expect("Failed to create AppState");
+        let state = app_state.clone();
         let app = build_router(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -136,6 +168,7 @@ impl TestApp {
             db,
             settings,
             client,
+            state,
         }
     }
 
@@ -175,6 +208,7 @@ impl TestApp {
         let app_state = AppState::new(db.clone(), settings.clone())
             .await
             .expect("Failed to create AppState");
+        let state = app_state.clone();
         let app = build_router(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -205,6 +239,7 @@ impl TestApp {
             db,
             settings,
             client,
+            state,
         }
     }
 }
@@ -343,5 +378,9 @@ fn test_settings() -> Settings {
             contact: "mailto:test@roomler.ai".to_string(),
         },
         auth: roomler_ai_config::AuthSettings::default(),
+        // Prod-shaped liveness (90 s — an in-process agent heartbeats every
+        // 30 s, so existing tests never trip it). The reap test shortens it
+        // via `spawn_with_settings`.
+        rc: roomler_ai_config::RcSettings::default(),
     }
 }

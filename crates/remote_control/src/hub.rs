@@ -258,7 +258,13 @@ impl Hub {
     /// Pass `None` for admin-driven kicks (e.g. the kick-agent route)
     /// that don't carry the agent's tx identity — these always
     /// remove unconditionally.
-    pub fn unregister_agent(&self, agent_id: ObjectId, tx: Option<&ClientTx>) {
+    ///
+    /// Returns whether the removal was OURS (Phase A-1): callers gate
+    /// the Mongo `mark_status(Offline)` + Redis presence delete on it,
+    /// because a displaced handler's late teardown writing Offline over
+    /// the displacing connection's Online was a live status-clobber
+    /// race (the same race rc.53 fixed for the registry entry itself).
+    pub fn unregister_agent(&self, agent_id: ObjectId, tx: Option<&ClientTx>) -> bool {
         if let Some(expected_tx) = tx {
             // Identity-gated removal. Read the current entry's tx
             // under the DashMap lock and compare; if it doesn't match
@@ -275,10 +281,11 @@ impl Hub {
                     "agent {} unregister skipped (tx no longer matches; newer connection holds the slot)",
                     agent_id
                 );
-                return;
+                return false;
             }
         }
-        if self.inner.agents.remove(&agent_id).is_some() {
+        let removed = self.inner.agents.remove(&agent_id).is_some();
+        if removed {
             info!("agent {} offline", agent_id);
             // Force-close any sessions tied to this agent.
             let dead: Vec<ObjectId> = self
@@ -294,6 +301,22 @@ impl Hub {
                 let _ = self.terminate(sid, EndReason::AgentDisconnect);
             }
         }
+        removed
+    }
+
+    /// Phase A-1 graceful shutdown: fire every registered agent's
+    /// displacement-cancel notify so each read loop exits within
+    /// milliseconds and runs its OWN teardown (unregister, gated
+    /// mark-offline, presence release) — the per-socket teardown is the
+    /// single source of cleanup truth, so shutdown reuses it instead of
+    /// duplicating it. Returns the notified agent ids for the caller's
+    /// belt-and-braces bulk cleanup.
+    pub fn cancel_all_agents(&self) -> Vec<ObjectId> {
+        let ids: Vec<ObjectId> = self.inner.agents.iter().map(|a| *a.key()).collect();
+        for entry in self.inner.agents.iter() {
+            entry.value().cancel.notify_waiters();
+        }
+        ids
     }
 
     /// Called by the WS handler when a controller browser tab connects.

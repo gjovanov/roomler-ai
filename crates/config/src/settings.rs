@@ -17,6 +17,29 @@ pub struct Settings {
     pub email: EmailSettings,
     pub push: PushSettings,
     pub auth: AuthSettings,
+    pub rc: RcSettings,
+}
+
+/// Remote-control WS liveness (Phase A-1). Settings (not consts) so the
+/// two-pod integration tests can run 2-3 s deadlines instead of 90 s
+/// waits. Env: `ROOMLER__RC__WS_RX_DEADLINE_SECS` etc.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RcSettings {
+    /// Reap an agent/tunnel WS after this many seconds without ANY
+    /// inbound frame (the agent pings every 25 s and heartbeats every
+    /// 30 s, so a healthy leg is never silent this long).
+    pub ws_rx_deadline_secs: u64,
+    /// How often the read loop checks the deadline.
+    pub ws_liveness_tick_secs: u64,
+}
+
+impl Default for RcSettings {
+    fn default() -> Self {
+        Self {
+            ws_rx_deadline_secs: 90,
+            ws_liveness_tick_secs: 30,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -297,6 +320,8 @@ impl Settings {
             .set_default("jwt.refresh_token_ttl_secs", 2_592_000)?
             .set_default("jwt.issuer", "roomler-ai")?
             .set_default("redis.url", "redis://127.0.0.1:6379")?
+            .set_default("rc.ws_rx_deadline_secs", 90)?
+            .set_default("rc.ws_liveness_tick_secs", 30)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

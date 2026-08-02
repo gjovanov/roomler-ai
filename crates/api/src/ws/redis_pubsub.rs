@@ -122,6 +122,112 @@ impl RedisPubSub {
         Ok(n > 0)
     }
 
+    // ── Agent presence directory (Phase A-1 / S6 split incident) ────
+    //
+    // The rc-hub is pod-local, so "is this agent reachable?" was
+    // answerable only on the pod holding its WS — the listing badge fell
+    // back to heartbeat freshness, which lies (green-but-`agent_offline`,
+    // field incidents 2026-07-29 + 2026-08-02). Each pod now mirrors its
+    // hub registrations into one Redis STRING per agent:
+    //
+    //   roomler:agent-online:<agent_id_hex> = "<instance_id>:<conn_id>:<since_ms>"
+    //
+    // Semantics: plain SET (newest-wins — mirrors the Hub's displacement
+    // rule where the newest live socket owns the slot); refreshed as a
+    // full `SET … EX` on each received heartbeat so a wrongful delete
+    // self-heals within one beat; deleted via COMPARE-and-delete on the
+    // full value (a bare GET+DEL races a fresh re-home on another pod).
+    // Key existence == fresh (TTL-expired keys vanish); the value's
+    // instance prefix answers "mine or foreign?". This record is
+    // re-derivable from the live socket at any time — Redis is a
+    // directory, not a database; every reader must fail-soft to the
+    // pod-local answer when Redis is down.
+
+    /// TTL on `roomler:agent-online:<id>` — same 3×-heartbeat headroom as
+    /// the user registry (agent heartbeats every 30 s).
+    const AGENT_TTL_SECS: u64 = 90;
+
+    /// Compare-and-delete: release the key only if we still own it.
+    /// The classic single-key lock-release script.
+    const AGENT_DEL_SCRIPT: &'static str = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end";
+
+    fn agent_key(agent_id_hex: &str) -> String {
+        format!("roomler:agent-online:{agent_id_hex}")
+    }
+
+    /// The owner token this instance writes for one agent registration.
+    /// `conn_id` is minted per WS registration, so a reconnect on the
+    /// SAME pod still produces a distinct token (the old socket's late
+    /// compare-DEL can't release the new socket's claim).
+    pub fn agent_owner_token(&self, conn_id: &str, since_ms: i64) -> String {
+        format!("{}:{}:{}", self.instance_id, conn_id, since_ms)
+    }
+
+    /// Claim/refresh this agent's presence record (full SET + TTL —
+    /// newest-wins by design).
+    pub async fn agent_presence_set(
+        &self,
+        agent_id_hex: &str,
+        owner_token: &str,
+    ) -> Result<(), redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        redis::cmd("SET")
+            .arg(Self::agent_key(agent_id_hex))
+            .arg(owner_token)
+            .arg("EX")
+            .arg(Self::AGENT_TTL_SECS)
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
+    /// Release this agent's presence record IF we still own it (a newer
+    /// registration's overwrite survives our late teardown). Returns
+    /// whether a delete actually happened.
+    pub async fn agent_presence_del_if_owned(
+        &self,
+        agent_id_hex: &str,
+        owner_token: &str,
+    ) -> Result<bool, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let n: i64 = redis::Script::new(Self::AGENT_DEL_SCRIPT)
+            .key(Self::agent_key(agent_id_hex))
+            .arg(owner_token)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Batched presence read for the agent listing: one MGET over all
+    /// ids, `Some(owner_token)` per present (⇒ fresh, TTL-enforced) key.
+    pub async fn agent_presence_get_many(
+        &self,
+        agent_id_hexes: &[String],
+    ) -> Result<Vec<Option<String>>, redis::RedisError> {
+        if agent_id_hexes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.publisher.clone();
+        let mut cmd = redis::cmd("MGET");
+        for hex in agent_id_hexes {
+            cmd.arg(Self::agent_key(hex));
+        }
+        cmd.query_async(&mut conn).await
+    }
+
+    /// Whether a foreign (other-pod) instance currently owns this agent's
+    /// presence record — the split-evidence probe.
+    pub async fn agent_presence_foreign(
+        &self,
+        agent_id_hex: &str,
+    ) -> Result<Option<String>, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let v: Option<String> = redis::cmd("GET")
+            .arg(Self::agent_key(agent_id_hex))
+            .query_async(&mut conn)
+            .await?;
+        Ok(v.filter(|owner| !owner.starts_with(&self.instance_id)))
+    }
+
     /// Spawn the subscriber task with reconnect-and-backoff. Before S0 a
     /// dropped Redis connection ended the subscription permanently (one
     /// error log, then silent local-only delivery forever). `alive` mirrors
