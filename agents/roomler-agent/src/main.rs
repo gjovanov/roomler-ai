@@ -1814,11 +1814,28 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // DaemonState). P8-cosmetics — no longer netstack-only: an OS-TUN node
     // probes over the OS ICMP path (`OsPinger`), so the `peers` RTT column is
     // populated everywhere instead of "— by-design on OS-TUN".
+    // B1 — bridge each successful probe into the overlay runtime's event
+    // channel as an `RttSample` (Q-plane instrumentation). The slot holds
+    // the CURRENT connection's sink hook (installed by `connect_once`,
+    // wrapping a WEAK sender — the prober must never keep a dead
+    // connection's runtime alive). Without overlay features the slot
+    // stays `None` forever and the hook is inert.
+    let rtt_sample_slot: signaling::RttSampleSlot = Default::default();
+    let rtt_hook: roomler_agent::localapi_state::RttSampleHook = {
+        let slot = rtt_sample_slot.clone();
+        std::sync::Arc::new(move |node_hex: &str, rtt_ms: u32| {
+            let inner = slot.read().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(hook) = inner {
+                hook(node_hex, rtt_ms);
+            }
+        })
+    };
     roomler_agent::localapi_state::spawn_rtt_prober(
         pinger_for_prober,
         overlay_view_tx.subscribe(),
         rtt_cache,
         shutdown_rx.clone(),
+        Some(rtt_hook),
     );
     let localapi_task = tokio::spawn({
         let shutdown = shutdown_rx.clone();
@@ -1845,6 +1862,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let rx = shutdown_rx.clone();
         let connected = localapi_connected.clone();
         let view_tx = overlay_view_tx.clone();
+        let sample_slot = rtt_sample_slot.clone();
         async move {
             signaling::run(
                 cfg,
@@ -1852,6 +1870,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 rx,
                 connected,
                 view_tx,
+                sample_slot,
                 consent_broker,
                 tunnel_hub,
             )
