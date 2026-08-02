@@ -137,6 +137,26 @@ Two consequences worth knowing:
   with a *different* address. To remove a device for good, delete it. There is
   deliberately no per-machine overlay denylist.
 
+### Pre-release gaps are ACCEPTED — don't "fix" them
+
+Every device removed *before* the release mechanism shipped (2026-07-29) burned
+its host number with nothing to hand it back, so a long-lived tenant's cursor
+sits above its live-node count with holes below. The fleet tenant is the worked
+example: `next_host = 33`, 14 live nodes, and 16 numbers (`.3 .5 .8–.13
+.16–.23`) that belong to no row at all.
+
+**This is expected and deliberately not reclaimed.** Those numbers aren't
+attached to any document, so eviction cannot reach them — recovering them means
+writing `free_hosts` directly, which bypasses every guard in `release_host` (the
+`next_host: {$gt: host}` sanity filter, the `$addToSet` dedup, the CAS release
+token) for a `/10` that holds 4.19 M addresses. The pool already stops *new*
+leaks, so the win is cosmetic.
+
+If a tenant ever does churn enough for the cursor to matter, do it properly: an
+admin-triggered reconcile that computes `(1..next_host) − live − pooled`
+server-side and returns each number through `release_host`, so the guards still
+apply. Not a hand-rolled database update.
+
 Because addresses are reused, the client keys every routing teardown by
 **pubkey**, never by address, and drops an OS `/32` only when no surviving peer
 still claims it. Those two rules are what stop a late reap of a stale peer from
