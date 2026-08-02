@@ -545,8 +545,12 @@ all.
 * **Route erasure** — the route guard reacts to OS route-change events
   (Windows `NotifyRouteChange2`, Linux `ip monitor route`) with an immediate
   re-assert of the per-peer `/32`s and any exit `/1`s (waves rate-limited to
-  ≥3 s apart), with the 2 s tick retained as a belt-and-braces heartbeat
-  until the event path is soak-proven enough to demote it.
+  ≥3 s apart; an event inside the quiet window pulls the next tick to the
+  due boundary, so no erase waits longer than that). The blind tick is a
+  30 s belt-and-braces heartbeat while the subscription is live
+  (`…_ROUTE_TICK_SECS` to override; `2` = the pre-demotion cadence) and
+  drops back to 2 s automatically whenever the subscription is unavailable
+  or dies.
 
 ---
 
@@ -564,7 +568,8 @@ prefix is still honoured.
 | `…_RELAY_SINGLE` | on | single-relay tier |
 | `…_DERP` | **on** since rc.203 | DERP tier |
 | `…_PATHMON` | **on** | path-monitor telemetry (`on`/`shadow`/`off`). Selection is always monitor-driven since rc.282 — non-`on` values only silence the 10-min decision summaries |
-| `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts (the 2 s tick stays as heartbeat) |
+| `…_ROUTE_EVENTS` | **on** | event-driven route guard: OS route-change subscription driving immediate re-asserts; off = 2 s blind tick only |
+| `…_ROUTE_TICK_SECS` | 30 | route-guard heartbeat seconds while the subscription is live (2–300; `2` = pre-demotion cadence). Ignored — always 2 s — without a live subscription |
 | `…_NETSTACK_SOCKS` | unset | userspace netstack + SOCKS5 instead of an OS TUN |
 
 Joining the mesh at all additionally requires `overlay_enabled = true` in the
