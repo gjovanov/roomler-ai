@@ -439,6 +439,25 @@ pub fn build_router(state: AppState) -> Router {
             delete(routes::overlay_route::evict_overlay_node),
         );
 
+    // Overlay L3 ACL — shapes the netmap each node receives. `/mode` carries
+    // the tenant-wide posture (off | warn | enforce); it is `off` by default so
+    // deploying the feature can never black-hole a live mesh.
+    let overlay_policy_routes = Router::new()
+        .route(
+            "/",
+            get(routes::overlay_policy::list).post(routes::overlay_policy::create),
+        )
+        .route(
+            "/mode",
+            get(routes::overlay_policy::get_mode).put(routes::overlay_policy::set_mode),
+        )
+        .route(
+            "/{policy_id}",
+            get(routes::overlay_policy::get)
+                .put(routes::overlay_policy::update)
+                .delete(routes::overlay_policy::delete),
+        );
+
     // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
     let magic_dns_routes = Router::new().route(
         "/",
@@ -540,6 +559,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/tunnel-client", tunnel_client_routes)
         .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy_routes)
         .nest("/tenant/{tenant_id}/overlay-node", overlay_node_routes)
+        .nest("/tenant/{tenant_id}/overlay-acl", overlay_policy_routes)
         .nest("/tenant/{tenant_id}/magic-dns", magic_dns_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 

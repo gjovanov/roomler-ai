@@ -1,7 +1,7 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use mongodb::options::ReturnDocument;
-use roomler_ai_remote_control::models::OverlayNetwork;
+use roomler_ai_remote_control::models::{OverlayAclMode, OverlayNetwork};
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
@@ -35,6 +35,9 @@ impl OverlayNetworkDao {
             next_host: 1,
             free_hosts: Vec::new(),
             mtu: OverlayNetwork::DEFAULT_MTU,
+            // New networks start permissive too — the ACL is opt-in per tenant
+            // so that turning the feature on can never black-hole a live mesh.
+            acl_mode: OverlayAclMode::default(),
             created_at: now,
             updated_at: now,
         };
@@ -49,6 +52,23 @@ impl OverlayNetworkDao {
                 .ok_or(DaoError::NotFound),
             Err(e) => Err(e),
         }
+    }
+
+    /// Set the tenant's overlay ACL posture (`off` | `warn` | `enforce`).
+    ///
+    /// Creates the network row if the tenant has never joined the overlay, so
+    /// an admin can stage the posture before the first node appears.
+    pub async fn set_acl_mode(&self, tenant_id: ObjectId, mode: OverlayAclMode) -> DaoResult<bool> {
+        self.get_or_create(tenant_id).await?;
+        self.base
+            .update_one(
+                doc! { "tenant_id": tenant_id },
+                doc! { "$set": {
+                    "acl_mode": bson::to_bson(&mode).unwrap_or(bson::Bson::Null),
+                    "updated_at": DateTime::now(),
+                }},
+            )
+            .await
     }
 
     /// Claim a host number for `network_id`. Prefers a RECYCLED host from the
