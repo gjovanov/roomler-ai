@@ -702,8 +702,17 @@ impl OverlayRuntime {
             let monitor_action = matches!(self.mode, CarrierMode::Relay)
                 .then(|| {
                     self.shadow(|s| {
-                        s.mon
-                            .decide(&np.node_id, incumbent, avail, make_before_break, now)
+                        // B2 — demotion executes only in `on` mode; shadow
+                        // counts separately below.
+                        let demote_on = s.demote == path::DemoteMode::On;
+                        s.mon.decide(
+                            &np.node_id,
+                            incumbent,
+                            avail,
+                            make_before_break,
+                            now,
+                            demote_on,
+                        )
                     })
                 })
                 .flatten();
@@ -780,7 +789,80 @@ impl OverlayRuntime {
                         wg.remove_peer(&pk).await;
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, fresh)
                             .await;
+                    } else if let Some(path::PathAction::Probe(target)) = monitor_action
+                        && target != tier
+                        && !wg.has_direct_probe(&pk)
+                    {
+                        // B2 (on) — voluntary demotion: the monitor found a
+                        // sustained margin-sized score deficit against an
+                        // eligible alternative. MBB-probe it — the incumbent
+                        // keeps carrying traffic until the probe latches
+                        // (`sweep_upgrade_probes` promotes tier-agnostically).
+                        let probe_target = match target {
+                            DirectTier::Lan => {
+                                if let (Some(ctx), Some((local_ip, dst))) = (direct_ctx, direct_dst)
+                                {
+                                    lan_egress_socket(ctx, local_ip, dst)
+                                        .await
+                                        .map(|s| (s, dst))
+                                } else {
+                                    None
+                                }
+                            }
+                            DirectTier::Public => {
+                                if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
+                                    ctx.public_sock.clone().map(|s| (s, dst))
+                                } else {
+                                    None
+                                }
+                            }
+                            DirectTier::Srflx => {
+                                if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
+                                    ctx.punch.clone().map(|(_, s)| (s, dst))
+                                } else {
+                                    None
+                                }
+                            }
+                            DirectTier::Relay => None,
+                        };
+                        if let Some((sock, dst)) = probe_target {
+                            record("install_peers:demote", path::PathAction::Probe(target));
+                            info!(
+                                peer = %np.node_id, from = ?tier, to = ?target,
+                                "overlay pathmon[demote]: sustained score deficit — probing better tier (incumbent held until latch)"
+                            );
+                            self.start_upgrade_probe(
+                                wg,
+                                upgrade_probes,
+                                np.node_id,
+                                &cfg,
+                                sock,
+                                dst,
+                                target,
+                                now,
+                            )
+                            .await;
+                        } else {
+                            record("install_peers:keep_direct", path::PathAction::Keep);
+                        }
                     } else {
+                        // B2 shadow — count the would-be demotion without
+                        // acting (its own by_class lane + rate-limited log).
+                        // The Relay class stays advisory even in `on` mode
+                        // (decide returns it, but execution is deferred —
+                        // the death path owns actual direct→relay moves).
+                        if let path::Incumbent::Direct(cur) = incumbent {
+                            self.shadow(|s| {
+                                let advisory_relay =
+                                    matches!(monitor_action, Some(path::PathAction::Relay));
+                                if (s.demote == path::DemoteMode::Shadow || advisory_relay)
+                                    && let Some(would) =
+                                        s.mon.demote_candidate(&np.node_id, cur, avail, now)
+                                {
+                                    s.note_shadow_demote(&np.node_id, would, now);
+                                }
+                            });
+                        }
                         // P3 PR-A (F14) — the already-direct fall-through IS a
                         // decision (keep the incumbent); record it so the
                         // shadow compare covers this arm too.
