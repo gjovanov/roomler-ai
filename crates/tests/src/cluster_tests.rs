@@ -750,3 +750,155 @@ async fn derp_split_rehomes_toward_newest_registration() {
 
     ws_b.close(None).await.ok();
 }
+
+// ── C-6: shutdown sweep for all classes + metrics + status route ────
+
+/// The status route is auth-gated and reports this pod's identity,
+/// cluster health, the rehome/fallback counters and live gauges.
+#[tokio::test]
+async fn cluster_status_reports_pod_counters_and_gauges() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("clstat").await;
+
+    // Unauthenticated → 401.
+    let resp = app
+        .client
+        .get(app.url("/api/cluster/status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+
+    let body: serde_json::Value = app
+        .auth_get("/api/cluster/status", &tenant.admin.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["pod"]["pod_id"].as_str(),
+        Some(app.state.pod.pod_id.as_str())
+    );
+    assert_eq!(
+        body["pod"]["epoch"].as_str(),
+        Some(app.state.pod.epoch.as_str())
+    );
+    for counter in [
+        "rc_rehome_total",
+        "tunnel_rehome_total",
+        "agent_nudge_total",
+        "bus_deadline_total",
+        "media_fold_total",
+        "media_belt_fallback_total",
+        "derp_rehome_close_total",
+        "derp_rehome_stuck_total",
+        "split_evidence_total",
+    ] {
+        assert!(
+            body["counters"][counter].is_u64(),
+            "missing counter {counter}: {body}"
+        );
+    }
+    for gauge in [
+        "agents_online",
+        "tunnel_sessions",
+        "derp_registrations",
+        "media_rooms",
+        "media_participants",
+        "media_consumers",
+    ] {
+        assert!(
+            body["local"][gauge].is_u64(),
+            "missing gauge {gauge}: {body}"
+        );
+    }
+    if app.state.cluster_directory.is_some() {
+        assert!(
+            body["cluster"]["pods_alive"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "own pod-alive record must be visible: {body}"
+        );
+    }
+}
+
+/// Graceful shutdown releases tunnel + derp directory records (zero
+/// ownerless window on deploys — TTL is only the crash backstop).
+#[tokio::test]
+async fn shutdown_releases_tunnel_and_derp_records() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use futures::{SinkExt, StreamExt};
+    use roomler_ai_api::cluster::directory::{derp_key, tunnel_key};
+    use roomler_ai_api::ws::derp_cluster::pk_hex;
+    use roomler_ai_remote_control::models::NodeRef;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let app = TestApp::spawn().await;
+    let Some(dir) = app.state.cluster_directory.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let tenant = app.seed_tenant("clshut").await;
+    let tid = bson::oid::ObjectId::parse_str(&tenant.tenant_id).unwrap();
+
+    // A live derp registration (real socket over a seeded overlay node).
+    let (aid, tok) = crate::agent_presence_tests::enroll(&app, &tenant, "shut-mach").await;
+    let networks = roomler_ai_services::dao::overlay_network::OverlayNetworkDao::new(&app.db);
+    let nodes = roomler_ai_services::dao::overlay_node::OverlayNodeDao::new(&app.db);
+    let network_id = networks.get_or_create(tid).await.unwrap().id.unwrap();
+    let pk: [u8; 32] = [0xc3; 32];
+    nodes
+        .create(
+            tid,
+            NodeRef::Agent {
+                agent_id: bson::oid::ObjectId::parse_str(&aid).unwrap(),
+            },
+            network_id,
+            "mach-shut".into(),
+            "shut-node".into(),
+            "100.64.0.9".into(),
+            B64.encode(pk),
+            0,
+            vec![],
+            false,
+            false,
+            true,
+            false,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let (mut ws, _) = connect_async(&format!("ws://{}/derp?token={}", app.addr, tok))
+        .await
+        .expect("derp WS");
+    ws.send(Message::Binary(pk.to_vec().into())).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let dkey = derp_key(&network_id.to_hex(), &pk_hex(&pk));
+    assert!(dir.get(&dkey).await.unwrap().is_some(), "derp record live");
+
+    // A tunnel session record (write path locked by the C-3 tests —
+    // here we only need a held token for the sweep to release).
+    let sid = bson::oid::ObjectId::new();
+    let ttoken = dir.owner_token("conn-x");
+    dir.claim_lww(&tunnel_key(&sid.to_hex()), &ttoken)
+        .await
+        .unwrap();
+    app.state.tunnel_presence_tokens.insert(sid, ttoken);
+
+    roomler_ai_api::state::shutdown_cleanup(&app.state).await;
+
+    assert_eq!(
+        dir.get(&dkey).await.unwrap(),
+        None,
+        "shutdown must release the derp record"
+    );
+    assert_eq!(
+        dir.get(&tunnel_key(&sid.to_hex())).await.unwrap(),
+        None,
+        "shutdown must release the tunnel record"
+    );
+    ws.close(None).await.ok();
+}

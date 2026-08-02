@@ -235,9 +235,13 @@ impl PodBus {
             Ok(Ok(Ok(v))) => Ok(v),
             Ok(Ok(Err(nack))) => Err(BusError::Nack(nack)),
             // Sender dropped without reply — treat as deadline-class.
-            Ok(Err(_)) => Err(BusError::Deadline(deadline)),
+            Ok(Err(_)) => {
+                super::metrics::bump(&super::metrics::BUS_DEADLINE_TOTAL);
+                Err(BusError::Deadline(deadline))
+            }
             Err(_) => {
                 self.pending.remove(&corr);
+                super::metrics::bump(&super::metrics::BUS_DEADLINE_TOTAL);
                 Err(BusError::Deadline(deadline))
             }
         }
