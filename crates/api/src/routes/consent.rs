@@ -76,6 +76,15 @@ async fn resolve(
             "consent slot no longer waiting (session gone / timed out)"
         );
     }
+    // C-2 — the approve-link HTTP can land on a pod that doesn't hold the
+    // session; broadcast the verdict so the holding pod applies it too
+    // (idempotent — the local attempt above already ran here).
+    crate::ws::remote_control::publish_rc_ctrl(
+        &state,
+        "consent",
+        serde_json::json!({ "session_id": req.session_id.to_hex(), "granted": granted }),
+    )
+    .await;
 
     Ok(Json(
         serde_json::json!({ "resolved": true, "granted": granted }),

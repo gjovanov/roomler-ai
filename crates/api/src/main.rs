@@ -1,9 +1,4 @@
-use bson::oid::ObjectId;
-use roomler_ai_api::{
-    build_router, state,
-    state::AppState,
-    ws::{dispatcher, redis_pubsub::RedisPubSub},
-};
+use roomler_ai_api::{build_router, state, state::AppState};
 use roomler_ai_config::Settings;
 use roomler_ai_db::{connect, indexes::ensure_indexes};
 use tracing::{error, info};
@@ -191,93 +186,6 @@ async fn main() -> anyhow::Result<()> {
     {
         let storage = app_state.storage.clone();
         tokio::spawn(async move { storage.migrate_local_to_s3().await });
-    }
-
-    // Start Redis Pub/Sub subscriber for cross-instance WS delivery
-    if let Some(pubsub) = &app_state.redis_pubsub {
-        let (redis_tx, _) = tokio::sync::broadcast::channel::<String>(1024);
-        let ws_storage = app_state.ws_storage.clone();
-        let mut redis_rx = redis_tx.subscribe();
-        let own_instance = pubsub.instance_id().to_string();
-
-        // Subscriber with reconnect-and-backoff; flips `redis_sub_alive`
-        // for `/health/ready`.
-        RedisPubSub::subscribe_with_reconnect(
-            settings.redis.url.clone(),
-            redis_tx,
-            app_state.redis_sub_alive.clone(),
-        );
-
-        // Forward Redis messages to local WS connections
-        tokio::spawn(async move {
-            loop {
-                match redis_rx.recv().await {
-                    Ok(payload) => {
-                        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&payload)
-                        else {
-                            continue;
-                        };
-                        // Self-echo guard: this instance already delivered
-                        // locally at publish time — re-delivering here
-                        // doubles every event on its origin pod.
-                        if envelope["origin"].as_str() == Some(own_instance.as_str()) {
-                            continue;
-                        }
-                        // S6 broadcast envelopes (presence fan-out): the
-                        // publisher can't know OUR user set, so it flags
-                        // the envelope and each pod delivers to its own
-                        // local connections.
-                        if envelope["broadcast"].as_bool() == Some(true) {
-                            if let Some(message) = envelope.get("message") {
-                                let ids = ws_storage.all_user_ids();
-                                dispatcher::broadcast(&ws_storage, &ids, message).await;
-                            }
-                            continue;
-                        }
-                        if let (Some(user_ids_val), Some(message)) =
-                            (envelope["user_ids"].as_array(), envelope.get("message"))
-                        {
-                            let ids: Vec<ObjectId> = user_ids_val
-                                .iter()
-                                .filter_map(|v| {
-                                    v.as_str().and_then(|s| ObjectId::parse_str(s).ok())
-                                })
-                                .collect();
-                            // Deliver to local connections only (no re-publish to Redis)
-                            dispatcher::broadcast(&ws_storage, &ids, message).await;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        // Slow consumer: events were dropped, keep forwarding
-                        // (the old `while let Ok` silently KILLED forwarding
-                        // on the first lag).
-                        tracing::warn!("Redis Pub/Sub forwarder lagged; dropped {n} events");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            error!("Redis Pub/Sub forwarding task ended (channel closed)");
-        });
-        info!("Redis Pub/Sub cross-instance WS delivery enabled");
-
-        // S6 — online-registry heartbeat: re-assert this pod's local
-        // users in Redis every 30 s (TTL 90 s). Heals missed SREMs on
-        // abnormal disconnects and lets a crashed pod's claims age out.
-        let hb_pubsub = pubsub.clone();
-        let hb_storage = app_state.ws_storage.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                for uid in hb_storage.all_user_ids() {
-                    if let Err(e) = hb_pubsub.online_add(&uid.to_hex()).await {
-                        tracing::debug!("online-registry heartbeat failed: {e}");
-                        break; // Redis down — retry whole set next tick.
-                    }
-                }
-            }
-        });
     }
 
     // Build router

@@ -304,6 +304,32 @@ impl Hub {
         removed
     }
 
+    /// C-2 — the idle-agent nudge: close an agent's WS (via its
+    /// displacement-cancel notify — the read loop exits within
+    /// milliseconds and runs the normal teardown) so its reconnect
+    /// re-hashes through the LB onto the pod the current map points at.
+    /// STRICTLY idle-only: an active rc session or (per `extra_busy`,
+    /// the caller's tunnel-session check) a live tunnel flow means the
+    /// truthful answer to the requester is "busy", not a forced move.
+    /// Returns whether the nudge fired.
+    pub fn nudge_agent_if_idle(&self, agent_id: ObjectId, extra_busy: bool) -> bool {
+        if extra_busy {
+            return false;
+        }
+        let Some(agent) = self.inner.agents.get(&agent_id) else {
+            return false;
+        };
+        if agent.active_sessions > 0 {
+            return false;
+        }
+        info!(
+            "agent {} nudged (idle) — cycling its WS for LB re-hash",
+            agent_id
+        );
+        agent.cancel.notify_waiters();
+        true
+    }
+
     /// Phase A-1 graceful shutdown: fire every registered agent's
     /// displacement-cancel notify so each read loop exits within
     /// milliseconds and runs its OWN teardown (unregister, gated
