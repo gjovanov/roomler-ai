@@ -203,6 +203,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Clamp media bitrate when the overlay carrier under a nominated pair is relay-tier. Built-in default: on. Env: ROOMLER_NODE_OVERLAY_TIER_DETECT.",
     ),
     (
+        "overlay_rtt_q",
+        "tribool",
+        "B1 - feed the 15 s overlay RTT probes into the PathMonitor quality plane (Q-only, never eligibility). Built-in default: on. Env: ROOMLER_AGENT_OVERLAY_RTT_Q.",
+    ),
+    (
         "forward_acl",
         "json",
         "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
@@ -286,6 +291,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ice_warm_standby" => cfg.ice_warm_standby.map(fmt_bool),
         "ice_overlay_host_deprioritize" => cfg.ice_overlay_host_deprioritize.map(fmt_bool),
         "overlay_tier_detect" => cfg.overlay_tier_detect.map(fmt_bool),
+        "overlay_rtt_q" => cfg.overlay_rtt_q.map(fmt_bool),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -402,6 +408,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             cfg.ice_overlay_host_deprioritize = parse_tribool(value)?
         }
         "overlay_tier_detect" => cfg.overlay_tier_detect = parse_tribool(value)?,
+        "overlay_rtt_q" => cfg.overlay_rtt_q = parse_tribool(value)?,
         "forward_acl" => {
             cfg.forward_acl = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => Default::default(),
@@ -778,6 +785,7 @@ mod tests {
             "ice_warm_standby",
             "ice_overlay_host_deprioritize",
             "overlay_tier_detect",
+            "overlay_rtt_q",
         ] {
             apply(&mut cfg, key, Some("off")).unwrap();
             assert_eq!(

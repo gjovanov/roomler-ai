@@ -192,6 +192,17 @@ impl Drop for ConnectedGuard {
 
 /// Drive the signaling loop forever. Returns only on fatal error (e.g.
 /// auth rejection) or shutdown signal.
+/// B1 — the CURRENT connection's RTT-sample sink. Each overlay start
+/// installs a hook wrapping a WEAK handle to its runtime's event
+/// channel (weak by design — the runtime tears down when its
+/// connection's `evt_tx` drops, and a strong clone held by the
+/// process-lifetime prober would defeat that; a dead weak sender just
+/// drops the sample). Type-erased so this compiles without the overlay
+/// features (`tunnel_core::overlay` is feature-gated): the slot simply
+/// stays `None` and the prober's hook is inert.
+pub type RttSampleSlot = Arc<std::sync::RwLock<Option<crate::localapi_state::RttSampleHook>>>;
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
@@ -201,6 +212,9 @@ pub async fn run(
     // runtime publishes its mesh view on.
     connected: Arc<AtomicBool>,
     overlay_view_tx: tokio::sync::watch::Sender<OverlayView>,
+    // B1 — where each connection publishes its (downgraded) overlay event
+    // sender for the RTT prober bridge.
+    rtt_sample_slot: RttSampleSlot,
     // P2b — the operator-consent broker, created in `run_cmd` and SHARED with the
     // LocalAPI's DaemonState so its live `pending` set gates LocalAPI decisions.
     consent_broker: crate::consent::ConsentBroker,
@@ -255,6 +269,7 @@ pub async fn run(
             consent_broker.clone(),
             connected.clone(),
             overlay_view_tx.clone(),
+            rtt_sample_slot.clone(),
             tunnel_hub.clone(),
             &mut kill_rx,
         )
@@ -482,6 +497,9 @@ async fn connect_once(
     consent_broker: crate::consent::ConsentBroker,
     connected: Arc<AtomicBool>,
     overlay_view_tx: tokio::sync::watch::Sender<OverlayView>,
+    // B1 — this connection publishes its downgraded overlay event sender
+    // here (the RTT prober bridge reads it).
+    rtt_sample_slot: RttSampleSlot,
     tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
@@ -585,10 +603,36 @@ async fn connect_once(
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     let overlay_evt_tx =
         crate::overlay::maybe_start(cfg, outbound_tx.clone(), overlay_view_tx.clone()).await;
-    // Without an overlay surface nothing publishes the view; keep the param
+    // B1 — install THIS connection's RTT-sample sink: a hook wrapping a
+    // WEAK handle to the runtime's event channel. `None` when overlay is
+    // off; a stale hook is harmless (weak upgrade fails once the runtime
+    // is gone).
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    {
+        *rtt_sample_slot.write().unwrap_or_else(|e| e.into_inner()) =
+            overlay_evt_tx.as_ref().map(|t| {
+                let weak = t.downgrade();
+                let hook: crate::localapi_state::RttSampleHook =
+                    Arc::new(move |node_hex: &str, rtt_ms: u32| {
+                        let Ok(node_id) = bson::oid::ObjectId::parse_str(node_hex) else {
+                            return;
+                        };
+                        if let Some(tx) = weak.upgrade() {
+                            let _ = tx.try_send(
+                                tunnel_core::overlay::runtime::OverlayEvent::RttSample {
+                                    node_id,
+                                    rtt_ms,
+                                },
+                            );
+                        }
+                    });
+                hook
+            });
+    }
+    // Without an overlay surface nothing publishes the view; keep the params
     // used so the LocalAPI wiring stays feature-agnostic in `run_cmd`.
     #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
-    let _ = &overlay_view_tx;
+    let _ = (&overlay_view_tx, &rtt_sample_slot);
     let mut peers: HashMap<bson::oid::ObjectId, AgentPeer> = HashMap::new();
     // 2026-07-27 — this connect iteration starts with a fresh session map;
     // release any GPU-clock pin a previous iteration left engaged (its
