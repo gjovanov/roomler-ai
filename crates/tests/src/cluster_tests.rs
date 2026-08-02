@@ -392,3 +392,242 @@ async fn tunnel_open_rehome_cross_pod() {
     }
     assert!(closed, "idle target agent's WS was not nudged closed");
 }
+
+// ── C-4: media claim-or-route ───────────────────────────────────────
+
+type UserWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connect a user WS and swallow the initial `connected` frame.
+async fn connect_user_ws(app: &TestApp, token: &str) -> UserWs {
+    use futures::StreamExt;
+    let url = format!("ws://{}/ws?token={}", app.addr, token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("user WS connects");
+    ws.next().await;
+    ws
+}
+
+/// Next `media:*` frame (skips room:*/presence/notification noise).
+async fn next_media_msg(ws: &mut UserWs) -> serde_json::Value {
+    use futures::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("media frame within 10s")
+            .expect("ws open")
+            .expect("ws frame");
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(msg.to_text().unwrap_or(""))
+        else {
+            continue;
+        };
+        if parsed["type"].as_str().unwrap_or("").starts_with("media:") {
+            return parsed;
+        }
+    }
+}
+
+async fn send_media(ws: &mut UserWs, msg_type: &str, room_id: &str) {
+    use futures::SinkExt;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({ "type": msg_type, "data": { "room_id": room_id } })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+}
+
+/// Seed a room with a started call on app1; returns (tenant, room_id hex).
+async fn seed_started_call(app1: &TestApp) -> (crate::fixtures::seed::SeededTenant, String) {
+    let tenant = app1.seed_tenant("mediac4").await;
+    let resp = app1
+        .auth_post(
+            &format!("/api/tenant/{}/room", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .json(&serde_json::json!({ "name": "C4 Conference" }))
+        .send()
+        .await
+        .unwrap();
+    let room: serde_json::Value = resp.json().await.unwrap();
+    let room_id = room["id"].as_str().unwrap().to_string();
+    let resp = app1
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/call/start",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    (tenant, room_id)
+}
+
+/// The C-4 core: a viewer on the non-owner pod joins through the bus,
+/// gets its transports conn-addressed back, and NO second router island
+/// is created; a leave on the owner reaches the remote viewer.
+#[tokio::test]
+async fn media_join_routes_to_owner_pod_single_router() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (tenant, room_id) = seed_started_call(&app1).await;
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+
+    // call/start claimed + created on app1 only.
+    assert!(app1.state.room_manager.has_room(&rid));
+    assert!(!app2.state.room_manager.has_room(&rid));
+
+    // Member joins via app2 (the NON-owner pod).
+    let mut ws2 = connect_user_ws(&app2, &tenant.member.access_token).await;
+    send_media(&mut ws2, "media:join", &room_id).await;
+    let caps = next_media_msg(&mut ws2).await;
+    assert_eq!(caps["type"], "media:router_capabilities", "{caps}");
+    let transport = next_media_msg(&mut ws2).await;
+    assert_eq!(transport["type"], "media:transport_created", "{transport}");
+    assert!(
+        transport["data"]["send_transport"]["id"].as_str().is_some(),
+        "owner-built transports must round-trip: {transport}"
+    );
+
+    // Exactly ONE router: app2 must NOT have materialized the room.
+    assert!(!app2.state.room_manager.has_room(&rid));
+    assert!(
+        app2.state.remote_media_conns.len() == 1,
+        "remote membership tracked for WS-close forwarding"
+    );
+
+    // Admin joins locally on the owner, then leaves — the peer_left push
+    // must cross pods to the remote viewer's connection.
+    let mut ws1 = connect_user_ws(&app1, &tenant.admin.access_token).await;
+    send_media(&mut ws1, "media:join", &room_id).await;
+    let m = next_media_msg(&mut ws1).await;
+    assert_eq!(m["type"], "media:router_capabilities");
+    let m = next_media_msg(&mut ws1).await;
+    assert_eq!(m["type"], "media:transport_created");
+
+    send_media(&mut ws1, "media:leave", &room_id).await;
+    let peer_left = next_media_msg(&mut ws2).await;
+    assert_eq!(peer_left["type"], "media:peer_left", "{peer_left}");
+    assert_eq!(
+        peer_left["data"]["user_id"].as_str(),
+        Some(tenant.admin.id.as_str())
+    );
+
+    use futures::SinkExt;
+    ws1.close(None).await.ok();
+    ws2.close(None).await.ok();
+}
+
+/// Owner death (graceful): shutdown releases the claim with zero gap —
+/// the next join claims fresh on the surviving pod and serves locally.
+#[tokio::test]
+async fn media_owner_shutdown_releases_claim_rejoin_wins() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let Some(d2) = app2.state.cluster_directory.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let (tenant, room_id) = seed_started_call(&app1).await;
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+    let key = roomler_ai_api::cluster::directory::media_key(&room_id);
+
+    let mut ws2 = connect_user_ws(&app2, &tenant.member.access_token).await;
+    send_media(&mut ws2, "media:join", &room_id).await;
+    let m = next_media_msg(&mut ws2).await;
+    assert_eq!(m["type"], "media:router_capabilities");
+    let m = next_media_msg(&mut ws2).await;
+    assert_eq!(m["type"], "media:transport_created");
+
+    // Graceful owner shutdown → claim compare-DELed immediately.
+    roomler_ai_api::state::shutdown_cleanup(&app1.state).await;
+    assert_eq!(
+        d2.get(&key).await.unwrap(),
+        None,
+        "graceful shutdown must release the media claim"
+    );
+
+    // Rejoin on the survivor: claims fresh + materializes locally.
+    send_media(&mut ws2, "media:join", &room_id).await;
+    let m = next_media_msg(&mut ws2).await;
+    assert_eq!(m["type"], "media:router_capabilities", "{m}");
+    let m = next_media_msg(&mut ws2).await;
+    assert_eq!(m["type"], "media:transport_created");
+    assert!(
+        app2.state.room_manager.has_room(&rid),
+        "survivor must own the rebuilt room"
+    );
+    let raw = d2.get(&key).await.unwrap().expect("fresh claim exists");
+    let rec = OwnerRecord::parse(&raw).unwrap();
+    assert_eq!(rec.pod_id, app2.state.pod.pod_id);
+
+    use futures::SinkExt;
+    ws2.close(None).await.ok();
+}
+
+/// The NX discipline under a real concurrent race: exactly one winner.
+#[tokio::test]
+async fn media_claim_race_single_winner() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let (Some(d1), Some(d2)) = (
+        app1.state.cluster_directory.clone(),
+        app2.state.cluster_directory.clone(),
+    ) else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let key =
+        roomler_ai_api::cluster::directory::media_key(&uuid::Uuid::new_v4().simple().to_string());
+    let (t1, t2) = (d1.owner_token("media"), d2.owner_token("media"));
+    let (r1, r2) = tokio::join!(d1.claim_nx(&key, &t1, 30), d2.claim_nx(&key, &t2, 30));
+    let wins = [r1.unwrap(), r2.unwrap()]
+        .iter()
+        .filter(|o| matches!(o, ClaimOutcome::Won))
+        .count();
+    assert_eq!(wins, 1, "exactly one pod may materialize a room");
+}
+
+/// The claim-loser fold: a foreign owner on the key (post-outage double
+/// claim) makes the refresh CONFLICT — the loser tears down its island
+/// and pushes the rejoin signal to its participants.
+#[tokio::test]
+async fn media_conflict_folds_loser_island() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let Some(d2) = app2.state.cluster_directory.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let (tenant, room_id) = seed_started_call(&app1).await;
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+
+    let mut ws1 = connect_user_ws(&app1, &tenant.admin.access_token).await;
+    send_media(&mut ws1, "media:join", &room_id).await;
+    let m = next_media_msg(&mut ws1).await;
+    assert_eq!(m["type"], "media:router_capabilities");
+    let m = next_media_msg(&mut ws1).await;
+    assert_eq!(m["type"], "media:transport_created");
+
+    // Simulate the post-Redis-outage double claim: app2 overwrites the key.
+    let key = roomler_ai_api::cluster::directory::media_key(&room_id);
+    d2.claim_lww(&key, &d2.owner_token("media")).await.unwrap();
+
+    // One maintenance pass on the loser: CONFLICT → fold.
+    roomler_ai_api::ws::media_cluster::refresh_media_claims_once(&app1.state).await;
+    assert!(
+        !app1.state.room_manager.has_room(&rid),
+        "claim loser must tear down its island"
+    );
+    let closed = next_media_msg(&mut ws1).await;
+    assert_eq!(closed["type"], "media:room_closed", "{closed}");
+    assert_eq!(closed["data"]["reason"].as_str(), Some("rehomed"));
+
+    use futures::SinkExt;
+    ws1.close(None).await.ok();
+}

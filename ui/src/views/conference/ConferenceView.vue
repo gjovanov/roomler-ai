@@ -440,6 +440,7 @@ async function handleJoin() {
     window.addEventListener('beforeunload', warnBeforeLeave)
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
+    wsStore.onMediaMessage('media:room_closed', handleMediaRoomClosed)
     await messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
     await nextTick()
@@ -448,6 +449,25 @@ async function handleJoin() {
   }
 
   await doJoin()
+}
+
+// C-4 — the server folds a conference island when its pod loses the
+// media-room claim (multi-pod rehome) and pushes media:room_closed with
+// reason "rehomed": rejoin transparently — the fresh join lands on the
+// surviving owner pod. Other reasons (call actually ended) keep today's
+// behavior (room:call_ended drives the teardown).
+let rehomeRejoining = false
+async function handleMediaRoomClosed(data: { room_id?: string; reason?: string }) {
+  if (data.reason !== 'rehomed' || data.room_id !== roomId.value) return
+  if (rehomeRejoining || !joined.value) return
+  rehomeRejoining = true
+  try {
+    conferenceStore.leaveRoom()
+    joined.value = false
+    await doJoin()
+  } finally {
+    rehomeRejoining = false
+  }
 }
 
 async function doJoin() {
@@ -475,6 +495,7 @@ async function doJoin() {
 
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
+    wsStore.onMediaMessage('media:room_closed', handleMediaRoomClosed)
   } catch (err: unknown) {
     const error = err as Error
     if (error.name === 'NotAllowedError') {
@@ -504,6 +525,7 @@ async function handleLeave() {
   // Clean up audio playback
   audioPlayback.stopCurrentPlayback()
   wsStore.offMediaMessage('media:audio_playback')
+  wsStore.offMediaMessage('media:room_closed')
 
   // Leave via conference store (tears down mediasoup)
   conferenceStore.leaveRoom()

@@ -440,6 +440,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
         tracing::debug!("online-registry remove failed: {e}");
     }
 
+    // C-4 — the conn may have joined a room OWNED BY ANOTHER POD: tell
+    // the owner to drop its transports (best-effort; no-op when the map
+    // has no entry).
+    crate::ws::media_cluster::forward_close_leave(&state, &user_id, &connection_id).await;
+
     if let Some(room_id) = state.room_manager.get_connection_room(&connection_id) {
         let remaining_conns = state
             .room_manager
@@ -459,7 +464,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
                 }
             });
             for conn_id in &remaining_conns {
-                super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+                super::dispatcher::send_to_connection_routed(
+                    &state.ws_storage,
+                    &state.redis_pubsub,
+                    conn_id,
+                    &event,
+                )
+                .await;
             }
         }
     }
@@ -576,8 +587,77 @@ async fn handle_client_message(
                 .await;
             }
         }
+        t if t.starts_with("media:") => {
+            route_and_dispatch_media(state, user_id, connection_id, t, data).await;
+        }
+        _ => {
+            debug!(?user_id, msg_type, "Unknown WS message type");
+        }
+    }
+}
+
+/// C-4 — the claim-or-route placement gate for every `media:*` command:
+/// a locally-held room serves in place (today's path); a foreign-owned
+/// room gets the command forwarded to its owner over the bus, with
+/// replies/pushes returning conn-addressed on the global channel. Only
+/// the join path may materialize a room (`create` from the resolver).
+async fn route_and_dispatch_media(
+    state: &AppState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    msg_type: &str,
+    data: Option<&serde_json::Value>,
+) {
+    use crate::ws::media_cluster::{MediaRoute, forward_media_cmd, resolve_media_route};
+
+    let rid = data
+        .and_then(|d| d.get("room_id"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| ObjectId::parse_str(s).ok());
+    let Some(rid) = rid else {
+        // Missing/invalid room_id — the local handlers own the error shape.
+        dispatch_media_local(state, user_id, connection_id, msg_type, data, false).await;
+        return;
+    };
+    let is_join = msg_type == "media:join";
+    match resolve_media_route(state, &rid, is_join).await {
+        MediaRoute::Local { create } => {
+            // A conn whose room came home (fold/rehome) no longer needs
+            // close-time forwarding to a remote owner.
+            state.remote_media_conns.remove(connection_id);
+            dispatch_media_local(state, user_id, connection_id, msg_type, data, create).await;
+        }
+        MediaRoute::Remote(owner) => {
+            let ok = forward_media_cmd(state, &owner, user_id, connection_id, msg_type, data).await;
+            // Track remote membership so WS close can tell the owner to
+            // drop the transports. (The prune fallback may have served
+            // the join LOCALLY after all — skip the marker then.)
+            if is_join && ok && !state.room_manager.has_room(&rid) {
+                state
+                    .remote_media_conns
+                    .insert(connection_id.to_string(), rid);
+            } else if msg_type == "media:leave" {
+                state.remote_media_conns.remove(connection_id);
+            }
+        }
+    }
+}
+
+/// Execute one media command against the LOCAL room manager. Shared by
+/// the WS dispatch above and the owner-side `media.cmd` bus handler
+/// (`ws/media_cluster.rs`) — which is why it must never re-enter the
+/// placement gate.
+pub(crate) async fn dispatch_media_local(
+    state: &AppState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    msg_type: &str,
+    data: Option<&serde_json::Value>,
+    create_allowed: bool,
+) {
+    match msg_type {
         "media:join" => {
-            handle_media_join(state, user_id, connection_id, data).await;
+            handle_media_join(state, user_id, connection_id, data, create_allowed).await;
         }
         "media:connect_transport" => {
             handle_media_connect_transport(state, connection_id, data).await;
@@ -601,17 +681,25 @@ async fn handle_client_message(
             handle_stop_audio(state, user_id, connection_id, data).await;
         }
         _ => {
-            debug!(?user_id, msg_type, "Unknown WS message type");
+            debug!(?user_id, msg_type, "Unknown media message type");
         }
     }
 }
 
-async fn send_media_error(state: &AppState, user_id: &ObjectId, message: &str) {
+async fn send_media_error(state: &AppState, connection_id: &str, message: &str) {
     let msg = serde_json::json!({
         "type": "media:error",
         "data": { "message": message }
     });
-    super::dispatcher::send_to_user(&state.ws_storage, user_id, &msg).await;
+    // Conn-addressed + routed: an error raised while executing a
+    // forwarded command must reach the viewer's pod.
+    super::dispatcher::send_to_connection_routed(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        connection_id,
+        &msg,
+    )
+    .await;
 }
 
 async fn handle_media_join(
@@ -619,11 +707,12 @@ async fn handle_media_join(
     user_id: &ObjectId,
     connection_id: &str,
     data: Option<&serde_json::Value>,
+    create_allowed: bool,
 ) {
     let room_id_str = match data.and_then(|d| d.get("room_id")).and_then(|c| c.as_str()) {
         Some(s) => s,
         None => {
-            send_media_error(state, user_id, "Missing room_id").await;
+            send_media_error(state, connection_id, "Missing room_id").await;
             return;
         }
     };
@@ -631,44 +720,30 @@ async fn handle_media_join(
     let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => {
-            send_media_error(state, user_id, "Invalid room_id").await;
+            send_media_error(state, connection_id, "Invalid room_id").await;
             return;
         }
     };
 
     let mut room_exists = state.room_manager.has_room(&rid);
-    debug!(?user_id, %connection_id, ?rid, room_exists, "media:join room check");
-    if !room_exists {
-        // S6 belt — get-or-create: `call/start` builds the mediasoup room
-        // on whichever pod served that HTTP request. If this pod doesn't
-        // hold it but Mongo says the conference is live (in_progress),
-        // create it locally instead of hard-failing. This also heals a
-        // call whose owning pod restarted (startup reset is leader-gated
-        // now, so a live-elsewhere call is no longer force-ended).
-        let call_live = state
-            .rooms
-            .base
-            .find_by_id(rid)
-            .await
-            .map(|r| r.conference_status.as_deref() == Some("in_progress"))
-            .unwrap_or(false);
-        if call_live {
-            match state.room_manager.create_room(rid).await {
-                Ok(_) => {
-                    info!(
-                        ?rid,
-                        "media:join re-created live conference room on this pod"
-                    );
-                    room_exists = true;
-                }
-                Err(e) => {
-                    warn!(?rid, %e, "media:join get-or-create failed");
-                }
+    debug!(?user_id, %connection_id, ?rid, room_exists, create_allowed, "media:join room check");
+    if !room_exists && create_allowed {
+        // C-4 — materialization is claim-gated: `create_allowed` comes
+        // from the placement resolver (NX claim won, or the belt
+        // fallback with a live conference while the directory is down).
+        // The Mongo in_progress check lives in the resolver too.
+        match state.room_manager.create_room(rid).await {
+            Ok(_) => {
+                info!(?rid, "media:join materialized conference room on this pod");
+                room_exists = true;
+            }
+            Err(e) => {
+                warn!(?rid, %e, "media:join room create failed");
             }
         }
     }
     if !room_exists {
-        send_media_error(state, user_id, "Room does not exist").await;
+        send_media_error(state, connection_id, "Room does not exist").await;
         return;
     }
 
@@ -695,7 +770,13 @@ async fn handle_media_join(
             "type": "media:router_capabilities",
             "data": { "rtp_capabilities": caps }
         });
-        super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+        super::dispatcher::send_to_connection_routed(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            connection_id,
+            &msg,
+        )
+        .await;
     }
 
     let ice_servers: Vec<serde_json::Value> = if let Some(ref url) = state.settings.turn.url {
@@ -778,7 +859,13 @@ async fn handle_media_join(
             "force_relay": force_relay,
         }
     });
-    super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+    super::dispatcher::send_to_connection_routed(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        connection_id,
+        &msg,
+    )
+    .await;
 
     let producers = state.room_manager.get_producer_ids(&rid, connection_id);
     for (uid, conn_id, pid, kind, source) in producers {
@@ -792,7 +879,13 @@ async fn handle_media_join(
                 "source": source,
             }
         });
-        super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+        super::dispatcher::send_to_connection_routed(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            connection_id,
+            &msg,
+        )
+        .await;
     }
 }
 
@@ -845,7 +938,7 @@ async fn handle_media_produce(
     let data = match data {
         Some(d) => d,
         None => {
-            send_media_error(state, user_id, "Missing data").await;
+            send_media_error(state, connection_id, "Missing data").await;
             return;
         }
     };
@@ -853,7 +946,7 @@ async fn handle_media_produce(
     let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
-            send_media_error(state, user_id, "Missing room_id").await;
+            send_media_error(state, connection_id, "Missing room_id").await;
             return;
         }
     };
@@ -863,7 +956,7 @@ async fn handle_media_produce(
     {
         Some(k) => k,
         None => {
-            send_media_error(state, user_id, "Invalid kind").await;
+            send_media_error(state, connection_id, "Invalid kind").await;
             return;
         }
     };
@@ -873,7 +966,7 @@ async fn handle_media_produce(
     {
         Some(p) => p,
         None => {
-            send_media_error(state, user_id, "Invalid rtp_parameters").await;
+            send_media_error(state, connection_id, "Invalid rtp_parameters").await;
             return;
         }
     };
@@ -889,7 +982,7 @@ async fn handle_media_produce(
     let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => {
-            send_media_error(state, user_id, "Invalid room_id").await;
+            send_media_error(state, connection_id, "Invalid room_id").await;
             return;
         }
     };
@@ -904,8 +997,13 @@ async fn handle_media_produce(
                 "type": "media:produce_result",
                 "data": { "id": producer_id.to_string() }
             });
-            super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &result_msg)
-                .await;
+            super::dispatcher::send_to_connection_routed(
+                &state.ws_storage,
+                &state.redis_pubsub,
+                connection_id,
+                &result_msg,
+            )
+            .await;
 
             let other_conns = state
                 .room_manager
@@ -923,12 +1021,18 @@ async fn handle_media_produce(
                     }
                 });
                 for conn_id in &other_conns {
-                    super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+                    super::dispatcher::send_to_connection_routed(
+                        &state.ws_storage,
+                        &state.redis_pubsub,
+                        conn_id,
+                        &event,
+                    )
+                    .await;
                 }
             }
         }
         Err(e) => {
-            send_media_error(state, user_id, &format!("produce failed: {}", e)).await;
+            send_media_error(state, connection_id, &format!("produce failed: {}", e)).await;
         }
     }
 }
@@ -942,7 +1046,7 @@ async fn handle_media_consume(
     let data = match data {
         Some(d) => d,
         None => {
-            send_media_error(state, user_id, "Missing data").await;
+            send_media_error(state, connection_id, "Missing data").await;
             return;
         }
     };
@@ -950,14 +1054,14 @@ async fn handle_media_consume(
     let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
-            send_media_error(state, user_id, "Missing room_id").await;
+            send_media_error(state, connection_id, "Missing room_id").await;
             return;
         }
     };
     let producer_id_str = match data.get("producer_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
-            send_media_error(state, user_id, "Missing producer_id").await;
+            send_media_error(state, connection_id, "Missing producer_id").await;
             return;
         }
     };
@@ -967,7 +1071,7 @@ async fn handle_media_consume(
     {
         Some(c) => c,
         None => {
-            send_media_error(state, user_id, "Invalid rtp_capabilities").await;
+            send_media_error(state, connection_id, "Invalid rtp_capabilities").await;
             return;
         }
     };
@@ -975,7 +1079,7 @@ async fn handle_media_consume(
     let rid = match ObjectId::parse_str(room_id_str) {
         Ok(id) => id,
         Err(_) => {
-            send_media_error(state, user_id, "Invalid room_id").await;
+            send_media_error(state, connection_id, "Invalid room_id").await;
             return;
         }
     };
@@ -983,7 +1087,7 @@ async fn handle_media_consume(
     let producer_id = match producer_id_str.parse::<ProducerId>() {
         Ok(id) => id,
         Err(_) => {
-            send_media_error(state, user_id, "Invalid producer_id").await;
+            send_media_error(state, connection_id, "Invalid producer_id").await;
             return;
         }
     };
@@ -1003,10 +1107,16 @@ async fn handle_media_consume(
                     "rtp_parameters": consumer_info.rtp_parameters,
                 }
             });
-            super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+            super::dispatcher::send_to_connection_routed(
+                &state.ws_storage,
+                &state.redis_pubsub,
+                connection_id,
+                &msg,
+            )
+            .await;
         }
         Err(e) => {
-            send_media_error(state, user_id, &format!("consume failed: {}", e)).await;
+            send_media_error(state, connection_id, &format!("consume failed: {}", e)).await;
         }
     }
 }
@@ -1062,7 +1172,13 @@ async fn handle_media_producer_close(
                 }
             });
             for conn_id in &other_conns {
-                super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+                super::dispatcher::send_to_connection_routed(
+                    &state.ws_storage,
+                    &state.redis_pubsub,
+                    conn_id,
+                    &event,
+                )
+                .await;
             }
         }
     }
@@ -1100,7 +1216,13 @@ async fn handle_media_leave(
             }
         });
         for conn_id in &other_conns {
-            super::dispatcher::send_to_connection(&state.ws_storage, conn_id, &event).await;
+            super::dispatcher::send_to_connection_routed(
+                &state.ws_storage,
+                &state.redis_pubsub,
+                conn_id,
+                &event,
+            )
+            .await;
         }
     }
 }
@@ -1175,12 +1297,24 @@ async fn handle_play_audio(
         }
     });
 
-    super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+    super::dispatcher::send_to_connection_routed(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        connection_id,
+        &msg,
+    )
+    .await;
     let other_conns = state
         .room_manager
         .get_other_connection_ids(&rid, connection_id);
     for cid in &other_conns {
-        super::dispatcher::send_to_connection(&state.ws_storage, cid, &msg).await;
+        super::dispatcher::send_to_connection_routed(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            cid,
+            &msg,
+        )
+        .await;
     }
 
     info!(%rid, %file_id, %playback_id, "Audio playback started");
@@ -1220,12 +1354,24 @@ async fn handle_stop_audio(
         }
     });
 
-    super::dispatcher::send_to_connection(&state.ws_storage, connection_id, &msg).await;
+    super::dispatcher::send_to_connection_routed(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        connection_id,
+        &msg,
+    )
+    .await;
     let other_conns = state
         .room_manager
         .get_other_connection_ids(&rid, connection_id);
     for cid in &other_conns {
-        super::dispatcher::send_to_connection(&state.ws_storage, cid, &msg).await;
+        super::dispatcher::send_to_connection_routed(
+            &state.ws_storage,
+            &state.redis_pubsub,
+            cid,
+            &msg,
+        )
+        .await;
     }
 
     info!(%rid, %playback_id, "Audio playback stopped");
