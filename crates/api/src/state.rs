@@ -94,6 +94,14 @@ pub struct AppState {
     /// re-made on the surviving pod mid-roll).
     pub agent_presence_tokens: Arc<DashMap<ObjectId, String>>,
 
+    // C-1 — cluster foundation (None without Redis; consumers fail soft).
+    /// Stable pod identity + process epoch.
+    pub pod: crate::cluster::identity::PodIdentity,
+    /// Entity → owning-pod records (LWW / NX namespaces).
+    pub cluster_directory: Option<crate::cluster::directory::OwnershipDirectory>,
+    /// Per-pod request/reply bus.
+    pub cluster_bus: Option<Arc<crate::cluster::bus::PodBus>>,
+
     // roomler-tunnel subsystem
     pub tunnel_clients: Arc<TunnelClientDao>,
     pub tunnel_policies: Arc<TunnelPolicyDao>,
@@ -206,7 +214,13 @@ impl AppState {
 
         let storage = Arc::new(crate::storage::FileStorage::from_settings(&settings.s3)?);
 
-        let redis_pubsub = match RedisPubSub::new(&settings.redis.url).await {
+        // C-1 — cluster identity precedes the Redis layer: the pub/sub
+        // origin, the ownership directory and the per-pod bus all speak
+        // `<pod_id>/<epoch>`.
+        let pod = crate::cluster::identity::PodIdentity::resolve(settings.app.pod_id.clone());
+        tracing::info!(pod_id = %pod.pod_id, epoch = %pod.epoch, "cluster identity resolved");
+
+        let redis_pubsub = match RedisPubSub::new(&settings.redis.url, pod.origin()).await {
             Ok(ps) => Some(Arc::new(ps)),
             Err(e) => {
                 tracing::warn!(
@@ -215,6 +229,26 @@ impl AppState {
                 );
                 None
             }
+        };
+
+        // C-1 — ownership directory + per-pod bus, both riding the
+        // pub/sub publisher's connection manager. Absent Redis ⇒ absent
+        // cluster layer ⇒ every consumer fails soft to pod-local
+        // behavior (the standing degradation rule). Constructed HERE
+        // (not main.rs) so two-pod TestApps exercise them.
+        let (cluster_directory, cluster_bus) = match &redis_pubsub {
+            Some(ps) => (
+                Some(crate::cluster::directory::OwnershipDirectory::new(
+                    ps.connection(),
+                    pod.origin(),
+                )),
+                Some(crate::cluster::bus::PodBus::start(
+                    pod.clone(),
+                    ps.connection(),
+                    settings.redis.url.clone(),
+                )),
+            ),
+            None => (None, None),
         };
 
         let giphy = if !settings.giphy.api_key.is_empty() {
@@ -246,6 +280,44 @@ impl AppState {
             turn_cfg,
             Some(consent_tx),
         ));
+
+        // C-1 — the directory heartbeat: every 30 s, re-assert this pod's
+        // agent presence records (gated on STILL holding the hub slot).
+        // Redundant with the per-received-heartbeat refresh in the socket
+        // handler — deliberately: this sweep is the single pattern later
+        // stages extend to tunnel/derp/media registries, and it heals a
+        // record lost to a Redis flap even while the agent is quiet.
+        // A CONFLICT (foreign owner) is the fold signal: log it; the
+        // socket-level machinery (displacement Goodbye / A2b counter)
+        // owns the reaction.
+        let agent_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
+        if let Some(dir) = &cluster_directory {
+            let dir = dir.clone();
+            let hub = rc_hub.clone();
+            let tokens = agent_presence_tokens.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    for entry in tokens.iter() {
+                        let (agent_id, token) = (*entry.key(), entry.value().clone());
+                        if !hub.is_agent_online(agent_id) {
+                            continue;
+                        }
+                        let key = crate::cluster::directory::agent_key(&agent_id.to_hex());
+                        match dir.refresh_if_mine(&key, &token, 90).await {
+                            Ok(true) => {}
+                            Ok(false) => tracing::warn!(
+                                agent = %agent_id,
+                                "directory heartbeat CONFLICT — foreign pod owns this agent's record"
+                            ),
+                            Err(e) => {
+                                tracing::debug!(agent = %agent_id, %e, "directory heartbeat failed");
+                            }
+                        }
+                    }
+                }
+            });
+        }
         spawn_consent_consumer(
             consent_rx,
             ConsentConsumerDeps {
@@ -271,6 +343,9 @@ impl AppState {
         Ok(Self {
             db,
             settings,
+            pod,
+            cluster_directory,
+            cluster_bus,
             auth,
             users,
             activation_codes,
@@ -303,7 +378,7 @@ impl AppState {
             agent_logs,
             consent_requests,
             rc_hub,
-            agent_presence_tokens: Arc::new(DashMap::new()),
+            agent_presence_tokens,
             tunnel_clients,
             tunnel_policies,
             tunnel_audit,

@@ -34,6 +34,8 @@ mod agent_tests;
 #[cfg(test)]
 mod billing_tests;
 #[cfg(test)]
+mod cluster_tests;
+#[cfg(test)]
 mod cors_tests;
 #[cfg(test)]
 mod invite_tests;
