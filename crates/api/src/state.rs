@@ -94,6 +94,12 @@ pub struct AppState {
     /// each key (an unconditional DEL could erase a claim an agent already
     /// re-made on the surviving pod mid-roll).
     pub agent_presence_tokens: Arc<DashMap<ObjectId, String>>,
+    /// C-3 — directory owner-tokens for LOCAL tunnel sessions
+    /// (`roomler:own:tunnel:<session>`). Written on open; refreshed by the
+    /// directory heartbeat while the session map still holds the session;
+    /// never explicitly released — the 90 s TTL reaps ≤90 s after any of
+    /// the four teardown paths drops the map entry.
+    pub tunnel_presence_tokens: Arc<DashMap<ObjectId, String>>,
 
     // C-1 — cluster foundation (None without Redis; consumers fail soft).
     /// Stable pod identity + process epoch.
@@ -292,6 +298,8 @@ impl AppState {
         // socket-level machinery (displacement Goodbye / A2b counter)
         // owns the reaction.
         let agent_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
+        let tunnel_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
+        let tunnel_clients_by_session: TunnelClientOutbound = Arc::new(DashMap::new());
         let tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
             Arc::new(DashMap::new());
 
@@ -411,6 +419,8 @@ impl AppState {
             let dir = dir.clone();
             let hub = rc_hub.clone();
             let tokens = agent_presence_tokens.clone();
+            let tunnel_tokens = tunnel_presence_tokens.clone();
+            let tunnel_sessions = tunnel_clients_by_session.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -429,6 +439,25 @@ impl AppState {
                             Err(e) => {
                                 tracing::debug!(agent = %agent_id, %e, "directory heartbeat failed");
                             }
+                        }
+                    }
+                    // C-3 — tunnel session records: refresh while the session
+                    // map holds the session (its four teardown paths all drop
+                    // the map entry, which stops the refresh here; the 90 s
+                    // TTL then reaps the record — no explicit release).
+                    let dead: Vec<ObjectId> = tunnel_tokens
+                        .iter()
+                        .filter(|e| !tunnel_sessions.contains_key(e.key()))
+                        .map(|e| *e.key())
+                        .collect();
+                    for sid in dead {
+                        tunnel_tokens.remove(&sid);
+                    }
+                    for entry in tunnel_tokens.iter() {
+                        let (sid, token) = (*entry.key(), entry.value().clone());
+                        let key = crate::cluster::directory::tunnel_key(&sid.to_hex());
+                        if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
+                            tracing::debug!(session = %sid, %e, "tunnel directory refresh failed");
                         }
                     }
                 }
@@ -495,10 +524,11 @@ impl AppState {
             consent_requests,
             rc_hub,
             agent_presence_tokens,
+            tunnel_presence_tokens: tunnel_presence_tokens.clone(),
             tunnel_clients,
             tunnel_policies,
             tunnel_audit,
-            tunnel_clients_by_session: Arc::new(DashMap::new()),
+            tunnel_clients_by_session: tunnel_clients_by_session.clone(),
             tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
             overlay_networks,
             overlay_nodes,

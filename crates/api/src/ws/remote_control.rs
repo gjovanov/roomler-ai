@@ -439,23 +439,7 @@ pub async fn dispatch_controller_rc(
                 open_nonce: None,
             });
             // Fire-and-forget idle nudge at the owner.
-            if let (Some(bus), false) = (&state.cluster_bus, owner_pod.is_empty()) {
-                let bus = bus.clone();
-                let agent_hex = agent_hex.clone();
-                tokio::spawn(async move {
-                    match bus
-                        .request(
-                            &owner_pod,
-                            "rc.agent_nudge",
-                            serde_json::json!({ "agent_id": agent_hex }),
-                        )
-                        .await
-                    {
-                        Ok(rep) => debug!(agent = %agent_hex, ?rep, "rc rehome nudge sent"),
-                        Err(e) => debug!(agent = %agent_hex, %e, "rc rehome nudge failed"),
-                    }
-                });
-            }
+            spawn_agent_nudge(state, owner_pod, agent_hex.clone());
             return true;
         }
         // Phase A-1 split-evidence probe for the remaining offline paths
@@ -585,6 +569,33 @@ pub async fn resolve_session_authz(
         return Ok(SessionAuthz::allow(mode));
     }
     Err("you're not on this device's control allowlist".to_string())
+}
+
+/// C-2/C-3 — fire-and-forget idle-agent nudge at the pod owning an
+/// agent's WS (read from its directory record): the owner cycles the
+/// socket iff the agent is fully idle, so its reconnect re-hashes onto
+/// the current LB map. Failure is harmless (the requester's own retry
+/// path still works; the agent converges on its next natural reconnect).
+pub(crate) fn spawn_agent_nudge(state: &AppState, owner_pod: String, agent_hex: String) {
+    let Some(bus) = state.cluster_bus.clone() else {
+        return;
+    };
+    if owner_pod.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        match bus
+            .request(
+                &owner_pod,
+                "rc.agent_nudge",
+                serde_json::json!({ "agent_id": agent_hex }),
+            )
+            .await
+        {
+            Ok(rep) => debug!(agent = %agent_hex, ?rep, "agent rehome nudge sent"),
+            Err(e) => debug!(agent = %agent_hex, %e, "agent rehome nudge failed"),
+        }
+    });
 }
 
 /// C-2 — publish an rc control event on the global channel. Control
@@ -930,6 +941,39 @@ async fn relay_to_client(state: &AppState, session_id: bson::oid::ObjectId, msg:
         .map(|entry| entry.value().clone())
     else {
         debug!(%session_id, "agent → client relay: no registered tunnel-client; dropping");
+        // C-3 split evidence: if ANOTHER pod owns this session's record,
+        // the drop was a cross-pod split (the agent's WS re-homed away
+        // from the client's pod), not a torn-down client. Counted like
+        // the A2b agent probe; throttled to 1/5 s.
+        if let Some(dir) = state.cluster_directory.clone() {
+            static LAST_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            static SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now = bson::DateTime::now().timestamp_millis();
+            let last = LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if now - last >= 5_000
+                && LAST_MS
+                    .compare_exchange(
+                        last,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                tokio::spawn(async move {
+                    let key = crate::cluster::directory::tunnel_key(&session_id.to_hex());
+                    if let Ok(Some(owner)) = dir.get(&key).await
+                        && dir.is_foreign(&owner)
+                    {
+                        let total = SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        warn!(
+                            session = %session_id, owner = %owner, total,
+                            "SPLIT EVIDENCE: tunnel relay dropped but another pod owns the session"
+                        );
+                    }
+                });
+            }
+        }
         return;
     };
     if let Err(e) = tx.send(msg).await {
