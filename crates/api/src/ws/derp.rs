@@ -73,6 +73,13 @@ pub type DerpKey = (ObjectId, DerpPubKey);
 /// write task. Shared across every `/derp` connection (lives in `AppState`).
 pub type DerpRegistry = Arc<DashMap<DerpKey, mpsc::Sender<Vec<u8>>>>;
 
+/// C-5 — per-connection close signal: the cluster convergence sweep
+/// (`ws/derp_cluster.rs`) fires it to rehome a socket parked on the
+/// wrong pod; the socket loop's cancel arm breaks, teardown releases
+/// the directory record, and the client's reconnect re-lands per the
+/// current LB map.
+pub type DerpCancelRegistry = Arc<DashMap<DerpKey, Arc<tokio::sync::Notify>>>;
+
 /// Per-connection outbound queue depth. Bounded so a slow or hostile consumer
 /// can't grow the relay's memory without bound; on overflow we DROP the frame
 /// (WG/QUIC are loss-tolerant — a dropped carrier datagram just retransmits).
@@ -167,6 +174,11 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
     // read loop keeps working as a SENDER until it notices its own close; only
     // inbound routing moves to the new connection.
     state.derp_registry.insert(key, out_tx.clone());
+    // C-5 — cancel handle (rehome close) + directory record + one
+    // convergence sweep over this network's registrations.
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    state.derp_cancels.insert(key, cancel.clone());
+    super::derp_cluster::on_derp_register(&state, network_id, &self_pubkey, agent_id).await;
     info!(%agent_id, %network_id, "derp: node registered");
 
     // Write task: drain outbound frames → WS binary.
@@ -193,14 +205,27 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
             // If the write task ends (peer's socket died on the write side),
             // stop reading too.
             _ = &mut write => break,
+            // C-5 — cluster rehome: this socket is parked on the wrong
+            // pod; close it so the reconnect re-lands converged.
+            _ = cancel.notified() => {
+                info!(%agent_id, %network_id, "derp: closing for cluster rehome");
+                break;
+            }
         }
     }
 
     // Deregister — but ONLY if we're still the registered sender. A newer
     // reconnect (last-writer-wins) may have replaced us; we must not evict it.
-    state
+    let removal_was_ours = state
         .derp_registry
-        .remove_if(&key, |_, tx| tx.same_channel(&out_tx));
+        .remove_if(&key, |_, tx| tx.same_channel(&out_tx))
+        .is_some();
+    super::derp_cluster::remove_cancel_if_ours(&state, &key, &cancel);
+    if removal_was_ours {
+        // C-5 — release the directory record (a displaced older socket
+        // skips this: the record belongs to its replacement).
+        super::derp_cluster::on_derp_teardown(&state, network_id, &self_pubkey).await;
+    }
     write.abort();
     info!(%agent_id, %network_id, "derp: node disconnected");
 }
