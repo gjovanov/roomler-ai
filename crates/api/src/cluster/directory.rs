@@ -241,6 +241,30 @@ impl OwnershipDirectory {
         let mut conn = self.conn.clone();
         redis::cmd("SMEMBERS").arg(key).query_async(&mut conn).await
     }
+
+    /// C-6 — cursor-driven `SCAN MATCH` (never `KEYS`): used by the
+    /// status snapshot for the handful of `roomler:pod-alive:*` records.
+    pub async fn scan_keys(&self, pattern: &str) -> Result<Vec<String>, redis::RedisError> {
+        let mut conn = self.conn.clone();
+        let mut cursor: u64 = 0;
+        let mut out = Vec::new();
+        loop {
+            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await?;
+            out.extend(batch);
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(out)
+    }
 }
 
 /// Key builders — ONE place per namespace so producers and readers can
