@@ -56,6 +56,17 @@ export const useWsStore = defineStore('ws', () => {
   function setTenantAffinity(tid: string | null) {
     if (tid === affinityTid) return
     affinityTid = tid
+    forceRedial()
+  }
+
+  /**
+   * C-2 — immediate redial with the CURRENT affinity, even when the tid
+   * didn't change. The rehome path needs this: after a server roll a
+   * socket can sit PARKED on a pod the LB no longer maps this tenant to —
+   * the affinity value is right, the placement is wrong, and only a fresh
+   * dial re-hashes it. No-op when no socket is live.
+   */
+  function forceRedial() {
     if (socket && socket.readyState <= WebSocket.OPEN && lastToken) {
       const token = lastToken
       const old = socket
@@ -295,6 +306,7 @@ export const useWsStore = defineStore('ws', () => {
     connect,
     disconnect,
     setTenantAffinity,
+    forceRedial,
     send,
     sendRaw,
     sendTyping,
