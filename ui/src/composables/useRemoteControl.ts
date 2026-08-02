@@ -736,15 +736,13 @@ function readStoredResolution(agentId: string): RcResolutionSetting {
   } catch {
     /* fall through to default */
   }
-  // rc.190 Ã¢ÂÂ default is FIT (agent downscales to this viewer's stage ÃÂ
-  // devicePixelRatio): never stream more pixels than the viewer can
-  // display. Field 2026-07-16: a 1200p viewer receiving a 4K stream paid
-  // 4ÃÂ the encode+bandwidth+decode for pixels it threw away. Dims are
-  // filled in by the view's `applyFitResolution()` as soon as the stage
-  // is measured (the dims-less setting is not sent Ã¢ÂÂ see
-  // `resolutionWireMessage`); users who explicitly picked a resolution
-  // have a stored value and keep it.
-  return { mode: 'fit' }
+  // 2026-08-02 (operator default set) — default is ORIGINAL: stream the
+  // host's native resolution for a 1:1 pixel mapping (pairs with the new
+  // display-match-ON default; sharpest possible text). The rc.190 'fit'
+  // rationale (a small viewer paying 4x for pixels it throws away) still
+  // holds as advice for small screens — those users pick Fit once and
+  // their stored value wins forever.
+  return { mode: 'original' }
 }
 
 function persistResolution(agentId: string, s: RcResolutionSetting) {
@@ -1511,7 +1509,8 @@ function readStoredPriority(): RcPriority {
   } catch {
     /* privacy mode Ã¢ÂÂ default */
   }
-  return 'balanced'
+  // 2026-08-02 operator default: Sharper (text fidelity over motion).
+  return 'sharper'
 }
 
 function persistPriority(p: RcPriority) {
@@ -1522,16 +1521,19 @@ function persistPriority(p: RcPriority) {
   }
 }
 
-/** loopback-TURN corp-relay opt-in (Phase 2; default OFF while it beds in Ã¢ÂÂ
- *  the plan's Phase-4 gating). When on, `connect()` probes the local agent's
- *  loopback TURN and, if present, relays through it. */
+/** loopback-TURN corp-relay (Phase 2; default ON since 2026-08-02 — bedded
+ *  in). When on, `connect()` probes the local agent's loopback TURN and, if
+ *  present, relays through it. */
 const LOCAL_RELAY_STORAGE_KEY = 'roomler-rc-local-relay'
 
 function readStoredLocalRelay(): boolean {
+  // 2026-08-02 operator default: ON (bedded in since rc.220 agent-side).
+  // Explicit off is stored as '0' (persist always writes), so users who
+  // turned it off keep their choice.
   try {
-    return globalThis.localStorage?.getItem(LOCAL_RELAY_STORAGE_KEY) === '1'
+    return globalThis.localStorage?.getItem(LOCAL_RELAY_STORAGE_KEY) !== '0'
   } catch {
-    return false
+    return true
   }
 }
 
@@ -2613,7 +2615,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  old Quality dropdown in the UI (which only shadowed AIMD/REMB); the
    *  underlying `quality` ref + `rc:quality` sender are kept for back-compat. */
   const priority = ref<RcPriority>(readStoredPriority())
-  /** loopback-TURN corp-relay opt-in (Phase 2; default OFF). When on,
+  /** loopback-TURN corp-relay (Phase 2; default ON since 2026-08-02). When on,
    *  `connect()` probes the local agent's loopback TURN and relays through it
    *  if present Ã¢ÂÂ bypasses the capped far-coturn relay on corp networks. */
   const localRelayEnabled = ref<boolean>(readStoredLocalRelay())
