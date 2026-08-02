@@ -231,3 +231,9 @@ mod tests {
         assert!(OwnerRecord::parse("garbage").is_none());
     }
 }
+
+/// C-3 — tunnel session ownership records (observability + the C-6
+/// metrics; liveness is the session map, TTL reaps ≤90 s after teardown).
+pub fn tunnel_key(session_hex: &str) -> String {
+    format!("roomler:own:tunnel:{session_hex}")
+}
