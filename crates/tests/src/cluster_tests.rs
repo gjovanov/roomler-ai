@@ -631,3 +631,122 @@ async fn media_conflict_folds_loser_island() {
     use futures::SinkExt;
     ws1.close(None).await.ok();
 }
+
+// ── C-5: DERP directory + registration-driven rehome ────────────────
+
+/// A DERP network split across pods converges toward the NEWEST
+/// registration: the parked socket on the losing pod is closed by the
+/// `derp.rehome` RPC, its record is compare-DEL-released on teardown,
+/// and the surviving registration keeps its record.
+#[tokio::test]
+async fn derp_split_rehomes_toward_newest_registration() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use futures::{SinkExt, StreamExt};
+    use roomler_ai_api::cluster::directory::derp_key;
+    use roomler_ai_api::ws::derp_cluster::pk_hex;
+    use roomler_ai_remote_control::models::NodeRef;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let Some(d1) = app1.state.cluster_directory.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let tenant = app1.seed_tenant("derpc5").await;
+    let tid = bson::oid::ObjectId::parse_str(&tenant.tenant_id).unwrap();
+
+    let (aid_a, tok_a) = crate::agent_presence_tests::enroll(&app1, &tenant, "derp-mach-a").await;
+    let (aid_b, tok_b) = crate::agent_presence_tests::enroll(&app1, &tenant, "derp-mach-b").await;
+
+    // Overlay network + node rows (what rc:overlay.join would create) —
+    // /derp registration resolves the agent's node and validates its
+    // wg_public_key against the registration frame.
+    let networks = roomler_ai_services::dao::overlay_network::OverlayNetworkDao::new(&app1.db);
+    let nodes = roomler_ai_services::dao::overlay_node::OverlayNodeDao::new(&app1.db);
+    let network_id = networks.get_or_create(tid).await.unwrap().id.unwrap();
+    let pk_a: [u8; 32] = [0xa1; 32];
+    let pk_b: [u8; 32] = [0xb2; 32];
+    for (aid, pk, ip, name) in [
+        (&aid_a, pk_a, "100.64.0.1", "derp-node-a"),
+        (&aid_b, pk_b, "100.64.0.2", "derp-node-b"),
+    ] {
+        nodes
+            .create(
+                tid,
+                NodeRef::Agent {
+                    agent_id: bson::oid::ObjectId::parse_str(aid).unwrap(),
+                },
+                network_id,
+                format!("mach-{name}"),
+                name.to_string(),
+                ip.to_string(),
+                B64.encode(pk),
+                0,
+                vec![],
+                false,
+                false,
+                true,
+                false,
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+
+    // A registers on pod1 (the socket that will end up parked).
+    let (mut ws_a, _) = connect_async(&format!("ws://{}/derp?token={}", app1.addr, tok_a))
+        .await
+        .expect("derp WS A");
+    ws_a.send(Message::Binary(pk_a.to_vec().into()))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let key_a = derp_key(&network_id.to_hex(), &pk_hex(&pk_a));
+    let raw = d1.get(&key_a).await.unwrap().expect("A's derp record");
+    assert_eq!(
+        OwnerRecord::parse(&raw).unwrap().pod_id,
+        app1.state.pod.pod_id
+    );
+
+    // B registers on pod2 — the NEWEST registration makes pod2 the
+    // convergence target; pod1 is told to close A.
+    let (mut ws_b, _) = connect_async(&format!("ws://{}/derp?token={}", app2.addr, tok_b))
+        .await
+        .expect("derp WS B");
+    ws_b.send(Message::Binary(pk_b.to_vec().into()))
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut closed = false;
+    while tokio::time::Instant::now() < deadline && !closed {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), ws_a.next()).await {
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => closed = true,
+            Ok(Some(Err(_))) => closed = true,
+            _ => {}
+        }
+    }
+    assert!(closed, "parked derp socket must be rehome-closed");
+
+    // A's teardown compare-DELs its record (not just TTL expiry).
+    let mut released = false;
+    for _ in 0..30 {
+        if d1.get(&key_a).await.unwrap().is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(released, "rehome-closed socket must release its record");
+
+    // B's record survives, attributed to pod2.
+    let key_b = derp_key(&network_id.to_hex(), &pk_hex(&pk_b));
+    let raw = d1.get(&key_b).await.unwrap().expect("B's derp record");
+    assert_eq!(
+        OwnerRecord::parse(&raw).unwrap().pod_id,
+        app2.state.pod.pod_id
+    );
+
+    ws_b.close(None).await.ok();
+}
