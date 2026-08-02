@@ -180,11 +180,36 @@ impl AgentDao {
     /// lived but quiet agent stays at "last_seen = hello time" forever.
     /// 30 s heartbeat cadence on the agent keeps the field fresh enough
     /// that "agent online" can be defined as `last_seen_at > now - 90 s`.
+    ///
+    /// Phase A-1: also re-asserts `status: Online`. A heartbeat only
+    /// arrives over a live registered WS, so Online is definitionally
+    /// true — and this bounds any status-clobber race (a displaced
+    /// handler's or a late reaper's wrongful `Offline`) to ≤30 s.
     pub async fn touch_heartbeat(&self, agent_id: ObjectId) -> DaoResult<bool> {
         self.base
             .update_by_id(
                 agent_id,
-                doc! { "$set": { "last_seen_at": DateTime::now() } },
+                doc! { "$set": {
+                    "last_seen_at": DateTime::now(),
+                    "status": bson::to_bson(&AgentStatus::Online).unwrap(),
+                } },
+            )
+            .await
+    }
+
+    /// Phase A-1 graceful shutdown: bulk-offline the agents whose WSs
+    /// this pod held (belt-and-braces behind the per-socket teardowns).
+    pub async fn mark_status_many(&self, ids: &[ObjectId], status: AgentStatus) -> DaoResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.base
+            .update_many(
+                doc! { "_id": { "$in": ids.to_vec() } },
+                doc! { "$set": {
+                    "status": bson::to_bson(&status).unwrap(),
+                    "last_seen_at": DateTime::now(),
+                } },
             )
             .await
     }
