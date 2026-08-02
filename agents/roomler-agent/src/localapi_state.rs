@@ -740,6 +740,7 @@ pub fn spawn_rtt_prober(
     overlay: watch::Receiver<OverlayView>,
     cache: RttCache,
     mut shutdown: watch::Receiver<bool>,
+    on_sample: Option<RttSampleHook>,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(RTT_PROBE_INTERVAL);
@@ -754,27 +755,41 @@ pub fn spawn_rtt_prober(
             }
             // Snapshot the peers to probe, then release the watch borrow before
             // any await (the borrow is not held across the ping).
-            let targets: Vec<(String, IpAddr)> = overlay
+            let targets: Vec<(String, String, IpAddr)> = overlay
                 .borrow()
                 .peers
                 .iter()
                 .filter(|p| matches!(p.connection, ConnectionType::Direct | ConnectionType::Relay))
                 .filter_map(|p| {
                     let ip = p.overlay_ip.as_deref()?;
-                    ip.parse::<IpAddr>().ok().map(|addr| (ip.to_string(), addr))
+                    ip.parse::<IpAddr>()
+                        .ok()
+                        .map(|addr| (p.node_id.clone(), ip.to_string(), addr))
                 })
                 .collect();
-            for (key, ip) in targets {
+            for (node_id, key, ip) in targets {
                 if let Ok(rtt) = pinger.ping(ip, RTT_PROBE_TIMEOUT).await {
                     let ms = rtt.as_millis().min(u32::MAX as u128) as u32;
                     if let Ok(mut c) = cache.lock() {
                         c.insert(key, (ms, Instant::now()));
+                    }
+                    // B1 — hand the sample to the overlay runtime's quality
+                    // plane (a timeout deliberately hands over NOTHING —
+                    // loss is the death path's business).
+                    if let Some(hook) = &on_sample {
+                        hook(&node_id, ms);
                     }
                 }
             }
         }
     });
 }
+
+/// B1 — optional per-sample prober callback: `(node_id_hex, rtt_ms)` for
+/// every SUCCESSFUL probe. Feature-agnostic — the overlay-enabled caller
+/// (main.rs) bridges it into the runtime's `OverlayEvent` channel via a
+/// weak sender, so this module never grows an overlay-feature dependency.
+pub type RttSampleHook = Arc<dyn Fn(&str, u32) + Send + Sync>;
 
 /// A 24-char hex ObjectId — the only shape a session id may take before it's
 /// used as a sentinel filename. Guards [`DaemonState::consent_decide`] against a
