@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{DateTime, oid::ObjectId};
+use roomler_ai_remote_control::models::{OverlayAclMode, OverlayPolicy};
 use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode, overlay_ip},
     signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo, ServerMsg},
@@ -40,6 +41,7 @@ use roomler_ai_remote_control::{
     worker_pick::pick_worker_fnv1a,
 };
 use roomler_ai_services::dao::base::DaoError;
+use roomler_ai_tunnel_core::policy::{OverlayPeerRef, OverlaySource, evaluate_overlay};
 use tokio::net::lookup_host;
 use tracing::{debug, warn};
 
@@ -286,10 +288,15 @@ async fn handle_overlay_join(
     // heartbeat went stale) ship `reachable = false` in the FULL netmap
     // instead of resurrecting as dialable peers on every rejoin.
     let reach = reachability(state, &all).await;
+    // Overlay ACL — the joiner's view is shaped for the JOINER. This half is
+    // naturally per-recipient because the full netmap is built for exactly one
+    // node; the delta fan-out below is the half that had to be un-broadcast.
+    let acl = load_acl(state, tenant_id).await;
+    let joiner_src = overlay_source_of(state, &self_node).await;
     let peers: Vec<NetmapPeer> = all
         .iter()
         .filter(|n| n.id != self_node.id)
-        .map(|n| to_netmap_peer(n, is_reachable(&reach, n)))
+        .filter_map(|n| shape_peer(&acl, &joiner_src, n, is_reachable(&reach, n)))
         .collect();
 
     // Phase 2 MagicDNS — carry the tenant's DNS suffix + upstreams so the node
@@ -328,16 +335,24 @@ async fn handle_overlay_join(
     )
     .await;
 
-    // Upsert delta → every peer. The joiner is live by construction.
-    let upsert = to_netmap_peer(&self_node, true);
+    // Upsert delta → every peer, shaped PER RECIPIENT. The joiner is live by
+    // construction. A recipient that may not see the joiner gets an explicit
+    // `removes` rather than mere omission: omitting a peer (or shipping
+    // `reachable: false`) is a no-op against an already-installed peer — only
+    // the removes branch tears down the WG peer, its route and its carrier.
     for peer in all.iter().filter(|n| n.id != self_node.id) {
+        let peer_src = overlay_source_of(state, peer).await;
+        let (upserts, removes) = match shape_peer(&acl, &peer_src, &self_node, true) {
+            Some(u) => (vec![u], vec![]),
+            None => (vec![], vec![self_node.id.unwrap_or_default()]),
+        };
         send_to_node(
             state,
             peer,
             ServerMsg::OverlayNetmapDelta {
                 epoch,
-                upserts: vec![upsert.clone()],
-                removes: vec![],
+                upserts,
+                removes,
             },
         )
         .await;
@@ -371,8 +386,7 @@ async fn handle_overlay_endpoints(state: &AppState, ident: NodeIdentity, candida
     let mut updated = self_node;
     updated.endpoints = candidates;
     let epoch = next_epoch();
-    let upsert = to_netmap_peer(&updated, true);
-    fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
+    fan_upsert_shaped(state, &updated, epoch, true).await;
 }
 
 /// NAT-traversal Phase B/C — the node trickled its server-reflexive (srflx)
@@ -407,8 +421,7 @@ async fn handle_overlay_srflx(
     updated.srflx_endpoints = candidates;
     updated.srflx_nat = nat;
     let epoch = next_epoch();
-    let upsert = to_netmap_peer(&updated, true);
-    fan_delta_to_peers(state, &updated, epoch, vec![upsert], vec![]).await;
+    fan_upsert_shaped(state, &updated, epoch, true).await;
 }
 
 /// Graceful leave (or WS teardown): mark offline + tell peers to drop.
@@ -435,8 +448,7 @@ pub async fn handle_overlay_leave(state: &AppState, ident: NodeIdentity) {
     // their next rejoin — which is the same goal P9 pursued from the join
     // side. `removes` keeps its one honest producer, `release_overlay_node`:
     // a device that was actually released does disappear.
-    let upsert = to_netmap_peer(&self_node, false);
-    fan_delta_to_peers(state, &self_node, epoch, vec![upsert], vec![]).await;
+    fan_upsert_shaped(state, &self_node, epoch, false).await;
 }
 
 /// Mint symmetric coturn creds for a relay leg to `peer_node_id`.
@@ -464,6 +476,33 @@ async fn handle_overlay_relay_request(
             return;
         }
     };
+
+    // Overlay ACL — a TURN grant is a carrier for the very pair the netmap may
+    // have just denied. Without this check a denied pair simply asks for relay
+    // credentials and routes around the netmap, which would make the whole ACL
+    // decorative. Enforced only in `Enforce` mode; `Warn` logs and grants.
+    let acl = load_acl(state, self_node.tenant_id).await;
+    if !matches!(acl.mode, OverlayAclMode::Off) {
+        let src = overlay_source_of(state, &self_node).await;
+        let access = evaluate_overlay(
+            &acl.policies,
+            &src,
+            OverlayPeerRef {
+                node_id: peer_node_id,
+                overlay_ip: &peer.overlay_ip,
+                approved_routes: &peer.approved_routes,
+            },
+        );
+        if !access.visible {
+            if acl.enforcing() {
+                warn!(%self_id, peer = %peer_node_id,
+                    "overlay acl: relay_request for a peer this node may not reach; refusing");
+                return;
+            }
+            debug!(%self_id, peer = %peer_node_id,
+                "overlay acl [warn]: would refuse relay_request");
+        }
+    }
 
     let pair_key = pair_key(self_id, peer_node_id);
 
@@ -714,8 +753,7 @@ pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
     // P9 — an out-of-band refan (admin route approval) can target a node
     // that is currently offline; carry its real presence, not a blanket true.
     let reach = reachability(state, std::slice::from_ref(node)).await;
-    let upsert = to_netmap_peer(node, is_reachable(&reach, node));
-    fan_delta_to_peers(state, node, next_epoch(), vec![upsert], vec![]).await;
+    fan_upsert_shaped(state, node, next_epoch(), is_reachable(&reach, node)).await;
 }
 
 /// What a successful [`release_overlay_node`] freed — for the route responses
@@ -876,16 +914,19 @@ pub(crate) async fn release_overlay_node_for(
 }
 
 /// Fan a delta to every active peer of `self_node` in its network.
-async fn fan_delta_to_peers(
-    state: &AppState,
-    self_node: &OverlayNode,
-    epoch: u64,
-    upserts: Vec<NetmapPeer>,
-    removes: Vec<ObjectId>,
-) {
+/// Fan an upsert of `node` to its peers, **shaped per recipient** by the
+/// tenant's overlay ACL.
+///
+/// Replaces the old build-once-clone-N-times fan-out: the entry a recipient
+/// receives now depends on what that recipient is allowed to see. A recipient
+/// that may not see `node` is sent an explicit `removes` rather than simply
+/// being skipped — omitting a peer from a delta (or shipping it with
+/// `reachable: false`) does NOT tear down an already-installed peer; only the
+/// removes branch drops the WG peer, its route and its carrier.
+async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, reachable: bool) {
     let peers = match state
         .overlay_nodes
-        .list_active_in_network(self_node.tenant_id, self_node.network_id)
+        .list_active_in_network(node.tenant_id, node.network_id)
         .await
     {
         Ok(v) => v,
@@ -894,7 +935,24 @@ async fn fan_delta_to_peers(
             return;
         }
     };
-    fan_delta_to(state, &peers, self_node.id, epoch, upserts, removes).await;
+    let acl = load_acl(state, node.tenant_id).await;
+    for peer in peers.iter().filter(|p| p.id != node.id) {
+        let src = overlay_source_of(state, peer).await;
+        let (upserts, removes) = match shape_peer(&acl, &src, node, reachable) {
+            Some(u) => (vec![u], vec![]),
+            None => (vec![], vec![node.id.unwrap_or_default()]),
+        };
+        send_to_node(
+            state,
+            peer,
+            ServerMsg::OverlayNetmapDelta {
+                epoch,
+                upserts,
+                removes,
+            },
+        )
+        .await;
+    }
 }
 
 /// Fan a delta to an EXPLICIT peer list, skipping `exclude`.
@@ -1129,6 +1187,140 @@ fn is_reachable(reach: &HashMap<ObjectId, bool>, node: &OverlayNode) -> bool {
 /// verdict ([`reachability`] for peer lists; `true` for a node's OWN upsert —
 /// the sender of a live WS message is reachable by construction). Phase 4
 /// additionally sets this from `policy::evaluate_overlay`.
+// ────────────────────────────────────────────────────────────────────────────
+// Overlay ACL (L3)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// One tenant's ACL posture + rules, loaded once per netmap event.
+///
+/// Cheap to build and short-lived on purpose: netmap events are joins, leaves,
+/// endpoint trickles and admin edits — orders of magnitude rarer than the
+/// per-flow tunnel gate, so there is nothing to cache yet.
+pub(crate) struct AclCtx {
+    mode: OverlayAclMode,
+    policies: Vec<OverlayPolicy>,
+}
+
+impl AclCtx {
+    fn off() -> Self {
+        Self {
+            mode: OverlayAclMode::Off,
+            policies: Vec::new(),
+        }
+    }
+    fn enforcing(&self) -> bool {
+        matches!(self.mode, OverlayAclMode::Enforce)
+    }
+}
+
+/// Load the tenant's ACL posture and rules.
+///
+/// **Fails OPEN, deliberately.** The tunnel gate defaults to deny because a
+/// denied flow is one broken connection; here a spurious deny would withhold
+/// every peer and tear down the tenant's whole mesh on a transient Mongo blip.
+/// The same reasoning already governs `reachability()` above ("failing open").
+/// A load failure is logged at ERROR so it is never silent.
+async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
+    let mode = match state.overlay_networks.get_or_create(tenant_id).await {
+        Ok(n) => n.acl_mode,
+        Err(e) => {
+            tracing::error!(%tenant_id, %e, "overlay acl: network read failed; failing OPEN");
+            return AclCtx::off();
+        }
+    };
+    if matches!(mode, OverlayAclMode::Off) {
+        return AclCtx::off();
+    }
+    match state
+        .overlay_policies
+        .list_active_for_tenant(tenant_id)
+        .await
+    {
+        Ok(policies) => AclCtx { mode, policies },
+        Err(e) => {
+            tracing::error!(%tenant_id, %e, "overlay acl: policy read failed; failing OPEN");
+            AclCtx::off()
+        }
+    }
+}
+
+/// Resolve the identity a netmap is being built FOR: the node itself, plus the
+/// owner + roles of its backing agent / tunnel client so `UserId` / `RoleId`
+/// selectors can match.
+async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> OverlaySource {
+    let owner_user_id = match &node.node_ref {
+        NodeRef::Agent { agent_id } => state
+            .agents
+            .base
+            .find_by_id(*agent_id)
+            .await
+            .ok()
+            .map(|a| a.owner_user_id),
+        NodeRef::TunnelClient { tunnel_client_id } => state
+            .tunnel_clients
+            .base
+            .find_by_id(*tunnel_client_id)
+            .await
+            .ok()
+            .map(|c| c.owner_user_id),
+    };
+    let role_ids = match owner_user_id {
+        Some(uid) => state
+            .tenants
+            .member_role_ids(node.tenant_id, uid)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    OverlaySource {
+        node_id: node.id.unwrap_or_default(),
+        owner_user_id,
+        role_ids,
+    }
+}
+
+/// Shape one peer for one recipient. `None` = withhold it entirely.
+///
+/// In `Warn` mode the permissive peer is returned but every difference is
+/// logged, which is what makes the cutover to `Enforce` evidence-driven rather
+/// than a leap of faith.
+fn shape_peer(
+    acl: &AclCtx,
+    src: &OverlaySource,
+    peer: &OverlayNode,
+    reachable: bool,
+) -> Option<NetmapPeer> {
+    if matches!(acl.mode, OverlayAclMode::Off) {
+        return Some(to_netmap_peer(peer, reachable));
+    }
+    let access = evaluate_overlay(
+        &acl.policies,
+        src,
+        OverlayPeerRef {
+            node_id: peer.id.unwrap_or_default(),
+            overlay_ip: &peer.overlay_ip,
+            approved_routes: &peer.approved_routes,
+        },
+    );
+    if !acl.enforcing() {
+        if !access.visible {
+            debug!(source = %src.node_id, peer = %peer.name,
+                "overlay acl [warn]: would WITHHOLD peer");
+        } else if access.routes.len() != peer.approved_routes.len() {
+            debug!(source = %src.node_id, peer = %peer.name,
+                granted = access.routes.len(), approved = peer.approved_routes.len(),
+                "overlay acl [warn]: would narrow routes");
+        }
+        return Some(to_netmap_peer(peer, reachable));
+    }
+    if !access.visible {
+        return None;
+    }
+    let mut shaped = to_netmap_peer(peer, reachable);
+    shaped.routes = access.routes;
+    Some(shaped)
+}
+
 fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
     NetmapPeer {
         node_id: node.id.unwrap_or_default(),
@@ -1168,7 +1360,10 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // Phase D (DERP) — surface the node's DERP capability so a both-UDP-blocked
         // pair only picks DERP when both ends advertise it.
         supports_derp: node.supports_derp,
-        // Phase 1 — only the admin-APPROVED routes reach peers.
+        // Only the admin-APPROVED routes reach peers — and, once the tenant's
+        // overlay ACL is enforcing, only the subset THIS recipient may install
+        // (see `shape_peer`). `to_netmap_peer` keeps the permissive default so
+        // every legacy call site is unchanged.
         routes: node.approved_routes.clone(),
         // P3b-3 — expose the backing agent id (bridging overlay-node-id →
         // agents._id) so a controlling node can join this peer to a
