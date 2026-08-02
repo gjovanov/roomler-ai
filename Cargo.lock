@@ -7310,6 +7310,7 @@ version = "0.3.0-rc.295"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bson",
  "chrono",
  "futures",
