@@ -252,6 +252,19 @@ where
         self.update_one(doc! { "_id": id }, update).await
     }
 
+    /// Bulk update; stamps `updated_at` like [`Self::update_one`].
+    /// Returns the modified-document count.
+    pub async fn update_many(&self, filter: Document, update: Document) -> DaoResult<u64> {
+        let mut final_update = update;
+        if let Ok(set_doc) = final_update.get_document_mut("$set") {
+            set_doc.insert("updated_at", bson::DateTime::now());
+        } else {
+            final_update.insert("$set", doc! { "updated_at": bson::DateTime::now() });
+        }
+        let result = self.collection.update_many(filter, final_update).await?;
+        Ok(result.modified_count)
+    }
+
     pub async fn soft_delete(&self, id: ObjectId) -> DaoResult<bool> {
         self.update_one(
             doc! { "_id": id },

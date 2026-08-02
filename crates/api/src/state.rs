@@ -87,6 +87,12 @@ pub struct AppState {
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
     pub rc_hub: Arc<Hub>,
+    /// Phase A-1 — the Redis presence owner-token per locally-registered
+    /// agent WS. Written/removed by `ws::remote_control::handle_agent_socket`;
+    /// read by [`shutdown_cleanup`] so the SIGTERM sweep can compare-DEL
+    /// each key (an unconditional DEL could erase a claim an agent already
+    /// re-made on the surviving pod mid-roll).
+    pub agent_presence_tokens: Arc<DashMap<ObjectId, String>>,
 
     // roomler-tunnel subsystem
     pub tunnel_clients: Arc<TunnelClientDao>,
@@ -297,6 +303,7 @@ impl AppState {
             agent_logs,
             consent_requests,
             rc_hub,
+            agent_presence_tokens: Arc::new(DashMap::new()),
             tunnel_clients,
             tunnel_policies,
             tunnel_audit,
@@ -530,4 +537,50 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
     }
 
     Ok(())
+}
+
+/// Phase A-1 graceful shutdown (SIGTERM/CTRL-C): make this pod's death
+/// honest BEFORE the process exits, so a roll never strands
+/// `agents.status = 'Online'` rows + stale presence claims (the
+/// green-but-dead badge class). Budget: well under the ~3 s drain window
+/// `main.rs` allows.
+///
+/// Mechanics: fire every registered agent's displacement-cancel notify —
+/// each read loop exits within milliseconds and runs its OWN teardown
+/// (identity-gated unregister, mark-offline, presence compare-DEL); the
+/// bulk writes below are belt-and-braces for sockets that don't finish
+/// in time. Agents see a plain socket close (never a Goodbye — those are
+/// fatal client-side) and reconnect with backoff through the LB.
+pub async fn shutdown_cleanup(state: &AppState) {
+    let ids = state.rc_hub.cancel_all_agents();
+    if ids.is_empty() {
+        return;
+    }
+    tracing::info!(
+        agents = ids.len(),
+        "shutdown: cancelling local agent sockets + bulk offline sweep"
+    );
+    // Give the per-socket teardowns a beat to do the fine-grained cleanup.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    if let Err(e) = state
+        .agents
+        .mark_status_many(
+            &ids,
+            roomler_ai_remote_control::models::AgentStatus::Offline,
+        )
+        .await
+    {
+        tracing::warn!(%e, "shutdown: bulk mark_status(Offline) failed");
+    }
+    if let Some(redis) = &state.redis_pubsub {
+        for id in &ids {
+            if let Some((_, token)) = state.agent_presence_tokens.remove(id)
+                && let Err(e) = redis
+                    .agent_presence_del_if_owned(&id.to_hex(), &token)
+                    .await
+            {
+                tracing::debug!(agent = %id, %e, "shutdown: presence release failed");
+            }
+        }
+    }
 }
