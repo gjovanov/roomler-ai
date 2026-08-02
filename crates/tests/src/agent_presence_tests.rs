@@ -17,7 +17,11 @@ fn urlencode(s: &str) -> String {
         .replace('=', "%3D")
 }
 
-async fn enroll(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> (String, String) {
+pub(crate) async fn enroll(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine_id: &str,
+) -> (String, String) {
     let et: Value = app
         .auth_post(
             &format!("/api/tenant/{}/agent/enroll-token", seeded.tenant_id),
@@ -52,7 +56,7 @@ async fn enroll(app: &TestApp, seeded: &SeededTenant, machine_id: &str) -> (Stri
 }
 
 /// Connect an agent WS to `app` and complete the hello handshake.
-async fn connect_agent(
+pub(crate) async fn connect_agent(
     app: &TestApp,
     agent_token: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
