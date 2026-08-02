@@ -10,7 +10,6 @@ use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
-    Hub,
     hub::DispatchCtx,
     models::ConsentMode,
     signaling::{ClientMsg, Role, ServerMsg},
@@ -97,6 +96,26 @@ pub async fn handle_agent_socket(
 
     debug!(%agent_id, %machine_name, "agent registered in Hub");
 
+    // Phase A-1 — mirror the registration into the cross-pod presence
+    // directory. The owner token is per-REGISTRATION (fresh conn_id), so a
+    // same-pod reconnect's late teardown can't release the new socket's
+    // claim. Best-effort: Redis down ⇒ pod-local behavior only.
+    let agent_hex = agent_id.to_hex();
+    let presence_token = state.redis_pubsub.as_ref().map(|r| {
+        r.agent_owner_token(
+            &uuid::Uuid::new_v4().to_string(),
+            bson::DateTime::now().timestamp_millis(),
+        )
+    });
+    if let (Some(redis), Some(token)) = (&state.redis_pubsub, &presence_token) {
+        if let Err(e) = redis.agent_presence_set(&agent_hex, token).await {
+            warn!(%agent_id, %e, "agent presence SET failed (register)");
+        }
+        // Registered-token registry for the SIGTERM sweep (newest wins —
+        // a displacing registration overwrites the displaced one's entry).
+        state.agent_presence_tokens.insert(agent_id, token.clone());
+    }
+
     // P3b-2: an agent may drive the tunnel-CLIENT role over this same WS
     // (originate tunnel-client sessions to OTHER nodes). Bundle its
     // originator identity once — the reply channel is a clone of the
@@ -132,6 +151,23 @@ pub async fn handle_agent_socket(
         override_reason: None,
     };
 
+    // Phase A-1 — server-side receive-liveness, symmetric to the agent's
+    // rc.293 deadline: reconnect/reap must key on frames RECEIVED, because
+    // a TLS-inspecting middlebox keeps the TCP leg alive (ACKing) long
+    // after the peer is gone, and the server never pings (deliberately:
+    // a ping arm would need the pump's shared sink mutex, which can be
+    // held while blocked on that same half-open peer — wedging the read
+    // loop in exactly the failure mode being detected). The agent's own
+    // 25 s pings + 30 s heartbeats mean a healthy inbound leg is never
+    // silent for 90 s. Breaking the loop runs the normal teardown below —
+    // the read loop IS the reaper; no registry, no sweeper task.
+    let rx_deadline = std::time::Duration::from_secs(state.settings.rc.ws_rx_deadline_secs.max(2));
+    let mut liveness = tokio::time::interval(std::time::Duration::from_secs(
+        state.settings.rc.ws_liveness_tick_secs.max(1),
+    ));
+    liveness.tick().await; // arm; first tick fires immediately
+    let mut last_rx = std::time::Instant::now();
+
     // Read loop. rc.53: wrapped in `tokio::select!` so the Hub's
     // displacement-cancel notify exits this loop within milliseconds
     // — without the cancel arm, a displaced socket would linger up
@@ -147,8 +183,19 @@ pub async fn handle_agent_socket(
                 info!(%agent_id, "agent connection cancelled by Hub (replaced by newer); exiting read-loop");
                 break;
             }
+            _ = liveness.tick() => {
+                if last_rx.elapsed() > rx_deadline {
+                    warn!(%agent_id, elapsed_s = last_rx.elapsed().as_secs(),
+                        "agent WS receive-liveness deadline exceeded — reaping half-open socket");
+                    break;
+                }
+                continue;
+            }
             maybe_msg = socket_rx.next() => {
                 let Some(msg) = maybe_msg else { break };
+                // EVERY inbound frame proves the leg alive — including
+                // Pings/Pongs/Binary (the catch-all below).
+                last_rx = std::time::Instant::now();
                 match msg {
                     Ok(Message::Text(text)) => match serde_json::from_str::<ClientMsg>(&text) {
                         Ok(parsed) => {
@@ -197,8 +244,22 @@ pub async fn handle_agent_socket(
                             if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
                                 warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
                             }
-                            if is_heartbeat && let Err(e) = state.agents.touch_heartbeat(agent_id).await {
-                                warn!(%agent_id, %e, "agent touch_heartbeat failed");
+                            if is_heartbeat {
+                                if let Err(e) = state.agents.touch_heartbeat(agent_id).await {
+                                    warn!(%agent_id, %e, "agent touch_heartbeat failed");
+                                }
+                                // Phase A-1 — refresh the presence claim, gated
+                                // on STILL holding the hub slot (an admin-kicked
+                                // agent whose socket lingers must not re-assert
+                                // a record the hub no longer serves).
+                                if state.rc_hub.is_agent_online(agent_id)
+                                    && let (Some(redis), Some(token)) =
+                                        (&state.redis_pubsub, &presence_token)
+                                    && let Err(e) =
+                                        redis.agent_presence_set(&agent_hex, token).await
+                                {
+                                    debug!(%agent_id, %e, "agent presence refresh failed");
+                                }
                             }
                         }
                         Err(e) => {
@@ -249,19 +310,37 @@ pub async fn handle_agent_socket(
     )
     .await;
 
-    state
+    // Phase A-1 — the Mongo Offline write + presence release are GATED on
+    // the hub removal being OURS: a displaced handler's late teardown must
+    // not clobber the displacing connection's Online status or its fresh
+    // presence claim (the status-race twin of the rc.53 registry fix).
+    let removal_was_ours = state
         .rc_hub
         .unregister_agent(agent_id, Some(&registered_tx));
     pump.abort();
-    if let Err(e) = state
-        .agents
-        .mark_status(
-            agent_id,
-            roomler_ai_remote_control::models::AgentStatus::Offline,
-        )
-        .await
-    {
-        warn!(%agent_id, %e, "agent mark_status(offline) failed");
+    if removal_was_ours {
+        if let Err(e) = state
+            .agents
+            .mark_status(
+                agent_id,
+                roomler_ai_remote_control::models::AgentStatus::Offline,
+            )
+            .await
+        {
+            warn!(%agent_id, %e, "agent mark_status(offline) failed");
+        }
+        if let (Some(redis), Some(token)) = (&state.redis_pubsub, &presence_token) {
+            if let Err(e) = redis.agent_presence_del_if_owned(&agent_hex, token).await {
+                debug!(%agent_id, %e, "agent presence release failed");
+            }
+            // Drop OUR token from the sweep registry (identity-gated: a
+            // displacing registration's newer token must survive).
+            state
+                .agent_presence_tokens
+                .remove_if(&agent_id, |_, stored| stored == token);
+        }
+    } else {
+        debug!(%agent_id, "teardown skipped Offline+presence (newer connection owns the slot)");
     }
     info!(%agent_id, "remote-control agent WS disconnected");
 }
@@ -308,7 +387,7 @@ pub async fn pump_server_messages(
 /// Route a parsed `rc:*` message coming from a controller browser tab.
 /// Returns `true` if the message was handled, `false` if it wasn't rc:*.
 pub fn dispatch_controller_rc(
-    hub: &Hub,
+    state: &AppState,
     user_id: ObjectId,
     controller_name: &str,
     controller_tx: &roomler_ai_remote_control::session::ClientTx,
@@ -316,6 +395,7 @@ pub fn dispatch_controller_rc(
     consent_mode: ConsentMode,
     override_reason: Option<String>,
 ) -> bool {
+    let hub = &state.rc_hub;
     let Ok(parsed) = serde_json::from_str::<ClientMsg>(text) else {
         return false;
     };
@@ -330,6 +410,13 @@ pub fn dispatch_controller_rc(
     };
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
+        // Phase A-1 split-evidence probe: a LOCAL "agent offline" while
+        // another pod holds a fresh presence record = a live cross-pod
+        // split — the exact green-but-unreachable incident class. Counted
+        // + logged; gates the Phase A-2 rehome work.
+        if let roomler_ai_remote_control::error::Error::AgentOffline(agent_hex) = &e {
+            note_agent_offline_evidence(state, agent_hex.clone(), "controller_session");
+        }
         // Surface the failure to the controller so the UI can exit its
         // "Requesting session…" spinner instead of hanging. Best-effort —
         // the controller may already be closing.
@@ -452,6 +539,54 @@ pub async fn resolve_session_authz(
         return Ok(SessionAuthz::allow(mode));
     }
     Err("you're not on this device's control allowlist".to_string())
+}
+
+/// Phase A-1 split-evidence probe (A2b): fired on a LOCAL hub miss; if
+/// another pod holds a FRESH presence record for the agent, that miss was
+/// a cross-pod split, not a real offline. One warn + a process counter —
+/// the permanent field instrument that gates the Phase A-2 rehome work
+/// (steady-state nonzero = stable split; spikes only around rolls =
+/// churn). Fire-and-forget: never blocks the caller.
+pub(crate) fn note_agent_offline_evidence(
+    state: &AppState,
+    agent_hex: String,
+    caller: &'static str,
+) {
+    static SPLIT_EVIDENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Probe throttle: the tunnel-ICE path can miss at candidate rate
+    // (>10/s in the 2026-08-02 incident); one Redis GET per 5 s is
+    // plenty for an existence instrument.
+    static LAST_PROBE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now_ms = bson::DateTime::now().timestamp_millis();
+    let last = LAST_PROBE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms - last < 5_000
+        || LAST_PROBE_MS
+            .compare_exchange(
+                last,
+                now_ms,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+    let Some(redis) = state.redis_pubsub.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        match redis.agent_presence_foreign(&agent_hex).await {
+            Ok(Some(owner)) => {
+                let total = SPLIT_EVIDENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                warn!(
+                    agent = %agent_hex, caller, owner = %owner, total,
+                    "SPLIT EVIDENCE: local hub miss but another pod holds a fresh presence record"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => debug!(%agent_hex, %e, "split-evidence probe failed"),
+        }
+    });
 }
 
 /// Stable short code for the wire. Exhaustive match so a new

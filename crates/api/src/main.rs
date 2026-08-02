@@ -1,6 +1,6 @@
 use bson::oid::ObjectId;
 use roomler_ai_api::{
-    build_router,
+    build_router, state,
     state::AppState,
     ws::{dispatcher, redis_pubsub::RedisPubSub},
 };
@@ -281,6 +281,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build router
+    let shutdown_state = app_state.clone();
     let app = build_router(app_state);
 
     // Start server
@@ -288,14 +289,63 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Listening on {}", addr);
 
+    // Phase A-1 — graceful shutdown: on SIGTERM/CTRL-C run the presence
+    // cleanup FIRST (mark this pod's agents Offline + release their Redis
+    // claims — a killed pod must not strand green-but-dead rows), then let
+    // axum stop accepting. axum's graceful drain waits for in-flight
+    // connections INDEFINITELY (surviving browser WSs would pin the
+    // process until SIGKILL), so the whole serve future is raced against
+    // a short post-signal drain window. No pre-close draining: the front
+    // nginx targets host IPs (readiness is invisible to it) and
+    // maxSurge=0 means every drained second is downtime for this node.
+    let (cleanup_done_tx, cleanup_done_rx) = tokio::sync::oneshot::channel::<()>();
     // `with_connect_info` so the rate limiter has a peer address to fall back
     // on when `X-Forwarded-For` is absent or too short to trust (a request
     // that did not come through our proxy chain).
-    axum::serve(
+    let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        info!("shutdown signal received — running presence cleanup");
+        state::shutdown_cleanup(&shutdown_state).await;
+        let _ = cleanup_done_tx.send(());
+    });
+    tokio::select! {
+        r = serve => { r?; }
+        _ = async {
+            let _ = cleanup_done_rx.await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } => {
+            info!("shutdown drain window elapsed; exiting");
+        }
+    }
 
     Ok(())
+}
+
+/// Resolve on SIGTERM (k8s pod stop; unix only) or CTRL-C (everywhere).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                error!(%e, "SIGTERM handler install failed; CTRL-C only");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
 }
