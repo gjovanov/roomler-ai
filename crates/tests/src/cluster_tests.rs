@@ -310,3 +310,85 @@ async fn kick_ctrl_event_applies_cross_pod() {
     }
     assert!(kicked, "kick ctrl event never reached pod1's hub");
 }
+
+/// C-3 — tunnel rehome: an open driven through pod2 targeting an agent
+/// homed on pod1 is rejected `agent_on_other_pod` at OPEN time (never a
+/// session that black-holes at forward time), and the idle target gets
+/// nudged. The CLI driver bails on open-errors and its reconnect loop
+/// dials a fresh WS — the redial-retry is structurally free client-side.
+#[tokio::test]
+async fn tunnel_open_rehome_cross_pod() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_bus.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    for _ in 0..40 {
+        let a = app1.state.cluster_bus.as_ref().unwrap();
+        let b = app2.state.cluster_bus.as_ref().unwrap();
+        if a.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+            && b.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let seeded = app1.seed_tenant("trehome").await;
+    // Target B homed on pod1; origin A drives the tunnel-client role on pod2.
+    let (b_id, b_tok) =
+        crate::tunnel_tests::enroll_agent(&app1, &seeded, "mach-trehome-B", "target-B").await;
+    let mut b_ws = crate::tunnel_tests::connect_agent_ws(&app1, &b_tok, "target-B").await;
+    let (_a_id, a_tok) =
+        crate::tunnel_tests::enroll_agent(&app2, &seeded, "mach-trehome-A", "origin-A").await;
+    let mut a_ws = crate::tunnel_tests::connect_agent_ws(&app2, &a_tok, "origin-A").await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    a_ws.send(Message::Text(
+        serde_json::json!({
+            "t": "rc:tunnel.hello",
+            "role": "client",
+            "version": "0.3.0",
+            "supported_transports": ["webrtc-dc-v1"],
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    a_ws.send(Message::Text(
+        serde_json::json!({
+            "t": "rc:tunnel.open",
+            "agent_id": b_id,
+            "transport": "webrtc-dc-v1",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let err = crate::tunnel_tests::read_until(&mut a_ws, "rc:error")
+        .await
+        .expect("origin must receive the rehome error");
+    assert_eq!(
+        err["code"].as_str(),
+        Some("agent_on_other_pod"),
+        "cross-pod open must rehome, not black-hole: {err}"
+    );
+
+    // The idle target's WS on pod1 gets nudged closed.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut closed = false;
+    while tokio::time::Instant::now() < deadline && !closed {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), b_ws.next()).await {
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => closed = true,
+            Ok(Some(Err(_))) => closed = true,
+            _ => continue,
+        }
+    }
+    assert!(closed, "idle target agent's WS was not nudged closed");
+}
