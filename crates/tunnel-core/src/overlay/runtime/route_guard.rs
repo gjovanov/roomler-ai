@@ -6,16 +6,43 @@
 
 use super::*;
 
-/// How often to re-assert per-peer `/32` routes on the overlay NIC (rc.146).
-/// A full-tunnel VPN (Check Point) keeps re-installing a competing `/32` for
-/// each overlay IP via its own NIC that swallows overlay traffic; the route
-/// table flaps between it and ours. Re-asserting UNCONDITIONALLY on a tight
-/// cadence — not gated on the carrier's traffic counters, because a captured
-/// route means our packets never reach the WG device so `tx` stays flat and a
-/// traffic-gated check would never fire — keeps the overlay winning the route
-/// war. Cheap (a couple of route commands per peer) and 2 s bounds the capture
-/// window to a couple of dropped pings.
+/// The route-guard blind-tick cadence WITHOUT a live route-event
+/// subscription (rc.146; sole cadence until the P4 demotion). A full-tunnel
+/// VPN (Check Point) keeps re-installing a competing `/32` for each overlay
+/// IP via its own NIC that swallows overlay traffic; the route table flaps
+/// between it and ours. Re-asserting UNCONDITIONALLY on a tight cadence —
+/// not gated on the carrier's traffic counters, because a captured route
+/// means our packets never reach the WG device so `tx` stays flat and a
+/// traffic-gated check would never fire — keeps the overlay winning the
+/// route war. Cheap (a couple of route commands per peer) and 2 s bounds the
+/// capture window to a couple of dropped pings. This cadence also RETURNS
+/// mid-session if the subscription dies (see the route-event arm's `None`
+/// leg), so the demoted heartbeat below never runs uncovered.
 pub(super) const ROUTE_GUARD_TICK: Duration = Duration::from_secs(2);
+
+/// P4 demotion (gated on the fleet soak: subscriptions alive 36 h+ on every
+/// host, zero watch deaths, zero uncaught erasures): with a LIVE
+/// route-event subscription the blind tick is belt-and-braces only — an
+/// erase is re-asserted by the event arm within milliseconds (or by its
+/// trailing-edge pull within `ROUTE_WAVE_MIN_INTERVAL` when it lands inside
+/// a rate-limit quiet window), so the tick drops to a 30 s heartbeat.
+pub(super) const ROUTE_GUARD_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// Effective route-guard cadence. No live subscription (env-disabled,
+/// platform-unavailable, or died) ⇒ [`ROUTE_GUARD_TICK`] — pre-P4 behaviour
+/// exactly. With one ⇒ [`ROUTE_GUARD_HEARTBEAT`], overridable via
+/// `ROOMLER_NODE_OVERLAY_ROUTE_TICK_SECS` (2–300 s; `2` is the operator
+/// revert to the old cadence; garbage/out-of-range falls back to the
+/// default so a typo can never disable the guard).
+pub(super) fn route_guard_cadence(watch_live: bool, env: Option<String>) -> Duration {
+    if !watch_live {
+        return ROUTE_GUARD_TICK;
+    }
+    match env.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(s) if (2..=300).contains(&s) => Duration::from_secs(s),
+        _ => ROUTE_GUARD_HEARTBEAT,
+    }
+}
 
 /// rc.285 — one entry of the DEFENDED SET: a prefix the overlay owns and
 /// keeps re-asserting against a competing full-tunnel VPN. The set is
@@ -592,5 +619,45 @@ impl OverlayRuntime {
         state.active_peer = None;
         state.v6_active = None;
         info!("overlay exit-node: default routing torn down; egress reverted to the local uplink");
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+
+    #[test]
+    fn no_watch_is_always_the_2s_tick() {
+        // Pre-P4 behaviour exactly — env is irrelevant without a subscription.
+        assert_eq!(route_guard_cadence(false, None), ROUTE_GUARD_TICK);
+        assert_eq!(
+            route_guard_cadence(false, Some("300".into())),
+            ROUTE_GUARD_TICK
+        );
+    }
+
+    #[test]
+    fn live_watch_demotes_to_heartbeat_with_env_override() {
+        assert_eq!(route_guard_cadence(true, None), ROUTE_GUARD_HEARTBEAT);
+        assert_eq!(
+            route_guard_cadence(true, Some("2".into())),
+            ROUTE_GUARD_TICK,
+            "the documented operator revert to the old cadence"
+        );
+        assert_eq!(
+            route_guard_cadence(true, Some(" 120 ".into())),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn garbage_or_out_of_range_env_falls_back_to_heartbeat() {
+        for bad in ["0", "1", "301", "fast", "", "-5"] {
+            assert_eq!(
+                route_guard_cadence(true, Some(bad.into())),
+                ROUTE_GUARD_HEARTBEAT,
+                "input {bad:?} must fall back, never disable the guard"
+            );
+        }
     }
 }
