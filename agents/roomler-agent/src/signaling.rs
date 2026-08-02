@@ -56,6 +56,60 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// frames RECEIVED, not frames sent.
 const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
 
+/// A5 — minimum wall-vs-monotonic skew that reads as suspend/resume at a
+/// keepalive tick (mirrors the overlay runtime's `RESUME_SKEW_THRESHOLD`).
+/// Below this it's scheduler jitter; above it the host slept and the WS is
+/// cycled proactively instead of trusting a possibly-dead socket for up to
+/// another RX-deadline window.
+const RESUME_SKEW_MIN: Duration = Duration::from_secs(120);
+
+/// A5 — a control-WS outage this long (or longer) triggers an immediate
+/// update check on reconnect: the standing fleet-heal path for an agent
+/// that missed a server-pushed `rc:agent.update` while its socket was
+/// wedged/split (the push rides this very WS). One hour matches "a broken
+/// agent should pick up the fixed build within minutes of recovering, not
+/// at the next periodic check".
+const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
+
+/// A5 — epoch-ms of the moment the control WS FIRST went down in the
+/// current outage; 0 = currently up (or never connected). Stamped by the
+/// reconnect ladder, cleared (and acted on) after a successful hello.
+static DOWN_SINCE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn note_ws_down() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    // Only the FIRST failure of an outage stamps (CAS from 0).
+    let _ = DOWN_SINCE_MS.compare_exchange(
+        0,
+        now,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn note_ws_up_and_maybe_recheck_update() {
+    let since = DOWN_SINCE_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if since == 0 {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let down_ms = now.saturating_sub(since);
+    if down_ms >= UPDATE_RECHECK_AFTER_DOWN.as_millis() as i64 {
+        let fired = crate::updater::request_update_now(None);
+        info!(
+            down_mins = down_ms / 60_000,
+            update_check_fired = fired,
+            "control WS recovered after a long outage — requesting an immediate update check"
+        );
+    }
+}
+
 /// rc.58: format an error chain by walking `source()` so the top-level
 /// `Display` (which `tokio_tungstenite::Error` keeps deliberately
 /// terse) doesn't hide the root cause — TLS handshake error,
@@ -351,6 +405,9 @@ pub async fn run(
                 backoff = Duration::from_secs(1);
             }
             Err(ConnectError::Transient(e)) => {
+                // A5 — first failure of this outage stamps the clock the
+                // reconnect-recovery update check keys off.
+                note_ws_down();
                 // rc.58: log the full `source()` chain alongside the
                 // top-level Display — `tokio_tungstenite::Error`'s top
                 // message is just "ws connect" / "ws read" without the
@@ -508,6 +565,9 @@ async fn connect_once(
     // immediately after upgrade.
     watchdog::tick("signaling");
     info!("rc:agent.hello sent");
+    // A5 — if this connect ended a ≥1 h outage, the fleet may have shipped a
+    // fix (or a forced update push) we never saw; check now, not in ≤4 h.
+    note_ws_up_and_maybe_recheck_update();
 
     // Outbound channel shared by all per-session peers. Peers push their
     // locally-gathered ICE candidates and state-change terminates here;
@@ -611,6 +671,16 @@ async fn connect_once(
     // send-success is not a liveness signal.
     let mut last_rx = std::time::Instant::now();
 
+    // A5 — resume detection. Every timer here runs on the MONOTONIC clock,
+    // which excludes suspend on Windows/Linux — so after a sleep the RX
+    // deadline picks up where it left off and a socket that died during
+    // the nap stays trusted for up to ~80 more seconds. Wall-vs-monotonic
+    // skew at the keepalive tick catches the nap (the overlay runtime and
+    // the watchdog use the same trick) and cycles the WS immediately: a
+    // fresh connect is cheap, a post-resume zombie socket is not.
+    let mut skew_wall = std::time::SystemTime::now();
+    let mut skew_mono = std::time::Instant::now();
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -624,6 +694,23 @@ async fn connect_once(
                 }
             }
             _ = keepalive.tick() => {
+                let wall_gap = skew_wall.elapsed().unwrap_or_default();
+                let mono_gap = skew_mono.elapsed();
+                skew_wall = std::time::SystemTime::now();
+                skew_mono = std::time::Instant::now();
+                if wall_gap > mono_gap + RESUME_SKEW_MIN {
+                    warn!(
+                        napped_s = (wall_gap - mono_gap).as_secs(),
+                        "suspend/resume detected at keepalive — cycling the control WS"
+                    );
+                    close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    return Err(ConnectError::Transient(anyhow::anyhow!(
+                        "resume-from-suspend (napped ~{} s)",
+                        (wall_gap - mono_gap).as_secs()
+                    )));
+                }
                 if last_rx.elapsed() > WS_RX_DEADLINE {
                     warn!(
                         silent_s = last_rx.elapsed().as_secs(),
