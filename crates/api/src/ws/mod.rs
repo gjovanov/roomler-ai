@@ -1,4 +1,5 @@
 pub mod derp;
+pub mod derp_cluster;
 pub mod dispatcher;
 pub mod handler;
 pub mod media_cluster;
