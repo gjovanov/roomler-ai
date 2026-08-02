@@ -111,3 +111,31 @@ pub async fn send_to_connection(
         }
     }
 }
+
+/// C-4 — cluster-aware single-connection delivery: local socket when
+/// present, else a **conn-addressed** envelope on the global channel
+/// (connection UUIDs are globally unique, so no per-conn directory is
+/// needed — the pod holding the socket delivers, everyone else drops).
+/// This is how a media-room owner reaches participants whose WS lives
+/// on another pod.
+pub async fn send_to_connection_routed(
+    ws_storage: &WsStorage,
+    redis_pubsub: &Option<Arc<RedisPubSub>>,
+    connection_id: &str,
+    message: &serde_json::Value,
+) {
+    if ws_storage.get_sender_by_connection(connection_id).is_some() {
+        send_to_connection(ws_storage, connection_id, message).await;
+        return;
+    }
+    if let Some(pubsub) = redis_pubsub {
+        let envelope = serde_json::json!({
+            "origin": pubsub.instance_id(),
+            "conn": connection_id,
+            "message": message,
+        });
+        if let Err(e) = pubsub.publish(&envelope.to_string()).await {
+            tracing::error!("Failed to publish conn-addressed WS message: {}", e);
+        }
+    }
+}
