@@ -425,7 +425,7 @@ type AgentWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// Enroll an agent via the REST flow; returns `(agent_id_hex, agent_token)`.
 /// Mirrors `remote_control_tests::enroll_helper` (duplicated so the tunnel
 /// suite stands alone).
-async fn enroll_agent(
+pub(crate) async fn enroll_agent(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
     machine_id: &str,
@@ -472,7 +472,11 @@ fn urlencode(s: &str) -> String {
 
 /// Connect a RAW agent WS (`?role=agent`) and send `rc:agent.hello` so the
 /// Hub registers the agent. Returns the live stream.
-async fn connect_agent_ws(app: &TestApp, agent_token: &str, machine_name: &str) -> AgentWs {
+pub(crate) async fn connect_agent_ws(
+    app: &TestApp,
+    agent_token: &str,
+    machine_name: &str,
+) -> AgentWs {
     let ws_url = format!(
         "ws://{}/ws?token={}&role=agent",
         app.addr,
@@ -505,7 +509,7 @@ async fn connect_agent_ws(app: &TestApp, agent_token: &str, machine_name: &str) 
 
 /// Poll the agent row until `status == "online"` (hello processed → Hub
 /// registered), so a subsequent `send_to_agent` relay lands.
-async fn wait_agent_online(
+pub(crate) async fn wait_agent_online(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
     agent_id: &str,
@@ -532,7 +536,7 @@ async fn wait_agent_online(
 
 /// Read WS frames until one arrives whose `t` == `want`, or a 5 s deadline
 /// elapses. Non-matching frames are skipped.
-async fn read_until(ws: &mut AgentWs, want: &str) -> Option<Value> {
+pub(crate) async fn read_until(ws: &mut AgentWs, want: &str) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(250), ws.next()).await {
