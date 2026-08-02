@@ -304,11 +304,24 @@ pub async fn call_start(
     }
 
     state.rooms.start_call(rid).await?;
-    let rtp_capabilities = state
-        .room_manager
-        .create_room(rid)
+    // C-4 — claim-or-route: creation is NX-claim-gated, so two pods
+    // racing call/start build exactly ONE router. The claim loser skips
+    // local creation — its members' `media:join` then routes to the
+    // owner (the UI never reads these HTTP caps; the real ones arrive
+    // via `media:router_capabilities` on the WS).
+    let rtp_capabilities = match crate::ws::media_cluster::resolve_media_route(&state, &rid, true)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to create media room: {}", e)))?;
+    {
+        crate::ws::media_cluster::MediaRoute::Local { .. } => state
+            .room_manager
+            .create_room(rid)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to create media room: {}", e)))?,
+        crate::ws::media_cluster::MediaRoute::Remote(pod) => {
+            tracing::info!(room = %rid, owner = %pod, "call/start: conference already owned by another pod");
+            serde_json::Value::Null
+        }
+    };
 
     // Notify all room members about the call
     let member_ids = state
@@ -433,28 +446,37 @@ pub async fn call_leave(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    // Clean up media before DB leave
-    state
-        .room_manager
-        .close_participant_by_user(&rid, &auth.user_id);
+    // Clean up media before DB leave. C-4: the room's media island may
+    // live on another pod — the owner then drops the transports and
+    // broadcasts peer_left itself.
+    match crate::ws::media_cluster::resolve_media_route(&state, &rid, false).await {
+        crate::ws::media_cluster::MediaRoute::Local { .. } => {
+            state
+                .room_manager
+                .close_participant_by_user(&rid, &auth.user_id);
 
-    // Broadcast peer_left to remaining participants
-    let remaining = state.room_manager.get_participant_user_ids(&rid);
-    if !remaining.is_empty() {
-        let event = serde_json::json!({
-            "type": "media:peer_left",
-            "data": {
-                "room_id": rid.to_hex(),
-                "user_id": auth.user_id.to_hex(),
+            // Broadcast peer_left to remaining participants
+            let remaining = state.room_manager.get_participant_user_ids(&rid);
+            if !remaining.is_empty() {
+                let event = serde_json::json!({
+                    "type": "media:peer_left",
+                    "data": {
+                        "room_id": rid.to_hex(),
+                        "user_id": auth.user_id.to_hex(),
+                    }
+                });
+                crate::ws::dispatcher::broadcast_with_redis(
+                    &state.ws_storage,
+                    &state.redis_pubsub,
+                    &remaining,
+                    &event,
+                )
+                .await;
             }
-        });
-        crate::ws::dispatcher::broadcast_with_redis(
-            &state.ws_storage,
-            &state.redis_pubsub,
-            &remaining,
-            &event,
-        )
-        .await;
+        }
+        crate::ws::media_cluster::MediaRoute::Remote(pod) => {
+            crate::ws::media_cluster::rpc_leave_user(&state, &pod, &rid, &auth.user_id).await;
+        }
     }
 
     state.rooms.leave_participant(rid, auth.user_id).await?;
@@ -466,7 +488,8 @@ pub async fn call_leave(
         && room.conference_status.as_deref() == Some("in_progress")
     {
         state.rooms.end_call(rid).await?;
-        state.room_manager.remove_room(&rid);
+        // C-4 — the media island may live on another pod.
+        crate::ws::media_cluster::close_room_everywhere(&state, &rid).await;
 
         // Notify all room members that the call has ended
         let member_ids = state
@@ -509,22 +532,13 @@ pub async fn call_end(
     }
 
     state.rooms.end_call(rid).await?;
-    state.room_manager.remove_room(&rid);
-
-    let remaining = state.room_manager.get_participant_user_ids(&rid);
-    if !remaining.is_empty() {
-        let event = serde_json::json!({
-            "type": "media:room_closed",
-            "data": { "room_id": rid.to_hex() }
-        });
-        crate::ws::dispatcher::broadcast_with_redis(
-            &state.ws_storage,
-            &state.redis_pubsub,
-            &remaining,
-            &event,
-        )
-        .await;
-    }
+    // C-4 — close the media island wherever it lives (local remove +
+    // claim release, or `media.close_room` RPC to the owning pod, which
+    // notifies its participants). The old local-only remove_room +
+    // media:room_closed block was dead code: it read the participant
+    // list AFTER removing the room, so the list was always empty — the
+    // UI teardown signal is `room:call_ended` below.
+    crate::ws::media_cluster::close_room_everywhere(&state, &rid).await;
 
     // Notify all room members that the call has ended
     let member_ids = state
