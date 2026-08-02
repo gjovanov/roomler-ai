@@ -756,7 +756,7 @@ async fn handle_media_join(
         Err(e) => {
             send_media_error(
                 state,
-                user_id,
+                connection_id,
                 &format!("Failed to create transports: {}", e),
             )
             .await;
@@ -1039,7 +1039,7 @@ async fn handle_media_produce(
 
 async fn handle_media_consume(
     state: &AppState,
-    user_id: &ObjectId,
+    _user_id: &ObjectId,
     connection_id: &str,
     data: Option<&serde_json::Value>,
 ) {
