@@ -80,7 +80,7 @@ async fn resolve(
     // session; broadcast the verdict so the holding pod applies it too
     // (idempotent — the local attempt above already ran here).
     crate::ws::remote_control::publish_rc_ctrl(
-        &state,
+        state,
         "consent",
         serde_json::json!({ "session_id": req.session_id.to_hex(), "granted": granted }),
     )
