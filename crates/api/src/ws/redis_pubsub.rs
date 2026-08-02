@@ -31,20 +31,31 @@ pub struct RedisPubSub {
 }
 
 impl RedisPubSub {
-    pub async fn new(redis_url: &str) -> Result<Self, redis::RedisError> {
+    /// C-1: `origin` is the cluster identity's `<pod_id>/<epoch>` string
+    /// (was a random per-process UUID). The stable pod prefix is what lets
+    /// ownership records name their pod; the per-process epoch keeps the
+    /// self-echo guard and the user-online SREM semantics identical to the
+    /// old random id.
+    pub async fn new(redis_url: &str, origin: String) -> Result<Self, redis::RedisError> {
         let client = redis::Client::open(redis_url)?;
         let publisher = ConnectionManager::new(client).await?;
         info!("Redis Pub/Sub publisher connected to {}", redis_url);
         Ok(Self {
             publisher,
             channel: CHANNEL_NAME.to_string(),
-            instance_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: origin,
         })
     }
 
     /// Per-process origin id stamped on every published envelope.
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// A clone of the multiplexed command connection — the cluster
+    /// directory + bus publisher ride the same manager.
+    pub fn connection(&self) -> ConnectionManager {
+        self.publisher.clone()
     }
 
     /// Publish a message to Redis for other instances to receive.
@@ -158,9 +169,13 @@ impl RedisPubSub {
     /// The owner token this instance writes for one agent registration.
     /// `conn_id` is minted per WS registration, so a reconnect on the
     /// SAME pod still produces a distinct token (the old socket's late
-    /// compare-DEL can't release the new socket's claim).
+    /// compare-DEL can't release the new socket's claim). C-1: the format
+    /// is the canonical directory record `<pod>/<epoch>/<conn>/<since>`
+    /// (`cluster::directory::OwnerRecord::parse`able — C-2's rehome reads
+    /// the pod out of it). Records only live 90 s, so a mixed-format
+    /// deploy window is self-clearing.
     pub fn agent_owner_token(&self, conn_id: &str, since_ms: i64) -> String {
-        format!("{}:{}:{}", self.instance_id, conn_id, since_ms)
+        format!("{}/{}/{}", self.instance_id, conn_id, since_ms)
     }
 
     /// Claim/refresh this agent's presence record (full SET + TTL —
