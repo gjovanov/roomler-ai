@@ -109,6 +109,13 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVENTS`). Built-in default: on.
     #[serde(default)]
     pub overlay_route_events: Option<bool>,
+    /// P4 demotion — route-guard blind-tick seconds while the route-event
+    /// subscription is live (`ROOMLER_NODE_OVERLAY_ROUTE_TICK_SECS`, 2–300).
+    /// Built-in default: 30 (the demoted heartbeat); `2` = the pre-demotion
+    /// war cadence (operator revert). Without a live subscription the tick
+    /// is always 2 s regardless of this key.
+    #[serde(default)]
+    pub overlay_route_tick_secs: Option<u32>,
     /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
     /// the corp-VPN field probe (`ROOMLER_NODE_OVERLAY_RELAY_TLS`).
     /// Built-in default: off.
@@ -776,6 +783,7 @@ mod tests {
             overlay_lan_iface_filter: None,
             overlay_pathmon: None,
             overlay_route_events: None,
+            overlay_route_tick_secs: None,
             overlay_relay_tls: None,
             overlay_tun_stable_guid: None,
             overlay_route_evict: None,
