@@ -29,6 +29,7 @@ mod agent_crash_tests;
 mod agent_e2e_tests;
 #[cfg(test)]
 mod agent_presence_tests;
+#[cfg(test)]
 mod agent_tests;
 #[cfg(test)]
 mod billing_tests;
