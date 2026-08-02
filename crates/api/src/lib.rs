@@ -504,6 +504,8 @@ pub fn build_router(state: AppState) -> Router {
 
     // Compose API
     let api = Router::new()
+        // C-6 — per-pod cluster status (identity, counters, gauges).
+        .route("/cluster/status", get(routes::cluster::status))
         .nest("/auth", auth_routes)
         .nest("/user", user_routes)
         .nest("/oauth", oauth_routes)
