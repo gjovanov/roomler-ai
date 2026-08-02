@@ -186,6 +186,13 @@ const Q_INBOUND_SAMPLE: f64 = 80.0;
 const Q_INBOUND_ALPHA: f64 = 0.4;
 /// A death slams Q to the floor (not an EWMA step — the carrier is gone).
 const Q_DEATH_SLAM: f64 = -100.0;
+/// B1 — an overlay ICMP RTT sample measured over the ACTIVE carrier (the
+/// agent's 15 s prober): a gentle EWMA complementing latch/heard. Sample
+/// `100 − rtt_ms/10` grades ~0 ms ≈ +100, 1 s = neutral 0, ≥2 s = −100
+/// (clamped). A ping TIMEOUT books NOTHING — loss is the death path's
+/// business (an ICMP-hostile network must not debit a healthy tier).
+const Q_RTT_ALPHA: f64 = 0.1;
+const Q_RTT_DIVISOR: f64 = 10.0;
 
 /// Eligibility float guard: `powf` at exactly one half-life is not guaranteed
 /// bit-exact, and legacy `until > now` counts the boundary instant as
@@ -458,6 +465,19 @@ impl PathMonitor {
         match tier_idx(tier) {
             Some(idx) => p.tiers[idx].q.feed(Q_HEARD_SAMPLE, Q_HEARD_ALPHA),
             None => p.relay_q.feed(Q_HEARD_SAMPLE, Q_HEARD_ALPHA),
+        }
+    }
+
+    /// B1 — an RTT sample from the agent's overlay pinger, credited to
+    /// the INCUMBENT tier only (the ping rode the active carrier).
+    /// Q-plane only: never touches penalties, strikes, spacing or
+    /// hysteresis — locked by the eligibility-invariance tests.
+    pub(crate) fn on_rtt_sample(&mut self, peer: &ObjectId, tier: DirectTier, rtt_ms: u32) {
+        let sample = (Q_CLAMP - f64::from(rtt_ms) / Q_RTT_DIVISOR).clamp(-Q_CLAMP, Q_CLAMP);
+        let p = self.peers.entry(*peer).or_default();
+        match tier_idx(tier) {
+            Some(idx) => p.tiers[idx].q.feed(sample, Q_RTT_ALPHA),
+            None => p.relay_q.feed(sample, Q_RTT_ALPHA),
         }
     }
 
@@ -846,6 +866,10 @@ pub(crate) struct ShadowStats {
     /// immediately after its own death/expiry penalty booked (must be 0 —
     /// the penalty math guarantees ineligibility right after booking).
     pub(crate) post_death_eligible: u64,
+    /// B1 — RTT samples applied to an installed peer's incumbent tier
+    /// (instrumentation health: a flat 0 with the flag on means the
+    /// prober→runtime plumbing is broken).
+    pub(crate) rtt_samples: u64,
     /// PR-C (soak #1 finding) — D10 re-dials, counted but NOT compared: a
     /// zombie-srflx re-dial refreshes the DIAL TARGET of the current tier
     /// (Srflx→Srflx), so it is not a tier-selection event and comparing it
@@ -1071,6 +1095,12 @@ mod tests {
         for _ in 0..500 {
             noisy.on_bad_sweep(&a, DirectTier::Lan);
             noisy.on_bad_sweep(&a, DirectTier::Srflx);
+            // B1 — RTT extremes are Q-plane too: a perfect RTT on the
+            // failed tier and a terrible one on the healthy tiers must
+            // not move any eligibility boundary either.
+            noisy.on_rtt_sample(&a, DirectTier::Public, 0);
+            noisy.on_rtt_sample(&a, DirectTier::Lan, 5_000);
+            noisy.on_rtt_sample(&a, DirectTier::Srflx, 5_000);
         }
         for probe_t in [59u64, 61, 899, 901] {
             let t = t0 + Duration::from_secs(probe_t);
@@ -1272,8 +1302,11 @@ mod tests {
         m.on_probe_started(&a, DirectTier::Lan, t0);
         m.on_probe_aborted(&a); // freed WITHOUT a failure — no penalty booked
         assert!(m.eligible(&a, DirectTier::Lan, t0 + Duration::from_secs(1)));
-        // Q-hammer LAN to the ceiling.
+        // Q-hammer LAN to the ceiling (heard + B1 perfect-RTT samples).
         pump_heard(&mut m, &a, DirectTier::Lan, 500);
+        for _ in 0..500 {
+            m.on_rtt_sample(&a, DirectTier::Lan, 0);
+        }
         let lan_only = TierAvailability {
             lan: true,
             public: false,
@@ -1303,6 +1336,45 @@ mod tests {
             ),
             PathAction::Probe(DirectTier::Lan)
         );
+    }
+
+    /// B1 — the RTT sample curve: fast RTTs drift Q up, slow ones drift it
+    /// down, extremes clamp, and the relay tier feeds `relay_q`.
+    #[test]
+    fn rtt_sample_curve_feeds_incumbent_q_only() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let now = Instant::now();
+
+        // 10 ms samples drift the tier's Q toward +99 (100 − 10/10).
+        for _ in 0..200 {
+            m.on_rtt_sample(&a, DirectTier::Public, 10);
+        }
+        let fast = m.score(&a, DirectTier::Public, now) - B_PUBLIC;
+        assert!(
+            (98.0..=100.0).contains(&fast),
+            "fast RTT Q ≈ +99, got {fast}"
+        );
+
+        // 2 s samples drift toward the −100 clamp.
+        for _ in 0..400 {
+            m.on_rtt_sample(&a, DirectTier::Public, 2_000);
+        }
+        let slow = m.score(&a, DirectTier::Public, now) - B_PUBLIC;
+        assert!(slow <= -95.0, "slow RTT Q near clamp, got {slow}");
+
+        // Only the sampled tier moved; a relay sample lands on relay_q.
+        assert_eq!(m.score(&a, DirectTier::Lan, now), B_LAN);
+        for _ in 0..200 {
+            m.on_rtt_sample(&a, DirectTier::Relay, 10);
+        }
+        assert!(m.score(&a, DirectTier::Relay, now) > B_RELAY + 90.0);
+
+        // One gentle sample moves Q by exactly alpha × delta.
+        let mut fresh = PathMonitor::default();
+        fresh.on_rtt_sample(&a, DirectTier::Srflx, 500);
+        let one = fresh.score(&a, DirectTier::Srflx, now) - B_SRFLX;
+        assert!((one - 5.0).abs() < 1e-9, "α·(100−500/10−0) = 5, got {one}");
     }
 
     /// The forced-DERP pin is an annotation: direct decisions identical with
