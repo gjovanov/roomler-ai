@@ -104,7 +104,7 @@ client: overlay_exit_node="mars"
           install split-default:  v4 0.0.0.0/1 + 128.0.0.0/1  → exit peer (wg allowed_ips + OS routes)
                                   v6 ::/1 + 8000::/1           → overlay NIC (crypto-router → v6_exit peer)
           steer DNS "." → local resolver / upstream  (captured by split-default → resolves from exit)
-          route-guard re-asserts the /1s + DNS on OS route events + a 2 s heartbeat
+          route-guard re-asserts the /1s + DNS on OS route events + a 30 s heartbeat
 ```
 
 The **split-default** is two `/1` halves rather than a literal `/0`. A `/1`
@@ -136,10 +136,12 @@ Four layers, each defending against a different way to cut yourself off:
 - **Route-guard (A7).** OS route-change events (Windows `NotifyRouteChange2`,
   Linux `ip monitor route`) trigger an immediate re-assert of the
   split-default `/1`s (and a DNS-steering re-evaluation) the moment a
-  competing route-write lands, with the legacy 2-second tick retained as a
-  belt-and-braces heartbeat until the event path is soak-proven — so a
-  transient flap or a VPN client's route grab can't silently drop egress.
-  Kill-switch: `ROOMLER_NODE_OVERLAY_ROUTE_EVENTS=0` reverts to tick-only.
+  competing route-write lands — so a transient flap or a VPN client's route
+  grab can't silently drop egress. The blind tick is a 30 s belt-and-braces
+  heartbeat while the subscription is live (`…_ROUTE_TICK_SECS` overrides;
+  `2` = the pre-demotion cadence) and returns to 2 s automatically if the
+  subscription is unavailable or dies. Kill-switch:
+  `ROOMLER_NODE_OVERLAY_ROUTE_EVENTS=0` reverts to the 2 s tick-only guard.
 
 Teardown is symmetric: a clean exit reverts everything; an unclean exit
 self-heals because the OS default route is *never deleted* (the `/1`s just

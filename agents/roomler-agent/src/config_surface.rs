@@ -110,7 +110,12 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_route_events",
         "tribool",
-        "Event-driven route guard (OS route-table change subscription; the 2 s tick stays as backstop). Built-in default: on.",
+        "Event-driven route guard (OS route-table change subscription; the blind tick backstops it). Built-in default: on.",
+    ),
+    (
+        "overlay_route_tick_secs",
+        "number",
+        "Route-guard blind-tick seconds while the route-event subscription is live (2-300; 2 = pre-demotion war cadence). Built-in default: 30. Always 2 s without a live subscription.",
     ),
     (
         "overlay_relay_tls",
@@ -261,6 +266,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
+        "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
@@ -351,6 +357,20 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
             }
         }
         "overlay_route_events" => cfg.overlay_route_events = parse_tribool(value)?,
+        "overlay_route_tick_secs" => {
+            cfg.overlay_route_tick_secs = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let s: u32 = v.parse().map_err(|_| {
+                        format!("overlay_route_tick_secs must be a number (got {v:?})")
+                    })?;
+                    if !(2..=300).contains(&s) {
+                        return Err("overlay_route_tick_secs must be between 2 and 300".into());
+                    }
+                    Some(s)
+                }
+            }
+        }
         "overlay_relay_tls" => cfg.overlay_relay_tls = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
@@ -664,6 +684,25 @@ mod tests {
     }
 
     /// P4/PR-D — the event-driven route-guard key set/echo/clear.
+    #[test]
+    fn overlay_route_tick_secs_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_route_tick_secs", Some("120")).unwrap();
+        assert_eq!(cfg.overlay_route_tick_secs, Some(120));
+        assert_eq!(
+            entry_for(&cfg, "overlay_route_tick_secs")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("120")
+        );
+        apply(&mut cfg, "overlay_route_tick_secs", None).unwrap();
+        assert_eq!(cfg.overlay_route_tick_secs, None);
+        assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("1")).is_err());
+        assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("301")).is_err());
+        assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("fast")).is_err());
+    }
+
     #[test]
     fn overlay_route_events_set_echo_clear() {
         let mut cfg = crate::config::test_fixture();
