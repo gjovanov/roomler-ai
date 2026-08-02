@@ -2549,16 +2549,20 @@ const displayMatchTooltip = computed<string>(() => {
     : 'Match remote display OFF — click to switch the HOST\'s display mode to fit this window (1:1 pixels, sharpest text). Restored on disconnect.'
 })
 function readStoredDisplayMatch(agentId: string): boolean {
+  // 2026-08-02 operator default: ON for agents without a stored choice
+  // (pairs with the resolution=Original default — 1:1 pixels, sharpest
+  // text). Explicit OFF is stored as '0' (persist below writes both
+  // states) so it survives the ON default; pre-change rows that toggled
+  // OFF via the old removeItem semantics flip to ON once.
   try {
-    return globalThis.localStorage?.getItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId) === '1'
+    return globalThis.localStorage?.getItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId) !== '0'
   } catch {
-    return false
+    return true
   }
 }
 function persistDisplayMatch(agentId: string, on: boolean) {
   try {
-    if (on) globalThis.localStorage?.setItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId, '1')
-    else globalThis.localStorage?.removeItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId)
+    globalThis.localStorage?.setItem(DISPLAY_MATCH_STORAGE_PREFIX + agentId, on ? '1' : '0')
   } catch {
     /* best-effort */
   }
