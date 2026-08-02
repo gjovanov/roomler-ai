@@ -97,6 +97,13 @@ const SHADOW_HARM_WINDOW: Duration = Duration::from_secs(60);
 /// Shadow summary cadence.
 const SHADOW_SUMMARY_EVERY: Duration = Duration::from_secs(600);
 
+/// B1 — RTT→Q ingestion gate (config `overlay_rtt_q`, env
+/// `ROOMLER_AGENT_OVERLAY_RTT_Q`). Default ON; a kill switch only —
+/// samples are Q-plane-only either way, never eligibility.
+fn rtt_q_enabled() -> bool {
+    crate::env::flag("OVERLAY_RTT_Q", true)
+}
+
 impl PathShadow {
     fn new() -> Self {
         let mode = path::PathMonMode::parse(crate::env::node_env("OVERLAY_PATHMON").as_deref());
@@ -221,6 +228,7 @@ impl PathShadow {
             harmful = self.stats.harmful,
             post_death_eligible = self.stats.post_death_eligible,
             d10_redials = self.stats.d10_redials,
+            rtt_samples = self.stats.rtt_samples,
             classes = %self.stats.classes_line(),
             "overlay pathmon: 10-min summary (soak gate: steady <0.1% diverged, harmful = 0)"
         );
@@ -538,6 +546,11 @@ pub enum OverlayEvent {
     /// single-relay DIALER never sends a relay_request and so never sees a
     /// grant.
     ForceDerp { peer_node_id: ObjectId, ttl_ms: u64 },
+    /// B1 — one overlay ICMP RTT measurement from the agent's 15 s prober
+    /// (OsPinger/NsPinger, measured over the ACTIVE carrier). Fed to the
+    /// PathMonitor's Q for the peer's incumbent tier; never affects
+    /// eligibility. Gated by `OVERLAY_RTT_Q` (default on).
+    RttSample { node_id: ObjectId, rtt_ms: u32 },
 }
 
 /// Builds the WG carrier for a peer. Production wires a direct UDP socket
@@ -1046,6 +1059,7 @@ impl OverlayRuntime {
                 Some(OverlayEvent::NetmapDelta { .. }) => continue, // pre-netmap; ignore
                 Some(OverlayEvent::RelayGrant { .. }) => continue,  // pre-netmap; ignore
                 Some(OverlayEvent::ForceDerp { .. }) => continue,   // pre-netmap; ignore
+                Some(OverlayEvent::RttSample { .. }) => continue,   // pre-netmap; ignore
                 None => return,
             }
         };
@@ -2063,6 +2077,19 @@ impl OverlayRuntime {
                             }
                         }
                         warn_if_slow("arm:force_derp", t_arm);
+                    }
+                    // B1 — one prober RTT measurement: Q-credit the peer's
+                    // INCUMBENT tier (the ping rode the installed carrier).
+                    // Uninstalled peer ⇒ drop (no carrier attribution).
+                    Some(OverlayEvent::RttSample { node_id, rtt_ms }) => {
+                        if rtt_q_enabled()
+                            && let Some(tier) = by_node.get(&node_id).map(|e| e.tier)
+                        {
+                            self.shadow(|s| {
+                                s.stats.rtt_samples += 1;
+                                s.mon.on_rtt_sample(&node_id, tier, rtt_ms);
+                            });
+                        }
                     }
                     None => break,
                 },
