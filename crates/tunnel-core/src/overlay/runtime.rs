@@ -1314,21 +1314,33 @@ impl OverlayRuntime {
         });
 
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
-        // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't keep
-        // its competing capture routes installed. First tick fires immediately;
-        // skip it (routes are freshly installed by `install_peers` below).
-        let mut route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
-        route_guard.tick().await;
         // P4 — event-driven route guard: subscribe to OS route-table changes
         // (NotifyRouteChange2 / `ip monitor route`) so an erased route is
-        // re-asserted within milliseconds instead of at the next 2 s tick.
-        // The tick above KEEPS running as the backstop until the P4 demotion
-        // gate (a fleet soak proving the subscription catches every erase
-        // first); `None` (env-disabled / platform-unavailable) = pre-P4
-        // behaviour exactly. Waves are rate-limited: our own re-asserts feed
-        // the subscription back (see `route_events` module doc).
+        // re-asserted within milliseconds instead of at the next blind tick.
+        // `None` (env-disabled / platform-unavailable) = pre-P4 behaviour
+        // exactly. Waves are rate-limited: our own re-asserts feed the
+        // subscription back (see `route_events` module doc).
         let mut route_watch = super::route_events::spawn_route_watch();
         let mut last_route_wave: Option<Instant> = None;
+        // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't
+        // keep its competing capture routes installed. First tick fires
+        // immediately; skip it (routes are freshly installed by
+        // `install_peers` below). P4 demotion: with a live subscription the
+        // tick is a 30 s belt-and-braces heartbeat (events + their
+        // trailing-edge pull do the real catching); without one — or if the
+        // watch dies mid-session (the event arm's `None` leg) — it is the
+        // 2 s war cadence.
+        let route_cadence = route_guard_cadence(
+            route_watch.is_some(),
+            crate::env::node_env("OVERLAY_ROUTE_TICK_SECS"),
+        );
+        let mut route_guard = tokio::time::interval(route_cadence);
+        route_guard.tick().await;
+        info!(
+            events = route_watch.is_some(),
+            tick_secs = route_cadence.as_secs(),
+            "overlay: route guard armed"
+        );
         // Phase D — LAZY `/derp`: open the WS (via the agent-provided factory)
         // ONLY for a relay-mode node that is itself UDP-blocked — i.e. its srflx
         // gather found nothing (`srflx_advertised.is_empty()`). A UDP-capable
@@ -1699,6 +1711,10 @@ impl OverlayRuntime {
                 // keeps our packets off the WG device, so the carrier's traffic
                 // counters can't detect it — only a periodic re-assert can.
                 _ = route_guard.tick() => {
+                    // A tick wave counts as a wave for the event arm's rate
+                    // limiter / trailing edge (P4 demotion — both arms share
+                    // one wave clock).
+                    last_route_wave = Some(Instant::now());
                     // rc.206 — DETACH the per-peer /32 re-assert (the head-of-line
                     // bulk on Windows: N peers × `route`/`netsh` delete-then-add,
                     // ~0.3–2 s each) off the select! loop. Awaiting it INLINE
@@ -1744,12 +1760,14 @@ impl OverlayRuntime {
                     }
                 },
                 // P4 — OS route-table change → re-assert NOW (same body as the
-                // 2 s tick above: detached /32 wave + inline exit /1). Rate-
+                // tick above: detached /32 wave + inline exit /1). Rate-
                 // limited to one wave per ROUTE_WAVE_MIN_INTERVAL because our
-                // own re-asserts feed the subscription back; anything erased
-                // inside the quiet window is the tick's job (which is why the
-                // tick stays until the P4 demotion gate). Inert (`pending`)
-                // when the subscription is off/unavailable.
+                // own re-asserts feed the subscription back; an event inside
+                // the quiet window pulls the next tick to the due boundary
+                // (trailing edge), so a quiet-window erase is repaired within
+                // ROUTE_WAVE_MIN_INTERVAL — the demoted 30 s heartbeat never
+                // carries it. Inert (`pending`) when the subscription is
+                // off/unavailable.
                 maybe_route_evt = async {
                     match route_watch.as_mut() {
                         Some(w) => w.recv().await,
@@ -1766,7 +1784,7 @@ impl OverlayRuntime {
                                 let first_short: String = first.chars().take(120).collect();
                                 info!(
                                     events = burst + 1, first = %first_short,
-                                    "overlay: route-table change — re-asserting peer routes now (P4 event-driven; 2 s tick remains the backstop)"
+                                    "overlay: route-table change — re-asserting peer routes now (P4 event-driven; heartbeat tick is the backstop)"
                                 );
                                 if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
                                     let tun2 = tun.clone();
@@ -1790,11 +1808,35 @@ impl OverlayRuntime {
                                     }
                                     warn_if_slow("arm:route_events(exit /1)", t0);
                                 }
+                                // The heartbeat counts from the last wave.
+                                route_guard.reset();
+                            } else {
+                                // Trailing edge: pull the next tick to the due
+                                // boundary so an erase inside the quiet window
+                                // waits ≤ ROUTE_WAVE_MIN_INTERVAL, not a full
+                                // heartbeat. Idempotent re-adds don't notify
+                                // (field: waves run ~6-40/h, not at echo
+                                // cadence), so a no-op wave settles silent.
+                                let elapsed = last_route_wave
+                                    .map(|t| t.elapsed())
+                                    .unwrap_or_default();
+                                route_guard.reset_after(
+                                    super::route_events::ROUTE_WAVE_MIN_INTERVAL
+                                        .saturating_sub(elapsed),
+                                );
                             }
                         }
                         None => {
-                            debug!("overlay: route-event subscription ended — route guard falls back to tick-only");
+                            // Post-demotion this is operational, not cosmetic:
+                            // the 30 s heartbeat must not keep running as the
+                            // only guard. Restore the 2 s war cadence; the
+                            // fresh interval fires immediately → one prompt
+                            // catch-up wave.
+                            warn!(
+                                "overlay: route-event subscription ended — restoring the 2 s route-guard tick"
+                            );
                             route_watch = None;
+                            route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
                         }
                     }
                 },
