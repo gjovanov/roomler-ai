@@ -553,6 +553,45 @@ async fn handle_tunnel_open(
         return None;
     }
 
+    // 3a½ (C-3). REHOME gate: the target agent isn't in THIS pod's hub but
+    // a FOREIGN pod holds a fresh presence record — a cross-pod split, not
+    // an offline agent. Without this, the open would "succeed" and every
+    // forward would then bounce off `agent unreachable` FOREVER (the client
+    // keeps its parked WS and never re-dials). Reject the open with the
+    // rehome code — the CLI driver bails on open-errors, its reconnect
+    // loop dials a FRESH WS, and the LB re-hashes it onto the owner pod —
+    // and nudge the owner to cycle the agent if idle so both ends
+    // converge. Plain hub-miss with no foreign record keeps today's
+    // behaviour (the P7 terminate machinery owns real agent flaps).
+    if !state.rc_hub.is_agent_online(agent_id)
+        && let Some(redis) = &state.redis_pubsub
+        && let Ok(Ok(Some(owner))) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            redis.agent_presence_foreign(&agent_id.to_hex()),
+        )
+        .await
+    {
+        let owner_pod = crate::cluster::directory::OwnerRecord::parse(&owner)
+            .map(|r| r.pod_id)
+            .unwrap_or_default();
+        warn!(
+            origin = %orig.log_id(), %agent_id, %owner_pod,
+            "tunnel open rejected: agent homed on another pod (rehome)"
+        );
+        crate::ws::remote_control::spawn_agent_nudge(state, owner_pod.clone(), agent_id.to_hex());
+        send_msg(
+            &orig.outbound_tx,
+            ServerMsg::Error {
+                session_id: None,
+                code: "agent_on_other_pod".into(),
+                message: format!("agent is homed on pod {owner_pod}; re-dial and retry"),
+                open_nonce: open_nonce.clone(),
+            },
+        )
+        .await;
+        return None;
+    }
+
     // 3b. Defence-in-depth for an AGENT origin (P3b-2 Risk 7): refuse if
     // the ORIGINATING agent's row is soft-deleted / quarantined. Its WS
     // auth already gated it at connect and the Hub closes a deleted
@@ -632,6 +671,25 @@ async fn handle_tunnel_open(
     state
         .tunnel_clients_by_session
         .insert(tunnel_session_id, orig.outbound_tx.clone());
+    // C-3 — ownership record: which pod owns this session's WS legs
+    // (observability + the C-6 metrics; refreshed by the directory
+    // heartbeat while the map entry above lives, TTL-reaped after).
+    if let Some(dir) = &state.cluster_directory {
+        let token = dir.owner_token(&tunnel_session_id.to_hex());
+        if let Err(e) = dir
+            .claim_lww(
+                &crate::cluster::directory::tunnel_key(&tunnel_session_id.to_hex()),
+                &token,
+            )
+            .await
+        {
+            debug!(%tunnel_session_id, %e, "tunnel ownership claim failed");
+        } else {
+            state
+                .tunnel_presence_tokens
+                .insert(tunnel_session_id, token);
+        }
+    }
     // P7 flap resilience: index the session by its TARGET agent so
     // `terminate_sessions_targeting_agent` can kill it the moment that
     // agent's WS drops (the agent's tunnel peers die with its socket).
