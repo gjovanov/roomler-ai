@@ -821,11 +821,16 @@ pub(crate) async fn release_overlay_node(
 
     // Drop any DERP registration this node holds. Already inert (it is keyed by
     // pubkey and no peer carries this node's key any more, and `handle_derp_socket`
-    // resolves through the live-only `current_node`), but tidy.
+    // resolves through the live-only `current_node`), but tidy. C-5: also fire
+    // the cancel so the socket actually closes (its teardown then releases the
+    // directory record; a re-dial fails registration — the node row is gone).
     if let Ok(pk) = BASE64.decode(&before.wg_public_key)
         && let Ok(pk) = <[u8; 32]>::try_from(pk.as_slice())
     {
         state.derp_registry.remove(&(before.network_id, pk));
+        if let Some(cancel) = state.derp_cancels.get(&(before.network_id, pk)) {
+            cancel.notify_one();
+        }
     }
 
     tracing::info!(
