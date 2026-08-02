@@ -579,6 +579,7 @@ async fn handle_tunnel_open(
             "tunnel open rejected: agent homed on another pod (rehome)"
         );
         crate::ws::remote_control::spawn_agent_nudge(state, owner_pod.clone(), agent_id.to_hex());
+        crate::cluster::metrics::bump(&crate::cluster::metrics::TUNNEL_REHOME_TOTAL);
         send_msg(
             &orig.outbound_tx,
             ServerMsg::Error {

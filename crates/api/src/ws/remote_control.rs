@@ -429,6 +429,7 @@ pub async fn dispatch_controller_rc(
             .await
         {
             note_agent_offline_evidence(state, agent_hex.clone(), "controller_session");
+            crate::cluster::metrics::bump(&crate::cluster::metrics::RC_REHOME_TOTAL);
             let owner_pod = crate::cluster::directory::OwnerRecord::parse(&owner)
                 .map(|r| r.pod_id)
                 .unwrap_or_default();
@@ -662,7 +663,6 @@ pub(crate) fn note_agent_offline_evidence(
     agent_hex: String,
     caller: &'static str,
 ) {
-    static SPLIT_EVIDENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Probe throttle: the tunnel-ICE path can miss at candidate rate
     // (>10/s in the 2026-08-02 incident); one Redis GET per 5 s is
     // plenty for an existence instrument.
@@ -687,7 +687,9 @@ pub(crate) fn note_agent_offline_evidence(
     tokio::spawn(async move {
         match redis.agent_presence_foreign(&agent_hex).await {
             Ok(Some(owner)) => {
-                let total = SPLIT_EVIDENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let total = crate::cluster::metrics::SPLIT_EVIDENCE_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
                 warn!(
                     agent = %agent_hex, caller, owner = %owner, total,
                     "SPLIT EVIDENCE: local hub miss but another pod holds a fresh presence record"
@@ -947,7 +949,7 @@ async fn relay_to_client(state: &AppState, session_id: bson::oid::ObjectId, msg:
         // the A2b agent probe; throttled to 1/5 s.
         if let Some(dir) = state.cluster_directory.clone() {
             static LAST_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-            static SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
             let now = bson::DateTime::now().timestamp_millis();
             let last = LAST_MS.load(std::sync::atomic::Ordering::Relaxed);
             if now - last >= 5_000
@@ -965,7 +967,9 @@ async fn relay_to_client(state: &AppState, session_id: bson::oid::ObjectId, msg:
                     if let Ok(Some(owner)) = dir.get(&key).await
                         && dir.is_foreign(&owner)
                     {
-                        let total = SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let total = crate::cluster::metrics::SPLIT_EVIDENCE_TOTAL
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
                         warn!(
                             session = %session_id, owner = %owner, total,
                             "SPLIT EVIDENCE: tunnel relay dropped but another pod owns the session"
