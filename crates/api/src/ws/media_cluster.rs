@@ -400,6 +400,7 @@ pub async fn forward_close_leave(state: &AppState, user_id: &ObjectId, connectio
 /// to the surviving owner.
 pub async fn fold_media_room(state: &AppState, rid: &ObjectId, reason: &str) {
     warn!(room = %rid, reason, "folding local media-room island");
+    crate::cluster::metrics::bump(&crate::cluster::metrics::MEDIA_FOLD_TOTAL);
     // The key belongs to the foreign owner now — drop the token WITHOUT
     // a release.
     state.media_claim_tokens.remove(rid);
