@@ -10,7 +10,6 @@ use axum::extract::ws::{Message, WebSocket};
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
-    Hub,
     hub::DispatchCtx,
     models::ConsentMode,
     signaling::{ClientMsg, Role, ServerMsg},

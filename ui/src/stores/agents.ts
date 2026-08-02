@@ -99,8 +99,9 @@ export interface Agent {
   status: AgentStatusValue
   /** Phase A-1 three-state truth: `online` = an rc socket is registered
    *  somewhere (Connect will work); `stale` = heartbeat trail fresh but no
-   *  pod claims the socket (amber — half-open leg or dead pod); `offline`. */
-  presence: 'online' | 'stale' | 'offline'
+   *  pod claims the socket (amber — half-open leg or dead pod); `offline`.
+   *  Optional for pre-A-1 API bodies — consumers fall back to `is_online`. */
+  presence?: 'online' | 'stale' | 'offline'
   /** Back-compat: `presence === 'online'`. */
   is_online: boolean
   last_seen_at: string
