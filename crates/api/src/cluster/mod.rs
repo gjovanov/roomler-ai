@@ -11,3 +11,4 @@
 pub mod bus;
 pub mod directory;
 pub mod identity;
+pub mod metrics;
