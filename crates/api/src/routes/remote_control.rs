@@ -379,6 +379,14 @@ pub async fn delete_agent(
     // only for the displaced-handler unregister race, not for
     // operator kicks).
     state.rc_hub.unregister_agent(aid, None); // kick any live WS
+    // C-2 — the agent's WS may be homed on another pod; broadcast the
+    // kick so every hub drops it (idempotent no-op where absent).
+    crate::ws::remote_control::publish_rc_ctrl(
+        &state,
+        "kick",
+        serde_json::json!({ "agent_id": aid.to_hex() }),
+    )
+    .await;
     Ok(Json(serde_json::json!({
         "deleted": true,
         "overlay_released": released.is_some(),

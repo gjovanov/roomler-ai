@@ -507,7 +507,8 @@ async fn handle_client_message(
             text,
             authz.mode,
             authz.override_reason,
-        );
+        )
+        .await;
         if handled {
             return;
         }
