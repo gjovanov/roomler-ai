@@ -108,6 +108,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
     ),
     (
+        "overlay_demote",
+        "string",
+        "B2 - score-driven demotion of degraded-but-live direct carriers: shadow (count only - built-in default) | on | off. Env: ROOMLER_AGENT_OVERLAY_DEMOTE.",
+    ),
+    (
         "overlay_route_events",
         "tribool",
         "Event-driven route guard (OS route-table change subscription; the blind tick backstops it). Built-in default: on.",
@@ -270,6 +275,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
+        "overlay_demote" => cfg.overlay_demote.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
@@ -357,6 +363,18 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                     let mode = v.to_ascii_lowercase();
                     if !matches!(mode.as_str(), "on" | "shadow" | "off") {
                         return Err("overlay_pathmon must be on | shadow | off".to_string());
+                    }
+                    Some(mode)
+                }
+            }
+        }
+        "overlay_demote" => {
+            cfg.overlay_demote = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let mode = v.to_ascii_lowercase();
+                    if !matches!(mode.as_str(), "on" | "shadow" | "off") {
+                        return Err("overlay_demote must be on | shadow | off".to_string());
                     }
                     Some(mode)
                 }
@@ -688,6 +706,23 @@ mod tests {
         apply(&mut cfg, "overlay_pathmon", None).unwrap();
         assert_eq!(cfg.overlay_pathmon, None);
         assert!(apply(&mut cfg, "overlay_pathmon", Some("sideways")).is_err());
+    }
+
+    /// B2 — the demotion-mode key set/echo/clear + validation.
+    #[test]
+    fn overlay_demote_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_demote", Some("on")).unwrap();
+        assert_eq!(cfg.overlay_demote.as_deref(), Some("on"));
+        assert_eq!(
+            entry_for(&cfg, "overlay_demote").unwrap().value.as_deref(),
+            Some("on")
+        );
+        apply(&mut cfg, "overlay_demote", Some("SHADOW")).unwrap();
+        assert_eq!(cfg.overlay_demote.as_deref(), Some("shadow"));
+        apply(&mut cfg, "overlay_demote", None).unwrap();
+        assert_eq!(cfg.overlay_demote, None);
+        assert!(apply(&mut cfg, "overlay_demote", Some("maybe")).is_err());
     }
 
     /// P4/PR-D — the event-driven route-guard key set/echo/clear.

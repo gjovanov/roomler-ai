@@ -201,6 +201,12 @@ pub struct AgentConfig {
     /// eligibility. Built-in default: on (kill switch).
     #[serde(default)]
     pub overlay_rtt_q: Option<bool>,
+    /// B2 — score-driven demotion of degraded-but-live direct carriers
+    /// (`ROOMLER_AGENT_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
+    /// count, never act — the built-in default) | `on` (voluntary MBB
+    /// demotions execute). Multi-state, so a string key, not a tribool.
+    #[serde(default)]
+    pub overlay_demote: Option<String>,
 
     /// Most recent version that ran for at least
     /// `CLEAN_RUN_THRESHOLD` seconds before exiting cleanly (or
@@ -808,6 +814,7 @@ mod tests {
             ice_overlay_host_deprioritize: None,
             overlay_tier_detect: None,
             overlay_rtt_q: None,
+            overlay_demote: None,
             last_known_good_version: None,
             crash_count: 0,
             last_crash_unix: 0,

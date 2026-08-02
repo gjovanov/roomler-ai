@@ -130,6 +130,39 @@ impl PathMonMode {
     }
 }
 
+/// B2 — score-driven demotion engagement (`overlay_demote` config /
+/// `ROOMLER_AGENT_OVERLAY_DEMOTE`): `off` | `shadow` (compute + count
+/// would-be demotions, never act — the first-ship default) | `on`
+/// (voluntary demotions execute as MBB probes). Flip to `on` only after
+/// a clean fleet shadow read (the acceptance analog: a shadow-demote
+/// whose incumbent then died ≤60 s was a CORRECT call; one whose
+/// incumbent kept passing traffic was wrong).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DemoteMode {
+    Off,
+    Shadow,
+    On,
+}
+
+impl DemoteMode {
+    pub(crate) fn parse(v: Option<&str>) -> Self {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("off") | Some("0") | Some("false") => DemoteMode::Off,
+            Some("on") | Some("1") | Some("true") => DemoteMode::On,
+            // Unset / "shadow" / anything else → the safe default.
+            _ => DemoteMode::Shadow,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DemoteMode::Off => "off",
+            DemoteMode::Shadow => "shadow",
+            DemoteMode::On => "on",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants — the model's numbers
 // ---------------------------------------------------------------------------
@@ -161,10 +194,19 @@ pub(crate) const LAN_PROBE_SPACING: Duration = Duration::from_secs(60);
 /// `WgDevice::probes` is keyed by pubkey and the monitor mirrors it).
 pub(crate) const PROBE_CAP: usize = 16;
 /// Voluntary (score-driven) switches must be at least this far apart per
-/// peer. Disabled-at-flip machinery — see [`Hysteresis`]; prod code reaches
-/// it only when the post-flip demotion work lands (the allow tracks that).
-#[allow(dead_code)]
+/// peer — the flap guard [`Hysteresis::voluntary_allowed`] enforces. Live
+/// since B2 (score-driven demotion).
 pub(crate) const SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// B2 — a strictly-eligible alternative must out-score a live direct
+/// incumbent by this margin, sustained for [`DEMOTE_HOLD`], before a
+/// voluntary demotion fires. 60 ≈ "the incumbent's Q is deeply negative
+/// while the alternative's is solidly positive" — transient dips and
+/// probe jitter never clear it.
+pub(crate) const DEMOTE_MARGIN: f64 = 60.0;
+pub(crate) const DEMOTE_HOLD: Duration = Duration::from_secs(15);
+/// B2 — "slammed-bad" Q floor for the (advisory) direct→relay demotion
+/// class: within one heard-credit of the −100 slam.
+const DEMOTE_RELAY_Q_FLOOR: f64 = -99.0;
 
 /// Q clamp: quality lives in [−Q_CLAMP, +Q_CLAMP].
 const Q_CLAMP: f64 = 100.0;
@@ -273,6 +315,11 @@ struct TierState {
     q: Ewma,
     penalty: Option<Penalty>,
     fails: u32,
+    /// B2 — since when (as the INCUMBENT tier) a margin-sized score
+    /// deficit against an eligible alternative has been continuously
+    /// observed; cleared the moment the deficit breaks. The demotion
+    /// fires only after [`DEMOTE_HOLD`] sustained.
+    below_since: Option<Instant>,
 }
 
 /// Per-peer monitor state.
@@ -394,10 +441,9 @@ impl Hysteresis {
     pub(crate) fn record_switch(&mut self, now: Instant) {
         self.last_switch = Some(now);
     }
-    /// May a VOLUNTARY switch fire now? Dead in prod until the post-flip
-    /// score-driven demotion consumes it (the allow tracks that) — the bound
-    /// itself is already locked by `voluntary_switch_hysteresis_bound`.
-    #[allow(dead_code)]
+    /// May a VOLUNTARY switch fire now? Live since B2 (score-driven
+    /// demotion consumes it); the bound is locked by
+    /// `voluntary_switch_hysteresis_bound`.
     pub(crate) fn voluntary_allowed(&self, now: Instant) -> bool {
         self.last_switch
             .is_none_or(|t| now.saturating_duration_since(t) >= SWITCH_MIN_INTERVAL)
@@ -707,14 +753,23 @@ impl PathMonitor {
     /// "Best" = highest `S` among eligible+available, tie-broken by legacy
     /// precedence; the F2 LAN spacing pin filters LAN scorelessly.
     pub(crate) fn decide(
-        &self,
+        &mut self,
         peer: &ObjectId,
         incumbent: Incumbent,
         avail: TierAvailability,
         mbb: bool,
         now: Instant,
+        demote_on: bool,
     ) -> PathAction {
-        if let Incumbent::Direct(_) = incumbent {
+        if let Incumbent::Direct(cur) = incumbent {
+            // B2 — a live direct incumbent is kept UNLESS a sustained
+            // margin-sized score deficit demotes it (voluntary MBB probe,
+            // hysteresis-bound; never a blind Install). `demote_on` is
+            // false in off/shadow modes — shadow counts via a separate
+            // `demote_candidate` call at the surface.
+            if demote_on && let Some(action) = self.demote_candidate(peer, cur, avail, now) {
+                return action;
+            }
             return PathAction::Keep;
         }
         let state = self.peers.get(peer);
@@ -784,6 +839,99 @@ impl PathMonitor {
             (Incumbent::None, Some((tier, _))) => PathAction::Install(tier),
             (Incumbent::None, None) => PathAction::Relay,
             (Incumbent::Direct(_), _) => unreachable!("handled above"),
+        }
+    }
+
+    /// B2 — the voluntary-demotion candidate for a LIVE direct incumbent,
+    /// if the sustained-margin conditions hold. Called from `decide` in
+    /// `on` mode and from the surface's shadow counter — exactly one
+    /// caller per evaluation tick, since it owns the `below_since`
+    /// tracking. Returns:
+    /// - `Probe(better_tier)` — the MBB machinery executes it (the
+    ///   incumbent carries traffic until the probe latches);
+    /// - `Relay` — the ADVISORY direct→relay class (nothing else
+    ///   eligible + incumbent Q slammed; execution deliberately
+    ///   deferred — counted and logged only, even in `on` mode).
+    pub(crate) fn demote_candidate(
+        &mut self,
+        peer: &ObjectId,
+        cur: DirectTier,
+        avail: TierAvailability,
+        now: Instant,
+    ) -> Option<PathAction> {
+        let cur_idx = tier_idx(cur)?;
+        let cur_score = self.score(peer, cur, now);
+        let probes_full = self.probes_in_flight >= PROBE_CAP;
+        let p = self.peers.entry(*peer).or_default();
+
+        // Never against a forced-DERP pin, and never while a probe for
+        // this peer is already in flight (freeze the hold — don't clear).
+        if p.forced_derp_until.is_some_and(|until| until > now) {
+            p.tiers[cur_idx].below_since = None;
+            return None;
+        }
+        if p.probe.is_some() {
+            return None;
+        }
+
+        let lan_spaced_out = p
+            .last_lan_attempt
+            .is_some_and(|t| now.saturating_duration_since(t) < LAN_PROBE_SPACING);
+        let voluntary_ok = p.hysteresis.voluntary_allowed(now);
+        let cur_q = p.tiers[cur_idx].q.get();
+
+        // DEGRADED-but-live means degraded: a non-negative incumbent Q
+        // never demotes, whatever the score gap — tier BASE differences
+        // alone (e.g. LAN − Public = 70) exceed the margin, and probing
+        // a HIGHER tier from a healthy incumbent is B3's upward-probing
+        // job (own spacing), not a demotion.
+        if cur_q >= 0.0 {
+            p.tiers[cur_idx].below_since = None;
+            return None;
+        }
+
+        // Best strictly-eligible alternative (the F2 LAN spacing pin and
+        // the probe cap apply to demotion targets exactly as to upgrades).
+        let mut best: Option<(DirectTier, f64)> = None;
+        for tier in DIRECT_TIERS {
+            if tier == cur || !avail.has(tier) {
+                continue;
+            }
+            if tier == DirectTier::Lan && lan_spaced_out {
+                continue;
+            }
+            if !self.eligible(peer, tier, now) {
+                continue;
+            }
+            let s = self.score(peer, tier, now);
+            if best.is_none_or(|(_, bs)| s > bs) {
+                best = Some((tier, s));
+            }
+        }
+
+        let p = self.peers.entry(*peer).or_default();
+        let deficit_holds = match best {
+            Some((_, alt_score)) => alt_score - cur_score >= DEMOTE_MARGIN,
+            // Direct→relay (advisory) class: nothing else eligible AND the
+            // incumbent's Q is slammed to the floor.
+            None => cur_q <= DEMOTE_RELAY_Q_FLOOR,
+        };
+        if !deficit_holds {
+            p.tiers[cur_idx].below_since = None;
+            return None;
+        }
+        let since = *p.tiers[cur_idx].below_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < DEMOTE_HOLD || !voluntary_ok {
+            return None;
+        }
+        match best {
+            Some((alt, _)) => {
+                if probes_full {
+                    return None;
+                }
+                Some(PathAction::Probe(alt))
+            }
+            None => Some(PathAction::Relay),
         }
     }
 
@@ -1118,17 +1266,17 @@ mod tests {
     /// Cold start reproduces the legacy precedence walk exactly.
     #[test]
     fn cold_start_ordering_matches_legacy_precedence() {
-        let m = PathMonitor::default();
+        let mut m = PathMonitor::default();
         let a = oid(1);
         let now = Instant::now();
         // P9 — LAN-best on a FRESH peer probes first under MBB (the same-/24
         // candidate is unproven); the destructive walk survives with MBB off.
         assert_eq!(
-            m.decide(&a, Incumbent::None, all_avail(), true, now),
+            m.decide(&a, Incumbent::None, all_avail(), true, now, false),
             PathAction::Probe(DirectTier::Lan)
         );
         assert_eq!(
-            m.decide(&a, Incumbent::None, all_avail(), false, now),
+            m.decide(&a, Incumbent::None, all_avail(), false, now, false),
             PathAction::Install(DirectTier::Lan)
         );
         let no_lan = TierAvailability {
@@ -1136,7 +1284,7 @@ mod tests {
             ..all_avail()
         };
         assert_eq!(
-            m.decide(&a, Incumbent::None, no_lan, true, now),
+            m.decide(&a, Incumbent::None, no_lan, true, now, false),
             PathAction::Install(DirectTier::Public)
         );
         let srflx_only = TierAvailability {
@@ -1145,25 +1293,39 @@ mod tests {
             srflx: true,
         };
         assert_eq!(
-            m.decide(&a, Incumbent::None, srflx_only, true, now),
+            m.decide(&a, Incumbent::None, srflx_only, true, now, false),
             PathAction::Install(DirectTier::Srflx)
         );
         assert_eq!(
-            m.decide(&a, Incumbent::None, TierAvailability::default(), true, now),
+            m.decide(
+                &a,
+                Incumbent::None,
+                TierAvailability::default(),
+                true,
+                now,
+                false
+            ),
             PathAction::Relay
         );
         // Relay incumbent: MBB probes, destructive mode installs, nothing
         // available keeps.
         assert_eq!(
-            m.decide(&a, Incumbent::Relay, all_avail(), true, now),
+            m.decide(&a, Incumbent::Relay, all_avail(), true, now, false),
             PathAction::Probe(DirectTier::Lan)
         );
         assert_eq!(
-            m.decide(&a, Incumbent::Relay, all_avail(), false, now),
+            m.decide(&a, Incumbent::Relay, all_avail(), false, now, false),
             PathAction::Install(DirectTier::Lan)
         );
         assert_eq!(
-            m.decide(&a, Incumbent::Relay, TierAvailability::default(), true, now),
+            m.decide(
+                &a,
+                Incumbent::Relay,
+                TierAvailability::default(),
+                true,
+                now,
+                false
+            ),
             PathAction::Keep
         );
         // Already direct: always Keep (cross-direct upgrades are post-flip).
@@ -1173,7 +1335,8 @@ mod tests {
                 Incumbent::Direct(DirectTier::Srflx),
                 all_avail(),
                 true,
-                now
+                now,
+                false
             ),
             PathAction::Keep
         );
@@ -1208,7 +1371,7 @@ mod tests {
             srflx: true,
         };
         assert_eq!(
-            m.decide(&a, Incumbent::Relay, avail, true, t),
+            m.decide(&a, Incumbent::Relay, avail, true, t, false),
             PathAction::Probe(DirectTier::Srflx)
         );
     }
@@ -1221,7 +1384,7 @@ mod tests {
         let now = Instant::now();
         m.on_probe_started(&a, DirectTier::Srflx, now);
         assert_eq!(
-            m.decide(&a, Incumbent::Relay, all_avail(), true, now),
+            m.decide(&a, Incumbent::Relay, all_avail(), true, now, false),
             PathAction::Keep,
             "an in-flight probe blocks new proposals for the peer"
         );
@@ -1242,7 +1405,7 @@ mod tests {
         }
         let fresh = oid(2);
         assert_eq!(
-            m.decide(&fresh, Incumbent::Relay, all_avail(), true, now),
+            m.decide(&fresh, Incumbent::Relay, all_avail(), true, now, false),
             PathAction::Keep,
             "global cap blocks new Probe proposals"
         );
@@ -1250,12 +1413,12 @@ mod tests {
         // to it too: cap-full falls back to Relay (carrier first), never to a
         // destructive unproven-LAN install.
         assert_eq!(
-            m.decide(&fresh, Incumbent::None, all_avail(), true, now),
+            m.decide(&fresh, Incumbent::None, all_avail(), true, now, false),
             PathAction::Relay
         );
         m.on_peer_removed(&oid(100));
         assert_eq!(
-            m.decide(&fresh, Incumbent::Relay, all_avail(), true, now),
+            m.decide(&fresh, Incumbent::Relay, all_avail(), true, now, false),
             PathAction::Probe(DirectTier::Lan),
             "freeing one slot unblocks"
         );
@@ -1267,16 +1430,16 @@ mod tests {
     /// keep the legacy fresh `Install`.
     #[test]
     fn fresh_lan_probes_first_under_mbb() {
-        let m = PathMonitor::default();
+        let mut m = PathMonitor::default();
         let a = oid(7);
         let now = Instant::now();
         assert_eq!(
-            m.decide(&a, Incumbent::None, all_avail(), true, now),
+            m.decide(&a, Incumbent::None, all_avail(), true, now, false),
             PathAction::Probe(DirectTier::Lan),
             "fresh + LAN best + MBB → shadow probe, not a destructive install"
         );
         assert_eq!(
-            m.decide(&a, Incumbent::None, all_avail(), false, now),
+            m.decide(&a, Incumbent::None, all_avail(), false, now, false),
             PathAction::Install(DirectTier::Lan),
             "MBB env-off keeps the destructive fresh install"
         );
@@ -1286,7 +1449,7 @@ mod tests {
             srflx: true,
         };
         assert_eq!(
-            m.decide(&a, Incumbent::None, no_lan, true, now),
+            m.decide(&a, Incumbent::None, no_lan, true, now, false),
             PathAction::Install(DirectTier::Public),
             "non-LAN best tiers keep the fresh Install"
         );
@@ -1320,7 +1483,8 @@ mod tests {
                 Incumbent::Relay,
                 lan_only,
                 true,
-                t0 + Duration::from_secs(30)
+                t0 + Duration::from_secs(30),
+                false
             ),
             PathAction::Probe(DirectTier::Srflx),
             "LAN must be spaced out at 30 s regardless of Q"
@@ -1332,7 +1496,8 @@ mod tests {
                 Incumbent::Relay,
                 lan_only,
                 true,
-                t0 + Duration::from_secs(61)
+                t0 + Duration::from_secs(61),
+                false
             ),
             PathAction::Probe(DirectTier::Lan)
         );
@@ -1377,6 +1542,187 @@ mod tests {
         assert!((one - 5.0).abs() < 1e-9, "α·(100−500/10−0) = 5, got {one}");
     }
 
+    /// B2 — drive a tier's Q toward a target via repeated RTT samples
+    /// (`q → 100 − rtt/10` as the EWMA converges).
+    fn pump_rtt(m: &mut PathMonitor, peer: &ObjectId, tier: DirectTier, rtt_ms: u32, n: usize) {
+        for _ in 0..n {
+            m.on_rtt_sample(peer, tier, rtt_ms);
+        }
+    }
+
+    /// B2 — the demotion window: degraded-incumbent gate, margin gate,
+    /// the 15 s hold (14/16 s boundaries), and the mode plumbing
+    /// (`demote_on = false` keeps forever).
+    #[test]
+    fn demotion_fires_on_sustained_margin_against_degraded_incumbent_only() {
+        let a = oid(1);
+        let t0 = Instant::now();
+        let inc = Incumbent::Direct(DirectTier::Public);
+        let avail = TierAvailability {
+            lan: false,
+            public: true,
+            srflx: true,
+        };
+
+        // Healthy incumbent (Q = 0 cold start): base gap Srflx−Public is
+        // negative anyway, but even a ceiling-Q alternative must NOT
+        // demote a non-negative incumbent.
+        let mut m = PathMonitor::default();
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 0, 400); // srflx Q → +99
+        assert_eq!(m.decide(&a, inc, avail, true, t0, true), PathAction::Keep);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + DEMOTE_HOLD * 4, true),
+            PathAction::Keep,
+            "a healthy incumbent never demotes"
+        );
+
+        // Degraded incumbent, deficit BELOW the margin: no demotion.
+        // Public q→−60 (score 270) vs srflx q→+31 (score 291): gap 21.
+        let mut m = PathMonitor::default();
+        pump_rtt(&mut m, &a, DirectTier::Public, 1_600, 400);
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 690, 400);
+        assert_eq!(m.decide(&a, inc, avail, true, t0, true), PathAction::Keep);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + DEMOTE_HOLD * 4, true),
+            PathAction::Keep,
+            "sub-margin deficit never demotes"
+        );
+
+        // Degraded incumbent, deficit ABOVE the margin (gap ≈ 89): the
+        // hold arms on first sight, refuses at 14 s, fires at 16 s.
+        let mut m = PathMonitor::default();
+        pump_rtt(&mut m, &a, DirectTier::Public, 1_600, 400);
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 0, 400);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0, false),
+            PathAction::Keep,
+            "demote_on=false (off/shadow) keeps forever"
+        );
+        assert_eq!(m.decide(&a, inc, avail, true, t0, true), PathAction::Keep);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + Duration::from_secs(14), true),
+            PathAction::Keep,
+            "inside the 15 s hold"
+        );
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + Duration::from_secs(16), true),
+            PathAction::Probe(DirectTier::Srflx),
+            "sustained deficit past the hold → voluntary MBB probe"
+        );
+
+        // A deficit that BREAKS mid-hold disarms: the next sight re-arms
+        // from scratch.
+        let mut m = PathMonitor::default();
+        pump_rtt(&mut m, &a, DirectTier::Public, 1_600, 400);
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 0, 400);
+        assert_eq!(m.decide(&a, inc, avail, true, t0, true), PathAction::Keep);
+        // Alternative collapses (bad RTTs) → deficit gone → cleared.
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 2_000, 400);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + Duration::from_secs(16), true),
+            PathAction::Keep
+        );
+        // Alternative recovers; the hold restarts at the NEW first sight.
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 0, 800);
+        let t1 = t0 + Duration::from_secs(20);
+        assert_eq!(m.decide(&a, inc, avail, true, t1, true), PathAction::Keep);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t1 + Duration::from_secs(14), true),
+            PathAction::Keep,
+            "hold re-armed, not carried over"
+        );
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t1 + Duration::from_secs(16), true),
+            PathAction::Probe(DirectTier::Srflx)
+        );
+    }
+
+    /// B2 — the flap guards: voluntary switches respect the 30 s
+    /// hysteresis; a forced-DERP pin vetoes; the probe cap holds; and
+    /// the no-alternative + slammed-Q case yields the ADVISORY Relay.
+    #[test]
+    fn demotion_respects_hysteresis_pin_cap_and_relay_advisory() {
+        let a = oid(1);
+        let t0 = Instant::now();
+        let inc = Incumbent::Direct(DirectTier::Public);
+        let avail = TierAvailability {
+            lan: false,
+            public: true,
+            srflx: true,
+        };
+
+        // Hysteresis: an install at t0 blocks the voluntary fire until
+        // t0+30 even though the hold (15 s) is long satisfied.
+        let mut m = PathMonitor::default();
+        pump_rtt(&mut m, &a, DirectTier::Public, 1_600, 400);
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 0, 400);
+        m.on_installed(&a, DirectTier::Public, t0);
+        assert_eq!(m.decide(&a, inc, avail, true, t0, true), PathAction::Keep);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + Duration::from_secs(29), true),
+            PathAction::Keep,
+            "hysteresis holds voluntary switches for 30 s"
+        );
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + Duration::from_secs(31), true),
+            PathAction::Probe(DirectTier::Srflx)
+        );
+
+        // Forced-DERP pin vetoes demotion outright.
+        let mut m = PathMonitor::default();
+        pump_rtt(&mut m, &a, DirectTier::Public, 1_600, 400);
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 0, 400);
+        m.on_forced_derp(&a, Duration::from_secs(300), t0);
+        assert_eq!(m.decide(&a, inc, avail, true, t0, true), PathAction::Keep);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + Duration::from_secs(60), true),
+            PathAction::Keep,
+            "no voluntary demotion under a forced-DERP pin"
+        );
+
+        // Probe cap: cap-full suppresses the fire (Keep, not a blind
+        // Install).
+        let mut m = PathMonitor::default();
+        pump_rtt(&mut m, &a, DirectTier::Public, 1_600, 400);
+        pump_rtt(&mut m, &a, DirectTier::Srflx, 0, 400);
+        for i in 0..(PROBE_CAP as u8) {
+            m.on_probe_started(&oid(100 + i), DirectTier::Srflx, t0);
+        }
+        assert_eq!(m.decide(&a, inc, avail, true, t0, true), PathAction::Keep);
+        assert_eq!(
+            m.decide(&a, inc, avail, true, t0 + Duration::from_secs(16), true),
+            PathAction::Keep,
+            "probe cap suppresses voluntary demotion"
+        );
+
+        // No eligible alternative + slammed incumbent Q → the ADVISORY
+        // Relay verdict (counted/logged; execution stays with the death
+        // path).
+        let mut m = PathMonitor::default();
+        let only_public = TierAvailability {
+            lan: false,
+            public: true,
+            srflx: false,
+        };
+        pump_rtt(&mut m, &a, DirectTier::Public, 60_000, 600); // q → −100 clamp
+        assert_eq!(
+            m.decide(&a, inc, only_public, true, t0, true),
+            PathAction::Keep
+        );
+        assert_eq!(
+            m.decide(
+                &a,
+                inc,
+                only_public,
+                true,
+                t0 + Duration::from_secs(16),
+                true
+            ),
+            PathAction::Relay,
+            "slammed incumbent with no alternative → advisory relay demote"
+        );
+    }
+
     /// The forced-DERP pin is an annotation: direct decisions identical with
     /// and without it; relay-Q resets; the pin expires by TTL.
     #[test]
@@ -1386,11 +1732,11 @@ mod tests {
         let now = Instant::now();
         pump_heard(&mut m, &a, DirectTier::Relay, 20);
         assert!(m.score(&a, DirectTier::Relay, now) > B_RELAY);
-        let before = m.decide(&a, Incumbent::Relay, all_avail(), true, now);
+        let before = m.decide(&a, Incumbent::Relay, all_avail(), true, now, false);
         m.on_forced_derp(&a, Duration::from_secs(1800), now);
         assert!(m.forced_derp_active(&a, now));
         assert_eq!(
-            m.decide(&a, Incumbent::Relay, all_avail(), true, now),
+            m.decide(&a, Incumbent::Relay, all_avail(), true, now, false),
             before,
             "the pin must not touch direct-tier decisions"
         );
@@ -1567,7 +1913,7 @@ mod tests {
             "in-flight probe bookkeeping survives"
         );
         assert_eq!(
-            m.decide(&b, Incumbent::Relay, all_avail(), true, t),
+            m.decide(&b, Incumbent::Relay, all_avail(), true, t, false),
             PathAction::Keep,
             "the surviving probe still serializes"
         );
