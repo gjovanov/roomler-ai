@@ -35,14 +35,20 @@ pub const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 pub const DEFAULT_PROXY_URL: &str = "https://roomler.ai/api/agent/latest-release";
 
 /// How often `run_periodic` wakes up and checks for a newer release.
-/// 24 hours — matches the cadence of "operator deploys a fix and
-/// wants the field to pick it up next day" without burning through
-/// GitHub's 60-req-per-IP-per-hour unauthenticated REST quota when
-/// many agents share a public IP (NAT'd offices, multiple boxes
-/// behind one home router during rapid testing). Field report
-/// 2026-04-27: 8 successive MSI installs across 5 boxes hit
-/// `403 Forbidden` from GitHub before the hour reset.
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+///
+/// A5 (2026-08-02): 24 h → **4 h**. The 24 h default was the fleet's
+/// wedge-heal ceiling: an agent whose control WS was wedged/split missed
+/// the server-pushed `rc:agent.update` (it rides that WS) and then sat
+/// broken for up to a day (field: pc50045/pc55331 ran a 4-day-old build
+/// through the S6 split because their next check was hours away). The
+/// original 24 h choice guarded GitHub's 60-req/IP/h unauthenticated
+/// quota (field 2026-04-27: 8 MSI installs across 5 NAT'd boxes hit 403)
+/// — but the check has been roomler.ai-proxy-first for a long time
+/// (`DEFAULT_PROXY_URL`, server-side 1 h cache), so GitHub only sees
+/// fallback traffic. 4 h keeps even a large NAT'd office far under the
+/// quota on the fallback path. Operators tune via
+/// `update_check_interval_h` / `ROOMLER_AGENT_UPDATE_INTERVAL_H`.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(4 * 3600);
 
 /// Minimum download size before we trust an installer artifact. A
 /// GitHub redirect to a deleted asset returns a tiny HTML page; this
