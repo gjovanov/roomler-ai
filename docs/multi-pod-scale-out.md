@@ -142,14 +142,19 @@ rejected there is NO data plane crossing pods), keyspace notifications
   forwarding*. A network is tenant-scoped and both ends carry the same
   tid, so under any consistent LB map the whole network converges to one
   pod; splits are stale-socket artifacts. On register, read the network's
-  sibling records; the minority side's owning pod closes those `/derp`
-  sockets (Close 1001) and the clients' reconnect re-lands converged.
-  Ping-pong guard: ≥60 s cooldown per (net, pubkey), 3 attempts, then the
-  split-evidence counter. DERP scales by distributing NETWORKS across
-  pods, never splitting one. (Frame forwarding rejected: it is the only
-  mechanism that would put WG-rate bytes on the bus, buys correctness only
-  for a transient window the rehome already bounds, and makes Redis a
-  bandwidth SPOF. Revisit only if affinity is dropped or multi-region.)
+  sibling records; the convergence target is the pod of the **newest**
+  registration (`since_ms` max — the newest dial reflects the LB's
+  *current* verdict; a "majority wins" rule would chase the parked past
+  during a topology flip). Every other pod is asked (`derp.rehome` RPC)
+  to close its `/derp` sockets for that network; the clients' reconnect
+  re-lands converged. Ping-pong guard on the closing side: ≥60 s cooldown
+  per (net, pubkey), 3 attempts per 10 min, then the split-evidence
+  counter (`derp_rehome_stuck_total`). DERP scales by distributing
+  NETWORKS across pods, never splitting one. (Frame forwarding rejected:
+  it is the only mechanism that would put WG-rate bytes on the bus, buys
+  correctness only for a transient window the rehome already bounds, and
+  makes Redis a bandwidth SPOF. Revisit only if affinity is dropped or
+  multi-region.)
 
 ## Mediasoup scale ladder
 
