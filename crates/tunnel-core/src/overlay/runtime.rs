@@ -78,10 +78,17 @@ use super::path;
 /// never be held across an await by construction.
 struct PathShadow {
     mode: path::PathMonMode,
+    /// B2 — score-driven demotion engagement (off | shadow | on;
+    /// first-ship default: shadow — computed + counted, never executed).
+    demote: path::DemoteMode,
     mon: path::PathMonitor,
     stats: path::ShadowStats,
     /// Per-peer divergence-warn rate limit (1/min/peer).
     last_div_log: HashMap<ObjectId, Instant>,
+    /// B2 — per-peer shadow-demote log rate limit (1/min/peer; the
+    /// deficit is sustained by definition, so unthrottled it would fire
+    /// every evaluation tick).
+    last_demote_log: HashMap<ObjectId, Instant>,
     /// Last 10-minute summary emission.
     last_summary: Instant,
     /// Harmful-class ledger: (peer, tier) the monitor refused while legacy
@@ -116,13 +123,42 @@ impl PathShadow {
                 "overlay pathmon: legacy selection removed (PR-E) — this mode now affects telemetry only; selection is always the monitor (rollback = deploy a pre-PR-E release)"
             );
         }
+        let demote = path::DemoteMode::parse(crate::env::node_env("OVERLAY_DEMOTE").as_deref());
+        info!(
+            demote = demote.as_str(),
+            "overlay pathmon: score-driven demotion armed (B2; shadow = counted only)"
+        );
         Self {
             mode,
+            demote,
             mon: path::PathMonitor::default(),
             stats: path::ShadowStats::default(),
             last_div_log: HashMap::new(),
+            last_demote_log: HashMap::new(),
             last_summary: Instant::now(),
             refused: HashMap::new(),
+        }
+    }
+
+    /// B2 shadow — count a would-be demotion (its own `by_class` lane,
+    /// `voluntary_demote:N/0`) + a rate-limited log carrying the verdict.
+    fn note_shadow_demote(&mut self, peer: &ObjectId, action: path::PathAction, now: Instant) {
+        let class = self
+            .stats
+            .by_class
+            .entry("voluntary_demote")
+            .or_insert((0, 0));
+        class.0 += 1;
+        if self
+            .last_demote_log
+            .get(peer)
+            .is_none_or(|&t| now.duration_since(t) >= Duration::from_secs(60))
+        {
+            self.last_demote_log.insert(*peer, now);
+            info!(
+                peer = %peer, ?action,
+                "overlay pathmon[demote-shadow]: sustained score deficit — would demote (not acting; rate-limited 1/min/peer)"
+            );
         }
     }
 
@@ -223,6 +259,7 @@ impl PathShadow {
             .retain(|_, &mut at| now.duration_since(at) <= SHADOW_HARM_WINDOW);
         info!(
             mode = self.mode.as_str(),
+            demote = self.demote.as_str(),
             decisions = self.stats.decisions,
             diverged = self.stats.diverged,
             harmful = self.stats.harmful,
