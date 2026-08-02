@@ -146,6 +146,15 @@ pub struct AppState {
     /// sender for that node's live `/derp` WS. The pubkey-addressed forwarding
     /// map for the both-UDP-blocked carrier tier. See [`crate::ws::derp`].
     pub derp_registry: crate::ws::derp::DerpRegistry,
+    /// C-5 — per-connection rehome-close signals (cluster convergence).
+    pub derp_cancels: crate::ws::derp::DerpCancelRegistry,
+    /// C-5 — directory owner-tokens for LOCAL derp registrations
+    /// (`roomler:own:derp:<net>:<pubkey>`); refreshed by the directory
+    /// heartbeat while the registry holds the key.
+    pub derp_presence_tokens: Arc<DashMap<crate::ws::derp::DerpKey, String>>,
+    /// C-5 — per-(network, pubkey) rehome pacing (60 s cooldown, 3
+    /// attempts / 10 min, then the split-evidence counter).
+    pub derp_rehome_cooldowns: Arc<crate::ws::derp_cluster::RehomeCooldowns>,
     /// P7 — per-pair TURN-relay churn state for the forced-DERP escalation,
     /// keyed by the symmetric `pair_key`. Manual TTL (checked on access) +
     /// a size-capped retain sweep — see [`crate::ws::overlay::PairChurn`].
@@ -310,6 +319,9 @@ impl AppState {
         let tunnel_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
         let media_claim_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
         let remote_media_conns: Arc<DashMap<String, ObjectId>> = Arc::new(DashMap::new());
+        let derp_presence_tokens: Arc<DashMap<crate::ws::derp::DerpKey, String>> =
+            Arc::new(DashMap::new());
+        let derp_registry: crate::ws::derp::DerpRegistry = Arc::new(DashMap::new());
         let tunnel_clients_by_session: TunnelClientOutbound = Arc::new(DashMap::new());
         let tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
             Arc::new(DashMap::new());
@@ -446,6 +458,8 @@ impl AppState {
             let tokens = agent_presence_tokens.clone();
             let tunnel_tokens = tunnel_presence_tokens.clone();
             let tunnel_sessions = tunnel_clients_by_session.clone();
+            let derp_tokens = derp_presence_tokens.clone();
+            let derp_reg = derp_registry.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -483,6 +497,29 @@ impl AppState {
                         let key = crate::cluster::directory::tunnel_key(&sid.to_hex());
                         if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
                             tracing::debug!(session = %sid, %e, "tunnel directory refresh failed");
+                        }
+                    }
+                    // C-5 — derp registration records: prune tokens whose
+                    // registry entry is gone (socket closed / displaced),
+                    // refresh the rest. A CONFLICT here just means the
+                    // node re-registered on another pod (LWW) while our
+                    // stale socket lingers — nothing to fold.
+                    let dead: Vec<crate::ws::derp::DerpKey> = derp_tokens
+                        .iter()
+                        .filter(|e| !derp_reg.contains_key(e.key()))
+                        .map(|e| *e.key())
+                        .collect();
+                    for k in dead {
+                        derp_tokens.remove(&k);
+                    }
+                    for entry in derp_tokens.iter() {
+                        let ((net, pk), token) = (*entry.key(), entry.value().clone());
+                        let key = crate::cluster::directory::derp_key(
+                            &net.to_hex(),
+                            &crate::ws::derp_cluster::pk_hex(&pk),
+                        );
+                        if let Err(e) = dir.refresh_if_mine(&key, &token, 90).await {
+                            tracing::debug!(network = %net, %e, "derp directory refresh failed");
                         }
                     }
                 }
@@ -560,7 +597,10 @@ impl AppState {
             overlay_networks,
             overlay_nodes,
             overlay_nodes_by_id: Arc::new(DashMap::new()),
-            derp_registry: Arc::new(DashMap::new()),
+            derp_registry: derp_registry.clone(),
+            derp_cancels: Arc::new(DashMap::new()),
+            derp_presence_tokens: derp_presence_tokens.clone(),
+            derp_rehome_cooldowns: Arc::new(DashMap::new()),
             relay_pair_churn: Arc::new(DashMap::new()),
             latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
             tunnel_release_cache: crate::routes::tunnel_release::LatestTunnelReleaseCache::new(),
@@ -571,6 +611,8 @@ impl AppState {
         // execution) + the 10 s claim heartbeat. Registered on the built
         // state because the handlers need the full AppState.
         crate::ws::media_cluster::wire_media_cluster(&state);
+        // C-5 — derp rehome: the owner-side close handler.
+        crate::ws::derp_cluster::wire_derp_cluster(&state);
 
         Ok(state)
     }
