@@ -206,6 +206,41 @@ impl OwnershipDirectory {
         }
         cmd.query_async(&mut conn).await
     }
+
+    // C-5 — member-index sets (per-network DERP membership). The set is
+    // an INDEX, not a truth source: per-member ownership lives in the
+    // keyed records; readers lazily prune members whose record is gone.
+    // A 1 h idle TTL (refreshed on every add) keeps dead networks from
+    // accreting keys.
+
+    pub async fn set_add(&self, key: &str, member: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.conn.clone();
+        redis::pipe()
+            .cmd("SADD")
+            .arg(key)
+            .arg(member)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(key)
+            .arg(3600)
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
+    pub async fn set_remove(&self, key: &str, member: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.conn.clone();
+        redis::cmd("SREM")
+            .arg(key)
+            .arg(member)
+            .query_async::<()>(&mut conn)
+            .await
+    }
+
+    pub async fn set_members(&self, key: &str) -> Result<Vec<String>, redis::RedisError> {
+        let mut conn = self.conn.clone();
+        redis::cmd("SMEMBERS").arg(key).query_async(&mut conn).await
+    }
 }
 
 /// Key builders — ONE place per namespace so producers and readers can
@@ -244,4 +279,15 @@ pub fn tunnel_key(session_hex: &str) -> String {
 pub const MEDIA_TTL_SECS: u64 = 30;
 pub fn media_key(room_hex: &str) -> String {
     format!("roomler:own:media:{room_hex}")
+}
+
+/// C-5 — DERP registrations (LWW: a reconnect for the same pubkey is
+/// definitionally the newer owner) + the per-network member index the
+/// convergence sweep reads. Pubkeys as lowercase hex (base64 would put
+/// `/` inside the token format).
+pub fn derp_key(net_hex: &str, pubkey_hex: &str) -> String {
+    format!("roomler:own:derp:{net_hex}:{pubkey_hex}")
+}
+pub fn derpnet_key(net_hex: &str) -> String {
+    format!("roomler:own:derpnet:{net_hex}")
 }
