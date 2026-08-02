@@ -198,8 +198,8 @@ record within one beat and the fold rule resolves any belt-era splits.
 | C-2 | rc rehome + `forceRedial` + idle-agent nudge + consent/kick broadcast | |
 | C-3 | tunnel rehome + CLI redial-retry + session ownership records | |
 | C-4 | media claim-or-route + command shim + conn-addressed events + conflict fold | **THE un-park gate** |
-| C-5 | DERP directory + rehome (cooldown + cap + counter) | |
-| C-6 | shutdown sweep for all four classes + metrics (rehome/nudge/deadline/belt/split counters, per-pod room+consumer gauges → the stage-(b) trigger) + admin listing | un-park pod-2 after C-4, C-5/C-6 in the following releases |
+| C-5 | DERP directory + rehome — convergence toward the NEWEST registration (cooldown + cap + `derp_rehome_stuck_total`) | |
+| C-6 | shutdown sweep for all four classes (media/agents from C-4/A-1; + tunnel + derp records) + `cluster::metrics` counters (`rc_rehome`, `tunnel_rehome`, `agent_nudge`, `bus_deadline`, `media_fold`, `media_belt_fallback`, `derp_rehome_close`, `derp_rehome_stuck`, `split_evidence` — all `_total`) + per-pod media gauges (rooms/participants/consumers → the stage-(b) PipeTransport trigger) + `GET /api/cluster/status` (auth-gated) | un-park pod-2 once C-4..C-6 are deployed |
 
 ## Not building (scope honesty)
 

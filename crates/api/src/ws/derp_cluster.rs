@@ -201,6 +201,7 @@ pub fn local_rehome_close(state: &AppState, network_id: ObjectId, pks: &[String]
         }
         if let Some(cancel) = state.derp_cancels.get(&(network_id, pk)) {
             info!(%network_id, pubkey = %member, "derp: closing socket for cluster rehome");
+            crate::cluster::metrics::bump(&crate::cluster::metrics::DERP_REHOME_CLOSE_TOTAL);
             cancel.notify_one();
         }
     }
