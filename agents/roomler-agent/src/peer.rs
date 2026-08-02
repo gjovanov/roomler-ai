@@ -584,13 +584,44 @@ impl AgentPeer {
             })
         };
 
-        // Forward locally-gathered ICE candidates.
+        // Forward locally-gathered ICE candidates — and rc.293, LOG them.
+        //
+        // The gather used to be SILENT: candidates were serialised and
+        // forwarded with no record, so "which candidates did this host
+        // actually produce?" could only be answered from the far end's
+        // `chrome://webrtc-internals` — and only if a browser was involved at
+        // all. Field 2026-08-02 (CORPLAP-3, Cisco AnyConnect full tunnel):
+        // the agent contributed ONLY an overlay host candidate and a relay —
+        // no srflx — even though a hand-run STUN Binding from its VPN adapter
+        // reached coturn fine (40-byte reply). Nothing in the log could say
+        // whether the srflx was never gathered or gathered-then-lost, which is
+        // the difference between an ICE-gather bug and a signalling bug. The
+        // rc.180 `ICE_RELAY_TCP` hunt was fought blind for the same reason.
+        // One line per candidate (a one-shot burst of a handful per session)
+        // plus a summary on the end-of-gather `None` sentinel makes it
+        // permanently greppable.
         {
             let tx = outbound.clone();
+            let tally = Arc::new(GatherTally::default());
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                 let tx = tx.clone();
+                let tally = tally.clone();
                 Box::pin(async move {
-                    let Some(c) = c else { return };
+                    let Some(c) = c else {
+                        // webrtc-rs signals end-of-gather with `None`.
+                        tally.log_summary(session_id, relay_tcp);
+                        return;
+                    };
+                    tally.note(c.typ);
+                    info!(
+                        %session_id,
+                        typ = %c.typ,
+                        protocol = %c.protocol,
+                        address = %c.address,
+                        port = c.port,
+                        related = %format_args!("{}:{}", c.related_address, c.related_port),
+                        "ICE: gathered local candidate"
+                    );
                     let json = match c.to_json() {
                         Ok(j) => j,
                         Err(e) => {
@@ -1247,6 +1278,64 @@ const KEYFRAME_FORCE_REBUILD_AFTER: Duration = Duration::from_millis(6500);
 /// this bounds the blast radius wherever that still fails.
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 const KEYFRAME_FORCE_REBUILD_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// rc.293 — per-session tally of the ICE candidate types this host gathered,
+/// so the end-of-gather summary answers "did we produce a server-reflexive
+/// candidate?" in one grep. Atomics because `on_ice_candidate` is an `Fn`
+/// invoked concurrently across the gather burst.
+#[derive(Default)]
+struct GatherTally {
+    host: std::sync::atomic::AtomicU32,
+    srflx: std::sync::atomic::AtomicU32,
+    prflx: std::sync::atomic::AtomicU32,
+    relay: std::sync::atomic::AtomicU32,
+}
+
+impl GatherTally {
+    // Fully qualified: the `RTCIceCandidateType` import at the top of this
+    // file is cfg-gated to the vp9-444 / ffmpeg-encoder builds (it keeps
+    // `clippy -D warnings` clean on FFmpeg-only builds), and this tally is
+    // unconditional.
+    fn note(&self, typ: webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType) {
+        use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType as T;
+        let slot = match typ {
+            T::Host => &self.host,
+            T::Srflx => &self.srflx,
+            T::Prflx => &self.prflx,
+            T::Relay => &self.relay,
+            T::Unspecified => return,
+        };
+        slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One summary line at end-of-gather, plus a WARN when this host offered
+    /// nothing hole-punchable — the state that silently forces every session
+    /// onto the relay. Suppressed under `relay_tcp`, where relay-only is the
+    /// deliberate configuration (`ice_transport_policy = Relay`) rather than a
+    /// symptom.
+    fn log_summary(&self, session_id: bson::oid::ObjectId, relay_tcp: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (host, srflx, prflx, relay) = (
+            self.host.load(Relaxed),
+            self.srflx.load(Relaxed),
+            self.prflx.load(Relaxed),
+            self.relay.load(Relaxed),
+        );
+        info!(
+            %session_id, host, srflx, prflx, relay, relay_tcp,
+            "ICE: local gather complete"
+        );
+        if srflx == 0 && !relay_tcp {
+            warn!(
+                %session_id, host, relay,
+                "ICE: gathered NO server-reflexive candidate — this host offers no \
+                 hole-punchable address, so media falls back to the relay. Usual cause: \
+                 STUN unreachable over UDP from every local interface (corp VPN / \
+                 firewall capturing or blocking the path to the STUN/TURN servers)."
+            );
+        }
+    }
+}
 
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 async fn current_pair_is_relay(
