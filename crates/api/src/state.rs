@@ -72,7 +72,8 @@ pub struct AppState {
     pub redis_pubsub: Option<Arc<RedisPubSub>>,
     /// True while the Redis pub/sub subscriber holds a live subscription —
     /// flipped by `RedisPubSub::subscribe_with_reconnect` (started in
-    /// `main.rs`), read by `/health/ready`.
+    /// `AppState::new` since C-2, so TestApps exercise cross-pod delivery),
+    /// read by `/health/ready`.
     pub redis_sub_alive: Arc<std::sync::atomic::AtomicBool>,
     /// File-storage backend for uploads + export artifacts (local disk or
     /// S3/MinIO, picked from `s3.enabled` at startup). See [`crate::storage`].
@@ -291,6 +292,121 @@ impl AppState {
         // socket-level machinery (displacement Goodbye / A2b counter)
         // owns the reaction.
         let agent_presence_tokens: Arc<DashMap<ObjectId, String>> = Arc::new(DashMap::new());
+        let tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
+            Arc::new(DashMap::new());
+
+        // C-2 — the global-channel subscriber + forwarder, MOVED here from
+        // main.rs so two-pod TestApps exercise cross-pod delivery (chat,
+        // presence, and the new rc ctrl events). Same reconnect-and-backoff
+        // subscription; the forwarder gains the ctrl lane.
+        let redis_sub_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(pubsub) = &redis_pubsub {
+            let (redis_tx, _) = tokio::sync::broadcast::channel::<String>(1024);
+            let mut redis_rx = redis_tx.subscribe();
+            let own_instance = pubsub.instance_id().to_string();
+            let fwd_storage = ws_storage.clone();
+            let ctrl_hub = rc_hub.clone();
+            RedisPubSub::subscribe_with_reconnect(
+                settings.redis.url.clone(),
+                redis_tx,
+                redis_sub_alive.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    match redis_rx.recv().await {
+                        Ok(payload) => {
+                            let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&payload)
+                            else {
+                                continue;
+                            };
+                            // Self-echo guard: this instance already delivered
+                            // locally at publish time.
+                            if envelope["origin"].as_str() == Some(own_instance.as_str()) {
+                                continue;
+                            }
+                            // C-2 — rc control events (consent verdicts, admin
+                            // kicks): idempotent hub operations every pod
+                            // applies locally; the one holding the entity acts.
+                            if let Some(ctrl) = envelope.get("ctrl") {
+                                crate::ws::remote_control::apply_rc_ctrl(&ctrl_hub, ctrl);
+                                continue;
+                            }
+                            // S6 broadcast envelopes (presence fan-out): each
+                            // pod delivers to its own local connections.
+                            if envelope["broadcast"].as_bool() == Some(true) {
+                                if let Some(message) = envelope.get("message") {
+                                    let ids = fwd_storage.all_user_ids();
+                                    crate::ws::dispatcher::broadcast(&fwd_storage, &ids, message)
+                                        .await;
+                                }
+                                continue;
+                            }
+                            if let (Some(user_ids_val), Some(message)) =
+                                (envelope["user_ids"].as_array(), envelope.get("message"))
+                            {
+                                let ids: Vec<ObjectId> = user_ids_val
+                                    .iter()
+                                    .filter_map(|v| {
+                                        v.as_str().and_then(|s| ObjectId::parse_str(s).ok())
+                                    })
+                                    .collect();
+                                crate::ws::dispatcher::broadcast(&fwd_storage, &ids, message).await;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Redis Pub/Sub forwarder lagged; dropped {n} events");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                tracing::error!("Redis Pub/Sub forwarding task ended (channel closed)");
+            });
+            tracing::info!("Redis Pub/Sub cross-instance WS delivery enabled");
+
+            // S6 — online-registry heartbeat (also moved from main.rs).
+            let hb_pubsub = pubsub.clone();
+            let hb_storage = ws_storage.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    for uid in hb_storage.all_user_ids() {
+                        if let Err(e) = hb_pubsub.online_add(&uid.to_hex()).await {
+                            tracing::debug!("online-registry heartbeat failed: {e}");
+                            break; // Redis down — retry whole set next tick.
+                        }
+                    }
+                }
+            });
+        }
+
+        // C-2 — the idle-agent nudge handler: the pod OWNING an agent's WS
+        // receives `rc.agent_nudge` from a pod whose controller found the
+        // agent foreign, and cycles that WS iff the agent is fully idle
+        // (no rc sessions, no tunnel sessions targeting it) so both ends
+        // re-land at the current LB hash.
+        if let Some(bus) = &cluster_bus {
+            let hub = rc_hub.clone();
+            let tunnel_targets = tunnel_sessions_by_target_agent.clone();
+            bus.register("rc.agent_nudge", move |body| {
+                let hub = hub.clone();
+                let tunnel_targets = tunnel_targets.clone();
+                Box::pin(async move {
+                    let hex = body
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "missing agent_id".to_string())?;
+                    let aid = ObjectId::parse_str(hex).map_err(|_| "bad agent_id".to_string())?;
+                    let tunnel_busy = tunnel_targets
+                        .get(&aid)
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    let nudged = hub.nudge_agent_if_idle(aid, tunnel_busy);
+                    Ok(serde_json::json!({ "nudged": nudged }))
+                })
+            });
+        }
         if let Some(dir) = &cluster_directory {
             let dir = dir.clone();
             let hub = rc_hub.clone();
@@ -369,7 +485,7 @@ impl AppState {
             push,
             push_subscriptions,
             redis_pubsub,
-            redis_sub_alive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            redis_sub_alive,
             storage,
             agents,
             remote_sessions,
@@ -383,7 +499,7 @@ impl AppState {
             tunnel_policies,
             tunnel_audit,
             tunnel_clients_by_session: Arc::new(DashMap::new()),
-            tunnel_sessions_by_target_agent: Arc::new(DashMap::new()),
+            tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
             overlay_networks,
             overlay_nodes,
             overlay_nodes_by_id: Arc::new(DashMap::new()),
