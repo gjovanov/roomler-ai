@@ -235,6 +235,21 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
 /// registered in the SAME `network_id` (hard scope). Silently drops on: a short
 /// or oversized frame, an unknown dst (peer offline / not in this network), or a
 /// full destination queue (the carrier is loss-tolerant).
+///
+/// ⚠️ **Overlay-ACL gap (known, deliberate).** This is scoped by `network_id`
+/// only, so a pair denied by the overlay ACL can still relay through DERP if
+/// both ends already hold each other's pubkeys (a stale or modified client —
+/// an honest client never learns a withheld peer's key, because the netmap
+/// withholds it and revokes with `removes`). The TURN-grant path IS gated
+/// (`ws::overlay::handle_overlay_relay_request`); this one is not, because
+/// forwarding is a per-DATAGRAM sync path and an async policy read here would
+/// be a serious throughput regression.
+///
+/// The fix is a **cached per-network allow-set** — a `DashMap<(network_id,
+/// src_pubkey), HashSet<dst_pubkey>>` rebuilt when policies change (the same
+/// re-fan hook that reshapes netmaps) and consulted with one lock-free lookup
+/// per frame. That belongs with the node-side ingress filter, which addresses
+/// the same "hostile client" tier of the threat model.
 fn forward_frame(
     registry: &DerpRegistry,
     network_id: ObjectId,
