@@ -51,6 +51,12 @@ export interface TunnelClientIdSubject {
   kind: 'tunnel_client_id'
   id: string
 }
+// P3b-2 node-stack unification: an AGENT acting as a tunnel ORIGIN. The
+// wire supported it all along; the UI type (and picker) gained it 2026-08-04.
+export interface AgentIdSubject {
+  kind: 'agent_id'
+  id: string
+}
 export interface AllUsersSubject {
   kind: 'all_users'
 }
@@ -58,6 +64,7 @@ export type PolicySubject =
   | UserIdSubject
   | RoleIdSubject
   | TunnelClientIdSubject
+  | AgentIdSubject
   | AllUsersSubject
 
 export interface AgentIdTarget {
