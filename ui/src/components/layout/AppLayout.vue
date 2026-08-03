@@ -258,6 +258,7 @@ import { useRoomStore } from '@/stores/rooms'
 import { useNotificationStore } from '@/stores/notification'
 import { useConferenceStore } from '@/stores/conference'
 import { useWsStore } from '@/stores/ws'
+import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import MiniConference from '@/components/conference/MiniConference.vue'
 import SearchDialog from '@/components/layout/SearchDialog.vue'
@@ -404,11 +405,25 @@ function onSearchShortcut(e: KeyboardEvent) {
   }
 }
 
+// WS came back after a drop: pushes that would have arrived meanwhile are
+// gone — refetch rooms (call badges), unread counts, and the open room's
+// messages so the UI converges without a manual reload.
+async function onWsReconnected() {
+  if (!tenantId.value) return
+  await roomStore.fetchRooms(tenantId.value)
+  roomStore.fetchAllUnreadCounts(tenantId.value)
+  const messageStore = useMessageStore()
+  if (messageStore.currentRoomId) {
+    messageStore.fetchMessages(tenantId.value, messageStore.currentRoomId)
+  }
+}
+
 onMounted(async () => {
   await tenantStore.fetchTenants()
   notificationStore.fetchUnreadCount()
   window.addEventListener('room:call_started', onCallStarted)
   window.addEventListener('keydown', onSearchShortcut)
+  window.addEventListener('ws:reconnected', onWsReconnected)
   // Fetch rooms and unread counts for current tenant
   if (tenantId.value) {
     await roomStore.fetchRooms(tenantId.value)
@@ -419,6 +434,7 @@ onMounted(async () => {
 onUnmounted(() => {
   window.removeEventListener('room:call_started', onCallStarted)
   window.removeEventListener('keydown', onSearchShortcut)
+  window.removeEventListener('ws:reconnected', onWsReconnected)
 })
 </script>
 

@@ -248,6 +248,28 @@ impl MessageDao {
         Ok(result.modified_count)
     }
 
+    /// Mark EVERY unread message in the room read for this user — the exact
+    /// same filter as `unread_count`, so the badge is guaranteed to reach 0.
+    /// (2026-08-04: unread counted messages outside the newest-25 fetch
+    /// window and messages read inside the call view; a broken scroll-up
+    /// cursor made the older ones unreachable → permanently stuck badges.)
+    pub async fn mark_all_read(&self, room_id: ObjectId, user_id: ObjectId) -> DaoResult<u64> {
+        let result = self
+            .base
+            .collection()
+            .update_many(
+                doc! {
+                    "room_id": room_id,
+                    "deleted_at": null,
+                    "thread_id": null,
+                    "readby": { "$ne": user_id },
+                },
+                doc! { "$addToSet": { "readby": user_id } },
+            )
+            .await?;
+        Ok(result.modified_count)
+    }
+
     /// Count unread messages for a user in a room
     pub async fn unread_count(&self, room_id: ObjectId, user_id: ObjectId) -> DaoResult<u64> {
         let count = self
