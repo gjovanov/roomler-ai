@@ -148,6 +148,31 @@ jobs:
         # default --workspace clippy never sees it. Lint it explicitly.
         run: cargo clippy -p roomler-agent --features overlay-l3 -- -D warnings
 
+  macos-overlay-check:
+    # The agent's macOS build exists ONLY in release-agent.yml, so a
+    # macOS-only compile error is invisible until an `agent-v*` tag is
+    # already pushed — where it fails the whole release after the Windows
+    # and Linux artifacts have built. rc.297 burned exactly that way:
+    # #295 added a `#[cfg(not(any(linux, windows)))]` fallback for
+    # `purge_one` but not for `enumerate_if_routes`, and nothing compiled
+    # the macOS arm until the tag ran.
+    #
+    # A cheap `cargo check` on the overlay features closes it. Check only,
+    # not a full build — the goal is "does the cfg tree compile on this
+    # target", which is the entire class of break this catches.
+    name: macOS overlay compile check
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-overlay-check
+      - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
+        run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest
