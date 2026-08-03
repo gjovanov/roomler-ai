@@ -221,6 +221,21 @@ pub struct PeerCarrierDebug {
     /// Relay flavor (`turn` / `derp`); `None` for direct carriers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_kind: Option<String>,
+    /// P4 — inbound packets from this peer the ingress ACL refused: a forged
+    /// SOURCE, a DESTINATION outside this node's advertised scope, or a
+    /// cidr/port/proto the tenant's policies didn't grant. Monotonic since the
+    /// carrier was installed.
+    ///
+    /// Under the default `overlay_rpf=warn` NOTHING is dropped, so a non-zero
+    /// value is pure evidence: it is exactly what `enforce` WOULD have killed.
+    /// Read this before flipping. Omitted when 0 so a healthy fleet's
+    /// `peers --json` stays unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub rx_denied: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Whether a forward is a static `--remote` forward or a SOCKS5 listener.
@@ -1752,11 +1767,25 @@ mod tests {
             rx: 0,
             last_rx_age_s: 7,
             relay_kind: Some("turn".into()),
+            rx_denied: 0,
         });
         let s = serde_json::to_string(&p2).unwrap();
         assert!(s.contains(r#""tier":"relay""#) && s.contains(r#""tx":42"#));
+        // P4 — a clean peer omits the counter entirely, so a healthy fleet's
+        // `peers --json` is byte-identical to pre-P4.
+        assert!(!s.contains("rx_denied"));
         let back: PeerInfo = serde_json::from_str(&s).unwrap();
         assert_eq!(back.debug, p2.debug);
+
+        // …and a peer the ingress ACL refused surfaces the count.
+        let mut p3 = p2.clone();
+        if let Some(d) = p3.debug.as_mut() {
+            d.rx_denied = 17;
+        }
+        let s3 = serde_json::to_string(&p3).unwrap();
+        assert!(s3.contains(r#""rx_denied":17"#));
+        let back3: PeerInfo = serde_json::from_str(&s3).unwrap();
+        assert_eq!(back3.debug.unwrap().rx_denied, 17);
     }
 
     /// rc.275 — `PeerInfo.stalled` is wire-compatible in both directions: a
