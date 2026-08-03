@@ -4,6 +4,7 @@ import { api } from '@/api/client'
 
 interface InviteInfo {
   code: string
+  tenant_id?: string
   tenant_name: string
   tenant_slug: string
   inviter_name: string
