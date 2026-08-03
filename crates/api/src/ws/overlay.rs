@@ -1437,6 +1437,11 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
             NodeRef::Agent { agent_id } => Some(*agent_id),
             NodeRef::TunnelClient { .. } => None,
         },
+        // P4 — the PERMISSIVE shape carries no ACL. `shape_peer` fills this in
+        // (with `Some`, possibly empty) only when the tenant is enforcing;
+        // leaving it `None` here is what makes an `off`/`warn` tenant's netmap
+        // byte-identical to a pre-P4 server's.
+        ingress_rules: None,
     }
 }
 
