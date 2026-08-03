@@ -266,18 +266,18 @@ fn forward_frame(
 
     // One lock-free lookup. Absent ⇒ fail open (no table built for this
     // network: ACL off, or not yet rebuilt after a restart).
-    if let Some(table) = acl.get(&network_id) {
-        if !table.permits(src_pubkey, &dst) {
-            // Rate-limited by the tenant's own churn, not per frame: a denied
-            // pair retries on the WG handshake timer (~5 s), not per packet.
-            debug!(
-                %network_id,
-                src = %BASE64.encode(src_pubkey),
-                dst = %BASE64.encode(dst),
-                "derp: dropped a frame the overlay ACL denies"
-            );
-            return;
-        }
+    if let Some(table) = acl.get(&network_id)
+        && !table.permits(src_pubkey, &dst)
+    {
+        // Rate-limited by the tenant's own churn, not per frame: a denied
+        // pair retries on the WG handshake timer (~5 s), not per packet.
+        debug!(
+            %network_id,
+            src = %BASE64.encode(src_pubkey),
+            dst = %BASE64.encode(dst),
+            "derp: dropped a frame the overlay ACL denies"
+        );
+        return;
     }
 
     // Clone the sender out of the shard guard so we don't hold the DashMap lock
