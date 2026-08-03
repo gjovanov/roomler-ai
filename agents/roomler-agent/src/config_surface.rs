@@ -218,6 +218,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "B1 - feed the 15 s overlay RTT probes into the PathMonitor quality plane (Q-only, never eligibility). Built-in default: on. Env: ROOMLER_AGENT_OVERLAY_RTT_Q.",
     ),
     (
+        "text_mod_neutralize",
+        "tribool",
+        "KeyText typing: temporarily release physically-held Shift/Ctrl/Alt the remote layout does not want around each character tap (fixes wrong/dead symbols on non-US layouts). Built-in default: on. Env: ROOMLER_NODE_TEXT_MOD_NEUTRALIZE. Restart required.",
+    ),
+    (
         "forward_acl",
         "json",
         "Agent-side allowlist for tunnel forwards (JSON: {\"enabled\": bool, \"allowlist\": [...]}).",
@@ -304,6 +309,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ice_overlay_host_deprioritize" => cfg.ice_overlay_host_deprioritize.map(fmt_bool),
         "overlay_tier_detect" => cfg.overlay_tier_detect.map(fmt_bool),
         "overlay_rtt_q" => cfg.overlay_rtt_q.map(fmt_bool),
+        "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
         "virtual_desktop_apps" => serde_json::to_string(&cfg.virtual_desktop_apps).ok(),
         _ => None,
@@ -445,6 +451,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "overlay_tier_detect" => cfg.overlay_tier_detect = parse_tribool(value)?,
         "overlay_rtt_q" => cfg.overlay_rtt_q = parse_tribool(value)?,
+        "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
         "forward_acl" => {
             cfg.forward_acl = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => Default::default(),
@@ -860,6 +867,7 @@ mod tests {
             "ice_overlay_host_deprioritize",
             "overlay_tier_detect",
             "overlay_rtt_q",
+            "text_mod_neutralize",
         ] {
             apply(&mut cfg, key, Some("off")).unwrap();
             assert_eq!(
