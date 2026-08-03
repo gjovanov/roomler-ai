@@ -70,8 +70,6 @@
           <v-list-item :to="`/tenant/${tenantId}/admin/settings`" prepend-icon="mdi-tune" :title="$t('nav.settings')" />
           <v-list-item :to="`/tenant/${tenantId}/admin/members`" prepend-icon="mdi-account-group" :title="$t('nav.members')" />
           <v-list-item :to="`/tenant/${tenantId}/admin/roles`" prepend-icon="mdi-shield-account" :title="$t('nav.roles')" />
-          <v-list-item :to="`/tenant/${tenantId}/admin/tasks`" prepend-icon="mdi-progress-clock" :title="$t('nav.tasks')" />
-          <v-list-item :to="`/tenant/${tenantId}/admin/audit-log`" prepend-icon="mdi-clipboard-text-clock" :title="$t('nav.auditLog')" />
           <v-list-item :to="`/tenant/${tenantId}/billing`" prepend-icon="mdi-credit-card" :title="$t('nav.billing')" />
         </v-list-group>
       </v-list>
