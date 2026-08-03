@@ -19,13 +19,16 @@
     <section class="hero-section">
       <v-container>
         <v-row align="center" justify="center">
-          <v-col cols="12" md="9" class="text-center">
+          <v-col cols="12" md="6" lg="5" class="text-center text-md-left hero-copy">
             <h1 class="text-h4 text-md-h2 font-weight-bold mb-4">Every device you own,<br/><span class="text-primary">one secure network</span></h1>
-            <p class="text-body-1 text-md-h6 landing-muted mb-6 mb-md-8">Remote desktop from any browser, a private WireGuard-style mesh between your machines, and tunnels into the networks you care about — with team chat and video conferencing included.</p>
-            <div class="d-flex flex-wrap justify-center ga-3">
+            <p class="text-body-1 text-md-h6 landing-muted mb-6 mb-md-8">Remote desktop from any browser and a private WireGuard-style mesh between your machines — with team chat and video included.</p>
+            <div class="d-flex flex-wrap justify-center justify-md-start ga-3">
               <v-btn color="primary" size="large" :to="{ name: 'register' }" class="px-6">Start Free</v-btn>
               <v-btn variant="outlined" size="large" href="#download" class="px-6">Download</v-btn>
             </div>
+          </v-col>
+          <v-col cols="12" md="6" lg="6" class="mt-8 mt-md-0 hero-graphic">
+            <ArchitectureGraphic />
           </v-col>
         </v-row>
       </v-container>
@@ -179,6 +182,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
+import ArchitectureGraphic from '@/components/landing/ArchitectureGraphic.vue'
 import { enrollCommands } from '@/utils/enrollCommands'
 
 const route = useRoute()
@@ -356,6 +360,15 @@ onMounted(async () => {
   background: radial-gradient(circle at 30% 70%, rgba(0, 150, 136, 0.06) 0%, transparent 50%),
               radial-gradient(circle at 70% 30%, rgba(239, 83, 80, 0.06) 0%, transparent 50%);
   animation: float 20s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* Keep the hero content (and its interactive legend) above the ambient
+   ::before layer. */
+.hero-copy,
+.hero-graphic {
+  position: relative;
+  z-index: 1;
 }
 
 @keyframes float {

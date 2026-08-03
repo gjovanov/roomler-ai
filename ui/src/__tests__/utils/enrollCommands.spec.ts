@@ -11,35 +11,89 @@ import { enrollCommands } from '@/utils/enrollCommands'
 describe('enrollCommands', () => {
   const ORIGIN = 'https://example.roomler.test'
   const TOKEN = 'eyJTOKEN'
+  const SCOPES = ['system', 'machine', 'user'] as const
 
-  it('covers all three OSes with three blocks each, for both kinds', () => {
+  it('covers all three OSes with three blocks each, for both kinds and every scope', () => {
     for (const kind of ['agent', 'tunnel'] as const) {
-      const all = enrollCommands(kind, ORIGIN, TOKEN)
-      expect(all.map((o) => o.os)).toEqual(['windows', 'linux', 'macos'])
-      for (const os of all) {
-        expect(os.blocks).toHaveLength(3)
-        for (const block of os.blocks) {
-          if (!block.isDownload) expect(block.command).toContain(TOKEN)
-          expect(block.command).toContain(ORIGIN)
+      for (const scope of SCOPES) {
+        const all = enrollCommands(kind, ORIGIN, TOKEN, scope)
+        expect(all.map((o) => o.os)).toEqual(['windows', 'linux', 'macos'])
+        for (const os of all) {
+          expect(os.blocks).toHaveLength(3)
+          for (const block of os.blocks) {
+            if (!block.isDownload) expect(block.command).toContain(TOKEN)
+            expect(block.command).toContain(ORIGIN)
+          }
         }
       }
     }
   })
 
-  it('agent commands use the install-script role vocabulary + roomlerd', () => {
+  it('defaults the agent scope to system-context (wizard-recommended)', () => {
     const [windows, linux, macos] = enrollCommands('agent', ORIGIN, TOKEN)
     // install.ps1: ValidateSet daemon-user|daemon-machine|daemon-system|tunnel-client
     expect(windows!.blocks[0]!.command).toContain('/api/setup/install.ps1')
-    expect(windows!.blocks[0]!.command).toContain('-Role daemon-user')
+    expect(windows!.blocks[0]!.command).toContain('-Role daemon-system')
     expect(windows!.blocks[0]!.command).toContain(`-Token ${TOKEN}`)
-    // install.sh: --role daemon|tunnel
+    // install.sh: --role daemon|tunnel; --system = root systemd unit (Linux only).
     expect(linux!.blocks[0]!.command).toContain('/api/setup/install.sh')
-    expect(linux!.blocks[0]!.command).toContain('--role daemon')
+    expect(linux!.blocks[0]!.command).toContain('--role daemon --system')
     expect(macos!.blocks[0]!.command).toContain('--role daemon')
-    // Manual enrolls use the unified daemon binary.
+    expect(macos!.blocks[0]!.command).not.toContain('--system')
+    // Manual enrolls use the unified daemon binary; S1b: SystemContext
+    // reads the machine-global config, so its enroll writes it.
     expect(windows!.blocks[2]!.command).toMatch(/^roomlerd enroll /)
-    expect(linux!.blocks[2]!.command).toMatch(/^roomlerd enroll /)
+    expect(windows!.blocks[2]!.command).toContain('--machine-global')
+    expect(linux!.blocks[2]!.command).toMatch(
+      /^sudo roomlerd --config \/etc\/roomler\/config\.toml enroll /,
+    )
     expect(linux!.blocks[2]!.command).toContain(`--server ${ORIGIN}`)
+    expect(macos!.blocks[2]!.command).toMatch(/^roomlerd enroll /)
+  })
+
+  it('maps the user scope to the per-user roles', () => {
+    const [windows, linux, macos] = enrollCommands('agent', ORIGIN, TOKEN, 'user')
+    expect(windows!.blocks[0]!.command).toContain('-Role daemon-user')
+    expect(linux!.blocks[0]!.command).toContain('--role daemon')
+    expect(linux!.blocks[0]!.command).not.toContain('--system')
+    for (const os of [windows!, linux!, macos!]) {
+      expect(os.blocks[2]!.command).toMatch(/^roomlerd enroll /)
+    }
+    expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
+  })
+
+  it('maps the machine scope to the attended role without machine-global', () => {
+    const [windows, linux, macos] = enrollCommands('agent', ORIGIN, TOKEN, 'machine')
+    expect(windows!.blocks[0]!.command).toContain('-Role daemon-machine')
+    // S1b: a plain-SCM service reads the per-user config — machine-global
+    // is the SystemContext flavour's config source ONLY.
+    expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
+    // Linux has no attended/SystemContext split — machine-wide = --system.
+    expect(linux!.blocks[0]!.command).toContain('--role daemon --system')
+    expect(linux!.blocks[2]!.command).toMatch(/^sudo roomlerd --config /)
+    expect(macos!.blocks[0]!.command).not.toContain('--system')
+  })
+
+  it('ignores scope for tunnel enrollments', () => {
+    const baseline = enrollCommands('tunnel', ORIGIN, TOKEN)
+    for (const scope of SCOPES) {
+      expect(enrollCommands('tunnel', ORIGIN, TOKEN, scope)).toEqual(baseline)
+    }
+  })
+
+  it('annotates machine-wide scopes with per-OS caveats', () => {
+    for (const scope of ['system', 'machine'] as const) {
+      const [windows, linux, macos] = enrollCommands('agent', ORIGIN, TOKEN, scope)
+      expect(windows!.note).toMatch(/Administrator PowerShell/)
+      expect(linux!.note).toBeTruthy()
+      expect(macos!.note).toMatch(/per-user/)
+    }
+    for (const os of enrollCommands('agent', ORIGIN, TOKEN, 'user')) {
+      expect(os.note).toBeUndefined()
+    }
+    for (const os of enrollCommands('tunnel', ORIGIN, TOKEN)) {
+      expect(os.note).toBeUndefined()
+    }
   })
 
   it('tunnel commands use the tunnel roles + the roomler CLI', () => {
@@ -63,11 +117,13 @@ describe('enrollCommands', () => {
 
   it('never emits the retired binary names or a hardcoded server', () => {
     for (const kind of ['agent', 'tunnel'] as const) {
-      for (const os of enrollCommands(kind, ORIGIN, TOKEN)) {
-        for (const block of os.blocks) {
-          expect(block.command).not.toContain('roomler-agent')
-          expect(block.command).not.toContain('roomler-tunnel')
-          expect(block.command).not.toContain('https://roomler.ai')
+      for (const scope of SCOPES) {
+        for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope)) {
+          for (const block of os.blocks) {
+            expect(block.command).not.toContain('roomler-agent')
+            expect(block.command).not.toContain('roomler-tunnel')
+            expect(block.command).not.toContain('https://roomler.ai')
+          }
         }
       }
     }
