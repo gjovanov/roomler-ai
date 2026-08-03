@@ -344,16 +344,23 @@ pub async fn release_media_claim(state: &AppState, rid: &ObjectId) {
 
 /// Tell a remote owner one user left the call (HTTP `call/leave` served
 /// on a non-owner pod): the owner drops the participant's transports and
-/// broadcasts `media:peer_left` itself.
-pub async fn rpc_leave_user(state: &AppState, owner_pod: &str, rid: &ObjectId, user_id: &ObjectId) {
+/// broadcasts `media:peer_left` itself. `connection_id: Some(_)` scopes the
+/// close to that one connection (multi-device: the user's other browsers
+/// keep their media); `None` is the legacy close-all-of-user path, kept as
+/// the mixed-version fallback during rolls.
+pub async fn rpc_leave_user(
+    state: &AppState,
+    owner_pod: &str,
+    rid: &ObjectId,
+    user_id: &ObjectId,
+    connection_id: Option<&str>,
+) {
+    let mut body = serde_json::json!({ "room_id": rid.to_hex(), "user_id": user_id.to_hex() });
+    if let Some(cid) = connection_id {
+        body["connection_id"] = serde_json::Value::String(cid.to_string());
+    }
     if let Some(bus) = state.cluster_bus.clone()
-        && let Err(e) = bus
-            .request(
-                owner_pod,
-                "media.leave_user",
-                serde_json::json!({ "room_id": rid.to_hex(), "user_id": user_id.to_hex() }),
-            )
-            .await
+        && let Err(e) = bus.request(owner_pod, "media.leave_user", body).await
     {
         debug!(room = %rid, %owner_pod, %e, "media.leave_user RPC failed");
     }
@@ -512,19 +519,31 @@ pub fn wire_media_cluster(state: &AppState) {
         });
 
         // media.leave_user — HTTP call/leave served on a non-owner pod.
+        // With `connection_id` the close is scoped to that one connection
+        // (same-user other devices keep their transports); without it we
+        // keep the legacy close-all-of-user behaviour (mixed-version rolls).
         let st = state.clone();
         bus.register("media.leave_user", move |body| {
             let st = st.clone();
             Box::pin(async move {
                 let rid = parse_oid(&body, "room_id")?;
                 let uid = parse_oid(&body, "user_id")?;
-                st.room_manager.close_participant_by_user(&rid, &uid);
+                let conn_id = body.get("connection_id").and_then(|v| v.as_str());
+                let closed = match conn_id {
+                    Some(cid) => st.room_manager.close_participant_of_user(&rid, cid, &uid),
+                    None => {
+                        st.room_manager.close_participant_by_user(&rid, &uid);
+                        true
+                    }
+                };
                 let remaining = st.room_manager.get_participant_user_ids(&rid);
-                if !remaining.is_empty() {
-                    let event = serde_json::json!({
-                        "type": "media:peer_left",
-                        "data": { "room_id": rid.to_hex(), "user_id": uid.to_hex() }
-                    });
+                if closed && !remaining.is_empty() {
+                    let mut data =
+                        serde_json::json!({ "room_id": rid.to_hex(), "user_id": uid.to_hex() });
+                    if let Some(cid) = conn_id {
+                        data["connection_id"] = serde_json::Value::String(cid.to_string());
+                    }
+                    let event = serde_json::json!({ "type": "media:peer_left", "data": data });
                     super::dispatcher::broadcast_with_redis(
                         &st.ws_storage,
                         &st.redis_pubsub,
