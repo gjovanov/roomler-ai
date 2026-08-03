@@ -288,6 +288,156 @@ pub fn host_matches(pattern: &HostPattern, host: &str) -> bool {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Overlay L3 ACL
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The overlay is a different enforcement problem from the tunnel and gets its
+// own evaluator rather than a reused `evaluate`:
+//
+//   * The tunnel gate answers "may this origin dial host:port through this
+//     agent" — one boolean per TCP/UDP flow, decided while the broker is in
+//     the path. The overlay's data plane is end-to-end WireGuard with the
+//     server nowhere near it, so the server's only lever is WHAT IT TELLS EACH
+//     NODE: which peers exist and which of their routes to install.
+//   * The answer is therefore not a boolean but "is this peer visible, and
+//     which subset of its approved routes does this recipient get".
+//   * `HostPattern::Exact`/`Wildcard` can never match a packet's destination,
+//     so overlay rules are CIDR-only ([`OverlayRule`]).
+//
+// Same skeleton as [`evaluate`] though: first match wins, default-deny, and
+// soft-deleted rows are skipped.
+
+pub use roomler_ai_remote_control::models::{
+    OverlayAclMode, OverlayPolicy, OverlayRule, OverlaySelector, OverlayTarget,
+};
+
+/// The node a netmap is being built FOR.
+#[derive(Debug, Clone)]
+pub struct OverlaySource {
+    pub node_id: ObjectId,
+    /// Owner of the backing agent / tunnel client. `None` when the backing row
+    /// is gone — such a node then matches only `AllNodes` / `NodeId` rules.
+    pub owner_user_id: Option<ObjectId>,
+    pub role_ids: Vec<ObjectId>,
+}
+
+/// The peer being considered for inclusion in that netmap.
+#[derive(Debug, Clone, Copy)]
+pub struct OverlayPeerRef<'a> {
+    pub node_id: ObjectId,
+    pub overlay_ip: &'a str,
+    pub approved_routes: &'a [String],
+}
+
+/// What a source node may see of one peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayAccess {
+    /// May the source dial the peer's own overlay address at all? When false
+    /// the peer must be withheld from the netmap **and**, if it was already
+    /// installed, revoked with an explicit `removes` — dropping it from a full
+    /// netmap or shipping `reachable: false` does NOT tear down a live peer.
+    pub visible: bool,
+    /// The subset of the peer's `approved_routes` this source may install.
+    pub routes: Vec<String>,
+}
+
+impl OverlayAccess {
+    /// The pre-ACL behaviour: full visibility, every approved route.
+    pub fn permissive(peer: OverlayPeerRef<'_>) -> Self {
+        Self {
+            visible: true,
+            routes: peer.approved_routes.to_vec(),
+        }
+    }
+
+    pub fn denied() -> Self {
+        Self {
+            visible: false,
+            routes: Vec::new(),
+        }
+    }
+}
+
+/// Does `outer` cover `inner`? Accepts a bare address for `inner` (a peer's
+/// overlay IP) as well as a prefix (an approved route).
+fn cidr_covers(outer: &str, inner: &str) -> bool {
+    let Ok(outer) = outer.trim().parse::<ipnet::IpNet>() else {
+        return false;
+    };
+    if let Ok(net) = inner.trim().parse::<ipnet::IpNet>() {
+        return outer.contains(&net);
+    }
+    match inner.trim().parse::<std::net::IpAddr>() {
+        Ok(ip) => outer.contains(&ip),
+        Err(_) => false,
+    }
+}
+
+fn source_matches(selectors: &[OverlaySelector], src: &OverlaySource) -> bool {
+    selectors.iter().any(|s| match s {
+        OverlaySelector::AllNodes => true,
+        OverlaySelector::NodeId { node_id } => *node_id == src.node_id,
+        OverlaySelector::UserId { user_id } => src.owner_user_id == Some(*user_id),
+        OverlaySelector::RoleId { role_id } => src.role_ids.contains(role_id),
+    })
+}
+
+fn via_matches(targets: &[OverlayTarget], peer_id: ObjectId) -> bool {
+    targets.iter().any(|t| match t {
+        OverlayTarget::AllNodes => true,
+        OverlayTarget::NodeId { node_id } => *node_id == peer_id,
+    })
+}
+
+/// Decide what `source` may see of `peer`.
+///
+/// Cross-tenant gating is the CALLER's job, exactly as for [`evaluate`] —
+/// there is no `tenant_id` parameter precisely so the contract stays explicit.
+///
+/// ⚠️ `port_range` / `proto` on a matched rule are deliberately **not**
+/// consulted here: the netmap can express peer visibility and route lists and
+/// nothing finer, so honouring them at this layer would silently widen a
+/// port-narrowed rule into full peer access. They are carried for the
+/// node-side ingress filter, which is the only layer that can apply them.
+pub fn evaluate_overlay(
+    policies: &[OverlayPolicy],
+    source: &OverlaySource,
+    peer: OverlayPeerRef<'_>,
+) -> OverlayAccess {
+    let mut visible = false;
+    let mut routes: Vec<String> = Vec::new();
+
+    for policy in policies {
+        if policy.deleted_at.is_some() || !policy.enabled {
+            continue;
+        }
+        if !source_matches(&policy.sources, source) {
+            continue;
+        }
+        if !via_matches(&policy.via, peer.node_id) {
+            continue;
+        }
+        for rule in &policy.destinations {
+            if cidr_covers(&rule.cidr, peer.overlay_ip) {
+                visible = true;
+            }
+            for route in peer.approved_routes {
+                if cidr_covers(&rule.cidr, route) && !routes.iter().any(|r| r == route) {
+                    routes.push(route.clone());
+                }
+            }
+        }
+    }
+
+    // A granted subnet route is useless if the gateway itself is unreachable,
+    // so any route grant implies visibility of the node that carries it.
+    if !routes.is_empty() {
+        visible = true;
+    }
+    OverlayAccess { visible, routes }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,5 +1254,243 @@ mod tests {
             GateResult::Reject { kind, .. } => assert_eq!(kind, RejectKind::AclDenied),
             r => panic!("expected AclDenied, got {r:?}"),
         }
+    }
+
+    // ── Overlay ACL ────────────────────────────────────────────────────────
+
+    fn ov_policy(
+        sources: Vec<OverlaySelector>,
+        via: Vec<OverlayTarget>,
+        cidrs: &[&str],
+    ) -> OverlayPolicy {
+        OverlayPolicy {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            name: "p".into(),
+            enabled: true,
+            sources,
+            via,
+            destinations: cidrs
+                .iter()
+                .map(|c| OverlayRule {
+                    cidr: (*c).to_string(),
+                    port_range: PortRange {
+                        low: 1,
+                        high: u16::MAX,
+                    },
+                    proto: ProtocolKind::Any,
+                })
+                .collect(),
+            created_at: bson::DateTime::now(),
+            updated_at: bson::DateTime::now(),
+            deleted_at: None,
+        }
+    }
+
+    fn ov_source(node_id: ObjectId) -> OverlaySource {
+        OverlaySource {
+            node_id,
+            owner_user_id: None,
+            role_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn overlay_default_denies_with_no_policies() {
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "100.64.0.7",
+            approved_routes: &[],
+        };
+        let got = evaluate_overlay(&[], &ov_source(ObjectId::new()), peer);
+        assert_eq!(got, OverlayAccess::denied());
+    }
+
+    #[test]
+    fn overlay_cidr_covering_peer_ip_grants_visibility() {
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "100.64.0.7",
+            approved_routes: &[],
+        };
+        let p = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::AllNodes],
+            &["100.64.0.0/10"],
+        );
+        assert!(evaluate_overlay(&[p], &ov_source(ObjectId::new()), peer).visible);
+    }
+
+    #[test]
+    fn overlay_grants_only_covered_routes() {
+        let routes = vec!["10.84.6.0/24".to_string(), "10.66.0.0/16".to_string()];
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "100.64.0.7",
+            approved_routes: &routes,
+        };
+        // A /16 supernet covers the /24 but not the unrelated 10.66 block.
+        let p = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::AllNodes],
+            &["10.84.0.0/16"],
+        );
+        let got = evaluate_overlay(&[p], &ov_source(ObjectId::new()), peer);
+        assert_eq!(got.routes, vec!["10.84.6.0/24".to_string()]);
+        // A route grant implies the gateway is reachable, else it is useless.
+        assert!(got.visible);
+    }
+
+    #[test]
+    fn overlay_via_scopes_the_grant_to_one_peer() {
+        let router = ObjectId::new();
+        let other = ObjectId::new();
+        let routes = vec!["10.84.6.0/24".to_string()];
+        let p = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::NodeId { node_id: router }],
+            &["10.84.0.0/16"],
+        );
+        let via_router = OverlayPeerRef {
+            node_id: router,
+            overlay_ip: "100.64.0.7",
+            approved_routes: &routes,
+        };
+        let via_other = OverlayPeerRef {
+            node_id: other,
+            overlay_ip: "100.64.0.8",
+            approved_routes: &routes,
+        };
+        let src = ov_source(ObjectId::new());
+        assert!(
+            !evaluate_overlay(std::slice::from_ref(&p), &src, via_router)
+                .routes
+                .is_empty()
+        );
+        assert!(evaluate_overlay(&[p], &src, via_other).routes.is_empty());
+    }
+
+    #[test]
+    fn overlay_source_selectors_discriminate() {
+        let me = ObjectId::new();
+        let owner = ObjectId::new();
+        let role = ObjectId::new();
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "100.64.0.7",
+            approved_routes: &[],
+        };
+        let by_node = ov_policy(
+            vec![OverlaySelector::NodeId { node_id: me }],
+            vec![OverlayTarget::AllNodes],
+            &["100.64.0.0/10"],
+        );
+        assert!(evaluate_overlay(std::slice::from_ref(&by_node), &ov_source(me), peer).visible);
+        assert!(
+            !evaluate_overlay(&[by_node], &ov_source(ObjectId::new()), peer).visible,
+            "a NodeId source must not match a different node"
+        );
+
+        let by_user = ov_policy(
+            vec![OverlaySelector::UserId { user_id: owner }],
+            vec![OverlayTarget::AllNodes],
+            &["100.64.0.0/10"],
+        );
+        let mut src = ov_source(me);
+        src.owner_user_id = Some(owner);
+        assert!(evaluate_overlay(std::slice::from_ref(&by_user), &src, peer).visible);
+        assert!(
+            !evaluate_overlay(&[by_user], &ov_source(me), peer).visible,
+            "an ownerless node must not match a UserId source"
+        );
+
+        let by_role = ov_policy(
+            vec![OverlaySelector::RoleId { role_id: role }],
+            vec![OverlayTarget::AllNodes],
+            &["100.64.0.0/10"],
+        );
+        let mut src = ov_source(me);
+        src.role_ids = vec![role];
+        assert!(evaluate_overlay(&[by_role], &src, peer).visible);
+    }
+
+    #[test]
+    fn overlay_disabled_and_deleted_policies_are_skipped() {
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "100.64.0.7",
+            approved_routes: &[],
+        };
+        let src = ov_source(ObjectId::new());
+
+        let mut disabled = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::AllNodes],
+            &["100.64.0.0/10"],
+        );
+        disabled.enabled = false;
+        assert!(!evaluate_overlay(&[disabled], &src, peer).visible);
+
+        let mut deleted = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::AllNodes],
+            &["100.64.0.0/10"],
+        );
+        deleted.deleted_at = Some(bson::DateTime::now());
+        assert!(!evaluate_overlay(&[deleted], &src, peer).visible);
+    }
+
+    #[test]
+    fn overlay_malformed_cidr_never_grants() {
+        let routes = vec!["10.84.6.0/24".to_string()];
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "100.64.0.7",
+            approved_routes: &routes,
+        };
+        let p = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::AllNodes],
+            &["not-a-cidr", "10.84.6.0"], // bare address, no prefix
+        );
+        let got = evaluate_overlay(&[p], &ov_source(ObjectId::new()), peer);
+        assert_eq!(got, OverlayAccess::denied());
+    }
+
+    #[test]
+    fn overlay_v6_cidrs_match() {
+        let routes = vec!["fd72:6f6f:6d6c::/64".to_string()];
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "fd72:6f6f:6d6c::6440:7",
+            approved_routes: &routes,
+        };
+        let p = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::AllNodes],
+            &["fd72:6f6f:6d6c::/48"],
+        );
+        let got = evaluate_overlay(&[p], &ov_source(ObjectId::new()), peer);
+        assert!(got.visible);
+        assert_eq!(got.routes, routes);
+    }
+
+    #[test]
+    fn overlay_default_route_grant_covers_everything() {
+        let routes = vec!["10.84.6.0/24".to_string(), "0.0.0.0/0".to_string()];
+        let peer = OverlayPeerRef {
+            node_id: ObjectId::new(),
+            overlay_ip: "100.64.0.7",
+            approved_routes: &routes,
+        };
+        let p = ov_policy(
+            vec![OverlaySelector::AllNodes],
+            vec![OverlayTarget::AllNodes],
+            &["0.0.0.0/0"],
+        );
+        // An exit node's /0 is only distributed when an admin explicitly grants
+        // /0 — the client still refuses to auto-install it (P5/A1).
+        let got = evaluate_overlay(&[p], &ov_source(ObjectId::new()), peer);
+        assert_eq!(got.routes, routes);
     }
 }

@@ -15,6 +15,7 @@ pub mod invite;
 pub mod message;
 pub mod notification;
 pub mod oauth;
+pub mod overlay_policy;
 pub mod overlay_route;
 pub mod push;
 pub mod reaction;
