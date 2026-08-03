@@ -54,7 +54,7 @@
                 color="primary"
                 block
                 size="large"
-                :to="`/tenant/${tenantSlugRoute}`"
+                :to="tenantRoute"
               >
                 Go to {{ info.tenant_name }}
               </v-btn>
@@ -120,9 +120,12 @@ const info = computed(() => inviteStore.inviteInfo)
 const accepting = ref(false)
 const acceptError = ref<string | null>(null)
 
-const tenantSlugRoute = computed(() => {
-  // We don't have tenantId in info, navigate to dashboard which will load tenants
-  return ''
+const tenantRoute = computed(() => {
+  // Route by tenant_id (the server now sends it); older servers without
+  // the field fall back to the org picker at '/' — never the broken
+  // `/tenant/` 404 this used to produce.
+  const id = info.value?.tenant_id
+  return id ? `/tenant/${id}` : '/'
 })
 
 async function handleAccept() {
