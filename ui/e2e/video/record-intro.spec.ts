@@ -568,24 +568,20 @@ test.describe('Roomler Intro Video', () => {
     await delay(page, 500)
     await caption(page, 15)
 
-    // Click through sections: Settings -> Members -> Roles
-    const membersItem = page.getByText('Members').first()
-    if (await membersItem.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await membersItem.click()
-      await delay(page, 1200)
-    }
+    // Walk the sections by direct URL — the page-local section list was
+    // removed 2026-08-04 (the drawer's Admin group is the only nav now,
+    // and it starts collapsed, so text-clicks would silently no-op).
+    await page.goto(`/tenant/${tenantId}/admin/members`)
+    await page.waitForLoadState('networkidle')
+    await delay(page, 1200)
 
-    const rolesItem = page.getByText('Roles').first()
-    if (await rolesItem.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await rolesItem.click()
-      await delay(page, 1200)
-    }
+    await page.goto(`/tenant/${tenantId}/admin/roles`)
+    await page.waitForLoadState('networkidle')
+    await delay(page, 1200)
 
-    const settingsItem = page.getByText('Settings').first()
-    if (await settingsItem.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await settingsItem.click()
-      await delay(page, 800)
-    }
+    await page.goto(`/tenant/${tenantId}/admin/settings`)
+    await page.waitForLoadState('networkidle')
+    await delay(page, 800)
 
     // -----------------------------------------------------------------------
     // Scene 16: Profile
