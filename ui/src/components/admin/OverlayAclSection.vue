@@ -1,7 +1,13 @@
 <template>
   <v-card>
     <v-card-title class="d-flex align-center">
-      <span>Overlay ACL</span>
+      <div>
+        <span>Overlay ACL</span>
+        <div class="text-caption text-medium-emphasis font-weight-regular">
+          Peer visibility + routes — enforced on direct, TURN-relayed and
+          DERP-relayed paths alike
+        </div>
+      </div>
       <v-spacer />
       <v-btn
         prepend-icon="mdi-refresh"
