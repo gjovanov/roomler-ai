@@ -275,12 +275,18 @@ pub async fn set_mode(
     Ok(Json(AclModeResponse { mode: body.mode }))
 }
 
-/// Re-fan every node in the tenant so a policy edit takes effect immediately.
+/// Re-fan every node in the tenant so a policy edit takes effect immediately,
+/// and refresh the DERP relay allow table with it.
 ///
 /// `refan_node` is single-node; a policy change can alter what EVERY node
 /// sees of every other, so the whole network has to be re-evaluated. Nodes are
 /// re-fanned one at a time (each fan-out is itself per-recipient), which is
 /// fine at fleet scale and keeps the write path simple — netmap edits are rare.
+///
+/// The DERP rebuild is NOT optional here: reshaping netmaps alone would leave a
+/// denied pair still able to relay by pubkey, which is the bypass the gate
+/// exists to close. It runs AFTER the fan so the two never disagree in the
+/// permissive direction — a peer loses its netmap entry before it loses relay.
 async fn refan_tenant(state: &AppState, tenant_id: ObjectId) {
     let Ok(network) = state.overlay_networks.get_or_create(tenant_id).await else {
         return;
@@ -296,4 +302,5 @@ async fn refan_tenant(state: &AppState, tenant_id: ObjectId) {
     for n in &nodes {
         crate::ws::overlay::refan_node(state, n).await;
     }
+    crate::ws::derp_acl::rebuild(state, tenant_id, network_id).await;
 }
