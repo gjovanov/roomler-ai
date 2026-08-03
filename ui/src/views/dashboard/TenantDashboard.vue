@@ -23,20 +23,20 @@
         </v-card>
       </v-col>
       <v-col cols="12" sm="6" md="3">
-        <v-card :to="`/tenant/${tenantId}/files`" hover>
+        <v-card :to="`/tenant/${tenantId}/rooms`" hover>
           <v-card-text class="text-center">
-            <v-icon size="48" color="accent">mdi-folder</v-icon>
+            <v-icon size="48" color="accent">mdi-message-text</v-icon>
             <div class="text-h4 mt-2">{{ totalMessageCount }}</div>
             <div class="text-subtitle-2">Messages</div>
           </v-card-text>
         </v-card>
       </v-col>
       <v-col cols="12" sm="6" md="3">
-        <v-card>
+        <v-card :to="showFleet ? `/tenant/${tenantId}/devices` : undefined" :hover="showFleet">
           <v-card-text class="text-center">
-            <v-icon size="48" color="warning">mdi-progress-clock</v-icon>
-            <div class="text-h4 mt-2">{{ activeTasks }}</div>
-            <div class="text-subtitle-2">Active Tasks</div>
+            <v-icon size="48" color="warning">mdi-monitor-multiple</v-icon>
+            <div class="text-h4 mt-2">{{ onlineDevices }}</div>
+            <div class="text-subtitle-2">Devices Online</div>
           </v-card-text>
         </v-card>
       </v-col>
@@ -66,6 +66,56 @@
         </v-btn>
       </v-col>
     </v-row>
+
+    <!-- Manage: every subsystem reachable from the org hub — the page used
+         to dead-end at chat stats with no path to devices/network/admin. -->
+    <h2 class="text-h6 mt-4 mb-2">Manage</h2>
+    <v-row>
+      <v-col v-if="showFleet" cols="12" sm="6" md="3">
+        <v-card :to="`/tenant/${tenantId}/devices`" hover>
+          <v-card-text>
+            <v-icon color="primary" class="mr-2">mdi-monitor-multiple</v-icon>
+            <span class="text-subtitle-1 font-weight-medium">Devices</span>
+            <div class="text-body-2 text-medium-emphasis mt-1">
+              Remote control, enrollment, updates
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-col>
+      <v-col v-if="showFleet" cols="12" sm="6" md="3">
+        <v-card :to="`/tenant/${tenantId}/network/machines`" hover>
+          <v-card-text>
+            <v-icon color="primary" class="mr-2">mdi-lan</v-icon>
+            <span class="text-subtitle-1 font-weight-medium">Network</span>
+            <div class="text-body-2 text-medium-emphasis mt-1">
+              Overlay mesh, tunnels, ACL, routes, DNS
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-col>
+      <v-col cols="12" sm="6" md="3">
+        <v-card :to="`/tenant/${tenantId}/admin/members`" hover>
+          <v-card-text>
+            <v-icon color="primary" class="mr-2">mdi-account-group</v-icon>
+            <span class="text-subtitle-1 font-weight-medium">Members &amp; Roles</span>
+            <div class="text-body-2 text-medium-emphasis mt-1">
+              People, permissions, org settings
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-col>
+      <v-col cols="12" sm="6" md="3">
+        <v-card :to="`/tenant/${tenantId}/invites`" hover>
+          <v-card-text>
+            <v-icon color="primary" class="mr-2">mdi-email-plus</v-icon>
+            <span class="text-subtitle-1 font-weight-medium">Invites</span>
+            <div class="text-body-2 text-medium-emphasis mt-1">
+              Bring teammates into this org
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-col>
+    </v-row>
   </v-container>
 </template>
 
@@ -74,24 +124,24 @@ import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTenantStore } from '@/stores/tenant'
 import { useRoomStore } from '@/stores/rooms'
-import { useTaskStore } from '@/stores/tasks'
+import { useAgentStore } from '@/stores/agents'
+import { canSeeFleetNav } from '@/utils/permissions'
 
 const route = useRoute()
 const router = useRouter()
 const tenantStore = useTenantStore()
 const roomStore = useRoomStore()
-const taskStore = useTaskStore()
+const agentStore = useAgentStore()
 
 const tenantId = computed(() => route.params.tenantId as string)
-const activeTasks = computed(
-  () => taskStore.tasks.filter((t) => t.status === 'Processing' || t.status === 'Pending').length,
-)
 const activeCallCount = computed(
   () => roomStore.rooms.filter((r) => r.conference_status === 'in_progress' && (r.participant_count || 0) > 0).length,
 )
 const totalMessageCount = computed(
   () => roomStore.rooms.reduce((sum, r) => sum + (r.message_count || 0), 0),
 )
+const onlineDevices = computed(() => agentStore.agents.filter((a) => a.is_online).length)
+const showFleet = computed(() => canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner))
 
 async function startCall() {
   const now = new Date()
@@ -107,7 +157,7 @@ async function startCall() {
 onMounted(() => {
   if (tenantId.value) {
     roomStore.fetchRooms(tenantId.value)
-    taskStore.fetchTasks(tenantId.value)
+    if (showFleet.value) agentStore.fetchAgents(tenantId.value).catch(() => {})
   }
 })
 </script>
