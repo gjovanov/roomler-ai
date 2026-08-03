@@ -8,10 +8,12 @@
     >
       <title id="arch-title">Roomler network architecture</title>
       <desc id="arch-desc">
-        Four machines — a laptop, a workstation, a home server behind its LAN, and a
-        phone — joined in a direct encrypted mesh with stable 100.64 addresses. Thin
-        control channels link each machine to the roomler.ai control plane, and a
-        live remote desktop stream runs from the workstation to the laptop's browser.
+        Four machines — your laptop, a GPU workstation, a Kubernetes cluster, and a
+        home server routing its LAN as subnet router and exit node — joined in a
+        direct encrypted mesh with stable 100.64 addresses that crosses NATs and
+        firewalls. Thin control channels link each machine to the roomler.ai control
+        plane, and a live remote desktop stream runs from the GPU workstation to the
+        laptop's browser.
       </desc>
       <defs>
         <linearGradient id="agDesk" x1="0" y1="0" x2="1" y2="1">
@@ -34,27 +36,41 @@
         <text x="277" y="60" text-anchor="middle" font-size="12" font-weight="700" fill="#00796B">roomler.ai</text>
         <text x="277" y="75" text-anchor="middle" font-size="9" fill="rgba(26, 26, 46, 0.55)">control plane</text>
         <path class="ctrl-line" d="M234 84 Q130 130 100 198" />
-        <path class="ctrl-line" d="M324 84 Q432 130 464 196" />
+        <path class="ctrl-line" d="M324 84 Q430 128 458 192" />
         <path class="ctrl-line" d="M250 92 Q175 255 150 388" />
-        <path class="ctrl-line" d="M310 92 Q385 255 414 394" />
+        <path class="ctrl-line" d="M310 92 Q385 255 414 391" />
       </g>
 
-      <!-- WireGuard-style overlay: a direct, end-to-end encrypted mesh. -->
+      <!-- WireGuard-style overlay: a direct, end-to-end encrypted mesh
+           that crosses NATs and firewalls. -->
       <g class="layer" :class="layerCls('mesh')">
-        <line class="mesh-line" x1="136" y1="222" x2="432" y2="214" />
+        <!-- Corporate firewall the tunnels punch straight through (the
+             remote-desktop stream above crosses it too). -->
+        <rect x="352" y="180" width="16" height="48" rx="1" fill="rgba(26, 26, 46, 0.1)" stroke="rgba(26, 26, 46, 0.5)" />
+        <path
+          d="M352 192 h16 M352 204 h16 M352 216 h16 M360 180 v12 M356 192 v12 M364 204 v12 M360 216 v12"
+          stroke="rgba(26, 26, 46, 0.45)"
+          stroke-width="1"
+          fill="none"
+        />
+        <text x="360" y="242" text-anchor="middle" font-size="8.5" fill="rgba(26, 26, 46, 0.55)">through NAT &amp; firewalls</text>
+        <line class="mesh-line" x1="136" y1="222" x2="418" y2="216" />
         <line class="mesh-line" x1="100" y1="250" x2="143" y2="388" style="animation-delay: -0.3s" />
-        <line class="mesh-line" x1="128" y1="248" x2="398" y2="404" style="animation-delay: -0.6s" />
-        <line class="mesh-line" x1="436" y1="240" x2="176" y2="404" style="animation-delay: -0.9s" />
-        <line class="mesh-line" x1="460" y1="250" x2="417" y2="394" style="animation-delay: -1.2s" />
-        <line class="mesh-line" x1="196" y1="428" x2="396" y2="428" style="animation-delay: -1.5s" />
+        <line class="mesh-line" x1="128" y1="248" x2="392" y2="405" style="animation-delay: -0.6s" />
+        <line class="mesh-line" x1="428" y1="242" x2="176" y2="404" style="animation-delay: -0.9s" />
+        <line class="mesh-line" x1="455" y1="250" x2="420" y2="390" style="animation-delay: -1.2s" />
+        <line class="mesh-line" x1="196" y1="428" x2="388" y2="428" style="animation-delay: -1.5s" />
         <circle class="pkt" cx="100" cy="250" r="3" style="--dx: 43px; --dy: 138px; animation-duration: 2.4s" />
-        <circle class="pkt" cx="436" cy="240" r="3" style="--dx: -260px; --dy: 164px; animation-duration: 3s; animation-delay: 0.8s" />
-        <circle class="pkt" cx="196" cy="428" r="3" style="--dx: 200px; --dy: 0px; animation-duration: 2.6s; animation-delay: 1.4s" />
-        <circle class="pkt" cx="128" cy="248" r="3" style="--dx: 270px; --dy: 156px; animation-duration: 3.2s; animation-delay: 2s" />
+        <circle class="pkt" cx="428" cy="242" r="3" style="--dx: -252px; --dy: 162px; animation-duration: 3s; animation-delay: 0.8s" />
+        <circle class="pkt" cx="196" cy="428" r="3" style="--dx: 192px; --dy: 0px; animation-duration: 2.6s; animation-delay: 1.4s" />
+        <circle class="pkt" cx="128" cy="248" r="3" style="--dx: 264px; --dy: 157px; animation-duration: 3.2s; animation-delay: 2s" />
         <rect x="245" y="308" width="110" height="20" rx="10" fill="#ffffff" stroke="rgba(0, 150, 136, 0.35)" />
         <path d="M253 317 v-2 a3 3 0 0 1 6 0 v2" fill="none" stroke="#00796B" stroke-width="1.3" />
         <rect x="252" y="317" width="8" height="6" rx="1" fill="#00796B" />
         <text x="308" y="321.5" text-anchor="middle" font-size="9" fill="#00796B">end-to-end encrypted</text>
+        <!-- Concrete ops story on the laptop-to-cluster tunnel. -->
+        <rect x="290" y="353" width="56" height="15" rx="7.5" fill="#ffffff" stroke="rgba(0, 150, 136, 0.35)" />
+        <text x="318" y="363.5" text-anchor="middle" font-size="8.5" fill="#00796B">ssh · kubectl</text>
       </g>
 
       <!-- Machines: anywhere — home, office, cloud. -->
@@ -70,17 +86,28 @@
         <text x="100" y="272" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a2e">laptop — you</text>
         <text class="ip" x="100" y="286" text-anchor="middle" font-size="10" fill="#00796B">100.64.0.12</text>
 
-        <!-- Workstation (the machine you reach). -->
-        <rect x="434" y="198" width="58" height="38" rx="3" fill="#1a1a2e" stroke="rgba(0, 150, 136, 0.5)" />
-        <rect x="440" y="206" width="28" height="3" rx="1.5" fill="#009688" opacity="0.8" />
-        <rect x="440" y="213" width="40" height="3" rx="1.5" fill="#009688" opacity="0.5" />
-        <rect x="440" y="220" width="22" height="3" rx="1.5" fill="#009688" opacity="0.65" />
-        <rect x="459" y="236" width="6" height="9" fill="#cfd8dc" />
-        <rect x="448" y="245" width="28" height="3.5" rx="1.75" fill="#cfd8dc" />
-        <circle cx="490" cy="195" r="3.5" fill="#4caf50" />
-        <circle class="ring" cx="490" cy="195" r="3.5" fill="none" stroke="rgba(76, 175, 80, 0.5)" style="animation-delay: 0.5s" />
-        <text x="462" y="268" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a2e">workstation</text>
-        <text class="ip" x="462" y="282" text-anchor="middle" font-size="10" fill="#00796B">100.64.0.23</text>
+        <!-- GPU workstation (the machine you reach): monitor with code,
+             tower with a spinning GPU fan. -->
+        <rect x="424" y="198" width="58" height="38" rx="3" fill="#1a1a2e" stroke="rgba(0, 150, 136, 0.5)" />
+        <rect x="430" y="206" width="28" height="3" rx="1.5" fill="#009688" opacity="0.8" />
+        <rect x="430" y="213" width="40" height="3" rx="1.5" fill="#009688" opacity="0.5" />
+        <rect x="430" y="220" width="22" height="3" rx="1.5" fill="#009688" opacity="0.65" />
+        <rect x="450" y="236" width="6" height="9" fill="#cfd8dc" />
+        <rect x="438" y="245" width="28" height="3.5" rx="1.75" fill="#cfd8dc" />
+        <rect x="488" y="196" width="28" height="46" rx="3" fill="#1a1a2e" stroke="rgba(0, 150, 136, 0.5)" />
+        <circle cx="502" cy="216" r="8" fill="none" stroke="#009688" stroke-width="1.2" />
+        <g class="fan" stroke="#4DB6AC" stroke-width="1.4">
+          <line x1="502" y1="210.5" x2="502" y2="221.5" />
+          <line x1="497.2" y1="213.2" x2="506.8" y2="218.8" />
+          <line x1="506.8" y1="213.2" x2="497.2" y2="218.8" />
+        </g>
+        <circle cx="502" cy="216" r="1.6" fill="#009688" />
+        <rect x="495" y="230" width="14" height="2" rx="1" fill="rgba(0, 150, 136, 0.5)" />
+        <rect x="495" y="235" width="14" height="2" rx="1" fill="rgba(0, 150, 136, 0.3)" />
+        <circle cx="510" cy="193" r="3.5" fill="#4caf50" />
+        <circle class="ring" cx="510" cy="193" r="3.5" fill="none" stroke="rgba(76, 175, 80, 0.5)" style="animation-delay: 0.5s" />
+        <text x="466" y="268" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a2e">GPU workstation</text>
+        <text class="ip" x="466" y="282" text-anchor="middle" font-size="10" fill="#00796B">100.64.0.23</text>
 
         <!-- Home server inside its LAN. -->
         <rect x="130" y="392" width="40" height="50" rx="4" fill="#ffffff" stroke="rgba(26, 26, 46, 0.4)" />
@@ -91,25 +118,29 @@
         <circle cx="145" cy="432" r="2" fill="#009688" />
         <text x="150" y="461" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a2e">home server</text>
         <text class="ip" x="150" y="475" text-anchor="middle" font-size="10" fill="#00796B">100.64.0.31</text>
-        <text x="150" y="490" text-anchor="middle" font-size="9.5" fill="rgba(26, 26, 46, 0.55)">subnet router · 192.168.1.0/24</text>
+        <text x="150" y="490" text-anchor="middle" font-size="9" fill="rgba(26, 26, 46, 0.55)">subnet router · exit node · 192.168.1.0/24</text>
 
-        <!-- Phone. -->
-        <rect x="399" y="398" width="27" height="50" rx="6" fill="#1a1a2e" stroke="rgba(0, 150, 136, 0.5)" />
-        <rect x="403" y="406" width="19" height="32" rx="2" fill="#263238" />
-        <rect x="406" y="410" width="13" height="3" rx="1.5" fill="#009688" />
-        <rect x="409" y="442" width="7" height="2" rx="1" fill="#cfd8dc" />
-        <circle cx="427" cy="395" r="3.5" fill="#4caf50" />
-        <circle class="ring" cx="427" cy="395" r="3.5" fill="none" stroke="rgba(76, 175, 80, 0.5)" style="animation-delay: 1.5s" />
-        <text x="412" y="466" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a2e">phone</text>
-        <text class="ip" x="412" y="480" text-anchor="middle" font-size="10" fill="#00796B">100.64.0.44</text>
+        <!-- Kubernetes cluster: hexagon with three worker nodes. -->
+        <path d="M415 393 L438 406.5 V433.5 L415 447 L392 433.5 V406.5 Z" fill="#ffffff" stroke="rgba(0, 150, 136, 0.5)" stroke-width="1.5" />
+        <rect x="404" y="406" width="22" height="7" rx="1.5" fill="rgba(26, 26, 46, 0.07)" stroke="rgba(26, 26, 46, 0.3)" stroke-width="0.8" />
+        <rect x="404" y="416.5" width="22" height="7" rx="1.5" fill="rgba(26, 26, 46, 0.07)" stroke="rgba(26, 26, 46, 0.3)" stroke-width="0.8" />
+        <rect x="404" y="427" width="22" height="7" rx="1.5" fill="rgba(26, 26, 46, 0.07)" stroke="rgba(26, 26, 46, 0.3)" stroke-width="0.8" />
+        <circle cx="408.5" cy="409.5" r="1.4" fill="#4caf50" />
+        <circle cx="408.5" cy="420" r="1.4" fill="#4caf50" />
+        <circle cx="408.5" cy="430.5" r="1.4" fill="#009688" />
+        <circle cx="440" cy="398" r="3.5" fill="#4caf50" />
+        <circle class="ring" cx="440" cy="398" r="3.5" fill="none" stroke="rgba(76, 175, 80, 0.5)" style="animation-delay: 1.5s" />
+        <text x="415" y="466" text-anchor="middle" font-size="11" font-weight="600" fill="#1a1a2e">k8s cluster</text>
+        <text class="ip" x="415" y="480" text-anchor="middle" font-size="10" fill="#00796B">100.64.0.44</text>
       </g>
 
-      <!-- Remote desktop: the workstation's screen, live in the laptop's browser. -->
+      <!-- Remote desktop: the GPU workstation's screen, live in the
+           laptop's browser (crossing the firewall like the mesh does). -->
       <g class="layer" :class="layerCls('remote')">
-        <path d="M136 214 Q283 156 430 206" fill="none" stroke="rgba(239, 83, 80, 0.18)" stroke-width="7" />
-        <path class="rd-line" d="M136 214 Q283 156 430 206" fill="none" />
-        <rect x="217" y="164" width="132" height="20" rx="10" fill="#ffffff" stroke="rgba(239, 83, 80, 0.4)" />
-        <text x="283" y="177.5" text-anchor="middle" font-size="9.5" fill="#ef5350">remote desktop · 60 fps</text>
+        <path d="M136 214 Q283 156 418 204" fill="none" stroke="rgba(239, 83, 80, 0.18)" stroke-width="7" />
+        <path class="rd-line" d="M136 214 Q283 156 418 204" fill="none" />
+        <rect x="217" y="163" width="132" height="20" rx="10" fill="#ffffff" stroke="rgba(239, 83, 80, 0.4)" />
+        <text x="283" y="176.5" text-anchor="middle" font-size="9.5" fill="#ef5350">remote desktop · 60 fps</text>
         <!-- Browser on the laptop showing the workstation's desktop. -->
         <rect x="70" y="202" width="60" height="7" fill="#37474f" />
         <circle cx="74" cy="205.5" r="1.2" fill="#ef5350" />
@@ -160,21 +191,21 @@ const layers = [
     label: 'Machines',
     color: '#455a64',
     caption:
-      'Laptop, workstation, home server, phone — at home, in the office, in the cloud. Enroll each one in minutes.',
+      'A GPU workstation, a k8s cluster, a home server, the laptop in your bag — if it runs the agent, it is on your network.',
   },
   {
     id: 'mesh',
     label: 'Encrypted mesh',
     color: '#00796B',
     caption:
-      'Every machine gets a stable 100.64.x.x address and talks to every other one directly — WireGuard-style, encrypted end to end.',
+      'Stable 100.64.x.x addresses and direct WireGuard-style tunnels, encrypted end to end — straight through NATs and corporate firewalls.',
   },
   {
     id: 'remote',
     label: 'Remote desktop',
     color: '#ef5350',
     caption:
-      'Click a machine, get its desktop in a browser tab — pixel-fresh at 60 fps, streamed through its own encrypted tunnel.',
+      'Open a tab and the GPU box desktop is in your browser — pixel-fresh at 60 fps, streamed through its own encrypted tunnel.',
   },
   {
     id: 'control',
@@ -322,6 +353,17 @@ onUnmounted(() => {
 }
 .ripple {
   animation: arch-ripple 3.6s ease-out infinite;
+}
+/* GPU fan — a slow, alive spin (static under reduced motion). */
+.fan {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: arch-spin 3.5s linear infinite;
+}
+@keyframes arch-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 @keyframes arch-ring {
   0% {
