@@ -2,8 +2,7 @@ use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use rand::Rng;
 use roomler_ai_db::models::{
-    CallChatMessage, ConferenceSettings, MediaSettings, ParticipantRole, ParticipantSession, Room,
-    RoomMember,
+    ConferenceSettings, MediaSettings, ParticipantRole, ParticipantSession, Room, RoomMember,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
@@ -20,7 +19,6 @@ pub struct LeaveOutcome {
 pub struct RoomDao {
     pub base: BaseDao<Room>,
     pub members: BaseDao<RoomMember>,
-    pub chat_messages: BaseDao<CallChatMessage>,
     db: Database,
 }
 
@@ -29,7 +27,6 @@ impl RoomDao {
         Self {
             base: BaseDao::new(db, Room::COLLECTION),
             members: BaseDao::new(db, RoomMember::COLLECTION),
-            chat_messages: BaseDao::new(db, CallChatMessage::COLLECTION),
             db: db.clone(),
         }
     }
@@ -193,7 +190,10 @@ impl RoomDao {
     }
 
     /// Hard-delete a room and cascade to all related resources:
-    /// messages, reactions, room_members, call_chat_messages, files (soft), recordings.
+    /// messages, reactions, room_members, files (soft), recordings.
+    /// (Legacy `call_chat_messages` cleanup kept as a raw-collection sweep —
+    /// the orphaned call-chat stack was removed 2026-08-04; pre-existing
+    /// rows may still linger in old databases.)
     pub async fn cascade_delete(&self, tenant_id: ObjectId, room_id: ObjectId) -> DaoResult<()> {
         // 1. Delete all messages in the room
         let msg_coll = self.db.collection::<bson::Document>("messages");
@@ -212,9 +212,10 @@ impl RoomDao {
             .hard_delete(doc! { "room_id": room_id })
             .await?;
 
-        // 4. Delete all call chat messages
-        self.chat_messages
-            .hard_delete(doc! { "room_id": room_id })
+        // 4. Delete any legacy call chat messages (orphaned collection)
+        let call_chat_coll = self.db.collection::<bson::Document>("call_chat_messages");
+        call_chat_coll
+            .delete_many(doc! { "room_id": room_id })
             .await?;
 
         // 5. Soft-delete all files associated with the room
@@ -733,43 +734,6 @@ impl RoomDao {
             .find_paginated(
                 doc! { "tenant_id": tenant_id, "deleted_at": null },
                 Some(doc! { "created_at": -1 }),
-                params,
-            )
-            .await
-    }
-
-    // ── Call Chat Messages ──────────────────────────────────────
-
-    pub async fn create_chat_message(
-        &self,
-        tenant_id: ObjectId,
-        room_id: ObjectId,
-        author_id: ObjectId,
-        display_name: String,
-        content: String,
-    ) -> DaoResult<CallChatMessage> {
-        let msg = CallChatMessage {
-            id: None,
-            tenant_id,
-            room_id,
-            author_id,
-            display_name,
-            content,
-            created_at: DateTime::now(),
-        };
-        let id = self.chat_messages.insert_one(&msg).await?;
-        self.chat_messages.find_by_id(id).await
-    }
-
-    pub async fn find_chat_messages(
-        &self,
-        room_id: ObjectId,
-        params: &PaginationParams,
-    ) -> DaoResult<PaginatedResult<CallChatMessage>> {
-        self.chat_messages
-            .find_paginated(
-                doc! { "room_id": room_id },
-                Some(doc! { "created_at": 1 }),
                 params,
             )
             .await
