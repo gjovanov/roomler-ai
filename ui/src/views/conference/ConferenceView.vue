@@ -23,8 +23,9 @@
             :color="showFiles ? 'primary' : undefined"
             @click="toggleFiles"
           />
+          <!-- Chat is room chat — usable before joining the call too
+               (a refreshed /call page used to show no chat until re-join) -->
           <v-btn
-            v-if="joined"
             :icon="showChat ? 'mdi-message-text' : 'mdi-message-text-outline'"
             variant="text"
             :color="showChat ? 'primary' : undefined"
@@ -101,9 +102,9 @@
             @play="handlePlayFile"
           />
 
-          <!-- Chat panel (unified with room messages) -->
+          <!-- Chat panel (unified with room messages; available pre-join) -->
           <div
-            v-if="joined && showChat"
+            v-if="showChat"
             class="chat-panel d-flex flex-column"
           >
             <v-toolbar density="compact" flat>
@@ -572,6 +573,26 @@ const warnBeforeLeave = (e: BeforeUnloadEvent) => {
   e.preventDefault()
 }
 
+// Auto-mark room messages read while the chat panel is visible. The call
+// view has no scroll-observer like ChatView — an open panel means the user
+// is reading; debounced so a burst of incoming messages is one API call.
+// (Messages read here used to stay unread forever and produce stuck badges.)
+let readAllTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleMarkAllRead() {
+  if (!showChat.value) return
+  if (readAllTimer) clearTimeout(readAllTimer)
+  readAllTimer = setTimeout(() => {
+    roomStore.markAllRead(tenantId.value, roomId.value)
+  }, 1200)
+}
+watch(showChat, (open) => {
+  if (open) scheduleMarkAllRead()
+})
+watch(
+  () => messageStore.messages.length,
+  () => scheduleMarkAllRead(),
+)
+
 onMounted(async () => {
   // Enumerate devices for pre-join selection
   conferenceStore.enumerateDevices()
@@ -582,23 +603,27 @@ onMounted(async () => {
     // Room not found
   }
 
+  // Room chat is available pre-join too: a refreshed /call page used to
+  // render no chat (and fetch none) until the user re-joined the call.
+  showChat.value = true
+  fetchRoomMembers()
+  await messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
+  await nextTick()
+  scrollChatToBottom()
+
   // If already in call for this room (returned from mini-view), restore full view
   if (conferenceStore.isInCall && conferenceStore.roomId === roomId.value) {
     joined.value = true
-    showChat.value = true
     window.addEventListener('beforeunload', warnBeforeLeave)
     conferenceStore.startActiveSpeaker()
     wsStore.onMediaMessage('media:audio_playback', audioPlayback.handlePlaybackMessage)
-    fetchRoomMembers()
-    await messageStore.fetchMessages(tenantId.value, roomId.value).catch(() => {})
     await roomStore.fetchParticipants(tenantId.value, roomId.value)
-    await nextTick()
-    scrollChatToBottom()
   }
 })
 
 onUnmounted(() => {
   window.removeEventListener('beforeunload', warnBeforeLeave)
+  if (readAllTimer) clearTimeout(readAllTimer)
 })
 </script>
 
