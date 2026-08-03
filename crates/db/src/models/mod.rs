@@ -1,4 +1,3 @@
-pub mod audit_log;
 pub mod background_task;
 pub mod custom_emoji;
 pub mod file;
@@ -16,7 +15,6 @@ pub mod tenant_member;
 
 pub mod user;
 
-pub use audit_log::*;
 pub use background_task::*;
 pub use custom_emoji::*;
 pub use file::*;
