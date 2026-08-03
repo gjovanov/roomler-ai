@@ -126,11 +126,14 @@ const routes: RouteRecordRaw[] = [
             // (bookmarkable, back/forward-friendly), same pattern as
             // Admin.
             path: 'network',
-            redirect: { name: 'network-machines' },
+            // 2026-08-04 — machines + tunnel-clients folded into the unified
+            // Devices page (overlay address/last-seen live on the device
+            // rows now); the parent lands on ACL, the first remaining child.
+            redirect: { name: 'network-acl' },
             component: () => import('@/views/network/NetworkPanel.vue'),
             children: [
-              { path: 'machines',       name: 'network-machines',       props: true, component: () => import('@/components/network/MachinesSection.vue') },
-              { path: 'tunnel-clients', name: 'network-tunnel-clients', props: true, component: () => import('@/components/admin/TunnelClientsSection.vue') },
+              { path: 'machines',       redirect: { name: 'devices' } },
+              { path: 'tunnel-clients', redirect: { name: 'devices' } },
               { path: 'acl',            name: 'network-acl',            props: true, component: () => import('@/components/admin/TunnelPoliciesSection.vue') },
               { path: 'subnet-routes',  name: 'network-subnet-routes',  props: true, component: () => import('@/components/admin/OverlaySubnetRoutesSection.vue') },
               { path: 'overlay-acl',    name: 'network-overlay-acl',    props: true, component: () => import('@/components/admin/OverlayAclSection.vue') },
@@ -158,7 +161,7 @@ const routes: RouteRecordRaw[] = [
               // old paths 301 to their new homes (named redirects keep
               // the :tenantId param). Old bookmarks + docs keep working.
               { path: 'agents',          redirect: { name: 'devices' } },
-              { path: 'tunnel-clients',  redirect: { name: 'network-tunnel-clients' } },
+              { path: 'tunnel-clients',  redirect: { name: 'devices' } },
               { path: 'tunnel-policies', redirect: { name: 'network-acl' } },
               { path: 'subnet-routes',   redirect: { name: 'network-subnet-routes' } },
               { path: 'magic-dns',       redirect: { name: 'network-dns' } },
