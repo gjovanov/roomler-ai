@@ -133,6 +133,7 @@ const routes: RouteRecordRaw[] = [
               { path: 'tunnel-clients', name: 'network-tunnel-clients', props: true, component: () => import('@/components/admin/TunnelClientsSection.vue') },
               { path: 'acl',            name: 'network-acl',            props: true, component: () => import('@/components/admin/TunnelPoliciesSection.vue') },
               { path: 'subnet-routes',  name: 'network-subnet-routes',  props: true, component: () => import('@/components/admin/OverlaySubnetRoutesSection.vue') },
+              { path: 'overlay-acl',    name: 'network-overlay-acl',    props: true, component: () => import('@/components/admin/OverlayAclSection.vue') },
               { path: 'dns',            name: 'network-dns',            props: true, component: () => import('@/components/admin/MagicDnsSection.vue') },
             ],
           },
