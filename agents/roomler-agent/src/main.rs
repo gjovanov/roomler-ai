@@ -1272,6 +1272,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         if let Some(mode) = &cfg.overlay_demote {
             fallbacks.insert("OVERLAY_DEMOTE".to_string(), mode.clone());
         }
+        // P4 — overlay_rpf (off|warn|enforce), same string ride.
+        if let Some(mode) = &cfg.overlay_rpf {
+            fallbacks.insert("OVERLAY_RPF".to_string(), mode.clone());
+        }
         // P4 demotion — numeric heartbeat override, same string ride.
         if let Some(secs) = cfg.overlay_route_tick_secs {
             fallbacks.insert("OVERLAY_ROUTE_TICK_SECS".to_string(), secs.to_string());

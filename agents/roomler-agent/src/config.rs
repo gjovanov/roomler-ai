@@ -207,6 +207,13 @@ pub struct AgentConfig {
     /// demotions execute). Multi-state, so a string key, not a tribool.
     #[serde(default)]
     pub overlay_demote: Option<String>,
+    /// P4 — reverse-path filtering of INBOUND overlay packets
+    /// (`ROOMLER_NODE_OVERLAY_RPF`): `off` | `warn` (count + log, still
+    /// deliver — the built-in default) | `enforce` (drop a packet whose
+    /// source address the sending peer does not own). Multi-state, so a
+    /// string key, not a tribool.
+    #[serde(default)]
+    pub overlay_rpf: Option<String>,
 
     /// Most recent version that ran for at least
     /// `CLEAN_RUN_THRESHOLD` seconds before exiting cleanly (or
@@ -815,6 +822,7 @@ mod tests {
             overlay_tier_detect: None,
             overlay_rtt_q: None,
             overlay_demote: None,
+            overlay_rpf: None,
             last_known_good_version: None,
             crash_count: 0,
             last_crash_unix: 0,
