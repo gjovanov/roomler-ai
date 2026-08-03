@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -33,7 +33,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use super::router::Router;
+use super::router::{Router, RpfMode, RpfVerdict};
 use crate::transport::quic::QuicPeer;
 use crate::transport::relay::{RelayConn, RelayUdpSocket};
 
@@ -292,6 +292,16 @@ pub struct PeerStats {
     /// 5 s tick, and that quantization would be worse than no number at all
     /// (why PR-A passed `None`).
     handshake_at: AtomicU64,
+    /// P4 — inbound IP packets from this peer whose SOURCE address it does not
+    /// own ([`Router::rpf_check`]). Counted in `warn` AND `enforce` (only
+    /// `enforce` also drops), so a fleet read of this counter is exactly the
+    /// blast radius of flipping the mode. Monotonic — never drained.
+    rx_denied: AtomicU64,
+    /// P4 — mono-ms (against [`wg_epoch`]) of the last reverse-path log line
+    /// emitted for this peer; 0 = never. Throttles the warning to ≤1 per peer
+    /// per [`RPF_LOG_THROTTLE_MS`] so neither a spoofing flood nor a
+    /// misconfigured subnet router turns a per-packet check into a log flood.
+    rpf_logged_at: AtomicU64,
 }
 
 /// P3 PR-B — process-monotonic epoch for [`PeerStats::handshake_at`] stamps.
@@ -309,9 +319,87 @@ fn mono_ms_now() -> u64 {
     wg_epoch().elapsed().as_millis() as u64
 }
 
-/// Demux routing table: a direct peer's source address → its `Tunn` + stats.
-/// One shared map drives the single direct-socket recv loop (rc.134).
-type DemuxRoutes = HashMap<SocketAddr, (Arc<Mutex<Tunn>>, Arc<PeerStats>)>;
+/// P4 — min interval between reverse-path warnings for the SAME peer.
+const RPF_LOG_THROTTLE_MS: u64 = 60_000;
+
+/// Short hex prefix of a WG public key, for logs.
+fn short_key(k: &[u8; 32]) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}", k[0], k[1], k[2], k[3])
+}
+
+/// P4 — everything the INGRESS path needs to authorize one peer's decapsulated
+/// packets: **who** is sending (its WG public key), the shared routing table
+/// that says which source addresses that peer owns, the mode, and the peer's
+/// counters.
+///
+/// Bundled into one parameter rather than four more arguments to
+/// [`process_inbound`] — and it is the seam the per-peer L4 ACL (server-compiled
+/// ingress rules on `NetmapPeer`) slots into, since it is already threaded to
+/// every inbound call site and already carries peer identity.
+#[derive(Clone)]
+struct Ingress {
+    peer: [u8; 32],
+    /// Read-only here: the routing table doubles as the allowed-IPs table.
+    send: WgSender,
+    stats: Arc<PeerStats>,
+    mode: RpfMode,
+}
+
+impl Ingress {
+    /// May this peer deliver a packet sourced from `src`? Counts and
+    /// throttled-logs every failure; returns `false` (drop) ONLY in
+    /// [`RpfMode::Enforce`].
+    fn permits(&self, src: IpAddr) -> bool {
+        if self.mode == RpfMode::Off {
+            return true;
+        }
+        // Tight sync block: `SendState`'s guard is a std (!Send) one, so the
+        // compiler rejects holding it across the `tun_tx.send().await` below.
+        let verdict = {
+            self.send
+                .0
+                .read()
+                .unwrap()
+                .router
+                .rpf_check(&self.peer, src)
+        };
+        let RpfVerdict::Deny(reason) = verdict else {
+            return true;
+        };
+        let denied = self.stats.rx_denied.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = mono_ms_now();
+        let last = self.stats.rpf_logged_at.load(Ordering::Relaxed);
+        // `last == 0` ⇒ never logged, so the FIRST denial always surfaces even
+        // when the process is younger than the throttle window. CAS so N
+        // concurrent recv tasks emit one line, not N.
+        if (last == 0 || now.saturating_sub(last) >= RPF_LOG_THROTTLE_MS)
+            && self
+                .stats
+                .rpf_logged_at
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let peer = short_key(&self.peer);
+            if self.mode == RpfMode::Enforce {
+                warn!(
+                    %src, ?reason, %peer, denied,
+                    "overlay: DROPPED an inbound packet whose source the sending peer does not own"
+                );
+            } else {
+                warn!(
+                    %src, ?reason, %peer, denied,
+                    "overlay: inbound packet whose source the sending peer does not own — \
+                     delivered anyway (overlay_rpf=warn; set `enforce` to drop, `off` to stop checking)"
+                );
+            }
+        }
+        self.mode != RpfMode::Enforce
+    }
+}
+
+/// Demux routing table: a direct peer's source address → its `Tunn` + ingress
+/// context. One shared map drives the single direct-socket recv loop (rc.134).
+type DemuxRoutes = HashMap<SocketAddr, (Arc<Mutex<Tunn>>, Ingress)>;
 
 /// Phase A — a WireGuard **handshake initiation** that arrived on a shared
 /// direct socket from a source address NO demux route matches. Two real cases
@@ -540,6 +628,11 @@ pub struct WgDevice {
     /// nobody took it (the srflx tier is off).
     stun_events_tx: mpsc::Sender<crate::transport::stun::StunInbound>,
     stun_events_rx: Option<mpsc::Receiver<crate::transport::stun::StunInbound>>,
+    /// P4 — reverse-path filtering mode, resolved once at construction and
+    /// copied into every peer's [`Ingress`]. Process-lifetime by design: a
+    /// data-plane gate that could change under a live session would make a
+    /// field report ("which packets did this node drop?") unanswerable.
+    rpf: RpfMode,
 }
 
 impl Drop for WgDevice {
@@ -563,6 +656,11 @@ impl WgDevice {
         let (tun_tx, tun_rx) = mpsc::channel(256);
         let (direct_events_tx, direct_events_rx) = mpsc::channel(16);
         let (stun_events_tx, stun_events_rx) = mpsc::channel(16);
+        let rpf = RpfMode::parse(crate::env::node_env("OVERLAY_RPF").as_deref());
+        tracing::info!(
+            mode = rpf.as_str(),
+            "overlay: reverse-path filtering (inbound source validation)"
+        );
         (
             Self {
                 secret,
@@ -577,9 +675,21 @@ impl WgDevice {
                 direct_events_rx: Some(direct_events_rx),
                 stun_events_tx,
                 stun_events_rx: Some(stun_events_rx),
+                rpf,
             },
             tun_rx,
         )
+    }
+
+    /// P4 — the [`Ingress`] context for one peer's inbound path: its identity,
+    /// the shared routing table, its counters, and this device's mode.
+    fn ingress_for(&self, peer_public: [u8; 32], stats: Arc<PeerStats>) -> Ingress {
+        Ingress {
+            peer: peer_public,
+            send: self.send.clone(),
+            stats,
+            mode: self.rpf,
+        }
     }
 
     /// Phase A — take the receiver for unknown-source handshake initiations
@@ -770,7 +880,7 @@ impl WgDevice {
         let recv_tunn = tunn.clone();
         let recv_carrier = carrier.clone();
         let tun_tx = self.tun_tx.clone();
-        let recv_stats = stats.clone();
+        let recv_ingress = self.ingress_for(peer_public, stats.clone());
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; WG_BUF];
             loop {
@@ -782,7 +892,7 @@ impl WgDevice {
                     }
                 };
                 let mut t = recv_tunn.lock().await;
-                process_inbound(&mut t, n, &mut buf, &recv_carrier, &tun_tx, &recv_stats).await;
+                process_inbound(&mut t, n, &mut buf, &recv_carrier, &tun_tx, &recv_ingress).await;
             }
         });
 
@@ -900,14 +1010,14 @@ impl WgDevice {
             return;
         };
         let entry = demux.routes.lock().await.get(&src).cloned();
-        let Some((tunn, stats)) = entry else {
+        let Some((tunn, ingress)) = entry else {
             return;
         };
         let reply = Arc::new(Carrier::Direct { sock, dst: src });
         let mut buf = packet.to_vec();
         let n = buf.len();
         let mut t = tunn.lock().await;
-        process_inbound(&mut t, n, &mut buf, &reply, &self.tun_tx, &stats).await;
+        process_inbound(&mut t, n, &mut buf, &reply, &self.tun_tx, &ingress).await;
     }
 
     /// rc.134 — install a peer reached over the SHARED direct socket. Its
@@ -969,12 +1079,13 @@ impl WgDevice {
         )));
 
         let stats = Arc::new(PeerStats::default());
+        let ingress = self.ingress_for(peer_public, stats.clone());
         // Register for demux BEFORE the handshake so inbound is routed.
         demux
             .routes
             .lock()
             .await
-            .insert(dst, (tunn.clone(), stats.clone()));
+            .insert(dst, (tunn.clone(), ingress));
 
         // Timer task only — no recv task; the shared demux loop delivers
         // this peer's inbound.
@@ -1259,6 +1370,32 @@ impl WgDevice {
     /// only inbound was content-free keepalives — so it advances `last_rx_at`
     /// (which the rx-staleness watchdog reads). Returns 0 for an unknown peer.
     /// Single-consumer by contract: only the sweep calls it (the swap resets it).
+    /// P4 — how many inbound packets from `peer_public` failed the reverse-path
+    /// check since it was installed (see [`PeerStats::rx_denied`]). Monotonic,
+    /// never drained: a non-zero read means this peer has sourced addresses it
+    /// does not own, whether or not the mode actually dropped them. 0 for an
+    /// unknown peer.
+    pub fn peer_rx_denied(&self, peer_public: &[u8; 32]) -> u64 {
+        self.peers
+            .get(peer_public)
+            .map(|p| p.stats.rx_denied.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// P4 — the device's reverse-path mode, for status/diagnostics.
+    pub fn rpf_mode(&self) -> RpfMode {
+        self.rpf
+    }
+
+    /// Test-only — override the reverse-path mode. Must run BEFORE `add_peer`:
+    /// each peer's [`Ingress`] copies the mode once, at install. Exists so the
+    /// enforce path is provable without mutating process-wide env (which would
+    /// race every other test in the binary).
+    #[cfg(test)]
+    pub(crate) fn set_rpf_mode(&mut self, mode: RpfMode) {
+        self.rpf = mode;
+    }
+
     pub fn peer_take_rx_any(&self, peer_public: &[u8; 32]) -> u64 {
         match self.peers.get(peer_public) {
             Some(p) => p.stats.rx_any.swap(0, Ordering::Relaxed),
@@ -1329,8 +1466,9 @@ async fn process_inbound(
     buf: &mut [u8],
     carrier: &Arc<Carrier>,
     tun_tx: &mpsc::Sender<Vec<u8>>,
-    stats: &PeerStats,
+    ingress: &Ingress,
 ) {
+    let stats = &ingress.stats;
     // Decapsulate writes into a separate scratch buffer so the borrow on
     // the result doesn't alias the inbound `buf`.
     let mut out = vec![0u8; WG_BUF];
@@ -1372,13 +1510,22 @@ async fn process_inbound(
                 }
             });
         }
-        TunnResult::WriteToTunnelV4(pkt, _) => {
-            stats.rx.fetch_add(1, Ordering::Relaxed);
-            let _ = tun_tx.send(pkt.to_vec()).await;
+        // P4 — the second field is boringtun's own parse of the decapsulated
+        // packet's SOURCE address (already validated against the IP header's
+        // length), handed to the caller precisely so cryptokey routing can be
+        // enforced on ingress. It was discarded until P4, which is what let any
+        // peer with a live session write an arbitrary source into our TUN.
+        TunnResult::WriteToTunnelV4(pkt, src) => {
+            if ingress.permits(IpAddr::V4(src)) {
+                stats.rx.fetch_add(1, Ordering::Relaxed);
+                let _ = tun_tx.send(pkt.to_vec()).await;
+            }
         }
-        TunnResult::WriteToTunnelV6(pkt, _) => {
-            stats.rx.fetch_add(1, Ordering::Relaxed);
-            let _ = tun_tx.send(pkt.to_vec()).await;
+        TunnResult::WriteToTunnelV6(pkt, src) => {
+            if ingress.permits(IpAddr::V6(src)) {
+                stats.rx.fetch_add(1, Ordering::Relaxed);
+                let _ = tun_tx.send(pkt.to_vec()).await;
+            }
         }
         TunnResult::Done => {}
         TunnResult::Err(e) => debug!(?e, "wg decapsulate error"),
@@ -1458,7 +1605,7 @@ async fn run_direct_demux(
         // (potentially awaiting) process_inbound so the demux map stays
         // contended only briefly.
         let entry = routes.lock().await.get(&src).cloned();
-        let Some((tunn, stats)) = entry else {
+        let Some((tunn, ingress)) = entry else {
             // Phase A — an UNKNOWN source is no longer unconditionally dropped:
             // if the datagram is a well-formed WG handshake INITIATION, forward
             // it to the runtime (a NAT'd peer dialling our public endpoint, or
@@ -1492,7 +1639,7 @@ async fn run_direct_demux(
             dst: src,
         });
         let mut t = tunn.lock().await;
-        process_inbound(&mut t, n, &mut buf, &reply, &tun_tx, &stats).await;
+        process_inbound(&mut t, n, &mut buf, &reply, &tun_tx, &ingress).await;
     }
 }
 
@@ -1697,6 +1844,129 @@ mod tests {
 
     const IP_A: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
     const IP_B: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
+
+    // -----------------------------------------------------------------------
+    // P4 — reverse-path filtering, end to end over a real carrier
+    // -----------------------------------------------------------------------
+
+    /// Two handshaked devices over loopback UDP. `mode` is the RECEIVER's
+    /// (`dev_b`) reverse-path mode. Returns both devices (dropping either kills
+    /// its tasks), B's TUN receiver, and A's pubkey.
+    async fn rpf_pair(mode: RpfMode) -> (WgDevice, WgDevice, mpsc::Receiver<Vec<u8>>, [u8; 32]) {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+        dev_b.set_rpf_mode(mode);
+
+        dev_a.add_peer(
+            b.public.to_bytes(),
+            IP_B,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        wait_connected(&dev_a, &b.public.to_bytes()).await;
+
+        // A packet A legitimately sources from its OWN overlay IP must arrive
+        // in every mode — the false-deny guard. (It also flushes anything
+        // boringtun queued during the handshake, so the assertions below see
+        // only what they sent.)
+        send_until_ok(
+            &dev_a,
+            &b.public.to_bytes(),
+            &synthetic_ipv4(IP_A, IP_B, b"ok"),
+        )
+        .await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("a peer's own source address must never be filtered")
+            .unwrap();
+        assert_eq!(&got[20..], b"ok");
+        while tokio::time::timeout(Duration::from_millis(200), rx_b.recv())
+            .await
+            .is_ok()
+        {}
+        assert_eq!(
+            dev_b.peer_rx_denied(&a.public.to_bytes()),
+            0,
+            "legitimate traffic must not be counted as a reverse-path failure"
+        );
+        (dev_a, dev_b, rx_b, a.public.to_bytes())
+    }
+
+    /// The spoofing hole this filter closes: a peer holding a live WG session
+    /// forges a THIRD party's source address. Under `enforce` the packet never
+    /// reaches the TUN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpf_enforce_drops_a_forged_source_address() {
+        let (dev_a, dev_b, mut rx_b, pk_a) = rpf_pair(RpfMode::Enforce).await;
+        let forged = Ipv4Addr::new(10, 66, 51, 147);
+        send_until_ok(
+            &dev_a,
+            &dev_b.public().to_bytes(),
+            &synthetic_ipv4(forged, IP_B, b"spoof"),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx_b.recv())
+                .await
+                .is_err(),
+            "a forged source must never reach the TUN under enforce"
+        );
+        assert_eq!(dev_b.peer_rx_denied(&pk_a), 1);
+    }
+
+    /// `warn` (the built-in default) is non-destructive: it counts the same
+    /// packet and DELIVERS it, so a fleet can measure the blast radius of
+    /// `enforce` before flipping. A regression here would silently blackhole
+    /// every node on upgrade.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpf_warn_counts_a_forged_source_but_still_delivers_it() {
+        let (dev_a, dev_b, mut rx_b, pk_a) = rpf_pair(RpfMode::Warn).await;
+        let forged = Ipv4Addr::new(10, 66, 51, 147);
+        send_until_ok(
+            &dev_a,
+            &dev_b.public().to_bytes(),
+            &synthetic_ipv4(forged, IP_B, b"spoof"),
+        )
+        .await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("warn mode must not drop")
+            .unwrap();
+        assert_eq!(&got[20..], b"spoof");
+        assert_eq!(dev_b.peer_rx_denied(&pk_a), 1);
+    }
+
+    /// `off` restores the pre-P4 behaviour exactly: delivered AND not counted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpf_off_does_not_even_count() {
+        let (dev_a, dev_b, mut rx_b, pk_a) = rpf_pair(RpfMode::Off).await;
+        send_until_ok(
+            &dev_a,
+            &dev_b.public().to_bytes(),
+            &synthetic_ipv4(Ipv4Addr::new(10, 66, 51, 147), IP_B, b"spoof"),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+                .await
+                .is_ok(),
+            "off mode must deliver"
+        );
+        assert_eq!(dev_b.peer_rx_denied(&pk_a), 0);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn wg_handshake_and_data_over_direct_udp() {
