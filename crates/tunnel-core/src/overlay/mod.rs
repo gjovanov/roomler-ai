@@ -26,6 +26,7 @@
 pub mod bridge;
 pub mod direct;
 pub mod dns;
+pub mod ingress;
 pub(crate) mod lifecycle;
 pub mod nat;
 pub mod netmap;

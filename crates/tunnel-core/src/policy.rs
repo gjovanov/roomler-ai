@@ -438,6 +438,40 @@ pub fn evaluate_overlay(
     OverlayAccess { visible, routes }
 }
 
+/// P4 — the rules `source` may use when sending INTO the node `via_node_id`.
+///
+/// The REVERSE direction of [`evaluate_overlay`]: that answers "what may this
+/// recipient see of a peer", this answers "what may that peer address through
+/// this recipient". The server compiles it per (recipient, peer) and ships it on
+/// the peer's `NetmapPeer.ingress_rules`, so the node can enforce port/proto —
+/// the dimensions the netmap's `routes` list structurally cannot express, which
+/// is why they were stored and distributed but never enforced until now.
+///
+/// Returns the UNION of every matching policy's destinations, not a first-match
+/// decision: these are grants, and the node treats any single match as allow.
+/// An empty result therefore means "denied", which is why the caller must ship
+/// `Some(vec![])` rather than `None` — see `NetmapPeer::ingress_rules`.
+pub fn evaluate_overlay_ingress(
+    policies: &[OverlayPolicy],
+    source: &OverlaySource,
+    via_node_id: ObjectId,
+) -> Vec<OverlayRule> {
+    let mut out: Vec<OverlayRule> = Vec::new();
+    for policy in policies {
+        if policy.deleted_at.is_some() || !policy.enabled {
+            continue;
+        }
+        if !source_matches(&policy.sources, source) {
+            continue;
+        }
+        if !via_matches(&policy.via, via_node_id) {
+            continue;
+        }
+        out.extend(policy.destinations.iter().cloned());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
