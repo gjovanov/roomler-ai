@@ -375,9 +375,13 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
     ));
 
     {
+        // `connection_id` lets the client scope its call sessions to this
+        // exact WS connection (call/join + call/leave bodies) — the id is
+        // minted per socket, so consumers must re-read it after any redial.
         let msg = serde_json::json!({
             "type": "connected",
             "user_id": user_id.to_hex(),
+            "connection_id": connection_id,
         });
         let mut guard = sender.lock().await;
         let _ = guard
@@ -440,12 +444,21 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
         tracing::debug!("online-registry remove failed: {e}");
     }
 
+    // Capture the call room BEFORE the media maps are consumed below
+    // (`forward_close_leave` removes the remote_media_conns entry) — the
+    // DB half of the leave still needs it.
+    let remote_media_rid = state
+        .remote_media_conns
+        .get(&connection_id)
+        .map(|e| *e.value());
+    let local_media_rid = state.room_manager.get_connection_room(&connection_id);
+
     // C-4 — the conn may have joined a room OWNED BY ANOTHER POD: tell
     // the owner to drop its transports (best-effort; no-op when the map
     // has no entry).
     crate::ws::media_cluster::forward_close_leave(&state, &user_id, &connection_id).await;
 
-    if let Some(room_id) = state.room_manager.get_connection_room(&connection_id) {
+    if let Some(room_id) = local_media_rid {
         let remaining_conns = state
             .room_manager
             .get_other_connection_ids(&room_id, &connection_id);
@@ -473,6 +486,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
                 .await;
             }
         }
+    }
+
+    // DB half of the leave: close this connection's call session, broadcast
+    // the new count, auto-end when it was the last one. Historically the
+    // disconnect path cleaned only media — a refresh mid-call left Mongo at
+    // `in_progress`/count>=1 forever ("1 Active call" until manual re-join +
+    // hangup). Mongo lookup is the fallback for a session whose `media:join`
+    // never happened (HTTP call/join only).
+    let db_rid = match local_media_rid.or(remote_media_rid) {
+        Some(rid) => Some(rid),
+        None => state
+            .rooms
+            .find_call_room_for_connection(user_id, &connection_id)
+            .await
+            .ok()
+            .flatten(),
+    };
+    if let Some(rid) = db_rid
+        && let Err(e) =
+            crate::routes::room::finalize_call_leave_db(&state, rid, user_id, Some(&connection_id))
+                .await
+    {
+        warn!(?user_id, %connection_id, room = %rid, %e, "disconnect call-leave DB cleanup failed");
     }
 
     info!(?user_id, %connection_id, "WebSocket disconnected");

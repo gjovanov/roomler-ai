@@ -13,6 +13,11 @@ type MediaMessageHandler = (data: any) => void
 
 export const useWsStore = defineStore('ws', () => {
   const status = ref<WsStatus>('disconnected')
+  // Server-minted id of THIS WebSocket connection (from the `connected`
+  // frame). Scopes call sessions per connection (call/join + call/leave
+  // bodies) so the same user can be in a call from several browsers.
+  // Re-minted on every redial — always read the current value at call time.
+  const connectionId = ref<string | null>(null)
   let socket: WebSocket | null = null
   let pingInterval: ReturnType<typeof setInterval> | null = null
   let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
@@ -108,6 +113,9 @@ export const useWsStore = defineStore('ws', () => {
         if (msg.type?.startsWith('media:') || msg.type === 'connected') {
           console.log('[WS] received:', msg.type)
         }
+        if (msg.type === 'connected' && typeof msg.connection_id === 'string') {
+          connectionId.value = msg.connection_id
+        }
         // rc:* messages use the flat `{t, ...}` shape from the signalling
         // protocol and don't go through the main dispatch.
         if (typeof msg.t === 'string' && msg.t.startsWith('rc:')) {
@@ -124,6 +132,7 @@ export const useWsStore = defineStore('ws', () => {
     socket.onclose = () => {
       cleanup()
       status.value = 'disconnected'
+      connectionId.value = null
       reconnectTimeout = setTimeout(() => connect(token), 3000)
     }
 
@@ -296,6 +305,7 @@ export const useWsStore = defineStore('ws', () => {
     socket?.close()
     socket = null
     status.value = 'disconnected'
+    connectionId.value = null
     pendingWaiters.clear()
     mediaHandlers.clear()
     rcHandlers.clear()
@@ -303,6 +313,7 @@ export const useWsStore = defineStore('ws', () => {
 
   return {
     status,
+    connectionId,
     connect,
     disconnect,
     setTenantAffinity,
