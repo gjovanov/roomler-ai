@@ -1122,6 +1122,11 @@ impl OverlayRuntime {
         // runtime's lifetime; its `Drop` reverts on WS disconnect / shutdown.
         let _subnet_router = super::nat::enable(&network.cidr, &self.advertised_routes).await;
 
+        // P4 — publish the ingress destination scope from the SAME list that
+        // just provisioned forwarding, so the filter and the forwarding it
+        // guards can never disagree. Set before any peer is installed.
+        wg.set_local_scope(Some(self_v4), &self.advertised_routes);
+
         // Inbound writer: decrypted packets → TUN. Independent of the
         // device, so it's a plain spawned task.
         let writer_tun = tun.clone();
