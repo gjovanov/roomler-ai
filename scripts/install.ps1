@@ -13,19 +13,22 @@
 #
 #   irm https://roomler.ai/api/setup/install.ps1 -OutFile install.ps1
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 `
-#       -Role daemon-user -Token <enrollment-jwt> [-Server https://roomler.ai] `
+#       -Role daemon-system -Token <enrollment-jwt> [-Server https://roomler.ai] `
 #       [-Name $env:COMPUTERNAME]
 #
 #   (One-liner equivalent:
-#     & ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Role daemon-user -Token <jwt>
+#     & ([scriptblock]::Create((irm https://roomler.ai/api/setup/install.ps1))) -Role daemon-system -Token <jwt>
 #   )
 #
 # Roles (same vocabulary as the roomler-setup wizard):
-#   daemon-user     perUser MSI -- Scheduled-Task autostart, no UAC. Default.
+#   daemon-user     perUser MSI -- Scheduled-Task autostart, no UAC.
 #                   Run from a NORMAL (non-elevated) shell -- see -AllowElevated.
 #   daemon-machine  perMachine MSI -- SCM service 'Roomler'. ELEVATED shell required.
 #   daemon-system   perMachine MSI + SystemContext (pre-logon / lock screen /
-#                   UAC control). ELEVATED shell required.
+#                   UAC control). ELEVATED shell required. Default.
+#
+#   The default role needs an ELEVATED shell; pass '-Role daemon-user' from a
+#   normal shell for a no-admin per-user install.
 #   tunnel-client   the roomler CLI only ("reach others") -- zip + user PATH.
 #                   Run from a NORMAL (non-elevated) shell -- see -AllowElevated.
 #
@@ -52,7 +55,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet('daemon-user', 'daemon-machine', 'daemon-system', 'tunnel-client')]
-    [string]$Role = 'daemon-user',
+    [string]$Role = 'daemon-system',
     [string]$Server = 'https://roomler.ai',
     [string]$Token = '',
     [string]$Name = $env:COMPUTERNAME,
@@ -147,7 +150,10 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
 $machineRole = $Role -in @('daemon-machine', 'daemon-system')
 if ($machineRole -and -not $DownloadOnly -and -not $Uninstall -and -not (Test-Elevated)) {
-    throw "role '$Role' installs the perMachine MSI -- run this script from an ELEVATED PowerShell (Terminal (Admin))."
+    Warn "role '$Role' installs the perMachine MSI and needs an ELEVATED shell."
+    Warn "Open 'Terminal (Admin)' / an Administrator PowerShell and re-run the same command there,"
+    Warn "or stay in this shell and add: -Role daemon-user   (per-user install, no admin needed)."
+    throw "role '$Role' requires an elevated PowerShell (or re-run with -Role daemon-user)."
 }
 
 # Mirror-image guard: the per-user roles must NOT run elevated. A perUser
