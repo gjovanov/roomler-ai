@@ -4536,6 +4536,26 @@ fn attach_input_handler(
             "input: SystemContext worker — Locked-state suppression disabled (remote unlock enabled)"
         );
     }
+    // 2026-08-04 — safety net: if the input DC dies mid-chord (browser
+    // crash, tab kill — paths where the viewer's blur-release can't run),
+    // release every modifier so the host isn't left holding a stuck
+    // Alt/Shift/Ctrl/Meta forever. HID 0xe0..=0xe7 = L/R Ctrl,Shift,Alt,Meta;
+    // releasing an un-pressed key is a no-op at the OS level.
+    let injector_for_close = injector.clone();
+    dc.on_close(Box::new(move || {
+        let injector = injector_for_close.clone();
+        Box::pin(async move {
+            let mut inj = injector.lock().await;
+            for code in 0xe0u32..=0xe7 {
+                let _ = inj.inject(input::InputMsg::Key {
+                    code,
+                    down: false,
+                    mods: 0,
+                });
+            }
+            info!("input: channel closed — released all modifier keys");
+        })
+    }));
     dc.on_message(Box::new(move |msg| {
         let injector = injector.clone();
         let lock_state_rx = lock_state_rx.clone();

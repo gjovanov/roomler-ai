@@ -109,6 +109,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ice_overlay_host_deprioritize: None,
         overlay_tier_detect: None,
         overlay_rtt_q: None,
+        text_mod_neutralize: None,
         overlay_demote: None,
         overlay_rpf: None,
         last_known_good_version: None,
