@@ -20,7 +20,7 @@
 //! noise, genuine internet v6) is unroutable by construction and dropped.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Roomler's overlay IPv6 ULA — `fd72:6f6f:6d6c::/48` (`fd` + ASCII "rooml").
 /// A node's overlay v6 is its overlay v4 embedded in the low 32 bits of the
@@ -73,6 +73,67 @@ pub fn embedded_v4_of_overlay_v6(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let hi = seg[6].to_be_bytes();
     let lo = seg[7].to_be_bytes();
     Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]))
+}
+
+/// P4 — reverse-path filtering mode (`overlay_rpf` config /
+/// `ROOMLER_NODE_OVERLAY_RPF`): `off` (deliver everything — the pre-P4
+/// behaviour) | `warn` (evaluate + count + throttled-log, still deliver — the
+/// built-in default) | `enforce` (drop).
+///
+/// Warn-first deliberately, mirroring B2's `shadow` default: this is a
+/// data-plane gate on EVERY inbound packet of every node in the fleet, and a
+/// false deny is a silent blackhole. `warn` costs one routing-table lookup per
+/// packet and can't drop anything, so the fleet reports what `enforce` WOULD
+/// have killed before anyone flips it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RpfMode {
+    Off,
+    #[default]
+    Warn,
+    Enforce,
+}
+
+impl RpfMode {
+    /// Parse the config/env value. Unset — or anything unrecognised — is the
+    /// safe `Warn` default, so a typo can never silently disable the counter
+    /// NOR silently start dropping traffic.
+    pub fn parse(v: Option<&str>) -> Self {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("off") | Some("0") | Some("false") => RpfMode::Off,
+            Some("enforce") | Some("on") | Some("1") | Some("true") => RpfMode::Enforce,
+            _ => RpfMode::Warn,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RpfMode::Off => "off",
+            RpfMode::Warn => "warn",
+            RpfMode::Enforce => "enforce",
+        }
+    }
+}
+
+/// Why a decapsulated packet's source address failed the reverse-path check.
+/// Carried into the log line + counters so a field report distinguishes "a
+/// subnet router is forwarding a range it never advertised" (`NoRoute` — an
+/// approval/config gap) from "a peer is forging a sibling's address"
+/// (`OtherPeer` — the actual attack).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RpfDeny {
+    /// No installed peer owns this source address.
+    NoRoute,
+    /// A DIFFERENT installed peer owns it.
+    OtherPeer,
+    /// A non-overlay IPv6 source from a peer that is not this node's v6 exit.
+    NonOverlayV6,
+}
+
+/// The reverse-path verdict for one decapsulated packet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RpfVerdict {
+    Allow,
+    Deny(RpfDeny),
 }
 
 /// An IPv4 CIDR — Phase 1 subnet routes. Hand-rolled (no dep): the overlay only
@@ -212,6 +273,48 @@ impl Router {
             .filter(|(c, _)| c.contains(*ip))
             .max_by_key(|(c, _)| c.prefix)
             .map(|(_, pk)| *pk)
+    }
+
+    /// P4 — **reverse-path check**: may the peer `from` originate a packet whose
+    /// SOURCE address is `src`?
+    ///
+    /// This is the ingress half of cryptokey routing, and until P4 it simply
+    /// did not exist: [`route`](Self::route) was consulted only on EGRESS
+    /// (`WgSender::send_ip_packet`), so any peer holding a live WireGuard
+    /// session could write a packet with ANY source and ANY destination
+    /// straight into this node's TUN. Real WireGuard treats `allowed_ips` as
+    /// bidirectional — an inbound packet whose source isn't in the sending
+    /// peer's allowed range is dropped — and this restores that semantic on
+    /// the same table, so a peer's authority to SEND AS an address is exactly
+    /// its authority to RECEIVE for it. No new state, and a subnet router or
+    /// exit node stays legitimate for its whole approved range for free.
+    ///
+    /// The address is boringtun's own `WriteToTunnelV4`/`V6` source field
+    /// (already length-validated against the IP header), never re-parsed here.
+    ///
+    /// * v4, or a derived-ULA v6 (unmapped to its embedded v4) → must resolve
+    ///   through the v4 table to `from` — its `/32`, or any subnet/exit CIDR it
+    ///   advertised (an exit peer carries the split-default `/1`s, so internet
+    ///   return traffic passes without a special case).
+    /// * any other v6 → only this node's v6 exit may originate it; with no exit
+    ///   configured that's nobody, mirroring the fail-closed drop
+    ///   [`WgSender::send_ip_packet`] already applies to global v6 on egress.
+    pub fn rpf_check(&self, from: &[u8; 32], src: IpAddr) -> RpfVerdict {
+        let v4 = match src {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(v6) => embedded_v4_of_overlay_v6(v6),
+        };
+        if let Some(v4) = v4 {
+            return match self.route(&v4) {
+                Some(pk) if pk == *from => RpfVerdict::Allow,
+                Some(_) => RpfVerdict::Deny(RpfDeny::OtherPeer),
+                None => RpfVerdict::Deny(RpfDeny::NoRoute),
+            };
+        }
+        match self.v6_exit {
+            Some(pk) if pk == *from => RpfVerdict::Allow,
+            _ => RpfVerdict::Deny(RpfDeny::NonOverlayV6),
+        }
     }
 
     /// The **v4 routing key** for a raw IP packet's destination, or `None` if
@@ -450,5 +553,143 @@ mod tests {
         assert_eq!(r.v6_exit(), Some([7u8; 32]));
         r.set_v6_exit(None);
         assert!(r.v6_exit().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // P4 — reverse-path filtering
+    // -----------------------------------------------------------------------
+
+    const PEER_A: [u8; 32] = [0xaa; 32];
+    const PEER_B: [u8; 32] = [0xbb; 32];
+
+    fn v4(s: &str) -> IpAddr {
+        IpAddr::V4(s.parse().unwrap())
+    }
+    fn v6(s: &str) -> IpAddr {
+        IpAddr::V6(s.parse().unwrap())
+    }
+
+    #[test]
+    fn rpf_allows_a_peer_its_own_host_route() {
+        let mut r = Router::new();
+        r.upsert(Ipv4Addr::new(100, 64, 0, 7), PEER_A);
+        assert_eq!(r.rpf_check(&PEER_A, v4("100.64.0.7")), RpfVerdict::Allow);
+    }
+
+    #[test]
+    fn rpf_denies_a_peer_forging_a_siblings_address() {
+        let mut r = Router::new();
+        r.upsert(Ipv4Addr::new(100, 64, 0, 7), PEER_A);
+        r.upsert(Ipv4Addr::new(100, 64, 0, 8), PEER_B);
+        // B claims A's overlay IP — the spoofing case the filter exists for.
+        assert_eq!(
+            r.rpf_check(&PEER_B, v4("100.64.0.7")),
+            RpfVerdict::Deny(RpfDeny::OtherPeer)
+        );
+    }
+
+    #[test]
+    fn rpf_denies_an_address_no_peer_owns() {
+        let r = Router::new();
+        assert_eq!(
+            r.rpf_check(&PEER_A, v4("10.66.51.147")),
+            RpfVerdict::Deny(RpfDeny::NoRoute)
+        );
+    }
+
+    #[test]
+    fn rpf_allows_a_subnet_router_its_whole_advertised_range() {
+        // The CORP3/CORP1 shape: a router peer forwards replies FROM hosts inside
+        // the LAN it advertised, so every such source must pass on its behalf.
+        let mut r = Router::new();
+        r.upsert(Ipv4Addr::new(100, 64, 0, 30), PEER_A);
+        r.set_subnets(PEER_A, &[Cidr::parse("10.66.0.0/16").unwrap()]);
+        assert_eq!(r.rpf_check(&PEER_A, v4("10.66.51.147")), RpfVerdict::Allow);
+        // …but only that peer: a sibling can't source the same LAN.
+        assert_eq!(
+            r.rpf_check(&PEER_B, v4("10.66.51.147")),
+            RpfVerdict::Deny(RpfDeny::OtherPeer)
+        );
+        // …and only within the range it actually advertised.
+        assert_eq!(
+            r.rpf_check(&PEER_A, v4("10.67.0.1")),
+            RpfVerdict::Deny(RpfDeny::NoRoute)
+        );
+    }
+
+    #[test]
+    fn rpf_allows_exit_node_internet_return_traffic() {
+        // P5 exit clients install the split-default `/1`s as the exit peer's
+        // allowed_ips, so arbitrary internet sources legitimately arrive from
+        // it. Without this the filter would blackhole every exit-node client.
+        let mut r = Router::new();
+        r.upsert(Ipv4Addr::new(100, 64, 0, 2), PEER_A);
+        r.set_subnets(
+            PEER_A,
+            &[
+                Cidr::parse("0.0.0.0/1").unwrap(),
+                Cidr::parse("128.0.0.0/1").unwrap(),
+            ],
+        );
+        assert_eq!(r.rpf_check(&PEER_A, v4("1.1.1.1")), RpfVerdict::Allow);
+        assert_eq!(r.rpf_check(&PEER_A, v4("203.0.113.9")), RpfVerdict::Allow);
+    }
+
+    #[test]
+    fn rpf_unmaps_derived_ula_v6_onto_the_v4_table() {
+        let mut r = Router::new();
+        r.upsert(Ipv4Addr::new(100, 64, 0, 7), PEER_A);
+        // fd72:6f6f:6d6c::6440:7 == 100.64.0.7 embedded.
+        assert_eq!(
+            r.rpf_check(&PEER_A, v6("fd72:6f6f:6d6c::6440:7")),
+            RpfVerdict::Allow
+        );
+        assert_eq!(
+            r.rpf_check(&PEER_B, v6("fd72:6f6f:6d6c::6440:7")),
+            RpfVerdict::Deny(RpfDeny::OtherPeer)
+        );
+    }
+
+    #[test]
+    fn rpf_non_overlay_v6_only_from_the_v6_exit() {
+        let mut r = Router::new();
+        r.upsert(Ipv4Addr::new(100, 64, 0, 2), PEER_A);
+        // No exit configured → fail-closed, mirroring egress.
+        assert_eq!(
+            r.rpf_check(&PEER_A, v6("2606:4700::1111")),
+            RpfVerdict::Deny(RpfDeny::NonOverlayV6)
+        );
+        r.set_v6_exit(Some(PEER_A));
+        assert_eq!(
+            r.rpf_check(&PEER_A, v6("2606:4700::1111")),
+            RpfVerdict::Allow
+        );
+        // …and still nobody else.
+        assert_eq!(
+            r.rpf_check(&PEER_B, v6("2606:4700::1111")),
+            RpfVerdict::Deny(RpfDeny::NonOverlayV6)
+        );
+        // Link-local / multicast OS noise is not overlay traffic either.
+        assert_eq!(
+            r.rpf_check(&PEER_B, v6("fe80::1")),
+            RpfVerdict::Deny(RpfDeny::NonOverlayV6)
+        );
+    }
+
+    #[test]
+    fn rpf_mode_parses_every_spelling_and_defaults_to_warn() {
+        assert_eq!(RpfMode::parse(Some("off")), RpfMode::Off);
+        assert_eq!(RpfMode::parse(Some("0")), RpfMode::Off);
+        assert_eq!(RpfMode::parse(Some("FALSE")), RpfMode::Off);
+        assert_eq!(RpfMode::parse(Some("enforce")), RpfMode::Enforce);
+        assert_eq!(RpfMode::parse(Some(" ON ")), RpfMode::Enforce);
+        assert_eq!(RpfMode::parse(Some("1")), RpfMode::Enforce);
+        assert_eq!(RpfMode::parse(Some("warn")), RpfMode::Warn);
+        // Unset or a typo lands on the safe default — never a silent enforce,
+        // never a silent off.
+        assert_eq!(RpfMode::parse(None), RpfMode::Warn);
+        assert_eq!(RpfMode::parse(Some("maybe")), RpfMode::Warn);
+        assert_eq!(RpfMode::default(), RpfMode::Warn);
+        assert_eq!(RpfMode::Enforce.as_str(), "enforce");
     }
 }
