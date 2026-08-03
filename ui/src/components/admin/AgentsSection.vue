@@ -203,7 +203,7 @@
                 <div class="text-caption font-mono">{{ nodeForAgent(a.id)!.overlay_ip }}</div>
                 <div
                   class="text-caption text-medium-emphasis font-mono"
-                  :title="deriveOverlayV6(nodeForAgent(a.id)!.overlay_ip)"
+                  :title="deriveOverlayV6(nodeForAgent(a.id)!.overlay_ip) ?? undefined"
                 >
                   {{ deriveOverlayV6(nodeForAgent(a.id)!.overlay_ip) }}
                 </div>
@@ -538,7 +538,7 @@
                 </div>
                 <div
                   class="text-caption text-medium-emphasis font-mono"
-                  :title="deriveOverlayV6(nodeForTunnelClient(c.id)!.overlay_ip)"
+                  :title="deriveOverlayV6(nodeForTunnelClient(c.id)!.overlay_ip) ?? undefined"
                 >
                   {{ deriveOverlayV6(nodeForTunnelClient(c.id)!.overlay_ip) }}
                 </div>
