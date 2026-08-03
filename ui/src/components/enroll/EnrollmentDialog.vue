@@ -40,11 +40,39 @@
             <span v-if="copiedId === 'token'" class="text-success text-caption ml-2">Copied</span>
           </div>
 
+          <!-- Install scope (agent only) — wizard role vocabulary; tunnel
+               clients are a per-user CLI with no scope choice. -->
+          <template v-if="kind === 'agent'">
+            <p class="text-body-2 font-weight-medium mb-1">Install scope</p>
+            <v-btn-toggle
+              v-model="scope"
+              mandatory
+              density="comfortable"
+              variant="outlined"
+              divided
+              class="mb-1"
+            >
+              <v-btn value="system" size="small">Background service</v-btn>
+              <v-btn value="machine" size="small">Attended service</v-btn>
+              <v-btn value="user" size="small">This user only</v-btn>
+            </v-btn-toggle>
+            <p class="text-caption text-medium-emphasis mb-3">{{ scopeHint }}</p>
+          </template>
+
           <v-tabs v-model="osTab" density="compact" class="mb-2">
             <v-tab v-for="os in commands" :key="os.os" :value="os.os">{{ os.title }}</v-tab>
           </v-tabs>
           <v-window v-model="osTab">
             <v-window-item v-for="os in commands" :key="os.os" :value="os.os">
+              <v-alert
+                v-if="os.note"
+                type="info"
+                variant="tonal"
+                density="compact"
+                class="text-caption mb-3"
+              >
+                {{ os.note }}
+              </v-alert>
               <div v-for="block in os.blocks" :key="block.id" class="mb-3">
                 <p class="text-body-2 font-weight-medium mb-1">{{ block.label }}</p>
                 <template v-if="block.isDownload">
@@ -90,7 +118,12 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { enrollCommands, type EnrollKind, type EnrollOs } from '@/utils/enrollCommands'
+import {
+  enrollCommands,
+  type DaemonScope,
+  type EnrollKind,
+  type EnrollOs,
+} from '@/utils/enrollCommands'
 
 const props = defineProps<{
   modelValue: boolean
@@ -113,8 +146,19 @@ function detectOs(): EnrollOs {
 }
 const osTab = ref<EnrollOs>(detectOs())
 
+// Sticky across dialog reopens — handy when enrolling a fleet of
+// same-shaped machines in a row.
+const scope = ref<DaemonScope>('system')
+const SCOPE_HINTS: Record<DaemonScope, string> = {
+  system:
+    'Starts before logon and survives logouts — recommended for servers and unattended machines.',
+  machine: 'Machine-wide service that runs while a user is logged in.',
+  user: 'Installs and autostarts for your account only — no admin rights needed.',
+}
+const scopeHint = computed(() => SCOPE_HINTS[scope.value])
+
 const commands = computed(() =>
-  enrollCommands(props.kind, window.location.origin, props.token),
+  enrollCommands(props.kind, window.location.origin, props.token, scope.value),
 )
 
 const copiedId = ref<string | null>(null)
