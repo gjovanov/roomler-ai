@@ -1183,10 +1183,6 @@ fn is_reachable(reach: &HashMap<ObjectId, bool>, node: &OverlayNode) -> bool {
     node.id.and_then(|i| reach.get(&i)).copied().unwrap_or(true)
 }
 
-/// Structural fields come from the row; `reachable` is the caller's presence
-/// verdict ([`reachability`] for peer lists; `true` for a node's OWN upsert —
-/// the sender of a live WS message is reachable by construction). Phase 4
-/// additionally sets this from `policy::evaluate_overlay`.
 // ────────────────────────────────────────────────────────────────────────────
 // Overlay ACL (L3)
 // ────────────────────────────────────────────────────────────────────────────
@@ -1321,6 +1317,15 @@ fn shape_peer(
     Some(shaped)
 }
 
+/// Structural fields come from the row; `reachable` is the caller's presence
+/// verdict ([`reachability`] for peer lists; `true` for a node's OWN upsert —
+/// the sender of a live WS message is reachable by construction).
+///
+/// This is the PERMISSIVE shape. Access control is applied by [`shape_peer`],
+/// which decides whether a given recipient sees this peer at all and narrows
+/// `routes` to the subset that recipient may install — `reachable` deliberately
+/// stays a presence signal, because shipping `reachable: false` does not tear
+/// down an already-installed peer (only a `removes` does).
 fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
     NetmapPeer {
         node_id: node.id.unwrap_or_default(),
