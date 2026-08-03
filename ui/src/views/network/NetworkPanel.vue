@@ -37,6 +37,7 @@ const sections = [
   { name: 'network-tunnel-clients', icon: 'mdi-tunnel',         title: 'Tunnel clients' },
   { name: 'network-acl',            icon: 'mdi-shield-key',     title: 'Tunnel ACL' },
   { name: 'network-subnet-routes',  icon: 'mdi-lan-connect',    title: 'Subnet routes' },
+  { name: 'network-overlay-acl',    icon: 'mdi-shield-lock-outline', title: 'Overlay ACL' },
   { name: 'network-dns',            icon: 'mdi-dns',            title: 'MagicDNS' },
 ]
 </script>
