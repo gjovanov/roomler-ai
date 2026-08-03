@@ -33,8 +33,6 @@
     "settings": "Settings",
     "members": "Members",
     "roles": "Roles",
-    "tasks": "Tasks",
-    "auditLog": "Audit log",
     "billing": "Billing"
   },
   "room": {

@@ -154,8 +154,6 @@ const routes: RouteRecordRaw[] = [
               { path: 'settings',  name: 'admin-settings',  props: true, component: () => import('@/components/admin/SettingsSection.vue') },
               { path: 'members',   name: 'admin-members',   props: true, component: () => import('@/components/admin/MembersSection.vue') },
               { path: 'roles',     name: 'admin-roles',     props: true, component: () => import('@/components/admin/RolesSection.vue') },
-              { path: 'tasks',     name: 'admin-tasks',     props: true, component: () => import('@/components/admin/TasksSection.vue') },
-              { path: 'audit-log', name: 'admin-audit-log', props: true, component: () => import('@/components/admin/AuditSection.vue') },
               // S4 — the fleet/network sections moved out of Admin; the
               // old paths 301 to their new homes (named redirects keep
               // the :tenantId param). Old bookmarks + docs keep working.
