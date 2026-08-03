@@ -189,56 +189,79 @@ jobs:
           # MSI install lands BOTH an Uninstall entry AND the
           # UpgradeCodes entry; checking the former is sufficient
           # for "the MSI installed and the system sees it").
-          # rc.279: assert the EXACT hive, not "any hive". The perUser MSI
-          # must register in HKCU ONLY -- the daemon-user "invisible in
-          # Programs & Features" class (HKCU-only ARP record x over-the-
-          # shoulder elevation) regresses silently if a machine-wide
-          # registration, or a scope flip, still passes this check (it
-          # did until rc.279).
-          $userRoot = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
-          $machineRoots = @(
+          # rc.279 asserted the ARP record must live in HKCU. That is NOT a
+          # reliable per-user signal, and the check has failed on EVERY master
+          # run since it landed in #260 -- it never once passed.
+          #
+          # The verbose MSI log from run 30843667006 settles what actually
+          # happens: the payload installs per-user exactly as intended
+          # (APPLICATIONFOLDER = C:\Users\<u>\AppData\Local\Programs\Roomler,
+          # Start Menu under the user's Roaming profile, no ALLUSERS authored),
+          # while Windows Server 2025 still mirrors the ARP record into an HKLM
+          # Uninstall hive. So the install is correct and the assertion was
+          # wrong about where to look.
+          #
+          # The AUTHORITATIVE per-user signal is the Installer UserData hive: a
+          # per-user install registers the product under the INSTALLING USER's
+          # SID, a per-machine one under SYSTEM (S-1-5-18). Assert that. The
+          # scope-flip guard rc.279 wanted is PRESERVED, just re-pointed: a
+          # genuine perMachine regression shows up under S-1-5-18 and still
+          # fails this step.
+          $sid    = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+          $udRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData'
+          function Find-RoomlerProduct($scopeSid) {
+            $products = Join-Path $udRoot "$scopeSid\Products"
+            if (-not (Test-Path $products)) { return $null }
+            Get-ChildItem $products -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                Get-ItemProperty (Join-Path $_.PSPath 'InstallProperties') -ErrorAction SilentlyContinue
+              } |
+              Where-Object { $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent' } |
+              Select-Object -First 1
+          }
+          $perUser    = Find-RoomlerProduct $sid
+          $perMachine = Find-RoomlerProduct 'S-1-5-18'
+
+          if (-not $perUser) {
+            Write-Host "--- Roomler ARP entries, per hive (installing SID: $sid) ---"
+            $hives = @{
+              'HKCU\Uninstall'           = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+              'HKLM\Uninstall'           = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+              'HKLM\WOW6432Node\Uninstall' = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+            }
+            foreach ($label in $hives.Keys) {
+              $root = $hives[$label]
+              if (-not (Test-Path $root)) { Write-Host "${label}: (absent)"; continue }
+              $rows = Get-ChildItem $root -ErrorAction SilentlyContinue |
+                        Get-ItemProperty -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like '*roomler*' } |
+                        Select-Object DisplayName, DisplayVersion, UninstallString
+              if ($rows) { Write-Host "${label}:"; $rows | Format-Table -AutoSize }
+              else { Write-Host "${label}: (no roomler entry)" }
+            }
+            Write-Host '--- Installer UserData SIDs present ---'
+            Get-ChildItem $udRoot -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty PSChildName
+            throw "MSI product not registered for the installing user ($sid) — the perUser flavour did not install per-user"
+          }
+          Write-Host "Installed per-user: $($perUser.DisplayName) $($perUser.DisplayVersion) (UserData SID $sid)"
+          if ($perMachine) {
+            throw "perUser MSI unexpectedly registered machine-wide (UserData S-1-5-18): $($perMachine.DisplayName)"
+          }
+          # Product code for later steps: the ARP mirror carries the real GUID
+          # (the UserData key name is the PACKED form, which msiexec /x rejects).
+          $arp = @(
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
             'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-          )
-          # Filter is intentionally loose: WiX's main.wxs uses the
-          # human-readable Product Name `"Roomler Agent"` (space-
-          # separated, capitalised) for DisplayName, NOT the Cargo
-          # kebab-case `roomler-agent`. Match either via case-
-          # insensitive regex against "roomler" + "agent". Run
-          # #26377062833 diag confirmed: the installed entry reads
-          # `DisplayName = "Roomler Agent"`.
-          $found = Get-ChildItem $userRoot -ErrorAction SilentlyContinue |
-                     Get-ItemProperty -ErrorAction SilentlyContinue |
-                     Where-Object {
-                       $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
-                     } |
-                     Select-Object -First 1
-          if (-not $found) {
-            Write-Host '--- Roomler entries in any Uninstall hive ---'
-            foreach ($root in @($userRoot) + $machineRoots) {
-              if (-not (Test-Path $root)) { continue }
-              Get-ChildItem $root -ErrorAction SilentlyContinue |
-                Get-ItemProperty -ErrorAction SilentlyContinue |
-                Where-Object { $_.DisplayName -like '*roomler*' } |
-                Select-Object DisplayName, DisplayVersion, UninstallString |
-                Format-Table -AutoSize
-            }
-            throw 'perUser MSI install record not found in HKCU (the flavour must register per-user)'
+          ) | Where-Object { Test-Path $_ } |
+              ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+              Get-ItemProperty -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent' } |
+              Select-Object -First 1
+          if ($arp) {
+            'INSTALLED_PRODUCT_CODE=' + $arp.PSChildName | Out-File -FilePath $env:GITHUB_ENV -Append
           }
-          Write-Host "Installed: $($found.DisplayName) $($found.DisplayVersion) (HKCU)"
-          foreach ($root in $machineRoots) {
-            if (-not (Test-Path $root)) { continue }
-            $leak = Get-ChildItem $root -ErrorAction SilentlyContinue |
-                      Get-ItemProperty -ErrorAction SilentlyContinue |
-                      Where-Object {
-                        $_.DisplayName -and $_.DisplayName -match '(?i)roomler.*agent'
-                      } |
-                      Select-Object -First 1
-            if ($leak) {
-              throw "perUser MSI unexpectedly registered machine-wide under ${root}: $($leak.DisplayName)"
-            }
-          }
-          'INSTALLED_PRODUCT_CODE=' + $found.PSChildName | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Assert install payload at the canonical path (P4b)
         shell: pwsh
