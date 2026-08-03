@@ -1933,6 +1933,9 @@ impl OverlayRuntime {
                         }
                         let old_peers = std::mem::take(&mut current_peers);
                         current_peers = peers.iter().map(|p| (p.node_id, p.clone())).collect();
+                        // P4 — refresh per-source ingress rules from the netmap
+                        // the server just shaped for us.
+                        wg.sync_peer_ingress(&current_peers);
                         // rc.225 — a peer whose direct endpoints changed gets a
                         // clean slate: its old strike counts were measured
                         // against dial conditions that no longer exist.
@@ -2029,6 +2032,9 @@ impl OverlayRuntime {
                                 debug!(peer = %p.node_id, "overlay: peer's direct endpoints changed — cleared its path-monitor evidence");
                             }
                         }
+                        // P4 — a delta can change a peer's grant without any
+                        // install/removal, so the table is resynced here too.
+                        wg.sync_peer_ingress(&current_peers);
                         let t0 = Instant::now();
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq, "delta").await;
                         warn_if_slow("install_peers(delta)", t0);
@@ -2442,6 +2448,7 @@ mod tests {
             supports_derp: false,
             routes: vec![],
             agent_id: None,
+            ingress_rules: None,
         };
         let base = mk(
             &["192.168.68.126:51573"],
@@ -3919,6 +3926,7 @@ mod tests {
                 supports_derp: false,
                 routes: vec![],
                 agent_id: None,
+                ingress_rules: None,
             }
         }
         fn installed(
@@ -4147,6 +4155,7 @@ mod tests {
             supports_derp: false,
             routes: vec![],
             agent_id: None,
+            ingress_rules: None,
         }
     }
 
@@ -4471,6 +4480,7 @@ mod tests {
             supports_derp: false,
             routes,
             agent_id: None,
+            ingress_rules: None,
         }
     }
 
@@ -4637,6 +4647,7 @@ mod tests {
             supports_derp: false,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
             agent_id: None,
+            ingress_rules: None,
         };
         let strs: Vec<String> = exit_peer_allowed_ips(&exit)
             .iter()
