@@ -46,11 +46,22 @@ pub struct OverlayNodeResponse {
     /// copy on this, so it must not be guessed.
     pub will_rejoin: bool,
     pub last_seen_at: String,
+    /// Backing device id (2026-08-04): the FK the unified Devices page joins
+    /// on — the wire previously carried NO key linking a node to its agent /
+    /// tunnel-client row (name is a lossy, de-duplicated DNS label).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_client_id: Option<String>,
 }
 
 impl OverlayNodeResponse {
     fn from_node(n: OverlayNode, will_rejoin: bool) -> Self {
         let can_be_exit_node = n.advertised_routes.iter().any(|r| r == DEFAULT_ROUTE_V4);
+        let (agent_id, tunnel_client_id) = match &n.node_ref {
+            NodeRef::Agent { agent_id } => (Some(agent_id.to_hex()), None),
+            NodeRef::TunnelClient { tunnel_client_id } => (None, Some(tunnel_client_id.to_hex())),
+        };
         Self {
             id: n.id.map(|i| i.to_hex()).unwrap_or_default(),
             name: n.name,
@@ -59,6 +70,8 @@ impl OverlayNodeResponse {
                 NodeRef::Agent { .. } => "agent",
                 NodeRef::TunnelClient { .. } => "tunnel_client",
             },
+            agent_id,
+            tunnel_client_id,
             online: matches!(n.status, AgentStatus::Online),
             will_rejoin,
             // Surface only the SUBNET routes in the per-CIDR grid — the `/0`
