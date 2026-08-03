@@ -416,6 +416,127 @@ impl TunnelPolicy {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Overlay ACL
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Who an [`OverlayPolicy`] applies to — the node ORIGINATING traffic.
+///
+/// Deliberately a separate enum from [`PolicySubject`]: the overlay is pure
+/// L3, so the tunnel's client/agent-origin distinction is meaningless here,
+/// and a node is addressed by its `overlay_nodes` id regardless of whether it
+/// is backed by an agent or a tunnel client. Reusing `PolicySubject` would
+/// offer variants that can never match an overlay node.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverlaySelector {
+    /// One specific overlay node.
+    NodeId {
+        #[serde(rename = "id")]
+        node_id: ObjectId,
+    },
+    /// Every node owned by this user (resolved through the node's backing
+    /// agent / tunnel-client `owner_user_id`).
+    UserId {
+        #[serde(rename = "id")]
+        user_id: ObjectId,
+    },
+    /// Every node whose owner holds this role.
+    RoleId {
+        #[serde(rename = "id")]
+        role_id: ObjectId,
+    },
+    /// Every node in the policy's tenant.
+    AllNodes,
+}
+
+/// Which node a policy lets the sources reach — the peer, and (when it is a
+/// subnet router) the gateway for its approved CIDRs.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OverlayTarget {
+    NodeId {
+        #[serde(rename = "id")]
+        node_id: ObjectId,
+    },
+    /// Every node in the policy's tenant.
+    AllNodes,
+}
+
+/// One destination grant: a CIDR plus an optional port/protocol narrowing.
+///
+/// ⚠️ `port_range` / `proto` are **stored and distributed but do not affect
+/// netmap shaping**, because peer visibility and route lists are the only
+/// primitives the netmap wire format can express — there is no port dimension
+/// in [`crate::signaling::NetmapPeer`]. They take effect only once the
+/// node-side ingress filter consumes them. Until then a port-narrowed rule
+/// grants the whole peer at L3, so the admin UI must say so rather than imply
+/// a narrowing that is not enforced.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OverlayRule {
+    /// Destination prefix, e.g. `"10.84.6.0/24"` or a peer's `"100.64.0.7/32"`.
+    pub cidr: String,
+    #[serde(default = "OverlayRule::all_ports")]
+    pub port_range: PortRange,
+    #[serde(default)]
+    pub proto: ProtocolKind,
+}
+
+impl OverlayRule {
+    fn all_ports() -> PortRange {
+        PortRange {
+            low: 1,
+            high: u16::MAX,
+        }
+    }
+}
+
+/// How strictly a tenant's overlay ACL is applied. Stored on the tenant's
+/// [`OverlayNetwork`] (one row per tenant) rather than on each policy — it is
+/// a network-wide posture, and putting it there means the join path already
+/// has it loaded.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayAclMode {
+    /// Legacy behaviour: every node sees every peer and every approved route.
+    /// The default, so enabling the feature never breaks a live mesh.
+    #[default]
+    Off,
+    /// Evaluate and log what WOULD be denied, but ship the permissive netmap.
+    /// The safe way to author policies against real traffic before cutting over.
+    Warn,
+    /// Evaluate and enforce.
+    Enforce,
+}
+
+/// A tenant-scoped overlay access rule. Default-deny **once the tenant's
+/// [`OverlayAclMode`] is `Enforce`**; `Off` (the default) preserves the
+/// historical "same tenant + same network ⇒ full visibility" behaviour.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OverlayPolicy {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    pub name: String,
+    /// Lets an admin park a rule without deleting it.
+    #[serde(default = "crate::models::default_true")]
+    pub enabled: bool,
+    pub sources: Vec<OverlaySelector>,
+    pub via: Vec<OverlayTarget>,
+    pub destinations: Vec<OverlayRule>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub deleted_at: Option<DateTime>,
+}
+
+impl OverlayPolicy {
+    pub const COLLECTION: &'static str = "overlay_policies";
+}
+
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tunnel audit
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -963,6 +1084,16 @@ pub struct OverlayNetwork {
     /// Path MTU for the overlay. 1280 leaves headroom for the WG +
     /// carrier (UDP/relay) overhead under a 1500-byte underlay.
     pub mtu: u16,
+    /// How strictly [`OverlayPolicy`] rows are applied for this tenant.
+    ///
+    /// `#[serde(default)]` is LOAD-BEARING for exactly the reason spelled out
+    /// on [`free_hosts`](Self::free_hosts): every row written before the ACL
+    /// feature lacks this field, and without the default they would all fail
+    /// to deserialize and take the whole overlay down on the next
+    /// `get_or_create`. The default is [`OverlayAclMode::Off`], so an existing
+    /// mesh keeps its current behaviour until an admin opts in.
+    #[serde(default)]
+    pub acl_mode: OverlayAclMode,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
