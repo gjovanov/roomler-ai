@@ -1943,6 +1943,50 @@ export function createClipboardEchoGate(): ClipboardEchoGate {
   }
 }
 
+/** Tracks which HID key codes and pointer buttons this viewer has told the
+ *  host to PRESS but not yet RELEASE. When the window blurs mid-chord
+ *  (alt-tab: AltLeft + Tab go down, focus leaves, the matching keyups never
+ *  fire), the host was left with a physically held Alt — every following
+ *  keystroke became an Alt-accelerator ("typing is dead" until some chord
+ *  happened to release Alt; the field-reported alt+shift 'fix' worked only
+ *  because it ends in a real AltLeft keyup). `releaseAll()` drains what the
+ *  caller must send as up-events. Applies under Keyboard Lock too: with the
+ *  lock active alt-tab is swallowed (no blur, tracker stays idle), and a
+ *  blur that DOES fire under lock is an OS-level steal (secure desktop) —
+ *  exactly a stuck-modifier scenario, so releasing is correct there as well.
+ *  Pure and exported for vitest. */
+export interface HeldInputTracker {
+  key(code: number, down: boolean): void
+  button(btn: string, down: boolean): void
+  /** Held codes/buttons in press order; clears the tracker. */
+  releaseAll(): { keys: number[]; buttons: string[] }
+  size(): number
+}
+
+export function createHeldInputTracker(): HeldInputTracker {
+  const keys = new Set<number>()
+  const buttons = new Set<string>()
+  return {
+    key(code: number, down: boolean) {
+      if (down) keys.add(code)
+      else keys.delete(code)
+    },
+    button(btn: string, down: boolean) {
+      if (down) buttons.add(btn)
+      else buttons.delete(btn)
+    },
+    releaseAll() {
+      const out = { keys: [...keys], buttons: [...buttons] }
+      keys.clear()
+      buttons.clear()
+      return out
+    },
+    size() {
+      return keys.size + buttons.size
+    },
+  }
+}
+
 /** Build the wire frames for one browser Ã¢ÂÂ agent image transfer:
  *  a `clipboard:img-begin` JSON header, Ã¢ÂÂ¤16 KiB binary PNG frames,
  *  and the `clipboard:img-end` trailer, all sharing one id. Exported
@@ -2885,6 +2929,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     pendingClipboardAcks.get(id)?.onSettle()
   }
 
+  /** Un-acked local-to-remote writes, keyed by content hash. The echo gate
+   *  remembers a hash at SEND time, so a deferred Ctrl+V that short-circuits
+   *  on `knows(hash)` could flush while the agent's OS write (ordered DC +
+   *  worker-thread hop) was still in flight — the remote app then pasted the
+   *  STALE clipboard. That is the exact race the ack gate was built for,
+   *  re-opened through the gate's own memory (auto-sync ON made it MORE
+   *  likely). Short-circuit lanes must await the outstanding write first. */
+  const unackedClipboardWrites = new Map<string, Promise<void>>()
+  function trackClipboardWrite(hash: string, id: string) {
+    if (!supportsClipboardAck.value) return
+    const p = awaitClipboardAck(id, CLIPBOARD_ACK_TIMEOUT_MS).then(() => {
+      if (unackedClipboardWrites.get(hash) === p) unackedClipboardWrites.delete(hash)
+    })
+    unackedClipboardWrites.set(hash, p)
+  }
+  function awaitOutstandingClipboardWrite(hash: string): Promise<void> {
+    return unackedClipboardWrites.get(hash) ?? Promise.resolve()
+  }
+
   /** Rich reads (accept:["image","html"]) that may resolve as an
    *  image/html stream instead of clipboard:content. Keyed by the
    *  same req_id namespace as pendingClipboardReads. */
@@ -3169,7 +3232,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (!(await sendRichFramesOverDc(ch, built))) return false
     clipboardEchoGate.recordPushed(rtfHash)
     clipboardEchoGate.recordPushed(textHash)
-    if (native.html) clipboardEchoGate.recordPushed(hashClipboardHtml(native.html, native.text))
+    trackClipboardWrite(rtfHash, built.id)
+    trackClipboardWrite(textHash, built.id)
+    if (native.html) {
+      const htmlHash = hashClipboardHtml(native.html, native.text)
+      clipboardEchoGate.recordPushed(htmlHash)
+      trackClipboardWrite(htmlHash, built.id)
+    }
     return true
   }
 
@@ -3215,6 +3284,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (!(await sendRichFramesOverDc(ch, built))) return false
       clipboardEchoGate.recordPushed(combinedHash)
       clipboardEchoGate.recordPushed(textHash)
+      trackClipboardWrite(combinedHash, built.id)
+      trackClipboardWrite(textHash, built.id)
       return true
     }
     return false // no html on the clipboard Ã¢ÂÂ plain-text fallback
@@ -3267,6 +3338,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   }
 
   let clipboardPushInFlight = false
+  let clipboardSyncDirty = false
   let lastClipboardSyncAttempt = 0
   async function syncLocalClipboardToRemote(
     reason: 'focus' | 'visible' | 'poll' | 'paste-intent' | 'connect',
@@ -3276,7 +3348,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const ch = channels.clipboard
     if (!ch || ch.readyState !== 'open') return
     if (!globalThis.document.hasFocus()) return
-    if (clipboardPushInFlight) return
+    if (clipboardPushInFlight) {
+      // focus + visibilitychange fire back-to-back on refocus; the second
+      // trigger used to be silently dropped while the first was still
+      // reading — mark dirty and re-run once the in-flight pass ends.
+      clipboardSyncDirty = true
+      return
+    }
     const now = Date.now()
     if (now - lastClipboardSyncAttempt < CLIPBOARD_SYNC_MIN_INTERVAL_MS) return
     lastClipboardSyncAttempt = now
@@ -3313,8 +3391,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           }
           try {
             // RAW text on the wire Ã¢ÂÂ see sendClipboardWriteOverDc.
-            sendClipboardWriteOverDc(ch, text)
+            const { id } = sendClipboardWriteOverDc(ch, text)
             clipboardEchoGate.recordPushed(hash)
+            trackClipboardWrite(hash, id)
           } catch {
             /* DC hiccup Ã¢ÂÂ the next trigger retries */
           }
@@ -3329,6 +3408,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (stashed) await writeRemoteContentToLocalClipboard(stashed)
     } finally {
       clipboardPushInFlight = false
+      if (clipboardSyncDirty) {
+        clipboardSyncDirty = false
+        // Re-run after the throttle window — the dropped trigger may have
+        // seen NEWER clipboard content than the pass that just finished.
+        setTimeout(() => {
+          void syncLocalClipboardToRemote(reason)
+        }, CLIPBOARD_SYNC_MIN_INTERVAL_MS)
+      }
     }
   }
 
@@ -3359,8 +3446,24 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
+  /** `clipboardSyncBlocked` used to be a PERMANENT latch — one transient
+   *  'denied' (focus race, temporary policy) killed auto-sync for the rest
+   *  of the page's life. Re-probe the permission on window focus and
+   *  un-latch when it reports granted; no prompt is shown by query(). */
+  async function maybeUnblockClipboardSync(): Promise<void> {
+    if (!clipboardSyncBlocked.value) return
+    try {
+      const status = await globalThis.navigator.permissions.query({
+        name: 'clipboard-read' as PermissionName,
+      })
+      if (status.state === 'granted') clipboardSyncBlocked.value = false
+    } catch {
+      /* Permissions API unavailable — stay blocked */
+    }
+  }
+
   function onWindowFocusClipboard() {
-    void syncLocalClipboardToRemote('focus')
+    void maybeUnblockClipboardSync().then(() => syncLocalClipboardToRemote('focus'))
   }
   function onVisibilityClipboard() {
     if (globalThis.document.visibilityState === 'visible') {
@@ -6655,15 +6758,26 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (!insideVideo) return
       cancelPendingMove()
       surface.setPointerCapture(ev.pointerId)
+      lastPointerNorm = { x, y }
       sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: true, x, y, mon: 0 })
+      heldInputs.button(browserButton(ev.button), true)
     }
 
     function onPointerUp(ev: PointerEvent) {
       try { surface.releasePointerCapture(ev.pointerId) } catch { /* noop */ }
       const { x, y, insideVideo } = normalisedXY(ev)
-      if (!insideVideo) return
       cancelPendingMove()
-      sendInput({ t: 'mouse_button', btn: browserButton(ev.button), down: false, x, y, mon: 0 })
+      // A press we forwarded MUST get its release even when the pointer
+      // ended outside the video (drag past the edge used to leave the
+      // host's mouse button physically stuck down). Use the last inside
+      // position for the up when the current one is out of bounds; a
+      // stray up for a never-pressed button is harmless on the host.
+      const btn = browserButton(ev.button)
+      const ux = insideVideo ? x : lastPointerNorm.x
+      const uy = insideVideo ? y : lastPointerNorm.y
+      if (insideVideo) lastPointerNorm = { x, y }
+      sendInput({ t: 'mouse_button', btn, down: false, x: ux, y: uy, mon: 0 })
+      heldInputs.button(btn, false)
     }
 
     function onWheel(ev: WheelEvent) {
@@ -6737,6 +6851,36 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // don't emit a stray V-up against an un-down'd V on the agent.
     let pendingCtrlV: { mods: number; timer: ReturnType<typeof setTimeout> | null } | null = null
     const KEY_V_HID = 0x19
+
+    // Every HID key / pointer button we press on the host is recorded here
+    // and force-released when this window loses focus (alt-tab, minimize,
+    // OS-level steal) — see createHeldInputTracker for the stuck-Alt story.
+    const heldInputs = createHeldInputTracker()
+    // Last normalized pointer position — synthetic button-ups reuse it so
+    // releasing a stuck drag doesn't teleport the host cursor.
+    let lastPointerNorm = { x: 0.5, y: 0.5 }
+
+    function releaseHeldInputs() {
+      // A pending Ctrl+V deferral must not fire its 50 ms fallback AFTER
+      // focus already left this window (it would paste at the host while
+      // the operator is working in a local app).
+      if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
+      pendingCtrlV = null
+      const held = heldInputs.releaseAll()
+      for (const btn of held.buttons) {
+        sendInput({
+          t: 'mouse_button',
+          btn,
+          down: false,
+          x: lastPointerNorm.x,
+          y: lastPointerNorm.y,
+          mon: 0,
+        })
+      }
+      for (const code of held.keys) {
+        sendInput({ t: 'key', code, down: false, mods: 0 })
+      }
+    }
 
     function flushPendingCtrlV() {
       if (!pendingCtrlV) return
@@ -6921,6 +7065,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         sendInput({ t: 'key_text', text: action.text })
       } else {
         sendInput({ t: 'key', code: action.code, down: action.down, mods: action.mods })
+        heldInputs.key(action.code, action.down)
       }
       // rc.18: after a Ctrl+C-over-viewer is forwarded to the host,
       // schedule the auto-mirror of the host's clipboard back to the
@@ -6979,6 +7124,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             if (native) {
               const rtfHash = hashClipboardBytes(native.rtf)
               if (clipboardEchoGate.knows(rtfHash)) {
+                // Auto-sync already delivered this content — but the gate
+                // records at SEND time, so its write-ack may still be
+                // outstanding; flushing before the OS write lands pastes
+                // the STALE clipboard (the race the ack gate exists for).
+                await awaitOutstandingClipboardWrite(rtfHash)
                 flushPendingCtrlV()
                 return
               }
@@ -7014,7 +7164,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (ch && ch.readyState === 'open') {
           const combinedHash = hashClipboardHtml(html, text)
           if (clipboardEchoGate.knows(combinedHash)) {
-            flushPendingCtrlV()
+            // Known content, but its write-ack may still be outstanding
+            // (gate records at SEND time) — hold the flush until it lands.
+            // Park the 50 ms fallback: the awaited path owns the flush now.
+            if (pendingCtrlV?.timer) {
+              clearTimeout(pendingCtrlV.timer)
+              pendingCtrlV.timer = null
+            }
+            void awaitOutstandingClipboardWrite(combinedHash).then(() => flushPendingCtrlV())
             return
           }
           const built = buildClipboardHtmlFrames(html, text)
@@ -7044,9 +7201,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (ch && ch.readyState === 'open') {
           const hash = hashClipboardText(text)
           if (clipboardEchoGate.knows(hash)) {
-            // v2 Ã¢ÂÂ auto-sync already delivered this exact content to
-            // the host; skip the redundant write and paste now.
-            flushPendingCtrlV()
+            // The gate records at SEND time, so the auto-sync write-ack may
+            // still be outstanding; flushing early pastes the STALE
+            // clipboard. Park the 50 ms fallback — the awaited path owns
+            // the flush now.
+            if (pendingCtrlV?.timer) {
+              clearTimeout(pendingCtrlV.timer)
+              pendingCtrlV.timer = null
+            }
+            void awaitOutstandingClipboardWrite(hash).then(() => flushPendingCtrlV())
             return
           }
           try {
@@ -7057,6 +7220,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
             // `max_message_size` ceiling.
             const { id } = sendClipboardWriteOverDc(ch, text)
             clipboardEchoGate.recordPushed(hash)
+            trackClipboardWrite(hash, id)
             if (supportsClipboardAck.value) {
               // v2 Ã¢ÂÂ flush the deferred keystroke only after the agent
               // confirms the OS clipboard write. Without this gate the
@@ -7087,6 +7251,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
     const onKeyDown = (e: KeyboardEvent) => onKey(e, true)
     const onKeyUp = (e: KeyboardEvent) => onKey(e, false)
+    // Alt-tab / minimize / OS steal: the matching keyups will never arrive —
+    // release everything we're holding on the host NOW. Registered even
+    // under Keyboard Lock (see createHeldInputTracker's doc).
+    const onWindowBlurInput = () => releaseHeldInputs()
+    const onVisibilityInput = () => {
+      if (globalThis.document.visibilityState === 'hidden') releaseHeldInputs()
+    }
 
     // Disable the OS-native context menu so right-click forwards cleanly.
     function onContextMenu(ev: MouseEvent) { ev.preventDefault() }
@@ -7104,6 +7275,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // Window-level listener with our own pendingCtrlV gating means
     // we only intercept paste events that follow a deferred Ctrl+V.
     window.addEventListener('paste', onPaste)
+    window.addEventListener('blur', onWindowBlurInput)
+    document.addEventListener('visibilitychange', onVisibilityInput)
     // rc.18: register on CAPTURE phase so we run BEFORE any focused
     // element's bubble-phase handlers. Combined with the per-handler
     // `stopPropagation` when pointer is inside, this stops a focused
@@ -7123,6 +7296,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       surface.removeEventListener('wheel', onWheel)
       surface.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('paste', onPaste)
+      // Release anything still held on the host BEFORE the channels close
+      // (detach mid-chord must not leave a stuck modifier behind).
+      releaseHeldInputs()
+      window.removeEventListener('blur', onWindowBlurInput)
+      document.removeEventListener('visibilitychange', onVisibilityInput)
       // Same `capture: true` as the add Ã¢ÂÂ required for matching.
       window.removeEventListener('keydown', onKeyDown, { capture: true })
       window.removeEventListener('keyup', onKeyUp, { capture: true })

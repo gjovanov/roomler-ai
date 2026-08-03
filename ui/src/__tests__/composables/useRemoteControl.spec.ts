@@ -34,6 +34,7 @@ import {
   hashClipboardText,
   hashClipboardHtml,
   createClipboardEchoGate,
+  createHeldInputTracker,
   buildClipboardImageFrames,
   buildClipboardHtmlFrames,
   buildClipboardNativeFrames,
@@ -3093,5 +3094,49 @@ describe('S3 resilience: timing constants', () => {
 
   it('watchdog cadence stays at 1 Hz so tick counts read as seconds', () => {
     expect(RC_WATCHDOG_TICK_MS).toBe(1000)
+  })
+})
+
+describe('createHeldInputTracker (stuck-Alt release, 2026-08-04)', () => {
+  it('tracks downs, clears on ups, releaseAll drains + empties', () => {
+    const t = createHeldInputTracker()
+    t.key(0xe2, true) // AltLeft
+    t.key(0x2b, true) // Tab
+    t.key(0x2b, false) // Tab released normally
+    t.button('left', true) // left mouse
+    expect(t.size()).toBe(2)
+
+    const held = t.releaseAll()
+    expect(held.keys).toEqual([0xe2])
+    expect(held.buttons).toEqual(['left'])
+    expect(t.size()).toBe(0)
+    // Idempotent: nothing left to release.
+    expect(t.releaseAll()).toEqual({ keys: [], buttons: [] })
+  })
+
+  it('alt-tab scenario: down-down then blur leaves exactly the un-upped keys', () => {
+    const t = createHeldInputTracker()
+    // Browser sees AltLeft down + Tab down, then the window blurs and the
+    // matching keyups never fire — this is the field-reported stuck Alt.
+    t.key(0xe2, true)
+    t.key(0x2b, true)
+    const held = t.releaseAll()
+    expect(held.keys).toEqual([0xe2, 0x2b])
+  })
+
+  it('re-press after release is tracked fresh (no ghost state)', () => {
+    const t = createHeldInputTracker()
+    t.key(0xe1, true)
+    t.releaseAll()
+    t.key(0xe1, true)
+    expect(t.releaseAll().keys).toEqual([0xe1])
+  })
+
+  it('duplicate downs collapse (auto-repeat must not multiply releases)', () => {
+    const t = createHeldInputTracker()
+    t.key(0x04, true)
+    t.key(0x04, true)
+    t.key(0x04, true)
+    expect(t.releaseAll().keys).toEqual([0x04])
   })
 })
