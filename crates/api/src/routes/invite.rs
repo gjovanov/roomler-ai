@@ -19,6 +19,9 @@ use roomler_ai_services::dao::{base::PaginationParams, invite::CreateInviteParam
 #[derive(Debug, Serialize)]
 pub struct InviteInfoResponse {
     pub code: String,
+    /// Routes are id-based — without this the invite page's "Go to
+    /// {tenant}" button had nothing to link to (it built `/tenant/` → 404).
+    pub tenant_id: String,
     pub tenant_name: String,
     pub tenant_slug: String,
     pub inviter_name: String,
@@ -124,6 +127,7 @@ pub async fn get_invite_info(
 
     Ok(Json(InviteInfoResponse {
         code: invite.code,
+        tenant_id: invite.tenant_id.to_hex(),
         tenant_name: tenant.name,
         tenant_slug: tenant.slug,
         inviter_name: inviter.display_name,

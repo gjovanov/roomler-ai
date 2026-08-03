@@ -28,7 +28,40 @@
           <v-card-text v-if="t.description">{{ t.description }}</v-card-text>
         </v-card>
       </v-col>
+      <!-- Creating a SECOND org used to be impossible: the create form
+           only rendered while you had zero tenants. -->
+      <v-col cols="12" sm="6" md="4">
+        <v-card
+          variant="outlined"
+          hover
+          class="d-flex align-center justify-center"
+          style="min-height: 96px; cursor: pointer"
+          @click="showCreate = true"
+        >
+          <div class="text-center text-medium-emphasis">
+            <v-icon size="28">mdi-plus</v-icon>
+            <div>New organization</div>
+          </div>
+        </v-card>
+      </v-col>
     </v-row>
+
+    <v-dialog v-model="showCreate" max-width="420">
+      <v-card>
+        <v-card-title>New organization</v-card-title>
+        <v-card-text>
+          <v-form ref="formRef" @submit.prevent="handleCreate">
+            <v-text-field v-model="name" label="Name" :rules="[rules.required]" @update:model-value="autoSlug" />
+            <v-text-field v-model="slug" label="Slug" hint="URL-friendly identifier, globally unique" :rules="[rules.required, rules.slug]" @update:model-value="slugTouched = true" />
+          </v-form>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showCreate = false">Cancel</v-btn>
+          <v-btn color="primary" @click="handleCreate">Create</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-container>
 </template>
 
@@ -47,6 +80,18 @@ const { rules } = useValidation()
 const formRef = ref()
 const name = ref('')
 const slug = ref('')
+const showCreate = ref(false)
+const slugTouched = ref(false)
+
+function autoSlug() {
+  if (!slugTouched.value) {
+    slug.value = name.value
+      .toLowerCase()
+      .trim()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+  }
+}
 
 async function handleCreate() {
   const { valid } = await formRef.value.validate()
@@ -56,7 +101,13 @@ async function handleCreate() {
     showSuccess('Workspace created')
     router.push(`/tenant/${tenant.id}`)
   } catch (e) {
-    showError(e instanceof Error ? e.message : 'Failed to create workspace')
+    const msg = e instanceof Error ? e.message : 'Failed to create workspace'
+    // tenants.slug is globally unique — put the dup-key case in words.
+    showError(
+      msg.includes('duplicate') || msg.includes('E11000')
+        ? 'That slug is already taken — pick another'
+        : msg,
+    )
   }
 }
 
