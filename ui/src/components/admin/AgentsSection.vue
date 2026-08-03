@@ -140,6 +140,17 @@
                     :title="nodeForAgent(a.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
                     @click="confirmEvict(nodeForAgent(a.id)!)"
                   />
+                  <v-list-item
+                    v-if="nodeForAgent(a.id)"
+                    prepend-icon="mdi-lan-connect"
+                    title="Overlay routes"
+                    :to="{ path: `/tenant//network/subnet-routes`, query: { node: nodeForAgent(a.id)!.id } }"
+                  />
+                  <v-list-item
+                    prepend-icon="mdi-shield-lock-outline"
+                    title="Overlay ACL"
+                    :to="{ path: `/tenant//network/acl`, query: { tab: 'overlay' } }"
+                  />
                   <v-divider />
                   <v-list-item
                     prepend-icon="mdi-delete"
@@ -431,6 +442,17 @@
                     prepend-icon="mdi-lan-disconnect"
                     :title="nodeForAgent(a.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
                     @click="confirmEvict(nodeForAgent(a.id)!)"
+                  />
+                  <v-list-item
+                    v-if="nodeForAgent(a.id)"
+                    prepend-icon="mdi-lan-connect"
+                    title="Overlay routes"
+                    :to="{ path: `/tenant//network/subnet-routes`, query: { node: nodeForAgent(a.id)!.id } }"
+                  />
+                  <v-list-item
+                    prepend-icon="mdi-shield-lock-outline"
+                    title="Overlay ACL"
+                    :to="{ path: `/tenant//network/acl`, query: { tab: 'overlay' } }"
                   />
                   <v-divider />
                   <v-list-item
@@ -774,7 +796,7 @@
   <!-- Subnet routes (mesh subnet-router, Phase 2 — MANAGE_AGENTS) -->
   <v-dialog v-model="routesDialogOpen" max-width="560">
     <v-card>
-      <v-card-title>Subnet routes</v-card-title>
+      <v-card-title>Tunnel mesh routes</v-card-title>
       <v-card-text>
         <p class="text-body-2 mb-3">
           CIDRs that <strong>{{ routesTarget?.name }}</strong> advertises for the
