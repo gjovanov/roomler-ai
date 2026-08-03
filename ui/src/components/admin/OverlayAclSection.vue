@@ -383,7 +383,7 @@ import {
 } from '@/stores/overlayAcl'
 import { useOverlayRoutesStore } from '@/stores/overlayRoutes'
 import { useRoleStore } from '@/stores/role'
-import { useMembersStore } from '@/stores/members'
+import { useMembersStore, type Member } from '@/stores/members'
 
 const props = defineProps<{ tenantId: string }>()
 const store = useOverlayAclStore()
@@ -423,8 +423,11 @@ const nodeItems = computed(() =>
 const roleItems = computed(() =>
   roleStore.roles.map((r) => ({ title: r.name, value: r.id })),
 )
+// The members store exposes its rows as `items` (not `members`) and is
+// page-1-only (25 rows) — fine for a small tenant, but a larger one needs a
+// search endpoint before this picker is complete.
 const memberItems = computed(() =>
-  membersStore.members.map((m) => ({
+  membersStore.items.map((m: Member) => ({
     title: m.display_name || m.nickname || m.user_id,
     value: m.user_id,
   })),
