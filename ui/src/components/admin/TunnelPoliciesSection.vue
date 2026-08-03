@@ -1,7 +1,7 @@
 <template>
   <v-card>
     <v-card-title class="d-flex align-center">
-      <span>Tunnel Policies</span>
+      <span>Tunnel ACL</span>
       <v-spacer />
       <v-btn
         prepend-icon="mdi-plus"
@@ -174,8 +174,28 @@
               style="max-width: 220px"
               @update:model-value="setSubjectKind(i, $event)"
             />
+            <!-- Pick from the fleet where a store already has the rows
+                 (agents / tunnel clients) — ids were hand-typed before. -->
+            <v-select
+              v-if="s.kind === 'agent_id'"
+              v-model="s.id"
+              :items="agentStore.agents.map((a) => ({ title: a.name, value: a.id }))"
+              :label="subjectIdLabel(s.kind)"
+              variant="outlined"
+              density="compact"
+              hide-details
+            />
+            <v-select
+              v-else-if="s.kind === 'tunnel_client_id'"
+              v-model="s.id"
+              :items="tunnelClientStore.clients.map((c) => ({ title: c.name, value: c.id }))"
+              :label="subjectIdLabel(s.kind)"
+              variant="outlined"
+              density="compact"
+              hide-details
+            />
             <v-text-field
-              v-if="s.kind !== 'all_users'"
+              v-else-if="s.kind !== 'all_users'"
               v-model="s.id"
               :label="subjectIdLabel(s.kind)"
               placeholder="24-hex ObjectId"
@@ -226,11 +246,11 @@
               style="max-width: 220px"
               @update:model-value="setTargetKind(i, $event)"
             />
-            <v-text-field
+            <v-select
               v-if="t.kind === 'agent_id'"
               v-model="t.id"
-              label="Agent ID"
-              placeholder="24-hex ObjectId"
+              :items="agentStore.agents.map((a) => ({ title: a.name, value: a.id }))"
+              label="Agent"
               variant="outlined"
               density="compact"
               hide-details
@@ -401,15 +421,25 @@ import {
   type TunnelPolicyCreate,
   useTunnelPolicyStore,
 } from '@/stores/tunnelPolicies'
+import { useAgentStore } from '@/stores/agents'
+import { useTunnelClientStore } from '@/stores/tunnelClients'
 
 const props = defineProps<{ tenantId: string }>()
 const store = useTunnelPolicyStore()
+// Fleet stores back the agent / tunnel-client PICKERS in the editor —
+// subjects/targets were hand-typed 24-hex ids before (2026-08-04).
+const agentStore = useAgentStore()
+const tunnelClientStore = useTunnelClientStore()
 
 const subjectKinds = [
   { title: 'All users', value: 'all_users' },
   { title: 'User ID', value: 'user_id' },
   { title: 'Role ID', value: 'role_id' },
-  { title: 'Tunnel-client ID', value: 'tunnel_client_id' },
+  { title: 'Tunnel client', value: 'tunnel_client_id' },
+  // 2026-08-04 — the wire supported AgentId subjects (node-stack
+  // unification P3b-2: an agent acting as a tunnel ORIGIN) but the picker
+  // never offered it.
+  { title: 'Agent', value: 'agent_id' },
 ]
 const targetKinds = [
   { title: 'All agents', value: 'all_agents' },
@@ -432,7 +462,7 @@ const saving = ref(false)
 const formError = ref<string | null>(null)
 
 interface FormSubject {
-  kind: 'all_users' | 'user_id' | 'role_id' | 'tunnel_client_id'
+  kind: 'all_users' | 'user_id' | 'role_id' | 'tunnel_client_id' | 'agent_id'
   id: string
 }
 interface FormTarget {
@@ -517,6 +547,7 @@ function subjectIdLabel(kind: string) {
     case 'user_id': return 'User ID'
     case 'role_id': return 'Role ID'
     case 'tunnel_client_id': return 'Tunnel-client ID'
+    case 'agent_id': return 'Agent ID'
     default: return 'ID'
   }
 }
@@ -654,6 +685,7 @@ function subjectLabel(s: PolicySubject): string {
     case 'user_id': return `User ${id}`
     case 'role_id': return `Role ${id}`
     case 'tunnel_client_id': return `Client ${id}`
+    case 'agent_id': return `Agent ${id}`
   }
 }
 
@@ -688,5 +720,9 @@ function formatBytes(n: number): string {
 
 onMounted(() => {
   store.fetchPolicies(props.tenantId)
+  if (agentStore.agents.length === 0) agentStore.fetchAgents(props.tenantId)
+  if (tunnelClientStore.clients.length === 0) {
+    tunnelClientStore.fetchTunnelClients(props.tenantId)
+  }
 })
 </script>
