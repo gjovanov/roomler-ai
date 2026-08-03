@@ -249,6 +249,9 @@ impl OverlayRuntime {
             if heard {
                 e.last_rx_at = now;
             }
+            // P4 — snapshot the ingress-ACL denial counter for the LocalAPI
+            // view. Monotonic, so a plain read (not a drain like `rx_any`).
+            e.rx_denied = wg.peer_rx_denied(&e.pubkey);
             // The peer exists (peer_traffic answered just above, no await in
             // between), so the latch read always answers too — the `else` is
             // unreachable belt-and-braces.
