@@ -299,6 +299,18 @@ async fn handle_overlay_join(
         .filter_map(|n| shape_peer(&acl, &joiner_src, n, is_reachable(&reach, n)))
         .collect();
 
+    // Overlay ACL — refresh the DERP relay allow table off the join path. A
+    // join is when a NEW pubkey can enter the network, and the table is keyed by
+    // pubkey, so it would otherwise stay stale (fail-open) for that node until
+    // the next policy edit. Spawned: it re-reads every node, and the joiner must
+    // not wait on that to get its netmap.
+    if acl.gating() {
+        let st = state.clone();
+        tokio::spawn(async move {
+            super::derp_acl::rebuild(&st, tenant_id, network_id).await;
+        });
+    }
+
     // Phase 2 MagicDNS — carry the tenant's DNS suffix + upstreams so the node
     // brings up its split-DNS resolver. Absent tenant settings → MagicDNS off.
     let (magic_domain, nameservers) = match state.tenants.base.find_by_id(tenant_id).await {
@@ -1194,7 +1206,7 @@ fn is_reachable(reach: &HashMap<ObjectId, bool>, node: &OverlayNode) -> bool {
 /// per-flow tunnel gate, so there is nothing to cache yet.
 pub(crate) struct AclCtx {
     mode: OverlayAclMode,
-    policies: Vec<OverlayPolicy>,
+    pub(crate) policies: Vec<OverlayPolicy>,
 }
 
 impl AclCtx {
@@ -1204,8 +1216,14 @@ impl AclCtx {
             policies: Vec::new(),
         }
     }
-    fn enforcing(&self) -> bool {
+    pub(crate) fn enforcing(&self) -> bool {
         matches!(self.mode, OverlayAclMode::Enforce)
+    }
+    /// `true` when the ACL is doing anything at all (`Warn` or `Enforce`).
+    /// `Warn` still evaluates — that's what produces the pre-cutover evidence —
+    /// so "is a table worth building?" is this, not [`enforcing`](Self::enforcing).
+    pub(crate) fn gating(&self) -> bool {
+        !matches!(self.mode, OverlayAclMode::Off)
     }
 }
 
@@ -1216,7 +1234,7 @@ impl AclCtx {
 /// every peer and tear down the tenant's whole mesh on a transient Mongo blip.
 /// The same reasoning already governs `reachability()` above ("failing open").
 /// A load failure is logged at ERROR so it is never silent.
-async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
+pub(crate) async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
     let mode = match state.overlay_networks.get_or_create(tenant_id).await {
         Ok(n) => n.acl_mode,
         Err(e) => {
@@ -1243,7 +1261,7 @@ async fn load_acl(state: &AppState, tenant_id: ObjectId) -> AclCtx {
 /// Resolve the identity a netmap is being built FOR: the node itself, plus the
 /// owner + roles of its backing agent / tunnel client so `UserId` / `RoleId`
 /// selectors can match.
-async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> OverlaySource {
+pub(crate) async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> OverlaySource {
     let owner_user_id = match &node.node_ref {
         NodeRef::Agent { agent_id } => state
             .agents
