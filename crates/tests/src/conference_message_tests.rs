@@ -205,7 +205,9 @@ async fn room_message_ws_broadcast() {
     assert_eq!(parsed["data"]["content"], "Hello from admin!");
     assert_eq!(parsed["data"]["room_id"], room_id);
 
-    // Admin connects WS to verify sender exclusion
+    // Admin connects a SECOND browser (another WS of the same user) — since
+    // 2026-08-04 the broadcast includes the sender, so the sender's other
+    // devices get realtime messages too (the client dedups by id).
     let ws_url_admin = format!("ws://{}/ws?token={}", app.addr, tenant.admin.access_token);
     let (mut ws_admin, _) = tokio_tungstenite::connect_async(&ws_url_admin)
         .await
@@ -224,21 +226,15 @@ async fn room_message_ws_broadcast() {
     .await
     .unwrap();
 
-    // Admin should NOT receive their own message via WS
-    let admin_msg =
-        tokio::time::timeout(std::time::Duration::from_millis(500), ws_admin.next()).await;
-    match admin_msg {
-        Ok(Some(Ok(msg))) => {
-            let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-            assert_ne!(
-                parsed["type"], "message:create",
-                "Sender should not receive their own message via WS"
-            );
-        }
-        _ => {
-            // Timeout or closed — correct, admin should not receive their own message
-        }
-    }
+    // The admin's other connection MUST receive it (multi-device realtime)
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws_admin.next())
+        .await
+        .expect("sender's other connection must receive message:create")
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    assert_eq!(parsed["type"], "message:create");
+    assert_eq!(parsed["data"]["content"], "Second message");
 
     ws_member.close(None).await.ok();
     ws_admin.close(None).await.ok();
