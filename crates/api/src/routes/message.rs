@@ -221,7 +221,12 @@ pub async fn create(
         .copied()
         .collect();
 
-    // Broadcast via WebSocket to room members (exclude sender)
+    // Broadcast via WebSocket to ALL room members INCLUDING the sender
+    // (2026-08-04): sends are fanned out per user, so excluding the sender's
+    // user id starved their OTHER browsers/devices of realtime messages.
+    // The client dedups by message id (the sending tab already appended the
+    // POST response), and skips unread/badge work for its own messages.
+    // Mentions + push below keep their own sender-excluded list.
     let response = to_response(message, &names, Some(auth.user_id));
     let event = serde_json::json!({
         "type": "message:create",
@@ -230,7 +235,7 @@ pub async fn create(
     crate::ws::dispatcher::broadcast_with_redis(
         &state.ws_storage,
         &state.redis_pubsub,
-        &member_ids_excluding_sender,
+        &all_member_ids,
         &event,
     )
     .await;
@@ -338,14 +343,9 @@ pub async fn update(
         .unwrap_or_default();
     let response = to_response(updated, &names, Some(auth.user_id));
 
-    // Broadcast full message to room members (exclude sender)
-    let member_ids: Vec<ObjectId> = state
-        .rooms
-        .find_member_user_ids(rid)
-        .await?
-        .into_iter()
-        .filter(|id| *id != auth.user_id)
-        .collect();
+    // Broadcast to ALL members incl. the sender — reaches their other
+    // browsers/devices; the client applies updates idempotently by id.
+    let member_ids: Vec<ObjectId> = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
         "type": "message:update",
         "data": &response,
@@ -387,13 +387,9 @@ pub async fn delete(
 
     state.messages.base.soft_delete_in_tenant(tid, mid).await?;
 
-    let member_ids: Vec<ObjectId> = state
-        .rooms
-        .find_member_user_ids(rid)
-        .await?
-        .into_iter()
-        .filter(|id| *id != auth.user_id)
-        .collect();
+    // All members incl. the sender — reaches their other browsers/devices;
+    // delete-by-id is idempotent client-side.
+    let member_ids: Vec<ObjectId> = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
         "type": "message:delete",
         "data": {
@@ -624,6 +620,28 @@ pub async fn mark_read(
         .messages
         .mark_read(rid, auth.user_id, &message_ids)
         .await?;
+
+    Ok(Json(serde_json::json!({ "marked": modified })))
+}
+
+/// Mark EVERY unread message in the room read for the caller (same filter
+/// as `unread_count`, so the badge reliably reaches 0). Invoked when a room
+/// is opened — Slack-style auto-clear (2026-08-04 user decision).
+pub async fn read_all(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, room_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
+
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+
+    let modified = state.messages.mark_all_read(rid, auth.user_id).await?;
 
     Ok(Json(serde_json::json!({ "marked": modified })))
 }

@@ -46,21 +46,11 @@ export interface FileEntry {
   created_at: string
 }
 
-export interface ChatMsg {
-  id: string
-  room_id: string
-  author_id: string
-  display_name: string
-  content: string
-  created_at: string
-}
-
 export const useRoomStore = defineStore('rooms', () => {
   const rooms = ref<Room[]>([])
   const current = ref<Room | null>(null)
   const participants = ref<Participant[]>([])
   const loading = ref(false)
-  const chatMessages = ref<ChatMsg[]>([])
   const roomFiles = ref<FileEntry[]>([])
   const filesLoading = ref(false)
 
@@ -176,33 +166,6 @@ export const useRoomStore = defineStore('rooms', () => {
     return data.items
   }
 
-  // --- In-call chat ---
-  async function fetchChatMessages(tenantId: string, roomId: string) {
-    const data = await api.get<{ items: ChatMsg[] }>(
-      `/tenant/${tenantId}/room/${roomId}/call/message`,
-    )
-    chatMessages.value = data.items
-  }
-
-  async function sendChatMessage(tenantId: string, roomId: string, content: string) {
-    const msg = await api.post<ChatMsg>(
-      `/tenant/${tenantId}/room/${roomId}/call/message`,
-      { content },
-    )
-    chatMessages.value.push(msg)
-    return msg
-  }
-
-  function addChatMessageFromWs(msg: ChatMsg) {
-    if (!chatMessages.value.some((m) => m.id === msg.id)) {
-      chatMessages.value.push(msg)
-    }
-  }
-
-  function clearChatMessages() {
-    chatMessages.value = []
-  }
-
   // --- Call status updates (from WS) ---
   function updateRoomCallStatus(roomId: string, conferenceStatus: string | null, participantCount?: number) {
     const room = rooms.value.find(r => r.id === roomId)
@@ -289,6 +252,18 @@ export const useRoomStore = defineStore('rooms', () => {
     unreadCounts.value[roomId] = (unreadCounts.value[roomId] || 0) + 1
   }
 
+  /// Mark EVERY unread message in the room read (server-side, same filter as
+  /// the unread count) and zero the badge. Called when the room is opened —
+  /// Slack-style auto-clear; also heals historically stuck counts.
+  async function markAllRead(tenantId: string, roomId: string) {
+    try {
+      await api.post(`/tenant/${tenantId}/room/${roomId}/message/read-all`)
+      unreadCounts.value[roomId] = 0
+    } catch {
+      // non-critical
+    }
+  }
+
   return {
     // State
     rooms,
@@ -317,12 +292,6 @@ export const useRoomStore = defineStore('rooms', () => {
     leaveCall,
     endCall,
     fetchParticipants,
-    // In-call chat
-    chatMessages,
-    fetchChatMessages,
-    sendChatMessage,
-    addChatMessageFromWs,
-    clearChatMessages,
     // Room files
     fetchRoomFiles,
     uploadRoomFile,
@@ -334,6 +303,7 @@ export const useRoomStore = defineStore('rooms', () => {
     fetchUnreadCount,
     fetchAllUnreadCounts,
     markMessagesRead,
+    markAllRead,
     incrementUnread,
   }
 })
