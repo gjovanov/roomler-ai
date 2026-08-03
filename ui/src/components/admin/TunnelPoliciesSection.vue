@@ -685,6 +685,7 @@ function subjectLabel(s: PolicySubject): string {
     case 'user_id': return `User ${id}`
     case 'role_id': return `Role ${id}`
     case 'tunnel_client_id': return `Client ${id}`
+    case 'agent_id': return `Agent ${id}`
   }
 }
 
