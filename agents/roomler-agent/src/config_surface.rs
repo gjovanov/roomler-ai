@@ -115,7 +115,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_rpf",
         "string",
-        "P4 - reverse-path filtering of inbound overlay packets (drop a source address the sending peer does not own): warn (count + log, still deliver - built-in default) | enforce | off. Env: ROOMLER_NODE_OVERLAY_RPF.",
+        "P4 - ingress filtering of inbound overlay packets: drops a SOURCE address the sending peer does not own, and a DESTINATION outside the subnets this node advertises. warn (count + log, still deliver - built-in default) | enforce | off. Env: ROOMLER_NODE_OVERLAY_RPF.",
     ),
     (
         "overlay_route_events",
