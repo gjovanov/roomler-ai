@@ -1263,6 +1263,24 @@ pub struct NetmapPeer {
         with = "option_oid_hex"
     )]
     pub agent_id: Option<ObjectId>,
+    /// P4 — **server-compiled ingress rules**: what THIS peer may address when
+    /// its packets arrive at the recipient of this netmap. Per-(recipient,peer),
+    /// which is why it lives on the peer entry rather than on the network.
+    ///
+    /// Compiled from `overlay_policies` by evaluating the REVERSE direction
+    /// (this peer as the source, the recipient as the `via` router), so the node
+    /// never sees policy documents and a policy edit rides the existing
+    /// netmap-delta fan-out — no restart, no new message type.
+    ///
+    /// `None` vs `Some(vec![])` is load-bearing and must not be collapsed:
+    /// **`None`** = no rules compiled (a pre-P4 server, or the tenant's
+    /// `acl_mode` is `off`) ⇒ the node falls back to its coarse
+    /// [`LocalScope`](../../tunnel_core/overlay/router/struct.LocalScope.html)
+    /// check only. **`Some(vec![])`** = the ACL ran and granted this peer
+    /// nothing ⇒ deny. Skipped when absent so a pre-P4 node's wire shape is
+    /// unchanged (13 serde wire-lock tests depend on that).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_rules: Option<Vec<crate::models::OverlayRule>>,
 }
 
 /// Network-wide parameters carried in a full netmap so the node can size
@@ -2427,15 +2445,54 @@ mod tests {
                 supports_derp: true,
                 routes: vec!["10.0.0.0/24".into()],
                 agent_id: Some(agent_id),
+                ingress_rules: None,
             }],
             epoch: 7,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.netmap""#));
+        // P4 — an un-compiled `ingress_rules` must be ABSENT from the wire, not
+        // `null`: a pre-P4 node's netmap shape has to stay byte-identical, and
+        // `None` (no ACL) must never be confused with `Some([])` (denied).
+        assert!(!s.contains("ingress_rules"));
         // Both node_id AND the populated agent_id are bare hex on the wire (no
         // $oid) — the latter locks the `option_oid_hex` serde (a bare
         // `Option<ObjectId>` would leak bson `{"$oid":…}`, the B1 trap).
         assert!(!s.contains("$oid"));
+
+        // …and when rules ARE compiled they round-trip, including the
+        // Some([]) = "denied" shape that must survive as distinct from None.
+        let mut m2 = m.clone();
+        if let ServerMsg::OverlayNetmap { peers, .. } = &mut m2 {
+            peers[0].ingress_rules = Some(vec![crate::models::OverlayRule {
+                cidr: "10.66.0.0/16".into(),
+                port_range: crate::models::PortRange { low: 22, high: 22 },
+                proto: crate::models::ProtocolKind::Tcp,
+            }]);
+        }
+        let s2 = serde_json::to_string(&m2).unwrap();
+        assert!(s2.contains(r#""cidr":"10.66.0.0/16""#));
+        assert!(s2.contains(r#""proto":"tcp""#));
+        let back: ServerMsg = serde_json::from_str(&s2).unwrap();
+        let ServerMsg::OverlayNetmap { peers, .. } = &back else {
+            panic!("wrong variant");
+        };
+        let rules = peers[0].ingress_rules.as_ref().unwrap();
+        assert_eq!(rules[0].port_range.high, 22);
+
+        let mut m3 = m.clone();
+        if let ServerMsg::OverlayNetmap { peers, .. } = &mut m3 {
+            peers[0].ingress_rules = Some(Vec::new());
+        }
+        let back3: ServerMsg = serde_json::from_str(&serde_json::to_string(&m3).unwrap()).unwrap();
+        let ServerMsg::OverlayNetmap { peers, .. } = &back3 else {
+            panic!("wrong variant");
+        };
+        assert_eq!(
+            peers[0].ingress_rules.as_deref(),
+            Some(&[][..]),
+            "Some([]) must survive the wire as DENY, never decay to None"
+        );
         assert!(s.contains("\"507f1f77bcf86cd799439011\""));
         assert!(s.contains("\"aaaaaaaaaaaaaaaaaaaaaaaa\""));
         match serde_json::from_str::<ServerMsg>(&s).unwrap() {

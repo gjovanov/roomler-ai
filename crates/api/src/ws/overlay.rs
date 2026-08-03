@@ -43,7 +43,9 @@ use roomler_ai_remote_control::{
 use roomler_ai_services::dao::base::DaoError;
 use tokio::net::lookup_host;
 use tracing::{debug, warn};
-use tunnel_core::policy::{OverlayPeerRef, OverlaySource, evaluate_overlay};
+use tunnel_core::policy::{
+    OverlayPeerRef, OverlaySource, evaluate_overlay, evaluate_overlay_ingress,
+};
 
 use crate::state::{AppState, build_turn_config};
 
@@ -293,11 +295,26 @@ async fn handle_overlay_join(
     // node; the delta fan-out below is the half that had to be un-broadcast.
     let acl = load_acl(state, tenant_id).await;
     let joiner_src = overlay_source_of(state, &self_node).await;
-    let peers: Vec<NetmapPeer> = all
-        .iter()
-        .filter(|n| n.id != self_node.id)
-        .filter_map(|n| shape_peer(&acl, &joiner_src, n, is_reachable(&reach, n)))
-        .collect();
+    let mut peers: Vec<NetmapPeer> = Vec::new();
+    for n in all.iter().filter(|n| n.id != self_node.id) {
+        // P4 — resolving the peer's own identity costs up to 2 reads, so do it
+        // ONLY when the tenant is enforcing and the rules will actually ship.
+        // An `off`/`warn` tenant's join path is unchanged.
+        let peer_src = if acl.enforcing() {
+            Some(overlay_source_of(state, n).await)
+        } else {
+            None
+        };
+        if let Some(p) = shape_peer(
+            &acl,
+            &joiner_src,
+            n,
+            peer_src.as_ref(),
+            is_reachable(&reach, n),
+        ) {
+            peers.push(p);
+        }
+    }
 
     // Overlay ACL — refresh the DERP relay allow table off the join path. A
     // join is when a NEW pubkey can enter the network, and the table is keyed by
@@ -354,7 +371,10 @@ async fn handle_overlay_join(
     // the removes branch tears down the WG peer, its route and its carrier.
     for peer in all.iter().filter(|n| n.id != self_node.id) {
         let peer_src = overlay_source_of(state, peer).await;
-        let (upserts, removes) = match shape_peer(&acl, &peer_src, &self_node, true) {
+        // The shaped peer here is the JOINER, whose identity we already have.
+        let joiner_ingress = acl.enforcing().then_some(&joiner_src);
+        let (upserts, removes) = match shape_peer(&acl, &peer_src, &self_node, joiner_ingress, true)
+        {
             Some(u) => (vec![u], vec![]),
             None => (vec![], vec![self_node.id.unwrap_or_default()]),
         };
@@ -948,9 +968,16 @@ async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, rea
         }
     };
     let acl = load_acl(state, node.tenant_id).await;
+    // P4 — the fanned node is the SHAPED peer for every recipient, so its
+    // identity is resolved once, not per recipient.
+    let node_src = if acl.enforcing() {
+        Some(overlay_source_of(state, node).await)
+    } else {
+        None
+    };
     for peer in peers.iter().filter(|p| p.id != node.id) {
         let src = overlay_source_of(state, peer).await;
-        let (upserts, removes) = match shape_peer(&acl, &src, node, reachable) {
+        let (upserts, removes) = match shape_peer(&acl, &src, node, node_src.as_ref(), reachable) {
             Some(u) => (vec![u], vec![]),
             None => (vec![], vec![node.id.unwrap_or_default()]),
         };
@@ -1298,10 +1325,17 @@ pub(crate) async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> O
 /// In `Warn` mode the permissive peer is returned but every difference is
 /// logged, which is what makes the cutover to `Enforce` evidence-driven rather
 /// than a leap of faith.
+/// `peer_src` is the PEER's own identity, needed to compile the ingress rules it
+/// may use against this recipient — the reverse direction of the visibility
+/// question. `None` ⇒ ship no rules (`ingress_rules: None`), which the node
+/// reads as "the ACL compiled nothing, fall back to the coarse local scope".
+/// Callers pass `None` unless the tenant is ENFORCING, so `warn` can never cause
+/// a node to drop: warn's whole contract is that it observes and never denies.
 fn shape_peer(
     acl: &AclCtx,
     src: &OverlaySource,
     peer: &OverlayNode,
+    peer_src: Option<&OverlaySource>,
     reachable: bool,
 ) -> Option<NetmapPeer> {
     if matches!(acl.mode, OverlayAclMode::Off) {
@@ -1332,6 +1366,13 @@ fn shape_peer(
     }
     let mut shaped = to_netmap_peer(peer, reachable);
     shaped.routes = access.routes;
+    // P4 — per-source ingress rules: what THIS peer may address through the
+    // recipient, including the port/proto dimensions `routes` cannot carry.
+    // Always `Some` when compiled, even when empty — an empty grant is a DENY
+    // and must not be confused with "no ACL".
+    if let Some(ps) = peer_src {
+        shaped.ingress_rules = Some(evaluate_overlay_ingress(&acl.policies, ps, src.node_id));
+    }
     Some(shaped)
 }
 
