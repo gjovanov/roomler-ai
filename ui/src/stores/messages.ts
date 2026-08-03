@@ -54,14 +54,25 @@ export const useMessageStore = defineStore('messages', () => {
   // Track which emojis the current user has reacted with per message: { message_id: Set<emoji> }
   const userReactions = ref<Record<string, Set<string>>>({})
 
+  // Room whose messages currently fill `messages` — WS-pushed messages for
+  // OTHER rooms must not leak into the open list (they used to be appended
+  // to whatever room was on screen).
+  const currentRoomId = ref<string | null>(null)
+
   async function fetchMessages(tenantId: string, roomId: string) {
     loading.value = true
     hasMore.value = true
+    currentRoomId.value = roomId
     try {
       const data = await api.get<{ items: Message[]; total: number }>(
         `/tenant/${tenantId}/room/${roomId}/message?per_page=${PAGE_SIZE}`,
       )
-      messages.value = data.items
+      // The wire is newest-first (DESC, locked by pagination tests); the UI
+      // renders top→bottom ascending and anchors at the bottom, so reverse
+      // each page on ingest. (2026-08-04: rendering the DESC page raw put
+      // the newest messages at the TOP while the view scrolled to the
+      // bottom — "my messages are gone after refresh".)
+      messages.value = [...data.items].reverse()
       hasMore.value = data.items.length < data.total
     } finally {
       loading.value = false
@@ -72,6 +83,9 @@ export const useMessageStore = defineStore('messages', () => {
     if (loadingMore.value || !hasMore.value || messages.value.length === 0) return
     loadingMore.value = true
     try {
+      // Ascending store ⇒ [0] IS the oldest. (Under the old DESC store this
+      // grabbed the NEWEST message, so `before` re-fetched the same page
+      // forever and genuinely older messages were unreachable.)
       const oldest = messages.value[0]
       const data = await api.get<{ items: Message[]; total: number }>(
         `/tenant/${tenantId}/room/${roomId}/message?per_page=${PAGE_SIZE}&before=${oldest.created_at}`,
@@ -79,7 +93,10 @@ export const useMessageStore = defineStore('messages', () => {
       if (data.items.length === 0) {
         hasMore.value = false
       } else {
-        messages.value = [...data.items, ...messages.value]
+        const known = new Set(messages.value.map((m) => m.id))
+        const older = [...data.items].reverse().filter((m) => !known.has(m.id))
+        messages.value = [...older, ...messages.value]
+        if (data.items.length < PAGE_SIZE) hasMore.value = false
       }
     } finally {
       loadingMore.value = false
@@ -227,6 +244,9 @@ export const useMessageStore = defineStore('messages', () => {
   }
 
   function addMessageFromWs(msg: Message) {
+    // Only the open room's list should grow — a message for another room is
+    // handled via the unread badge, not by leaking into this view.
+    if (currentRoomId.value && msg.room_id !== currentRoomId.value) return
     if (msg.thread_id) {
       if (!threadMessages.value.some((m) => m.id === msg.id)) {
         threadMessages.value.push(msg)
@@ -253,6 +273,7 @@ export const useMessageStore = defineStore('messages', () => {
   return {
     messages,
     threadMessages,
+    currentRoomId,
     loading,
     loadingMore,
     hasMore,

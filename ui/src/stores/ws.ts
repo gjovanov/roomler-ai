@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { useAuthStore } from './auth'
 import { useRoomStore } from './rooms'
 import { useMessageStore } from './messages'
 import { useNotificationStore } from './notification'
@@ -37,6 +38,9 @@ export const useWsStore = defineStore('ws', () => {
   // arrive via the Redis fan-out, so a multi-tenant user loses nothing.
   let affinityTid: string | null = null
   let lastToken: string | null = null
+  // True once a socket has opened — a later open is a RE-connect and the
+  // shell must resync state that WS pushes would have delivered meanwhile.
+  let hadConnection = false
 
   function wsUrl(token: string): string {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -95,6 +99,12 @@ export const useWsStore = defineStore('ws', () => {
 
     socket.onopen = () => {
       status.value = 'connected'
+      // Anything that arrived while the socket was down is lost — let the
+      // shell (AppLayout) refetch rooms/unread/current messages on re-open.
+      if (hadConnection) {
+        window.dispatchEvent(new CustomEvent('ws:reconnected'))
+      }
+      hadConnection = true
       pingInterval = setInterval(() => {
         if (socket?.readyState === WebSocket.OPEN) {
           socket.send(JSON.stringify({ type: 'ping' }))
@@ -156,9 +166,14 @@ export const useWsStore = defineStore('ws', () => {
     switch (msg.type) {
       case 'message:create': {
         messageStore.addMessageFromWs(msg.data as never)
-        // Increment unread count if user is not viewing this room
-        const msgData = msg.data as { room_id?: string }
-        if (msgData.room_id) {
+        // Increment unread count if user is not viewing this room — but
+        // NEVER for the user's own messages: since 2026-08-04 the server
+        // broadcasts to ALL members including the sender (so their other
+        // browsers get realtime), and a self-echo must not inflate badges.
+        const msgData = msg.data as { room_id?: string; author_id?: string }
+        const selfId = useAuthStore().user?.id
+        const isOwn = !!selfId && msgData.author_id === selfId
+        if (msgData.room_id && !isOwn) {
           const roomStore = useRoomStore()
           if (roomStore.current?.id !== msgData.room_id) {
             roomStore.incrementUnread(msgData.room_id)
@@ -174,10 +189,6 @@ export const useWsStore = defineStore('ws', () => {
         break
       case 'message:reaction':
         messageStore.handleReactionFromWs(msg.data as never)
-        break
-      case 'call:message:create':
-        // Legacy call chat event — route to message store for backwards compat
-        messageStore.addMessageFromWs(msg.data as never)
         break
       case 'task:update':
         taskStore.updateFromWs(msg.data as never)
