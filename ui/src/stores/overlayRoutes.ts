@@ -20,6 +20,10 @@ export interface OverlayNode {
   // address. `false` means the device is gone and the eviction is permanent.
   will_rejoin: boolean
   last_seen_at: string
+  // Backing device FK (2026-08-04) — the unified Devices page joins a node
+  // to its agent / tunnel-client row on these (name is a lossy DNS label).
+  agent_id?: string
+  tunnel_client_id?: string
 }
 
 interface OverlayNodeListResponse {
