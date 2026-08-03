@@ -56,7 +56,7 @@ pub async fn enable(overlay_cidr: &str, advertised_routes: &[String]) -> SubnetR
             active: false,
         };
     }
-    let fully_ok = setup(overlay_cidr).await;
+    let fully_ok = setup(overlay_cidr, advertised_routes).await;
     // Arm the guard on any platform where `setup` installs rules, so `Drop`
     // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
     // idempotent — reverting an absent rule is a harmless no-op). `fully_ok`
@@ -78,7 +78,7 @@ pub async fn enable(overlay_cidr: &str, advertised_routes: &[String]) -> SubnetR
 }
 
 #[cfg(target_os = "linux")]
-async fn setup(overlay_cidr: &str) -> bool {
+async fn setup(overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
     // Global forwarding (leave it on at teardown — another service may rely on
     // it; we only remove our own rules).
     let _ = run(vec![
@@ -211,7 +211,7 @@ async fn setup_v6() {
 }
 
 #[cfg(target_os = "windows")]
-async fn setup(overlay_cidr: &str) -> bool {
+async fn setup(overlay_cidr: &str, advertised_routes: &[String]) -> bool {
     // P5/S3b — WinNAT (`New-NetNat`) has NO IPv6 API, so a Windows exit node
     // cannot NAT v6. Clients routing through a Windows exit stay v6-fail-closed
     // (their global v6 is encapsulated but dropped here — never leaked). v6 exit
@@ -219,18 +219,70 @@ async fn setup(overlay_cidr: &str) -> bool {
     info!(
         "overlay: IPv6 exit NAT unavailable on Windows (WinNAT is v4-only); v6 stays fail-closed"
     );
-    // Forwarding on the overlay NIC. The LAN adapter's forwarding is normally
-    // already on; enabling every interface is heavy-handed, so we do the roomler
-    // NIC and rely on WinNAT for the address translation.
-    let _ = run(vec![
+    // Forwarding on the overlay NIC **and on the EGRESS NIC for each advertised
+    // route**.
+    //
+    // The previous version enabled only `roomler`, on the assumption that "the
+    // LAN adapter's forwarding is normally already on". That is FALSE on
+    // Windows: every interface ships `Forwarding: Disabled`, and Windows only
+    // forwards a packet when forwarding is enabled on BOTH the ingress and the
+    // egress interface. So the subnet router accepted overlay packets and then
+    // silently dropped them — peers had the OS route installed and every TCP
+    // connection still timed out.
+    //
+    // Field-diagnosed on CORPLAP-1 2026-08-03: `roomler` Enabled, every other NIC
+    // Disabled, `Get-NetNat` healthy — the subnet router had been dead for a
+    // week while the agent logged "forwarding + NAT enabled".
+    //
+    // The egress NIC is DERIVED PER ROUTE via `Find-NetRoute` rather than
+    // hardcoded to Ethernet/Wi-Fi: a corp route is very often carried by a VPN
+    // adapter (Check Point / AnyConnect WAN miniports), which is exactly the
+    // deployment a subnet router exists for. Only the interfaces that actually
+    // carry an advertised route are touched — still far short of "enable every
+    // interface".
+    //
+    // The script VERIFIES the resulting state and exits non-zero on failure,
+    // because `run` can only observe the PowerShell process exit code and
+    // `-ErrorAction SilentlyContinue` would otherwise report success for a
+    // cmdlet that never applied.
+    let targets = advertised_routes
+        .iter()
+        .map(|c| format!("'{}'", c.trim().replace('\'', "")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let fwd_ok = run(vec![
         "powershell".into(),
         "-NoProfile".into(),
         "-Command".into(),
-        "Set-NetIPInterface -InterfaceAlias roomler -Forwarding Enabled \
-         -ErrorAction SilentlyContinue"
-            .into(),
+        format!(
+            "$fail = 0; \
+             Set-NetIPInterface -InterfaceAlias roomler -AddressFamily IPv4 \
+               -Forwarding Enabled -ErrorAction SilentlyContinue; \
+             if ((Get-NetIPInterface -InterfaceAlias roomler -AddressFamily IPv4 \
+               -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding \
+               -ne 'Enabled') {{ $fail = 1 }}; \
+             foreach ($c in @({targets})) {{ \
+               $ip = ($c -split '/')[0]; \
+               $r = Find-NetRoute -RemoteIPAddress $ip -ErrorAction SilentlyContinue | \
+                 Select-Object -First 1; \
+               if (-not $r) {{ continue }}; \
+               Set-NetIPInterface -ifIndex $r.InterfaceIndex -AddressFamily IPv4 \
+                 -Forwarding Enabled -ErrorAction SilentlyContinue; \
+               if ((Get-NetIPInterface -ifIndex $r.InterfaceIndex -AddressFamily IPv4 \
+                 -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding \
+                 -ne 'Enabled') {{ $fail = 1 }} \
+             }}; \
+             exit $fail"
+        ),
     ])
     .await;
+    if !fwd_ok {
+        warn!(
+            "overlay: could not enable IPv4 forwarding on the overlay NIC and/or an \
+             advertised route's egress NIC — the subnet router will accept packets and \
+             drop them. Check `Get-NetIPInterface | ft ifIndex,InterfaceAlias,Forwarding`."
+        );
+    }
     // Create the NAT only if no existing WinNAT covers this prefix (Docker
     // Desktop / WSL2 also use WinNAT and overlapping prefixes are rejected).
     run(vec![
@@ -249,7 +301,7 @@ async fn setup(overlay_cidr: &str) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-async fn setup(_overlay_cidr: &str) -> bool {
+async fn setup(_overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
     false
 }
 
