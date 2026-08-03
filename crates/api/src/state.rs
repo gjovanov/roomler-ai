@@ -15,10 +15,11 @@ use roomler_ai_services::{
         activation_code::ActivationCodeDao, agent::AgentDao, consent_request::ConsentRequestDao,
         file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
         overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
-        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
-        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
-        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
+        overlay_policy::OverlayPolicyDao, push_subscription::PushSubscriptionDao,
+        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
+        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao, tenant::TenantDao,
+        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
+        tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -136,6 +137,9 @@ pub struct AppState {
     // Overlay-network subsystem (Tailscale-style L3 mesh)
     pub overlay_networks: Arc<OverlayNetworkDao>,
     pub overlay_nodes: Arc<OverlayNodeDao>,
+    /// Overlay L3 ACL. Read on every netmap event (join / leave / admin edit),
+    /// not per flow — the overlay data plane never touches the server.
+    pub overlay_policies: Arc<OverlayPolicyDao>,
     /// Connection-lifetime WS outbound channels for **tunnel-client**
     /// overlay nodes, keyed by `tunnel_client_id` (agent nodes are
     /// reached via [`Hub::send_to_agent`]). Used by the overlay broker
@@ -549,6 +553,7 @@ impl AppState {
         // Overlay-network subsystem
         let overlay_networks = Arc::new(OverlayNetworkDao::new(&db));
         let overlay_nodes = Arc::new(OverlayNodeDao::new(&db));
+        let overlay_policies = Arc::new(OverlayPolicyDao::new(&db));
 
         let state = Self {
             db,
@@ -599,6 +604,7 @@ impl AppState {
             tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
             overlay_networks,
             overlay_nodes,
+            overlay_policies,
             overlay_nodes_by_id: Arc::new(DashMap::new()),
             derp_registry: derp_registry.clone(),
             derp_cancels: Arc::new(DashMap::new()),
