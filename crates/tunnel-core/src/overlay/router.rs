@@ -208,6 +208,15 @@ impl LocalScope {
     pub fn is_unconstrained(&self) -> bool {
         self.unconstrained
     }
+
+    /// Is `dst` this node's OWN overlay address (rather than something it would
+    /// forward)? Per-source ingress rules govern what a peer may reach
+    /// *through* us; talking *to* us is already governed by netmap visibility,
+    /// so a policy that grants only LAN access must not also make the router
+    /// itself unpingable.
+    pub fn is_self_dst(&self, dst: Option<Ipv4Addr>) -> bool {
+        matches!((self.self_ip, dst), (Some(a), Some(b)) if a == b)
+    }
 }
 
 /// Why a decapsulated packet's source address failed the reverse-path check.
