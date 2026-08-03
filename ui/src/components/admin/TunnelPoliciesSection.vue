@@ -462,7 +462,7 @@ const saving = ref(false)
 const formError = ref<string | null>(null)
 
 interface FormSubject {
-  kind: 'all_users' | 'user_id' | 'role_id' | 'tunnel_client_id'
+  kind: 'all_users' | 'user_id' | 'role_id' | 'tunnel_client_id' | 'agent_id'
   id: string
 }
 interface FormTarget {
