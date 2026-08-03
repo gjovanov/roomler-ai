@@ -201,6 +201,13 @@ pub struct AgentConfig {
     /// eligibility. Built-in default: on (kill switch).
     #[serde(default)]
     pub overlay_rtt_q: Option<bool>,
+    /// 2026-08-04 - KeyText modifier neutralization: temporarily release
+    /// physically-held Shift/Ctrl/Alt that the remote layout does NOT
+    /// want around a scancode tap (fixes '+'->'*' / dead '|' on non-US
+    /// hosts), restoring them after (`ROOMLER_AGENT_TEXT_MOD_NEUTRALIZE`).
+    /// Built-in default: on (kill switch).
+    #[serde(default)]
+    pub text_mod_neutralize: Option<bool>,
     /// B2 — score-driven demotion of degraded-but-live direct carriers
     /// (`ROOMLER_AGENT_OVERLAY_DEMOTE`): `off` | `shadow` (compute +
     /// count, never act — the built-in default) | `on` (voluntary MBB
@@ -617,7 +624,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 17] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 18] {
     [
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
@@ -636,6 +643,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 17]
         ("LOGS_UPLOAD_DISABLED", cfg.logs_upload_disabled),
         ("OVERLAY_TIER_DETECT", cfg.overlay_tier_detect),
         ("OVERLAY_RTT_Q", cfg.overlay_rtt_q),
+        ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
     ]
 }
 
@@ -823,6 +831,7 @@ mod tests {
             ice_overlay_host_deprioritize: None,
             overlay_tier_detect: None,
             overlay_rtt_q: None,
+            text_mod_neutralize: None,
             overlay_demote: None,
             overlay_rpf: None,
             last_known_good_version: None,

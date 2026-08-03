@@ -37,9 +37,10 @@
 
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
-    SendInput, VK_CAPITAL, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB, VkKeyScanExW,
+    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+    MapVirtualKeyExW, SendInput, VK_CAPITAL, VK_CONTROL, VK_MENU, VK_RETURN, VK_SHIFT, VK_TAB,
+    VkKeyScanExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -106,21 +107,100 @@ pub(super) fn decode_vk_scan(res: i16) -> Option<(u16, bool, bool, bool)> {
     ))
 }
 
-/// Tap a real virtual key (down+up) with the required modifier presses, using
+/// Whether pre-held-modifier neutralization is enabled (default ON).
+/// `ROOMLER_NODE_TEXT_MOD_NEUTRALIZE=0` (or the `text_mod_neutralize`
+/// config key) reverts to the pre-2026-08 behaviour of layering the
+/// layout's wanted modifiers ON TOP of whatever is physically held.
+fn neutralize_enabled() -> bool {
+    !matches!(
+        node_env("TEXT_MOD_NEUTRALIZE").map(|s| s.trim().to_ascii_lowercase()),
+        Some(v) if v == "0" || v == "false" || v == "no" || v == "off"
+    )
+}
+
+/// One planned modifier transition: `(vk, down)`.
+type ModStep = (u16, bool);
+
+/// Plan the modifier presses/releases around a scancode tap so the OS sees
+/// EXACTLY the modifier state the layout wants — regardless of what the
+/// operator is physically holding.
+///
+/// The browser forwards Shift/Ctrl/Alt as REAL HID keys (they are physically
+/// down on the host) while printable characters arrive separately as
+/// `KeyText`. `VkKeyScanExW` computes the modifiers the REMOTE layout wants
+/// from scratch; the old tap only ADDED wanted modifiers, so a held Shift
+/// leaked into the tap: US-viewer `Shift+=` ('+') on a German host injected
+/// a bare VK_OEM_PLUS scancode under physical Shift → '*'; German '|'
+/// (AltGr+<) became Ctrl+Alt+SHIFT+< → dead key. Field report 2026-08-03.
+///
+/// `current`/`wanted` are `[ctrl, alt, shift]` (tap press order). Returns
+/// `(pre, post)`: `pre` runs before the scancode, `post` after — `post`
+/// restores the operator's physical state in reverse order, so their held
+/// Shift keeps working for the NEXT chord (the browser still owns its
+/// eventual release).
+pub(super) fn plan_mod_transitions(
+    current: [bool; 3],
+    wanted: [bool; 3],
+) -> (Vec<ModStep>, Vec<ModStep>) {
+    const VKS: [u16; 3] = [VK_CONTROL, VK_MENU, VK_SHIFT];
+    let mut pre: Vec<ModStep> = Vec::with_capacity(3);
+    let mut post: Vec<ModStep> = Vec::with_capacity(3);
+    for i in 0..3 {
+        match (current[i], wanted[i]) {
+            // Wanted but not held: press for the tap, release after.
+            (false, true) => {
+                pre.push((VKS[i], true));
+                post.push((VKS[i], false));
+            }
+            // Held but unwanted: NEUTRALIZE — release for the tap, restore
+            // after (the operator is still physically holding it).
+            (true, false) => {
+                pre.push((VKS[i], false));
+                post.push((VKS[i], true));
+            }
+            // Held AND wanted: leave it alone (the old code pressed and
+            // then RELEASED it, yanking a physically held modifier away
+            // mid-chord). Not held and not wanted: nothing to do.
+            _ => {}
+        }
+    }
+    post.reverse();
+    (pre, post)
+}
+
+/// Physical down-state of `[Ctrl, Alt, Shift]` right now. `GetAsyncKeyState`
+/// reads the GLOBAL async state (injected keys from the browser's HID path
+/// included), unlike the per-thread-queue `GetKeyState`.
+fn physical_mods_down() -> [bool; 3] {
+    // SAFETY: plain state queries.
+    unsafe {
+        [
+            GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000 != 0,
+            GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000 != 0,
+            GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000 != 0,
+        ]
+    }
+}
+
+/// Tap a real virtual key (down+up) with the required modifier state, using
 /// the scancode so the legacy console accepts it. `hkl` is the active layout.
+/// Pre-held modifiers that the layout does NOT want are temporarily released
+/// and restored afterwards (see [`plan_mod_transitions`]).
 fn tap_vk(vk: u16, shift: bool, ctrl: bool, alt: bool, hkl: HKL) {
     // SAFETY: MapVirtualKeyExW with a valid VK + layout handle; returns 0 when
     // there's no scancode mapping, which we handle below.
     let scan = unsafe { MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, hkl) } as u16;
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(8);
-    if ctrl {
-        inputs.push(kbd(VK_CONTROL, 0, 0));
-    }
-    if alt {
-        inputs.push(kbd(VK_MENU, 0, 0));
-    }
-    if shift {
-        inputs.push(kbd(VK_SHIFT, 0, 0));
+    // With neutralization off, pretend nothing is held: the plan degrades to
+    // exactly the legacy press-wanted/release-wanted sequence.
+    let current = if neutralize_enabled() {
+        physical_mods_down()
+    } else {
+        [false; 3]
+    };
+    let (pre, post) = plan_mod_transitions(current, [ctrl, alt, shift]);
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(pre.len() + post.len() + 2);
+    for &(mvk, down) in &pre {
+        inputs.push(kbd(mvk, 0, if down { 0 } else { KEYEVENTF_KEYUP }));
     }
     if scan != 0 {
         inputs.push(kbd(0, scan, KEYEVENTF_SCANCODE));
@@ -130,14 +210,8 @@ fn tap_vk(vk: u16, shift: bool, ctrl: bool, alt: bool, hkl: HKL) {
         inputs.push(kbd(vk, 0, 0));
         inputs.push(kbd(vk, 0, KEYEVENTF_KEYUP));
     }
-    if shift {
-        inputs.push(kbd(VK_SHIFT, 0, KEYEVENTF_KEYUP));
-    }
-    if alt {
-        inputs.push(kbd(VK_MENU, 0, KEYEVENTF_KEYUP));
-    }
-    if ctrl {
-        inputs.push(kbd(VK_CONTROL, 0, KEYEVENTF_KEYUP));
+    for &(mvk, down) in &post {
+        inputs.push(kbd(mvk, 0, if down { 0 } else { KEYEVENTF_KEYUP }));
     }
     send(&inputs);
 }
@@ -327,5 +401,63 @@ mod tests {
     #[test]
     fn decode_zero_vk_is_none() {
         assert!(decode_vk_scan(0x0100).is_none()); // shift set but VK == 0
+    }
+
+    // ── plan_mod_transitions (2026-08-04 neutralization) ────────────
+
+    #[test]
+    fn plan_legacy_no_held_presses_and_releases_wanted() {
+        // current all-up + wanted ctrl/alt/shift = the legacy sequence:
+        // press in ctrl,alt,shift order, release in reverse.
+        let (pre, post) = plan_mod_transitions([false; 3], [true, true, true]);
+        assert_eq!(
+            pre,
+            vec![(VK_CONTROL, true), (VK_MENU, true), (VK_SHIFT, true)]
+        );
+        assert_eq!(
+            post,
+            vec![(VK_SHIFT, false), (VK_MENU, false), (VK_CONTROL, false)]
+        );
+    }
+
+    #[test]
+    fn plan_held_shift_unwanted_is_neutralized_and_restored() {
+        // The field bug: US-viewer Shift+'=' ('+') with German remote layout —
+        // '+' is UNSHIFTED there, but the browser-held Shift leaked in → '*'.
+        let (pre, post) = plan_mod_transitions([false, false, true], [false, false, false]);
+        assert_eq!(pre, vec![(VK_SHIFT, false)]);
+        assert_eq!(post, vec![(VK_SHIFT, true)]);
+    }
+
+    #[test]
+    fn plan_altgr_with_held_shift_releases_shift_adds_ctrl_alt() {
+        // '|' on German = AltGr+'<' (ctrl+alt wanted, shift NOT) while the
+        // viewer physically holds Shift — the poisoned chord was
+        // Ctrl+Alt+Shift+key = dead key.
+        let (pre, post) = plan_mod_transitions([false, false, true], [true, true, false]);
+        assert_eq!(
+            pre,
+            vec![(VK_CONTROL, true), (VK_MENU, true), (VK_SHIFT, false)]
+        );
+        assert_eq!(
+            post,
+            vec![(VK_SHIFT, true), (VK_MENU, false), (VK_CONTROL, false)]
+        );
+    }
+
+    #[test]
+    fn plan_held_and_wanted_is_left_alone() {
+        // US 'A' with the operator physically holding Shift: wanted == held —
+        // do NOT press-and-release (the old code yanked the held Shift away).
+        let (pre, post) = plan_mod_transitions([false, false, true], [false, false, true]);
+        assert!(pre.is_empty());
+        assert!(post.is_empty());
+    }
+
+    #[test]
+    fn plan_noop_when_nothing_held_nothing_wanted() {
+        let (pre, post) = plan_mod_transitions([false; 3], [false; 3]);
+        assert!(pre.is_empty());
+        assert!(post.is_empty());
     }
 }
