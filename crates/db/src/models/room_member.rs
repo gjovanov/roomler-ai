@@ -58,4 +58,9 @@ pub struct ParticipantSession {
     pub left_at: Option<DateTime>,
     pub duration: Option<i64>,
     pub device_type: String,
+    /// WS connection that owns this session. Optional: pre-2026-08 documents
+    /// and legacy clients carry no connection scope — those sessions can only
+    /// be closed by the user-level (all-sessions) leave path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
 }

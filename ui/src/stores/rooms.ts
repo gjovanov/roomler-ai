@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '@/api/client'
+import { useWsStore } from './ws'
 
 export interface Room {
   id: string
@@ -143,15 +144,24 @@ export const useRoomStore = defineStore('rooms', () => {
     return result
   }
 
+  // Scope call sessions to THIS WebSocket connection so the same user can
+  // join from several browsers/devices without one leave tearing down the
+  // others. Read at call time — the id changes on every WS redial.
+  function callSessionBody(): { connection_id: string } | undefined {
+    const cid = useWsStore().connectionId
+    return cid ? { connection_id: cid } : undefined
+  }
+
   async function joinCall(tenantId: string, roomId: string) {
     const data = await api.post<{ participant_id: string; joined: boolean; transports?: unknown }>(
       `/tenant/${tenantId}/room/${roomId}/call/join`,
+      callSessionBody(),
     )
     return data
   }
 
   async function leaveCall(tenantId: string, roomId: string) {
-    await api.post(`/tenant/${tenantId}/room/${roomId}/call/leave`)
+    await api.post(`/tenant/${tenantId}/room/${roomId}/call/leave`, callSessionBody())
     participants.value = []
   }
 
