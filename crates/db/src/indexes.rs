@@ -158,20 +158,6 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
-    // Audit Logs
-    create_indexes(
-        db,
-        "audit_logs",
-        vec![
-            index(bson::doc! { "tenant_id": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "action": 1, "created_at": -1 }),
-            index(bson::doc! { "tenant_id": 1, "actor_id": 1, "created_at": -1 }),
-            // Auto-expire audit logs after 90 days
-            index_ttl(bson::doc! { "created_at": 1 }, 90 * 24 * 60 * 60),
-        ],
-    )
-    .await?;
-
     // S5 — Stripe webhook idempotency ledger: `_id` = the Stripe event
     // id (natural unique key), rows expire after 30 days (Stripe stops
     // retrying long before that).
