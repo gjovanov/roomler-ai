@@ -150,6 +150,11 @@ pub struct AppState {
     /// sender for that node's live `/derp` WS. The pubkey-addressed forwarding
     /// map for the both-UDP-blocked carrier tier. See [`crate::ws::derp`].
     pub derp_registry: crate::ws::derp::DerpRegistry,
+    /// Overlay ACL — per-network relay allow tables consulted by
+    /// `ws::derp::forward_frame`. Precomputed because forwarding is a
+    /// synchronous per-datagram path; a missing entry fails OPEN. See
+    /// [`crate::ws::derp_acl`].
+    pub derp_acl: crate::ws::derp_acl::DerpAclCache,
     /// C-5 — per-connection rehome-close signals (cluster convergence).
     pub derp_cancels: crate::ws::derp::DerpCancelRegistry,
     /// C-5 — directory owner-tokens for LOCAL derp registrations
@@ -607,6 +612,7 @@ impl AppState {
             overlay_policies,
             overlay_nodes_by_id: Arc::new(DashMap::new()),
             derp_registry: derp_registry.clone(),
+            derp_acl: Arc::new(DashMap::new()),
             derp_cancels: Arc::new(DashMap::new()),
             derp_presence_tokens: derp_presence_tokens.clone(),
             derp_rehome_cooldowns: Arc::new(DashMap::new()),
