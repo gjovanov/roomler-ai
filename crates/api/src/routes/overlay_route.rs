@@ -193,9 +193,18 @@ pub async fn set_approved_routes(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     let nid = ObjectId::parse_str(&node_id)
         .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    // Distributing a subnet route (or an exit node's /0) exposes a whole
+    // network to the mesh, and overlay traffic bypasses the tunnel ACL — so
+    // this is an agent-management action, not something bare tenant
+    // membership should authorise.
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
     let network = state.overlay_networks.get_or_create(tid).await?;
     let network_id = network
         .id
@@ -267,9 +276,18 @@ pub async fn set_exit_node(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     let nid = ObjectId::parse_str(&node_id)
         .map_err(|_| ApiError::BadRequest("Invalid node_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    // Distributing a subnet route (or an exit node's /0) exposes a whole
+    // network to the mesh, and overlay traffic bypasses the tunnel ACL — so
+    // this is an agent-management action, not something bare tenant
+    // membership should authorise.
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
     let network = state.overlay_networks.get_or_create(tid).await?;
     let network_id = network
         .id
