@@ -108,6 +108,7 @@ mod tests {
             supports_derp: false,
             routes: vec![],
             agent_id: None,
+            ingress_rules: None,
         }
     }
 
