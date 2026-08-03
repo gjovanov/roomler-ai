@@ -114,6 +114,102 @@ impl RpfMode {
     }
 }
 
+/// P4 — what this node accepts as a DESTINATION from a peer: its own overlay
+/// address, plus the subnets it advertises.
+///
+/// The other half of the ingress gap. [`Router::rpf_check`] stops a peer
+/// FORGING a source; this stops it ADDRESSING somewhere we were never meant to
+/// carry it. Without it, any peer that can reach a subnet router at all can
+/// aim a packet at anything that router's own routing table can resolve —
+/// approval bought nothing beyond the first hop.
+///
+/// Scope comes from the node's OWN `advertised_routes`, which is already what
+/// `overlay::nat::enable` provisions forwarding + NAT for. So this enforces
+/// exactly the set the data plane was configured to carry — no wire change, no
+/// server round-trip, and it cannot disagree with the forwarding it guards.
+///
+/// ⚠️ Deliberately NOT per-source. Narrowing "which peer may reach which subset,
+/// on which ports" needs server-compiled per-peer rules that the netmap has no
+/// field for yet. This is the coarse tier: everyone who may reach this router
+/// may reach everything it advertises, but nothing beyond.
+#[derive(Debug, Clone)]
+pub struct LocalScope {
+    self_ip: Option<Ipv4Addr>,
+    advertised: Vec<Cidr>,
+    /// `true` when scope can't be represented (an advertised route we couldn't
+    /// parse as a v4 CIDR — e.g. a v6 prefix), or when this node is an exit.
+    /// Then EVERY destination is accepted: refusing to guess is the only safe
+    /// posture, because a too-narrow scope silently blackholes a legitimate
+    /// subnet router.
+    unconstrained: bool,
+}
+
+impl Default for LocalScope {
+    /// **Unconstrained**, deliberately — this is what a device holds before
+    /// bring-up calls [`WgDevice::set_local_scope`]. An empty-but-enforcing
+    /// default would deny every destination (not even the self IP is known
+    /// yet), so under `enforce` a node would blackhole all traffic in the
+    /// window before its scope is published. Fail open until we actually know
+    /// the scope, exactly as every other tier of this ACL does.
+    fn default() -> Self {
+        Self {
+            self_ip: None,
+            advertised: Vec::new(),
+            unconstrained: true,
+        }
+    }
+}
+
+impl LocalScope {
+    /// Build from the node's own overlay IP and its advertised route strings.
+    /// An unparseable route, or a default route (exit node — it legitimately
+    /// carries the whole internet), makes the scope unconstrained.
+    pub fn new(self_ip: Option<Ipv4Addr>, advertised_routes: &[String]) -> Self {
+        let mut advertised = Vec::new();
+        let mut unconstrained = false;
+        for r in advertised_routes {
+            match Cidr::parse(r) {
+                Some(c) if c.is_default_route() => unconstrained = true,
+                Some(c) => advertised.push(c),
+                // v6 prefix or malformed — can't represent it, so don't pretend.
+                None => unconstrained = true,
+            }
+        }
+        Self {
+            self_ip,
+            advertised,
+            unconstrained,
+        }
+    }
+
+    /// May a peer address this packet's destination through us?
+    ///
+    /// `dst` is [`Router::dst_of_ip_packet`]'s v4 routing key, so a derived
+    /// overlay ULA v6 is already unmapped to its v4. `None` (a non-overlay v6)
+    /// is accepted only by an unconstrained scope, mirroring the fail-closed
+    /// stance on global v6 elsewhere.
+    pub fn permits_dst(&self, dst: Option<Ipv4Addr>) -> bool {
+        if self.unconstrained {
+            return true;
+        }
+        let Some(v4) = dst else {
+            return false;
+        };
+        // Traffic TO us is always in scope — the overwhelmingly common case,
+        // and checked first so a plain peer-to-peer node never walks the list.
+        if self.self_ip == Some(v4) {
+            return true;
+        }
+        self.advertised.iter().any(|c| c.contains(v4))
+    }
+
+    /// `true` when this scope accepts everything (no advertised routes to
+    /// enforce, an exit node, or an unrepresentable route).
+    pub fn is_unconstrained(&self) -> bool {
+        self.unconstrained
+    }
+}
+
 /// Why a decapsulated packet's source address failed the reverse-path check.
 /// Carried into the log line + counters so a field report distinguishes "a
 /// subnet router is forwarding a range it never advertised" (`NoRoute` — an
@@ -674,6 +770,73 @@ mod tests {
             r.rpf_check(&PEER_B, v6("fe80::1")),
             RpfVerdict::Deny(RpfDeny::NonOverlayV6)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P4 — local destination scope
+    // -----------------------------------------------------------------------
+
+    fn ip4(s: &str) -> Option<Ipv4Addr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn scope_of_a_leaf_node_accepts_only_traffic_to_itself() {
+        let s = LocalScope::new(ip4("100.64.0.7"), &[]);
+        assert!(s.permits_dst(ip4("100.64.0.7")));
+        // Transit toward another peer is not this node's business.
+        assert!(!s.permits_dst(ip4("100.64.0.8")));
+        // The hole this closes: a LAN address a leaf node never advertised.
+        assert!(!s.permits_dst(ip4("10.66.51.147")));
+        assert!(!s.is_unconstrained());
+    }
+
+    #[test]
+    fn scope_of_a_subnet_router_accepts_exactly_what_it_advertises() {
+        let s = LocalScope::new(ip4("100.64.0.30"), &["10.66.0.0/16".to_string()]);
+        assert!(s.permits_dst(ip4("100.64.0.30")));
+        assert!(s.permits_dst(ip4("10.66.51.147")));
+        // One octet outside the advertised range — previously forwarded by the
+        // OS if it had any route for it.
+        assert!(!s.permits_dst(ip4("10.67.0.1")));
+        assert!(!s.permits_dst(ip4("10.84.6.5")));
+    }
+
+    #[test]
+    fn scope_unmaps_derived_ula_v6_and_rejects_other_v6() {
+        let s = LocalScope::new(ip4("100.64.0.7"), &[]);
+        // dst_of_ip_packet already unmaps a derived ULA to its v4.
+        assert!(s.permits_dst(embedded_v4_of_overlay_v6(
+            "fd72:6f6f:6d6c::6440:7".parse().unwrap()
+        )));
+        // A non-overlay v6 arrives as None and is fail-closed.
+        assert!(!s.permits_dst(None));
+    }
+
+    #[test]
+    fn an_exit_node_scope_is_unconstrained() {
+        // A default route means this node legitimately carries the whole
+        // internet; enforcing a scope would blackhole every exit client.
+        let s = LocalScope::new(ip4("100.64.0.2"), &["0.0.0.0/0".to_string()]);
+        assert!(s.is_unconstrained());
+        assert!(s.permits_dst(ip4("1.1.1.1")));
+        assert!(s.permits_dst(None));
+        // The split-default halves count too.
+        assert!(
+            LocalScope::new(ip4("100.64.0.2"), &["128.0.0.0/1".to_string()]).is_unconstrained()
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_route_fails_open_rather_than_blackholing() {
+        // A v6 prefix can't be expressed by the v4-only Cidr. Refusing to
+        // guess is the only safe posture: a too-narrow scope would silently
+        // break a legitimate v6 subnet router.
+        let s = LocalScope::new(ip4("100.64.0.30"), &["fd00:dead::/48".to_string()]);
+        assert!(s.is_unconstrained());
+        assert!(s.permits_dst(ip4("10.66.51.147")));
+        let s = LocalScope::new(ip4("100.64.0.30"), &["not-a-cidr".to_string()]);
+        assert!(s.is_unconstrained());
     }
 
     #[test]
