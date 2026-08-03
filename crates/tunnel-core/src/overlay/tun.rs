@@ -116,7 +116,7 @@ pub trait TunIo: Send + Sync {
 /// bridge logic stay device-free (and dependency-free) under plain
 /// `overlay`.
 #[cfg(feature = "overlay-l3")]
-pub use system::{SystemTun, purge_split_default};
+pub use system::{SystemTun, purge_split_default, purge_stale_peer_routes};
 
 #[cfg(feature = "overlay-l3")]
 mod system {
@@ -1637,6 +1637,102 @@ mod system {
         {
             purge_one(cidr);
         }
+    }
+
+    /// Boot reconciler for STALE PEER/SUBNET ROUTES on a persisted TUN.
+    ///
+    /// `install_subnets` writes an OS route **and** the crypto-router entry in
+    /// one call, so within a single runtime generation the two cannot diverge.
+    /// They diverge ACROSS generations: with `overlay_tun_persist` the wintun
+    /// device (and its routing table entries) outlive the runtime that created
+    /// them, while the router is rebuilt from scratch on every WS session. A
+    /// route left behind by an older generation therefore points at an
+    /// interface whose router has no matching `allowed_ips` — packets reach the
+    /// TUN and are dropped locally, never even leaving the host.
+    ///
+    /// That is a SILENT black hole: the OS route looks correct, the peer is
+    /// online, the carrier is up, and only the traffic disappears. Field case
+    /// 2026-08-03 — `10.66.24.53/32` and `10.66.51.147/32` sat on ifIndex 61
+    /// with a healthy carrier while every connection timed out; a daemon
+    /// restart (which re-ran `install_peers`) fixed it instantly.
+    ///
+    /// Called at TUN bring-up, BEFORE any peer is installed. At that instant the
+    /// router is empty by construction, so every route on the device except its
+    /// own connected prefixes is a leftover — which is why this needs no
+    /// keep-set and cannot race a legitimate install. `install_peers` then
+    /// re-adds exactly what the current netmap says.
+    ///
+    /// Best-effort and sync, like [`purge_split_default`]: a failure just leaves
+    /// the pre-existing (broken) state, never a worse one.
+    pub fn purge_stale_peer_routes() {
+        let stale: Vec<String> = enumerate_if_routes()
+            .into_iter()
+            .filter(|c| !is_derived_prefix(c))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for cidr in &stale {
+            purge_one(cidr);
+        }
+        tracing::info!(
+            count = stale.len(), routes = ?stale,
+            "overlay: boot reconcile — dropped stale routes left by a previous generation \
+             on a persisted TUN (their crypto-router entries are gone, so they black-hole)"
+        );
+    }
+
+    /// Entries the OS DERIVES from the interface address rather than routes we
+    /// installed: the on-link overlay prefixes plus the multicast / broadcast /
+    /// link-local rows Windows adds to every NIC. Deleting these would break the
+    /// overlay itself (or churn state the OS immediately recreates).
+    ///
+    /// Peer `/32`s are deliberately NOT protected — a stale peer route is
+    /// exactly what this reconciler exists to remove, and `install_peers`
+    /// re-adds the live ones moments later.
+    fn is_derived_prefix(cidr: &str) -> bool {
+        let c = cidr.trim();
+        c.starts_with("100.64.0.0/")            // the overlay's own on-link v4
+            || c == crate::overlay::router::OVERLAY_ULA_V6_CIDR
+            || c.starts_with("224.")            // v4 multicast
+            || c == "255.255.255.255/32"        // v4 broadcast
+            || c.starts_with("ff00:")           // v6 multicast
+            || c.starts_with("fe80:") // v6 link-local
+    }
+
+    #[cfg(target_os = "linux")]
+    fn enumerate_if_routes() -> Vec<String> {
+        let out = std::process::Command::new("ip")
+            .args(["route", "show", "dev", IF_NAME])
+            .output();
+        let Ok(out) = out else { return Vec::new() };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|p| p.contains('/'))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn enumerate_if_routes() -> Vec<String> {
+        let out = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-NetRoute -InterfaceAlias {IF_NAME} -ErrorAction SilentlyContinue | \
+                     Select-Object -ExpandProperty DestinationPrefix"
+                ),
+            ])
+            .output();
+        let Ok(out) = out else { return Vec::new() };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|p| p.contains('/'))
+            .map(str::to_string)
+            .collect()
     }
 
     #[cfg(target_os = "linux")]
