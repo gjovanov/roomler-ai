@@ -19,8 +19,6 @@
     "dashboard": "Dashboard",
     "devices": "Devices",
     "network": "Network",
-    "machines": "Machines",
-    "tunnelClients": "Tunnel clients",
     "tunnelAcl": "Tunnel ACL",
     "subnetRoutes": "Subnet routes",
     "magicDns": "MagicDNS",

@@ -89,9 +89,11 @@
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-lan" :title="$t('nav.network')" />
           </template>
-          <v-list-item :to="`/tenant/${tenantId}/network/machines`" prepend-icon="mdi-server-network" :title="$t('nav.machines')" />
-          <v-list-item :to="`/tenant/${tenantId}/network/tunnel-clients`" prepend-icon="mdi-tunnel" :title="$t('nav.tunnelClients')" />
+          <!-- 2026-08-04 — Machines + Tunnel clients folded into Devices;
+               Overlay ACL joins the group (it existed but was reachable
+               from NO nav at all). -->
           <v-list-item :to="`/tenant/${tenantId}/network/acl`" prepend-icon="mdi-shield-key" :title="$t('nav.tunnelAcl')" />
+          <v-list-item :to="`/tenant/${tenantId}/network/overlay-acl`" prepend-icon="mdi-shield-lock-outline" title="Overlay ACL" />
           <v-list-item :to="`/tenant/${tenantId}/network/subnet-routes`" prepend-icon="mdi-lan-connect" :title="$t('nav.subnetRoutes')" />
           <v-list-item :to="`/tenant/${tenantId}/network/dns`" prepend-icon="mdi-dns" :title="$t('nav.magicDns')" />
         </v-list-group>
