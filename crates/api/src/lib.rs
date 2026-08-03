@@ -172,10 +172,6 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{room_id}/call/participant",
             get(routes::room::participants),
-        )
-        .route(
-            "/{room_id}/call/message",
-            get(routes::room::call_messages).post(routes::room::create_call_message),
         );
 
     // Message routes (under tenant/room)
@@ -193,6 +189,7 @@ pub fn build_router(state: AppState) -> Router {
             delete(routes::reaction::remove),
         )
         .route("/read", post(routes::message::mark_read))
+        .route("/read-all", post(routes::message::read_all))
         .route("/unread-count", get(routes::message::unread_count));
 
     // Recording routes (under room)

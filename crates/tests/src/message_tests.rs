@@ -1,7 +1,6 @@
 use crate::fixtures::test_app::TestApp;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use serde_json::Value;
-use tokio_tungstenite::tungstenite::Message;
 
 #[tokio::test]
 async fn create_and_list_messages() {
@@ -172,7 +171,7 @@ async fn delete_message_soft_deletes() {
 }
 
 #[tokio::test]
-async fn message_broadcast_excludes_sender_reaches_member() {
+async fn message_broadcast_reaches_member_and_sender() {
     let app = TestApp::spawn().await;
     let tenant = app.seed_tenant("msgws").await;
     let room_id = &tenant.rooms[0].id;
@@ -232,29 +231,135 @@ async fn message_broadcast_excludes_sender_reaches_member() {
     assert_eq!(parsed["type"], "message:create");
     assert_eq!(parsed["data"]["content"], "Hello from admin");
 
-    // Admin should NOT receive message:create (sender excluded from broadcast).
-    // Send a ping to flush any pending messages, then check.
-    ws_admin
-        .send(Message::Text(
-            serde_json::to_string(&serde_json::json!({ "type": "ping" }))
-                .unwrap()
-                .into(),
-        ))
+    // The sender's connection ALSO receives it (2026-08-04): broadcasts are
+    // per-user, so including the sender is what delivers realtime messages
+    // to their OTHER browsers/devices; the client dedups by message id.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), ws_admin.next())
         .await
-        .unwrap();
-
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws_admin.next())
-        .await
-        .expect("Timed out waiting for pong")
+        .expect("sender must receive their own message:create (multi-device fan-out)")
         .unwrap()
         .unwrap();
 
     let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
-    assert_eq!(
-        parsed["type"], "pong",
-        "Admin should receive pong, not message:create (sender excluded)"
-    );
+    assert_eq!(parsed["type"], "message:create");
+    assert_eq!(parsed["data"]["content"], "Hello from admin");
 
     ws_admin.close(None).await.ok();
     ws_member.close(None).await.ok();
+}
+
+/// PR-2 (2026-08-04): `POST message/read-all` marks EVERY unread message in
+/// the room read for the caller — same filter as `unread-count`, so stuck
+/// badges (messages outside the fetch window, call-view reads) heal to 0.
+#[tokio::test]
+async fn read_all_zeroes_unread_count() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("readall1").await;
+    let room_id = &tenant.rooms[0].id;
+
+    for token in [&tenant.admin.access_token, &tenant.member.access_token] {
+        app.auth_post(
+            &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
+            token,
+        )
+        .send()
+        .await
+        .unwrap();
+    }
+
+    // Admin writes 8 messages; the member has read none of them.
+    for i in 0..8 {
+        app.auth_post(
+            &format!("/api/tenant/{}/room/{}/message", tenant.tenant_id, room_id),
+            &tenant.admin.access_token,
+        )
+        .json(&serde_json::json!({ "content": format!("Unread {i}") }))
+        .send()
+        .await
+        .unwrap();
+    }
+
+    let count: Value = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/room/{}/message/unread-count",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(count["count"], 8);
+
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/message/read-all",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let marked: Value = resp.json().await.unwrap();
+    assert_eq!(marked["marked"], 8);
+
+    let count: Value = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/room/{}/message/unread-count",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(count["count"], 0);
+
+    // Idempotent: a second read-all marks nothing further.
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/message/read-all",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let marked: Value = resp.json().await.unwrap();
+    assert_eq!(marked["marked"], 0);
+}
+
+/// Non-members must not be able to mark-all-read.
+#[tokio::test]
+async fn read_all_requires_membership() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("readall2").await;
+    let outsider = app.seed_tenant("readall2b").await;
+    let room_id = &tenant.rooms[0].id;
+
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/message/read-all",
+                tenant.tenant_id, room_id
+            ),
+            &outsider.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
 }
