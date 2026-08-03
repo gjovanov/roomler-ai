@@ -207,10 +207,12 @@ pub struct AgentConfig {
     /// demotions execute). Multi-state, so a string key, not a tribool.
     #[serde(default)]
     pub overlay_demote: Option<String>,
-    /// P4 — reverse-path filtering of INBOUND overlay packets
+    /// P4 — ingress filtering of INBOUND overlay packets
     /// (`ROOMLER_NODE_OVERLAY_RPF`): `off` | `warn` (count + log, still
-    /// deliver — the built-in default) | `enforce` (drop a packet whose
-    /// source address the sending peer does not own). Multi-state, so a
+    /// deliver — the built-in default) | `enforce` (drop). Two checks share
+    /// the mode: a packet whose SOURCE the sending peer does not own
+    /// (forgery), and one whose DESTINATION lies outside the subnets this
+    /// node advertises (aiming past a subnet router). Multi-state, so a
     /// string key, not a tribool.
     #[serde(default)]
     pub overlay_rpf: Option<String>,

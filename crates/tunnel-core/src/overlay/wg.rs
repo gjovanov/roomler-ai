@@ -33,7 +33,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use super::router::{Router, RpfMode, RpfVerdict};
+use super::router::{LocalScope, Router, RpfMode, RpfVerdict};
 use crate::transport::quic::QuicPeer;
 use crate::transport::relay::{RelayConn, RelayUdpSocket};
 
@@ -336,6 +336,20 @@ fn short_key(k: &[u8; 32]) -> String {
 /// [`process_inbound`] — and it is the seam the per-peer L4 ACL (server-compiled
 /// ingress rules on `NetmapPeer`) slots into, since it is already threaded to
 /// every inbound call site and already carries peer identity.
+/// Why an inbound packet was refused. Distinguishes the two ingress tiers in
+/// logs and field reports: a forged SOURCE (the peer lying about who it is) vs.
+/// an out-of-scope DESTINATION (the peer aiming past us at something we never
+/// advertised).
+#[derive(Debug, Clone, Copy)]
+enum IngressDeny {
+    /// The inner reason is consumed only by the derived `Debug` in the warning
+    /// below — which dead-code analysis doesn't count as a read — but it is the
+    /// whole diagnostic value of the line (`NoRoute` = an approval/config gap,
+    /// `OtherPeer` = an actual forgery), so it stays.
+    Rpf(#[allow(dead_code)] super::router::RpfDeny),
+    OutOfScope,
+}
+
 #[derive(Clone)]
 struct Ingress {
     peer: [u8; 32],
@@ -346,25 +360,36 @@ struct Ingress {
 }
 
 impl Ingress {
-    /// May this peer deliver a packet sourced from `src`? Counts and
-    /// throttled-logs every failure; returns `false` (drop) ONLY in
+    /// May this peer deliver this packet? Two independent questions, answered
+    /// from ONE lock acquisition:
+    ///
+    /// 1. **Source** — does `src` route back to this peer? (address forgery)
+    /// 2. **Destination** — is the packet addressed inside this node's own
+    ///    scope? (a peer aiming *past* a subnet router at something the router
+    ///    never advertised)
+    ///
+    /// Counts and throttled-logs every failure; returns `false` (drop) ONLY in
     /// [`RpfMode::Enforce`].
-    fn permits(&self, src: IpAddr) -> bool {
+    fn permits(&self, src: IpAddr, packet: &[u8]) -> bool {
         if self.mode == RpfMode::Off {
             return true;
         }
-        // Tight sync block: `SendState`'s guard is a std (!Send) one, so the
-        // compiler rejects holding it across the `tun_tx.send().await` below.
-        let verdict = {
-            self.send
-                .0
-                .read()
-                .unwrap()
-                .router
-                .rpf_check(&self.peer, src)
+        // ONE tight sync block for both checks. `SendState`'s guard is a std
+        // (!Send) one, so the compiler rejects holding it across the
+        // `tun_tx.send().await` below.
+        let (verdict, in_scope) = {
+            let g = self.send.0.read().unwrap();
+            (
+                g.router.rpf_check(&self.peer, src),
+                g.scope.permits_dst(Router::dst_of_ip_packet(packet)),
+            )
         };
-        let RpfVerdict::Deny(reason) = verdict else {
-            return true;
+        // Same counter + throttle as a reverse-path failure, distinct reason so
+        // a field report separates "forged its source" from "aimed past us".
+        let reason = match verdict {
+            _ if !in_scope => IngressDeny::OutOfScope,
+            RpfVerdict::Deny(r) => IngressDeny::Rpf(r),
+            RpfVerdict::Allow => return true,
         };
         let denied = self.stats.rx_denied.fetch_add(1, Ordering::Relaxed) + 1;
         let now = mono_ms_now();
@@ -383,12 +408,12 @@ impl Ingress {
             if self.mode == RpfMode::Enforce {
                 warn!(
                     %src, ?reason, %peer, denied,
-                    "overlay: DROPPED an inbound packet whose source the sending peer does not own"
+                    "overlay: DROPPED an inbound packet the sending peer is not entitled to send"
                 );
             } else {
                 warn!(
                     %src, ?reason, %peer, denied,
-                    "overlay: inbound packet whose source the sending peer does not own — \
+                    "overlay: inbound packet the sending peer is not entitled to send — \
                      delivered anyway (overlay_rpf=warn; set `enforce` to drop, `off` to stop checking)"
                 );
             }
@@ -482,6 +507,11 @@ struct SendPeer {
 /// source of truth; the device reaches it through the lock.
 struct SendState {
     router: Router,
+    /// P4 — this node's own destination scope (its overlay IP + the subnets it
+    /// advertises). Lives HERE so the ingress check reads it under the SAME
+    /// lock it already takes for the reverse-path lookup: no extra
+    /// synchronisation on the per-packet path.
+    scope: LocalScope,
     /// Mirror of `WgDevice::peers`' send triples, maintained at the same
     /// mutation choke points ([`WgDevice::send_install`] /
     /// [`WgDevice::send_uninstall`]). Key-set equality with `peers` is
@@ -515,6 +545,7 @@ impl WgSender {
     fn new() -> Self {
         Self(Arc::new(std::sync::RwLock::new(SendState {
             router: Router::new(),
+            scope: LocalScope::default(),
             peers: HashMap::new(),
         })))
     }
@@ -1387,6 +1418,25 @@ impl WgDevice {
         self.rpf
     }
 
+    /// P4 — publish this node's own destination scope: its overlay address plus
+    /// the subnets it advertises. Called once at overlay bring-up, from the same
+    /// `advertised_routes` that `overlay::nat::enable` provisions forwarding for
+    /// — so the filter and the forwarding it guards can never disagree.
+    ///
+    /// Before this runs the scope is [`LocalScope::default`], which is
+    /// UNCONSTRAINED — the bring-up window fails open rather than blackholing
+    /// every destination while the node's own address is still unknown.
+    pub fn set_local_scope(&mut self, self_ip: Option<Ipv4Addr>, advertised_routes: &[String]) {
+        let scope = LocalScope::new(self_ip, advertised_routes);
+        tracing::info!(
+            ?self_ip,
+            routes = advertised_routes.len(),
+            unconstrained = scope.is_unconstrained(),
+            "overlay: ingress destination scope set"
+        );
+        self.send.0.write().unwrap().scope = scope;
+    }
+
     /// Test-only — override the reverse-path mode. Must run BEFORE `add_peer`:
     /// each peer's [`Ingress`] copies the mode once, at install. Exists so the
     /// enforce path is provable without mutating process-wide env (which would
@@ -1516,13 +1566,13 @@ async fn process_inbound(
         // enforced on ingress. It was discarded until P4, which is what let any
         // peer with a live session write an arbitrary source into our TUN.
         TunnResult::WriteToTunnelV4(pkt, src) => {
-            if ingress.permits(IpAddr::V4(src)) {
+            if ingress.permits(IpAddr::V4(src), pkt) {
                 stats.rx.fetch_add(1, Ordering::Relaxed);
                 let _ = tun_tx.send(pkt.to_vec()).await;
             }
         }
         TunnResult::WriteToTunnelV6(pkt, src) => {
-            if ingress.permits(IpAddr::V6(src)) {
+            if ingress.permits(IpAddr::V6(src), pkt) {
                 stats.rx.fetch_add(1, Ordering::Relaxed);
                 let _ = tun_tx.send(pkt.to_vec()).await;
             }
@@ -1947,6 +1997,78 @@ mod tests {
             .unwrap();
         assert_eq!(&got[20..], b"spoof");
         assert_eq!(dev_b.peer_rx_denied(&pk_a), 1);
+    }
+
+    /// The destination half: a peer with a perfectly legitimate SOURCE aims
+    /// past us at a LAN address this node never advertised. Before P4 the
+    /// packet went to the TUN and the OS forwarded it if it had any route —
+    /// which is how "approved for one subnet" became "reaches everything".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingress_scope_drops_a_destination_this_node_never_advertised() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+        dev_b.set_rpf_mode(RpfMode::Enforce);
+        // B is a subnet router for 10.66.0.0/16 and nothing else.
+        dev_b.set_local_scope(Some(IP_B), &["10.66.0.0/16".to_string()]);
+
+        dev_a.add_peer(
+            b.public.to_bytes(),
+            IP_B,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        wait_connected(&dev_a, &b.public.to_bytes()).await;
+        let pk_b = dev_b.public().to_bytes();
+
+        // In scope: addressed into the advertised LAN. Honest source throughout.
+        send_until_ok(
+            &dev_a,
+            &pk_b,
+            &synthetic_ipv4(IP_A, Ipv4Addr::new(10, 66, 51, 147), b"lan"),
+        )
+        .await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("an advertised destination must be delivered")
+            .unwrap();
+        assert_eq!(&got[20..], b"lan");
+        assert_eq!(dev_b.peer_rx_denied(&a.public.to_bytes()), 0);
+
+        // Out of scope: a different RFC1918 range B never advertised.
+        send_until_ok(
+            &dev_a,
+            &pk_b,
+            &synthetic_ipv4(IP_A, Ipv4Addr::new(10, 84, 6, 5), b"past"),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx_b.recv())
+                .await
+                .is_err(),
+            "a destination outside the node's advertised scope must not reach the TUN"
+        );
+        assert_eq!(dev_b.peer_rx_denied(&a.public.to_bytes()), 1);
+
+        // Traffic addressed to B ITSELF is always in scope.
+        send_until_ok(&dev_a, &pk_b, &synthetic_ipv4(IP_A, IP_B, b"self")).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("traffic to the node's own overlay IP must be delivered")
+            .unwrap();
+        assert_eq!(&got[20..], b"self");
     }
 
     /// `off` restores the pre-P4 behaviour exactly: delivered AND not counted.
