@@ -33,9 +33,11 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use super::ingress::{dst_ip_of, parse_l4, rules_permit};
 use super::router::{LocalScope, Router, RpfMode, RpfVerdict};
 use crate::transport::quic::QuicPeer;
 use crate::transport::relay::{RelayConn, RelayUdpSocket};
+use roomler_ai_remote_control::models::OverlayRule;
 
 /// Scratch buffer size for encap/decap + carrier I/O. The overlay MTU is
 /// 1280; a WG datagram adds ~32 B of overhead, so 2048 is comfortable
@@ -348,6 +350,9 @@ enum IngressDeny {
     /// `OtherPeer` = an actual forgery), so it stays.
     Rpf(#[allow(dead_code)] super::router::RpfDeny),
     OutOfScope,
+    /// The destination is inside this node's scope, but the tenant's ACL grants
+    /// this particular peer no rule covering it (or its port/protocol).
+    NotPermitted,
 }
 
 #[derive(Clone)]
@@ -377,17 +382,38 @@ impl Ingress {
         // ONE tight sync block for both checks. `SendState`'s guard is a std
         // (!Send) one, so the compiler rejects holding it across the
         // `tun_tx.send().await` below.
-        let (verdict, in_scope) = {
+        let routing_dst = Router::dst_of_ip_packet(packet);
+        let (verdict, in_scope, to_self, rules) = {
             let g = self.send.0.read().unwrap();
             (
                 g.router.rpf_check(&self.peer, src),
-                g.scope.permits_dst(Router::dst_of_ip_packet(packet)),
+                g.scope.permits_dst(routing_dst),
+                g.scope.is_self_dst(routing_dst),
+                g.ingress_acls.get(&self.peer).cloned(),
             )
         };
-        // Same counter + throttle as a reverse-path failure, distinct reason so
-        // a field report separates "forged its source" from "aimed past us".
+        // Per-source rules govern what a peer may reach THROUGH us; talking TO
+        // us is already governed by netmap visibility. Parsing is deferred to
+        // here so the common in-scope, no-ACL packet never touches the L4 path.
+        let rule_denied = match rules {
+            Some(rules) if in_scope && !to_self => {
+                let dst = dst_ip_of(packet);
+                match dst {
+                    Some(dst) => !rules_permit(&rules, dst, parse_l4(packet).as_ref()),
+                    // No parseable destination but it passed the scope check —
+                    // fail closed, the same stance the rules take on a packet
+                    // that hides its port.
+                    None => true,
+                }
+            }
+            _ => false,
+        };
+        // Same counter + throttle as a reverse-path failure, distinct reasons so
+        // a field report separates "forged its source" from "aimed past us"
+        // from "not granted this destination".
         let reason = match verdict {
             _ if !in_scope => IngressDeny::OutOfScope,
+            _ if rule_denied => IngressDeny::NotPermitted,
             RpfVerdict::Deny(r) => IngressDeny::Rpf(r),
             RpfVerdict::Allow => return true,
         };
@@ -512,6 +538,12 @@ struct SendState {
     /// lock it already takes for the reverse-path lookup: no extra
     /// synchronisation on the per-packet path.
     scope: LocalScope,
+    /// P4 — server-compiled per-source ingress rules, keyed by the sending
+    /// peer's WG public key. Present only for peers whose netmap entry carried
+    /// `ingress_rules` (i.e. the tenant is ENFORCING); an absent key means the
+    /// ACL compiled nothing for that peer and only [`scope`](Self::scope)
+    /// applies. `Arc` so the per-packet path clones a pointer, not the rules.
+    ingress_acls: HashMap<[u8; 32], Arc<Vec<OverlayRule>>>,
     /// Mirror of `WgDevice::peers`' send triples, maintained at the same
     /// mutation choke points ([`WgDevice::send_install`] /
     /// [`WgDevice::send_uninstall`]). Key-set equality with `peers` is
@@ -546,6 +578,7 @@ impl WgSender {
         Self(Arc::new(std::sync::RwLock::new(SendState {
             router: Router::new(),
             scope: LocalScope::default(),
+            ingress_acls: HashMap::new(),
             peers: HashMap::new(),
         })))
     }
@@ -1437,6 +1470,43 @@ impl WgDevice {
         self.send.0.write().unwrap().scope = scope;
     }
 
+    /// P4 — replace the per-source ingress rule table from the current netmap.
+    ///
+    /// Rebuilt WHOLESALE on every netmap/delta rather than patched per install,
+    /// which is what keeps it correct: the table is keyed by pubkey, and a peer
+    /// whose grant was revoked must lose its entry even though no install or
+    /// removal happened for it. Rebuilding is O(peers) on a control-plane
+    /// event, never on the packet path.
+    ///
+    /// A peer whose entry carries `ingress_rules: None` (the ACL compiled
+    /// nothing — pre-P4 server, or the tenant isn't enforcing) gets NO entry, so
+    /// only the coarse [`LocalScope`] applies to it. `Some(vec![])` DOES get an
+    /// entry, and denies everything it forwards — that distinction is the whole
+    /// reason the wire field is an `Option`.
+    pub fn sync_peer_ingress(
+        &mut self,
+        peers: &HashMap<bson::oid::ObjectId, roomler_ai_remote_control::signaling::NetmapPeer>,
+    ) {
+        let mut table: HashMap<[u8; 32], Arc<Vec<OverlayRule>>> = HashMap::new();
+        for p in peers.values() {
+            let (Some(rules), Some(pk)) = (
+                p.ingress_rules.as_ref(),
+                super::decode_public(&p.wg_public_key),
+            ) else {
+                continue;
+            };
+            table.insert(pk, Arc::new(rules.clone()));
+        }
+        let mut g = self.send.0.write().unwrap();
+        if g.ingress_acls.len() != table.len() {
+            tracing::info!(
+                peers_with_rules = table.len(),
+                "overlay: per-source ingress rules updated"
+            );
+        }
+        g.ingress_acls = table;
+    }
+
     /// Test-only — override the reverse-path mode. Must run BEFORE `add_peer`:
     /// each peer's [`Ingress`] copies the mode once, at install. Exists so the
     /// enforce path is provable without mutating process-wide env (which would
@@ -1895,6 +1965,49 @@ mod tests {
     const IP_A: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 1);
     const IP_B: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 2);
 
+    /// Minimal well-formed IPv4 + TCP packet with a real destination port, so
+    /// the P4 rule matcher sees a parseable L4 header. Payload starts at 24.
+    fn synthetic_tcp(src: Ipv4Addr, dst: Ipv4Addr, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        let total = 24 + payload.len();
+        let mut p = vec![0u8; total];
+        p[0] = 0x45;
+        p[2] = (total >> 8) as u8;
+        p[3] = (total & 0xff) as u8;
+        p[8] = 64;
+        p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p[22..24].copy_from_slice(&dst_port.to_be_bytes());
+        p[24..].copy_from_slice(payload);
+        p
+    }
+
+    /// A netmap entry for `kp` at `ip`, with no ingress rules compiled.
+    fn netmap_peer_for(
+        kp: &WgKeypair,
+        ip: Ipv4Addr,
+    ) -> roomler_ai_remote_control::signaling::NetmapPeer {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        roomler_ai_remote_control::signaling::NetmapPeer {
+            node_id: bson::oid::ObjectId::new(),
+            overlay_ip: ip.to_string(),
+            name: String::new(),
+            wg_public_key: B64.encode(kp.public.to_bytes()),
+            endpoints: vec![],
+            lan_endpoints: vec![],
+            srflx_endpoints: vec![],
+            srflx_nat: None,
+            relay_home: None,
+            reachable: true,
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            routes: vec![],
+            agent_id: None,
+            ingress_rules: None,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // P4 — reverse-path filtering, end to end over a real carrier
     // -----------------------------------------------------------------------
@@ -2069,6 +2182,133 @@ mod tests {
             .expect("traffic to the node's own overlay IP must be delivered")
             .unwrap();
         assert_eq!(&got[20..], b"self");
+    }
+
+    /// P4 per-source narrowing: two peers, identical honest traffic into the
+    /// same advertised subnet, but only one is granted :22 — the tier neither
+    /// the netmap `routes` list nor `LocalScope` can express.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_source_rules_narrow_one_peer_without_touching_another() {
+        use roomler_ai_remote_control::models::{PortRange, ProtocolKind};
+
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+        dev_b.set_rpf_mode(RpfMode::Enforce);
+        dev_b.set_local_scope(Some(IP_B), &["10.66.0.0/16".to_string()]);
+
+        // The server granted A only TCP/22 into the LAN B fronts.
+        let mut np = netmap_peer_for(&a, IP_A);
+        np.ingress_rules = Some(vec![OverlayRule {
+            cidr: "10.66.0.0/16".into(),
+            port_range: PortRange { low: 22, high: 22 },
+            proto: ProtocolKind::Tcp,
+        }]);
+        let mut peers = HashMap::new();
+        peers.insert(np.node_id, np);
+        dev_b.sync_peer_ingress(&peers);
+
+        dev_a.add_peer(
+            b.public.to_bytes(),
+            IP_B,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        wait_connected(&dev_a, &b.public.to_bytes()).await;
+        let pk_b = dev_b.public().to_bytes();
+        let lan = Ipv4Addr::new(10, 66, 51, 147);
+
+        // Granted: TCP/22 into the advertised LAN.
+        send_until_ok(&dev_a, &pk_b, &synthetic_tcp(IP_A, lan, 22, b"ssh")).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("a granted destination+port must be delivered")
+            .unwrap();
+        assert_eq!(&got[24..], b"ssh");
+
+        // Same peer, same subnet, NOT granted port — this is what LocalScope
+        // alone could never have stopped.
+        send_until_ok(&dev_a, &pk_b, &synthetic_tcp(IP_A, lan, 443, b"web")).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx_b.recv())
+                .await
+                .is_err(),
+            "a port the ACL did not grant must not reach the TUN"
+        );
+
+        // Traffic addressed to B ITSELF stays reachable: per-source rules govern
+        // what you reach THROUGH us, not whether you may talk TO us.
+        send_until_ok(&dev_a, &pk_b, &synthetic_tcp(IP_A, IP_B, 443, b"self")).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("the node's own address is never gated by per-source rules")
+            .unwrap();
+        assert_eq!(&got[24..], b"self");
+    }
+
+    /// A peer with NO compiled rules keeps the pre-P4 behaviour: only the coarse
+    /// scope applies. This is the compatibility guarantee for a pre-P4 server
+    /// and for any tenant that isn't enforcing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_without_compiled_rules_is_governed_only_by_scope() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (mut dev_a, _rx_a) = WgDevice::new(a.secret.clone());
+        let (mut dev_b, mut rx_b) = WgDevice::new(b.secret.clone());
+        dev_b.set_rpf_mode(RpfMode::Enforce);
+        dev_b.set_local_scope(Some(IP_B), &["10.66.0.0/16".to_string()]);
+
+        // Netmap entry with ingress_rules = None ⇒ no table entry at all.
+        let mut peers = HashMap::new();
+        let np = netmap_peer_for(&a, IP_A);
+        peers.insert(np.node_id, np);
+        dev_b.sync_peer_ingress(&peers);
+
+        dev_a.add_peer(
+            b.public.to_bytes(),
+            IP_B,
+            Carrier::direct(sock_a.clone(), addr_b),
+            true,
+        );
+        dev_b.add_peer(
+            a.public.to_bytes(),
+            IP_A,
+            Carrier::direct(sock_b.clone(), addr_a),
+            false,
+        );
+        wait_connected(&dev_a, &b.public.to_bytes()).await;
+        let pk_b = dev_b.public().to_bytes();
+
+        // Any port into the advertised LAN is fine — nothing narrowed it.
+        send_until_ok(
+            &dev_a,
+            &pk_b,
+            &synthetic_tcp(IP_A, Ipv4Addr::new(10, 66, 51, 147), 443, b"web"),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+                .await
+                .is_ok(),
+            "with no compiled rules only the coarse scope applies"
+        );
     }
 
     /// `off` restores the pre-P4 behaviour exactly: delivered AND not counted.
