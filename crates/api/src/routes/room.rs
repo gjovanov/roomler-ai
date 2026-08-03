@@ -379,10 +379,20 @@ pub async fn call_start(
     })))
 }
 
+/// Optional body for `call/join` / `call/leave`. Legacy clients (and the
+/// Rust/e2e test helpers) post with NO body at all — `Option<Json<_>>`
+/// keeps those working; `connection_id` scopes the call session to one WS
+/// connection so the same user can join from several browsers/devices.
+#[derive(Debug, Default, Deserialize)]
+pub struct CallSessionBody {
+    pub connection_id: Option<String>,
+}
+
 pub async fn call_join(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
+    body: Option<Json<CallSessionBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -393,11 +403,19 @@ pub async fn call_join(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
+    let connection_id = body.and_then(|Json(b)| b.connection_id);
     let user = state.users.base.find_by_id(auth.user_id).await?;
 
     let member = state
         .rooms
-        .join_participant(tid, rid, auth.user_id, user.display_name, "web".to_string())
+        .join_participant(
+            tid,
+            rid,
+            auth.user_id,
+            user.display_name,
+            "web".to_string(),
+            connection_id,
+        )
         .await?;
 
     // Notify room members about updated participant count
@@ -436,6 +454,7 @@ pub async fn call_leave(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
+    body: Option<Json<CallSessionBody>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -446,25 +465,51 @@ pub async fn call_leave(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    // Clean up media before DB leave. C-4: the room's media island may
-    // live on another pod — the owner then drops the transports and
-    // broadcasts peer_left itself.
-    match crate::ws::media_cluster::resolve_media_route(&state, &rid, false).await {
-        crate::ws::media_cluster::MediaRoute::Local { .. } => {
-            state
-                .room_manager
-                .close_participant_by_user(&rid, &auth.user_id);
+    let connection_id = body.and_then(|Json(b)| b.connection_id);
+    close_call_media(&state, rid, auth.user_id, connection_id.as_deref()).await;
+    finalize_call_leave_db(&state, rid, auth.user_id, connection_id.as_deref()).await?;
 
-            // Broadcast peer_left to remaining participants
+    Ok(Json(serde_json::json!({ "left": true })))
+}
+
+/// Media half of a call leave. With `connection_id` only that connection's
+/// transports are dropped (multi-device: the same user's other browsers keep
+/// theirs — the pre-2026-08 user-keyed close was exactly the bug that killed
+/// the second browser's video); without it the legacy close-all-of-user path
+/// runs. C-4: the media island may live on another pod — the owner then drops
+/// the transports and broadcasts `media:peer_left` itself.
+pub(crate) async fn close_call_media(
+    state: &AppState,
+    rid: ObjectId,
+    user_id: ObjectId,
+    connection_id: Option<&str>,
+) {
+    match crate::ws::media_cluster::resolve_media_route(state, &rid, false).await {
+        crate::ws::media_cluster::MediaRoute::Local { .. } => {
+            let closed = match connection_id {
+                // Ownership-checked: the conn id comes from an HTTP body, so
+                // it must not be able to close another participant's media.
+                Some(cid) => state
+                    .room_manager
+                    .close_participant_of_user(&rid, cid, &user_id),
+                None => {
+                    state.room_manager.close_participant_by_user(&rid, &user_id);
+                    true
+                }
+            };
+
+            // Broadcast peer_left to remaining participants (including the
+            // leaver's OTHER connections — they key tiles by connection_id).
             let remaining = state.room_manager.get_participant_user_ids(&rid);
-            if !remaining.is_empty() {
-                let event = serde_json::json!({
-                    "type": "media:peer_left",
-                    "data": {
-                        "room_id": rid.to_hex(),
-                        "user_id": auth.user_id.to_hex(),
-                    }
+            if closed && !remaining.is_empty() {
+                let mut data = serde_json::json!({
+                    "room_id": rid.to_hex(),
+                    "user_id": user_id.to_hex(),
                 });
+                if let Some(cid) = connection_id {
+                    data["connection_id"] = serde_json::Value::String(cid.to_string());
+                }
+                let event = serde_json::json!({ "type": "media:peer_left", "data": data });
                 crate::ws::dispatcher::broadcast_with_redis(
                     &state.ws_storage,
                     &state.redis_pubsub,
@@ -475,28 +520,66 @@ pub async fn call_leave(
             }
         }
         crate::ws::media_cluster::MediaRoute::Remote(pod) => {
-            crate::ws::media_cluster::rpc_leave_user(&state, &pod, &rid, &auth.user_id).await;
+            crate::ws::media_cluster::rpc_leave_user(state, &pod, &rid, &user_id, connection_id)
+                .await;
         }
     }
+}
 
-    state.rooms.leave_participant(rid, auth.user_id).await?;
+/// DB half of a call leave, shared by HTTP `call/leave` and the WS
+/// disconnect path (which historically skipped it entirely — the "1 Active
+/// call after refresh" bug): close the session, and only when the user's
+/// LAST session closed broadcast the new count / auto-end the call.
+pub(crate) async fn finalize_call_leave_db(
+    state: &AppState,
+    rid: ObjectId,
+    user_id: ObjectId,
+    connection_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let outcome = state
+        .rooms
+        .leave_participant(rid, user_id, connection_id)
+        .await?;
+    if !outcome.was_last_session {
+        // Another session of this user is still open (or nothing was closed):
+        // the distinct-user count is unchanged — nothing to broadcast.
+        return Ok(());
+    }
 
-    // Check if this was the last participant — if so, auto-end the call
-    let room = state.rooms.base.find_by_id_in_tenant(tid, rid).await.ok();
-    if let Some(ref room) = room
-        && room.participant_count == 0
-        && room.conference_status.as_deref() == Some("in_progress")
-    {
+    let room = state.rooms.base.find_by_id(rid).await.ok();
+    let (count, status) = room
+        .as_ref()
+        .map(|r| (r.participant_count, r.conference_status.clone()))
+        .unwrap_or((0, None));
+    let member_ids = state
+        .rooms
+        .find_member_user_ids(rid)
+        .await
+        .unwrap_or_default();
+
+    if count > 0 {
+        if !member_ids.is_empty() {
+            let event = serde_json::json!({
+                "type": "room:call_updated",
+                "data": {
+                    "room_id": rid.to_hex(),
+                    "participant_count": count,
+                    "conference_status": status.clone().unwrap_or_else(|| "in_progress".into()),
+                }
+            });
+            crate::ws::dispatcher::broadcast_with_redis(
+                &state.ws_storage,
+                &state.redis_pubsub,
+                &member_ids,
+                &event,
+            )
+            .await;
+        }
+    } else if status.as_deref() == Some("in_progress") {
         state.rooms.end_call(rid).await?;
         // C-4 — the media island may live on another pod.
-        crate::ws::media_cluster::close_room_everywhere(&state, &rid).await;
+        crate::ws::media_cluster::close_room_everywhere(state, &rid).await;
 
-        // Notify all room members that the call has ended
-        let member_ids = state
-            .rooms
-            .find_member_user_ids(rid)
-            .await
-            .unwrap_or_default();
         if !member_ids.is_empty() {
             let event = serde_json::json!({
                 "type": "room:call_ended",
@@ -514,7 +597,7 @@ pub async fn call_leave(
         }
     }
 
-    Ok(Json(serde_json::json!({ "left": true })))
+    Ok(())
 }
 
 pub async fn call_end(

@@ -1672,3 +1672,276 @@ async fn ws_disconnect_notifies_peers_with_peer_left() {
 
     ws1.close(None).await.ok();
 }
+
+// ── PR-1 (2026-08-04): session-scoped call leave ────────────────────
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open a WS and capture the server-minted `connection_id` from the
+/// `connected` frame (call sessions are scoped per connection).
+async fn ws_connect_with_conn_id(addr: &std::net::SocketAddr, token: &str) -> (WsStream, String) {
+    let ws_url = format!("ws://{}/ws?token={}", addr, token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .expect("WS connect failed");
+    let first = ws.next().await.expect("no frame").expect("ws error");
+    let parsed: Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    assert_eq!(parsed["type"], "connected");
+    let conn_id = parsed["connection_id"]
+        .as_str()
+        .expect("connected frame carries connection_id")
+        .to_string();
+    (ws, conn_id)
+}
+
+/// Send media:join on an already-connected WS and read caps + transport.
+async fn media_join(ws: &mut WsStream, room_id: &str) -> Value {
+    ws.send(Message::Text(
+        serde_json::to_string(&serde_json::json!({
+            "type": "media:join",
+            "data": { "room_id": room_id }
+        }))
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let caps = next_media_msg(ws).await;
+    assert_eq!(caps["type"], "media:router_capabilities");
+    let transport = next_media_msg(ws).await;
+    assert_eq!(transport["type"], "media:transport_created");
+    transport
+}
+
+async fn get_room(app: &TestApp, tenant_id: &str, room_id: &str, token: &str) -> Value {
+    app.auth_get(
+        &format!("/api/tenant/{}/room/{}", tenant_id, room_id),
+        token,
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap()
+}
+
+/// The bug-1 regression lock: the same user in the call from TWO browsers —
+/// one browser's HTTP leave (with its connection_id) must NOT tear down the
+/// other browser's media, must NOT decrement the distinct-user count, and
+/// must NOT end the call.
+#[tokio::test]
+async fn http_call_leave_with_connection_id_keeps_other_connection_alive() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("connleave1").await;
+    let token = &tenant.admin.access_token;
+    let room_id = create_room_and_start_call(&app, &tenant.tenant_id, token, "Two Browsers").await;
+
+    let (mut ws1, conn1) = ws_connect_with_conn_id(&app.addr, token).await;
+    let (mut ws2, conn2) = ws_connect_with_conn_id(&app.addr, token).await;
+    assert_ne!(conn1, conn2);
+
+    for conn in [&conn1, &conn2] {
+        let resp = app
+            .auth_post(
+                &format!(
+                    "/api/tenant/{}/room/{}/call/join",
+                    tenant.tenant_id, room_id
+                ),
+                token,
+            )
+            .json(&serde_json::json!({ "connection_id": conn }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    // Same user twice = ONE distinct participant.
+    let room = get_room(&app, &tenant.tenant_id, &room_id, token).await;
+    assert_eq!(room["participant_count"], 1);
+    assert_eq!(room["conference_status"], "in_progress");
+
+    let _t1 = media_join(&mut ws1, &room_id).await;
+    let _t2 = media_join(&mut ws2, &room_id).await;
+
+    // Browser 2 hangs up via HTTP, scoped to ITS connection.
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/call/leave",
+                tenant.tenant_id, room_id
+            ),
+            token,
+        )
+        .json(&serde_json::json!({ "connection_id": conn2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Browser 1 gets a peer_left carrying the LEAVING connection's id (tiles
+    // are keyed by connection_id), and its own media stays alive.
+    let peer_left = next_media_msg(&mut ws1).await;
+    assert_eq!(peer_left["type"], "media:peer_left");
+    assert_eq!(peer_left["data"]["connection_id"], conn2.as_str());
+
+    let room = get_room(&app, &tenant.tenant_id, &room_id, token).await;
+    assert_eq!(
+        room["participant_count"], 1,
+        "distinct-user count must not drop while another session is open"
+    );
+    assert_eq!(
+        room["conference_status"], "in_progress",
+        "the call must NOT auto-end while the user's other browser is in it"
+    );
+
+    // Browser 1 hangs up too → now the call ends.
+    app.auth_post(
+        &format!(
+            "/api/tenant/{}/room/{}/call/leave",
+            tenant.tenant_id, room_id
+        ),
+        token,
+    )
+    .json(&serde_json::json!({ "connection_id": conn1 }))
+    .send()
+    .await
+    .unwrap();
+
+    let room = get_room(&app, &tenant.tenant_id, &room_id, token).await;
+    assert_eq!(room["participant_count"], 0);
+    assert_eq!(room["conference_status"], "ended");
+
+    ws1.close(None).await.ok();
+    ws2.close(None).await.ok();
+}
+
+/// Legacy contract: a bodyless (or connection-less) leave still closes ALL
+/// of the user's sessions — the mixed-version fallback during rolls.
+#[tokio::test]
+async fn call_leave_without_connection_id_closes_all_sessions() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("connleave2").await;
+    let token = &tenant.admin.access_token;
+    let room_id = create_room_and_start_call(&app, &tenant.tenant_id, token, "Legacy Leave").await;
+
+    let (ws1, conn1) = ws_connect_with_conn_id(&app.addr, token).await;
+    let (ws2, conn2) = ws_connect_with_conn_id(&app.addr, token).await;
+    for conn in [&conn1, &conn2] {
+        app.auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/call/join",
+                tenant.tenant_id, room_id
+            ),
+            token,
+        )
+        .json(&serde_json::json!({ "connection_id": conn }))
+        .send()
+        .await
+        .unwrap();
+    }
+
+    // Bodyless leave (legacy client shape).
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/call/leave",
+                tenant.tenant_id, room_id
+            ),
+            token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let room = get_room(&app, &tenant.tenant_id, &room_id, token).await;
+    assert_eq!(room["participant_count"], 0);
+    assert_eq!(room["conference_status"], "ended");
+
+    drop(ws1);
+    drop(ws2);
+}
+
+/// The bug-4 regression lock: a WS drop (page refresh / tab close) must
+/// finalize the call session in the DB — count decremented, call auto-ended
+/// when it was the last session — with no HTTP leave ever arriving.
+#[tokio::test]
+async fn ws_disconnect_finalizes_call_session_in_db() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("conndrop1").await;
+    let token = &tenant.admin.access_token;
+    let room_id = create_room_and_start_call(&app, &tenant.tenant_id, token, "Refresh Drop").await;
+
+    let (mut ws1, conn1) = ws_connect_with_conn_id(&app.addr, token).await;
+    app.auth_post(
+        &format!(
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
+        ),
+        token,
+    )
+    .json(&serde_json::json!({ "connection_id": conn1 }))
+    .send()
+    .await
+    .unwrap();
+    let _t1 = media_join(&mut ws1, &room_id).await;
+
+    let room = get_room(&app, &tenant.tenant_id, &room_id, token).await;
+    assert_eq!(room["participant_count"], 1);
+
+    // Simulate a page refresh: the socket just dies.
+    drop(ws1);
+
+    let mut cleaned = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let room = get_room(&app, &tenant.tenant_id, &room_id, token).await;
+        if room["participant_count"] == 0 && room["conference_status"] == "ended" {
+            cleaned = true;
+            break;
+        }
+    }
+    assert!(
+        cleaned,
+        "WS disconnect must close the call session (count→0, status→ended)"
+    );
+}
+
+/// A session whose media:join never happened (HTTP call/join only) must
+/// still be finalized on WS disconnect via the Mongo connection lookup.
+#[tokio::test]
+async fn ws_disconnect_finalizes_http_only_call_session() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("conndrop2").await;
+    let token = &tenant.admin.access_token;
+    let room_id = create_room_and_start_call(&app, &tenant.tenant_id, token, "HTTP Only").await;
+
+    let (ws1, conn1) = ws_connect_with_conn_id(&app.addr, token).await;
+    app.auth_post(
+        &format!(
+            "/api/tenant/{}/room/{}/call/join",
+            tenant.tenant_id, room_id
+        ),
+        token,
+    )
+    .json(&serde_json::json!({ "connection_id": conn1 }))
+    .send()
+    .await
+    .unwrap();
+
+    drop(ws1);
+
+    let mut cleaned = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let room = get_room(&app, &tenant.tenant_id, &room_id, token).await;
+        if room["participant_count"] == 0 && room["conference_status"] == "ended" {
+            cleaned = true;
+            break;
+        }
+    }
+    assert!(cleaned, "HTTP-only session must be reaped on WS disconnect");
+}
