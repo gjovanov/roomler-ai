@@ -297,6 +297,14 @@ struct Installed {
     /// render `stalled` instead of a healthy-looking tier label. Verdict
     /// only — every kill/refresh decision stays in `lifecycle::carrier_tick`.
     stalled: bool,
+    /// P4 — inbound packets from this peer refused by the ingress ACL
+    /// (`PeerStats::rx_denied`), snapshotted by the health sweep. Monotonic.
+    /// Surfaced through the LocalAPI so a `warn`-mode fleet can be READ
+    /// (`roomler peers --json`) instead of grepped: the warning line is
+    /// throttled to one per peer per minute, which is deliberately useless for
+    /// measuring volume — and volume is exactly what decides whether `enforce`
+    /// is safe to flip.
+    rx_denied: u64,
     /// Monotonic instant we last HEARD from this peer — a real "last seen"
     /// (P3b-3). Seeded to `since` at install; advanced by `sweep_carrier_health`
     /// whenever the keepalive-inclusive `rx_any` liveness counter climbed since
@@ -380,6 +388,7 @@ impl Installed {
             relay_local: None,
             relay_dst: None,
             public_direct_dst: None,
+            rx_denied: 0,
             tier,
         }
     }
@@ -870,6 +879,7 @@ fn build_overlay_view(
                     rx: i.last_traffic.1,
                     last_rx_age_s: now.saturating_duration_since(i.last_rx_at).as_secs(),
                     relay_kind: i.relay_kind_dbg.map(str::to_string),
+                    rx_denied: i.rx_denied,
                 }),
             }
         })
