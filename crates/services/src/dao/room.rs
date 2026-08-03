@@ -8,6 +8,15 @@ use roomler_ai_db::models::{
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
+/// Outcome of `leave_participant`: whether an open session was actually
+/// closed, and whether it was the user's last one (⇒ the count was
+/// decremented and the caller may need to auto-end the call).
+#[derive(Debug, Clone, Copy)]
+pub struct LeaveOutcome {
+    pub closed: bool,
+    pub was_last_session: bool,
+}
+
 pub struct RoomDao {
     pub base: BaseDao<Room>,
     pub members: BaseDao<RoomMember>,
@@ -422,6 +431,9 @@ impl RoomDao {
     }
 
     /// Join a call as a participant (add session, update media state on RoomMember).
+    ///
+    /// `connection_id` scopes the session to one WS connection so the same
+    /// user can hold independent sessions from several browsers/devices.
     pub async fn join_participant(
         &self,
         tenant_id: ObjectId,
@@ -429,6 +441,7 @@ impl RoomDao {
         user_id: ObjectId,
         display_name: String,
         device_type: String,
+        connection_id: Option<String>,
     ) -> DaoResult<RoomMember> {
         let now = DateTime::now();
         let session = ParticipantSession {
@@ -436,6 +449,7 @@ impl RoomDao {
             left_at: None,
             duration: None,
             device_type,
+            connection_id,
         };
 
         // Check for existing active session (already in call)
@@ -452,6 +466,28 @@ impl RoomDao {
 
         if let Some(existing) = existing {
             let eid = existing.id.unwrap();
+
+            // Idempotent per connection: a rehome-rejoin re-invokes call/join
+            // on the same WS connection — close the stale open session that
+            // connection left behind so one connection never holds two open
+            // sessions (which would break the last-session leave decrement).
+            if let Some(cid) = session.connection_id.as_deref() {
+                let opts = mongodb::options::UpdateOptions::builder()
+                    .array_filters(vec![
+                        doc! { "elem.connection_id": cid, "elem.left_at": null },
+                    ])
+                    .build();
+                self.members
+                    .collection()
+                    .update_one(
+                        doc! { "_id": eid },
+                        doc! { "$set": { "sessions.$[elem].left_at": now } },
+                    )
+                    .with_options(opts)
+                    .await
+                    .map_err(DaoError::Mongo)?;
+            }
+
             self.members
                 .collection()
                 .update_one(
@@ -544,11 +580,41 @@ impl RoomDao {
         self.members.find_by_id(id).await
     }
 
-    pub async fn leave_participant(&self, room_id: ObjectId, user_id: ObjectId) -> DaoResult<bool> {
+    /// Close call session(s) for a user. `connection_id: Some(_)` closes ONLY
+    /// that connection's session (multi-device: the user's other browsers keep
+    /// theirs); `None` is the legacy user-level leave closing all open ones.
+    ///
+    /// `participant_count` counts DISTINCT USERS, so it is decremented only
+    /// when the user's last open session closed. The close runs as a single
+    /// `find_one_and_update` whose filter DEMANDS a matching open session and
+    /// whose post-image decides "last": two concurrent leaves serialize on the
+    /// document, exactly one observes zero open sessions, and a duplicate
+    /// leave matches nothing — the double-decrement that used to drive the
+    /// count to 0 under another live user (ending their call) can't happen.
+    pub async fn leave_participant(
+        &self,
+        room_id: ObjectId,
+        user_id: ObjectId,
+        connection_id: Option<&str>,
+    ) -> DaoResult<LeaveOutcome> {
         let now = DateTime::now();
-        let filter = doc! {
-            "room_id": room_id,
-            "user_id": user_id,
+        let (filter, array_filters) = match connection_id {
+            Some(cid) => (
+                doc! {
+                    "room_id": room_id,
+                    "user_id": user_id,
+                    "sessions": { "$elemMatch": { "connection_id": cid, "left_at": null } },
+                },
+                vec![doc! { "elem.connection_id": cid, "elem.left_at": null }],
+            ),
+            None => (
+                doc! {
+                    "room_id": room_id,
+                    "user_id": user_id,
+                    "sessions.left_at": null,
+                },
+                vec![doc! { "elem.left_at": null }],
+            ),
         };
         let update = doc! {
             "$set": {
@@ -556,32 +622,67 @@ impl RoomDao {
                 "updated_at": now,
             }
         };
-        let opts = mongodb::options::UpdateOptions::builder()
-            .array_filters(vec![doc! { "elem.left_at": null }])
+        let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+            .array_filters(array_filters)
+            .return_document(mongodb::options::ReturnDocument::After)
             .build();
-        self.members
+        let post = self
+            .members
             .collection()
-            .update_one(filter, update)
+            .find_one_and_update(filter, update)
             .with_options(opts)
             .await
             .map_err(DaoError::Mongo)?;
 
-        // Guarded decrement: only when participant_count > 0, so a stray /call/leave
-        // (duplicate, or after the join was never recorded) can't underflow the u32
-        // and break subsequent GET /room with a "expected u32, got -1" deserialize 500.
-        self.base
+        let Some(post) = post else {
+            return Ok(LeaveOutcome {
+                closed: false,
+                was_last_session: false,
+            });
+        };
+        let was_last_session = post.sessions.iter().all(|s| s.left_at.is_some());
+
+        if was_last_session {
+            // Guarded decrement: only when participant_count > 0, so a stray
+            // leave after the join was never recorded can't underflow the u32
+            // and break GET /room with a "expected u32, got -1" deserialize 500.
+            self.base
+                .collection()
+                .update_one(
+                    doc! { "_id": room_id, "participant_count": { "$gt": 0 } },
+                    doc! {
+                        "$inc": { "participant_count": -1 },
+                        "$set": { "updated_at": now },
+                    },
+                )
+                .await
+                .map_err(DaoError::Mongo)?;
+        }
+
+        Ok(LeaveOutcome {
+            closed: true,
+            was_last_session,
+        })
+    }
+
+    /// Room in which the given WS connection still holds an OPEN call session.
+    /// Disconnect-path fallback for when the in-memory media maps have no
+    /// entry (HTTP call/join succeeded but `media:join` never happened).
+    pub async fn find_call_room_for_connection(
+        &self,
+        user_id: ObjectId,
+        connection_id: &str,
+    ) -> DaoResult<Option<ObjectId>> {
+        let member = self
+            .members
             .collection()
-            .update_one(
-                doc! { "_id": room_id, "participant_count": { "$gt": 0 } },
-                doc! {
-                    "$inc": { "participant_count": -1 },
-                    "$set": { "updated_at": now },
-                },
-            )
+            .find_one(doc! {
+                "user_id": user_id,
+                "sessions": { "$elemMatch": { "connection_id": connection_id, "left_at": null } },
+            })
             .await
             .map_err(DaoError::Mongo)?;
-
-        Ok(true)
+        Ok(member.map(|m| m.room_id))
     }
 
     pub async fn list_participants(&self, room_id: ObjectId) -> DaoResult<Vec<RoomMember>> {
