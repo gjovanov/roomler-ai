@@ -113,6 +113,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "B2 - score-driven demotion of degraded-but-live direct carriers: shadow (count only - built-in default) | on | off. Env: ROOMLER_AGENT_OVERLAY_DEMOTE.",
     ),
     (
+        "overlay_rpf",
+        "string",
+        "P4 - reverse-path filtering of inbound overlay packets (drop a source address the sending peer does not own): warn (count + log, still deliver - built-in default) | enforce | off. Env: ROOMLER_NODE_OVERLAY_RPF.",
+    ),
+    (
         "overlay_route_events",
         "tribool",
         "Event-driven route guard (OS route-table change subscription; the blind tick backstops it). Built-in default: on.",
@@ -276,6 +281,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
+        "overlay_rpf" => cfg.overlay_rpf.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
@@ -375,6 +381,18 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                     let mode = v.to_ascii_lowercase();
                     if !matches!(mode.as_str(), "on" | "shadow" | "off") {
                         return Err("overlay_demote must be on | shadow | off".to_string());
+                    }
+                    Some(mode)
+                }
+            }
+        }
+        "overlay_rpf" => {
+            cfg.overlay_rpf = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let mode = v.to_ascii_lowercase();
+                    if !matches!(mode.as_str(), "warn" | "enforce" | "off") {
+                        return Err("overlay_rpf must be warn | enforce | off".to_string());
                     }
                     Some(mode)
                 }
@@ -709,6 +727,27 @@ mod tests {
     }
 
     /// B2 — the demotion-mode key set/echo/clear + validation.
+    #[test]
+    fn overlay_rpf_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_rpf", Some("enforce")).unwrap();
+        assert_eq!(cfg.overlay_rpf.as_deref(), Some("enforce"));
+        assert_eq!(
+            entry_for(&cfg, "overlay_rpf").unwrap().value.as_deref(),
+            Some("enforce")
+        );
+        apply(&mut cfg, "overlay_rpf", Some("WARN")).unwrap();
+        assert_eq!(cfg.overlay_rpf.as_deref(), Some("warn"));
+        apply(&mut cfg, "overlay_rpf", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_rpf.as_deref(), Some("off"));
+        apply(&mut cfg, "overlay_rpf", None).unwrap();
+        assert_eq!(cfg.overlay_rpf, None);
+        // `shadow` is B2's vocabulary, not this key's — reject it rather than
+        // silently landing on the default.
+        assert!(apply(&mut cfg, "overlay_rpf", Some("shadow")).is_err());
+        assert!(apply(&mut cfg, "overlay_rpf", Some("yes")).is_err());
+    }
+
     #[test]
     fn overlay_demote_set_echo_clear_and_validate() {
         let mut cfg = crate::config::test_fixture();
