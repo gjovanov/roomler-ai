@@ -86,6 +86,9 @@ impl OverlayPolicyDao {
         self.base.find_by_id_in_tenant(tenant_id, policy_id).await
     }
 
+    // Same shape (and same allow) as `TunnelPolicyDao::update`: every field is
+    // an independent `Option` so a PATCH can leave the rest untouched.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         tenant_id: ObjectId,
