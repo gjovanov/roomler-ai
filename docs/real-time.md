@@ -222,7 +222,7 @@ Browser                             Server (Axum + mediasoup)
 
 2. **Sender exclusion**: Message broadcasts exclude the sender's user_id to prevent duplicates. The frontend also has dedup (checking by message ID) as a safety net.
 
-3. **HTTP leave cleanup**: The HTTP leave endpoint uses `close_participant_by_user()` which removes ALL connections for that user (since it doesn't know the connection_id). The WS leave and disconnect path uses `close_participant()` with the specific connection_id.
+3. **HTTP leave cleanup** (2026-08-04): `call/join` and `call/leave` accept an optional `connection_id` (from the WS `connected` frame) — the leave then closes ONLY that connection's media + session (`close_participant_of_user()`, ownership-checked), so the same user's other browsers keep their call. Without a connection_id the legacy `close_participant_by_user()` close-all path runs (mixed-version fallback). `participant_count` counts DISTINCT USERS and is decremented only when the user's last session closes; the WS disconnect path finalizes the DB session the same way (count + auto-end + `room:call_updated`/`room:call_ended` broadcasts).
 
 4. **Race condition mitigation**: The frontend registers `media:new_producer` handlers BEFORE sending `media:join`, and buffers any producer messages that arrive before transports are ready.
 

@@ -378,6 +378,35 @@ impl RoomManager {
         debug!(?room_id, %connection_id, "participant media closed");
     }
 
+    /// Removes ONE connection's media state, but only when that connection
+    /// belongs to `user_id`. The connection id may come from an HTTP body, so
+    /// a room member must not be able to close another participant's media by
+    /// guessing a UUID. Returns whether an entry was removed.
+    pub fn close_participant_of_user(
+        &self,
+        room_id: &ObjectId,
+        connection_id: &str,
+        user_id: &ObjectId,
+    ) -> bool {
+        let mut removed = false;
+        if let Some(room) = self.rooms.get(room_id) {
+            let owned = room
+                .participants
+                .get(connection_id)
+                .map(|p| &p.user_id == user_id)
+                .unwrap_or(false);
+            if owned {
+                room.participants.remove(connection_id);
+                removed = true;
+            }
+        }
+        if removed {
+            self.connection_rooms.remove(connection_id);
+            debug!(?room_id, %connection_id, "participant media closed (ownership-checked)");
+        }
+        removed
+    }
+
     /// Removes ALL participant entries for a given user_id from a room.
     /// Used by HTTP leave endpoint which doesn't have a connection_id.
     pub fn close_participant_by_user(&self, room_id: &ObjectId, user_id: &ObjectId) {
