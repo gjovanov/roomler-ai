@@ -57,6 +57,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::derp_acl::DerpAclCache;
 use super::handler::WsParams;
 use super::overlay::{NodeIdentity, current_node};
 use crate::state::AppState;
@@ -196,7 +197,13 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
         tokio::select! {
             msg = ws_rx.next() => match msg {
                 Some(Ok(Message::Binary(frame))) => {
-                    forward_frame(&state.derp_registry, network_id, &self_pubkey, &frame[..]);
+                    forward_frame(
+                        &state.derp_registry,
+                        &state.derp_acl,
+                        network_id,
+                        &self_pubkey,
+                        &frame[..],
+                    );
                 }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 // Ignore text / ping / pong (axum auto-pongs).
@@ -236,22 +243,16 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
 /// or oversized frame, an unknown dst (peer offline / not in this network), or a
 /// full destination queue (the carrier is loss-tolerant).
 ///
-/// ⚠️ **Overlay-ACL gap (known, deliberate).** This is scoped by `network_id`
-/// only, so a pair denied by the overlay ACL can still relay through DERP if
-/// both ends already hold each other's pubkeys (a stale or modified client —
-/// an honest client never learns a withheld peer's key, because the netmap
-/// withholds it and revokes with `removes`). The TURN-grant path IS gated
-/// (`ws::overlay::handle_overlay_relay_request`); this one is not, because
-/// forwarding is a per-DATAGRAM sync path and an async policy read here would
-/// be a serious throughput regression.
-///
-/// The fix is a **cached per-network allow-set** — a `DashMap<(network_id,
-/// src_pubkey), HashSet<dst_pubkey>>` rebuilt when policies change (the same
-/// re-fan hook that reshapes netmaps) and consulted with one lock-free lookup
-/// per frame. That belongs with the node-side ingress filter, which addresses
-/// the same "hostile client" tier of the threat model.
+/// **Overlay-ACL gated.** Beyond the `network_id` scope, a frame is dropped when
+/// the tenant is ENFORCING and the ACL would not let `src_pubkey` see the
+/// destination — otherwise a stale or modified client holding a denied peer's
+/// key could relay straight around the netmap (an honest client never learns a
+/// withheld key). The decision is a precomputed [`super::derp_acl`] table read,
+/// not a policy query: this is a synchronous per-datagram path. A missing table
+/// permits the frame — see that module for the fail-open rationale.
 fn forward_frame(
     registry: &DerpRegistry,
+    acl: &DerpAclCache,
     network_id: ObjectId,
     src_pubkey: &DerpPubKey,
     frame: &[u8],
@@ -262,6 +263,22 @@ fn forward_frame(
     let mut dst = [0u8; 32];
     dst.copy_from_slice(&frame[..32]);
     let payload = &frame[32..];
+
+    // One lock-free lookup. Absent ⇒ fail open (no table built for this
+    // network: ACL off, or not yet rebuilt after a restart).
+    if let Some(table) = acl.get(&network_id)
+        && !table.permits(src_pubkey, &dst)
+    {
+        // Rate-limited by the tenant's own churn, not per frame: a denied
+        // pair retries on the WG handshake timer (~5 s), not per packet.
+        debug!(
+            %network_id,
+            src = %BASE64.encode(src_pubkey),
+            dst = %BASE64.encode(dst),
+            "derp: dropped a frame the overlay ACL denies"
+        );
+        return;
+    }
 
     // Clone the sender out of the shard guard so we don't hold the DashMap lock
     // across the (non-blocking) try_send.
@@ -292,6 +309,19 @@ mod tests {
         f
     }
 
+    /// No table for any network — the fail-open posture, and the pre-ACL
+    /// behaviour every test above asserts.
+    fn no_acl() -> DerpAclCache {
+        Arc::new(DashMap::new())
+    }
+
+    /// A cache holding one network's table.
+    fn acl_with(net: ObjectId, table: crate::ws::derp_acl::DerpAllowTable) -> DerpAclCache {
+        let c: DerpAclCache = Arc::new(DashMap::new());
+        c.insert(net, Arc::new(table));
+        c
+    }
+
     #[test]
     fn forwards_within_network_and_rewrites_src() {
         let reg: DerpRegistry = Arc::new(DashMap::new());
@@ -301,7 +331,7 @@ mod tests {
         reg.insert((net, b), b_tx);
 
         // A → B with payload [1,2,3]; B should receive [A-pubkey || 1,2,3].
-        forward_frame(&reg, net, &a, &frame(&b, &[1, 2, 3]));
+        forward_frame(&reg, &no_acl(), net, &a, &frame(&b, &[1, 2, 3]));
 
         let got = b_rx.try_recv().expect("B should receive the frame");
         assert_eq!(&got[..32], &a, "src prefix must be rewritten to the sender");
@@ -320,7 +350,7 @@ mod tests {
         reg.insert((net_b, b), b_in_b_tx);
 
         // A sends from net_a → only net_a's B receives; net_b's B never does.
-        forward_frame(&reg, net_a, &a, &frame(&b, &[9]));
+        forward_frame(&reg, &no_acl(), net_a, &a, &frame(&b, &[9]));
 
         assert!(b_in_a_rx.try_recv().is_ok(), "same-network dst delivered");
         assert!(
@@ -334,7 +364,55 @@ mod tests {
         let reg: DerpRegistry = Arc::new(DashMap::new());
         let net = ObjectId::new();
         // No registrations at all — forwarding must not panic.
-        forward_frame(&reg, net, &pk(0xAA), &frame(&pk(0xCC), &[1]));
+        forward_frame(&reg, &no_acl(), net, &pk(0xAA), &frame(&pk(0xCC), &[1]));
+    }
+
+    /// The bypass this gate closes: both ends are registered in the same
+    /// network and hold each other's pubkeys, but the ACL denies the pair.
+    #[test]
+    fn enforcing_acl_drops_a_denied_pair_even_though_both_are_registered() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (a, b) = (pk(0xAA), pk(0xBB));
+        let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
+        reg.insert((net, b), b_tx);
+
+        // Table enforces and lists no A→B pair.
+        let acl = acl_with(
+            net,
+            crate::ws::derp_acl::DerpAllowTable::for_test(true, &[]),
+        );
+        forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
+        assert!(
+            b_rx.try_recv().is_err(),
+            "a pair the overlay ACL denies must not relay through DERP"
+        );
+
+        // Same registry, same frame — permitted once the pair is allowed.
+        let acl = acl_with(
+            net,
+            crate::ws::derp_acl::DerpAllowTable::for_test(true, &[(a, b)]),
+        );
+        forward_frame(&reg, &acl, net, &a, &frame(&b, &[1, 2, 3]));
+        assert!(b_rx.try_recv().is_ok(), "an allowed pair must still relay");
+    }
+
+    /// `warn` must never drop — the evidence-first cutover, mirroring the
+    /// netmap shaping and the node-side reverse-path filter.
+    #[test]
+    fn warn_mode_acl_delivers_even_an_unlisted_pair() {
+        let reg: DerpRegistry = Arc::new(DashMap::new());
+        let net = ObjectId::new();
+        let (a, b) = (pk(0xAA), pk(0xBB));
+        let (b_tx, mut b_rx) = mpsc::channel::<Vec<u8>>(8);
+        reg.insert((net, b), b_tx);
+
+        let acl = acl_with(
+            net,
+            crate::ws::derp_acl::DerpAllowTable::for_test(false, &[]),
+        );
+        forward_frame(&reg, &acl, net, &a, &frame(&b, &[7]));
+        assert!(b_rx.try_recv().is_ok(), "warn mode must not drop");
     }
 
     #[test]
@@ -344,7 +422,7 @@ mod tests {
         let (dst_tx, mut dst_rx) = mpsc::channel::<Vec<u8>>(8);
         reg.insert((net, pk(0xBB)), dst_tx);
         // 10 bytes < 32 → no dst pubkey → dropped, nothing delivered.
-        forward_frame(&reg, net, &pk(0xAA), &[0u8; 10]);
+        forward_frame(&reg, &no_acl(), net, &pk(0xAA), &[0u8; 10]);
         assert!(dst_rx.try_recv().is_err());
     }
 }
