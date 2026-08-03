@@ -72,6 +72,7 @@
             <th>Name</th>
             <th>Status</th>
             <th>OS</th>
+            <th>Overlay</th>
             <th>Consent</th>
             <th>Codecs</th>
             <th>Last seen</th>
@@ -89,61 +90,65 @@
                 :to="{ name: 'agent-remote', params: { tenantId, agentId: a.id } }"
                 :aria-label="`Connect to agent ${a.name}`"
               />
-              <v-btn
-                icon="mdi-update"
-                size="small"
-                variant="text"
-                color="primary"
-                :disabled="updateBusy === a.id"
-                :loading="updateBusy === a.id"
-                @click="triggerUpdate(a)"
-                :aria-label="`Update agent ${a.name} now`"
-                title="Update agent now"
-              />
-              <v-btn
-                icon="mdi-alert-circle-outline"
-                size="small"
-                variant="text"
-                color="warning"
-                @click="openCrashes(a)"
-                :aria-label="`View crash reports for ${a.name}`"
-                title="Crash reports"
-              />
-              <v-btn
-                icon="mdi-text-box-search-outline"
-                size="small"
-                variant="text"
-                color="primary"
-                @click="openLogs(a)"
-                :aria-label="`View logs for ${a.name}`"
-                title="Agent logs"
-              />
-              <v-btn
-                icon="mdi-account-switch"
-                size="small"
-                variant="text"
-                color="primary"
-                @click="openReassign(a)"
-                :aria-label="`Reassign owner of ${a.name}`"
-                title="Reassign owner"
-              />
-              <v-btn
-                icon="mdi-ip-network-outline"
-                size="small"
-                variant="text"
-                color="primary"
-                @click="openRoutes(a)"
-                :aria-label="`Manage subnet routes for ${a.name}`"
-                title="Subnet routes"
-              />
-              <v-btn
-                icon="mdi-delete"
-                size="small"
-                variant="text"
-                color="error"
-                @click="confirmDelete(a)"
-                :aria-label="`Delete agent ${a.name}`"
-              />
+              <!-- Everything but Connect lives in ONE grouped menu — the
+                   seven bare icons were unscannable and the mobile cards
+                   had silently drifted (they dropped Reassign owner). -->
+              <v-menu>
+                <template #activator="{ props: menuProps }">
+                  <v-btn
+                    v-bind="menuProps"
+                    icon="mdi-dots-vertical"
+                    size="small"
+                    variant="text"
+                    :aria-label="`Actions for ${a.name}`"
+                  />
+                </template>
+                <v-list density="compact" min-width="230">
+                  <v-list-subheader>Maintenance</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-update"
+                    title="Update now"
+                    :disabled="updateBusy === a.id"
+                    @click="triggerUpdate(a)"
+                  />
+                  <v-list-subheader>Diagnostics</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-alert-circle-outline"
+                    title="Crash reports"
+                    @click="openCrashes(a)"
+                  />
+                  <v-list-item
+                    prepend-icon="mdi-text-box-search-outline"
+                    title="Agent logs"
+                    @click="openLogs(a)"
+                  />
+                  <v-list-subheader>Access</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-account-switch"
+                    title="Reassign owner"
+                    @click="openReassign(a)"
+                  />
+                  <v-list-subheader>Network</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-ip-network-outline"
+                    title="Tunnel mesh routes"
+                    @click="openRoutes(a)"
+                  />
+                  <v-list-item
+                    v-if="nodeForAgent(a.id)"
+                    prepend-icon="mdi-lan-disconnect"
+                    :title="nodeForAgent(a.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
+                    @click="confirmEvict(nodeForAgent(a.id)!)"
+                  />
+                  <v-divider />
+                  <v-list-item
+                    prepend-icon="mdi-delete"
+                    title="Delete device"
+                    base-color="error"
+                    @click="confirmDelete(a)"
+                  />
+                </v-list>
+              </v-menu>
             </td>
             <td>
               <div class="d-flex align-center">
@@ -192,6 +197,18 @@
               <v-chip size="x-small" :prepend-icon="osIcon(a.os)" variant="tonal">
                 {{ a.os }}
               </v-chip>
+            </td>
+            <td>
+              <template v-if="nodeForAgent(a.id)">
+                <div class="text-caption font-mono">{{ nodeForAgent(a.id)!.overlay_ip }}</div>
+                <div
+                  class="text-caption text-medium-emphasis font-mono"
+                  :title="deriveOverlayV6(nodeForAgent(a.id)!.overlay_ip) ?? undefined"
+                >
+                  {{ deriveOverlayV6(nodeForAgent(a.id)!.overlay_ip) }}
+                </div>
+              </template>
+              <span v-else class="text-caption text-medium-emphasis">—</span>
             </td>
             <td>
               <v-select
@@ -366,38 +383,64 @@
               >
                 Connect
               </v-btn>
-              <v-btn
-                icon="mdi-alert-circle-outline"
-                size="small"
-                variant="text"
-                color="warning"
-                @click="openCrashes(a)"
-                :aria-label="`View crash reports for ${a.name}`"
-              />
-              <v-btn
-                icon="mdi-text-box-search-outline"
-                size="small"
-                variant="text"
-                color="primary"
-                @click="openLogs(a)"
-                :aria-label="`View logs for ${a.name}`"
-              />
-              <v-btn
-                icon="mdi-ip-network-outline"
-                size="small"
-                variant="text"
-                color="primary"
-                @click="openRoutes(a)"
-                :aria-label="`Manage subnet routes for ${a.name}`"
-              />
-              <v-btn
-                icon="mdi-delete"
-                size="small"
-                variant="text"
-                color="error"
-                @click="confirmDelete(a)"
-                :aria-label="`Delete agent ${a.name}`"
-              />
+              <!-- Same grouped menu as the desktop table — the mobile card
+                   used to carry its own DIVERGED subset (no Reassign owner). -->
+              <v-menu>
+                <template #activator="{ props: menuProps }">
+                  <v-btn
+                    v-bind="menuProps"
+                    icon="mdi-dots-vertical"
+                    size="small"
+                    variant="text"
+                    :aria-label="`Actions for ${a.name}`"
+                  />
+                </template>
+                <v-list density="compact" min-width="230">
+                  <v-list-subheader>Maintenance</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-update"
+                    title="Update now"
+                    :disabled="updateBusy === a.id"
+                    @click="triggerUpdate(a)"
+                  />
+                  <v-list-subheader>Diagnostics</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-alert-circle-outline"
+                    title="Crash reports"
+                    @click="openCrashes(a)"
+                  />
+                  <v-list-item
+                    prepend-icon="mdi-text-box-search-outline"
+                    title="Agent logs"
+                    @click="openLogs(a)"
+                  />
+                  <v-list-subheader>Access</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-account-switch"
+                    title="Reassign owner"
+                    @click="openReassign(a)"
+                  />
+                  <v-list-subheader>Network</v-list-subheader>
+                  <v-list-item
+                    prepend-icon="mdi-ip-network-outline"
+                    title="Tunnel mesh routes"
+                    @click="openRoutes(a)"
+                  />
+                  <v-list-item
+                    v-if="nodeForAgent(a.id)"
+                    prepend-icon="mdi-lan-disconnect"
+                    :title="nodeForAgent(a.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
+                    @click="confirmEvict(nodeForAgent(a.id)!)"
+                  />
+                  <v-divider />
+                  <v-list-item
+                    prepend-icon="mdi-delete"
+                    title="Delete device"
+                    base-color="error"
+                    @click="confirmDelete(a)"
+                  />
+                </v-list>
+              </v-menu>
             </div>
           </v-card-text>
         </v-card>
@@ -414,6 +457,112 @@
     </v-card-text>
   </v-card>
 
+  <!-- Tunnel clients (2026-08-04): CLI-only endpoints folded into the
+       unified Devices page — /network/tunnel-clients redirects here. Same
+       overlay/last-seen columns; no remote-desktop/consent/codec cells
+       (those are agent-only capabilities). -->
+  <v-card class="mt-4">
+    <v-card-title class="d-flex align-center">
+      <span>Tunnel clients</span>
+      <v-spacer />
+      <v-btn
+        prepend-icon="mdi-key-plus"
+        variant="tonal"
+        size="small"
+        @click="openTunnelEnrollDialog"
+      >
+        Enroll tunnel client
+      </v-btn>
+    </v-card-title>
+    <v-card-text>
+      <v-table v-if="tunnelClientStore.clients.length > 0" density="compact">
+        <thead>
+          <tr>
+            <th class="agents-actions-col">Actions</th>
+            <th>Name</th>
+            <th>Status</th>
+            <th>OS</th>
+            <th>Overlay</th>
+            <th>Version</th>
+            <th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="c in tunnelClientStore.clients" :key="c.id">
+            <td class="agents-actions-col">
+              <v-menu>
+                <template #activator="{ props: menuProps }">
+                  <v-btn
+                    v-bind="menuProps"
+                    icon="mdi-dots-vertical"
+                    size="small"
+                    variant="text"
+                    :aria-label="`Actions for ${c.name}`"
+                  />
+                </template>
+                <v-list density="compact" min-width="230">
+                  <v-list-subheader>Network</v-list-subheader>
+                  <v-list-item
+                    v-if="nodeForTunnelClient(c.id)"
+                    prepend-icon="mdi-lan-disconnect"
+                    :title="nodeForTunnelClient(c.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
+                    @click="confirmEvict(nodeForTunnelClient(c.id)!)"
+                  />
+                  <v-divider />
+                  <v-list-item
+                    prepend-icon="mdi-delete"
+                    title="Delete tunnel client"
+                    base-color="error"
+                    @click="confirmTunnelDelete(c)"
+                  />
+                </v-list>
+              </v-menu>
+            </td>
+            <td class="font-weight-medium">{{ c.name }}</td>
+            <td>
+              <v-chip
+                size="small"
+                :color="c.status === 'online' ? 'success' : 'grey'"
+                variant="flat"
+              >
+                {{ c.status }}
+              </v-chip>
+            </td>
+            <td>
+              <v-chip size="x-small" variant="tonal">{{ c.os }}</v-chip>
+            </td>
+            <td>
+              <template v-if="nodeForTunnelClient(c.id)">
+                <div class="text-caption font-mono">
+                  {{ nodeForTunnelClient(c.id)!.overlay_ip }}
+                </div>
+                <div
+                  class="text-caption text-medium-emphasis font-mono"
+                  :title="deriveOverlayV6(nodeForTunnelClient(c.id)!.overlay_ip) ?? undefined"
+                >
+                  {{ deriveOverlayV6(nodeForTunnelClient(c.id)!.overlay_ip) }}
+                </div>
+              </template>
+              <span v-else class="text-caption text-medium-emphasis">—</span>
+            </td>
+            <td class="text-caption">{{ c.client_version || '—' }}</td>
+            <td class="text-caption" :title="fmtDate(c.last_seen_at)">
+              {{ fmtRelative(c.last_seen_at) }}
+            </td>
+          </tr>
+        </tbody>
+      </v-table>
+      <div v-else class="text-center pa-4 text-medium-emphasis">
+        <p class="mb-1">No tunnel clients enrolled.</p>
+        <p class="text-body-2">
+          Tunnel clients are CLI-only endpoints (SOCKS5 / port forwards) with
+          no remote-desktop — enroll one with the command from "Enroll tunnel
+          client".
+        </p>
+      </div>
+    </v-card-text>
+  </v-card>
+
   <!-- S4 — unified enrollment dialog (token + per-OS install commands
        derived from this origin; template map vitest-locked). -->
   <EnrollmentDialog
@@ -425,6 +574,92 @@
     :error="enrollError"
     @update:model-value="(v: boolean) => { if (!v) closeEnrollDialog() }"
   />
+
+  <!-- Tunnel-client enrollment (folded from /network/tunnel-clients) -->
+  <EnrollmentDialog
+    :model-value="tunnelEnrollDialogOpen"
+    kind="tunnel"
+    :token="tunnelEnrollToken?.enrollment_token ?? null"
+    :expires-in="tunnelEnrollToken?.expires_in ?? null"
+    :loading="tunnelEnrollLoading"
+    :error="tunnelEnrollError"
+    @update:model-value="(v: boolean) => { if (!v) closeTunnelEnrollDialog() }"
+  />
+
+  <!-- Overlay eviction (lifted from MachinesSection; shared by devices and
+       tunnel clients — the confirm copy branches on will_rejoin). -->
+  <v-dialog v-model="evictDialogOpen" max-width="540">
+    <v-card>
+      <v-card-title>
+        {{ evictTarget?.will_rejoin
+          ? `Force a new overlay address for “${evictTarget?.name}”?`
+          : `Remove “${evictTarget?.name}” from the mesh?` }}
+      </v-card-title>
+      <v-card-text>
+        <ul class="text-body-2 mb-3 ps-4">
+          <li>
+            It leaves the mesh immediately — every peer drops its routes, and
+            traffic to
+            <span class="text-mono">{{ evictTarget?.overlay_ip }}</span>
+            stops.
+          </li>
+          <li>
+            That address is released back to this tenant's pool and may later
+            be assigned to a <strong>different</strong> machine.
+          </li>
+          <li v-if="evictTarget?.will_rejoin">
+            <strong>{{ evictTarget?.name }}</strong> is still enrolled, so it
+            rejoins automatically on its next connect — with a
+            <strong>different</strong> overlay address. This does not revoke
+            access; to remove the device for good, delete the agent or tunnel
+            client.
+          </li>
+          <li v-else>
+            Its backing device is no longer enrolled, so it will not come back.
+          </li>
+        </ul>
+        <v-alert type="warning" variant="tonal" density="compact" class="mb-0">
+          Anything pinned to the old address stops working — firewall rules,
+          scripts, and any client configured with
+          <code>overlay_exit_node = "{{ evictTarget?.name }}"</code>.
+        </v-alert>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="evictDialogOpen = false">Cancel</v-btn>
+        <v-btn color="error" variant="flat" :loading="evicting" @click="performEvict">
+          {{ evictTarget?.will_rejoin ? 'Evict and reassign' : 'Remove from mesh' }}
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Tunnel-client delete confirmation (folded from TunnelClientsSection) -->
+  <v-dialog v-model="tunnelDeleteDialogOpen" max-width="480">
+    <v-card>
+      <v-card-title>Delete tunnel client?</v-card-title>
+      <v-card-text>
+        <p class="font-weight-medium mb-2">{{ tunnelDeleteTarget?.name }}</p>
+        <p class="text-body-2">
+          Its access token is revoked and, if it joined the overlay, its node
+          is evicted and the overlay address released. The CLI stays installed
+          on the machine and can be re-enrolled with a new token.
+        </p>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="tunnelDeleteDialogOpen = false">Cancel</v-btn>
+        <v-btn
+          color="error"
+          variant="flat"
+          :loading="tunnelDeleting"
+          @click="performTunnelDelete"
+        >
+          Delete
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 
   <!-- Crash reports modal -->
   <AgentCrashesDialog
@@ -627,10 +862,112 @@ import { codecChips } from './agentCodecChips'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
 import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
+import {
+  useOverlayRoutesStore,
+  deriveOverlayV6,
+  type OverlayNode,
+} from '@/stores/overlayRoutes'
+import {
+  useTunnelClientStore,
+  type TunnelClient,
+  type TunnelEnrollmentToken,
+} from '@/stores/tunnelClients'
 
 const props = defineProps<{ tenantId: string }>()
 
 const agentStore = useAgentStore()
+const overlayStore = useOverlayRoutesStore()
+const tunnelClientStore = useTunnelClientStore()
+
+// ── Unified-devices join (2026-08-04): overlay node per device row. The
+// wire's agent_id / tunnel_client_id FKs are the join key — the node NAME
+// is a lossy, de-duplicated DNS label and must not be used for this.
+const nodesByAgentId = computed(() => {
+  const m = new Map<string, OverlayNode>()
+  for (const n of overlayStore.nodes) if (n.agent_id) m.set(n.agent_id, n)
+  return m
+})
+const nodesByTunnelClientId = computed(() => {
+  const m = new Map<string, OverlayNode>()
+  for (const n of overlayStore.nodes) if (n.tunnel_client_id) m.set(n.tunnel_client_id, n)
+  return m
+})
+function nodeForAgent(agentId: string): OverlayNode | undefined {
+  return nodesByAgentId.value.get(agentId)
+}
+function nodeForTunnelClient(tcId: string): OverlayNode | undefined {
+  return nodesByTunnelClientId.value.get(tcId)
+}
+
+// ── Overlay eviction (lifted from MachinesSection) ───────────────
+const evictDialogOpen = ref(false)
+const evictTarget = ref<OverlayNode | null>(null)
+const evicting = ref(false)
+function confirmEvict(node: OverlayNode) {
+  evictTarget.value = node
+  evictDialogOpen.value = true
+}
+async function performEvict() {
+  if (!evictTarget.value) return
+  evicting.value = true
+  try {
+    await overlayStore.evictNode(props.tenantId, evictTarget.value.id)
+    evictDialogOpen.value = false
+    evictTarget.value = null
+    await overlayStore.fetchNodes(props.tenantId)
+  } finally {
+    evicting.value = false
+  }
+}
+
+// ── Tunnel clients (folded from TunnelClientsSection) ────────────
+const tunnelEnrollDialogOpen = ref(false)
+const tunnelEnrollToken = ref<TunnelEnrollmentToken | null>(null)
+const tunnelEnrollLoading = ref(false)
+const tunnelEnrollError = ref<string | null>(null)
+async function openTunnelEnrollDialog() {
+  tunnelEnrollDialogOpen.value = true
+  tunnelEnrollLoading.value = true
+  tunnelEnrollToken.value = null
+  tunnelEnrollError.value = null
+  try {
+    tunnelEnrollToken.value = await tunnelClientStore.issueEnrollmentToken(props.tenantId)
+  } catch (e) {
+    tunnelEnrollError.value = (e as Error).message
+  } finally {
+    tunnelEnrollLoading.value = false
+  }
+}
+function closeTunnelEnrollDialog() {
+  tunnelEnrollDialogOpen.value = false
+  tunnelEnrollToken.value = null
+  tunnelEnrollError.value = null
+  // A freshly-enrolled client shows up on the next fetch.
+  tunnelClientStore.fetchTunnelClients(props.tenantId)
+}
+
+const tunnelDeleteDialogOpen = ref(false)
+const tunnelDeleteTarget = ref<TunnelClient | null>(null)
+const tunnelDeleting = ref(false)
+function confirmTunnelDelete(c: TunnelClient) {
+  tunnelDeleteTarget.value = c
+  tunnelDeleteDialogOpen.value = true
+}
+async function performTunnelDelete() {
+  if (!tunnelDeleteTarget.value) return
+  tunnelDeleting.value = true
+  try {
+    await tunnelClientStore.deleteTunnelClient(props.tenantId, tunnelDeleteTarget.value.id)
+    tunnelDeleteDialogOpen.value = false
+    tunnelDeleteTarget.value = null
+    await Promise.all([
+      tunnelClientStore.fetchTunnelClients(props.tenantId),
+      overlayStore.fetchNodes(props.tenantId),
+    ])
+  } finally {
+    tunnelDeleting.value = false
+  }
+}
 
 // Per-device consent mode. Email/Push route the request to the device OWNER
 // (approve-link) for unattended hosts; PromptThenEmail (host-then-email hybrid)
@@ -1028,10 +1365,16 @@ async function saveRoutes() {
 onMounted(() => {
   agentStore.fetchAgents(props.tenantId)
   agentStore.fetchTenantMembers(props.tenantId)
+  overlayStore.fetchNodes(props.tenantId)
+  tunnelClientStore.fetchTunnelClients(props.tenantId)
 })
 
 watch(() => props.tenantId, (tid) => {
-  if (tid) agentStore.fetchAgents(tid)
+  if (tid) {
+    agentStore.fetchAgents(tid)
+    overlayStore.fetchNodes(tid)
+    tunnelClientStore.fetchTunnelClients(tid)
+  }
 })
 </script>
 
