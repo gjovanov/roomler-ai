@@ -741,6 +741,9 @@ fn spawn_origin_signaling(
             stop_rx,
             connected,
             view_tx,
+            // B1 — the RTT-prober bridge slot. Tests never install a hook, so
+            // an empty slot is the correct value, not a stub.
+            Default::default(),
             broker,
             hub,
         )
