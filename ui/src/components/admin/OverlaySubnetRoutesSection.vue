@@ -1,7 +1,17 @@
 <template>
   <v-card>
     <v-card-title class="d-flex align-center">
-      <span>Subnet Routes</span>
+      <span>Overlay routes</span>
+      <v-chip
+        v-if="nodeFilter"
+        size="small"
+        variant="tonal"
+        closable
+        class="ml-3"
+        @click:close="clearNodeFilter"
+      >
+        {{ filteredNodeName ?? 'device filter' }}
+      </v-chip>
       <v-spacer />
       <v-btn
         prepend-icon="mdi-refresh"
@@ -135,6 +145,7 @@
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   deriveOverlayV6,
   useOverlayRoutesStore,
@@ -149,12 +160,27 @@ const draft = reactive<Record<string, Set<string>>>({})
 const saving = ref<string | null>(null)
 const exitSaving = ref<string | null>(null)
 
+// `?node=<id>` deep link from a device row's action menu (2026-08-04):
+// scope the grid to that one machine so it's obvious which device the
+// routes belong to; the chip clears back to the full list.
+const route = useRoute()
+const router = useRouter()
+const nodeFilter = computed(() => (route.query.node as string) || null)
+const filteredNodeName = computed(
+  () => store.nodes.find((n) => n.id === nodeFilter.value)?.name ?? null,
+)
+function clearNodeFilter() {
+  router.replace({ query: { ...route.query, node: undefined } })
+}
+
 // Show nodes advertising subnet routes OR eligible to be an exit node (a pure
 // exit node advertises only 0.0.0.0/0, which the server filters out of
 // advertised_routes — so key off can_be_exit_node too).
 const advertisingNodes = computed(() =>
   store.nodes.filter(
-    (n) => n.advertised_routes.length > 0 || n.can_be_exit_node,
+    (n) =>
+      (n.advertised_routes.length > 0 || n.can_be_exit_node) &&
+      (!nodeFilter.value || n.id === nodeFilter.value),
   ),
 )
 

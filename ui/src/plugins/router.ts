@@ -134,9 +134,12 @@ const routes: RouteRecordRaw[] = [
             children: [
               { path: 'machines',       redirect: { name: 'devices' } },
               { path: 'tunnel-clients', redirect: { name: 'devices' } },
-              { path: 'acl',            name: 'network-acl',            props: true, component: () => import('@/components/admin/TunnelPoliciesSection.vue') },
+              // 2026-08-04 — ONE ACL page with Overlay + Tunnel tabs
+              // (separate backends, single place); the standalone
+              // overlay-acl path lands on its tab.
+              { path: 'acl',            name: 'network-acl',            props: true, component: () => import('@/components/admin/AclSection.vue') },
               { path: 'subnet-routes',  name: 'network-subnet-routes',  props: true, component: () => import('@/components/admin/OverlaySubnetRoutesSection.vue') },
-              { path: 'overlay-acl',    name: 'network-overlay-acl',    props: true, component: () => import('@/components/admin/OverlayAclSection.vue') },
+              { path: 'overlay-acl',    redirect: (to) => ({ name: 'network-acl', params: to.params, query: { tab: 'overlay' } }) },
               { path: 'dns',            name: 'network-dns',            props: true, component: () => import('@/components/admin/MagicDnsSection.vue') },
             ],
           },
