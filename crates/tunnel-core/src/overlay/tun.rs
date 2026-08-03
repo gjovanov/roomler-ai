@@ -1700,6 +1700,22 @@ mod system {
             || c.starts_with("fe80:") // v6 link-local
     }
 
+    /// Other platforms (macOS): no enumeration, so the reconciler is INERT
+    /// rather than absent — mirroring the `purge_one` fallback below, which
+    /// #295 added while this one was missed (the agent's macOS build is the
+    /// only lane that compiles this arm, and it runs only at release time).
+    ///
+    /// Deliberately empty rather than a `netstat -rn` parse: macOS ABBREVIATES
+    /// destinations (`10.66/16`, `100.64/10`), which cannot be turned back into
+    /// a CIDR reliably — and `purge_one` DELETES whatever this returns. A
+    /// mis-parse would remove the wrong route, which is strictly worse than the
+    /// documented best-effort contract of "a failure leaves the pre-existing
+    /// state, never a worse one".
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn enumerate_if_routes() -> Vec<String> {
+        Vec::new()
+    }
+
     #[cfg(target_os = "linux")]
     fn enumerate_if_routes() -> Vec<String> {
         let out = std::process::Command::new("ip")
