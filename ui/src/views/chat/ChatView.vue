@@ -333,8 +333,16 @@ watch(roomId, async (id) => {
     readMessageIds.value.clear()
     pendingReadIds.value.clear()
     showFiles.value = false
+    // Keep roomStore.current in sync on room SWITCH (it was only set on
+    // mount, so the WS handler bumped the unread badge of the room the
+    // user was actually reading).
+    roomStore.fetchRoom(tenantId.value, id)
     fetchRoomMembers()
     await messageStore.fetchMessages(tenantId.value, id)
+    // Slack-style auto-clear: opening the room marks everything read —
+    // including messages outside the fetched window and ones read from
+    // the call view (historically stuck badges heal here).
+    roomStore.markAllRead(tenantId.value, id)
     // Initialize read state from backend
     for (const msg of messageStore.messages) {
       if (msg.is_read || msg.author_id === currentUserId.value) {
@@ -415,6 +423,8 @@ onMounted(async () => {
     roomStore.fetchRoom(tenantId.value, roomId.value)
     fetchRoomMembers()
     await messageStore.fetchMessages(tenantId.value, roomId.value)
+    // Slack-style auto-clear on open (see the roomId watcher).
+    roomStore.markAllRead(tenantId.value, roomId.value)
     // Initialize read state from backend
     for (const msg of messageStore.messages) {
       if (msg.is_read || msg.author_id === currentUserId.value) {

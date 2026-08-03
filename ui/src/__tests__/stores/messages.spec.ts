@@ -65,16 +65,52 @@ describe('useMessageStore', () => {
   })
 
   describe('fetchMessages', () => {
-    it('should populate the messages array from API', async () => {
-      const msgs = [makeMessage({ id: 'a' }), makeMessage({ id: 'b' })]
+    it('reverses the newest-first API page into ascending render order', async () => {
+      // Wire contract: newest first (DESC). Store contract: ascending, so
+      // the view renders oldest→newest top-to-bottom and anchors at bottom.
+      const msgs = [
+        makeMessage({ id: 'newest', created_at: '2026-01-02T00:00:00Z' }),
+        makeMessage({ id: 'oldest', created_at: '2026-01-01T00:00:00Z' }),
+      ]
       mockApi.get.mockResolvedValueOnce({ items: msgs, total: 2 })
 
       const store = useMessageStore()
       await store.fetchMessages('t1', 'r1')
 
       expect(mockApi.get).toHaveBeenCalledWith('/tenant/t1/room/r1/message?per_page=25')
-      expect(store.messages).toEqual(msgs)
+      expect(store.messages.map((m) => m.id)).toEqual(['oldest', 'newest'])
+      expect(store.currentRoomId).toBe('r1')
       expect(store.loading).toBe(false)
+    })
+
+    it('fetchOlderMessages uses the true oldest as cursor, prepends deduped ascending', async () => {
+      const store = useMessageStore()
+      mockApi.get.mockResolvedValueOnce({
+        items: [
+          makeMessage({ id: 'm3', created_at: '2026-01-03T00:00:00Z' }),
+          makeMessage({ id: 'm2', created_at: '2026-01-02T00:00:00Z' }),
+        ],
+        total: 4,
+      })
+      await store.fetchMessages('t1', 'r1')
+
+      mockApi.get.mockResolvedValueOnce({
+        items: [
+          makeMessage({ id: 'm2', created_at: '2026-01-02T00:00:00Z' }), // dup — must not double-render
+          makeMessage({ id: 'm1', created_at: '2026-01-01T00:00:00Z' }),
+        ],
+        total: 4,
+      })
+      await store.fetchOlderMessages('t1', 'r1')
+
+      // Cursor must be the OLDEST loaded message (m2), not the newest —
+      // the old DESC store re-fetched the same page forever.
+      expect(mockApi.get).toHaveBeenLastCalledWith(
+        '/tenant/t1/room/r1/message?per_page=25&before=2026-01-02T00:00:00Z',
+      )
+      expect(store.messages.map((m) => m.id)).toEqual(['m1', 'm2', 'm3'])
+      // Short page (2 < 25) ⇒ history exhausted.
+      expect(store.hasMore).toBe(false)
     })
 
     it('should set hasMore to true when total exceeds returned items', async () => {
@@ -106,6 +142,17 @@ describe('useMessageStore', () => {
 
       expect(store.messages).toHaveLength(1)
       expect(store.messages[0].id).toBe('ws-1')
+    })
+
+    it('drops messages for a room other than the open one', async () => {
+      const store = useMessageStore()
+      mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+      await store.fetchMessages('t1', 'r1')
+
+      store.addMessageFromWs(makeMessage({ id: 'foreign', room_id: 'r2' }) as never)
+      store.addMessageFromWs(makeMessage({ id: 'local', room_id: 'r1' }) as never)
+
+      expect(store.messages.map((m) => m.id)).toEqual(['local'])
     })
 
     it('should deduplicate messages with the same id', () => {
