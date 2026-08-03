@@ -1,28 +1,69 @@
 <template>
   <v-app class="app-layout-root">
     <v-navigation-drawer v-model="drawer" :rail="!mobile && rail" :permanent="!mobile" :temporary="mobile">
+      <!-- Brand = way home (org picker at '/'); the chevron owns the rail
+           toggle — the brand used to be ONLY a rail toggle, leaving the
+           app with no route back to the root at all. -->
       <v-list-item
-        :prepend-icon="!mobile && rail ? 'mdi-menu' : undefined"
-        :title="!mobile && rail ? '' : 'Roomler'"
-        @click="mobile ? undefined : rail = !rail"
-      >
-        <template v-if="!rail" #prepend>
+        v-if="!mobile && rail"
+        prepend-icon="mdi-menu"
+        title=""
+        @click="rail = false"
+      />
+      <v-list-item v-else title="Roomler" style="cursor: pointer" @click="goHome">
+        <template #prepend>
           <v-icon color="primary">mdi-forum</v-icon>
+        </template>
+        <template v-if="!mobile" #append>
+          <v-btn
+            icon="mdi-chevron-double-left"
+            size="x-small"
+            variant="text"
+            aria-label="Collapse sidebar"
+            @click.stop="rail = true"
+          />
         </template>
       </v-list-item>
 
       <v-divider />
 
-      <!-- Tenant selector -->
+      <!-- Organization switcher: current org + dropdown (switch orgs,
+           create a new one, back to the picker). Switching NAVIGATES —
+           the old list only mutated the store, leaving the URL and the
+           room list on the previous org. -->
       <v-list v-if="!rail" density="compact">
-        <v-list-item
-          v-for="t in tenantStore.tenants"
-          :key="t.id"
-          :title="t.name"
-          :active="tenantStore.current?.id === t.id"
-          @click="selectTenant(t)"
-          prepend-icon="mdi-domain"
-        />
+        <v-menu>
+          <template #activator="{ props: menuProps }">
+            <v-list-item
+              v-bind="menuProps"
+              :title="tenantStore.current?.name || 'Select organization'"
+              prepend-icon="mdi-domain"
+              append-icon="mdi-chevron-down"
+            />
+          </template>
+          <v-list density="compact">
+            <v-list-item
+              v-for="t in tenantStore.tenants"
+              :key="t.id"
+              :title="t.name"
+              :subtitle="t.slug"
+              :active="tenantStore.current?.id === t.id"
+              prepend-icon="mdi-domain"
+              @click="selectTenant(t)"
+            />
+            <v-divider />
+            <v-list-item
+              title="New organization"
+              prepend-icon="mdi-plus"
+              @click="showCreateOrg = true"
+            />
+            <v-list-item
+              title="All organizations"
+              prepend-icon="mdi-view-grid-outline"
+              @click="goHome"
+            />
+          </v-list>
+        </v-menu>
       </v-list>
 
       <v-divider />
@@ -236,6 +277,35 @@
     <!-- Global search dialog -->
     <search-dialog v-model="showSearch" />
 
+    <!-- New organization dialog (reachable from the org switcher) -->
+    <v-dialog v-model="showCreateOrg" max-width="420">
+      <v-card>
+        <v-card-title>New organization</v-card-title>
+        <v-card-text>
+          <v-form ref="createOrgForm" @submit.prevent="handleCreateOrg">
+            <v-text-field
+              v-model="orgName"
+              label="Name"
+              :rules="[rules.required]"
+              @update:model-value="autoSlugFromName"
+            />
+            <v-text-field
+              v-model="orgSlug"
+              label="Slug"
+              hint="URL-friendly identifier, globally unique"
+              :rules="[rules.required, rules.slug]"
+              @update:model-value="orgSlugTouched = true"
+            />
+          </v-form>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="showCreateOrg = false">Cancel</v-btn>
+          <v-btn color="primary" :loading="creatingOrg" @click="handleCreateOrg">Create</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <!-- Call started notification -->
     <v-snackbar v-model="callSnackbar" :timeout="8000" color="success" location="top right">
       {{ callSnackbarText }}
@@ -262,8 +332,12 @@ import { useMessageStore } from '@/stores/messages'
 import NotificationPanel from '@/components/layout/NotificationPanel.vue'
 import MiniConference from '@/components/conference/MiniConference.vue'
 import SearchDialog from '@/components/layout/SearchDialog.vue'
+import { useSnackbar } from '@/composables/useSnackbar'
+import { useValidation } from '@/composables/useValidation'
 
 const { mobile } = useDisplay()
+const { showError: showCreateOrgError } = useSnackbar()
+const { rules } = useValidation()
 const { auth, logout: handleLogout } = useAuth()
 const tenantStore = useTenantStore()
 const roomStore = useRoomStore()
@@ -348,19 +422,42 @@ function joinCallFromSnackbar() {
   }
 }
 
-const tenantId = computed(() => tenantStore.current?.id || '')
+// Route param wins over the store: a deep link to /tenant/B while the
+// store still says A used to point every sidebar target at A.
+const tenantId = computed(
+  () => (route.params.tenantId as string | undefined) || tenantStore.current?.id || '',
+)
+
+// Route → store sync: keep tenantStore.current on the org the URL names
+// (nothing watched route.params.tenantId before, so titles/settings/billing
+// showed the alphabetically-first org on deep links).
+watch(
+  () => route.params.tenantId,
+  (id) => {
+    if (typeof id === 'string' && id && id !== tenantStore.current?.id) {
+      const t = tenantStore.tenants.find((x) => x.id === id)
+      if (t) tenantStore.setCurrent(t)
+    }
+  },
+)
 
 // S6 — keep the WS's tenant-affinity key in sync with the active
 // tenant. The store redials the socket when it actually changes so the
 // front LB re-routes this session onto the tenant's pod.
 watch(
   () => tenantStore.current?.id ?? null,
-  (tid) => {
+  (tid, prevTid) => {
     wsStore.setTenantAffinity(tid)
     // Deferred-S4 — the caller's own permission mask drives fleet-nav
     // visibility. Fail-open: nav shows until the fetch lands (see
     // canSeeFleetNav); the server still enforces every action.
     if (tid) void tenantStore.fetchMyMembership(tid)
+    // Org SWITCH (not the immediate first fire — onMounted owns the
+    // initial fetch): reload the sidebar's rooms + unread badges for the
+    // new org; the old switcher left them showing the previous org.
+    if (tid && prevTid !== undefined && prevTid !== tid) {
+      void roomStore.fetchRooms(tid).then(() => roomStore.fetchAllUnreadCounts(tid))
+    }
   },
   { immediate: true },
 )
@@ -394,8 +491,59 @@ interface Tenant {
   slug: string
 }
 
+function goHome() {
+  router.push('/')
+}
+
 function selectTenant(t: Tenant) {
   tenantStore.setCurrent(t as never)
+  // Navigate — the pre-2026-08 switcher only mutated the store, leaving
+  // the URL, sidebar targets and room list on the previous org.
+  router.push(`/tenant/${t.id}`)
+}
+
+// ── New-organization dialog ─────────────────────────────────────
+const showCreateOrg = ref(false)
+const createOrgForm = ref()
+const orgName = ref('')
+const orgSlug = ref('')
+const orgSlugTouched = ref(false)
+const creatingOrg = ref(false)
+
+function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+function autoSlugFromName() {
+  if (!orgSlugTouched.value) orgSlug.value = slugify(orgName.value)
+}
+
+async function handleCreateOrg() {
+  const { valid } = await createOrgForm.value.validate()
+  if (!valid) return
+  creatingOrg.value = true
+  try {
+    const tenant = await tenantStore.createTenant(orgName.value, orgSlug.value)
+    showCreateOrg.value = false
+    orgName.value = ''
+    orgSlug.value = ''
+    orgSlugTouched.value = false
+    router.push(`/tenant/${tenant.id}`)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Failed to create organization'
+    // tenants.slug is globally unique — surface the dup-key case in words.
+    showCreateOrgError(
+      msg.includes('duplicate') || msg.includes('E11000')
+        ? 'That slug is already taken — pick another'
+        : msg,
+    )
+  } finally {
+    creatingOrg.value = false
+  }
 }
 
 function onSearchShortcut(e: KeyboardEvent) {

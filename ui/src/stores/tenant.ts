@@ -50,12 +50,33 @@ export const useTenantStore = defineStore('tenant', () => {
     }
   }
 
+  // Persist the active org across reloads (`current` used to silently
+  // reset to the alphabetically-first tenant on every refresh). The URL's
+  // /tenant/:id still wins — AppLayout's route watcher re-syncs on top.
+  const CURRENT_TENANT_KEY = 'roomler-current-tenant'
+  function readStoredTenantId(): string | null {
+    try {
+      return globalThis.localStorage?.getItem(CURRENT_TENANT_KEY) ?? null
+    } catch {
+      return null
+    }
+  }
+  function persistTenantId(id: string | null) {
+    try {
+      if (id) globalThis.localStorage?.setItem(CURRENT_TENANT_KEY, id)
+      else globalThis.localStorage?.removeItem(CURRENT_TENANT_KEY)
+    } catch {
+      /* best-effort */
+    }
+  }
+
   async function fetchTenants() {
     loading.value = true
     try {
       tenants.value = await api.get<Tenant[]>('/tenant')
       if (!current.value && tenants.value.length > 0) {
-        current.value = tenants.value[0]!
+        const stored = readStoredTenantId()
+        current.value = tenants.value.find((t) => t.id === stored) ?? tenants.value[0]!
       }
     } finally {
       loading.value = false
@@ -66,11 +87,13 @@ export const useTenantStore = defineStore('tenant', () => {
     const tenant = await api.post<Tenant>('/tenant', { name, slug })
     tenants.value.push(tenant)
     current.value = tenant
+    persistTenantId(tenant.id)
     return tenant
   }
 
   function setCurrent(tenant: Tenant) {
     current.value = tenant
+    persistTenantId(tenant.id)
   }
 
   return {
