@@ -973,6 +973,7 @@ mod tests {
             agent_token_hash: String::new(),
             status,
             last_seen_at: DateTime::now(),
+            last_presence: None,
             displays: vec![],
             capabilities: AgentCaps::default(),
             access_policy: Default::default(),

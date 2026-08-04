@@ -303,4 +303,19 @@ impl TenantDao {
             .map(|m| m.role_ids)
             .unwrap_or_default())
     }
+
+    /// P4 — every member's user id for one tenant, in one query. The
+    /// `device:presence` fan-out recipient set (device listing visibility is
+    /// member-gated, so presence events follow the same audience). Callers
+    /// cache this briefly — a fleet reconnect storm must not turn into a
+    /// per-event membership scan.
+    pub async fn member_user_ids(&self, tenant_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
+        Ok(self
+            .members
+            .find_many(doc! { "tenant_id": tenant_id }, None)
+            .await?
+            .into_iter()
+            .map(|m| m.user_id)
+            .collect())
+    }
 }

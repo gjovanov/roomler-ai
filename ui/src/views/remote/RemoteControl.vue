@@ -3041,12 +3041,12 @@ async function loadAgent() {
   agent.value = agentStore.agents.find((a) => a.id === agentId.value) || null
 }
 
-// S3 — keep the toolbar online-dot honest. The mount-time snapshot
-// went stale the moment the page outlived one heartbeat; now the
-// agent row re-fetches every 30 s while the page is open, plus
-// immediately when the session enters 'reconnecting'/'error' (the
-// operator's next question is "is the device even online?").
-const AGENT_STATUS_POLL_MS = 30_000
+// S3 — keep the toolbar online-dot honest; P4 relaxed the cadence from
+// 30 s to 5 min because `device:presence` WS pushes now patch the agents
+// store in realtime — the poll is only the belt for a missed push (plus
+// the immediate refetch when the session enters 'reconnecting'/'error':
+// the operator's next question is "is the device even online?").
+const AGENT_STATUS_POLL_MS = 300_000
 let agentStatusTimer: ReturnType<typeof setInterval> | null = null
 async function refreshAgentStatus() {
   try {

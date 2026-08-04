@@ -107,6 +107,9 @@ vi.stubGlobal('location', { protocol: 'http:', host: 'localhost:5000' })
 import { useWsStore } from '@/stores/ws'
 import { useMessageStore } from '@/stores/messages'
 import { useRoomStore } from '@/stores/rooms'
+import { useTenantStore } from '@/stores/tenant'
+import { useOrgBadgesStore } from '@/stores/orgBadges'
+import { useAgentStore } from '@/stores/agents'
 
 describe('useWsStore', () => {
   beforeEach(() => {
@@ -319,6 +322,103 @@ describe('useWsStore', () => {
       })
 
       expect(spy).toHaveBeenCalledWith('r1', null, 0)
+    })
+  })
+
+  // P4 — events carrying a tenant_id that is NOT the active org must feed
+  // the org-badge store, not the active org's stores (pre-P4 a cross-org
+  // message:create inflated totalUnread with a phantom room key).
+  describe('P4 cross-org routing', () => {
+    function openSocketWithActiveOrg(activeTenantId: string) {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+      useTenantStore().setCurrent({ id: activeTenantId, name: 'Org', slug: 'org' } as never)
+      return store
+    }
+
+    it('routes a foreign-org message:create into the badge store, not the active stores', () => {
+      openSocketWithActiveOrg('org-a')
+      const messageStore = useMessageStore()
+      const roomStore = useRoomStore()
+      const badges = useOrgBadgesStore()
+      const addSpy = vi.spyOn(messageStore, 'addMessageFromWs')
+      const unreadSpy = vi.spyOn(roomStore, 'incrementUnread')
+      const badgeSpy = vi.spyOn(badges, 'noteForeignMessage')
+
+      mockWsInstance.simulateMessage({
+        type: 'message:create',
+        data: { id: 'm1', tenant_id: 'org-b', room_id: 'r-foreign', author_id: 'other' },
+      })
+
+      expect(badgeSpy).toHaveBeenCalledWith('org-b')
+      expect(addSpy).not.toHaveBeenCalled()
+      expect(unreadSpy).not.toHaveBeenCalled()
+      expect(badges.badgeCount('org-b')).toBe(1)
+    })
+
+    it('keeps active-org and legacy (no tenant_id) message:create on the normal path', () => {
+      openSocketWithActiveOrg('org-a')
+      const messageStore = useMessageStore()
+      const addSpy = vi.spyOn(messageStore, 'addMessageFromWs')
+
+      mockWsInstance.simulateMessage({
+        type: 'message:create',
+        data: { id: 'm1', tenant_id: 'org-a', room_id: 'r1', author_id: 'other' },
+      })
+      mockWsInstance.simulateMessage({
+        type: 'message:create',
+        data: { id: 'm2', room_id: 'r1', author_id: 'other' },
+      })
+
+      expect(addSpy).toHaveBeenCalledTimes(2)
+    })
+
+    it('bumps the foreign-org badge for notification:new with a non-active tenant_id', () => {
+      openSocketWithActiveOrg('org-a')
+      const badges = useOrgBadgesStore()
+      const spy = vi.spyOn(badges, 'noteForeignNotification')
+
+      mockWsInstance.simulateMessage({
+        type: 'notification:new',
+        data: { id: 'n1', tenant_id: 'org-b', notification_type: 'mention', title: 't', body: 'b' },
+      })
+
+      expect(spy).toHaveBeenCalledWith('org-b', 'mention')
+      expect(badges.summaries['org-b']?.mentions).toBe(1)
+    })
+
+    it('patches the agents store for active-org device:presence and badges foreign orgs', () => {
+      openSocketWithActiveOrg('org-a')
+      const agentStore = useAgentStore()
+      agentStore.agents = [
+        { id: 'ag1', presence: 'online', is_online: true } as never,
+      ]
+      const badges = useOrgBadgesStore()
+      const badgeSpy = vi.spyOn(badges, 'noteDevicePresence')
+
+      mockWsInstance.simulateMessage({
+        type: 'device:presence',
+        data: {
+          tenant_id: 'org-a',
+          agents: [{ agent_id: 'ag1', name: 'box', presence: 'offline' }],
+        },
+      })
+      expect(agentStore.agents[0]?.presence).toBe('offline')
+      expect(agentStore.agents[0]?.is_online).toBe(false)
+      expect(badgeSpy).not.toHaveBeenCalled()
+
+      mockWsInstance.simulateMessage({
+        type: 'device:presence',
+        data: {
+          tenant_id: 'org-b',
+          agents: [{ agent_id: 'ag9', name: 'other', presence: 'offline' }],
+        },
+      })
+      expect(badgeSpy).toHaveBeenCalledWith('org-b', [
+        { agent_id: 'ag9', name: 'other', presence: 'offline' },
+      ])
+      expect(badges.hasDeviceEvents('org-b')).toBe(true)
     })
   })
 

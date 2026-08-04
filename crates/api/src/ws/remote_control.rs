@@ -112,11 +112,24 @@ pub async fn handle_agent_socket(
     // targets — ONLY to an agent that advertised the capability (its ServerMsg
     // deserializer would error on the unknown variant otherwise) and only
     // when regions are actually configured+enabled.
+    let mut device_name = machine_name.clone();
     if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
         state
             .rc_hub
             .set_agent_relay_home(agent_id, row.relay_home.clone());
+        // The row name wins over the hello machine_name — admins rename devices.
+        device_name = row.name;
     }
+    // P4 — announce the online transition (`agents.last_presence` ledger
+    // CAS: a reconnect that was already broadcast as online stays silent).
+    crate::ws::device_presence::note_transition(
+        &state,
+        tenant_id,
+        agent_id,
+        &device_name,
+        crate::ws::device_presence::ONLINE,
+    )
+    .await;
     if supports_relay_regions && let Some((regions, rev)) = relay_regions_wire(&state.turn_map) {
         let _ = registered_tx.try_send(ServerMsg::RelayRegions { regions, rev });
     }
@@ -380,15 +393,38 @@ pub async fn handle_agent_socket(
         {
             warn!(%agent_id, %e, "agent mark_status(offline) failed");
         }
+        // P4 — offline event, SUPPRESSED when a newer registration owns the
+        // directory record (a re-homed agent's late teardown on the old pod:
+        // the device is alive on another pod, and its ledger stays "online").
+        let mut foreign_claim = false;
         if let (Some(redis), Some(token)) = (&state.redis_pubsub, &presence_token) {
-            if let Err(e) = redis.agent_presence_del_if_owned(&agent_hex, token).await {
-                debug!(%agent_id, %e, "agent presence release failed");
+            match redis.agent_presence_del_if_owned(&agent_hex, token).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    foreign_claim = redis
+                        .agent_presence_exists(&agent_hex)
+                        .await
+                        .unwrap_or(false);
+                }
+                Err(e) => {
+                    debug!(%agent_id, %e, "agent presence release failed");
+                }
             }
             // Drop OUR token from the sweep registry (identity-gated: a
             // displacing registration's newer token must survive).
             state
                 .agent_presence_tokens
                 .remove_if(&agent_id, |_, stored| stored == token);
+        }
+        if !foreign_claim {
+            crate::ws::device_presence::note_transition(
+                &state,
+                tenant_id,
+                agent_id,
+                &machine_name,
+                crate::ws::device_presence::OFFLINE,
+            )
+            .await;
         }
     } else {
         debug!(%agent_id, "teardown skipped Offline+presence (newer connection owns the slot)");

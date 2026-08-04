@@ -230,6 +230,9 @@ async fn message_broadcast_reaches_member_and_sender() {
     let parsed: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
     assert_eq!(parsed["type"], "message:create");
     assert_eq!(parsed["data"]["content"], "Hello from admin");
+    // P4 contract lock: the fan-out payload carries tenant_id so multi-org
+    // clients can route non-active-org messages into per-org badges.
+    assert_eq!(parsed["data"]["tenant_id"], tenant.tenant_id.as_str());
 
     // The sender's connection ALSO receives it (2026-08-04): broadcasts are
     // per-user, so including the sender is what delivers realtime messages
