@@ -155,6 +155,48 @@ impl TurnMap {
     }
 }
 
+/// Build the [`crate::signaling::ServerMsg::RelayRegions`] payload: one probe
+/// target per enabled+usable region. `None` when the map is disabled or
+/// nothing is probe-able — the capability-flagged agent then simply never
+/// probes. `rev` is FNV-1a over the serialized list: deterministic across
+/// pods/processes (both build from the same env), so an agent only re-probes
+/// when the region set actually changes.
+pub fn relay_regions_wire(map: &TurnMap) -> Option<(Vec<crate::signaling::RelayRegionInfo>, u64)> {
+    if !map.enabled {
+        return None;
+    }
+    let mut out = Vec::new();
+    for spec in &map.specs {
+        if !spec.enabled || !map.regions.contains_key(&spec.id) {
+            continue;
+        }
+        let Some((host, port)) = crate::turn_url::host_port(&spec.turn_url) else {
+            continue;
+        };
+        out.push(crate::signaling::RelayRegionInfo {
+            id: spec.id.clone(),
+            stun: format!("{host}:{port}"),
+            derp_url: spec.derp_url.clone(),
+        });
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let json = serde_json::to_string(&out).unwrap_or_default();
+    Some((out, fnv1a64(json.as_bytes())))
+}
+
+/// FNV-1a 64-bit — stable across processes (unlike `RandomState` hashing),
+/// which is all `rev` needs.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// Pick the relay region for a PAIR from the two ends' `relay_home`s.
 /// Interim policy until RTT tables land: agreement wins; a single known home
 /// wins over none; two DIFFERENT homes fall to a deterministic FNV pick over
@@ -389,6 +431,36 @@ mod tests {
         let ba = select_pair_region(&map, Some("eu-west"), Some("us-east"), "pair-1");
         assert_eq!(ab, ba);
         assert!(ab.as_deref() == Some("us-east") || ab.as_deref() == Some("eu-west"));
+    }
+
+    #[test]
+    fn relay_regions_wire_builds_probe_targets() {
+        let spec = |id: &str, url: &str, enabled: bool| RelayRegionSpec {
+            id: id.into(),
+            turn_url: url.into(),
+            worker_urls: vec![],
+            derp_url: Some(format!("wss://derp-{id}.example/derp")),
+            shared_secret: None,
+            caps: Default::default(),
+            enabled,
+        };
+        let mut map = two_region_map(true);
+        map.specs = vec![
+            spec("us-east", "turn:coturn-us-east.example:3478", true),
+            // Disabled spec: parsed but never pushed.
+            spec("eu-west", "turn:coturn-eu-west.example:3478", false),
+            // Spec without a compiled region (e.g. no secret): never pushed.
+            spec("ghost", "turn:ghost.example:3478", true),
+        ];
+        let (regions, rev) = relay_regions_wire(&map).expect("one probe target");
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].id, "us-east");
+        assert_eq!(regions[0].stun, "coturn-us-east.example:3478");
+        // rev is stable across calls (deterministic hash).
+        assert_eq!(relay_regions_wire(&map).unwrap().1, rev);
+        // Master flag off ⇒ nothing is ever pushed.
+        map.enabled = false;
+        assert!(relay_regions_wire(&map).is_none());
     }
 
     #[test]

@@ -233,6 +233,18 @@ pub struct Agent {
     /// pre-feature agents deserialize to none.
     #[serde(default)]
     pub advertised_routes: Vec<String>,
+    /// Multi-region relay PoPs: the agent's nearest relay region (a
+    /// `relay_regions` id), derived server-side from its STUN probe reports
+    /// with hysteresis. `None` = never probed / all probes timed out — every
+    /// issuance path then uses the default region. `#[serde(default)]` →
+    /// older rows deserialize to `None`.
+    #[serde(default)]
+    pub relay_home: Option<String>,
+    /// The agent's last full probe table (observability; the UI shows it on
+    /// the device detail). `#[serde(default)]` → older rows deserialize to
+    /// `None`.
+    #[serde(default)]
+    pub relay_rtt: Option<Vec<crate::signaling::RelayRegionRtt>>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub deleted_at: Option<DateTime>,

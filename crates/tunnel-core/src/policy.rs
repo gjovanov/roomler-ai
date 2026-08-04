@@ -978,6 +978,8 @@ mod tests {
             access_policy: Default::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
+            relay_home: None,
+            relay_rtt: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
             deleted_at: deleted.then(DateTime::now),

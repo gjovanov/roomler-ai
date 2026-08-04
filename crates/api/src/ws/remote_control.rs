@@ -12,7 +12,8 @@ use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     hub::DispatchCtx,
     models::ConsentMode,
-    signaling::{ClientMsg, Role, ServerMsg},
+    signaling::{ClientMsg, RelayRegionRtt, Role, ServerMsg},
+    turn_creds::relay_regions_wire,
 };
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -45,6 +46,7 @@ pub async fn handle_agent_socket(
             displays,
             caps,
             advertised_routes,
+            supports_relay_regions,
         }) => (
             machine_name,
             os,
@@ -52,13 +54,22 @@ pub async fn handle_agent_socket(
             displays,
             caps,
             advertised_routes,
+            supports_relay_regions,
         ),
         other => {
             warn!(?other, "agent opened WS without rc:agent.hello — closing");
             return;
         }
     };
-    let (machine_name, os, agent_version, displays, caps, advertised_routes) = hello;
+    let (
+        machine_name,
+        os,
+        agent_version,
+        displays,
+        caps,
+        advertised_routes,
+        supports_relay_regions,
+    ) = hello;
 
     // Persist: mark online, update hello fields on the Mongo row. Best-effort —
     // signaling still works if Mongo lags.
@@ -95,6 +106,20 @@ pub async fn handle_agent_socket(
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
     debug!(%agent_id, %machine_name, "agent registered in Hub");
+
+    // Multi-region relay PoPs: seed the Hub's live relay_home from the row
+    // (probing refreshes it within seconds when enabled), and push the probe
+    // targets — ONLY to an agent that advertised the capability (its ServerMsg
+    // deserializer would error on the unknown variant otherwise) and only
+    // when regions are actually configured+enabled.
+    if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
+        state
+            .rc_hub
+            .set_agent_relay_home(agent_id, row.relay_home.clone());
+    }
+    if supports_relay_regions && let Some((regions, rev)) = relay_regions_wire(&state.turn_map) {
+        let _ = registered_tx.try_send(ServerMsg::RelayRegions { regions, rev });
+    }
 
     // Phase A-1 — mirror the registration into the cross-pod presence
     // directory. The owner token is per-REGISTRATION (fresh conn_id), so a
@@ -137,6 +162,10 @@ pub async fn handle_agent_socket(
         crate::ws::tunnel::TunnelSession,
     > = std::collections::HashMap::new();
     let mut tunnel_orig_transports: Vec<String> = Vec::new();
+    // Multi-region relay PoPs: per-connection persist rate limiter for probe
+    // reports (the Hub's live copy refreshes on every report; Mongo doesn't
+    // need to).
+    let mut last_probe_persist: Option<std::time::Instant> = None;
 
     // Build a ctx once — it's Copy-able across messages for this connection.
     let ctx = DispatchCtx {
@@ -236,6 +265,20 @@ pub async fn handle_agent_socket(
                             else {
                                 continue;
                             };
+                            // Multi-region relay PoPs: probe reports are
+                            // consumed HERE (they need AppState + the per-
+                            // connection persist rate limiter, which the Hub
+                            // has no business holding).
+                            if let ClientMsg::RelayProbeReport { results } = &parsed {
+                                handle_relay_probe_report(
+                                    &state,
+                                    agent_id,
+                                    results,
+                                    &mut last_probe_persist,
+                                )
+                                .await;
+                                continue;
+                            }
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
                             // dispatch is a no-op for AgentHeartbeat (handled here);
                             // we still call dispatch so any future routing logic
@@ -343,6 +386,80 @@ pub async fn handle_agent_socket(
         debug!(%agent_id, "teardown skipped Offline+presence (newer connection owns the slot)");
     }
     info!(%agent_id, "remote-control agent WS disconnected");
+}
+
+/// Minimum spacing between Mongo persists of an agent's probe table. The
+/// Hub's live copy refreshes on EVERY report regardless.
+const PROBE_PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Multi-region relay PoPs: derive the agent's `relay_home` from a probe
+/// report and fan it out (Hub live copy always; Mongo rate-limited).
+///
+/// Hysteresis: the home only MOVES when the best region improves on the
+/// current home's measured RTT by >20%, or the current home stopped being
+/// measurable (dropped from the region set, or all its samples timed out).
+/// This keeps a border-line agent from flapping between two near-equal PoPs —
+/// the sticky pair cache protects live pairs, this protects everything else.
+async fn handle_relay_probe_report(
+    state: &AppState,
+    agent_id: ObjectId,
+    results: &[RelayRegionRtt],
+    last_persist: &mut Option<std::time::Instant>,
+) {
+    let map = &state.turn_map;
+    if !map.enabled || map.regions.is_empty() {
+        return;
+    }
+    let known: Vec<&RelayRegionRtt> = results
+        .iter()
+        .filter(|r| map.regions.contains_key(&r.region))
+        .collect();
+    let best = known
+        .iter()
+        .filter_map(|r| r.rtt_ms.map(|ms| (ms, r.region.as_str())))
+        .min();
+    let current = state.rc_hub.agent_relay_home(agent_id);
+    let new_home: Option<String> = match (best, current.as_deref()) {
+        // Nothing measurable (full-UDP-block / dead PoPs) → default region.
+        (None, _) => None,
+        (Some((_, b)), None) => Some(b.to_string()),
+        (Some((best_ms, b)), Some(cur)) => {
+            let cur_ms = known
+                .iter()
+                .find(|r| r.region == cur)
+                .and_then(|r| r.rtt_ms);
+            match cur_ms {
+                None => Some(b.to_string()),
+                Some(c) if f64::from(best_ms) < f64::from(c) * 0.8 => Some(b.to_string()),
+                Some(_) => Some(cur.to_string()),
+            }
+        }
+    };
+    state
+        .rc_hub
+        .set_agent_relay_home(agent_id, new_home.clone());
+    let due = last_persist
+        .map(|t| t.elapsed() >= PROBE_PERSIST_MIN_INTERVAL)
+        .unwrap_or(true);
+    if !due {
+        return;
+    }
+    *last_persist = Some(std::time::Instant::now());
+    if let Err(e) = state
+        .agents
+        .set_relay_home(agent_id, new_home.as_deref(), results)
+        .await
+    {
+        warn!(%agent_id, %e, "set_relay_home (agents) failed");
+    }
+    if let Err(e) = state
+        .overlay_nodes
+        .set_relay_home_for_agent(agent_id, new_home.as_deref())
+        .await
+    {
+        warn!(%agent_id, %e, "set_relay_home (overlay_nodes) failed");
+    }
+    debug!(%agent_id, home = ?new_home, "relay probe report processed");
 }
 
 /// Parse the next inbound WS text frame as [`ClientMsg`]. Skips non-text frames.
