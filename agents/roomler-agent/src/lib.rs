@@ -40,6 +40,16 @@ pub mod logs_fetch;
 pub mod logs_upload;
 pub mod machine;
 pub mod mdns_resolve;
+// P5 — crate-private: its surface leans on `peer::TargetResolution`
+// (pub(crate)) and nothing outside the agent consumes it. Compiled on
+// every build so its pure logic unit-tests on the default feature set
+// (mirrors `encode::viewer_rate`); the dead_code allow covers builds
+// without the DC video pumps, which are its only production callers.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) mod media_share;
 pub mod notify;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
