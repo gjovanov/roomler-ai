@@ -71,42 +71,107 @@ const RESUME_SKEW_MIN: Duration = Duration::from_secs(120);
 /// at the next periodic check".
 const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
 
-/// A5 — epoch-ms of the moment the control WS FIRST went down in the
-/// current outage; 0 = currently up (or never connected). Stamped by the
-/// reconnect ladder, cleared (and acted on) after a successful hello.
-static DOWN_SINCE_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn note_ws_down() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    // Only the FIRST failure of an outage stamps (CAS from 0).
-    let _ = DOWN_SINCE_MS.compare_exchange(
-        0,
-        now,
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+/// Multi-org P1 — per-enrollment context for one supervised signaling loop.
+/// `run_cmd` builds one per enabled enrollment (the config's scalar primary
+/// + each `[[orgs]]` entry) and spawns one [`run`] per context.
+#[derive(Clone)]
+pub struct OrgCtx {
+    /// `primary` or the `[[orgs]]` label. Log/CLI-facing.
+    pub label: String,
+    /// Only the primary enrollment drives PROCESS-WIDE effects: the
+    /// self-updater (`rc:agent.update` + the long-outage recheck),
+    /// attention sentinels (the notify subsystem has no per-org files),
+    /// exit-route purges, and the `process::exit` escalations — a secondary
+    /// org's terminal conditions stop ITS loop, never the daemon.
+    pub is_primary: bool,
+    /// Watchdog pump name, registered by `run_cmd` before spawn:
+    /// `signaling` for the primary (kept verbatim for log/tooling
+    /// continuity) and `signaling:<label>` for secondaries — per-org pumps
+    /// so one org's healthy ticks can't mask another org's stalled loop.
+    /// `&'static` because the watchdog registry is keyed on static strs;
+    /// secondary names are INTERNED once per [`OrgCtx::secondary`] call
+    /// (bounded by the org count for the process lifetime — `run_cmd`
+    /// builds each org's ctx exactly once and clones it thereafter).
+    pub pump: &'static str,
+    /// A5 — epoch-ms of the moment THIS org's control WS first went down in
+    /// the current outage; 0 = up (or never connected). Was a process-global
+    /// static pre-multi-org: one org's reconnect would have erased another
+    /// org's outage stamp (and fired the update recheck off the wrong org).
+    down_since_ms: Arc<std::sync::atomic::AtomicI64>,
+    /// `rc:agent.update` pushes ignored on this org's WS because it is not
+    /// the primary. Surfaced in the LocalAPI `OrgStatus`.
+    pub updates_ignored: Arc<std::sync::atomic::AtomicU32>,
 }
 
-fn note_ws_up_and_maybe_recheck_update() {
-    let since = DOWN_SINCE_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if since == 0 {
-        return;
+impl OrgCtx {
+    pub fn primary() -> Self {
+        Self {
+            label: crate::config::PRIMARY_ORG_LABEL.to_string(),
+            is_primary: true,
+            pump: "signaling",
+            down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let down_ms = now.saturating_sub(since);
-    if down_ms >= UPDATE_RECHECK_AFTER_DOWN.as_millis() as i64 {
-        let fired = crate::updater::request_update_now(None);
-        info!(
-            down_mins = down_ms / 60_000,
-            update_check_fired = fired,
-            "control WS recovered after a long outage — requesting an immediate update check"
+
+    pub fn secondary(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            is_primary: false,
+            // Interned (see the `pump` field doc): the watchdog registry
+            // wants `&'static str`; one bounded leak per org per process.
+            pump: Box::leak(format!("signaling:{label}").into_boxed_str()),
+            down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    fn note_ws_down(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // Only the FIRST failure of an outage stamps (CAS from 0).
+        let _ = self.down_since_ms.compare_exchange(
+            0,
+            now,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    fn note_ws_up_and_maybe_recheck_update(&self) {
+        let since = self
+            .down_since_ms
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if since == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let down_ms = now.saturating_sub(since);
+        if down_ms < UPDATE_RECHECK_AFTER_DOWN.as_millis() as i64 {
+            return;
+        }
+        if self.is_primary {
+            let fired = crate::updater::request_update_now(None);
+            info!(
+                down_mins = down_ms / 60_000,
+                update_check_fired = fired,
+                "control WS recovered after a long outage — requesting an immediate update check"
+            );
+        } else {
+            // The machine-wide updater is the primary's to drive; a
+            // secondary's outage recovering says nothing about the
+            // primary's ability to receive pushes.
+            info!(
+                org = %self.label,
+                down_mins = down_ms / 60_000,
+                "org control WS recovered after a long outage (update recheck is primary-only)"
+            );
+        }
     }
 }
 
@@ -142,22 +207,24 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// start with a flaky network got force-exited at 90 s and the
 /// supervisor crash-looped forever. See `main.rs` register call for
 /// the symmetric flip there.
-struct SignalingPumpGuard;
+struct SignalingPumpGuard {
+    pump: &'static str,
+}
 
 impl SignalingPumpGuard {
-    /// Activate the watchdog's `signaling` pump and reset its
+    /// Activate the watchdog pump for THIS org's loop and reset its
     /// `last_tick` (the `gate(false → true)` transition resets the
     /// timer; see `watchdog.rs::Watchdog::gate`). Use right after
     /// `connect_async` returns Ok.
-    fn activate() -> Self {
-        watchdog::gate("signaling", true);
-        Self
+    fn activate(pump: &'static str) -> Self {
+        watchdog::gate(pump, true);
+        Self { pump }
     }
 }
 
 impl Drop for SignalingPumpGuard {
     fn drop(&mut self) {
-        watchdog::gate("signaling", false);
+        watchdog::gate(self.pump, false);
     }
 }
 
@@ -170,7 +237,7 @@ impl Drop for SignalingPumpGuard {
 struct ConnectedGuard(Arc<AtomicBool>);
 
 impl ConnectedGuard {
-    fn mark(flag: Arc<AtomicBool>) -> Self {
+    fn mark(flag: Arc<AtomicBool>, clear_attention: bool) -> Self {
         flag.store(true, Ordering::Relaxed);
         // S1b — a healthy authenticated connect resolves (almost) every
         // attention reason by definition: auth works, no goodbye, no live
@@ -179,7 +246,13 @@ impl ConnectedGuard {
         // code cleared only after a same-process auth-failure streak, so
         // e.g. test-artifact sentinels stuck forever). `rollback_failed`
         // is deliberately spared — see `clear_attention_on_healthy_connect`.
-        crate::notify::clear_attention_on_healthy_connect();
+        //
+        // Multi-org P1: PRIMARY-only. The notify subsystem has no per-org
+        // sentinel files, so a healthy SECONDARY connect must not clear a
+        // sentinel the (possibly still-broken) primary raised.
+        if clear_attention {
+            crate::notify::clear_attention_on_healthy_connect();
+        }
         Self(flag)
     }
 }
@@ -204,6 +277,10 @@ pub type RttSampleSlot = Arc<std::sync::RwLock<Option<crate::localapi_state::Rtt
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
+    // Multi-org P1 — which enrollment this loop serves ([`OrgCtx::primary`]
+    // for the config's scalar identity; `run_cmd` synthesizes a per-org
+    // `AgentConfig` via `AgentConfig::for_org` for secondaries).
+    ctx: OrgCtx,
     cfg: AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -262,6 +339,7 @@ pub async fn run(
         }
 
         match connect_once(
+            &ctx,
             &cfg,
             encoder_preference,
             shutdown.clone(),
@@ -283,7 +361,11 @@ pub async fn run(
                         prior_auth_failures = auth_failures,
                         "auth recovered; clearing attention sentinel"
                     );
-                    notify::clear_attention();
+                    // Multi-org P1: sentinels are primary-owned (no per-org
+                    // files) — a secondary's recovery must not clear one.
+                    if ctx.is_primary {
+                        notify::clear_attention();
+                    }
                     auth_failures = 0;
                 }
             }
@@ -298,8 +380,10 @@ pub async fn run(
                 // Raise the attention sentinel after the third
                 // consecutive 401 — by then a transient server-side
                 // JWT-cache miss has had time to recover and the
-                // operator genuinely needs to act.
-                if auth_failures == 3 {
+                // operator genuinely needs to act. Multi-org P1: the
+                // sentinel is primary-only; a secondary org's auth death
+                // is surfaced via the LocalAPI `OrgStatus` + logs.
+                if auth_failures == 3 && ctx.is_primary {
                     let msg = "Roomler agent: re-enrollment required.\n\n\
                               The server is rejecting this agent's token. \
                               Either the token expired (default 1 year) or an \
@@ -323,6 +407,24 @@ pub async fn run(
                 }
             }
             Err(ConnectError::FatalGoodbye { reason, message }) => {
+                // Multi-org P1: a SECONDARY org's goodbye (row deleted /
+                // policy refused in THAT org) terminates only its own loop.
+                // No sentinel (primary-owned), no exit-route purge (the
+                // primary's overlay owns those routes), no process exit —
+                // the supervisor in `run_cmd` records the terminal error
+                // for the LocalAPI `OrgStatus`.
+                if !ctx.is_primary {
+                    warn!(
+                        org = %ctx.label,
+                        ?reason,
+                        %message,
+                        "server-side close for this org — stopping its loop (other orgs unaffected)"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "server goodbye ({reason:?}): {message} — re-enroll this org \
+                         with `roomler-agent enroll --server <url> --token <new-jwt>`"
+                    ));
+                }
                 // rc.53: server told us to stop reconnecting. The
                 // teardown of in-flight peers already ran in the
                 // `handle_server_msg::ServerMsg::Goodbye` arm
@@ -375,6 +477,21 @@ pub async fn run(
                 );
 
                 if recent_replacements.len() >= 3 {
+                    // Multi-org P1: a secondary org's duel terminates only
+                    // its own loop (see the FatalGoodbye arm's rationale).
+                    if !ctx.is_primary {
+                        warn!(
+                            org = %ctx.label,
+                            displacements = recent_replacements.len(),
+                            "duplicate-instance duel on this org — stopping its loop \
+                             (other orgs unaffected)"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "duplicate-instance duel: displaced {}× in 5 min — another \
+                             process is using this org's agent_id ({message})",
+                            recent_replacements.len()
+                        ));
+                    }
                     let body = format!(
                         "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
                          This connection has been displaced {} times in the last 5 minutes — \
@@ -422,7 +539,7 @@ pub async fn run(
             Err(ConnectError::Transient(e)) => {
                 // A5 — first failure of this outage stamps the clock the
                 // reconnect-recovery update check keys off.
-                note_ws_down();
+                ctx.note_ws_down();
                 // rc.58: log the full `source()` chain alongside the
                 // top-level Display — `tokio_tungstenite::Error`'s top
                 // message is just "ws connect" / "ws read" without the
@@ -490,6 +607,7 @@ enum ConnectError {
 
 #[allow(clippy::too_many_arguments)]
 async fn connect_once(
+    ctx: &OrgCtx,
     cfg: &AgentConfig,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -556,10 +674,11 @@ async fn connect_once(
     // explicit `return Err(...)`) also flips it back off, so the next
     // backoff-reconnect cycle isn't counted against the 90 s stall
     // threshold. See the type-level comment on `SignalingPumpGuard`.
-    let _pump_guard = SignalingPumpGuard::activate();
+    let _pump_guard = SignalingPumpGuard::activate(ctx.pump);
     // Unification P1 — mark the daemon connected for the LocalAPI; the guard
-    // clears it on every return path (like `_pump_guard`).
-    let _connected_guard = ConnectedGuard::mark(connected);
+    // clears it on every return path (like `_pump_guard`). Sentinel clearing
+    // is primary-only (see `ConnectedGuard::mark`).
+    let _connected_guard = ConnectedGuard::mark(connected, ctx.is_primary);
 
     // Say hello.
     let hello = ClientMsg::AgentHello {
@@ -581,11 +700,11 @@ async fn connect_once(
     // gate-activation instant. Belt-and-suspenders: the gate already
     // reset the timer, so this only matters when the server stalls
     // immediately after upgrade.
-    watchdog::tick("signaling");
+    watchdog::tick(ctx.pump);
     info!("rc:agent.hello sent");
     // A5 — if this connect ended a ≥1 h outage, the fleet may have shipped a
     // fix (or a forced update push) we never saw; check now, not in ≤4 h.
-    note_ws_up_and_maybe_recheck_update();
+    ctx.note_ws_up_and_maybe_recheck_update();
 
     // Outbound channel shared by all per-session peers. Peers push their
     // locally-gathered ICE candidates and state-change terminates here;
@@ -780,7 +899,7 @@ async fn connect_once(
                 // is healthy even during long quiet periods between
                 // sessions. Without this tick the watchdog would flag
                 // a stall after 90 s of no inbound traffic.
-                watchdog::tick("signaling");
+                watchdog::tick(ctx.pump);
             }
             _ = heartbeat.tick() => {
                 let hb = ClientMsg::AgentHeartbeat {
@@ -795,13 +914,13 @@ async fn connect_once(
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Err(ConnectError::Transient(e.context("heartbeat send")));
                 }
-                watchdog::tick("signaling");
+                watchdog::tick(ctx.pump);
             }
             Some(outbound_msg) = outbound_rx.recv() => {
                 if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
                     warn!(%e, "failed to flush peer-originated message");
                 }
-                watchdog::tick("signaling");
+                watchdog::tick(ctx.pump);
             }
             Some(sid) = kill_rx.recv() => {
                 // Viewee clicked "Disconnect" in the on-screen overlay.
@@ -825,12 +944,12 @@ async fn connect_once(
                 )
                 .await;
                 indicator.hide_session(sid.to_hex());
-                watchdog::tick("signaling");
+                watchdog::tick(ctx.pump);
             }
             maybe_msg = ws.next() => match maybe_msg {
                 Some(Ok(Message::Text(text))) => {
                     last_rx = std::time::Instant::now();
-                    watchdog::tick("signaling");
+                    watchdog::tick(ctx.pump);
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
                             // Phase 3b: route `rc:overlay.*` to the node
@@ -856,6 +975,7 @@ async fn connect_once(
                                 None => continue,
                             };
                             handle_server_msg(
+                                ctx,
                                 &mut ws,
                                 parsed,
                                 &mut peers,
@@ -880,7 +1000,7 @@ async fn connect_once(
                 Some(Ok(Message::Ping(data))) => {
                     last_rx = std::time::Instant::now();
                     let _ = ws.send(Message::Pong(data)).await;
-                    watchdog::tick("signaling");
+                    watchdog::tick(ctx.pump);
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     info!("ws closed by peer");
@@ -907,6 +1027,7 @@ async fn connect_once(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_server_msg(
+    ctx: &OrgCtx,
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
@@ -1575,6 +1696,25 @@ async fn handle_server_msg(
         // periodic path: 5-min install-storm cooldown; transfer-defer
         // is bypassed with a warn because the operator asked NOW).
         ServerMsg::UpdateNow { pin } => {
+            // Multi-org P1: the self-updater is machine-wide, so only the
+            // PRIMARY enrollment may drive it — a secondary org's admin
+            // must not force-update a binary shared with every other org.
+            // The ignore is surfaced (log + LocalAPI OrgStatus counter)
+            // rather than silently swallowed.
+            if !ctx.is_primary {
+                let total = ctx
+                    .updates_ignored
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                warn!(
+                    org = %ctx.label,
+                    ?pin,
+                    ignored_total = total,
+                    "rc:agent.update ignored — only the primary enrollment drives the \
+                     machine-wide self-updater"
+                );
+                return Ok(());
+            }
             info!(?pin, "rc:agent.update — operator-triggered self-update");
             if !crate::updater::request_update_now(pin) {
                 warn!(
