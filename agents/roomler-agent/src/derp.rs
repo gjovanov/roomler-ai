@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
+use crate::relay_probe::DerpTicketSlot;
 use tunnel_core::transport::derp::DerpMux;
 
 /// Hard upper bound on a single `/derp` connect attempt (mirrors the control
@@ -77,11 +78,50 @@ pub fn spawn(
     );
     let reg_frame = mux.registration_frame();
     let weak = Arc::downgrade(mux);
-    tokio::spawn(run(full_url, reg_frame, weak, outbound_rx));
+    tokio::spawn(run(
+        Box::new(move || Some(full_url.clone())),
+        reg_frame,
+        weak,
+        outbound_rx,
+    ));
+}
+
+/// Multi-region DERP: like [`spawn`] but for a REGIONAL relay authenticated by
+/// an admission ticket. The URL is rebuilt per connect attempt from the ticket
+/// slot, so a refreshed ticket takes effect on the next reconnect; while the
+/// slot is empty the owner just backs off (ticket still in flight).
+pub fn spawn_regional(
+    derp_url: &str,
+    ticket_slot: DerpTicketSlot,
+    tenant_id: &str,
+    mux: &Arc<DerpMux>,
+    outbound_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    let base = derp_url.to_string();
+    let tid = crate::signaling::urlencode(tenant_id);
+    let reg_frame = mux.registration_frame();
+    let weak = Arc::downgrade(mux);
+    tokio::spawn(run(
+        Box::new(move || {
+            let ticket = ticket_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|(t, _)| t.clone())?;
+            let sep = if base.contains('?') { '&' } else { '?' };
+            Some(format!(
+                "{base}{sep}ticket={}&tid={tid}",
+                crate::signaling::urlencode(&ticket)
+            ))
+        }),
+        reg_frame,
+        weak,
+        outbound_rx,
+    ));
 }
 
 async fn run(
-    url: String,
+    url_for_attempt: Box<dyn Fn() -> Option<String> + Send>,
     reg_frame: Vec<u8>,
     mux: Weak<DerpMux>,
     mut outbound_rx: mpsc::Receiver<Vec<u8>>,
@@ -93,6 +133,14 @@ async fn run(
             debug!("overlay derp: mux dropped; stopping /derp WS owner");
             return;
         }
+        // Regional relays: no admission ticket cached yet — back off and
+        // retry (the signaling loop fills the slot within seconds).
+        let Some(url) = url_for_attempt() else {
+            debug!("overlay derp: no admission ticket yet; delaying connect");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(DERP_BACKOFF_MAX);
+            continue;
+        };
         match tokio::time::timeout(DERP_CONNECT_TIMEOUT, connect_async(&url)).await {
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1);

@@ -230,6 +230,13 @@ pub enum ClientMsg {
     #[serde(rename = "rc:relay.probe_report")]
     RelayProbeReport { results: Vec<RelayRegionRtt> },
 
+    /// Multi-region DERP: request an EdDSA admission ticket for the regional
+    /// relays (`derp_url`s in [`ServerMsg::RelayRegions`]). The server answers
+    /// with [`ServerMsg::DerpTicket`]. Sent only by agents that saw a region
+    /// list carrying a DERP endpoint, so an old server never receives it.
+    #[serde(rename = "rc:relay.derp_ticket_request")]
+    DerpTicketRequest {},
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -1138,6 +1145,12 @@ pub enum ServerMsg {
         /// How long the pin lasts, in ms (server-side TTL mirrored so both
         /// ends expire together).
         ttl_ms: u64,
+        /// Multi-region DERP: the REGIONAL relay both ends must dial for this
+        /// pair (server-computed from the pair's relay homes, pushed
+        /// identically to both — symmetric by construction). Absent/`None` =
+        /// the central `/derp`. `#[serde(default)]` for pre-region agents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derp_url: Option<String>,
     },
 
     /// Multi-region relay PoPs: the probe-target list the server pushes to a
@@ -1154,6 +1167,13 @@ pub enum ServerMsg {
         /// Stable hash of the region list — change detection for re-probes.
         rev: u64,
     },
+
+    /// Multi-region DERP: the admission ticket for the regional relays, in
+    /// reply to [`ClientMsg::DerpTicketRequest`] (never unsolicited — reply-
+    /// only makes it capability-safe for old agents). `exp` is unix seconds;
+    /// the agent re-requests at ~90 % of the TTL.
+    #[serde(rename = "rc:relay.derp_ticket")]
+    DerpTicket { ticket: String, exp: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2427,6 +2447,7 @@ mod tests {
         let m = ServerMsg::OverlayForceDerp {
             peer_node_id: id,
             ttl_ms: 1_800_000,
+            derp_url: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.force_derp""#));
@@ -2434,15 +2455,63 @@ mod tests {
             s.contains(&id.to_hex()),
             "node id must serialize as raw hex"
         );
+        // Wire-compat lock: a central-DERP pin (None) serializes WITHOUT the
+        // field — byte-identical to the pre-region message, so old agents see
+        // exactly what they always saw.
+        assert!(!s.contains("derp_url"));
         match serde_json::from_str::<ServerMsg>(&s).unwrap() {
             ServerMsg::OverlayForceDerp {
                 peer_node_id,
                 ttl_ms,
+                derp_url,
             } => {
                 assert_eq!(peer_node_id, id);
                 assert_eq!(ttl_ms, 1_800_000);
+                assert_eq!(derp_url, None);
             }
             other => panic!("expected OverlayForceDerp, got {other:?}"),
+        }
+        // Regional pin round-trips the url.
+        let m = ServerMsg::OverlayForceDerp {
+            peer_node_id: id,
+            ttl_ms: 1,
+            derp_url: Some("wss://derp-us-east.roomler.ai/derp".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayForceDerp { derp_url, .. } => {
+                assert_eq!(
+                    derp_url.as_deref(),
+                    Some("wss://derp-us-east.roomler.ai/derp")
+                );
+            }
+            other => panic!("expected OverlayForceDerp, got {other:?}"),
+        }
+    }
+
+    /// Multi-region DERP ticket wire locks.
+    #[test]
+    fn derp_ticket_request_and_reply_roundtrip() {
+        let m = ClientMsg::DerpTicketRequest {};
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:relay.derp_ticket_request""#));
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(&s).unwrap(),
+            ClientMsg::DerpTicketRequest {}
+        ));
+
+        let m = ServerMsg::DerpTicket {
+            ticket: "eyJ.header.sig".into(),
+            exp: 1_900_000_000,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:relay.derp_ticket""#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::DerpTicket { ticket, exp } => {
+                assert_eq!(ticket, "eyJ.header.sig");
+                assert_eq!(exp, 1_900_000_000);
+            }
+            other => panic!("expected DerpTicket, got {other:?}"),
         }
     }
 
