@@ -181,6 +181,33 @@ impl RouteReconciler {
         //    reads/writes are scoped to keep the mutexes un-held across
         //    awaits.
         for route in declared.iter().filter(|r| r.enabled) {
+            // Multi-org P1: only primary-org routes are supervised. A
+            // secondary label is legal in the schema (clients may write it
+            // ahead of the P2/P3 supervision slice) but parks as terminal
+            // Failed so a mislabeled route can't hammer the WRONG org's WS
+            // with doomed opens.
+            if let Some(org) = route.org.as_deref()
+                && org != crate::config::PRIMARY_ORG_LABEL
+            {
+                let mut runtime = self.inner.runtime.lock().unwrap();
+                if !matches!(runtime.get(&route.id), Some(RouteRuntime::Failed { .. })) {
+                    warn!(
+                        route = %route.id,
+                        %org,
+                        "declared route names a secondary org — parked (org route \
+                         supervision lands with multi-org P2/P3)"
+                    );
+                    runtime.insert(
+                        route.id.clone(),
+                        RouteRuntime::Failed {
+                            reason: format!(
+                                "org {org:?} routes are not supervised yet (P1: primary only)"
+                            ),
+                        },
+                    );
+                }
+                continue;
+            }
             enum Action {
                 Create,
                 MarkFailed(String, String), // (flow_id to kill, reason)
@@ -473,6 +500,7 @@ mod tests {
             remote: Some("db:5432".into()),
             transport: String::new(),
             enabled,
+            org: None,
         }
     }
 
@@ -499,6 +527,30 @@ mod tests {
         assert_eq!(create_backoff(3), Duration::from_secs(4));
         assert_eq!(create_backoff(6), Duration::from_secs(30)); // 2^5=32 → cap
         assert_eq!(create_backoff(60), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn secondary_org_route_parks_as_failed() {
+        let mut acme = desc("acme-pg", 41051, true);
+        acme.org = Some("acme".into());
+        let mut prim = desc("prim", 41052, true);
+        prim.org = Some("primary".into()); // explicit primary is supervised normally
+        let (r, _dir) = reconciler(vec![acme, prim]);
+        r.reconcile_pass().await;
+        let rows = r.list();
+        let acme_row = rows.iter().find(|i| i.route.id == "acme-pg").unwrap();
+        assert!(
+            matches!(&acme_row.state, RouteState::Failed { reason }
+                if reason.contains("acme") && reason.contains("primary only")),
+            "got {:?}",
+            acme_row.state
+        );
+        let prim_row = rows.iter().find(|i| i.route.id == "prim").unwrap();
+        assert!(
+            !matches!(&prim_row.state, RouteState::Failed { .. }),
+            "explicit-primary route must not park: {:?}",
+            prim_row.state
+        );
     }
 
     #[tokio::test]

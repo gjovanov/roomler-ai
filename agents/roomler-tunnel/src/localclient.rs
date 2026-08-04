@@ -187,6 +187,7 @@ pub async fn route_add(
             remote,
             transport: transport.to_string(),
             enabled,
+            org: None,
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
@@ -630,6 +631,7 @@ mod tests {
                     remote: Some("db:5432".into()),
                     transport: String::new(),
                     enabled: true,
+                    org: None,
                 },
                 state,
             }
