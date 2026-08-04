@@ -108,13 +108,45 @@ export const useConferenceStore = defineStore('conference', () => {
     ws.onMediaMessage('media:peer_left', handlePeerLeft)
     ws.onMediaMessage('media:producer_closed', handleProducerClosed)
 
-    const capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
-    const transportPromise = ws.waitForMessage('media:transport_created')
+    let capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
+    let transportPromise = ws.waitForMessage('media:transport_created')
 
     ws.send('media:join', { room_id: rid })
 
-    const capsMsg = await capabilitiesPromise
-    const transportMsg = await transportPromise
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let capsMsg: any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let transportMsg: any
+    try {
+      capsMsg = await capabilitiesPromise
+      transportMsg = await transportPromise
+    } catch (e) {
+      // Field 2026-08-04: a join sent into a half-dead socket ("Connection
+      // reset without closing handshake" — mobile radio blips, pod rolls)
+      // never reaches the server, so the capabilities wait times out while
+      // the store's 3 s auto-reconnect quietly brings up a NEW socket (and
+      // a NEW connection_id). Retry ONCE on the fresh socket: re-run the
+      // HTTP call/join so the session is re-scoped to the new connection
+      // (the server closes the dead connection's session on disconnect —
+      // without the re-join the call could auto-end under us), then
+      // re-send media:join.
+      console.warn('[conference] join wait failed — retrying once after WS reconnect:', e)
+      const deadline = Date.now() + 8000
+      while (ws.status !== 'connected' && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250))
+      }
+      if (ws.status !== 'connected') throw e
+      const { useRoomStore } = await import('./rooms')
+      await useRoomStore()
+        .joinCall(tid, rid)
+        .catch(() => {})
+      capabilitiesPromise = ws.waitForMessage('media:router_capabilities')
+      transportPromise = ws.waitForMessage('media:transport_created')
+      ws.send('media:join', { room_id: rid })
+      capsMsg = await capabilitiesPromise
+      transportMsg = await transportPromise
+      console.warn('[conference] join retry succeeded on the reconnected socket')
+    }
 
     const dev = new Device()
     await dev.load({ routerRtpCapabilities: capsMsg.rtp_capabilities })
