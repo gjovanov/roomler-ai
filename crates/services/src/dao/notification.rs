@@ -99,4 +99,45 @@ impl NotificationDao {
             .await?;
         Ok(result.modified_count)
     }
+
+    /// P4 — one aggregation feeding `/api/user/unread-summary`: the user's
+    /// unread notifications grouped per tenant, with mention + consent
+    /// sub-counts split out (the discriminants are the snake_case serde
+    /// names of [`NotificationType`]).
+    pub async fn unread_by_tenant(&self, user_id: ObjectId) -> DaoResult<Vec<TenantUnread>> {
+        use futures::TryStreamExt;
+
+        let pipeline = vec![
+            doc! { "$match": { "user_id": user_id, "is_read": false } },
+            doc! { "$group": {
+                "_id": "$tenant_id",
+                "total": { "$sum": 1 },
+                "mentions": { "$sum": { "$cond": [ { "$eq": ["$notification_type", "mention"] }, 1, 0 ] } },
+                "consents": { "$sum": { "$cond": [ { "$eq": ["$notification_type", "consent_request"] }, 1, 0 ] } },
+            }},
+        ];
+
+        let mut cursor = self.base.collection().aggregate(pipeline).await?;
+        let mut results = Vec::new();
+        while let Some(d) = cursor.try_next().await? {
+            if let Ok(tenant_id) = d.get_object_id("_id") {
+                results.push(TenantUnread {
+                    tenant_id,
+                    total: d.get_i32("total").unwrap_or(0).max(0) as u64,
+                    mentions: d.get_i32("mentions").unwrap_or(0).max(0) as u64,
+                    consents: d.get_i32("consents").unwrap_or(0).max(0) as u64,
+                });
+            }
+        }
+        Ok(results)
+    }
+}
+
+/// One tenant's unread-notification slice (see [`NotificationDao::unread_by_tenant`]).
+#[derive(Debug, Clone)]
+pub struct TenantUnread {
+    pub tenant_id: ObjectId,
+    pub total: u64,
+    pub mentions: u64,
+    pub consents: u64,
 }

@@ -57,6 +57,9 @@ async fn create_and_send_notification(
                 "type": "notification:new",
                 "data": {
                     "id": notification.id.unwrap().to_hex(),
+                    // P4 — clients route non-active-org notifications into the
+                    // per-org badge store; without the tenant they can't.
+                    "tenant_id": params.tenant_id.to_hex(),
                     "title": notification.title,
                     "body": notification.body,
                     "link": notification.link,
