@@ -609,12 +609,59 @@ pub async fn terminate_session(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
+    // P3 security — bare tenant membership no longer suffices: only the
+    // session's OWN controller or a member holding REMOTE_CONTROL may
+    // force-close it. Party/tenant facts come from the LIVE session when this
+    // pod holds it; a session homed on ANOTHER pod (rc sessions are pod-local
+    // under S6) can't be inspected here, so non-controllers fall back to the
+    // permission check against the ROUTE tenant — the ctrl event below only
+    // acts on a hub that actually holds the session, and its tenant is
+    // re-checked there.
+    let live = state.rc_hub.session_snapshot(sid);
+    if let Some((live_tid, _)) = live
+        && live_tid != tid
+    {
+        // The path tenant must own the session it names.
+        return Err(ApiError::NotFound("Session not found".to_string()));
+    }
+    let is_controller = matches!(live, Some((_, controller)) if controller == auth.user_id);
+    if !is_controller {
+        require_permission(
+            &state,
+            tid,
+            auth.user_id,
+            permissions::REMOTE_CONTROL,
+            "remote-control",
+        )
+        .await?;
+    }
+
     // Force-close via Hub. The Hub pushes a Terminate to both peers and audits.
-    let _ = state.rc_hub.terminate(
-        sid,
-        roomler_ai_remote_control::models::EndReason::AdminTerminated,
-    );
-    Ok(Json(serde_json::json!({ "terminated": true })))
+    let terminated_here = state
+        .rc_hub
+        .terminate(
+            sid,
+            roomler_ai_remote_control::models::EndReason::AdminTerminated,
+        )
+        .is_ok();
+    // P3 — rc sessions are pod-local (S6): when the session is homed on a
+    // different pod the local terminate is a no-op that previously STILL
+    // returned `{"terminated": true}`. Broadcast an idempotent ctrl event so
+    // the owning pod applies it; `terminated` now reports only what THIS
+    // request could verify locally.
+    crate::ws::remote_control::publish_rc_ctrl(
+        &state,
+        "terminate",
+        serde_json::json!({
+            "session_id": sid.to_hex(),
+            "tenant_id": tid.to_hex(),
+        }),
+    )
+    .await;
+    Ok(Json(serde_json::json!({
+        "terminated": terminated_here && live.is_some(),
+        "broadcast": true,
+    })))
 }
 
 #[derive(Debug, Serialize)]

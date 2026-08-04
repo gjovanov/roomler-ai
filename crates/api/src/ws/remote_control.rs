@@ -648,6 +648,33 @@ pub fn apply_rc_ctrl(hub: &roomler_ai_remote_control::Hub, ctrl: &serde_json::Va
                 info!(agent = %aid, "rc ctrl: kick applied from another pod");
             }
         }
+        // P3 — admin/controller force-close for a session homed on another
+        // pod (the HTTP terminate route already authz'd against the named
+        // tenant; the local terminate there was a silent no-op cross-pod).
+        // The tenant re-check here stops a forged/mismatched envelope from
+        // killing an identically-numbered session in a different tenant.
+        Some("terminate") => {
+            let (Some(sid), Some(tid)) = (
+                ctrl.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok()),
+                ctrl.get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok()),
+            ) else {
+                return;
+            };
+            if hub.session_snapshot(sid).is_some_and(|(t, _)| t == tid)
+                && hub
+                    .terminate(
+                        sid,
+                        roomler_ai_remote_control::models::EndReason::AdminTerminated,
+                    )
+                    .is_ok()
+            {
+                info!(session = %sid, "rc ctrl: terminate applied from another pod");
+            }
+        }
         _ => {}
     }
 }
