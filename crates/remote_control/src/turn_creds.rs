@@ -197,6 +197,66 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// One region's live load snapshot, written by the API's `/stats` poller and
+/// consulted at issuance time. Everything here is advisory: a missing or
+/// STALE entry means "not busy" (fail-open — a stats blip must never
+/// mass-reroute traffic off a healthy PoP).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegionLoad {
+    pub busy: bool,
+    pub load1: f64,
+    pub tx_mbps: f64,
+    pub coturn_allocations: f64,
+    /// Unix seconds of the sample; entries older than
+    /// [`REGION_LOAD_FRESH_SECS`] are ignored.
+    pub updated_unix: u64,
+}
+
+/// How long a load sample stays authoritative (3 missed 30 s polls).
+pub const REGION_LOAD_FRESH_SECS: u64 = 120;
+
+/// Shared region-load table: region id → latest snapshot.
+pub type RelayLoadMap = std::sync::Arc<dashmap::DashMap<String, RegionLoad>>;
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Is `region` currently marked busy by a FRESH sample?
+pub fn region_busy(load: &RelayLoadMap, region: &str) -> bool {
+    load.get(region)
+        .map(|l| l.busy && now_unix().saturating_sub(l.updated_unix) <= REGION_LOAD_FRESH_SECS)
+        .unwrap_or(false)
+}
+
+/// Load-aware single-node region pick (RC sessions / tunnel): the agent's
+/// nearest region unless it's busy, then the agent's next-nearest non-busy
+/// region from `prefs` (its RTT-ordered probe results). Every region busy →
+/// the nearest anyway (nearest-busy still beats far-and-idle for latency,
+/// and thresholds are advisory). `None` = the default region.
+pub fn pick_region_with_load(
+    map: &TurnMap,
+    load: &RelayLoadMap,
+    home: Option<&str>,
+    prefs: &[String],
+) -> Option<String> {
+    if !map.enabled {
+        return None;
+    }
+    let home = home.filter(|r| map.regions.contains_key(*r))?;
+    if !region_busy(load, home) {
+        return Some(home.to_string());
+    }
+    prefs
+        .iter()
+        .find(|r| map.regions.contains_key(*r) && !region_busy(load, r))
+        .map(|r| r.to_string())
+        .or(Some(home.to_string()))
+}
+
 /// Pick the relay region for a PAIR from the two ends' `relay_home`s.
 /// Interim policy until RTT tables land: agreement wins; a single known home
 /// wins over none; two DIFFERENT homes fall to a deterministic FNV pick over
@@ -205,6 +265,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// agree). `None` = use the default region.
 pub fn select_pair_region(
     map: &TurnMap,
+    load: &RelayLoadMap,
     home_a: Option<&str>,
     home_b: Option<&str>,
     pair_key: &str,
@@ -214,7 +275,7 @@ pub fn select_pair_region(
     }
     let known_a = home_a.filter(|r| map.regions.contains_key(*r));
     let known_b = home_b.filter(|r| map.regions.contains_key(*r));
-    match (known_a, known_b) {
+    let chosen = match (known_a, known_b) {
         (Some(a), Some(b)) if a == b => Some(a.to_string()),
         (Some(a), Some(b)) => {
             // Sorted so the pick is symmetric in argument order.
@@ -224,7 +285,19 @@ pub fn select_pair_region(
         }
         (Some(one), None) | (None, Some(one)) => Some(one.to_string()),
         (None, None) => None,
+    }?;
+    // Load-aware fallback for pairs: a busy pick moves to the OTHER end's
+    // non-busy home, else to the default region (`None`) — per-node RTT
+    // tables aren't available on this path, so "next closest" degrades to
+    // "the other end's closest, then central".
+    if region_busy(load, &chosen) {
+        let other = [known_a, known_b]
+            .into_iter()
+            .flatten()
+            .find(|r| *r != chosen && !region_busy(load, r));
+        return other.map(|r| r.to_string());
     }
+    Some(chosen)
 }
 
 /// Convenience: also include public STUN servers so trickle ICE has something
@@ -362,6 +435,25 @@ mod tests {
         }
     }
 
+    fn no_load() -> RelayLoadMap {
+        std::sync::Arc::new(dashmap::DashMap::new())
+    }
+
+    fn load_with(region: &str, busy: bool, age_s: u64) -> RelayLoadMap {
+        let m = no_load();
+        m.insert(
+            region.to_string(),
+            RegionLoad {
+                busy,
+                load1: 3.0,
+                tx_mbps: 450.0,
+                coturn_allocations: 10.0,
+                updated_unix: now_unix().saturating_sub(age_s),
+            },
+        );
+        m
+    }
+
     fn two_region_map(enabled: bool) -> TurnMap {
         let mut regions = std::collections::HashMap::new();
         regions.insert("us-east".to_string(), region_cfg("coturn-us-east.example"));
@@ -384,7 +476,7 @@ mod tests {
             assert_eq!(cfg.urls[0], "turn:coturn.example:3478");
         }
         assert_eq!(
-            select_pair_region(&map, Some("us-east"), Some("us-east"), "k"),
+            select_pair_region(&map, &no_load(), Some("us-east"), Some("us-east"), "k"),
             None
         );
     }
@@ -412,25 +504,88 @@ mod tests {
         let map = two_region_map(true);
         // Agreement.
         assert_eq!(
-            select_pair_region(&map, Some("us-east"), Some("us-east"), "k").as_deref(),
+            select_pair_region(&map, &no_load(), Some("us-east"), Some("us-east"), "k").as_deref(),
             Some("us-east")
         );
         // One known home wins over none / over an UNKNOWN home.
         assert_eq!(
-            select_pair_region(&map, Some("eu-west"), None, "k").as_deref(),
+            select_pair_region(&map, &no_load(), Some("eu-west"), None, "k").as_deref(),
             Some("eu-west")
         );
         assert_eq!(
-            select_pair_region(&map, Some("gone"), Some("eu-west"), "k").as_deref(),
+            select_pair_region(&map, &no_load(), Some("gone"), Some("eu-west"), "k").as_deref(),
             Some("eu-west")
         );
         // No homes → default region.
-        assert_eq!(select_pair_region(&map, None, None, "k"), None);
+        assert_eq!(select_pair_region(&map, &no_load(), None, None, "k"), None);
         // Differing homes: deterministic AND symmetric in argument order.
-        let ab = select_pair_region(&map, Some("us-east"), Some("eu-west"), "pair-1");
-        let ba = select_pair_region(&map, Some("eu-west"), Some("us-east"), "pair-1");
+        let ab = select_pair_region(&map, &no_load(), Some("us-east"), Some("eu-west"), "pair-1");
+        let ba = select_pair_region(&map, &no_load(), Some("eu-west"), Some("us-east"), "pair-1");
         assert_eq!(ab, ba);
         assert!(ab.as_deref() == Some("us-east") || ab.as_deref() == Some("eu-west"));
+    }
+
+    /// Load-aware picks: fresh-busy home falls to the next non-busy pref;
+    /// stale-busy is IGNORED (fail-open); all-busy keeps the nearest.
+    #[test]
+    fn load_aware_pick_and_freshness() {
+        let map = two_region_map(true);
+        let prefs = vec!["us-east".to_string(), "eu-west".to_string()];
+
+        // Not busy → home.
+        assert_eq!(
+            pick_region_with_load(&map, &no_load(), Some("us-east"), &prefs).as_deref(),
+            Some("us-east")
+        );
+        // Fresh busy home → next non-busy pref.
+        let busy = load_with("us-east", true, 0);
+        assert_eq!(
+            pick_region_with_load(&map, &busy, Some("us-east"), &prefs).as_deref(),
+            Some("eu-west")
+        );
+        // STALE busy sample → ignored (fail-open).
+        let stale = load_with("us-east", true, REGION_LOAD_FRESH_SECS + 30);
+        assert_eq!(
+            pick_region_with_load(&map, &stale, Some("us-east"), &prefs).as_deref(),
+            Some("us-east")
+        );
+        // Every candidate busy → nearest anyway.
+        let all = load_with("us-east", true, 0);
+        all.insert(
+            "eu-west".into(),
+            RegionLoad {
+                busy: true,
+                load1: 9.0,
+                tx_mbps: 480.0,
+                coturn_allocations: 99.0,
+                updated_unix: now_unix(),
+            },
+        );
+        assert_eq!(
+            pick_region_with_load(&map, &all, Some("us-east"), &prefs).as_deref(),
+            Some("us-east")
+        );
+        // Disabled map / unknown home → default region.
+        assert_eq!(
+            pick_region_with_load(&two_region_map(false), &no_load(), Some("us-east"), &prefs),
+            None
+        );
+        assert_eq!(
+            pick_region_with_load(&map, &no_load(), Some("mars"), &prefs),
+            None
+        );
+
+        // Pair fallback: busy pick moves to the other end's home, else default.
+        let busy_us = load_with("us-east", true, 0);
+        assert_eq!(
+            select_pair_region(&map, &busy_us, Some("us-east"), Some("eu-west"), "k").as_deref(),
+            Some("eu-west")
+        );
+        assert_eq!(
+            select_pair_region(&map, &busy_us, Some("us-east"), Some("us-east"), "k"),
+            None,
+            "both ends on the busy region → default"
+        );
     }
 
     #[test]
