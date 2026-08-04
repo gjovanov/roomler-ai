@@ -50,6 +50,10 @@ pub struct AttachmentResponse {
 #[derive(Debug, Serialize, Clone)]
 pub struct MessageResponse {
     pub id: String,
+    /// P4 — carried so a multi-org client can route a `message:create` for a
+    /// NON-active org into its per-org badge store (without it, cross-org
+    /// events could only inflate the wrong org's badges or be dropped).
+    pub tenant_id: String,
     pub room_id: String,
     pub author_id: String,
     pub author_name: String,
@@ -543,6 +547,7 @@ fn to_response(
     };
     MessageResponse {
         id: m.id.unwrap().to_hex(),
+        tenant_id: m.tenant_id.to_hex(),
         room_id: m.room_id.to_hex(),
         author_id: m.author_id.to_hex(),
         author_name,

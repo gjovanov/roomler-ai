@@ -246,6 +246,207 @@ async fn shutdown_cleanup_marks_local_agents_offline() {
     assert_eq!(row["status"], "offline", "row: {row}");
 }
 
+// ─── P4 — device:presence push events ───────────────────────────────────
+
+/// Await the next `{type: <ty>}` frame on a USER WebSocket, skipping
+/// unrelated events, within `secs`.
+async fn wait_for_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ty: &str,
+    secs: u64,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {ty}"))
+            .expect("ws stream ended")
+            .expect("ws frame error");
+        let Ok(v) = serde_json::from_str::<Value>(msg.to_text().unwrap_or_default()) else {
+            continue;
+        };
+        if v["type"] == ty {
+            return v;
+        }
+    }
+}
+
+/// (f) P4 — an agent WS connect pushes `device:presence` online to a
+/// tenant member's user socket; the disconnect pushes offline. The
+/// payload carries tenant_id + the batched agents list.
+#[tokio::test]
+async fn device_presence_events_on_connect_and_disconnect() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.rc.presence_batch_ms = 50;
+    })
+    .await;
+    let seeded = app.seed_tenant("presp4a").await;
+
+    let ws_url = format!("ws://{}/ws?token={}", app.addr, seeded.member.access_token);
+    let (mut user_ws, _) = connect_async(&ws_url).await.expect("user ws connect");
+    user_ws.next().await; // drain the `connected` frame
+
+    let (agent_id, agent_token) = enroll(&app, &seeded, "mach-presp4-a").await;
+    let mut agent_ws = connect_agent(&app, &agent_token).await;
+
+    let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
+    assert_eq!(
+        ev["data"]["tenant_id"],
+        seeded.tenant_id.as_str(),
+        "ev: {ev}"
+    );
+    let agents = ev["data"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1, "ev: {ev}");
+    assert_eq!(agents[0]["agent_id"], agent_id.as_str());
+    assert_eq!(agents[0]["presence"], "online");
+    assert!(agents[0]["name"].is_string());
+
+    let _ = agent_ws.close(None).await;
+    let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
+    let agents = ev["data"]["agents"].as_array().unwrap();
+    assert_eq!(agents[0]["agent_id"], agent_id.as_str());
+    assert_eq!(agents[0]["presence"], "offline", "ev: {ev}");
+}
+
+/// (g) P4 — the staleness sweep: a stranded row (status Online + fresh
+/// heartbeat, no socket anywhere) transitions to `stale`; once the
+/// heartbeat trail ages out it transitions to `offline` AND the row's
+/// status is healed. The `last_presence` ledger dedupes: a repeat sweep
+/// with no change announces nothing.
+#[tokio::test]
+async fn presence_sweep_transitions_stale_then_offline_once() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.rc.presence_batch_ms = 50;
+    })
+    .await;
+    let seeded = app.seed_tenant("presp4b").await;
+
+    let ws_url = format!("ws://{}/ws?token={}", app.addr, seeded.member.access_token);
+    let (mut user_ws, _) = connect_async(&ws_url).await.expect("user ws connect");
+    user_ws.next().await;
+
+    let (agent_id, _token) = enroll(&app, &seeded, "mach-presp4-b").await;
+    let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
+
+    use bson::doc;
+    let agents_coll = app.db.collection::<bson::Document>("agents");
+    // Fabricate the stranded shape: last broadcast said online, Mongo still
+    // says Online + fresh heartbeat, but no socket ever registered.
+    agents_coll
+        .update_one(
+            doc! { "_id": aid },
+            doc! { "$set": {
+                "status": "online",
+                "last_seen_at": bson::DateTime::now(),
+                "last_presence": "online",
+            } },
+        )
+        .await
+        .unwrap();
+
+    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(&app.state).await;
+    assert_eq!(n, 1, "fresh-heartbeat stranded row must announce stale");
+    let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
+    assert_eq!(ev["data"]["agents"][0]["presence"], "stale", "ev: {ev}");
+
+    // Unchanged state ⇒ the ledger CAS keeps a repeat sweep silent.
+    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(&app.state).await;
+    assert_eq!(n, 0, "repeat sweep with no transition must be silent");
+
+    // Age the heartbeat past the 90 s freshness window ⇒ offline + heal.
+    let aged = bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 120_000);
+    agents_coll
+        .update_one(
+            doc! { "_id": aid },
+            doc! { "$set": { "last_seen_at": aged } },
+        )
+        .await
+        .unwrap();
+    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(&app.state).await;
+    assert_eq!(n, 1);
+    let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
+    assert_eq!(ev["data"]["agents"][0]["presence"], "offline", "ev: {ev}");
+
+    let row = agents_coll
+        .find_one(doc! { "_id": aid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.get_str("status").unwrap(),
+        "offline",
+        "row status healed"
+    );
+    assert_eq!(row.get_str("last_presence").unwrap(), "offline");
+
+    // Offline rows leave the scan set entirely.
+    let n = roomler_ai_api::ws::device_presence::run_presence_sweep(&app.state).await;
+    assert_eq!(n, 0);
+}
+
+/// (h) P4 — re-home suppression: when the agent moves pod 1 → pod 2, the
+/// OLD socket's late teardown must NOT announce offline (a foreign pod
+/// owns the presence record and the device is alive). Closing the NEW
+/// socket afterwards must still announce offline — proving silence came
+/// from suppression, not a broken pipeline.
+#[tokio::test]
+async fn rehome_teardown_does_not_announce_offline() {
+    let (app1, app2) = TestApp::spawn_pair(|s| {
+        s.rc.presence_batch_ms = 50;
+    })
+    .await;
+    if app1.state.redis_pubsub.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let seeded = app1.seed_tenant("presp4c").await;
+
+    let ws_url = format!("ws://{}/ws?token={}", app1.addr, seeded.member.access_token);
+    let (mut user_ws, _) = connect_async(&ws_url).await.expect("user ws connect");
+    user_ws.next().await;
+
+    let (_agent_id, agent_token) = enroll(&app1, &seeded, "mach-presp4-c").await;
+    let mut ws_old = connect_agent(&app1, &agent_token).await;
+    let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
+    assert_eq!(ev["data"]["agents"][0]["presence"], "online");
+
+    // Re-home to pod 2, then tear the OLD socket down last.
+    let mut ws_new = connect_agent(&app2, &agent_token).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _ = ws_old.close(None).await;
+
+    // No offline may arrive: the ledger stayed "online" throughout, and the
+    // old teardown saw pod 2's foreign claim. Drain the WHOLE quiet window —
+    // one unrelated frame must not mask a late wrongful offline behind it.
+    let quiet_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
+    loop {
+        let remaining = quiet_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(Some(Ok(msg))) = tokio::time::timeout(remaining, user_ws.next()).await else {
+            break;
+        };
+        let v: Value = serde_json::from_str(msg.to_text().unwrap_or_default()).unwrap_or_default();
+        assert_ne!(
+            (
+                v["type"].as_str(),
+                v["data"]["agents"][0]["presence"].as_str()
+            ),
+            (Some("device:presence"), Some("offline")),
+            "re-homed agent's old-socket teardown must not announce offline: {v}"
+        );
+    }
+
+    // The pipeline still works: closing the LIVE socket announces offline.
+    let _ = ws_new.close(None).await;
+    let ev = wait_for_event(&mut user_ws, "device:presence", 5).await;
+    assert_eq!(ev["data"]["agents"][0]["presence"], "offline", "ev: {ev}");
+}
+
 /// (e) The "stale" state: heartbeat trail fresh + status Online in Mongo,
 /// but NO socket anywhere (the stranded-row shape a hard-killed pod
 /// leaves) ⇒ amber `stale`, `is_online: false` — never a green lie.
