@@ -40,6 +40,10 @@ pub static AGENT_NUDGE_REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// PR-1 rehome — nudges suppressed by the cooldown cap (split evidence:
 /// repeated convergence attempts are not converging).
 pub static AGENT_NUDGE_STUCK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// PR-2 — rc frames successfully relayed to the owner pod (cross-pod
+/// sessions WORKING rather than converging; sustained growth means a
+/// stable co-location gap worth investigating).
+pub static RC_RELAY_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -107,6 +111,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "rc_rehome_controller_total": RC_REHOME_CONTROLLER_TOTAL.load(Ordering::Relaxed),
             "agent_nudge_refused_total": AGENT_NUDGE_REFUSED_TOTAL.load(Ordering::Relaxed),
             "agent_nudge_stuck_total": AGENT_NUDGE_STUCK_TOTAL.load(Ordering::Relaxed),
+            "rc_relay_total": RC_RELAY_TOTAL.load(Ordering::Relaxed),
         },
         "local": {
             "agents_online": state.rc_hub.online_agents().len(),
