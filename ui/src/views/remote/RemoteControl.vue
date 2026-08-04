@@ -102,6 +102,71 @@
       >
         {{ rc.remoteLayout.value.activeTag }}
       </v-chip>
+      <!-- P6 — multi-user participants rail. Self-gating: pre-P6 agents
+           never broadcast rc:control.state, so controlState stays null and
+           nothing renders. Shows everyone on the device; the star marks
+           the exclusive-mode floor holder. -->
+      <v-menu v-if="rc.phase.value === 'connected' && multiUserState && multiUserState.participants.length > 1">
+        <template #activator="{ props: railProps }">
+          <v-chip
+            v-bind="railProps"
+            size="small"
+            variant="tonal"
+            prepend-icon="mdi-account-multiple"
+            class="mr-2"
+            :title="`${multiUserState.participants.length} viewers on this device (input: ${multiUserState.mode})`"
+          >
+            {{ multiUserState.participants.length }}
+          </v-chip>
+        </template>
+        <v-list density="compact">
+          <v-list-subheader>Viewers · input {{ multiUserState.mode }}</v-list-subheader>
+          <v-list-item
+            v-for="p in multiUserState.participants"
+            :key="p.session"
+            :title="p.name || 'Viewer'"
+            :prepend-icon="p.input ? 'mdi-keyboard' : 'mdi-eye'"
+          >
+            <template #append>
+              <v-icon
+                v-if="multiUserState.holder === p.session"
+                size="small"
+                color="warning"
+                title="Holds input control"
+              >
+                mdi-star
+              </v-icon>
+            </template>
+          </v-list-item>
+          <v-divider />
+          <v-list-item
+            v-if="multiUserState.mode === 'free'"
+            title="Switch to exclusive input"
+            prepend-icon="mdi-account-key"
+            @click="rc.setInputMode('exclusive')"
+          />
+          <v-list-item
+            v-else
+            title="Switch to free-for-all input"
+            prepend-icon="mdi-account-group"
+            @click="rc.setInputMode('free')"
+          />
+        </v-list>
+      </v-menu>
+      <!-- P6 — exclusive mode + someone else holds the floor: one-click
+           request. Auto-granted when the holder has been idle ≥2 s. -->
+      <v-btn
+        v-if="rc.phase.value === 'connected' && multiUserState?.mode === 'exclusive' && !iHoldTheFloor"
+        size="small"
+        color="warning"
+        variant="tonal"
+        prepend-icon="mdi-hand-back-right"
+        class="mr-2"
+        title="Request input control (auto-granted when the current holder is idle)"
+        @click="rc.requestControl()"
+      >
+        Request control
+      </v-btn>
       <!-- Live stats (codec · bitrate · fps · resolution). Relocated here
            from over the video (2026-07-21) so it never hides a maximized
            remote window's caption buttons. Desktop only (md+) — the toolbar
@@ -637,6 +702,19 @@
         >
           <div class="cursor-arrow" />
           <div class="cursor-chip">{{ controllerInitials }}</div>
+        </div>
+        <!-- P6 — ghost cursors: other sessions' pointers (agent
+             rebroadcast, normalized coords → the same letterbox math as
+             the OS cursor). Name-tagged; fade out 5 s after the peer's
+             pointer goes still. pointer-events: none — never eats input. -->
+        <div
+          v-for="g in ghostCursors"
+          :key="g.sid"
+          class="ghost-cursor"
+          :style="{ transform: `translate(${g.left}px, ${g.top}px)` }"
+        >
+          <div class="cursor-arrow" />
+          <div class="cursor-chip ghost-chip">{{ g.name }}</div>
         </div>
         <!-- Keyboard-lock affordances. Plain divs INSIDE the fullscreen
              element (.video-frame) — Vuetify snackbars teleport to
@@ -2880,6 +2958,36 @@ function cursorMapping(): { sx: number; sy: number; offsetX: number; offsetY: nu
   }
 }
 
+// ── P6 — multi-user rail + ghost cursors ─────────────────────────
+const multiUserState = computed(() => rc.controlState.value)
+/** Whether THIS session holds the exclusive-mode floor. */
+const iHoldTheFloor = computed(() => {
+  const st = rc.controlState.value
+  if (!st || st.mode !== 'exclusive') return true
+  return st.holder != null && st.holder === rc.sessionId.value
+})
+/** 1 s ticker so still ghosts fade out (5 s) without a paint loop. */
+const ghostNow = ref(Date.now())
+let ghostTicker: ReturnType<typeof setInterval> | null = null
+/** Other sessions' pointers mapped through the same letterbox math as
+ *  the OS cursor. Ghost coords are NORMALIZED 0..1 of the source frame
+ *  (`cursor:peer`), so source pixels = (x·srcW, y·srcH). */
+const ghostCursors = computed(() => {
+  const now = ghostNow.value
+  const srcW = rc.mediaIntrinsicW.value
+  const srcH = rc.mediaIntrinsicH.value
+  if (!srcW || !srcH) return []
+  const m = cursorMapping()
+  return Object.entries(rc.peerCursors.value)
+    .filter(([, g]) => now - g.ts < 5000)
+    .map(([sid, g]) => ({
+      sid,
+      name: g.name || 'Viewer',
+      left: m.offsetX + g.x * srcW * m.sx,
+      top: m.offsetY + g.y * srcH * m.sy,
+    }))
+})
+
 // Paint the current cursor shape onto the canvas every time the
 // shape or pos changes. drawImage is cheap (O(cursor pixels), ≤32×32
 // for classic cursors) so we don't need an explicit RAF loop.
@@ -3280,6 +3388,8 @@ watch(
 onMounted(() => {
   void loadAgent()
   agentStatusTimer = setInterval(() => void refreshAgentStatus(), AGENT_STATUS_POLL_MS)
+  // P6 — ghost-cursor staleness ticker (cheap; drives the 5 s fade).
+  ghostTicker = setInterval(() => { ghostNow.value = Date.now() }, 1000)
   document.addEventListener('fullscreenchange', onFullscreenChange)
   // Drawer-scope Ctrl+V / Ctrl+C handlers attached at window-level
   // (not on the drawer element) so they fire regardless of which
@@ -3293,6 +3403,10 @@ onBeforeUnmount(() => {
   if (agentStatusTimer !== null) {
     clearInterval(agentStatusTimer)
     agentStatusTimer = null
+  }
+  if (ghostTicker !== null) {
+    clearInterval(ghostTicker)
+    ghostTicker = null
   }
   if (detachInput) detachInput()
   stopFitResizeObserver()
@@ -3507,6 +3621,22 @@ onBeforeUnmount(() => {
   transform: rotate(-20deg);
   transform-origin: 0 0;
 }
+/* P6 — ghost cursors: other viewers' pointers. Same anatomy as the
+   synthetic cursor badge, tinted amber and input-transparent. */
+.ghost-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  z-index: 5;
+  opacity: 0.85;
+  transition: transform 80ms linear;
+}
+.ghost-chip {
+  background: #ffb74d;
+  color: #3e2723;
+}
+
 .cursor-chip {
   position: absolute;
   top: 14px;

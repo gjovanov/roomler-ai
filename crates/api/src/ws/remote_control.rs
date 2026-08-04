@@ -103,10 +103,17 @@ pub async fn handle_agent_socket(
     //     instead of waiting up to one 25 s keepalive interval.
     //   * `rx` feeds the pump task as before.
     let max_sessions = caps.max_simultaneous_sessions.max(1);
-    let (registered_tx, cancel, rx) =
-        state
-            .rc_hub
-            .register_agent(agent_id, tenant_id, owner_user_id, os, max_sessions);
+    // P6 — an arbiter-capable agent serializes + fences concurrent input
+    // itself; the hub then skips the P3 single-INPUT-holder downgrade.
+    let input_arbiter = caps.input.iter().any(|c| c == "arbiter");
+    let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
+        agent_id,
+        tenant_id,
+        owner_user_id,
+        os,
+        max_sessions,
+        input_arbiter,
+    );
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
@@ -201,6 +208,7 @@ pub async fn handle_agent_socket(
         // consumes these); harmless defaults.
         consent_mode: ConsentMode::Prompt,
         override_reason: None,
+        input_mode: None,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's
@@ -605,6 +613,9 @@ pub async fn dispatch_controller_rc(
     text: &str,
     consent_mode: ConsentMode,
     override_reason: Option<String>,
+    // P6 — the device's `AccessPolicy.input_mode` (resolved by the authz
+    // gate alongside `consent_mode`); forwarded to the agent's arbiter.
+    input_mode: Option<roomler_ai_remote_control::models::InputMode>,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -623,6 +634,7 @@ pub async fn dispatch_controller_rc(
         controller_tx: Some(controller_tx.clone()),
         consent_mode,
         override_reason,
+        input_mode,
     };
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
@@ -735,6 +747,8 @@ pub async fn dispatch_controller_rc(
 pub struct SessionAuthz {
     pub mode: ConsentMode,
     pub override_reason: Option<String>,
+    /// P6 — the device's `AccessPolicy.input_mode` (None = free default).
+    pub input_mode: Option<roomler_ai_remote_control::models::InputMode>,
 }
 
 impl SessionAuthz {
@@ -742,6 +756,17 @@ impl SessionAuthz {
         Self {
             mode,
             override_reason: None,
+            input_mode: None,
+        }
+    }
+    fn allow_with_input(
+        mode: ConsentMode,
+        input_mode: Option<roomler_ai_remote_control::models::InputMode>,
+    ) -> Self {
+        Self {
+            mode,
+            override_reason: None,
+            input_mode,
         }
     }
 }
@@ -789,9 +814,15 @@ pub async fn resolve_session_authz(
         return Err("device is quarantined; new sessions are blocked".to_string());
     }
 
+    // P6 — the device's input arbitration mode rides every allowed outcome.
+    let input_mode = agent.access_policy.input_mode;
+
     // Controlling your OWN device is always allowed AND auto-consents.
     if agent.owner_user_id == controller_user_id {
-        return Ok(SessionAuthz::allow(ConsentMode::Auto));
+        return Ok(SessionAuthz::allow_with_input(
+            ConsentMode::Auto,
+            input_mode,
+        ));
     }
 
     // The effective mode for an allowed non-owner controller (attended default).
@@ -810,9 +841,10 @@ pub async fn resolve_session_authz(
             return Ok(SessionAuthz {
                 mode: ConsentMode::Auto,
                 override_reason: Some(reason),
+                input_mode,
             });
         }
-        return Ok(SessionAuthz::allow(mode));
+        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
@@ -822,10 +854,10 @@ pub async fn resolve_session_authz(
     // request; consent is the real gate). Non-empty ⇒ user or a role must match.
     let policy = &agent.access_policy;
     if policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty() {
-        return Ok(SessionAuthz::allow(mode));
+        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
-        return Ok(SessionAuthz::allow(mode));
+        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
     }
     let role_ids = state
         .tenants
@@ -833,7 +865,7 @@ pub async fn resolve_session_authz(
         .await
         .unwrap_or_default();
     if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
-        return Ok(SessionAuthz::allow(mode));
+        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
     }
     Err("you're not on this device's control allowlist".to_string())
 }
