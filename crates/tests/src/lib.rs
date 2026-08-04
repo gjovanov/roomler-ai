@@ -54,6 +54,8 @@ mod pdf_export_tests;
 #[cfg(test)]
 mod rate_limit_tests;
 #[cfg(test)]
+mod relay_region_tests;
+#[cfg(test)]
 mod remote_control_tests;
 #[cfg(test)]
 mod role_tests;
