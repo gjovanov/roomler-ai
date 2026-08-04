@@ -738,7 +738,9 @@ async fn handle_tunnel_open(
     // both peers derive identical, session-scoped creds.
     let quic_ice_servers = roomler_ai_remote_control::turn_creds::ice_servers_for(
         &tunnel_session_id.to_hex(),
-        crate::state::build_turn_config(&state.settings.turn).as_ref(),
+        // Region-keyed map; `None` = default region until the agent's
+        // relay_home is threaded through (probe reports, PR3).
+        state.turn_map.cfg_for(None),
     );
 
     // For quic-v1, tell the agent to stand up its endpoint + authorize
