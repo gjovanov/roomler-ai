@@ -813,6 +813,13 @@ async fn connect_once(
         bson::oid::ObjectId,
         roomler_ai_remote_control::permissions::Permissions,
     > = HashMap::new();
+    // P6 — (controller display name, device-policy input mode) from
+    // `rc:request`, consumed at `rc:sdp.offer` so AgentPeer can register
+    // the session with the InputArbiter (participants rail + mode seed).
+    let mut pending_session_meta: HashMap<
+        bson::oid::ObjectId,
+        (String, Option<roomler_ai_remote_control::models::InputMode>),
+    > = HashMap::new();
     // T2.10d: one `AgentTunnelPeer` per active `roomler-tunnel`
     // session. Distinct map from `peers` (remote-control sessions)
     // because the namespaces don't overlap and the lifecycles
@@ -957,6 +964,7 @@ async fn connect_once(
                 pending_transports.remove(&sid);
                 pending_audio.remove(&sid);
                 pending_permissions.remove(&sid);
+                pending_session_meta.remove(&sid);
                 let _ = send_msg(
                     &mut ws,
                     &ClientMsg::Terminate {
@@ -1006,6 +1014,7 @@ async fn connect_once(
                                 &mut pending_chroma,
                                 &mut pending_audio,
                                 &mut pending_permissions,
+                                &mut pending_session_meta,
                                 &mut tunnel_peers,
                                 &mut tunnel_quic_peers,
                                 &outbound_tx,
@@ -1065,6 +1074,10 @@ async fn handle_server_msg(
         bson::oid::ObjectId,
         roomler_ai_remote_control::permissions::Permissions,
     >,
+    pending_session_meta: &mut HashMap<
+        bson::oid::ObjectId,
+        (String, Option<roomler_ai_remote_control::models::InputMode>),
+    >,
     tunnel_peers: &mut HashMap<bson::oid::ObjectId, Arc<crate::tunnel::peer::AgentTunnelPeer>>,
     tunnel_quic_peers: &mut HashMap<
         bson::oid::ObjectId,
@@ -1090,6 +1103,7 @@ async fn handle_server_msg(
             chroma_pref,
             audio_enabled,
             consent_mode,
+            input_mode,
         } => {
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
@@ -1138,6 +1152,9 @@ async fn handle_server_msg(
             // bitfield so the SdpOffer handler can hand it to the
             // AgentPeer's DC handlers for enforcement.
             pending_permissions.insert(session_id, permissions);
+            // P6 — controller name (participants rail / ghost labels) +
+            // the device policy's input arbitration mode.
+            pending_session_meta.insert(session_id, (controller_name.clone(), input_mode));
             info!(
                 %session_id, %controller_user_id, %controller_name,
                 ?permissions, consent_timeout_secs,
@@ -1282,6 +1299,12 @@ async fn handle_server_msg(
             // Permissions default (VIEW | INPUT | CLIPBOARD) so those
             // flows behave exactly as pre-v2.
             let permissions = pending_permissions.remove(&session_id).unwrap_or_default();
+            // P6 — controller name + policy input mode for the arbiter
+            // registration. Missing (harness skipped rc:request) → an
+            // anonymous label + the agent-default (free) mode.
+            let (controller_name, input_mode) = pending_session_meta
+                .remove(&session_id)
+                .unwrap_or_else(|| ("Controller".to_string(), None));
 
             let peer = match AgentPeer::new(
                 session_id,
@@ -1293,6 +1316,14 @@ async fn handle_server_msg(
                 chroma_pref,
                 audio_enabled,
                 permissions,
+                controller_name,
+                input_mode.map(|m| {
+                    match m {
+                        roomler_ai_remote_control::models::InputMode::Free => "free",
+                        roomler_ai_remote_control::models::InputMode::Exclusive => "exclusive",
+                    }
+                    .to_string()
+                }),
             )
             .await
             {
@@ -1373,6 +1404,7 @@ async fn handle_server_msg(
             pending_transports.remove(&session_id);
             pending_audio.remove(&session_id);
             pending_permissions.remove(&session_id);
+            pending_session_meta.remove(&session_id);
             indicator.hide_session(session_id.to_hex());
         }
 

@@ -75,6 +75,19 @@ pub struct AgentCaps {
     /// `files:get` / `files:dir`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// P6 — multi-user input capabilities. Recognised values:
+    ///
+    /// * `arbiter` — the agent runs the InputArbiter (single fenced
+    ///   injection worker); the SERVER lifts the P3 single-INPUT-holder
+    ///   downgrade for concurrent sessions on agents advertising this.
+    /// * `exclusive` — the arbiter supports the exclusive floor mode
+    ///   (`rc:control.request` / `rc:control.mode` on the control DC).
+    /// * `ghost-cursor` — other sessions' pointers are rebroadcast as
+    ///   `cursor:peer` on the cursor DC.
+    ///
+    /// Empty / unset = a pre-P6 agent → the P3 single-holder rule stays.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input: Vec<String>,
     /// VP9 chroma format the agent will emit on the
     /// `data-channel-vp9-444` transport. Values: `"yuv444"` (default,
     /// current behaviour, VP9 profile 1) for sharpest text via
@@ -181,6 +194,11 @@ pub struct AccessPolicy {
     #[serde(default)]
     pub allowed_user_ids: Vec<ObjectId>,
     pub auto_terminate_idle_minutes: Option<u32>,
+    /// P6 — multi-user input arbitration mode. `None` = the system default
+    /// ([`InputMode::Free`] — free-for-all with agent-side fencing). Old rows
+    /// deserialize to `None` via the default.
+    #[serde(default)]
+    pub input_mode: Option<InputMode>,
 }
 
 impl AccessPolicy {
@@ -190,6 +208,19 @@ impl AccessPolicy {
     pub fn effective_consent_mode(&self) -> ConsentMode {
         self.consent_mode.unwrap_or(ConsentMode::Prompt)
     }
+}
+
+/// P6 — multi-user input arbitration mode for a device. `Free` (the default)
+/// lets every INPUT-granted session inject, serialized + modifier-fenced by
+/// the agent's InputArbiter; `Exclusive` funnels input through one explicit
+/// floor holder (request/grant, idle takeover). Set per device via
+/// `AccessPolicy.input_mode`; toggleable in-session on the control DC.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputMode {
+    #[default]
+    Free,
+    Exclusive,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

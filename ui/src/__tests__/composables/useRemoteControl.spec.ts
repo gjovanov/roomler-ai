@@ -2611,6 +2611,31 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
     }
   })
 
+  it('parses the P6 arbiter state broadcast (rc:control.state)', () => {
+    const parsed = parseControlInbound(
+      '{"t":"rc:control.state","mode":"exclusive","holder":"aabbccdd00112233aabbccdd","participants":[{"session":"aabbccdd00112233aabbccdd","name":"Goran","input":true},{"session":"ffeeddcc00112233aabbccdd","name":"Ana","input":false}]}',
+    )
+    expect(parsed?.kind).toBe('control_state')
+    if (parsed?.kind === 'control_state') {
+      expect(parsed.state.mode).toBe('exclusive')
+      expect(parsed.state.holder).toBe('aabbccdd00112233aabbccdd')
+      expect(parsed.state.participants).toEqual([
+        { session: 'aabbccdd00112233aabbccdd', name: 'Goran', input: true },
+        { session: 'ffeeddcc00112233aabbccdd', name: 'Ana', input: false },
+      ])
+    }
+    // Free mode + no holder + malformed participants degrade safely.
+    const free = parseControlInbound(
+      '{"t":"rc:control.state","mode":"free","holder":null,"participants":[{"bogus":1}]}',
+    )
+    expect(free?.kind).toBe('control_state')
+    if (free?.kind === 'control_state') {
+      expect(free.state.mode).toBe('free')
+      expect(free.state.holder).toBeNull()
+      expect(free.state.participants).toEqual([])
+    }
+  })
+
   it('defaults native dims to 0 for older agents that omit them (back-compat)', () => {
     const parsed = parseControlInbound(
       '{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct"}',
