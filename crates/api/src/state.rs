@@ -404,6 +404,8 @@ impl AppState {
             Arc::new(DashMap::new());
         let tunnel_sessions_by_origin_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
             Arc::new(DashMap::new());
+        let agent_nudge_cooldowns: Arc<crate::ws::rc_cluster::NudgeCooldowns> =
+            Arc::new(DashMap::new());
 
         // C-2 — the global-channel subscriber + forwarder, MOVED here from
         // main.rs so two-pod TestApps exercise cross-pod delivery (chat,
@@ -743,7 +745,7 @@ impl AppState {
             tunnel_clients_by_session: tunnel_clients_by_session.clone(),
             tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
             tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
-            agent_nudge_cooldowns: Arc::new(DashMap::new()),
+            agent_nudge_cooldowns: agent_nudge_cooldowns.clone(),
             agent_nudge_throttle: Arc::new(DashMap::new()),
             overlay_networks,
             overlay_nodes,

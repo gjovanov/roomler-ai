@@ -32,8 +32,8 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use bson::oid::ObjectId;
 use dashmap::DashMap;
-use mongodb::bson::oid::ObjectId;
 use tracing::warn;
 
 /// Who moves to converge a cross-pod miss.
