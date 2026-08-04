@@ -2663,7 +2663,11 @@ const statsCodecLabel = computed(() => {
         : rc.viewerDecodeHw.value === false
           ? ' · dec SW'
           : ''
-    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec
+    // P5 — the agent's shared-floor pipeline: >1 viewers on this encoded
+    // stream means rate/dials are floor-merged across them, so a lower
+    // fps/resolution than expected is explainable from the badge.
+    const shared = (vi.viewers ?? 1) > 1 ? ` · shared ×${vi.viewers}` : ''
+    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec + shared
   }
   // Fallback when the agent hasn't sent video-info (legacy track /
   // libvpx VP9-444 path). Derive chroma from the USER's selection
