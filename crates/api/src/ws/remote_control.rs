@@ -279,6 +279,14 @@ pub async fn handle_agent_socket(
                                 .await;
                                 continue;
                             }
+                            // Multi-region DERP: mint an admission ticket for
+                            // this agent's overlay node. Unanswerable (no
+                            // signer / no overlay node) = silently unanswered;
+                            // the agent keeps using the central /derp.
+                            if matches!(parsed, ClientMsg::DerpTicketRequest {}) {
+                                handle_derp_ticket_request(&state, agent_id, &registered_tx).await;
+                                continue;
+                            }
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
                             // dispatch is a no-op for AgentHeartbeat (handled here);
                             // we still call dispatch so any future routing logic
@@ -386,6 +394,34 @@ pub async fn handle_agent_socket(
         debug!(%agent_id, "teardown skipped Offline+presence (newer connection owns the slot)");
     }
     info!(%agent_id, "remote-control agent WS disconnected");
+}
+
+/// Multi-region DERP: answer a ticket request. The ticket binds the agent's
+/// overlay `(network_id, wg_public_key)` — exactly the invariants the central
+/// `/derp` enforces from Mongo, so a PoP relay can enforce them with the
+/// PUBLIC key alone.
+async fn handle_derp_ticket_request(
+    state: &AppState,
+    agent_id: ObjectId,
+    tx: &tokio::sync::mpsc::Sender<ServerMsg>,
+) {
+    let Some(signer) = &state.derp_ticket else {
+        debug!(%agent_id, "derp ticket requested but no signer configured");
+        return;
+    };
+    let Some(node) =
+        crate::ws::overlay::current_node(state, crate::ws::overlay::NodeIdentity::Agent(agent_id))
+            .await
+    else {
+        debug!(%agent_id, "derp ticket requested but agent has no overlay node");
+        return;
+    };
+    match signer.mint(&node.network_id.to_hex(), &node.wg_public_key) {
+        Ok((ticket, exp)) => {
+            let _ = tx.try_send(ServerMsg::DerpTicket { ticket, exp });
+        }
+        Err(e) => warn!(%agent_id, %e, "derp ticket mint failed"),
+    }
 }
 
 /// Minimum spacing between Mongo persists of an agent's probe table. The

@@ -18,6 +18,8 @@ parking_lot.workspace = true
 hmac.workspace = true
 sha1.workspace = true
 base64.workspace = true
+jsonwebtoken.workspace = true
+ring = "0.17"
 mongodb.workspace = true
 bson.workspace = true
 bitflags = { workspace = true, features = ["serde"] }

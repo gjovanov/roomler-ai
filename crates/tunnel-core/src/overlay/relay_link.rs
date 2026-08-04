@@ -217,6 +217,15 @@ pub struct RelayCoordinator {
     /// lazy (checked on read); after it, the normal strategy resumes on the
     /// next establishment cycle.
     forced_derp_until: HashMap<ObjectId, Instant>,
+    /// Multi-region DERP — lazily-opened muxes for REGIONAL relays, keyed by
+    /// their `derp_url`. A pair force-pinned with a `derp_url` builds its
+    /// [`DerpConn`] off that region's mux; everything else keeps the central
+    /// [`derp_mux`](Self::derp_mux).
+    regional_muxes: HashMap<String, Arc<DerpMux>>,
+    /// Multi-region DERP — the regional URL a force-pinned peer must use
+    /// (server-pushed, identical on both ends). Entry present ONLY when the
+    /// matching regional mux exists; pruned alongside `forced_derp_until`.
+    forced_urls: HashMap<ObjectId, String>,
 }
 
 impl RelayCoordinator {
@@ -246,6 +255,8 @@ impl RelayCoordinator {
             derp_mux,
             roles: HashMap::new(),
             forced_derp_until: HashMap::new(),
+            regional_muxes: HashMap::new(),
+            forced_urls: HashMap::new(),
         }
     }
 
@@ -263,6 +274,27 @@ impl RelayCoordinator {
         if self.derp_mux.is_none() {
             self.derp_mux = Some(mux);
         }
+    }
+
+    /// Multi-region DERP — is a mux for this regional `derp_url` already open?
+    pub fn has_regional_mux(&self, url: &str) -> bool {
+        self.regional_muxes.contains_key(url)
+    }
+
+    /// Multi-region DERP — register a lazily-opened regional mux. First mux
+    /// per URL wins (per-peer `DerpConn`s vend from the original).
+    pub fn set_regional_mux(&mut self, url: &str, mux: Arc<DerpMux>) {
+        self.regional_muxes.entry(url.to_string()).or_insert(mux);
+    }
+
+    /// The DERP mux serving `node_id`: its force-pinned REGIONAL mux when one
+    /// exists, else the central `/derp` mux. Region failure degrades to
+    /// central (worse RTT, still connected) — never to no-DERP.
+    fn mux_for(&self, node_id: &ObjectId) -> Option<&Arc<DerpMux>> {
+        self.forced_urls
+            .get(node_id)
+            .and_then(|u| self.regional_muxes.get(u))
+            .or(self.derp_mux.as_ref())
     }
 
     /// P7 — is `node_id` currently force-pinned to DERP (unexpired pin)?
@@ -283,15 +315,35 @@ impl RelayCoordinator {
     /// The caller must ensure a `/derp` mux exists first ([`has_derp_mux`] /
     /// [`set_derp_mux`]); without one the pin is refused (a pinned peer with
     /// no mux would park in `derping` unreachable until expiry).
-    pub fn force_derp(&mut self, node_id: ObjectId, ttl: Duration) -> Option<ReadyLink> {
-        if self.derp_mux.is_none() {
+    pub fn force_derp(
+        &mut self,
+        node_id: ObjectId,
+        ttl: Duration,
+        derp_url: Option<&str>,
+    ) -> Option<ReadyLink> {
+        // Multi-region DERP: bind the peer to the pushed regional relay when
+        // its mux was opened (the runtime opens it via the regional factory
+        // BEFORE calling here); an un-openable region or `None` degrades to
+        // the central mux — worse RTT, still connected.
+        match derp_url {
+            Some(u) if self.regional_muxes.contains_key(u) => {
+                self.forced_urls.insert(node_id, u.to_string());
+            }
+            _ => {
+                self.forced_urls.remove(&node_id);
+            }
+        }
+        if self.mux_for(&node_id).is_none() {
             warn!(peer = %node_id, "overlay relay: force-derp push but no /derp mux — ignoring");
             return None;
         }
-        // Lazy hygiene: drop expired pins so the map tracks only live ones.
+        // Lazy hygiene: drop expired pins so the map tracks only live ones
+        // (URL pins go with them — a re-pin re-supplies its URL).
         self.forced_derp_until
             .retain(|_, until| Instant::now() < *until);
         self.forced_derp_until.insert(node_id, Instant::now() + ttl);
+        let live = &self.forced_derp_until;
+        self.forced_urls.retain(|n, _| live.contains_key(n));
         info!(
             peer = %node_id, ttl_s = ttl.as_secs(),
             "overlay relay: pair force-pinned to DERP (server escalation — TURN churn)"
@@ -370,7 +422,8 @@ impl RelayCoordinator {
         // broken TURN tier). Still gated on the peer's `supports_derp` and a
         // live mux — the server only escalates when both ends advertised
         // support, so these normally hold; they keep a stale pin harmless.
-        if self.forced_derp_active(node_id) && self.derp_mux.is_some() && peer.supports_derp {
+        if self.forced_derp_active(node_id) && self.mux_for(node_id).is_some() && peer.supports_derp
+        {
             return RelayStrategy::Derp;
         }
         let peer_udp_ok = !peer.srflx_endpoints.is_empty();
@@ -386,7 +439,7 @@ impl RelayCoordinator {
         }
         // DERP — the ONLY tier that serves a both-UDP-blocked pair.
         if self.derp
-            && self.derp_mux.is_some()
+            && self.mux_for(node_id).is_some()
             && peer.supports_derp
             && !self.my_udp_relay_ok
             && !peer_udp_ok
@@ -755,7 +808,7 @@ impl RelayCoordinator {
     /// `None` if the DERP WS isn't up (no `derp_mux`).
     fn try_build_derp(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let peer = self.derping.get(node_id)?.clone();
-        let mux = self.derp_mux.as_ref()?;
+        let mux = self.mux_for(node_id)?;
         let derp_conn = mux.conn_for(peer.public_key);
         // A stable synthetic peer addr (the DERP carrier is pubkey-addressed and
         // discards this `dst`; it exists only so the carrier has a consistent
@@ -1438,7 +1491,11 @@ mod tests {
             RelayStrategy::SingleRelay(true),
             "natural tier before the pin"
         );
-        assert!(coord.force_derp(node, Duration::from_secs(60)).is_none());
+        assert!(
+            coord
+                .force_derp(node, Duration::from_secs(60), None)
+                .is_none()
+        );
         assert_eq!(
             coord.relay_strategy(&node, &peer),
             RelayStrategy::Derp,
@@ -1492,14 +1549,18 @@ mod tests {
                 pair_key: None,
             },
         );
-        let link = c.force_derp(n, Duration::from_secs(60)).expect("built");
+        let link = c
+            .force_derp(n, Duration::from_secs(60), None)
+            .expect("built");
         assert_eq!(link.relay_kind, RelayKind::Derp);
         assert!(c.pending.is_empty() && c.derping.is_empty());
 
         // dialing → derping.
         let mut c = mk();
         c.dialing.insert(n, peer.clone());
-        let link = c.force_derp(n, Duration::from_secs(60)).expect("built");
+        let link = c
+            .force_derp(n, Duration::from_secs(60), None)
+            .expect("built");
         assert_eq!(link.relay_kind, RelayKind::Derp);
         assert!(c.dialing.is_empty());
 
@@ -1518,7 +1579,9 @@ mod tests {
                 peer: peer.clone(),
             },
         );
-        let link = c.force_derp(n, Duration::from_secs(60)).expect("built");
+        let link = c
+            .force_derp(n, Duration::from_secs(60), None)
+            .expect("built");
         assert_eq!(link.relay_kind, RelayKind::Derp);
         assert!(
             !c.advertised.contains_key(&n),
@@ -1527,13 +1590,13 @@ mod tests {
 
         // Untracked peer ⇒ stamp-only (pin governs the next cycle).
         let mut c = mk();
-        assert!(c.force_derp(n, Duration::from_secs(60)).is_none());
+        assert!(c.force_derp(n, Duration::from_secs(60), None).is_none());
         assert!(c.forced_derp_active(&n), "pin stamped");
 
         // No mux ⇒ refused, no pin.
         let (tx3, _rx3) = tokio::sync::mpsc::channel::<ClientMsg>(8);
         let mut bare = RelayCoordinator::new(tx3, [0x00u8; 32], true, vec![], None);
-        assert!(bare.force_derp(n, Duration::from_secs(60)).is_none());
+        assert!(bare.force_derp(n, Duration::from_secs(60), None).is_none());
         assert!(!bare.forced_derp_active(&n), "no mux ⇒ no pin");
     }
 

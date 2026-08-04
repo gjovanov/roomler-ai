@@ -564,12 +564,34 @@ async fn handle_overlay_relay_request(
             "overlay relay: TURN churn threshold — escalating pair to forced DERP"
         );
         let ttl_ms = FORCED_DERP_TTL.as_millis() as u64;
+        // Multi-region DERP: pick the pair's regional relay from the same
+        // sticky region the TURN grants use (symmetric — the server computes
+        // once and pushes the SAME url to both ends); store it on the churn
+        // entry so every repush during this pin reuses it. `None` = central.
+        let derp_url = sticky_pair_region(
+            &state.turn_map,
+            &pair_key,
+            self_node.relay_home.as_deref(),
+            peer.relay_home.as_deref(),
+        )
+        .and_then(|region| {
+            state
+                .turn_map
+                .specs
+                .iter()
+                .find(|s| s.id == region)
+                .and_then(|s| s.derp_url.clone())
+        });
+        if let Some(mut pc) = state.relay_pair_churn.get_mut(&pair_key) {
+            pc.forced_derp_url = derp_url.clone();
+        }
         send_to_node(
             state,
             &self_node,
             ServerMsg::OverlayForceDerp {
                 peer_node_id: peer.id.unwrap_or(peer_node_id),
                 ttl_ms,
+                derp_url: derp_url.clone(),
             },
         )
         .await;
@@ -579,6 +601,7 @@ async fn handle_overlay_relay_request(
             ServerMsg::OverlayForceDerp {
                 peer_node_id: self_id,
                 ttl_ms,
+                derp_url,
             },
         )
         .await;
@@ -649,6 +672,10 @@ pub struct PairChurn {
     last_grant_at: Option<Instant>,
     /// While unexpired, the pair is escalated (mirrors the client-side pin).
     forced_until: Option<Instant>,
+    /// Multi-region DERP: the regional relay URL this pair was escalated onto
+    /// (`None` = central `/derp`). Stored at escalation so every repush hands
+    /// both ends the SAME URL for the pin's whole lifetime.
+    forced_derp_url: Option<String>,
 }
 
 /// P7 — is this pair currently under an unexpired forced-DERP TTL?
@@ -754,7 +781,7 @@ async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
     let Some(self_id) = node.id else { return };
     let self_hex = self_id.to_hex();
     let now = Instant::now();
-    let peers: Vec<(ObjectId, u64)> = state
+    let peers: Vec<(ObjectId, u64, Option<String>)> = state
         .relay_pair_churn
         .iter()
         .filter_map(|e| {
@@ -768,10 +795,14 @@ async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
             } else {
                 return None;
             };
-            Some((peer, remaining.as_millis() as u64))
+            Some((
+                peer,
+                remaining.as_millis() as u64,
+                e.value().forced_derp_url.clone(),
+            ))
         })
         .collect();
-    for (peer_id, ttl_ms) in peers {
+    for (peer_id, ttl_ms, derp_url) in peers {
         tracing::info!(node = %self_id, peer = %peer_id, ttl_ms,
             "overlay relay: re-pushing forced-DERP pin on rejoin");
         send_to_node(
@@ -780,6 +811,7 @@ async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
             ServerMsg::OverlayForceDerp {
                 peer_node_id: peer_id,
                 ttl_ms,
+                derp_url,
             },
         )
         .await;

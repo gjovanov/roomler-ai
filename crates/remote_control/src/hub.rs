@@ -1047,7 +1047,8 @@ impl Hub {
                 _,
                 ClientMsg::AgentHello { .. }
                 | ClientMsg::AgentHeartbeat { .. }
-                | ClientMsg::RelayProbeReport { .. },
+                | ClientMsg::RelayProbeReport { .. }
+                | ClientMsg::DerpTicketRequest {},
             ) => {
                 // Hello is handled at registration time; heartbeat is logged by WS layer.
                 Ok(())
