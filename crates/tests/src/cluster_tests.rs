@@ -159,28 +159,23 @@ async fn agent_presence_records_are_canonical_and_pod_attributed() {
     let _ = ws.close(None).await;
 }
 
-/// C-2/PR-1 — the rehome loop end to end for a PARKED agent: a
-/// correctly-keyed controller on pod2 (dialed with `tid=`, provably
-/// newer than the agent's registration — guard band shrunk to 0)
-/// requesting an agent homed on pod1 gets `agent_on_other_pod` (never a
-/// lying `agent_offline`), and the owner pod nudges the idle agent's WS
-/// closed so its reconnect re-hashes.
+/// PR-2 - the relay end to end: a KEY-LESS controller on pod2 (the
+/// worst dial shape, the 2026-08-04 incident) requests an agent homed
+/// on pod1. Pre-PR-2 this was a rehome error plus eleven refused
+/// nudges; now the frame relays to the owner pod over `rc.cmd`, the
+/// replies route back conn-addressed, and the agent is never touched.
+/// Closing the browser socket forwards the teardown (`rc.conn_closed`)
+/// so the agent-side session dies and the slot frees.
 #[tokio::test]
-async fn rehome_error_and_idle_nudge_cross_pod() {
+async fn cross_pod_session_relays_without_nudge() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-    let (app1, app2) = TestApp::spawn_pair(|s| {
-        // PR-1 direction rule: judge the agent parked as soon as the
-        // controller conn is any amount newer than the presence record.
-        s.rc.rehome_direction_guard_ms = 0;
-    })
-    .await;
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
     if app1.state.cluster_bus.is_none() {
         eprintln!("skipping: no Redis available");
         return;
     }
-    // Bus subscriptions live.
     for _ in 0..40 {
         let a = app1.state.cluster_bus.as_ref().unwrap();
         let b = app2.state.cluster_bus.as_ref().unwrap();
@@ -192,28 +187,31 @@ async fn rehome_error_and_idle_nudge_cross_pod() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    let seeded = app1.seed_tenant("rehome").await;
+    let seeded = app1.seed_tenant("rcrelay").await;
     let (agent_id, agent_token) =
-        crate::agent_presence_tests::enroll(&app1, &seeded, "mach-rehome-a").await;
+        crate::agent_presence_tests::enroll(&app1, &seeded, "mach-rcrelay-a").await;
     let mut agent_ws = crate::agent_presence_tests::connect_agent(&app1, &agent_token).await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
 
-    // Controller WS on the OTHER pod (user JWT, no role param), dialed
-    // WITH the tenant-affinity key — the PR-1 direction rule only nudges
-    // for a correctly-keyed, provably-newer conn.
-    let ctrl_url = format!(
-        "ws://{}/ws?token={}&tid={}",
+    // KEY-LESS controller on the OTHER pod.
+    let (mut ctrl_ws, _) = connect_async(&format!(
+        "ws://{}/ws?token={}",
         app2.addr,
         seeded
             .admin
             .access_token
             .replace('+', "%2B")
             .replace('/', "%2F")
-            .replace('=', "%3D"),
-        seeded.tenant_id,
-    );
-    let (mut ctrl_ws, _) = connect_async(&ctrl_url).await.expect("controller ws");
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), ctrl_ws.next()).await;
+            .replace('=', "%3D")
+    ))
+    .await
+    .expect("controller ws");
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        futures::StreamExt::next(&mut ctrl_ws),
+    )
+    .await;
 
     ctrl_ws
         .send(Message::Text(
@@ -228,10 +226,12 @@ async fn rehome_error_and_idle_nudge_cross_pod() {
         .await
         .unwrap();
 
-    // Expect the rehome error on the controller.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut saw_rehome = false;
-    while tokio::time::Instant::now() < deadline && !saw_rehome {
+    // The relayed create answers rc:session.created over the
+    // conn-addressed lane - an rc:error here means the relay regressed
+    // to the rehome bounce.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut created = false;
+    while tokio::time::Instant::now() < deadline && !created {
         let msg = match tokio::time::timeout(std::time::Duration::from_millis(500), ctrl_ws.next())
             .await
         {
@@ -242,78 +242,67 @@ async fn rehome_error_and_idle_nudge_cross_pod() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) else {
             continue;
         };
-        if v.get("t").and_then(|x| x.as_str()) == Some("rc:error") {
-            assert_eq!(
-                v.get("code").and_then(|x| x.as_str()),
-                Some("agent_on_other_pod"),
-                "cross-pod miss must rehome, not lie offline: {v}"
-            );
-            saw_rehome = true;
+        match v.get("t").and_then(|x| x.as_str()) {
+            Some("rc:session.created") => created = true,
+            Some("rc:error") => panic!("relay must not bounce the controller: {v}"),
+            _ => {}
         }
     }
-    assert!(saw_rehome, "controller never received the rehome error");
+    assert!(created, "rc:session.created never arrived via the relay");
 
-    // The nudge closes the idle agent's WS on pod1 (read returns Close/None).
+    // The agent received the forwarded request and its socket SURVIVES
+    // (no nudge on the relay path - a cycle would tear the session the
+    // relay just built).
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut closed = false;
-    while tokio::time::Instant::now() < deadline && !closed {
-        match tokio::time::timeout(std::time::Duration::from_millis(500), agent_ws.next()).await {
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => closed = true,
-            Ok(Some(Err(_))) => closed = true,
+    let mut saw_request = false;
+    while tokio::time::Instant::now() < deadline && !saw_request {
+        match tokio::time::timeout(std::time::Duration::from_millis(400), agent_ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+                    && v.get("t").and_then(|x| x.as_str()) == Some("rc:request")
+                {
+                    saw_request = true;
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                panic!("agent WS closed - nudged on the relay path")
+            }
+            _ => continue,
+        }
+    }
+    assert!(saw_request, "forwarded rc:request never reached the agent");
+    assert!(app1.state.rc_hub.is_agent_online(aid));
+
+    // Browser socket dies -> rc.conn_closed forwards -> the owner pod's
+    // proxy unregisters -> the agent sees rc:terminate; its socket
+    // stays up.
+    let _ = ctrl_ws.close(None).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut terminated = false;
+    while tokio::time::Instant::now() < deadline && !terminated {
+        match tokio::time::timeout(std::time::Duration::from_millis(400), agent_ws.next()).await {
+            Ok(Some(Ok(Message::Text(t)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
+                    && v.get("t").and_then(|x| x.as_str()) == Some("rc:terminate")
+                {
+                    terminated = true;
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                panic!("agent WS closed during proxy teardown")
+            }
             _ => continue,
         }
     }
     assert!(
-        closed,
-        "idle agent's WS was not nudged closed by the owner pod"
+        terminated,
+        "rc.conn_closed teardown never reached the agent as rc:terminate"
     );
-    let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
-    for _ in 0..10 {
-        if !app1.state.rc_hub.is_agent_online(aid) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    assert!(!app1.state.rc_hub.is_agent_online(aid));
+    let _ = agent_ws.close(None).await;
 }
 
 type WsClient =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// Pump the controller socket until an `rc:error` arrives; assert it is
-/// the rehome code (never a lying `agent_offline`).
-async fn await_rehome_error(ctrl_ws: &mut WsClient) {
-    use futures::StreamExt;
-    use tokio_tungstenite::tungstenite::Message;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        let msg = match tokio::time::timeout(std::time::Duration::from_millis(500), ctrl_ws.next())
-            .await
-        {
-            Ok(Some(Ok(Message::Text(t)))) => t,
-            Ok(None) => break,
-            _ => continue,
-        };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg) else {
-            continue;
-        };
-        if v.get("t").and_then(|x| x.as_str()) == Some("rc:error") {
-            assert_eq!(
-                v.get("code").and_then(|x| x.as_str()),
-                Some("agent_on_other_pod"),
-                "cross-pod miss must rehome, not lie offline: {v}"
-            );
-            // PR-1: pod identity must never ride the wire.
-            let text = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
-            assert!(
-                !text.contains("testpod"),
-                "rehome message leaks pod identity: {text}"
-            );
-            return;
-        }
-    }
-    panic!("controller never received the rehome error");
-}
 
 /// `true` iff the agent's WS survives (no Close/EOF) for `for_ms`.
 async fn agent_ws_stays_open(agent_ws: &mut WsClient, for_ms: u64) -> bool {
@@ -329,180 +318,85 @@ async fn agent_ws_stays_open(agent_ws: &mut WsClient, for_ms: u64) -> bool {
     true
 }
 
-/// PR-1 direction rule, the 2026-08-04 incident class: a KEY-LESS
-/// controller (and a keyed-but-ambiguous one) gets the rehome error and
-/// the agent — correctly homed from the LB's perspective — is NEVER
-/// nudged. Pre-PR-1 this dial pattern fired a nudge per request (11 in
-/// 15 s at one refusing owner).
+/// PR-1/PR-2 - the owner-side `rc.agent_nudge` verb at its own layer
+/// (with the relay in front, rc misses no longer trigger nudges):
+/// truthful refusal reasons for tunnel-TARGET busy and ORIGIN busy (the
+/// pre-PR-1 blind spot), a fired cycle for the idle case, and the
+/// cooldown right after.
 #[tokio::test]
-async fn rehome_keyless_or_ambiguous_controller_never_nudges() {
-    use futures::SinkExt;
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-    // Huge guard band: even the keyed dial below is "ambiguous age".
-    let (app1, app2) = TestApp::spawn_pair(|s| {
-        s.rc.rehome_direction_guard_ms = 60_000;
-    })
-    .await;
+async fn nudge_verb_reasons_cooldown_and_idle_cycle() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
     if app1.state.cluster_bus.is_none() {
         eprintln!("skipping: no Redis available");
         return;
     }
-    let seeded = app1.seed_tenant("rehomedir").await;
-    let (agent_id, agent_token) =
-        crate::agent_presence_tests::enroll(&app1, &seeded, "mach-rehomedir-a").await;
-    let mut agent_ws = crate::agent_presence_tests::connect_agent(&app1, &agent_token).await;
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
-
-    let token = seeded
-        .admin
-        .access_token
-        .replace('+', "%2B")
-        .replace('/', "%2F")
-        .replace('=', "%3D");
-    let request = serde_json::json!({
-        "t": "rc:session.request",
-        "agent_id": agent_id,
-        "permissions": "VIEW",
-    })
-    .to_string();
-
-    // (a) KEY-LESS controller on pod2 (the deep-link race shape).
-    let (mut ctrl_ws, _) = connect_async(&format!("ws://{}/ws?token={token}", app2.addr))
-        .await
-        .expect("keyless controller ws");
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        futures::StreamExt::next(&mut ctrl_ws),
-    )
-    .await;
-    ctrl_ws
-        .send(Message::Text(request.clone().into()))
-        .await
-        .unwrap();
-    await_rehome_error(&mut ctrl_ws).await;
-
-    // (b) keyed but inside the guard band (ambiguous age).
-    let (mut ctrl_ws2, _) = connect_async(&format!(
-        "ws://{}/ws?token={token}&tid={}",
-        app2.addr, seeded.tenant_id
-    ))
-    .await
-    .expect("keyed controller ws");
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        futures::StreamExt::next(&mut ctrl_ws2),
-    )
-    .await;
-    ctrl_ws2.send(Message::Text(request.into())).await.unwrap();
-    await_rehome_error(&mut ctrl_ws2).await;
-
-    // Through BOTH misses the agent must keep its socket and its hub
-    // registration — nudging it would tear planes for a controller that
-    // is itself the mis-placed party.
-    assert!(
-        agent_ws_stays_open(&mut agent_ws, 2_500).await,
-        "agent WS was nudged closed despite a controller-move direction"
-    );
-    assert!(app1.state.rc_hub.is_agent_online(aid));
-
-    let _ = agent_ws.close(None).await;
-}
-
-/// PR-1 — a busy agent (tunnel sessions targeting it, then sessions it
-/// ORIGINATED — the pre-PR-1 blind spot) is refused; once idle, the next
-/// miss converges it.
-#[tokio::test]
-async fn rehome_busy_agent_refused_then_converges_on_idle() {
-    use futures::SinkExt;
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-    let (app1, app2) = TestApp::spawn_pair(|s| {
-        s.rc.rehome_direction_guard_ms = 0;
-        // The same controller retries several times inside this test.
-        s.rc.nudge_requester_throttle_ms = 0;
-        s.rc.nudge_cooldown_secs = 0;
-    })
-    .await;
-    if app1.state.cluster_bus.is_none() {
-        eprintln!("skipping: no Redis available");
-        return;
+    for _ in 0..40 {
+        let a = app1.state.cluster_bus.as_ref().unwrap();
+        let b = app2.state.cluster_bus.as_ref().unwrap();
+        if a.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+            && b.sub_alive.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let seeded = app1.seed_tenant("rehomebusy").await;
+
+    let seeded = app1.seed_tenant("nudgev").await;
     let (agent_id, agent_token) =
-        crate::agent_presence_tests::enroll(&app1, &seeded, "mach-rehomebusy-a").await;
+        crate::agent_presence_tests::enroll(&app1, &seeded, "mach-nudgev-a").await;
     let mut agent_ws = crate::agent_presence_tests::connect_agent(&app1, &agent_token).await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
+    let b2 = app2.state.cluster_bus.clone().unwrap();
+    let pod1 = app1.state.pod.pod_id.clone();
+    let body = serde_json::json!({ "agent_id": agent_id });
 
-    let (mut ctrl_ws, _) = connect_async(&format!(
-        "ws://{}/ws?token={}&tid={}",
-        app2.addr,
-        seeded
-            .admin
-            .access_token
-            .replace('+', "%2B")
-            .replace('/', "%2F")
-            .replace('=', "%3D"),
-        seeded.tenant_id
-    ))
-    .await
-    .expect("controller ws");
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        futures::StreamExt::next(&mut ctrl_ws),
-    )
-    .await;
-    let request = serde_json::json!({
-        "t": "rc:session.request",
-        "agent_id": agent_id,
-        "permissions": "VIEW",
-    })
-    .to_string();
-
-    // (a) Tunnel session TARGETING the agent: refused.
+    // (a) tunnel session TARGETING the agent: refused, truthfully.
     let fake_session = bson::oid::ObjectId::new();
     app1.state
         .tunnel_sessions_by_target_agent
         .entry(aid)
         .or_default()
         .insert(fake_session);
-    ctrl_ws
-        .send(Message::Text(request.clone().into()))
+    let rep = b2
+        .request(&pod1, "rc.agent_nudge", body.clone())
         .await
-        .unwrap();
-    await_rehome_error(&mut ctrl_ws).await;
-    assert!(
-        agent_ws_stays_open(&mut agent_ws, 1_500).await,
-        "tunnel-target-busy agent must not be nudged"
-    );
+        .expect("nudge rpc");
+    assert_eq!(rep["nudged"], false, "{rep}");
+    assert_eq!(rep["reason"], "tunnel_busy", "{rep}");
     app1.state.tunnel_sessions_by_target_agent.remove(&aid);
 
-    // (b) Session the agent ORIGINATED (declared routes): refused too —
-    // pre-PR-1 this index did not exist and the agent read as idle.
+    // (b) session the agent ORIGINATED (declared routes) - the pre-PR-1
+    // blind spot index.
     app1.state
         .tunnel_sessions_by_origin_agent
         .entry(aid)
         .or_default()
         .insert(fake_session);
-    ctrl_ws
-        .send(Message::Text(request.clone().into()))
+    let rep = b2
+        .request(&pod1, "rc.agent_nudge", body.clone())
         .await
-        .unwrap();
-    await_rehome_error(&mut ctrl_ws).await;
-    assert!(
-        agent_ws_stays_open(&mut agent_ws, 1_500).await,
-        "origin-busy agent must not be nudged (the pre-PR-1 blind spot)"
-    );
+        .expect("nudge rpc");
+    assert_eq!(rep["nudged"], false, "{rep}");
+    assert_eq!(rep["reason"], "origin_busy", "{rep}");
     app1.state.tunnel_sessions_by_origin_agent.remove(&aid);
 
-    // (c) Fully idle now: the next miss converges the parked agent.
-    ctrl_ws.send(Message::Text(request.into())).await.unwrap();
-    await_rehome_error(&mut ctrl_ws).await;
+    // Busy refusals never cycled the socket (nor consumed cooldown
+    // attempts - the fired cycle below proves the gate stayed open).
+    assert!(
+        agent_ws_stays_open(&mut agent_ws, 1_000).await,
+        "busy refusal must not cycle the agent WS"
+    );
+
+    // (c) fully idle: the cycle fires and the WS closes.
+    let rep = b2
+        .request(&pod1, "rc.agent_nudge", body.clone())
+        .await
+        .expect("nudge rpc");
+    assert_eq!(rep["nudged"], true, "{rep}");
     assert!(
         !agent_ws_stays_open(&mut agent_ws, 5_000).await,
-        "idle parked agent should be nudged closed for LB re-hash"
+        "idle nudge must cycle the agent WS"
     );
     for _ in 0..10 {
         if !app1.state.rc_hub.is_agent_online(aid) {
@@ -511,6 +405,14 @@ async fn rehome_busy_agent_refused_then_converges_on_idle() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     assert!(!app1.state.rc_hub.is_agent_online(aid));
+
+    // (d) straight after a fired cycle: the cooldown refuses.
+    let rep = b2
+        .request(&pod1, "rc.agent_nudge", body)
+        .await
+        .expect("nudge rpc");
+    assert_eq!(rep["nudged"], false, "{rep}");
+    assert_eq!(rep["reason"], "cooldown", "{rep}");
 }
 
 /// C-2 — an admin kick issued on pod2 reaches the hub on pod1 via the
@@ -1052,6 +954,7 @@ async fn cluster_status_reports_pod_counters_and_gauges() {
         "rc_rehome_controller_total",
         "agent_nudge_refused_total",
         "agent_nudge_stuck_total",
+        "rc_relay_total",
     ] {
         assert!(
             body["counters"][counter].is_u64(),
