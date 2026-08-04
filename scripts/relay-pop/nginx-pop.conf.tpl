@@ -36,6 +36,10 @@ http {
         location /healthz {
             proxy_pass http://127.0.0.1:8443/healthz;
         }
+        # PoP load snapshot for the API's load-aware region routing.
+        location /stats {
+            proxy_pass http://127.0.0.1:8443/stats;
+        }
         location /derp {
             proxy_pass http://127.0.0.1:8443/derp;
             proxy_http_version 1.1;
