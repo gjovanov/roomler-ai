@@ -27,6 +27,13 @@ pub fn probing_enabled() -> bool {
 /// re-prober.
 pub type RegionSlot = Arc<Mutex<Option<(Vec<RelayRegionInfo>, u64)>>>;
 
+/// Multi-region DERP: the per-connection admission-ticket cache
+/// (`(ticket, exp_unix)`), filled by the signaling loop's
+/// `ServerMsg::DerpTicket` arm and read by the regional relay dialer per
+/// connect attempt. Lives here (not in `derp.rs`) because that module is
+/// overlay-feature-gated while the signaling arms that fill this are not.
+pub type DerpTicketSlot = Arc<Mutex<Option<(String, u64)>>>;
+
 /// STUN samples per region; the reported RTT is their median.
 const SAMPLES: usize = 3;
 /// Per-sample wait — a PoP farther than this is never the right home anyway.
