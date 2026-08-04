@@ -98,8 +98,109 @@ async fn main() {
 fn router(state: RelayState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/stats", get(stats))
         .route("/derp", get(derp_upgrade))
         .with_state(state)
+}
+
+/// `GET /stats` — the PoP's load snapshot for the API's load-aware region
+/// routing: system load/memory/uptime + per-interface traffic counters from
+/// `/proc` (host-visible: the container runs host-network and /proc's
+/// loadavg/meminfo/net are not namespaced away), live DERP registrations from
+/// the in-process registry, and coturn's allocation gauges scraped from its
+/// localhost prometheus listener (absent → `null`, never an error — a PoP
+/// without the coturn exporter still reports its system half).
+async fn stats(State(state): State<RelayState>) -> axum::Json<serde_json::Value> {
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let mut load_it = load.split_whitespace();
+    let load1: f64 = load_it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let load5: f64 = load_it.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mem_kb = |key: &str| -> u64 {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+
+    // Aggregate rx/tx across physical interfaces (skip lo). Monotonic
+    // counters — the poller derives rates from successive samples.
+    let netdev = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
+    let (mut rx, mut tx) = (0u64, 0u64);
+    for line in netdev.lines().skip(2) {
+        let Some((iface, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if iface.trim() == "lo" {
+            continue;
+        }
+        let f: Vec<u64> = rest
+            .split_whitespace()
+            .map(|v| v.parse().unwrap_or(0))
+            .collect();
+        if f.len() >= 9 {
+            rx = rx.saturating_add(f[0]);
+            tx = tx.saturating_add(f[8]);
+        }
+    }
+
+    let uptime_s: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0);
+
+    axum::Json(serde_json::json!({
+        "region": std::env::var("REGION").unwrap_or_default(),
+        "cpus": cpus,
+        "load1": load1,
+        "load5": load5,
+        "mem_total_kb": mem_kb("MemTotal:"),
+        "mem_available_kb": mem_kb("MemAvailable:"),
+        "net_rx_bytes": rx,
+        "net_tx_bytes": tx,
+        "uptime_s": uptime_s,
+        "derp_registrations": state.registry.len(),
+        "coturn": coturn_prometheus().await,
+    }))
+}
+
+/// Scrape coturn's localhost prometheus listener (`prometheus` directive,
+/// :9641 — firewalled to loopback by provision.sh) for the gauges the router
+/// cares about. Minimal HTTP/1.0 over a raw socket — not worth an HTTP-client
+/// dependency for one localhost endpoint. `null` on any failure.
+async fn coturn_prometheus() -> serde_json::Value {
+    let fetch = async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", 9641))
+            .await
+            .ok()?;
+        s.write_all(b"GET /metrics HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .ok()?;
+        let mut body = String::new();
+        s.read_to_string(&mut body).await.ok()?;
+        let gauge = |name: &str| -> f64 {
+            body.lines()
+                .filter(|l| l.starts_with(name) && !l.starts_with('#'))
+                .filter_map(|l| l.split_whitespace().last()?.parse::<f64>().ok())
+                .sum()
+        };
+        Some(serde_json::json!({
+            // Live allocations = the direct "how busy is this TURN" signal.
+            "allocations": gauge("turn_total_allocations"),
+            "sessions": gauge("turn_total_sessions"),
+        }))
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(1), fetch).await {
+        Ok(Some(v)) => v,
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// `GET /derp?ticket=<eddsa-jwt>` — verify the ticket, then upgrade.
@@ -305,6 +406,35 @@ mod tests {
             tokio_tungstenite::connect_async(&url).await.is_err(),
             "foreign-signed ticket must 401"
         );
+    }
+
+    #[tokio::test]
+    async fn stats_serves_system_snapshot() {
+        let (_, key) = test_signer();
+        let (addr, _) = serve(key).await;
+        let body = reqwest_lite(addr, "/stats").await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("stats is JSON");
+        // /proc-backed fields exist on Linux; on other CI hosts they parse to
+        // zero — the shape is the contract either way.
+        assert!(v["cpus"].as_u64().unwrap() >= 1);
+        assert!(v["load1"].is_number());
+        assert!(v["derp_registrations"].is_u64());
+        // No coturn exporter in the test env → explicit null, not an error.
+        assert!(v["coturn"].is_null());
+    }
+
+    /// Tiny HTTP/1.0 GET so the test needs no client dependency.
+    async fn reqwest_lite(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.0\r\nHost: t\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).await.unwrap();
+        resp.split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default()
     }
 
     #[tokio::test]
