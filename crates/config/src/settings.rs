@@ -18,6 +18,25 @@ pub struct Settings {
     pub push: PushSettings,
     pub auth: AuthSettings,
     pub rc: RcSettings,
+    pub relay: RelaySettings,
+}
+
+/// Multi-region relay PoPs (regional coturn + DERP). Regions are fleet
+/// infrastructure — like `turn.worker_urls` they live in operator config, not
+/// the DB. `regions` is a JSON array of region specs (see
+/// `remote_control::turn_creds::RelayRegionSpec`):
+/// `[{"id":"us-east","turn_url":"turn:coturn-us-east.roomler.ai:3478",
+///    "derp_url":"wss://derp-us-east.roomler.ai/derp",
+///    "caps":{"tls_443_tcp":false}}, …]`
+/// With `regions_enabled=false` (default) every issuance path uses the
+/// legacy `turn.*` single-region config — provably unchanged behaviour.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RelaySettings {
+    /// Master gate for region-aware TURN/DERP issuance.
+    /// Env: `ROOMLER__RELAY__REGIONS_ENABLED`.
+    pub regions_enabled: bool,
+    /// JSON array of relay region specs. Env: `ROOMLER__RELAY__REGIONS`.
+    pub regions: Option<String>,
 }
 
 /// Remote-control WS liveness (Phase A-1). Settings (not consts) so the
@@ -249,6 +268,9 @@ pub struct TurnSettings {
     pub password: Option<String>,
     pub shared_secret: Option<String>,
     pub force_relay: Option<bool>,
+    /// Ephemeral-credential TTL in seconds; 600 (the historical hardcode)
+    /// when unset. Env: `ROOMLER__TURN__TTL_SECS`.
+    pub ttl_secs: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -346,6 +368,9 @@ impl Settings {
             .set_default("turn.username", None::<String>)?
             .set_default("turn.password", None::<String>)?
             .set_default("turn.force_relay", false)?
+            .set_default("turn.ttl_secs", None::<i64>)?
+            .set_default("relay.regions_enabled", false)?
+            .set_default("relay.regions", None::<String>)?
             .set_default("claude.model", "claude-sonnet-4-5-20250929")?
             .set_default("claude.max_tokens", 4096)?
             .set_default("oauth.base_url", "http://localhost:5001")?

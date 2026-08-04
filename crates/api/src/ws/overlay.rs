@@ -589,7 +589,13 @@ async fn handle_overlay_relay_request(
     // broker pins them to a single deterministic coturn worker (see
     // `overlay_ice_servers`) so the relay-to-relay leg is an intra-worker
     // hairpin that never crosses mars's dual-public-IP SNAT.
-    let ice_servers = overlay_ice_servers(state, &pair_key).await;
+    let ice_servers = overlay_ice_servers(
+        state,
+        &pair_key,
+        self_node.relay_home.as_deref(),
+        peer.relay_home.as_deref(),
+    )
+    .await;
 
     // P7 — arm the churn detector: a re-request for this pair arriving after
     // this grant (past the dedup gap) counts as one churn cycle. Armed before
@@ -1506,11 +1512,20 @@ fn next_epoch() -> u64 {
 /// authoritative for both peers → guaranteed intra-worker hairpin. Falls back
 /// to the hostname-based servers (pre-fix behaviour) with no TURN config or on
 /// DNS failure.
-async fn overlay_ice_servers(state: &AppState, pair_key: &str) -> Vec<IceServer> {
-    let Some(turn_cfg) = build_turn_config(&state.settings.turn) else {
+async fn overlay_ice_servers(
+    state: &AppState,
+    pair_key: &str,
+    home_a: Option<&str>,
+    home_b: Option<&str>,
+) -> Vec<IceServer> {
+    let region = sticky_pair_region(&state.turn_map, pair_key, home_a, home_b);
+    if region.is_some() {
+        crate::cluster::metrics::bump(&crate::cluster::metrics::RELAY_REGION_PICK_TOTAL);
+    }
+    let Some(turn_cfg) = state.turn_map.cfg_for(region.as_deref()) else {
         return turn_creds::ice_servers_for(pair_key, None);
     };
-    let servers = turn_creds::ice_servers_for(pair_key, Some(&turn_cfg));
+    let servers = turn_creds::ice_servers_for(pair_key, Some(turn_cfg));
     let Some((host, port)) = turn_cfg
         .urls
         .first()
@@ -1599,7 +1614,8 @@ fn stun_urls_from_turn_urls(turn_urls: &[String]) -> Vec<String> {
     out
 }
 
-/// Short-TTL process cache of the resolved coturn worker IP set.
+/// Short-TTL process cache of resolved coturn worker IP sets, keyed by host
+/// (one entry per region's coturn hostname).
 ///
 /// The relay pin MUST be identical for BOTH ends of a pair — they co-locate on
 /// one coturn worker so the relay-to-relay leg is an intra-worker hairpin
@@ -1611,19 +1627,21 @@ fn stun_urls_from_turn_urls(turn_urls: &[String]) -> Vec<String> {
 /// Resolving ONCE and caching for a short TTL makes every grant in the window
 /// share one stable set → one pin. On a transient resolve failure we reuse the
 /// last-good set rather than emit an unpinned grant that would round-robin the
-/// pair apart. (roomler-ai runs a single API pod, so this process cache is
-/// authoritative for every grant.)
-static WORKER_SET_CACHE: Mutex<Option<(Instant, Vec<IpAddr>)>> = Mutex::new(None);
+/// pair apart. (Both peers of a pair land on the SAME pod — the front LB
+/// hashes on tenant — so this process cache is authoritative per pair.)
+static WORKER_SET_CACHE: Mutex<Option<std::collections::HashMap<String, (Instant, Vec<IpAddr>)>>> =
+    Mutex::new(None);
 const WORKER_SET_TTL: Duration = Duration::from_secs(300);
 
-/// Resolve the coturn worker IPs through [`WORKER_SET_CACHE`] so the pin is
-/// stable across grants. Returns the cached set while fresh; otherwise resolves,
-/// caches, and returns; on resolve failure reuses the last-good set (may be
-/// empty only before the first successful resolve).
+/// Resolve a coturn host's worker IPs through [`WORKER_SET_CACHE`] so the pin
+/// is stable across grants. Returns the cached set while fresh; otherwise
+/// resolves, caches, and returns; on resolve failure reuses the host's
+/// last-good set (empty only before its first successful resolve).
 async fn resolve_workers_cached(host: &str, port: u16) -> Vec<IpAddr> {
     {
-        let guard = WORKER_SET_CACHE.lock().unwrap();
-        if let Some((at, ips)) = guard.as_ref()
+        let mut guard = WORKER_SET_CACHE.lock().unwrap();
+        let cache = guard.get_or_insert_with(Default::default);
+        if let Some((at, ips)) = cache.get(host)
             && at.elapsed() < WORKER_SET_TTL
             && !ips.is_empty()
         {
@@ -1636,18 +1654,54 @@ async fn resolve_workers_cached(host: &str, port: u16) -> Vec<IpAddr> {
     };
     ips.sort();
     ips.dedup();
+    let mut guard = WORKER_SET_CACHE.lock().unwrap();
+    let cache = guard.get_or_insert_with(Default::default);
     if !ips.is_empty() {
-        *WORKER_SET_CACHE.lock().unwrap() = Some((Instant::now(), ips.clone()));
+        cache.insert(host.to_string(), (Instant::now(), ips.clone()));
         return ips;
     }
     // Transient resolve failure: reuse the last-good set (even if past TTL) so a
     // DNS blip doesn't unpin grants and split pairs across workers.
-    WORKER_SET_CACHE
-        .lock()
-        .unwrap()
-        .as_ref()
+    cache
+        .get(host)
         .map(|(_, ips)| ips.clone())
         .unwrap_or_default()
+}
+
+/// Sticky per-pair relay region. A re-grant inside the TTL reuses the prior
+/// choice even if a probe report moved a home meanwhile — the worker pin and
+/// the region must stay stable for a LIVE pair, or its two ends land on
+/// different PoPs and the relay carries nothing. TTL-expired entries recompute
+/// (a dead pair's next establishment cycle may then move regions).
+const PAIR_REGION_TTL: Duration = Duration::from_secs(600);
+#[allow(clippy::type_complexity)]
+static PAIR_REGION_CACHE: Mutex<
+    Option<std::collections::HashMap<String, (Option<String>, Instant)>>,
+> = Mutex::new(None);
+
+fn sticky_pair_region(
+    map: &roomler_ai_remote_control::turn_creds::TurnMap,
+    pair_key: &str,
+    home_a: Option<&str>,
+    home_b: Option<&str>,
+) -> Option<String> {
+    if !map.enabled {
+        return None;
+    }
+    let mut guard = PAIR_REGION_CACHE.lock().unwrap();
+    let cache = guard.get_or_insert_with(Default::default);
+    if let Some((region, at)) = cache.get(pair_key)
+        && at.elapsed() < PAIR_REGION_TTL
+    {
+        return region.clone();
+    }
+    // Opportunistic sweep so dead pairs don't accrete on a long-lived pod.
+    if cache.len() > 2048 {
+        cache.retain(|_, (_, at)| at.elapsed() < PAIR_REGION_TTL);
+    }
+    let region = turn_creds::select_pair_region(map, home_a, home_b, pair_key);
+    cache.insert(pair_key.to_string(), (region.clone(), Instant::now()));
+    region
 }
 
 /// Resolve `host` (cached, stable) and pick one IPv4 worker, indexed by
