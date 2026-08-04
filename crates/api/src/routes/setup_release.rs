@@ -23,49 +23,16 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use std::time::Duration;
 
 use crate::{
     error::ApiError,
-    routes::agent_release::{AgentRelease, AgentReleaseAsset},
+    routes::{
+        agent_release::{AgentRelease, AgentReleaseAsset},
+        releases,
+    },
     state::AppState,
 };
-
-/// GitHub repo slug — same repo as agent + tunnel CLI.
-const RELEASES_REPO: &str = "gjovanov/roomler-ai";
-
-/// Cache TTL — 1 hour. Mirrors the CLI / agent caches. Operators
-/// download once during install; the wizard release cadence is
-/// per-tag (rare).
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
-
-/// GitHub page size. 100 (the API max) rather than the old 30:
-/// `agent-v*` tags ship several times a day, so the rarely-tagged
-/// `setup-v*` family falls off a 30-deep first page within days
-/// (observed with the retired tunnel-wizard family, whose last tag
-/// was long gone from the top 30 within weeks). One page of 100
-/// buys weeks of agent cadence; a per-family fetch is the follow-up
-/// if that ever becomes insufficient.
-const RELEASES_PER_PAGE: usize = 100;
-
-struct CacheEntry {
-    fetched_at: Instant,
-    payload: Vec<AgentRelease>,
-}
-
-pub struct LatestSetupReleaseCache {
-    inner: RwLock<Option<CacheEntry>>,
-}
-
-impl LatestSetupReleaseCache {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: RwLock::new(None),
-        })
-    }
-}
 
 #[derive(Deserialize)]
 pub struct InstallerQuery {
@@ -95,7 +62,7 @@ pub struct InstallerHealth {
 pub async fn setup_latest_release(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     let filtered: Vec<AgentRelease> = releases
         .into_iter()
         .filter(|r| r.tag_name.starts_with("setup-v"))
@@ -112,7 +79,7 @@ pub async fn setup_installer_health(
     Query(params): Query<InstallerQuery>,
 ) -> Result<Json<InstallerHealth>, ApiError> {
     let normalised = normalise_platform(&platform)?;
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     let release = pick_release_for(&releases, &params.version, "setup-v").ok_or_else(|| {
         ApiError::NotFound(format!(
             "no setup release matching version={}",
@@ -142,7 +109,7 @@ pub async fn setup_installer_proxy(
     Query(params): Query<InstallerQuery>,
 ) -> Result<Response, ApiError> {
     let normalised = normalise_platform(&platform)?;
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     let release = pick_release_for(&releases, &params.version, "setup-v").ok_or_else(|| {
         ApiError::NotFound(format!(
             "no setup release matching version={}",
@@ -318,73 +285,6 @@ fn pick_release_for<'a>(
             r.tag_name == target_with_prefix || r.tag_name == target_bare || r.tag_name == version
         })
     }
-}
-
-async fn ensure_releases_cached(state: &AppState) -> Result<Vec<AgentRelease>, ApiError> {
-    let cache = state.setup_release_cache.clone();
-    {
-        let g = cache.inner.read().await;
-        if let Some(entry) = g.as_ref()
-            && entry.fetched_at.elapsed() < CACHE_TTL
-        {
-            return Ok(entry.payload.clone());
-        }
-    }
-    let url = format!(
-        "https://api.github.com/repos/{}/releases?per_page={}",
-        RELEASES_REPO, RELEASES_PER_PAGE
-    );
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| ApiError::Internal(format!("reqwest client build: {e}")))?;
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await;
-    let releases = match resp {
-        Ok(r) if r.status().is_success() => r
-            .json::<Vec<AgentRelease>>()
-            .await
-            .map_err(|e| ApiError::Internal(format!("github releases parse: {e}")))?,
-        Ok(r) => {
-            let g = cache.inner.read().await;
-            if let Some(entry) = g.as_ref() {
-                tracing::warn!(
-                    status = %r.status(),
-                    "setup releases upstream returned non-success; serving stale cache"
-                );
-                return Ok(entry.payload.clone());
-            }
-            return Err(ApiError::Internal(format!(
-                "setup releases upstream returned {}",
-                r.status()
-            )));
-        }
-        Err(e) => {
-            let g = cache.inner.read().await;
-            if let Some(entry) = g.as_ref() {
-                tracing::warn!(
-                    %e,
-                    "setup releases upstream fetch errored; serving stale cache"
-                );
-                return Ok(entry.payload.clone());
-            }
-            return Err(ApiError::Internal(format!(
-                "setup releases upstream fetch failed: {e}"
-            )));
-        }
-    };
-    {
-        let mut g = cache.inner.write().await;
-        *g = Some(CacheEntry {
-            fetched_at: Instant::now(),
-            payload: releases.clone(),
-        });
-    }
-    Ok(releases)
 }
 
 #[cfg(test)]

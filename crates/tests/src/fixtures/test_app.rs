@@ -335,6 +335,7 @@ fn test_settings() -> Settings {
             ttl_secs: None,
         },
         relay: roomler_ai_config::RelaySettings::default(),
+        releases: roomler_ai_config::ReleasesSettings::default(),
         claude: roomler_ai_config::ClaudeSettings {
             api_key: None,
             model: "claude-sonnet-4-5-20250929".to_string(),

@@ -19,6 +19,7 @@ pub struct Settings {
     pub auth: AuthSettings,
     pub rc: RcSettings,
     pub relay: RelaySettings,
+    pub releases: ReleasesSettings,
 }
 
 /// Multi-region relay PoPs (regional coturn + DERP). Regions are fleet
@@ -62,6 +63,38 @@ impl Default for RelaySettings {
             stats_poll_secs: 30,
             busy_load: 1.5,
             busy_tx_mbps: 400.0,
+        }
+    }
+}
+
+/// GitHub-releases proxy cache (`routes::releases`, consumed by the
+/// `/api/{agent,tunnel,setup}/latest-release` + installer handlers).
+///
+/// The cache is per-pod and in-process, so with N pods a freshly published
+/// release stays invisible for up to one TTL on each of them independently.
+/// `refresh_token` gates `POST /api/releases/refresh`, which the release
+/// workflows call right after publishing to bust every pod's copy at once;
+/// `cache_ttl_secs` is the backstop that heals a missed refresh.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleasesSettings {
+    /// Shared secret for `POST /api/releases/refresh` (`Authorization:
+    /// Bearer <token>`). **Unset ⇒ the endpoint is disabled (503)** — there
+    /// is deliberately no permissive default, since an open refresh endpoint
+    /// would let anyone burn GitHub's 60-req/h unauthenticated quota.
+    /// Env: `ROOMLER__RELEASES__REFRESH_TOKEN`.
+    pub refresh_token: Option<String>,
+    /// TTL of the cached releases list. 15 min: one consolidated cache means
+    /// N pods × 4 fetches/h, comfortably under GitHub's 60/h unauthenticated
+    /// cap, while bounding worst-case staleness when the refresh call never
+    /// lands. Env: `ROOMLER__RELEASES__CACHE_TTL_SECS`.
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for ReleasesSettings {
+    fn default() -> Self {
+        Self {
+            refresh_token: None,
+            cache_ttl_secs: 900,
         }
     }
 }
@@ -415,6 +448,8 @@ impl Settings {
             .set_default("relay.stats_poll_secs", 30)?
             .set_default("relay.busy_load", 1.5)?
             .set_default("relay.busy_tx_mbps", 400.0)?
+            .set_default("releases.refresh_token", None::<String>)?
+            .set_default("releases.cache_ttl_secs", 900)?
             .set_default("claude.model", "claude-sonnet-4-5-20250929")?
             .set_default("claude.max_tokens", 4096)?
             .set_default("oauth.base_url", "http://localhost:5001")?
