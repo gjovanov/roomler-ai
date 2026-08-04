@@ -55,6 +55,15 @@ pub struct RcSettings {
     pub ws_rx_deadline_secs: u64,
     /// How often the read loop checks the deadline.
     pub ws_liveness_tick_secs: u64,
+    /// P4 — per-tenant coalescing window for `device:presence` fan-out.
+    /// A pod roll reconnects a whole fleet within seconds; batching turns
+    /// that into one WS event per tenant instead of one per agent.
+    /// Env: `ROOMLER__RC__PRESENCE_BATCH_MS`.
+    pub presence_batch_ms: u64,
+    /// P4 — interval of the cluster-singleton presence staleness sweep
+    /// (stale/offline transitions have no socket-teardown moment to hook).
+    /// Env: `ROOMLER__RC__PRESENCE_SWEEP_SECS`.
+    pub presence_sweep_secs: u64,
 }
 
 impl Default for RcSettings {
@@ -62,6 +71,8 @@ impl Default for RcSettings {
         Self {
             ws_rx_deadline_secs: 90,
             ws_liveness_tick_secs: 30,
+            presence_batch_ms: 2000,
+            presence_sweep_secs: 30,
         }
     }
 }
@@ -357,6 +368,8 @@ impl Settings {
             .set_default("redis.url", "redis://127.0.0.1:6379")?
             .set_default("rc.ws_rx_deadline_secs", 90)?
             .set_default("rc.ws_liveness_tick_secs", 30)?
+            .set_default("rc.presence_batch_ms", 2000)?
+            .set_default("rc.presence_sweep_secs", 30)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

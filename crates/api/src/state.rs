@@ -108,6 +108,9 @@ pub struct AppState {
     /// each key (an unconditional DEL could erase a claim an agent already
     /// re-made on the surviving pod mid-roll).
     pub agent_presence_tokens: Arc<DashMap<ObjectId, String>>,
+    /// P4 — per-tenant `device:presence` batching + member-list cache.
+    /// See [`crate::ws::device_presence`].
+    pub presence_fanout: Arc<crate::ws::device_presence::PresenceFanout>,
     /// C-3 — directory owner-tokens for LOCAL tunnel sessions
     /// (`roomler:own:tunnel:<session>`). Written on open; refreshed by the
     /// directory heartbeat while the session map still holds the session;
@@ -589,6 +592,9 @@ impl AppState {
                 email: email.clone(),
                 push: push.clone(),
                 base_url: settings.oauth.base_url.clone(),
+                notifications: notifications.clone(),
+                ws_storage: ws_storage.clone(),
+                redis_pubsub: redis_pubsub.clone(),
             },
         );
 
@@ -643,6 +649,7 @@ impl AppState {
             turn_map,
             derp_ticket,
             agent_presence_tokens,
+            presence_fanout: Arc::new(crate::ws::device_presence::PresenceFanout::default()),
             tunnel_presence_tokens: tunnel_presence_tokens.clone(),
             media_claim_tokens,
             remote_media_conns,
@@ -672,6 +679,11 @@ impl AppState {
         crate::ws::media_cluster::wire_media_cluster(&state);
         // C-5 — derp rehome: the owner-side close handler.
         crate::ws::derp_cluster::wire_derp_cluster(&state);
+        // P4 — the presence staleness sweep (cluster-singleton per cycle
+        // via a DB-name-scoped Redis NX claim; first tick a full interval
+        // out so tests driving `run_presence_sweep` directly stay
+        // deterministic).
+        crate::ws::device_presence::spawn_sweeper(state.clone());
 
         Ok(state)
     }
@@ -788,6 +800,68 @@ struct ConsentConsumerDeps {
     email: Option<Arc<EmailService>>,
     push: Option<Arc<PushService>>,
     base_url: String,
+    // P4 — the owner also gets an IN-APP notification row + `notification:new`
+    // WS push (the email/web-push above are useless when the owner is sitting
+    // in the app on another org's page).
+    notifications: Arc<NotificationDao>,
+    ws_storage: Arc<WsStorage>,
+    redis_pubsub: Option<Arc<RedisPubSub>>,
+}
+
+/// P4 — persist an in-app Notification for the device owner and push it over
+/// WS (`notification:new`, same payload shape as `routes::helpers`). Consent
+/// requests carry the approve/deny page as their link; break-glass notices
+/// link the device list. Best-effort — the email/push legs stay authoritative.
+async fn consent_in_app_notification(
+    deps: &ConsentConsumerDeps,
+    ev: &ConsentEvent,
+    owner_id: bson::oid::ObjectId,
+    title: String,
+    body: String,
+    link: String,
+) {
+    let created = deps
+        .notifications
+        .create(
+            ev.tenant_id,
+            owner_id,
+            roomler_ai_db::models::NotificationType::ConsentRequest,
+            title,
+            body,
+            Some(link),
+            roomler_ai_db::models::NotificationSource {
+                entity_type: "remote_session".to_string(),
+                entity_id: ev.session_id,
+                actor_id: Some(ev.controller_user_id),
+            },
+        )
+        .await;
+    match created {
+        Ok(n) => {
+            let event = serde_json::json!({
+                "type": "notification:new",
+                "data": {
+                    "id": n.id.map(|i| i.to_hex()).unwrap_or_default(),
+                    "tenant_id": ev.tenant_id.to_hex(),
+                    "title": n.title,
+                    "body": n.body,
+                    "link": n.link,
+                    "notification_type": "consent_request",
+                    "created_at": n.created_at.try_to_rfc3339_string().unwrap_or_default(),
+                }
+            });
+            crate::ws::dispatcher::send_to_user_with_redis(
+                &deps.ws_storage,
+                &deps.redis_pubsub,
+                &owner_id,
+                &event,
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(session = %ev.session_id, %e, "consent in-app notification failed");
+        }
+    }
 }
 
 /// Spawn the background task that turns Hub [`ConsentEvent`]s (Email/Push sessions
@@ -815,6 +889,18 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
     // is informational (no approval, no ConsentRequest). Tell the owner their
     // device was accessed + why, then we're done.
     if let Some(reason) = &ev.override_reason {
+        consent_in_app_notification(
+            deps,
+            ev,
+            owner_id,
+            "Device accessed (admin override)".to_string(),
+            format!(
+                "{} accessed {} via admin break-glass. Reason: {}",
+                ev.controller_name, device_name, reason
+            ),
+            format!("/tenant/{}/devices", ev.tenant_id.to_hex()),
+        )
+        .await;
         if let Some(email) = &deps.email {
             let owner = deps.users.base.find_by_id(owner_id).await?;
             let _ = email
@@ -867,6 +953,18 @@ async fn handle_consent_event(deps: &ConsentConsumerDeps, ev: &ConsentEvent) -> 
         deps.base_url.trim_end_matches('/'),
         req.token
     );
+
+    // P4 — in-app row + WS for the owner alongside the email/push leg. The
+    // link is the RELATIVE approve/deny page (in-app navigation).
+    consent_in_app_notification(
+        deps,
+        ev,
+        owner_id,
+        "Remote control request".to_string(),
+        format!("{} wants to control {}", ev.controller_name, device_name),
+        format!("/consent/{}", req.token),
+    )
+    .await;
 
     match ev.mode {
         // Email + PromptThenEmail both email the owner an approve-link. For
