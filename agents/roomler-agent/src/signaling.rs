@@ -692,6 +692,10 @@ async fn connect_once(
         // local subnets. Admin-gated server-side (untrusted until an admin
         // approves them into this agent's `routes`).
         advertised_routes: crate::subnet_detect::local_advertised_routes(cfg),
+        // Multi-region relay PoPs: advertise the probe capability so the
+        // server may push `rc:relay.regions` (it never sends the variant to
+        // an agent that didn't flag it — our deserializer would error).
+        supports_relay_regions: crate::relay_probe::probing_enabled(),
     };
     send_msg(&mut ws, &hello).await.context("sending hello")?;
     // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't
@@ -710,6 +714,16 @@ async fn connect_once(
     // locally-gathered ICE candidates and state-change terminates here;
     // the main loop flushes them to the WS.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<ClientMsg>(PEER_OUTBOUND_CAP);
+    // Multi-region relay probing: the server's last region push (per
+    // connection) + the periodic re-prober (exits with the connection —
+    // its sends fail once `outbound_rx` drops).
+    let relay_regions_slot: crate::relay_probe::RegionSlot = Default::default();
+    if crate::relay_probe::probing_enabled() {
+        tokio::spawn(crate::relay_probe::periodic_reprobe(
+            relay_regions_slot.clone(),
+            outbound_tx.clone(),
+        ));
+    }
     // P3b-2 PR-C: publish this connection's egress so tunnel-client flow
     // supervisors can open sessions over it; the guard clears it to `None` on
     // every exit path (like `_connected_guard`), so a supervisor holding the
@@ -991,6 +1005,7 @@ async fn connect_once(
                                 &indicator,
                                 &consent_broker,
                                 &cfg.forward_acl,
+                                &relay_regions_slot,
                             )
                             .await?;
                         }
@@ -1051,6 +1066,7 @@ async fn handle_server_msg(
     indicator: &ViewerIndicator,
     consent_broker: &crate::consent::ConsentBroker,
     forward_acl: &crate::tunnel::acl::AgentForwardAcl,
+    relay_regions_slot: &crate::relay_probe::RegionSlot,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -1406,6 +1422,27 @@ async fn handle_server_msg(
             debug!(%session_id, "unexpected controller-side msg on agent socket");
         }
         ServerMsg::Pong { .. } => {}
+
+        // Multi-region relay PoPs: stash the pushed region list; probe now
+        // when the set actually changed (rev), else let the periodic
+        // re-prober use the stored copy.
+        ServerMsg::RelayRegions { regions, rev } => {
+            if crate::relay_probe::probing_enabled() {
+                let changed = {
+                    let mut slot = relay_regions_slot.lock().unwrap_or_else(|e| e.into_inner());
+                    let changed = slot.as_ref().map(|(_, r)| *r != rev).unwrap_or(true);
+                    *slot = Some((regions.clone(), rev));
+                    changed
+                };
+                if changed {
+                    debug!(count = regions.len(), rev, "relay regions pushed; probing");
+                    tokio::spawn(crate::relay_probe::probe_and_report(
+                        regions,
+                        outbound_tx.clone(),
+                    ));
+                }
+            }
+        }
 
         // rc:tunnel.tcp.forward — server has gated the request, asks
         // the agent to dial dst + reply with Accept/Reject via the

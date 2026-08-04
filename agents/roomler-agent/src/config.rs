@@ -201,6 +201,12 @@ pub struct AgentConfig {
     /// eligibility. Built-in default: on (kill switch).
     #[serde(default)]
     pub overlay_rtt_q: Option<bool>,
+    /// Multi-region relay PoPs — probe the server-pushed region list (timed
+    /// STUN binding per PoP) and report RTTs so the server derives this
+    /// node's `relay_home` (`ROOMLER_NODE_RELAY_PROBE`). Built-in default:
+    /// on (kill switch).
+    #[serde(default)]
+    pub relay_probe: Option<bool>,
     /// 2026-08-04 - KeyText modifier neutralization: temporarily release
     /// physically-held Shift/Ctrl/Alt that the remote layout does NOT
     /// want around a scancode tap (fixes '+'->'*' / dead '|' on non-US
@@ -904,7 +910,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 18] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 19] {
     [
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
@@ -923,6 +929,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 18]
         ("LOGS_UPLOAD_DISABLED", cfg.logs_upload_disabled),
         ("OVERLAY_TIER_DETECT", cfg.overlay_tier_detect),
         ("OVERLAY_RTT_Q", cfg.overlay_rtt_q),
+        ("RELAY_PROBE", cfg.relay_probe),
         ("TEXT_MOD_NEUTRALIZE", cfg.text_mod_neutralize),
     ]
 }
@@ -1111,6 +1118,7 @@ mod tests {
             ice_overlay_host_deprioritize: None,
             overlay_tier_detect: None,
             overlay_rtt_q: None,
+            relay_probe: None,
             text_mod_neutralize: None,
             overlay_demote: None,
             overlay_rpf: None,
