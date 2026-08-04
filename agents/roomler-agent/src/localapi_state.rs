@@ -161,7 +161,30 @@ pub struct DaemonState {
     /// the `SetDeviceName` verb. `None` in unit tests / states built without a
     /// persist target — the verb then reports unsupported.
     config_persist: Option<(std::path::PathBuf, crate::config::WriteLock)>,
+    /// Multi-org P1: live per-enrollment rows surfaced as `NodeStatus.orgs`.
+    /// `None` in unit tests / states built without one → the field is empty
+    /// (old-daemon shape).
+    orgs: Option<OrgStatusRegistry>,
 }
+
+/// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
+/// read by `status()`. The `connected` flag is the SAME per-connection
+/// `AtomicBool` the org's signaling guard flips; `terminal_error` is written
+/// by the org supervisor when its loop stops permanently.
+pub struct OrgRuntime {
+    pub label: String,
+    pub server_url: String,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub primary: bool,
+    pub enabled: bool,
+    pub connected: Arc<AtomicBool>,
+    pub terminal_error: Arc<Mutex<Option<String>>>,
+    pub updates_ignored: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// Shared registry of [`OrgRuntime`] rows (primary first).
+pub type OrgStatusRegistry = Arc<Mutex<Vec<OrgRuntime>>>;
 
 impl DaemonState {
     /// Build from the enrolled config identity + the live handles. `mode` is the
@@ -195,7 +218,16 @@ impl DaemonState {
             rtt_cache,
             routes: None,
             config_persist: None,
+            orgs: None,
         }
+    }
+
+    /// Attach the multi-org status registry so `NodeStatus.orgs` is live.
+    /// Separate from `new` to keep the constructor's existing call sites
+    /// (incl. tests) unchanged.
+    pub fn with_orgs(mut self, orgs: OrgStatusRegistry) -> Self {
+        self.orgs = Some(orgs);
+        self
     }
 
     /// Attach the declared-route reconciler (P6) so the `Route*` verbs are
@@ -275,6 +307,37 @@ impl LocalApiState for DaemonState {
                 .map(|(p, _)| p.display().to_string()),
             // S2 — MagicDNS status the overlay runtime published.
             dns: self.overlay.borrow().dns.clone(),
+            // Multi-org P1 — one row per enrollment; empty (and omitted on
+            // the wire) for a single-org daemon or a state built without
+            // the registry.
+            orgs: self
+                .orgs
+                .as_ref()
+                .map(|reg| {
+                    reg.lock()
+                        .map(|rows| {
+                            rows.iter()
+                                .map(|o| tunnel_core::localapi::OrgStatus {
+                                    label: o.label.clone(),
+                                    server_url: o.server_url.clone(),
+                                    tenant_id: (!o.tenant_id.is_empty())
+                                        .then(|| o.tenant_id.clone()),
+                                    agent_id: (!o.agent_id.is_empty()).then(|| o.agent_id.clone()),
+                                    primary: o.primary,
+                                    enabled: o.enabled,
+                                    connected: o.connected.load(Ordering::Relaxed),
+                                    terminal_error: o
+                                        .terminal_error
+                                        .lock()
+                                        .ok()
+                                        .and_then(|t| t.clone()),
+                                    updates_ignored: o.updates_ignored.load(Ordering::Relaxed),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default(),
         }
     }
 
