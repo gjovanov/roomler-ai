@@ -133,7 +133,12 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "rc_max_sessions",
         "number",
-        "Concurrent remote-control sessions this agent accepts (1-8). Each extra session runs its own capture + encoder until the shared encoder lands — weak-GPU hosts may prefer 1. Built-in default: 2.",
+        "Concurrent remote-control sessions this agent accepts (1-8). Same-profile DC viewers share one capture+encoder (see shared_encoder); distinct profiles run their own — weak-GPU hosts may prefer 1. Built-in default: 2.",
+    ),
+    (
+        "shared_encoder",
+        "tribool",
+        "P5 shared-floor encoder: concurrent same-profile DC viewers share one capture+encoder with floor-merged rate/dials. off = one pipeline per session (rc.302 behaviour). Built-in default: on.",
     ),
     (
         "overlay_relay_tls",
@@ -303,6 +308,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
+        "shared_encoder" => cfg.shared_encoder.map(fmt_bool),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
@@ -448,6 +454,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 }
             }
         }
+        "shared_encoder" => cfg.shared_encoder = parse_tribool(value)?,
         "overlay_relay_tls" => cfg.overlay_relay_tls = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
@@ -839,6 +846,22 @@ mod tests {
         assert!(apply(&mut cfg, "rc_max_sessions", Some("0")).is_err());
         assert!(apply(&mut cfg, "rc_max_sessions", Some("9")).is_err());
         assert!(apply(&mut cfg, "rc_max_sessions", Some("many")).is_err());
+    }
+
+    #[test]
+    fn shared_encoder_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "shared_encoder", Some("off")).unwrap();
+        assert_eq!(cfg.shared_encoder, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "shared_encoder").unwrap().value.as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "shared_encoder", Some("on")).unwrap();
+        assert_eq!(cfg.shared_encoder, Some(true));
+        apply(&mut cfg, "shared_encoder", None).unwrap();
+        assert_eq!(cfg.shared_encoder, None);
+        assert!(apply(&mut cfg, "shared_encoder", Some("maybe")).is_err());
     }
 
     #[test]
