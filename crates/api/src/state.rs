@@ -166,6 +166,13 @@ pub struct AppState {
     /// PR-1 rehome — requester-side per-agent throttle for
     /// `rc.agent_nudge` RPCs (click storms sent 11 in 15 s pre-PR-1).
     pub agent_nudge_throttle: Arc<crate::ws::rc_cluster::NudgeRequestThrottle>,
+    /// PR-2 relay — owner-side proxy controllers for cross-pod rc
+    /// sessions, keyed by the ORIGIN connection id. See `ws::rc_relay`.
+    pub rc_proxy_controllers: Arc<crate::ws::rc_relay::ProxyControllers>,
+    /// PR-2 relay — controller-side: conn id → owner pods hosting its
+    /// proxied rc sessions (WS close forwards `rc.conn_closed` there;
+    /// mirrors C-4's `remote_media_conns`).
+    pub remote_rc_conns: Arc<crate::ws::rc_relay::RemoteRcConns>,
 
     // Overlay-network subsystem (Tailscale-style L3 mesh)
     pub overlay_networks: Arc<OverlayNetworkDao>,
@@ -747,6 +754,8 @@ impl AppState {
             tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
             agent_nudge_cooldowns: agent_nudge_cooldowns.clone(),
             agent_nudge_throttle: Arc::new(DashMap::new()),
+            rc_proxy_controllers: Arc::new(DashMap::new()),
+            remote_rc_conns: Arc::new(DashMap::new()),
             overlay_networks,
             overlay_nodes,
             overlay_policies,
@@ -768,6 +777,9 @@ impl AppState {
         crate::ws::media_cluster::wire_media_cluster(&state);
         // C-5 — derp rehome: the owner-side close handler.
         crate::ws::derp_cluster::wire_derp_cluster(&state);
+        // PR-2 — cross-pod rc signalling relay: owner-side rc.cmd /
+        // rc.conn_closed / rc.conn_alive + the proxy janitor sweep.
+        crate::ws::rc_relay::wire_rc_relay(&state);
         // P4 — the presence staleness sweep (cluster-singleton per cycle
         // via a DB-name-scoped Redis NX claim; first tick a full interval
         // out so tests driving `run_presence_sweep` directly stay
