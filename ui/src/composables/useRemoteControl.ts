@@ -213,6 +213,11 @@ export interface RcVideoInfo {
    *  them (older agents) Ã¢ÂÂ the badge then omits the annotation. */
   native_w: number
   native_h: number
+  /** P5 — how many viewers share this encoded stream (agent-side
+   *  shared-floor pipeline). `1` (or absent on pre-P5 agents) = solo;
+   *  `>1` = the stream's rate/dials are floor-merged across viewers and
+   *  the stats badge shows "shared ×N" to explain a capped stream. */
+  viewers: number
 }
 
 /** rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts). The
@@ -301,6 +306,7 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         transport: typeof obj.transport === 'string' ? obj.transport : '',
         native_w: typeof obj.native_w === 'number' ? obj.native_w : 0,
         native_h: typeof obj.native_h === 'number' ? obj.native_h : 0,
+        viewers: typeof obj.viewers === 'number' && obj.viewers > 0 ? obj.viewers : 1,
       },
     }
   }
