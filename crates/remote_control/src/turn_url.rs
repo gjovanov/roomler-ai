@@ -15,21 +15,34 @@
 /// advertises only what a PoP really listens on, so clients never burn their
 /// per-candidate allocate timeout (5–6 s each on a hostile corp path) dialing
 /// a port that routes elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Deserializes from a region spec's `caps` object; every ABSENT field is
+/// `true` (a partial `{"tls_443_tcp":false}` turns off exactly one variant),
+/// matching [`VariantCaps::default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VariantCaps {
     /// `turn:host:443?transport=udp` — coturn behind a UDP/443 DNAT (or
     /// `alt-listening-port=443`); looks like QUIC to corp firewalls.
+    #[serde(default = "d_true")]
     pub udp_443: bool,
     /// `turn:host:<base-port>?transport=tcp`.
+    #[serde(default = "d_true")]
     pub tcp: bool,
     /// `turns:host:5349?transport=tcp` — coturn's standard TLS port.
+    #[serde(default = "d_true")]
     pub tls_5349: bool,
     /// `turns:host:443?transport=udp` (DTLS). webrtc-rs silently drops it
     /// (upstream NOT_PLANNED, webrtc-rs/webrtc#690); browsers use it.
+    #[serde(default = "d_true")]
     pub tls_443_udp: bool,
     /// `turns:host:443?transport=tcp`. Browser corp-escape; on regional PoPs
     /// TCP/443 belongs to the DERP relay (SNI-routed), so this is off there.
+    #[serde(default = "d_true")]
     pub tls_443_tcp: bool,
+}
+
+fn d_true() -> bool {
+    true
 }
 
 impl Default for VariantCaps {
@@ -221,6 +234,20 @@ mod tests {
             expand_turn_url("turn:pop.example.com:3478", &none),
             vec!["turn:pop.example.com:3478"]
         );
+    }
+
+    #[test]
+    fn caps_deserialize_partial_defaults_true() {
+        let caps: VariantCaps = serde_json::from_str(r#"{"tls_443_tcp":false}"#).unwrap();
+        assert_eq!(
+            caps,
+            VariantCaps {
+                tls_443_tcp: false,
+                ..VariantCaps::default()
+            }
+        );
+        let empty: VariantCaps = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, VariantCaps::default());
     }
 
     #[test]

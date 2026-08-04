@@ -10,7 +10,7 @@ use roomler_ai_remote_control::{
     hub::ConsentEvent,
     models::ConsentMode,
     signaling::ServerMsg,
-    turn_creds::TurnConfig,
+    turn_creds::{TurnConfig, TurnMap},
     turn_url::{VariantCaps, expand_turn_url},
 };
 use roomler_ai_services::{
@@ -94,6 +94,10 @@ pub struct AppState {
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
     pub rc_hub: Arc<Hub>,
+    /// Region-keyed TURN issuance (the Hub holds its own clone). Built once at
+    /// startup from `turn.*` + `relay.*` settings; `cfg_for(None)` == the
+    /// legacy single-region config.
+    pub turn_map: Arc<roomler_ai_remote_control::turn_creds::TurnMap>,
     /// Phase A-1 — the Redis presence owner-token per locally-registered
     /// agent WS. Written/removed by `ws::remote_control::handle_agent_socket`;
     /// read by [`shutdown_cleanup`] so the SIGTERM sweep can compare-DEL
@@ -307,7 +311,7 @@ impl AppState {
 
         let consent_requests = Arc::new(ConsentRequestDao::new(&db));
 
-        let turn_cfg = build_turn_config(&settings.turn);
+        let turn_map = Arc::new(build_turn_map(&settings));
         let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
         // Phase 4 — owner-side consent: the Hub emits a `ConsentEvent` for each
         // Email/Push session; this consumer resolves the owner + persists a
@@ -316,7 +320,7 @@ impl AppState {
         let (consent_tx, consent_rx) = mpsc::channel::<ConsentEvent>(64);
         let rc_hub = Arc::new(Hub::new_with_consent(
             audit_sink,
-            turn_cfg,
+            (*turn_map).clone(),
             Some(consent_tx),
         ));
 
@@ -603,6 +607,7 @@ impl AppState {
             agent_logs,
             consent_requests,
             rc_hub,
+            turn_map,
             agent_presence_tokens,
             tunnel_presence_tokens: tunnel_presence_tokens.clone(),
             media_claim_tokens,
@@ -669,8 +674,74 @@ pub(crate) fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Optio
         urls: expand_turn_url(base, &VariantCaps::default()),
         workers,
         shared_secret: secret,
-        ttl_secs: 600, // 10 minutes
+        ttl_secs: turn.ttl_secs.unwrap_or(600),
     })
+}
+
+/// Build the region-keyed [`TurnMap`]: the legacy `turn.*` config as the
+/// default region plus one [`TurnConfig`] per enabled spec in
+/// `ROOMLER__RELAY__REGIONS`. A malformed JSON or a region without any usable
+/// shared secret is logged and skipped — never fatal, and with
+/// `relay.regions_enabled=false` the map degrades to exactly the legacy
+/// behaviour.
+pub(crate) fn build_turn_map(settings: &Settings) -> TurnMap {
+    use roomler_ai_remote_control::turn_creds::RelayRegionSpec;
+
+    let default = build_turn_config(&settings.turn);
+    let ttl_secs = settings.turn.ttl_secs.unwrap_or(600);
+    let mut regions = std::collections::HashMap::new();
+    let mut specs: Vec<RelayRegionSpec> = Vec::new();
+    if let Some(json) = settings.relay.regions.as_deref() {
+        match serde_json::from_str::<Vec<RelayRegionSpec>>(json) {
+            Ok(list) => {
+                for spec in list {
+                    if !spec.enabled {
+                        specs.push(spec);
+                        continue;
+                    }
+                    let Some(secret) = spec
+                        .shared_secret
+                        .clone()
+                        .or_else(|| settings.turn.shared_secret.clone())
+                    else {
+                        tracing::warn!(
+                            region = %spec.id,
+                            "relay region has no shared secret (own or global turn.shared_secret); skipping"
+                        );
+                        continue;
+                    };
+                    regions.insert(
+                        spec.id.clone(),
+                        TurnConfig {
+                            urls: expand_turn_url(&spec.turn_url, &spec.caps),
+                            workers: spec
+                                .worker_urls
+                                .iter()
+                                .map(|w| expand_turn_url(w, &spec.caps))
+                                .collect(),
+                            shared_secret: secret,
+                            ttl_secs,
+                        },
+                    );
+                    specs.push(spec);
+                }
+            }
+            Err(e) => {
+                tracing::error!(%e, "ROOMLER__RELAY__REGIONS is not valid JSON; ignoring regions");
+            }
+        }
+    }
+    if settings.relay.regions_enabled && regions.is_empty() {
+        tracing::warn!(
+            "relay.regions_enabled=true but no usable regions parsed — all issuance stays on the default region"
+        );
+    }
+    TurnMap {
+        default,
+        regions,
+        specs,
+        enabled: settings.relay.regions_enabled,
+    }
 }
 
 /// Dependencies the Phase-4 owner-consent consumer needs — cheap `Arc` clones of
