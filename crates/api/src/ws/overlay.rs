@@ -217,7 +217,14 @@ async fn handle_overlay_join(
             const CREATE_ATTEMPTS: usize = 3;
             let mut created = None;
             for attempt in 1..=CREATE_ATTEMPTS {
-                let host = match state.overlay_networks.allocate_host(network_id).await {
+                // Multi-org P2a: the allocation is bounded by the network's
+                // OWN block ceiling — exhaustion refuses the join loudly
+                // instead of leasing into a neighbor tenant's block.
+                let host = match state
+                    .overlay_networks
+                    .allocate_host(network_id, network.max_host())
+                    .await
+                {
                     Ok(h) => h,
                     Err(e) => {
                         warn!(%tenant_id, %e, "overlay.join: IPAM allocate failed");

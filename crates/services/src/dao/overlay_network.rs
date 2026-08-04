@@ -80,7 +80,17 @@ impl OverlayNetworkDao {
     /// joiners can never be handed the same host: MongoDB serialises updates to
     /// one document, and each racer gets its OWN pre-image — racer A sees
     /// `[7, 9]` and takes 7 while racer B sees `[9]` and takes 9.
-    pub async fn allocate_host(&self, network_id: ObjectId) -> DaoResult<u32> {
+    ///
+    /// Multi-org P2a — `max_host` is the network's OWN block ceiling
+    /// ([`OverlayNetwork::max_host`], computed by the caller from the row it
+    /// already holds). The cursor previously grew unbounded; under
+    /// tenant-block addressing (P2b) that would silently walk into the
+    /// NEIGHBOR tenant's block — the exact collision class blocks exist to
+    /// kill. Exhaustion is a loud [`DaoError::Validation`], never a
+    /// wrapped-around or out-of-block address. A popped pool entry above the
+    /// ceiling (a since-shrunk CIDR) is DISCARDED — a leak, never a
+    /// conflict — and the cursor branch decides.
+    pub async fn allocate_host(&self, network_id: ObjectId, max_host: u32) -> DaoResult<u32> {
         // 1) The pool. `free_hosts.0: {$exists: true}` is the "array is
         //    non-empty" test — an empty pool simply fails to match and we fall
         //    through to the cursor.
@@ -99,21 +109,45 @@ impl OverlayNetworkDao {
         if let Some(before) = popped
             && let Some(host) = before.free_hosts.first().copied()
         {
-            return Ok(host);
+            if host <= max_host {
+                return Ok(host);
+            }
+            tracing::warn!(
+                %network_id, host, max_host,
+                "overlay ipam: discarding pooled host above the block ceiling \
+                 (CIDR shrank since it was released)"
+            );
         }
 
-        // 2) Pool empty — bump the cursor.
+        // 2) Pool empty — bump the cursor, but ONLY while it is within the
+        //    block. The bound rides the atomic filter, so N concurrent
+        //    joiners racing the last host serialize correctly: exactly one
+        //    gets it, the rest fail the match and land in the exhaustion arm.
         let before = self
             .base
             .collection()
             .find_one_and_update(
-                doc! { "_id": network_id },
+                doc! { "_id": network_id, "next_host": { "$lte": max_host as i64 } },
                 doc! { "$inc": { "next_host": 1 }, "$set": { "updated_at": DateTime::now() } },
             )
             .return_document(ReturnDocument::Before)
-            .await?
-            .ok_or(DaoError::NotFound)?;
-        Ok(before.next_host)
+            .await?;
+        match before {
+            Some(b) => Ok(b.next_host),
+            None => {
+                // Row missing vs cursor-past-ceiling: only the latter is
+                // exhaustion; keep NotFound honest for a deleted network.
+                if self.base.find_by_id(network_id).await.is_ok() {
+                    Err(DaoError::Validation(format!(
+                        "overlay network {network_id} exhausted: every host \
+                         ordinal up to {max_host} is leased (grow the tenant's \
+                         block or release unused devices)"
+                    )))
+                } else {
+                    Err(DaoError::NotFound)
+                }
+            }
+        }
     }
 
     /// Return a host number to the tenant's free pool so a future join can
