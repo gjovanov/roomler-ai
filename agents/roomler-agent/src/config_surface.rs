@@ -131,6 +131,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Route-guard blind-tick seconds while the route-event subscription is live (2-300; 2 = pre-demotion war cadence). Built-in default: 30. Always 2 s without a live subscription.",
     ),
     (
+        "rc_max_sessions",
+        "number",
+        "Concurrent remote-control sessions this agent accepts (1-8). Each extra session runs its own capture + encoder until the shared encoder lands — weak-GPU hosts may prefer 1. Built-in default: 2.",
+    ),
+    (
         "overlay_relay_tls",
         "tribool",
         "Force overlay coturn allocations onto the TURNS/TCP (TLS) tier — corp-VPN probe. Built-in default: off.",
@@ -292,6 +297,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_rpf" => cfg.overlay_rpf.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
+        "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
@@ -419,6 +425,20 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         return Err("overlay_route_tick_secs must be between 2 and 300".into());
                     }
                     Some(s)
+                }
+            }
+        }
+        "rc_max_sessions" => {
+            cfg.rc_max_sessions = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| format!("rc_max_sessions must be a number (got {v:?})"))?;
+                    if !(1..=8).contains(&n) {
+                        return Err("rc_max_sessions must be between 1 and 8".into());
+                    }
+                    Some(n)
                 }
             }
         }
@@ -710,9 +730,13 @@ mod tests {
             let key = suffix.to_ascii_lowercase();
             let entry = entry_for(&cfg, &key)
                 .unwrap_or_else(|| panic!("bridged suffix {suffix} has no surface key '{key}'"));
-            assert_eq!(
-                entry.kind, "string",
-                "bridged numeric '{key}' rides the surface as a validated string"
+            // Historically "string" (the rate_factor keys predate the
+            // "number" editor kind); newer numerics use "number" like
+            // overlay_route_tick_secs. Either is a validated numeric edit.
+            assert!(
+                matches!(entry.kind.as_str(), "string" | "number"),
+                "bridged numeric '{key}' must be a validated string/number key, got {:?}",
+                entry.kind
             );
         }
     }
@@ -792,6 +816,22 @@ mod tests {
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("1")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("301")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("fast")).is_err());
+    }
+
+    #[test]
+    fn rc_max_sessions_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "rc_max_sessions", Some("3")).unwrap();
+        assert_eq!(cfg.rc_max_sessions, Some(3));
+        assert_eq!(
+            entry_for(&cfg, "rc_max_sessions").unwrap().value.as_deref(),
+            Some("3")
+        );
+        apply(&mut cfg, "rc_max_sessions", None).unwrap();
+        assert_eq!(cfg.rc_max_sessions, None);
+        assert!(apply(&mut cfg, "rc_max_sessions", Some("0")).is_err());
+        assert!(apply(&mut cfg, "rc_max_sessions", Some("9")).is_err());
+        assert!(apply(&mut cfg, "rc_max_sessions", Some("many")).is_err());
     }
 
     #[test]
