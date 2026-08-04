@@ -517,6 +517,8 @@ pub fn build_router(state: AppState) -> Router {
         "/credentials",
         get(routes::remote_control::turn_credentials),
     );
+    // Multi-region relay PoP topology (user-scoped, read-only, no secrets).
+    let relay_routes = Router::new().route("/regions", get(routes::remote_control::relay_regions));
 
     // Compose API
     let api = Router::new()
@@ -536,6 +538,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tunnel", public_tunnel_release_routes)
         .nest("/setup", public_setup_routes)
         .nest("/turn", turn_routes)
+        .nest("/relay", relay_routes)
         .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)

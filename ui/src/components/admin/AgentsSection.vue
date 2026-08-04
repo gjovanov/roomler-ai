@@ -192,6 +192,12 @@
                 <span class="mx-1">·</span>
                 <span :title="`machine_id: ${a.machine_id}`">{{ shortId(a.machine_id) }}</span>
                 <span v-if="a.agent_version"> · v{{ a.agent_version }}</span>
+                <span
+                  v-if="a.relay_home"
+                  :title="`Nearest relay region (RTT-probed): ${a.relay_home}`"
+                >
+                  · {{ a.relay_home }}</span
+                >
               </div>
             </td>
             <td>
