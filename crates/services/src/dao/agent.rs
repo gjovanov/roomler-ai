@@ -43,6 +43,7 @@ impl AgentDao {
             agent_token_hash,
             status: AgentStatus::Offline,
             last_seen_at: now,
+            last_presence: None,
             displays: Vec::new(),
             capabilities: AgentCaps::default(),
             access_policy: AccessPolicy::default(),
@@ -234,6 +235,48 @@ impl AgentDao {
                     "status": bson::to_bson(&status).unwrap(),
                     "last_seen_at": DateTime::now(),
                 } },
+            )
+            .await
+    }
+
+    /// P4 — CAS on the `last_presence` broadcast ledger. Returns `true` iff
+    /// THIS caller moved the field (i.e. it should fan the `device:presence`
+    /// transition out); a concurrent path on any pod that already recorded
+    /// the same value loses the race and stays silent. Tombstoned rows never
+    /// match — a deleted device must not resurrect as a badge event.
+    pub async fn set_presence_if_changed(
+        &self,
+        agent_id: ObjectId,
+        presence: &str,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! {
+                    "_id": agent_id,
+                    "deleted_at": null,
+                    "last_presence": { "$ne": presence },
+                },
+                doc! { "$set": { "last_presence": presence } },
+            )
+            .await
+    }
+
+    /// P4 — the presence sweeper's scan set: every non-tombstoned row whose
+    /// Mongo status still claims Online OR whose last BROADCAST presence was
+    /// online/stale. The second arm is what catches a pod that died without
+    /// teardown (its shutdown belt may have flipped `status` while the
+    /// ledger still says "online" — the offline event is still owed).
+    pub async fn find_presence_scan_set(&self) -> DaoResult<Vec<Agent>> {
+        self.base
+            .find_many(
+                doc! {
+                    "deleted_at": null,
+                    "$or": [
+                        { "status": bson::to_bson(&AgentStatus::Online).unwrap() },
+                        { "last_presence": { "$in": ["online", "stale"] } },
+                    ],
+                },
+                None,
             )
             .await
     }

@@ -226,6 +226,19 @@ export const useAgentStore = defineStore('agents', () => {
     }
   }
 
+  /** P4 — patch presence in place from a `device:presence` WS event for the
+   *  ACTIVE org. `status` is left alone (it's the Mongo lifecycle field);
+   *  `presence`/`is_online` are the reachability truth the list renders.
+   *  Unknown agent ids are ignored — the next fetch converges. */
+  function applyPresence(updates: Array<{ agent_id: string; presence: 'online' | 'stale' | 'offline' }>) {
+    for (const u of updates) {
+      const a = agents.value.find((x) => x.id === u.agent_id)
+      if (!a) continue
+      a.presence = u.presence
+      a.is_online = u.presence === 'online'
+    }
+  }
+
   async function issueEnrollmentToken(tenantId: string): Promise<EnrollmentToken> {
     return api.post<EnrollmentToken>(`/tenant/${tenantId}/agent/enroll-token`)
   }
@@ -343,6 +356,7 @@ export const useAgentStore = defineStore('agents', () => {
     loading,
     error,
     fetchAgents,
+    applyPresence,
     issueEnrollmentToken,
     rename,
     updateAccessPolicy,

@@ -212,6 +212,39 @@ impl RedisPubSub {
         Ok(n > 0)
     }
 
+    /// P4 — whether ANY pod currently claims this agent's presence record.
+    /// The teardown path uses this to tell "our compare-DEL lost to a
+    /// NEWER registration" (⇒ suppress the offline event) apart from "the
+    /// key was already gone" (⇒ the agent really is unreachable).
+    pub async fn agent_presence_exists(
+        &self,
+        agent_id_hex: &str,
+    ) -> Result<bool, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let n: i64 = redis::cmd("EXISTS")
+            .arg(Self::agent_key(agent_id_hex))
+            .query_async(&mut conn)
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// P4 — one-shot NX claim (`SET key <instance> NX EX ttl`) for
+    /// cluster-singleton periodic work (the presence staleness sweep).
+    /// Returns whether THIS instance won the cycle. Never released — the
+    /// TTL is the cycle length, so the claim self-expires.
+    pub async fn try_claim(&self, key: &str, ttl_secs: u64) -> Result<bool, redis::RedisError> {
+        let mut conn = self.publisher.clone();
+        let res: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(&self.instance_id)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut conn)
+            .await?;
+        Ok(res.is_some())
+    }
+
     /// Batched presence read for the agent listing: one MGET over all
     /// ids, `Some(owner_token)` per present (⇒ fresh, TTL-enforced) key.
     pub async fn agent_presence_get_many(
