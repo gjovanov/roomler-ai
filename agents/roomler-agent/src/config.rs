@@ -371,6 +371,280 @@ pub struct AgentConfig {
     /// survive an auto-rollback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tunnel_routes: Vec<tunnel_core::localapi::RouteDescriptor>,
+
+    /// Multi-org P1: SECONDARY enrollments (`[[orgs]]`). The top-level scalar
+    /// identity fields (`server_url` / `agent_token` / `agent_id` /
+    /// `tenant_id`) REMAIN the PRIMARY org — deliberately, so a rollback to a
+    /// pre-multi-org binary keeps running the primary unchanged and simply
+    /// never reads this table. Each enabled entry gets its own supervised
+    /// signaling WS loop in `run_cmd`; `machine_id` / `machine_name` are
+    /// machine-scoped and shared by every org (the server dedupes per tenant
+    /// via the `agents.{tenant_id, machine_id}` unique index).
+    ///
+    /// Managed by `roomler-agent enroll` (appends when the enrollment
+    /// resolves to a NEW (server, tenant) pair) and the `roomler-agent org`
+    /// verbs. Deliberately NOT on the S2 config surface — same policy as
+    /// `[[tunnel_routes]]`: identity + secrets live behind dedicated verbs.
+    ///
+    /// NB: same rollback caveat as `tunnel_routes` — a crash-rollback to a
+    /// pre-multi-org binary rewrites the config without this field, so
+    /// secondary enrollments do not survive an auto-rollback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orgs: Vec<OrgEntry>,
+}
+
+/// Multi-org P1 — one SECONDARY enrollment (see [`AgentConfig::orgs`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrgEntry {
+    /// Operator-facing slug, unique among entries and never
+    /// [`PRIMARY_ORG_LABEL`]. Used by the `org` CLI verbs, log/tracing
+    /// fields, the per-org watchdog pump name, and `[[tunnel_routes]].org`.
+    pub label: String,
+    /// Base URL of this org's Roomler API. May differ from the primary's
+    /// (self-hosted servers); overlay `tun` mode is reserved for orgs sharing
+    /// the primary's control plane (enforced in P2 — P1 forces `off`).
+    pub server_url: String,
+    /// Derived WSS URL; recomputed from `server_url` if absent.
+    #[serde(default)]
+    pub ws_url: Option<String>,
+    /// This org's long-lived agent JWT.
+    pub agent_token: String,
+    /// This org's server-assigned agent id (hex ObjectId).
+    pub agent_id: String,
+    /// This org's tenant id (hex ObjectId).
+    pub tenant_id: String,
+    /// Soft-disable: a disabled org keeps its enrollment but gets no
+    /// supervised WS loop until re-enabled (applied at the next daemon
+    /// start, like every config key).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How this org joins the L3 overlay. P1 supervisors force `Off`
+    /// regardless of this value; P2 honours `netstack`/`tun` (with `tun`
+    /// restricted to same-control-plane orgs + tenant-block addressing).
+    #[serde(default)]
+    pub overlay_mode: OrgOverlayMode,
+    /// This org's OWN WireGuard secret (base64). NEVER copied from the
+    /// primary or another org — a shared public key would let two orgs
+    /// correlate the same physical device. Minted at enroll-append time
+    /// (or on this org's first overlay-enabled start, P2).
+    #[serde(default)]
+    pub overlay_wg_secret_key: Option<String>,
+    /// Org-scoped twin of `overlay_advertised_routes` (P2).
+    #[serde(default)]
+    pub overlay_advertised_routes: Vec<String>,
+    /// Org-scoped twin of `overlay_exit_node_enabled` (P2; exit offering is
+    /// single-owner across orgs — arbitrated at bring-up).
+    #[serde(default)]
+    pub overlay_exit_node_enabled: bool,
+    /// Org-scoped twin of `advertise_routes` (tunnel/SOCKS mesh subnet
+    /// advertisements are per-tenant admin-approved).
+    #[serde(default)]
+    pub advertise_routes: Vec<String>,
+}
+
+impl OrgEntry {
+    pub fn ws_url(&self) -> String {
+        if let Some(url) = &self.ws_url {
+            return url.clone();
+        }
+        derive_ws_url(&self.server_url)
+    }
+}
+
+/// Multi-org P1 — per-org overlay participation. Multi-state, so an enum
+/// (never a tribool): `off` (P1 default for secondaries) | `netstack`
+/// (userspace stack — no TUN/OS routes; P2) | `tun` (full OS-TUN presence;
+/// P2, same-control-plane orgs only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrgOverlayMode {
+    #[default]
+    Off,
+    Netstack,
+    Tun,
+}
+
+/// The reserved label naming the config's scalar (primary) identity.
+pub const PRIMARY_ORG_LABEL: &str = "primary";
+
+impl AgentConfig {
+    /// Enabled secondary enrollments, in config order.
+    pub fn enabled_secondary_orgs(&self) -> impl Iterator<Item = &OrgEntry> {
+        self.orgs.iter().filter(|o| o.enabled)
+    }
+
+    /// Find a secondary org by label (case-sensitive).
+    pub fn find_org(&self, label: &str) -> Option<&OrgEntry> {
+        self.orgs.iter().find(|o| o.label == label)
+    }
+
+    /// Find a secondary org by its enrollment identity — the (server, tenant)
+    /// pair that `enroll` resolves against.
+    pub fn find_org_by_identity_mut(
+        &mut self,
+        server_url: &str,
+        tenant_id: &str,
+    ) -> Option<&mut OrgEntry> {
+        self.orgs
+            .iter_mut()
+            .find(|o| o.server_url == server_url && o.tenant_id == tenant_id)
+    }
+
+    /// Does the (server, tenant) pair name the PRIMARY enrollment?
+    pub fn is_primary_identity(&self, server_url: &str, tenant_id: &str) -> bool {
+        self.server_url == server_url && self.tenant_id == tenant_id
+    }
+
+    /// The AgentConfig an org supervisor runs with: machine identity +
+    /// operator knobs from `self`, enrollment identity + org-scoped fields
+    /// from the entry. P1: the overlay is FORCED OFF for secondaries (no
+    /// second TUN/netstack runtime until P2's tenant-block addressing), and
+    /// declared tunnel routes are reconciled only by the primary-side
+    /// reconciler.
+    pub fn for_org(&self, org: &OrgEntry) -> AgentConfig {
+        let mut c = self.clone();
+        c.server_url = org.server_url.clone();
+        c.ws_url = org.ws_url.clone();
+        c.agent_token = org.agent_token.clone();
+        c.agent_id = org.agent_id.clone();
+        c.tenant_id = org.tenant_id.clone();
+        c.overlay_enabled = false;
+        c.overlay_wg_secret_key = org.overlay_wg_secret_key.clone();
+        c.overlay_advertised_routes = org.overlay_advertised_routes.clone();
+        c.overlay_exit_node_enabled = false;
+        c.overlay_exit_node = None;
+        c.advertise_routes = org.advertise_routes.clone();
+        c.tunnel_routes = Vec::new();
+        c.orgs = Vec::new();
+        c
+    }
+
+    /// Per-entry runnability partition for the daemon supervisor: each
+    /// `[[orgs]]` entry paired with `None` (runnable) or `Some(reason)` (a
+    /// validation problem — the supervisor skips it and surfaces the reason
+    /// in the LocalAPI `OrgStatus.terminal_error`). Never fatal: a bad
+    /// hand-edited entry must not take down the healthy orgs.
+    pub fn partition_runnable_orgs(&self) -> Vec<(OrgEntry, Option<String>)> {
+        let mut out = Vec::with_capacity(self.orgs.len());
+        let mut seen_labels = std::collections::HashSet::new();
+        let mut seen_identities = std::collections::HashSet::new();
+        for o in &self.orgs {
+            let problem = if sanitize_org_label(&o.label).as_deref() != Some(o.label.as_str()) {
+                Some(format!("invalid org label {:?}", o.label))
+            } else if !seen_labels.insert(o.label.clone()) {
+                Some(format!("duplicate org label {:?}", o.label))
+            } else if self.is_primary_identity(&o.server_url, &o.tenant_id) {
+                Some("duplicates the primary enrollment".to_string())
+            } else if !seen_identities.insert((o.server_url.clone(), o.tenant_id.clone())) {
+                Some("duplicates another entry's (server, tenant) pair".to_string())
+            } else {
+                None
+            };
+            out.push((o.clone(), problem));
+        }
+        out
+    }
+
+    /// Validate the `[[orgs]]` table. Returns human-readable problems; the
+    /// caller logs them and SKIPS the offending entries (never fatal — a bad
+    /// hand-edited entry must not take down the healthy orgs).
+    pub fn validate_orgs(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let mut seen_labels = std::collections::HashSet::new();
+        let mut seen_identities = std::collections::HashSet::new();
+        for o in &self.orgs {
+            if sanitize_org_label(&o.label).as_deref() != Some(o.label.as_str()) {
+                problems.push(format!(
+                    "org label {:?} is invalid (lowercase alphanumeric + dashes, \
+                     not {PRIMARY_ORG_LABEL:?})",
+                    o.label
+                ));
+            }
+            if !seen_labels.insert(o.label.clone()) {
+                problems.push(format!("duplicate org label {:?}", o.label));
+            }
+            let identity = (o.server_url.clone(), o.tenant_id.clone());
+            if self.is_primary_identity(&o.server_url, &o.tenant_id) {
+                problems.push(format!(
+                    "org {:?} duplicates the primary enrollment ({} / tenant {})",
+                    o.label, o.server_url, o.tenant_id
+                ));
+            } else if !seen_identities.insert(identity) {
+                problems.push(format!(
+                    "org {:?} duplicates another entry's (server, tenant) pair",
+                    o.label
+                ));
+            }
+        }
+        problems
+    }
+}
+
+/// Multi-org P1 — swap a secondary enrollment into the PRIMARY (scalar)
+/// slot; the demoted primary takes the promoted org's `[[orgs]]` position
+/// under the promoted org's old label. Machine identity and operator knobs
+/// stay put; the org-scoped fields (WG key, advertised routes, exit offer)
+/// travel with their enrollments. The overlay TUN follows the primary slot,
+/// so the swapped-in primary starts `overlay_enabled = false` (P1: the
+/// operator opts back in explicitly) and the demoted entry parks at
+/// `OrgOverlayMode::Off` until P2's per-org overlay lands.
+pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> {
+    let Some(idx) = cfg.orgs.iter().position(|o| o.label == label) else {
+        anyhow::bail!("no org labelled {label:?} — see `roomler-agent org ls`");
+    };
+    let entry = cfg.orgs.remove(idx);
+    let demoted = OrgEntry {
+        label: entry.label.clone(),
+        server_url: cfg.server_url.clone(),
+        ws_url: cfg.ws_url.clone(),
+        agent_token: cfg.agent_token.clone(),
+        agent_id: cfg.agent_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        enabled: true,
+        overlay_mode: OrgOverlayMode::Off,
+        overlay_wg_secret_key: cfg.overlay_wg_secret_key.clone(),
+        overlay_advertised_routes: cfg.overlay_advertised_routes.clone(),
+        overlay_exit_node_enabled: cfg.overlay_exit_node_enabled,
+        advertise_routes: cfg.advertise_routes.clone(),
+    };
+    cfg.server_url = entry.server_url;
+    cfg.ws_url = entry.ws_url;
+    cfg.agent_token = entry.agent_token;
+    cfg.agent_id = entry.agent_id;
+    cfg.tenant_id = entry.tenant_id;
+    cfg.overlay_wg_secret_key = entry.overlay_wg_secret_key;
+    cfg.overlay_advertised_routes = entry.overlay_advertised_routes;
+    cfg.overlay_exit_node_enabled = entry.overlay_exit_node_enabled;
+    cfg.overlay_exit_node = None;
+    cfg.advertise_routes = entry.advertise_routes;
+    cfg.overlay_enabled = false;
+    cfg.orgs.insert(idx, demoted);
+    Ok(())
+}
+
+/// Normalize an operator-supplied org label: lowercase, spaces/`_` → `-`,
+/// strip everything outside `[a-z0-9-]`, trim dashes, cap at 32 chars.
+/// Returns `None` when nothing valid remains or the result would collide
+/// with the reserved [`PRIMARY_ORG_LABEL`].
+pub fn sanitize_org_label(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in raw.trim().chars() {
+        let ch = ch.to_ascii_lowercase();
+        match ch {
+            'a'..='z' | '0'..='9' => out.push(ch),
+            ' ' | '_' | '-' | '.' if !out.ends_with('-') && !out.is_empty() => out.push('-'),
+            _ => {}
+        }
+        if out.len() >= 32 {
+            break;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() || out == PRIMARY_ORG_LABEL {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 impl AgentConfig {
@@ -402,7 +676,13 @@ fn default_true() -> bool {
 /// Current schema version. Bumped whenever [`migrate`] gains a new
 /// step. Persisted into the config file by the migration so subsequent
 /// runs short-circuit the migration check.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.198";
+///
+/// `0.3.0-rc.300` — multi-org P1: `[[orgs]]` secondary enrollments. No
+/// structural rewrite is needed (the scalar identity fields REMAIN the
+/// primary org, and `orgs` serde-defaults to empty), so the step is a
+/// stamp-only pass that rewrites the file with the current in-memory
+/// shape.
+pub const CURRENT_SCHEMA_VERSION: &str = "0.3.0-rc.300";
 
 /// Apply schema migrations to `cfg` in place. Returns `true` when the
 /// caller should persist the mutated config via [`save`]. Safe to call
@@ -850,7 +1130,200 @@ mod tests {
             advertise_routes: Vec::new(),
             advertise_local_subnets: true,
             tunnel_routes: Vec::new(),
+            orgs: Vec::new(),
         }
+    }
+
+    /// A minimal valid secondary-org entry for tests.
+    pub(super) fn org_fixture(label: &str, tenant: &str) -> OrgEntry {
+        OrgEntry {
+            label: label.to_string(),
+            server_url: "https://example.invalid".into(),
+            ws_url: None,
+            agent_token: format!("tok-{label}"),
+            agent_id: format!("aid-{label}"),
+            tenant_id: tenant.to_string(),
+            enabled: true,
+            overlay_mode: OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn orgs_toml_round_trip_preserves_entries() {
+        let mut cfg = fixture();
+        cfg.orgs = vec![
+            org_fixture("acme", "tid-acme"),
+            OrgEntry {
+                enabled: false,
+                overlay_mode: OrgOverlayMode::Netstack,
+                overlay_wg_secret_key: Some("KEY-B".into()),
+                overlay_advertised_routes: vec!["10.9.0.0/24".into()],
+                advertise_routes: vec!["192.168.7.0/24".into()],
+                ..org_fixture("beta-corp", "tid-beta")
+            },
+        ];
+        let toml_str = toml::to_string_pretty(&cfg).expect("serialise");
+        let back: AgentConfig = toml::from_str(&toml_str).expect("parse");
+        assert_eq!(back.orgs, cfg.orgs, "orgs must survive a TOML round-trip");
+        // The scalar (primary) identity is untouched by the table.
+        assert_eq!(back.agent_id, cfg.agent_id);
+        assert_eq!(back.tenant_id, cfg.tenant_id);
+    }
+
+    #[test]
+    fn config_without_orgs_field_loads_and_serialises_without_it() {
+        // Back-compat both ways: a legacy file has no `orgs` (defaults
+        // empty), and a single-org config never writes the key (so a
+        // rollback binary's parser has nothing to trip on).
+        let raw = r#"
+            server_url = "https://example.invalid"
+            agent_token = "tok"
+            agent_id = "aid"
+            tenant_id = "tid"
+            machine_id = "mid"
+            machine_name = "host"
+        "#;
+        let cfg: AgentConfig = toml::from_str(raw).expect("legacy config must parse");
+        assert!(cfg.orgs.is_empty());
+        let out = toml::to_string_pretty(&cfg).expect("serialise");
+        assert!(
+            !out.contains("[[orgs]]"),
+            "empty orgs table must not be written: {out}"
+        );
+    }
+
+    #[test]
+    fn for_org_swaps_identity_and_forces_overlay_off() {
+        let mut cfg = fixture();
+        cfg.overlay_enabled = true;
+        cfg.overlay_wg_secret_key = Some("PRIMARY-KEY".into());
+        cfg.overlay_exit_node = Some("exit-1".into());
+        cfg.tunnel_routes = vec![tunnel_core::localapi::RouteDescriptor {
+            id: "r1".into(),
+            kind: tunnel_core::localapi::FlowKind::Forward,
+            node: "aid".into(),
+            local: 18080,
+            remote: Some("127.0.0.1:80".into()),
+            transport: String::new(),
+            enabled: true,
+            org: None,
+        }];
+        let mut org = org_fixture("acme", "tid-acme");
+        org.overlay_wg_secret_key = Some("ACME-KEY".into());
+        org.advertise_routes = vec!["10.1.0.0/24".into()];
+        cfg.orgs = vec![org.clone()];
+
+        let oc = cfg.for_org(&org);
+        // Identity comes from the entry…
+        assert_eq!(oc.server_url, org.server_url);
+        assert_eq!(oc.agent_token, "tok-acme");
+        assert_eq!(oc.agent_id, "aid-acme");
+        assert_eq!(oc.tenant_id, "tid-acme");
+        // …machine identity + operator knobs are shared…
+        assert_eq!(oc.machine_id, cfg.machine_id);
+        assert_eq!(oc.machine_name, cfg.machine_name);
+        // …the org's own WG key rides along (never the primary's)…
+        assert_eq!(oc.overlay_wg_secret_key.as_deref(), Some("ACME-KEY"));
+        assert_eq!(oc.advertise_routes, vec!["10.1.0.0/24".to_string()]);
+        // …and P1 forces the overlay + route surfaces off/empty.
+        assert!(!oc.overlay_enabled, "P1: secondary overlay must be OFF");
+        assert!(!oc.overlay_exit_node_enabled);
+        assert!(oc.overlay_exit_node.is_none());
+        assert!(oc.tunnel_routes.is_empty());
+        assert!(oc.orgs.is_empty(), "no recursive org table");
+    }
+
+    #[test]
+    fn validate_orgs_flags_dupes_and_bad_labels() {
+        let mut cfg = fixture();
+        cfg.orgs = vec![
+            org_fixture("acme", "tid-a"),
+            org_fixture("acme", "tid-b"),    // dup label
+            org_fixture("primary", "tid-c"), // reserved
+            org_fixture("beta", "tid"), // duplicates the PRIMARY identity (fixture tenant "tid")
+            org_fixture("gamma", "tid-a"), // dup (server, tenant) with the first entry
+        ];
+        let problems = cfg.validate_orgs();
+        assert!(problems.iter().any(|p| p.contains("duplicate org label")));
+        assert!(problems.iter().any(|p| p.contains("\"primary\"")));
+        assert!(
+            problems.iter().any(|p| p.contains("primary enrollment")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("another entry's (server, tenant)")),
+            "{problems:?}"
+        );
+
+        let clean = AgentConfig {
+            orgs: vec![org_fixture("acme", "tid-a"), org_fixture("beta", "tid-b")],
+            ..fixture()
+        };
+        assert!(clean.validate_orgs().is_empty());
+    }
+
+    #[test]
+    fn promote_org_swaps_identity_and_org_scoped_fields() {
+        let mut cfg = fixture(); // primary: example.invalid / tid / tok
+        cfg.overlay_enabled = true;
+        cfg.overlay_wg_secret_key = Some("PRIM-KEY".into());
+        cfg.overlay_advertised_routes = vec!["10.0.0.0/24".into()];
+        cfg.overlay_exit_node = Some("exit-1".into());
+        cfg.encoder_preference = EncoderPreferenceChoice::Software;
+        let mut acme = org_fixture("acme", "tid-acme");
+        acme.server_url = "https://acme.invalid".into();
+        acme.overlay_wg_secret_key = Some("ACME-KEY".into());
+        acme.advertise_routes = vec!["192.168.9.0/24".into()];
+        cfg.orgs = vec![org_fixture("zeta", "tid-z"), acme];
+
+        promote_org_to_primary(&mut cfg, "acme").unwrap();
+
+        // Promoted identity + org-scoped fields are now the scalars…
+        assert_eq!(cfg.server_url, "https://acme.invalid");
+        assert_eq!(cfg.agent_token, "tok-acme");
+        assert_eq!(cfg.agent_id, "aid-acme");
+        assert_eq!(cfg.tenant_id, "tid-acme");
+        assert_eq!(cfg.overlay_wg_secret_key.as_deref(), Some("ACME-KEY"));
+        assert_eq!(cfg.advertise_routes, vec!["192.168.9.0/24".to_string()]);
+        // …the TUN opt-in resets (operator re-opts per the P1 contract)…
+        assert!(!cfg.overlay_enabled);
+        assert!(cfg.overlay_exit_node.is_none());
+        // …operator knobs stay put…
+        assert!(matches!(
+            cfg.encoder_preference,
+            EncoderPreferenceChoice::Software
+        ));
+        // …and the demoted primary sits in acme's old slot under acme's label.
+        assert_eq!(cfg.orgs.len(), 2);
+        assert_eq!(cfg.orgs[0].label, "zeta");
+        let demoted = &cfg.orgs[1];
+        assert_eq!(demoted.label, "acme");
+        assert_eq!(demoted.server_url, "https://example.invalid");
+        assert_eq!(demoted.tenant_id, "tid");
+        assert_eq!(demoted.agent_token, "tok");
+        assert_eq!(demoted.overlay_wg_secret_key.as_deref(), Some("PRIM-KEY"));
+        assert_eq!(demoted.overlay_mode, OrgOverlayMode::Off);
+        assert!(demoted.enabled);
+
+        // Unknown label is a hard error, config untouched.
+        assert!(promote_org_to_primary(&mut cfg, "ghost").is_err());
+    }
+
+    #[test]
+    fn sanitize_org_label_rules() {
+        assert_eq!(sanitize_org_label(" Acme Corp "), Some("acme-corp".into()));
+        assert_eq!(sanitize_org_label("roomler.ai"), Some("roomler-ai".into()));
+        assert_eq!(sanitize_org_label("Ümlaut__x"), Some("mlaut-x".into()));
+        assert_eq!(sanitize_org_label("primary"), None, "reserved");
+        assert_eq!(sanitize_org_label("PRIMARY"), None, "reserved, any case");
+        assert_eq!(sanitize_org_label("###"), None);
+        assert_eq!(sanitize_org_label(""), None);
     }
 
     #[test]
