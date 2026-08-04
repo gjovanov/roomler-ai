@@ -2133,6 +2133,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "derp-relay"
+version = "0.3.0-rc.299"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "dashmap",
+ "futures",
+ "ring",
+ "roomler-ai-remote-control",
+ "serde",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7252,8 +7269,10 @@ dependencies = [
  "bson",
  "dashmap",
  "hmac",
+ "jsonwebtoken",
  "mongodb",
  "parking_lot 0.12.5",
+ "ring",
  "serde",
  "serde_json",
  "sha1 0.10.6",
