@@ -240,6 +240,18 @@
                 :aria-label="`Consent mode for ${a.name}`"
                 @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
               />
+              <!-- P6 — multi-user input mode (free-for-all | exclusive). -->
+              <v-select
+                :model-value="a.access_policy.input_mode ?? 'free'"
+                :items="INPUT_MODE_ITEMS"
+                density="compact"
+                variant="plain"
+                hide-details
+                :disabled="consentBusy === a.id"
+                class="consent-select"
+                :aria-label="`Input mode for ${a.name}`"
+                @update:model-value="(m) => onInputModeChange(a, m as 'free' | 'exclusive')"
+              />
             </td>
             <td>
               <div v-if="codecChips(a).length === 0" class="text-caption text-medium-emphasis">—</div>
@@ -386,6 +398,19 @@
               class="mb-2"
               :aria-label="`Consent mode for ${a.name}`"
               @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
+            />
+            <!-- P6 — multi-user input mode. -->
+            <v-select
+              :model-value="a.access_policy.input_mode ?? 'free'"
+              :items="INPUT_MODE_ITEMS"
+              label="Input"
+              density="compact"
+              variant="outlined"
+              hide-details
+              :disabled="consentBusy === a.id"
+              class="mb-2"
+              :aria-label="`Input mode for ${a.name}`"
+              @update:model-value="(m) => onInputModeChange(a, m as 'free' | 'exclusive')"
             />
             <div class="d-flex gap-2">
               <v-btn
@@ -1016,6 +1041,28 @@ async function onConsentModeChange(a: Agent, mode: ConsentMode) {
     await agentStore.updateAccessPolicy(props.tenantId, a.id, {
       ...a.access_policy,
       consent_mode: mode,
+    })
+  } catch (e) {
+    agentStore.error = (e as Error).message
+  } finally {
+    consentBusy.value = null
+  }
+}
+
+// P6 — per-device multi-user input arbitration mode. `free` (default) =
+// every INPUT-granted viewer injects (agent-fenced); `exclusive` = one
+// floor holder with request/grant. Applies to NEW sessions.
+const INPUT_MODE_ITEMS: { title: string; value: 'free' | 'exclusive' }[] = [
+  { title: 'Free-for-all (fenced)', value: 'free' },
+  { title: 'Exclusive (one controller)', value: 'exclusive' },
+]
+async function onInputModeChange(a: Agent, mode: 'free' | 'exclusive') {
+  if ((a.access_policy.input_mode ?? 'free') === mode) return
+  consentBusy.value = a.id
+  try {
+    await agentStore.updateAccessPolicy(props.tenantId, a.id, {
+      ...a.access_policy,
+      input_mode: mode,
     })
   } catch (e) {
     agentStore.error = (e as Error).message

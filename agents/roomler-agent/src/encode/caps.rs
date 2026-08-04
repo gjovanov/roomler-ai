@@ -444,6 +444,11 @@ fn compute_caps() -> AgentCaps {
         apps,
         clipboard,
         layout,
+        // P6 — the InputArbiter runs on every build (injection degrades to
+        // Noop without enigo-input, but the arbitration/floor semantics
+        // hold), so the server can safely lift the P3 single-INPUT-holder
+        // downgrade for this agent.
+        input: vec!["arbiter".into(), "exclusive".into(), "ghost-cursor".into()],
     }
 }
 

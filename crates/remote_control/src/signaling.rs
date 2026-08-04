@@ -768,6 +768,13 @@ pub enum ServerMsg {
         /// `AccessPolicy.consent_mode` (self-control → `Auto`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consent_mode: Option<ConsentMode>,
+        /// P6 — the device's input arbitration mode directive from
+        /// `AccessPolicy.input_mode`. `None` (older server / unset policy) →
+        /// the agent's arbiter default (free). Only the FIRST session's hint
+        /// seeds the mode; in-session toggles win afterwards. Additive —
+        /// serde-default so old agents/servers interop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_mode: Option<crate::models::InputMode>,
     },
 
     /// Server forwards SDP offer from controller → agent.
