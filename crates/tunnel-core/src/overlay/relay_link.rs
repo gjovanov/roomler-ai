@@ -610,8 +610,12 @@ impl RelayCoordinator {
                 // literal fails coturn's DNS-cert verification (NotValidForName).
                 // The TURNS tier is pinned via the server's `&pin=` on its
                 // hostname URL (rc.140), which dials this same worker while
-                // keeping the SNI valid.
-                let mut pinned = vec![format!("turn:{h}:3478?transport=udp")];
+                // keeping the SNI valid. The pin dials the grant's own UDP
+                // port, not a hardcoded 3478 — regional PoPs may differ.
+                let udp_port = roomler_ai_remote_control::turn_url::first_udp_port(
+                    ice.iter().flat_map(|s| s.urls.iter()).map(String::as_str),
+                );
+                let mut pinned = vec![format!("turn:{h}:{udp_port}?transport=udp")];
                 pinned.extend(urls);
                 pinned
             }
@@ -820,15 +824,15 @@ fn turn_creds(ice_servers: &[IceServer]) -> Option<(Vec<String>, String, String)
     })
 }
 
-/// Hostname of the first `turn:`/`turns:` ICE url (e.g. `coturn.roomler.ai`).
-/// Strips the scheme + `:port` + `?query`.
-fn turn_host(ice: &[IceServer]) -> Option<String> {
+/// Host + port of the first `turn:`/`turns:` ICE url (e.g.
+/// `("coturn.roomler.ai", 3478)`). Skips `stun:` entries; the port defaults to
+/// 3478 when the url carries none.
+fn turn_host_port(ice: &[IceServer]) -> Option<(String, u16)> {
     ice.iter().flat_map(|s| s.urls.iter()).find_map(|u| {
-        let rest = u
-            .strip_prefix("turns:")
-            .or_else(|| u.strip_prefix("turn:"))?;
-        let host = rest.split([':', '?']).next()?;
-        (!host.is_empty()).then(|| host.to_string())
+        if !u.starts_with("turn:") && !u.starts_with("turns:") {
+            return None;
+        }
+        roomler_ai_remote_control::turn_url::host_port(u)
     })
 }
 
@@ -841,8 +845,8 @@ fn turn_host(ice: &[IceServer]) -> Option<String> {
 /// resolution fails, which degrades to the pre-rc.125 behaviour rather than
 /// failing the allocation.
 async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
-    let host = turn_host(ice)?;
-    let ips: Vec<IpAddr> = match lookup_host((host.as_str(), 3478u16)).await {
+    let (host, port) = turn_host_port(ice)?;
+    let ips: Vec<IpAddr> = match lookup_host((host.as_str(), port)).await {
         Ok(addrs) => addrs.map(|s| s.ip()).collect(),
         Err(e) => {
             warn!(%host, %e, "overlay relay: coturn DNS resolve failed; not pinning a worker");
@@ -911,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_host_strips_scheme_port_query() {
+    fn turn_host_port_strips_scheme_and_query_keeps_port() {
         let servers = vec![
             IceServer {
                 urls: vec!["stun:stun.l.google.com:19302".into()],
@@ -920,14 +924,22 @@ mod tests {
             },
             ice("turn:coturn.roomler.ai:3478?transport=udp"),
         ];
-        assert_eq!(turn_host(&servers).as_deref(), Some("coturn.roomler.ai"));
         assert_eq!(
-            turn_host(&[ice("turns:coturn.roomler.ai:443?transport=tcp")]).as_deref(),
-            Some("coturn.roomler.ai")
+            turn_host_port(&servers),
+            Some(("coturn.roomler.ai".into(), 3478))
+        );
+        assert_eq!(
+            turn_host_port(&[ice("turns:coturn.roomler.ai:443?transport=tcp")]),
+            Some(("coturn.roomler.ai".into(), 443))
+        );
+        // A portless url resolves on the default TURN port.
+        assert_eq!(
+            turn_host_port(&[ice("turn:pop.example.com")]),
+            Some(("pop.example.com".into(), 3478))
         );
         // stun-only / empty → no host
         assert_eq!(
-            turn_host(&[IceServer {
+            turn_host_port(&[IceServer {
                 urls: vec!["stun:stun.example:3478".into()],
                 username: None,
                 credential: None,
