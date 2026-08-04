@@ -32,14 +32,25 @@
            the old list only mutated the store, leaving the URL and the
            room list on the previous org. -->
       <v-list v-if="!rail" density="compact">
-        <v-menu>
+        <v-menu @update:model-value="(open: boolean) => open && orgBadges.fetchSummary()">
           <template #activator="{ props: menuProps }">
             <v-list-item
               v-bind="menuProps"
               :title="tenantStore.current?.name || 'Select organization'"
               prepend-icon="mdi-domain"
-              append-icon="mdi-chevron-down"
-            />
+            >
+              <template #append>
+                <!-- P4 — dot = some OTHER org has unread activity -->
+                <v-badge
+                  v-if="orgBadges.anyForeignActivity(tenantStore.current?.id ?? null)"
+                  dot
+                  color="error"
+                  inline
+                  class="mr-1"
+                />
+                <v-icon size="small">mdi-chevron-down</v-icon>
+              </template>
+            </v-list-item>
           </template>
           <v-list density="compact">
             <v-list-item
@@ -50,7 +61,26 @@
               :active="tenantStore.current?.id === t.id"
               prepend-icon="mdi-domain"
               @click="selectTenant(t)"
-            />
+            >
+              <template #append>
+                <!-- P4 — per-org badges: unread messages+notifications, plus an
+                     amber marker when devices went offline/stale while parked -->
+                <v-badge
+                  v-if="tenantStore.current?.id !== t.id && orgBadges.badgeCount(t.id) > 0"
+                  :content="orgBadges.badgeCount(t.id)"
+                  color="error"
+                  inline
+                />
+                <v-icon
+                  v-if="tenantStore.current?.id !== t.id && orgBadges.hasDeviceEvents(t.id)"
+                  size="x-small"
+                  color="warning"
+                  class="ml-1"
+                >
+                  mdi-monitor-off
+                </v-icon>
+              </template>
+            </v-list-item>
             <v-divider />
             <v-list-item
               title="New organization"
@@ -325,6 +355,7 @@ import { useTenantStore } from '@/stores/tenant'
 import { canSeeFleetNav } from '@/utils/permissions'
 import { useRoomStore } from '@/stores/rooms'
 import { useNotificationStore } from '@/stores/notification'
+import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
 import { useWsStore } from '@/stores/ws'
 import { useMessageStore } from '@/stores/messages'
@@ -341,6 +372,7 @@ const { auth, logout: handleLogout } = useAuth()
 const tenantStore = useTenantStore()
 const roomStore = useRoomStore()
 const notificationStore = useNotificationStore()
+const orgBadges = useOrgBadgesStore()
 const conferenceStore = useConferenceStore()
 const wsStore = useWsStore()
 const route = useRoute()
@@ -496,6 +528,9 @@ function goHome() {
 
 function selectTenant(t: Tenant) {
   tenantStore.setCurrent(t as never)
+  // P4 — visiting an org acknowledges its badges (device-attention dot
+  // clears; counts re-sync from the summary endpoint).
+  orgBadges.clearForTenant(t.id)
   // Navigate — the pre-2026-08 switcher only mutated the store, leaving
   // the URL, sidebar targets and room list on the previous org.
   router.push(`/tenant/${t.id}`)
@@ -556,6 +591,8 @@ function onSearchShortcut(e: KeyboardEvent) {
 // gone — refetch rooms (call badges), unread counts, and the open room's
 // messages so the UI converges without a manual reload.
 async function onWsReconnected() {
+  // P4 — cross-org badges converge by refetch (no event replay).
+  orgBadges.fetchSummary()
   if (!tenantId.value) return
   await roomStore.fetchRooms(tenantId.value)
   roomStore.fetchAllUnreadCounts(tenantId.value)
@@ -568,6 +605,7 @@ async function onWsReconnected() {
 onMounted(async () => {
   await tenantStore.fetchTenants()
   notificationStore.fetchUnreadCount()
+  orgBadges.fetchSummary()
   window.addEventListener('room:call_started', onCallStarted)
   window.addEventListener('keydown', onSearchShortcut)
   window.addEventListener('ws:reconnected', onWsReconnected)
