@@ -651,6 +651,35 @@ impl OverlayRuntime {
             let phase_a_dst = cands.public;
             let srflx_dst = cands.srflx;
 
+            // Multi-org P2a: the peer's OVERLAY IP changed under a stable
+            // node_id — the tenant-block renumber (P2b) re-IPs nodes, and
+            // everything we hold (crypto-route, peer /32, defended route) is
+            // keyed to the OLD address. Pre-P2a this upsert was a silent
+            // no-op: the already-installed short-circuits below kept the
+            // stale /32 + router entry alive and the new IP was never
+            // installed. Tear down FIRST (so the copy-out below reads None →
+            // clean install); `PeerRoute::Drop` (vs the key-rotation arm's
+            // `Keep`) because the OLD address's route must go — install
+            // re-adds the new one, and Drop's other-claimant guard protects a
+            // recycled address already owned by a different live peer.
+            if let Some(old_ip) = by_node.get(&np.node_id).map(|e| e.overlay_ip)
+                && old_ip != cfg.overlay_ip
+            {
+                warn!(peer = %np.node_id, old_ip = %old_ip, new_ip = %cfg.overlay_ip,
+                    "overlay: peer's overlay IP changed (renumber) — reinstalling its carrier");
+                self.remove_peer_state(
+                    np.node_id,
+                    wg,
+                    by_node,
+                    tun,
+                    relay,
+                    relay_bq,
+                    None,
+                    upgrade_probes,
+                    PeerRoute::Drop,
+                )
+                .await;
+            }
             // Copy-out the installed carrier's shape (all Copy), so the by_node
             // borrow ends before any mutation below.
             let installed = by_node

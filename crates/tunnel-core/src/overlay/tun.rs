@@ -1690,14 +1690,42 @@ mod system {
     /// Peer `/32`s are deliberately NOT protected — a stale peer route is
     /// exactly what this reconciler exists to remove, and `install_peers`
     /// re-adds the live ones moments later.
+    ///
+    /// Multi-org P2a forward-compat: the v4 keep-rule is "any on-link BLOCK
+    /// (prefix < 32) inside the CGNAT `100.64.0.0/10`", NOT the literal
+    /// `100.64.0.0/…` string it used to be. Tenant-block addressing (P2b)
+    /// hands tenants sub-blocks like `100.68.12.0/22`; under the old literal
+    /// this boot reconciler would have purged a renumbered tenant's own
+    /// connected route — a host-wide mesh blackhole on every start. This rc
+    /// must be fleet-wide BEFORE any tenant migrates. Same reasoning for the
+    /// ULA: prefix-match the base, not the exact `/96` const.
     fn is_derived_prefix(cidr: &str) -> bool {
         let c = cidr.trim();
-        c.starts_with("100.64.0.0/")            // the overlay's own on-link v4
-            || c == crate::overlay::router::OVERLAY_ULA_V6_CIDR
+        v4_block_in_cgnat(c)                    // any on-link v4 block within 100.64/10
+            || c.starts_with("fd72:6f6f:6d6c:") // the overlay ULA (any block size)
             || c.starts_with("224.")            // v4 multicast
             || c == "255.255.255.255/32"        // v4 broadcast
             || c.starts_with("ff00:")           // v6 multicast
             || c.starts_with("fe80:") // v6 link-local
+    }
+
+    /// `true` iff `cidr` parses as `A.B.C.D/len`, lies within `100.64.0.0/10`,
+    /// and is a BLOCK (`len < 32`) — i.e. an on-link/connected prefix, never a
+    /// peer host route. Unparseable input is NOT derived (the reconciler then
+    /// treats it as stale, matching the pre-P2a behavior for junk).
+    fn v4_block_in_cgnat(cidr: &str) -> bool {
+        let Some((addr, len)) = cidr.split_once('/') else {
+            return false;
+        };
+        let Ok(len) = len.parse::<u8>() else {
+            return false;
+        };
+        let Ok(ip) = addr.parse::<Ipv4Addr>() else {
+            return false;
+        };
+        // 100.64.0.0/10 ⇔ the top 10 bits equal 100.64's.
+        let in_cgnat = (u32::from(ip) & 0xFFC0_0000) == 0x6440_0000;
+        in_cgnat && len < 32
     }
 
     /// Other platforms (macOS): no enumeration, so the reconciler is INERT
@@ -2118,6 +2146,41 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// Multi-org P2a — the boot-reconciler keep-set accepts ANY on-link
+        /// block inside 100.64.0.0/10 (tenant-block forward-compat), keeps
+        /// the ULA/multicast family, and still treats peer host routes +
+        /// junk as purgeable.
+        #[test]
+        fn derived_prefix_keeps_any_cgnat_block_purges_host_routes() {
+            use super::is_derived_prefix;
+            // Legacy whole-range on-link + future tenant blocks: kept.
+            assert!(is_derived_prefix("100.64.0.0/10"));
+            assert!(is_derived_prefix("100.68.12.0/22"));
+            assert!(is_derived_prefix("100.127.255.0/24"));
+            assert!(is_derived_prefix(" 100.65.0.0/16 "), "trimmed");
+            // Peer host routes inside the range: purgeable (the point of
+            // the reconciler).
+            assert!(!is_derived_prefix("100.64.0.7/32"));
+            assert!(!is_derived_prefix("100.68.12.9/32"));
+            // Outside the CGNAT range: purgeable even as a block.
+            assert!(!is_derived_prefix("100.128.0.0/22"));
+            assert!(!is_derived_prefix("10.66.0.0/16"));
+            assert!(!is_derived_prefix("0.0.0.0/1"));
+            // ULA (exact const + any future sub-block) kept; junk not.
+            assert!(is_derived_prefix(
+                crate::overlay::router::OVERLAY_ULA_V6_CIDR
+            ));
+            assert!(is_derived_prefix("fd72:6f6f:6d6c::/96"));
+            assert!(!is_derived_prefix("fd00:dead::/64"));
+            // OS-derived families kept; garbage not.
+            assert!(is_derived_prefix("224.0.0.0/4"));
+            assert!(is_derived_prefix("255.255.255.255/32"));
+            assert!(is_derived_prefix("ff00::/8"));
+            assert!(is_derived_prefix("fe80::/64"));
+            assert!(!is_derived_prefix("not-a-cidr"));
+            assert!(!is_derived_prefix("100.64.0.0"));
+        }
 
         /// P9 — the net-hygiene kill-switch parse: only an explicit falsy
         /// value disables; unset / anything else keeps the default ON.
