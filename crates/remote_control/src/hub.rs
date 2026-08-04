@@ -66,6 +66,12 @@ pub struct ConnectedAgent {
     pub tx: ClientTx,
     pub active_sessions: u8,
     pub max_sessions: u8,
+    /// P6 — the agent advertises the InputArbiter capability
+    /// (`AgentCaps.input` contains `"arbiter"`): concurrent input is
+    /// serialized + modifier-fenced agent-side, so `create_session` does
+    /// NOT apply the P3 single-INPUT-holder downgrade. Pre-P6 agents
+    /// (false) keep the P3 strip.
+    pub input_arbiter: bool,
     /// rc.53: signalled by [`Hub::register_agent`] when a newer
     /// connection displaces this one. The WS handler's read-loop
     /// `select!`s on `socket_rx.next()` AND `cancel.notified()`, so
@@ -185,6 +191,9 @@ impl Hub {
         owner_user_id: ObjectId,
         os: OsKind,
         max_sessions: u8,
+        // P6 — whether the agent's caps advertise the InputArbiter (see
+        // [`ConnectedAgent::input_arbiter`]).
+        input_arbiter: bool,
     ) -> (ClientTx, Arc<Notify>, mpsc::Receiver<ServerMsg>) {
         let (tx, rx) = mpsc::channel(SERVER_TX_CAPACITY);
         let cancel = Arc::new(Notify::new());
@@ -196,6 +205,7 @@ impl Hub {
             tx: tx.clone(),
             active_sessions: 0,
             max_sessions,
+            input_arbiter,
             cancel: cancel.clone(),
             relay_home: None,
         };
@@ -456,6 +466,7 @@ impl Hub {
         consent_mode: ConsentMode,
         override_reason: Option<String>,
         local_relay: Option<LocalRelayDescriptor>,
+        input_mode: Option<crate::models::InputMode>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -492,7 +503,7 @@ impl Hub {
             let _ = self.terminate(sid, EndReason::ControllerHangup);
         }
 
-        let agent_org = {
+        let (agent_org, agent_arbitrates) = {
             let mut agent = self
                 .inner
                 .agents
@@ -502,7 +513,7 @@ impl Hub {
                 return Err(Error::AgentBusy);
             }
             agent.active_sessions += 1;
-            agent.tenant_id
+            (agent.tenant_id, agent.input_arbiter)
         };
 
         // Multi-user P3 back-compat — the FILES bit becomes agent-ENFORCED in
@@ -519,28 +530,27 @@ impl Hub {
             permissions
         };
 
-        // Multi-user P3 — ONE INPUT holder per agent. With N concurrent
-        // sessions now reachable (rc_max_sessions ≥ 2) but no input
-        // arbitration yet, two typing users would merge on the host's single
-        // modifier plane (the agent injects real HID presses and the OS
-        // combines them: A holding Shift turns B's clicks into chords) and
-        // fight over the process-global keyboard layout. Until the P6
-        // arbitration modes (free-for-all + per-session modifier fencing /
-        // explicit handoff) land, a session requested while another LIVE
-        // session on this agent already holds INPUT is downgraded to
-        // view-effective (INPUT stripped; VIEW/CLIPBOARD/FILES kept). The
-        // effective grant travels in `SessionCreated.permissions` (viewer)
-        // and `Request.permissions` (agent, which enforces it on the input
-        // DC), and INPUT is RE-offered naturally when the holder's session
-        // ends and a new session is created.
+        // Multi-user P3 → P6 — the single-INPUT-holder rule is now
+        // CONDITIONAL on the agent's capabilities. A P6 agent advertises the
+        // InputArbiter (`AgentCaps.input` contains "arbiter"): all its
+        // sessions' events flow through ONE fenced injection worker
+        // (free-for-all default, exclusive floor per policy/in-session
+        // toggle), so concurrent INPUT grants are safe and the strip is
+        // lifted. A pre-P6 agent injects per-session with no fencing —
+        // for those, a session requested while another LIVE session holds
+        // INPUT is still downgraded to view-effective (INPUT stripped;
+        // VIEW/CLIPBOARD/FILES kept). The effective grant travels in
+        // `SessionCreated.permissions` (viewer) and `Request.permissions`
+        // (agent-enforced on the input DC).
         let permissions = if permissions.contains(Permissions::INPUT)
+            && !agent_arbitrates
             && self.inner.sessions.iter().any(|e| {
                 let s = e.value().lock();
                 s.agent_id == agent_id && s.permissions.contains(Permissions::INPUT)
             }) {
             info!(
-                "agent {} already has an INPUT-holding session — new session is view-effective \
-                 (P3 single-holder rule; arbitration modes land with P6)",
+                "agent {} already has an INPUT-holding session and does not arbitrate — new \
+                 session is view-effective (P3 single-holder rule for pre-P6 agents)",
                 agent_id.to_hex()
             );
             permissions - Permissions::INPUT
@@ -603,6 +613,9 @@ impl Hub {
             // its local `auto_grant_session`. `Auto` → immediate grant;
             // `Prompt` → on-host prompt; `Email`/`Push` → wait (owner resolves).
             consent_mode: Some(consent_mode),
+            // P6 — the device policy's arbitration mode for the agent's
+            // InputArbiter (first session seeds; toggles win afterwards).
+            input_mode,
         });
 
         self.audit(
@@ -973,6 +986,10 @@ pub struct DispatchCtx {
     /// ⇒ consent was skipped; `create_session` records an `AdminOverride` audit.
     /// The `SessionRequest` wire field is NOT trusted directly — only this.
     pub override_reason: Option<String>,
+    /// P6 — the device's `AccessPolicy.input_mode`, resolved by the API WS
+    /// layer alongside `consent_mode`; forwarded to the agent's InputArbiter
+    /// in `ServerMsg::Request`. `None` = agent default (free).
+    pub input_mode: Option<crate::models::InputMode>,
 }
 
 impl Hub {
@@ -1055,6 +1072,7 @@ impl Hub {
                     ctx.consent_mode,
                     ctx.override_reason.clone(),
                     local_relay,
+                    ctx.input_mode,
                 )?;
                 Ok(())
             }
@@ -1155,6 +1173,7 @@ mod tests {
             ConsentMode::Prompt,
             None, // override_reason
             None, // local_relay
+            None, // input_mode
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -1163,8 +1182,14 @@ mod tests {
     async fn end_to_end_consent_grant() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (_agent_tx, _cancel, _agent_rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
         let sid = hub
             .create_session(
@@ -1180,6 +1205,7 @@ mod tests {
                 ConsentMode::Prompt,
                 None, // override_reason
                 None, // local_relay
+                None, // input_mode
             )
             .unwrap();
 
@@ -1207,8 +1233,14 @@ mod tests {
     async fn dispatch_enforces_session_party() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (_agent_tx, _cancel, _agent_rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
         let owner = ObjectId::new();
         let (ctl_tx, _ctl_rx) = mpsc::channel(8);
         let sid = hub
@@ -1225,6 +1257,7 @@ mod tests {
                 ConsentMode::Prompt,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1236,6 +1269,7 @@ mod tests {
             controller_tx: Some(ctl_tx.clone()),
             consent_mode: ConsentMode::Prompt,
             override_reason: None,
+            input_mode: None,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -1336,8 +1370,14 @@ mod tests {
     async fn second_concurrent_session_is_input_stripped_until_holder_ends() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (_agent_tx, _cancel, _agent_rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
 
         let mk = |hub: &Hub, name: &str, tx: ClientTx| {
             hub.create_session(
@@ -1351,6 +1391,7 @@ mod tests {
                 None,
                 false,
                 ConsentMode::Prompt,
+                None,
                 None,
                 None,
             )
@@ -1393,6 +1434,66 @@ mod tests {
         );
     }
 
+    /// P6 — an agent that advertises the InputArbiter capability lifts the
+    /// P3 single-INPUT-holder rule: concurrent sessions BOTH keep their
+    /// INPUT grant (the agent serializes + fences them; exclusive-mode
+    /// floor control is agent-side).
+    #[tokio::test]
+    async fn arbitrating_agent_keeps_input_on_concurrent_sessions() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            true, // P6 — arbiter-capable
+        );
+
+        let mk = |hub: &Hub, name: &str, tx: ClientTx| {
+            hub.create_session(
+                agent_id,
+                ObjectId::new(),
+                name.into(),
+                tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                Some(crate::models::InputMode::Exclusive),
+            )
+        };
+        let effective = |rx: &mut mpsc::Receiver<ServerMsg>| match rx.try_recv().unwrap() {
+            ServerMsg::SessionCreated { permissions, .. } => permissions.unwrap(),
+            other => panic!("expected SessionCreated, got {other:?}"),
+        };
+
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        mk(&hub, "first", tx_a).unwrap();
+        assert!(effective(&mut rx_a).contains(Permissions::INPUT));
+
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        mk(&hub, "second", tx_b).unwrap();
+        assert!(
+            effective(&mut rx_b).contains(Permissions::INPUT),
+            "arbitrating agent: second concurrent session KEEPS INPUT"
+        );
+
+        // The device policy's input_mode rides `ServerMsg::Request` to the
+        // agent's arbiter.
+        match agent_rx.try_recv().unwrap() {
+            ServerMsg::Request { input_mode, .. } => {
+                assert_eq!(input_mode, Some(crate::models::InputMode::Exclusive));
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+    }
+
     /// P3 — `unregister_controller` is per-CONNECTION: closing tab A must
     /// not tear down the same user's live session on tab B (pre-P3 it was
     /// user-keyed and killed every session — #307's org-switch redial in
@@ -1401,8 +1502,14 @@ mod tests {
     async fn unregister_controller_kills_only_that_tabs_sessions() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (_agent_tx, _cancel, _agent_rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
         let user = ObjectId::new();
 
         let (tx_a, _rx_a) = hub.register_controller(user);
@@ -1421,6 +1528,7 @@ mod tests {
                 ConsentMode::Prompt,
                 None,
                 None,
+                None,
             )
             .unwrap();
         let sid_b = hub
@@ -1435,6 +1543,7 @@ mod tests {
                 None,
                 false,
                 ConsentMode::Prompt,
+                None,
                 None,
                 None,
             )
@@ -1464,8 +1573,14 @@ mod tests {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
         // max_sessions = 1 so a single orphan blocks reconnect pre-fix.
-        let (_agent_tx, _cancel, mut agent_rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 1);
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            1,
+            false,
+        );
 
         // Controller A connects, then "disconnects" (drop its receiver) —
         // the fast connect→disconnect that used to leave a stuck session.
@@ -1484,6 +1599,7 @@ mod tests {
                 ConsentMode::Prompt,
                 None,
                 None, // local_relay
+                None, // input_mode
             )
             .unwrap();
         drop(ctl_rx_a); // controller gone → the session's controller_tx.is_closed()
@@ -1504,6 +1620,7 @@ mod tests {
             ConsentMode::Prompt,
             None,
             None, // local_relay
+            None, // input_mode
         );
         assert!(
             res_b.is_ok(),
@@ -1544,6 +1661,7 @@ mod tests {
             ConsentMode::Prompt,
             None,
             None, // local_relay
+            None, // input_mode
         );
         assert!(
             matches!(res_c, Err(Error::AgentBusy)),
@@ -1560,8 +1678,14 @@ mod tests {
     async fn forward_offer_appends_overlay_local_relay_to_agent_ice() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (_agent_tx, _cancel, mut agent_rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
         let (ctl_tx, _ctl_rx) = mpsc::channel(8);
         let sid = hub
             .create_session(
@@ -1582,6 +1706,7 @@ mod tests {
                     username: "1700000600:uid".into(),
                     credential: "abcd1234".into(),
                 }),
+                None,
             )
             .unwrap();
 
@@ -1612,8 +1737,14 @@ mod tests {
     async fn forward_offer_rejects_non_overlay_local_relay() {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (_agent_tx, _cancel, mut agent_rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
         let (ctl_tx, _ctl_rx) = mpsc::channel(8);
         let sid = hub
             .create_session(
@@ -1634,6 +1765,7 @@ mod tests {
                     username: "u".into(),
                     credential: "c".into(),
                 }),
+                None,
             )
             .unwrap();
 
@@ -1685,10 +1817,22 @@ mod tests {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
 
-        let (_tx1, cancel1, mut rx1) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
-        let (_tx2, _cancel2, _rx2) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_tx1, cancel1, mut rx1) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
+        let (_tx2, _cancel2, _rx2) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
 
         // First connection's pump rx should immediately have the
         // Goodbye queued; the channel hasn't been polled yet so
@@ -1733,10 +1877,22 @@ mod tests {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
 
-        let (tx1, _cancel1, _rx1) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
-        let (_tx2, _cancel2, _rx2) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (tx1, _cancel1, _rx1) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
+        let (_tx2, _cancel2, _rx2) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
 
         // tx1 is now stale (tx2 holds the slot). Stale-tx unregister
         // must NOT evict tx2's entry.
@@ -1755,8 +1911,14 @@ mod tests {
         // unconditionally (otherwise admins lose their kick power).
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (_tx, _cancel, _rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (_tx, _cancel, _rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
         assert!(hub.is_agent_online(agent_id));
 
         hub.unregister_agent(agent_id, None);
@@ -1771,8 +1933,14 @@ mod tests {
         // Sanity: when the tx still matches, removal proceeds normally.
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
-        let (tx, _cancel, _rx) =
-            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let (tx, _cancel, _rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
         assert!(hub.is_agent_online(agent_id));
 
         hub.unregister_agent(agent_id, Some(&tx));
