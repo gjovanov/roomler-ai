@@ -5,8 +5,13 @@ use dashmap::DashMap;
 use mongodb::Database;
 use roomler_ai_config::Settings;
 use roomler_ai_remote_control::{
-    Hub, audit::AuditSink, hub::ConsentEvent, models::ConsentMode, signaling::ServerMsg,
+    Hub,
+    audit::AuditSink,
+    hub::ConsentEvent,
+    models::ConsentMode,
+    signaling::ServerMsg,
     turn_creds::TurnConfig,
+    turn_url::{VariantCaps, expand_turn_url},
 };
 use roomler_ai_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
@@ -655,48 +660,17 @@ pub(crate) fn build_turn_config(turn: &roomler_ai_config::TurnSettings) -> Optio
             s.split(',')
                 .map(str::trim)
                 .filter(|w| !w.is_empty())
-                .map(expand_turn_url)
+                .map(|w| expand_turn_url(w, &VariantCaps::default()))
                 .collect()
         })
         .unwrap_or_default();
 
     Some(TurnConfig {
-        urls: expand_turn_url(base),
+        urls: expand_turn_url(base, &VariantCaps::default()),
         workers,
         shared_secret: secret,
         ttl_secs: 600, // 10 minutes
     })
-}
-
-/// Expand a single `turn:host:port` base into UDP/TCP/TLS variants the same
-/// way `ws/handler.rs::handle_media_join` already does for the media path, so
-/// the remote-control path behaves consistently behind NAT. Factored out of
-/// `build_turn_config` so the per-worker affinity URLs get the identical
-/// expansion.
-fn expand_turn_url(base: &str) -> Vec<String> {
-    let mut urls = vec![base.to_string()];
-    if base.starts_with("turn:") && !base.contains("?transport=") {
-        // Plain TURN-over-UDP on :443 — same code path as the base URL, just
-        // a different port. webrtc-rs's ICE agent IS able to use this; many
-        // corporate firewalls drop UDP/3478 but allow UDP/443 (it looks like
-        // QUIC). Requires coturn `alt-listening-port=443`.
-        let turn_443 = base.replace(":3478", ":443");
-        urls.push(format!("{}?transport=udp", turn_443));
-        urls.push(format!("{}?transport=tcp", base));
-        let turns_5349 = base
-            .replacen("turn:", "turns:", 1)
-            .replace(":3478", ":5349");
-        urls.push(format!("{}?transport=tcp", turns_5349));
-        // TURNS on :443 — both DTLS-over-UDP and TLS-over-TCP, sharing the
-        // same ephemeral secret. webrtc-rs's ICE agent silently drops these
-        // (TODO upstream, closed NOT_PLANNED per webrtc-rs/webrtc#690), but
-        // Chrome / Firefox / Safari DO implement them, so we keep emitting
-        // them for the browser-controller path.
-        let turns_443 = base.replacen("turn:", "turns:", 1).replace(":3478", ":443");
-        urls.push(format!("{}?transport=udp", turns_443));
-        urls.push(format!("{}?transport=tcp", turns_443));
-    }
-    urls
 }
 
 /// Dependencies the Phase-4 owner-consent consumer needs — cheap `Arc` clones of
