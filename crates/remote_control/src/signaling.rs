@@ -206,6 +206,13 @@ pub enum ClientMsg {
         /// `#[serde(default)]` keeps pre-feature agents (no field) compatible.
         #[serde(default)]
         advertised_routes: Vec<String>,
+        /// Multi-region relay PoPs: the agent can receive
+        /// [`ServerMsg::RelayRegions`] and answer with
+        /// [`ClientMsg::RelayProbeReport`]. Capability-gates the push — a
+        /// pre-feature agent's `ServerMsg` deserializer would ERROR on the
+        /// unknown variant. Absent ⇒ `false`.
+        #[serde(default)]
+        supports_relay_regions: bool,
     },
 
     /// Agent periodic stats.
@@ -215,6 +222,13 @@ pub enum ClientMsg {
         cpu_pct: f32,
         active_sessions: u8,
     },
+
+    /// Multi-region relay PoPs: the agent's timed STUN probe results for the
+    /// regions last pushed in [`ServerMsg::RelayRegions`]. The server derives
+    /// the agent's `relay_home` (with hysteresis) and persists it on the
+    /// `agents` + `overlay_nodes` rows.
+    #[serde(rename = "rc:relay.probe_report")]
+    RelayProbeReport { results: Vec<RelayRegionRtt> },
 
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
@@ -1125,6 +1139,21 @@ pub enum ServerMsg {
         /// ends expire together).
         ttl_ms: u64,
     },
+
+    /// Multi-region relay PoPs: the probe-target list the server pushes to a
+    /// node that advertised `supports_relay_regions` (hello-gated — the agent's
+    /// `ServerMsg` deserializer errors on unknown variants, so this is NEVER
+    /// sent to a node that didn't advertise the capability). The node times a
+    /// STUN binding against each region's `stun` target and reports back via
+    /// [`ClientMsg::RelayProbeReport`]; the resulting `relay_home` drives every
+    /// per-session/per-pair TURN region pick. Re-pushed with a new `rev` when
+    /// the region set changes; same `rev` ⇒ the node may skip re-probing early.
+    #[serde(rename = "rc:relay.regions")]
+    RelayRegions {
+        regions: Vec<RelayRegionInfo>,
+        /// Stable hash of the region list — change detection for re-probes.
+        rev: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1134,6 +1163,31 @@ pub struct IceServer {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
+}
+
+/// One relay region as pushed in [`ServerMsg::RelayRegions`] — the probe
+/// target, not the credential set (creds keep flowing through the normal
+/// grant paths; this only lets the node measure which PoP is nearest).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelayRegionInfo {
+    /// Region id (`relay_home` value), e.g. `"us-east"`.
+    pub id: String,
+    /// STUN probe target `host:port` (the region's coturn answers STUN
+    /// Binding on its TURN UDP port).
+    pub stun: String,
+    /// The region's DERP endpoint, when it runs one (regional-DERP dialing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derp_url: Option<String>,
+}
+
+/// One region's probe outcome in [`ClientMsg::RelayProbeReport`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RelayRegionRtt {
+    pub region: String,
+    /// Median STUN round-trip in ms; `None` = every sample timed out
+    /// (UDP-blocked path or dead PoP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
 }
 
 /// Loopback-TURN corp-relay descriptor (loopback-TURN Phase 2). Minted + served
@@ -1335,6 +1389,7 @@ mod tests {
             displays: vec![],
             caps: AgentCaps::default(),
             advertised_routes: vec!["192.168.1.0/24".into()],
+            supports_relay_regions: true,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.hello""#));
@@ -1356,6 +1411,85 @@ mod tests {
             } => assert!(
                 advertised_routes.is_empty(),
                 "a hello without advertised_routes must default to none"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Multi-region relay wire locks: exact tags, field defaults, and the
+    /// hello capability flag's absent⇒false back-compat.
+    #[test]
+    fn relay_regions_wire_roundtrip_and_defaults() {
+        let m = ServerMsg::RelayRegions {
+            regions: vec![
+                RelayRegionInfo {
+                    id: "us-east".into(),
+                    stun: "coturn-us-east.roomler.ai:3478".into(),
+                    derp_url: Some("wss://derp-us-east.roomler.ai/derp".into()),
+                },
+                RelayRegionInfo {
+                    id: "eu-central".into(),
+                    stun: "coturn.roomler.ai:3478".into(),
+                    derp_url: None,
+                },
+            ],
+            rev: 7,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:relay.regions""#));
+        assert!(s.contains(r#""stun":"coturn-us-east.roomler.ai:3478""#));
+        // Absent derp_url is OMITTED, not null.
+        assert!(!s.contains(r#""derp_url":null"#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::RelayRegions { regions, rev } => {
+                assert_eq!(rev, 7);
+                assert_eq!(regions.len(), 2);
+                assert_eq!(regions[0].id, "us-east");
+                assert!(regions[1].derp_url.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let r = ClientMsg::RelayProbeReport {
+            results: vec![
+                RelayRegionRtt {
+                    region: "us-east".into(),
+                    rtt_ms: Some(23),
+                },
+                RelayRegionRtt {
+                    region: "eu-central".into(),
+                    rtt_ms: None,
+                },
+            ],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""t":"rc:relay.probe_report""#));
+        assert!(s.contains(r#""rtt_ms":23"#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::RelayProbeReport { results } => {
+                assert_eq!(results[0].rtt_ms, Some(23));
+                assert_eq!(results[1].rtt_ms, None, "all-timed-out region is None");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // Pre-feature hello (no flag) ⇒ supports_relay_regions == false, so
+        // the server never pushes rc:relay.regions at an old agent.
+        let hello = serde_json::json!({
+            "t": "rc:agent.hello",
+            "machine_name": "old-host",
+            "os": "linux",
+            "agent_version": "0.3.0-rc.200",
+            "displays": [],
+            "caps": AgentCaps::default(),
+        });
+        match serde_json::from_value::<ClientMsg>(hello).unwrap() {
+            ClientMsg::AgentHello {
+                supports_relay_regions,
+                ..
+            } => assert!(
+                !supports_relay_regions,
+                "absent capability flag must default to false"
             ),
             other => panic!("wrong variant: {other:?}"),
         }
