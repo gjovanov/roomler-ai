@@ -27,6 +27,8 @@ pub static DERP_REHOME_CLOSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Split-evidence observations (rc hub-miss with fresh foreign record,
 /// tunnel relay drop with foreign session record) (A2b).
 pub static SPLIT_EVIDENCE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Relay grants issued on a NON-default region (multi-region PoPs).
+pub static RELAY_REGION_PICK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -90,6 +92,7 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
             "derp_rehome_stuck_total":
                 crate::ws::derp_cluster::DERP_REHOME_STUCK_TOTAL.load(Ordering::Relaxed),
             "split_evidence_total": SPLIT_EVIDENCE_TOTAL.load(Ordering::Relaxed),
+            "relay_region_pick_total": RELAY_REGION_PICK_TOTAL.load(Ordering::Relaxed),
         },
         "local": {
             "agents_online": state.rc_hub.online_agents().len(),
