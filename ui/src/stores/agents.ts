@@ -119,6 +119,10 @@ export interface Agent {
   advertised_routes?: string[]
   /** Optional because pre-2A.1 agents (and tests) may not include it. */
   capabilities?: AgentCapabilities
+  /** Multi-region relay PoPs: the agent's nearest relay region id (derived
+   *  server-side from its STUN probe reports), e.g. "us-east". Absent/null =
+   *  never probed or all probes timed out — the default region serves it. */
+  relay_home?: string | null
 }
 
 /** A tenant member as returned by `GET /tenant/{id}/member` — enough to populate
