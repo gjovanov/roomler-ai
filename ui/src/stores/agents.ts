@@ -15,6 +15,10 @@ export interface AccessPolicy {
   allowed_role_ids: string[]
   allowed_user_ids: string[]
   auto_terminate_idle_minutes: number | null
+  /** P6 — multi-user input arbitration: `free` (default — everyone with
+   *  INPUT injects, agent-fenced) | `exclusive` (one floor holder,
+   *  request/grant). `null`/absent = free. */
+  input_mode?: 'free' | 'exclusive' | null
 }
 
 /** Codec + HW backend availability advertised by the agent in its
