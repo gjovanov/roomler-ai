@@ -591,7 +591,13 @@ pub enum OverlayEvent {
     /// the DERP carrier for `ttl_ms`. Pushed (never grant-borne) because the
     /// single-relay DIALER never sends a relay_request and so never sees a
     /// grant.
-    ForceDerp { peer_node_id: ObjectId, ttl_ms: u64 },
+    ForceDerp {
+        peer_node_id: ObjectId,
+        ttl_ms: u64,
+        /// Multi-region DERP: the regional relay both ends must dial (server-
+        /// computed, identical on both). `None` = the central `/derp`.
+        derp_url: Option<String>,
+    },
     /// B1 — one overlay ICMP RTT measurement from the agent's 15 s prober
     /// (OsPinger/NsPinger, measured over the ACTIVE carrier). Fed to the
     /// PathMonitor's Q for the peer's incumbent tier; never affects
@@ -771,6 +777,10 @@ pub struct OverlayRuntime {
     /// ⇒ no DERP; the coordinator falls through to both-allocate. Set via
     /// [`with_derp_mux_factory`](Self::with_derp_mux_factory).
     derp_mux_factory: Option<DerpMuxFactory>,
+    /// Multi-region DERP — per-URL regional mux opener (agent-provided, like
+    /// [`derp_mux_factory`](Self::derp_mux_factory)); consulted by the
+    /// force-DERP handler when a push carries a `derp_url`.
+    regional_derp_factory: Option<RegionalDerpFactory>,
     /// P3 PR-A — the shadow [`path::PathMonitor`] + divergence bookkeeping.
     /// Behind a Mutex (not a field of the loop) because the feed sites are
     /// `&self` methods whose signatures are frozen by the timer-parity tests;
@@ -794,6 +804,13 @@ pub struct OverlayRuntime {
 /// factory) must be `Sync`. The agent's closure captures only `Sync` values
 /// (`String` server-url/token + the 32-byte pubkey), so it satisfies both.
 pub type DerpMuxFactory = Box<dyn FnOnce() -> Arc<DerpMux> + Send + Sync>;
+
+/// Multi-region DERP: opens a `/derp` WS to a REGIONAL relay (`derp_url`) and
+/// returns its demux, or `None` when the connection can't be attempted yet
+/// (e.g. no admission ticket cached) — the caller then degrades to the central
+/// mux. Called per distinct URL (results are cached in the coordinator), so
+/// unlike [`DerpMuxFactory`] this is a reusable `Fn`.
+pub type RegionalDerpFactory = Box<dyn Fn(&str) -> Option<Arc<DerpMux>> + Send + Sync>;
 
 /// Map the runtime's live carrier bookkeeping into the LocalAPI [`OverlayView`]
 /// — the daemon-internal shape the `roomler status` / `peers` verbs read. Pure
@@ -929,6 +946,7 @@ impl OverlayRuntime {
             exit_node: None,
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
+            regional_derp_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
         }
@@ -953,6 +971,7 @@ impl OverlayRuntime {
             exit_node: None,
             exit_server_ips: Vec::new(),
             derp_mux_factory: None,
+            regional_derp_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
         }
@@ -984,6 +1003,12 @@ impl OverlayRuntime {
     /// `DerpConn` carriers. `None` (the default) leaves DERP inert.
     pub fn with_derp_mux_factory(mut self, factory: Option<DerpMuxFactory>) -> Self {
         self.derp_mux_factory = factory;
+        self
+    }
+
+    /// Multi-region DERP — install the per-URL regional relay opener.
+    pub fn with_regional_derp_factory(mut self, factory: Option<RegionalDerpFactory>) -> Self {
+        self.regional_derp_factory = factory;
         self
     }
 
@@ -1437,6 +1462,8 @@ impl OverlayRuntime {
         // handler invokes the factory at-most-once THEN — see the ForceDerp
         // arm.
         let mut derp_factory = self.derp_mux_factory.take();
+        // Multi-region DERP — reusable per-URL opener for regional relays.
+        let regional_derp_factory = self.regional_derp_factory.take();
         let derp_mux = if matches!(self.mode, CarrierMode::Relay) && srflx_advertised.is_empty() {
             derp_factory.take().map(|f| f())
         } else {
@@ -2108,7 +2135,7 @@ impl OverlayRuntime {
                         }
                         warn_if_slow("arm:relay_grant", t_arm);
                     }
-                    Some(OverlayEvent::ForceDerp { peer_node_id, ttl_ms }) => {
+                    Some(OverlayEvent::ForceDerp { peer_node_id, ttl_ms, derp_url }) => {
                         let t_arm = Instant::now();
                         // P3 PR-A — annotate the pinned window in the monitor
                         // (relay-Q resets; direct decisions unaffected — the
@@ -2123,11 +2150,23 @@ impl OverlayRuntime {
                             {
                                 r.set_derp_mux(f());
                             }
+                            // Multi-region DERP — a push carrying a regional
+                            // url: open (once per URL) via the reusable
+                            // factory. An unopenable region (no ticket yet /
+                            // factory absent) degrades to the central mux
+                            // inside force_derp.
+                            if let Some(url) = derp_url.as_deref()
+                                && !r.has_regional_mux(url)
+                                && let Some(f) = regional_derp_factory.as_ref()
+                                && let Some(mux) = f(url)
+                            {
+                                r.set_regional_mux(url, mux);
+                            }
                             // Supersede any in-flight off-loop ALLOCATE — a
                             // stale AllocDone must not resurrect a TURN link
                             // inside the forced window.
                             alloc_q.invalidate(&peer_node_id);
-                            let mut link = r.force_derp(peer_node_id, Duration::from_millis(ttl_ms));
+                            let mut link = r.force_derp(peer_node_id, Duration::from_millis(ttl_ms), derp_url.as_deref());
                             // rc.222 — stamp-only + an INSTALLED TURN relay for
                             // the pair: tear it down NOW and rebuild under the
                             // pin. The server just certified the pair's TURN

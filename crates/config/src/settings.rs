@@ -37,6 +37,11 @@ pub struct RelaySettings {
     pub regions_enabled: bool,
     /// JSON array of relay region specs. Env: `ROOMLER__RELAY__REGIONS`.
     pub regions: Option<String>,
+    /// Ed25519 private key (base64 PKCS#8 DER) minting regional-DERP
+    /// admission tickets; PoP relays hold only the derived PUBLIC key.
+    /// Generate: `openssl genpkey -algorithm ed25519 -outform DER | base64 -w0`.
+    /// Env: `ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY`.
+    pub derp_ticket_private_key: Option<String>,
 }
 
 /// Remote-control WS liveness (Phase A-1). Settings (not consts) so the
@@ -371,6 +376,7 @@ impl Settings {
             .set_default("turn.ttl_secs", None::<i64>)?
             .set_default("relay.regions_enabled", false)?
             .set_default("relay.regions", None::<String>)?
+            .set_default("relay.derp_ticket_private_key", None::<String>)?
             .set_default("claude.model", "claude-sonnet-4-5-20250929")?
             .set_default("claude.max_tokens", 4096)?
             .set_default("oauth.base_url", "http://localhost:5001")?

@@ -98,6 +98,10 @@ pub struct AppState {
     /// startup from `turn.*` + `relay.*` settings; `cfg_for(None)` == the
     /// legacy single-region config.
     pub turn_map: Arc<roomler_ai_remote_control::turn_creds::TurnMap>,
+    /// Multi-region DERP ticket signer (`relay.derp_ticket_private_key`).
+    /// `None` = no key configured — ticket requests go unanswered and agents
+    /// keep using the central `/derp`.
+    pub derp_ticket: Option<Arc<roomler_ai_remote_control::derp_ticket::DerpTicketSigner>>,
     /// Phase A-1 — the Redis presence owner-token per locally-registered
     /// agent WS. Written/removed by `ws::remote_control::handle_agent_socket`;
     /// read by [`shutdown_cleanup`] so the SIGTERM sweep can compare-DEL
@@ -312,6 +316,35 @@ impl AppState {
         let consent_requests = Arc::new(ConsentRequestDao::new(&db));
 
         let turn_map = Arc::new(build_turn_map(&settings));
+        // Multi-region DERP tickets: load the signer when a key is configured;
+        // log the derived public key so the operator can copy it to PoPs.
+        // Regions carrying derp_urls without a key = loud warn, never fatal.
+        let derp_ticket = match settings.relay.derp_ticket_private_key.as_deref() {
+            Some(key) => {
+                match roomler_ai_remote_control::derp_ticket::DerpTicketSigner::from_pkcs8_b64(key)
+                {
+                    Ok(s) => {
+                        tracing::info!(
+                            public_key = %s.public_key_b64(),
+                            "derp ticket signer loaded — set DERP_TICKET_PUBLIC_KEY to this on every PoP relay"
+                        );
+                        Some(Arc::new(s))
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY is unusable; regional DERP disabled");
+                        None
+                    }
+                }
+            }
+            None => {
+                if turn_map.enabled && turn_map.specs.iter().any(|s| s.derp_url.is_some()) {
+                    tracing::warn!(
+                        "relay regions carry derp_urls but no ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY is set — regional DERP disabled"
+                    );
+                }
+                None
+            }
+        };
         let (audit_sink, _audit_handle) = AuditSink::spawn(db.clone());
         // Phase 4 — owner-side consent: the Hub emits a `ConsentEvent` for each
         // Email/Push session; this consumer resolves the owner + persists a
@@ -608,6 +641,7 @@ impl AppState {
             consent_requests,
             rc_hub,
             turn_map,
+            derp_ticket,
             agent_presence_tokens,
             tunnel_presence_tokens: tunnel_presence_tokens.clone(),
             media_claim_tokens,

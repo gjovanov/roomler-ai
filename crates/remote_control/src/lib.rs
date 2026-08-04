@@ -23,6 +23,7 @@
 
 pub mod audit;
 pub mod consent;
+pub mod derp_ticket;
 pub mod error;
 pub mod hub;
 pub mod models;

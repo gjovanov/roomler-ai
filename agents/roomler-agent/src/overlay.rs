@@ -27,7 +27,9 @@ use tracing::{info, warn};
 use tunnel_core::env::node_env;
 use tunnel_core::localapi::OverlayView;
 use tunnel_core::overlay::WgKeypair;
-use tunnel_core::overlay::runtime::{DerpMuxFactory, OverlayEvent, OverlayRuntime, TunFactory};
+use tunnel_core::overlay::runtime::{
+    DerpMuxFactory, OverlayEvent, OverlayRuntime, RegionalDerpFactory, TunFactory,
+};
 #[cfg(feature = "overlay-l3")]
 use tunnel_core::overlay::tun::SystemTun;
 use tunnel_core::overlay::tun::TunIo;
@@ -46,6 +48,7 @@ pub async fn maybe_start(
     cfg: &AgentConfig,
     outbound: mpsc::Sender<ClientMsg>,
     peer_view: watch::Sender<OverlayView>,
+    derp_ticket_slot: crate::relay_probe::DerpTicketSlot,
 ) -> Option<mpsc::Sender<OverlayEvent>> {
     if !cfg.overlay_enabled {
         return None;
@@ -102,6 +105,31 @@ pub async fn maybe_start(
         None
     };
 
+    // Multi-region DERP — the per-URL regional relay opener the force-DERP
+    // handler consults when a push carries a `derp_url`. Reads the admission
+    // ticket cached by the signaling loop; no ticket yet ⇒ `None` (the
+    // coordinator degrades to the central mux; the WS owner spawned on a
+    // later successful open reads the slot per attempt anyway).
+    let regional_derp_factory: Option<RegionalDerpFactory> =
+        if tunnel_core::overlay::direct::derp_enabled() {
+            let tenant = cfg.tenant_id.clone();
+            let pubkey = keypair.public.to_bytes();
+            let slot = derp_ticket_slot.clone();
+            Some(Box::new(move |url: &str| {
+                let has_ticket = slot.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                if !has_ticket {
+                    warn!(%url, "overlay derp: regional relay pushed but no admission ticket yet");
+                    return None;
+                }
+                let (mux, outbound_rx) = tunnel_core::transport::derp::DerpMux::new(pubkey);
+                crate::derp::spawn_regional(url, slot.clone(), &tenant, &mux, outbound_rx);
+                info!(%url, "overlay derp: regional /derp carrier opened");
+                Some(mux)
+            }))
+        } else {
+            None
+        };
+
     let rt = OverlayRuntime::new_relay(keypair, outbound, tun_factory, OVERLAY_MTU)
         // Phase 1 — advertise this node's subnet routes (admin-gated server-side).
         // P5 — plus `0.0.0.0/0` when this node is configured as an exit node.
@@ -112,6 +140,8 @@ pub async fn maybe_start(
         // Phase D — LAZY `/derp`: the runtime opens the WS via this factory only
         // if the node is itself UDP-blocked (else no idle WS).
         .with_derp_mux_factory(derp_factory)
+        // Multi-region DERP — per-URL regional relay opener (ticket-gated).
+        .with_regional_derp_factory(regional_derp_factory)
         // Unification P1 — publish the live mesh view for the LocalAPI so
         // `roomler status` / `peers` see per-device connection types.
         .with_peer_view(peer_view);
@@ -382,9 +412,11 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
         ServerMsg::OverlayForceDerp {
             peer_node_id,
             ttl_ms,
+            derp_url,
         } => OverlayEvent::ForceDerp {
             peer_node_id,
             ttl_ms,
+            derp_url,
         },
         other => return Some(other),
     };

@@ -724,6 +724,9 @@ async fn connect_once(
             outbound_tx.clone(),
         ));
     }
+    // Multi-region DERP: the per-connection admission-ticket cache the
+    // regional dialer reads (filled by the DerpTicket arm below).
+    let derp_ticket_slot: crate::relay_probe::DerpTicketSlot = Default::default();
     // P3b-2 PR-C: publish this connection's egress so tunnel-client flow
     // supervisors can open sessions over it; the guard clears it to `None` on
     // every exit path (like `_connected_guard`), so a supervisor holding the
@@ -734,8 +737,13 @@ async fn connect_once(
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
     // peer, and tears down when this connection's `overlay_evt_tx` drops.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
-    let overlay_evt_tx =
-        crate::overlay::maybe_start(cfg, outbound_tx.clone(), overlay_view_tx.clone()).await;
+    let overlay_evt_tx = crate::overlay::maybe_start(
+        cfg,
+        outbound_tx.clone(),
+        overlay_view_tx.clone(),
+        derp_ticket_slot.clone(),
+    )
+    .await;
     // B1 — install THIS connection's RTT-sample sink: a hook wrapping a
     // WEAK handle to the runtime's event channel. `None` when overlay is
     // off; a stale hook is harmless (weak upgrade fails once the runtime
@@ -1006,6 +1014,7 @@ async fn connect_once(
                                 &consent_broker,
                                 &cfg.forward_acl,
                                 &relay_regions_slot,
+                                &derp_ticket_slot,
                             )
                             .await?;
                         }
@@ -1067,6 +1076,7 @@ async fn handle_server_msg(
     consent_broker: &crate::consent::ConsentBroker,
     forward_acl: &crate::tunnel::acl::AgentForwardAcl,
     relay_regions_slot: &crate::relay_probe::RegionSlot,
+    derp_ticket_slot: &crate::relay_probe::DerpTicketSlot,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -1427,6 +1437,19 @@ async fn handle_server_msg(
         // when the set actually changed (rev), else let the periodic
         // re-prober use the stored copy.
         ServerMsg::RelayRegions { regions, rev } => {
+            // Multi-region DERP: any region carrying a derp_url ⇒ fetch an
+            // admission ticket (once; the reply arm schedules refreshes).
+            // Only when this build can actually dial regional relays.
+            #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+            if regions.iter().any(|r| r.derp_url.is_some())
+                && tunnel_core::overlay::direct::derp_enabled()
+                && derp_ticket_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none()
+            {
+                let _ = outbound_tx.try_send(ClientMsg::DerpTicketRequest {});
+            }
             if crate::relay_probe::probing_enabled() {
                 let changed = {
                     let mut slot = relay_regions_slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -1442,6 +1465,30 @@ async fn handle_server_msg(
                     ));
                 }
             }
+        }
+
+        // Multi-region DERP: cache the admission ticket + schedule a refresh
+        // at ~90 % of its remaining validity (the refresher dies with the
+        // connection — its send fails once the outbound channel closes).
+        ServerMsg::DerpTicket { ticket, exp } => {
+            *derp_ticket_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((ticket, exp));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let refresh_in =
+                std::time::Duration::from_secs(exp.saturating_sub(now).saturating_mul(9) / 10)
+                    .max(std::time::Duration::from_secs(60));
+            let tx = outbound_tx.clone();
+            debug!(
+                exp,
+                refresh_in_s = refresh_in.as_secs(),
+                "derp ticket cached"
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(refresh_in).await;
+                let _ = tx.send(ClientMsg::DerpTicketRequest {}).await;
+            });
         }
 
         // rc:tunnel.tcp.forward — server has gated the request, asks

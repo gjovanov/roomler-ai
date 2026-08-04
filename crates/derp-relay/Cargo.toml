@@ -1,0 +1,28 @@
+[package]
+name = "derp-relay"
+version.workspace = true
+edition.workspace = true
+
+# The standalone regional DERP relay — one per PoP, behind the PoP's nginx
+# (which terminates TLS on 443 and proxies plain WS here, exactly like the
+# prod pods' nginx → API /derp). Ticket-authenticated (Ed25519 public key
+# only), no database, no cluster machinery — see src/main.rs.
+
+[[bin]]
+name = "derp-relay"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+futures.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
+serde.workspace = true
+roomler-ai-remote-control = { path = "../remote_control" }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+ring = "0.17"
