@@ -136,7 +136,152 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         advertise_routes: Vec::new(),
         advertise_local_subnets: true,
         tunnel_routes: Vec::new(),
+        orgs: Vec::new(),
     })
+}
+
+/// Multi-org P1 — how [`apply_enrollment`] folded a fresh enrollment into
+/// the on-disk config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnrollOutcome {
+    /// No prior config at the path — the fresh config was written as-is.
+    FreshPrimary,
+    /// The enrollment resolved to the SAME (server, tenant) as the primary:
+    /// identity refreshed, operator state preserved (rc.204 semantics).
+    RefreshedPrimary,
+    /// The enrollment resolved to an existing `[[orgs]]` entry: its token /
+    /// agent_id refreshed in place.
+    RefreshedOrg { label: String },
+    /// A NEW (server, tenant) pair: appended as a secondary org.
+    AppendedOrg { label: String },
+    /// `--replace` forced the legacy whole-primary rebind.
+    ReplacedPrimary,
+}
+
+/// Multi-org P1 — fold a fresh enrollment into an existing config (or none).
+///
+/// Dispatch, in order:
+///   1. no existing config → fresh as-is (`FreshPrimary`);
+///   2. `force_replace` → legacy primary rebind via
+///      [`preserve_operator_config`] (`ReplacedPrimary`); any secondary
+///      entry now duplicating the new primary identity is dropped;
+///   3. (server, tenant) == the primary's → [`preserve_operator_config`]
+///      (`RefreshedPrimary`) — this is exactly the pre-multi-org re-enroll;
+///   4. (server, tenant) == a secondary entry's → refresh that entry's
+///      token / agent_id in place (`RefreshedOrg`);
+///   5. otherwise → APPEND a new secondary entry (`AppendedOrg`) with a
+///      freshly minted WireGuard key — NEVER a copy of another org's (a
+///      shared pubkey would let two orgs correlate this device).
+///
+/// On append the top-level `machine_name` is kept as-is even when the
+/// operator passed a different `--name` (the new org's SERVER row got the
+/// name from the enroll POST; the machine-scoped local name stays until
+/// `roomler set-device-name` changes it everywhere).
+pub fn apply_enrollment(
+    existing: Option<AgentConfig>,
+    fresh: AgentConfig,
+    requested_label: Option<&str>,
+    force_replace: bool,
+) -> anyhow::Result<(AgentConfig, EnrollOutcome)> {
+    let Some(existing) = existing else {
+        return Ok((fresh, EnrollOutcome::FreshPrimary));
+    };
+
+    if force_replace {
+        let mut merged = preserve_operator_config(fresh, existing);
+        let (server, tenant) = (merged.server_url.clone(), merged.tenant_id.clone());
+        merged
+            .orgs
+            .retain(|o| !(o.server_url == server && o.tenant_id == tenant));
+        return Ok((merged, EnrollOutcome::ReplacedPrimary));
+    }
+
+    if existing.is_primary_identity(&fresh.server_url, &fresh.tenant_id) {
+        return Ok((
+            preserve_operator_config(fresh, existing),
+            EnrollOutcome::RefreshedPrimary,
+        ));
+    }
+
+    let mut cfg = existing;
+    if let Some(org) = cfg.find_org_by_identity_mut(&fresh.server_url, &fresh.tenant_id) {
+        org.agent_token = fresh.agent_token;
+        org.agent_id = fresh.agent_id;
+        org.ws_url = None;
+        let label = org.label.clone();
+        return Ok((cfg, EnrollOutcome::RefreshedOrg { label }));
+    }
+
+    let label = unique_org_label(&cfg, requested_label, &fresh.server_url)?;
+    #[cfg_attr(
+        not(any(feature = "overlay-l3", feature = "overlay-netstack")),
+        allow(unused_mut)
+    )]
+    let mut entry = crate::config::OrgEntry {
+        label: label.clone(),
+        server_url: fresh.server_url,
+        ws_url: None,
+        agent_token: fresh.agent_token,
+        agent_id: fresh.agent_id,
+        tenant_id: fresh.tenant_id,
+        enabled: true,
+        overlay_mode: crate::config::OrgOverlayMode::Off,
+        overlay_wg_secret_key: None,
+        overlay_advertised_routes: Vec::new(),
+        overlay_exit_node_enabled: false,
+        advertise_routes: Vec::new(),
+    };
+    // Mint this org's OWN WireGuard identity now (builds without an overlay
+    // surface leave it None; P2's first overlay-enabled start mints then,
+    // mirroring the primary's lazy path in `run_cmd`).
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    {
+        entry.overlay_wg_secret_key =
+            Some(tunnel_core::overlay::WgKeypair::generate().secret_base64());
+    }
+    cfg.orgs.push(entry);
+    Ok((cfg, EnrollOutcome::AppendedOrg { label }))
+}
+
+/// Pick a unique label for a new secondary org: the sanitized requested
+/// label if given (hard error when invalid/taken — the operator named it
+/// deliberately), else the server host sanitized + `-2`/`-3`… uniquifier.
+fn unique_org_label(
+    cfg: &AgentConfig,
+    requested: Option<&str>,
+    server_url: &str,
+) -> anyhow::Result<String> {
+    use crate::config::sanitize_org_label;
+    if let Some(raw) = requested {
+        let label = sanitize_org_label(raw).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid --label {raw:?}: use lowercase letters/digits/dashes \
+                 (and not the reserved {:?})",
+                crate::config::PRIMARY_ORG_LABEL
+            )
+        })?;
+        if cfg.find_org(&label).is_some() {
+            bail!("--label {label:?} is already in use (see `roomler-agent org ls`)");
+        }
+        return Ok(label);
+    }
+    let host = server_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(server_url);
+    let base = sanitize_org_label(host).unwrap_or_else(|| "org".to_string());
+    if cfg.find_org(&base).is_none() {
+        return Ok(base);
+    }
+    for n in 2..100 {
+        let candidate = format!("{base}-{n}");
+        if cfg.find_org(&candidate).is_none() {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not derive a unique org label from {server_url:?}; pass --label");
 }
 
 /// rc.204 — re-enrolling a machine that already has a config must NOT reset
@@ -350,6 +495,167 @@ mod tests {
         assert_eq!(
             merged.last_known_good_version.as_deref(),
             Some("0.3.0-rc.199")
+        );
+    }
+
+    // ---- Multi-org P1: apply_enrollment dispatch --------------------------
+
+    fn fresh_for(server: &str, tenant: &str, token: &str) -> AgentConfig {
+        let mut f = crate::config::test_fixture();
+        f.server_url = server.into();
+        f.tenant_id = tenant.into();
+        f.agent_token = token.into();
+        f.agent_id = format!("aid-{tenant}");
+        f
+    }
+
+    fn org(label: &str, server: &str, tenant: &str) -> crate::config::OrgEntry {
+        crate::config::OrgEntry {
+            label: label.into(),
+            server_url: server.into(),
+            ws_url: None,
+            agent_token: format!("tok-{label}"),
+            agent_id: format!("aid-{label}"),
+            tenant_id: tenant.into(),
+            enabled: true,
+            overlay_mode: crate::config::OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn apply_enrollment_fresh_when_no_existing() {
+        let fresh = fresh_for("https://a.invalid", "t1", "tok1");
+        let (cfg, outcome) = apply_enrollment(None, fresh.clone(), None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::FreshPrimary);
+        assert_eq!(cfg.agent_token, fresh.agent_token);
+        assert!(cfg.orgs.is_empty());
+    }
+
+    #[test]
+    fn apply_enrollment_same_identity_refreshes_primary_and_keeps_orgs() {
+        let mut existing = crate::config::test_fixture(); // server example.invalid / tenant tid
+        existing.overlay_enabled = true;
+        existing.orgs = vec![org("acme", "https://b.invalid", "t-acme")];
+        let fresh = fresh_for("https://example.invalid", "tid", "NEW-TOK");
+        let (cfg, outcome) = apply_enrollment(Some(existing), fresh, None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::RefreshedPrimary);
+        assert_eq!(cfg.agent_token, "NEW-TOK");
+        assert!(cfg.overlay_enabled, "operator state preserved");
+        assert_eq!(cfg.orgs.len(), 1, "secondary enrollments must survive");
+        assert_eq!(cfg.orgs[0].label, "acme");
+    }
+
+    #[test]
+    fn apply_enrollment_matching_org_refreshes_in_place() {
+        let mut existing = crate::config::test_fixture();
+        existing.orgs = vec![org("acme", "https://b.invalid", "t-acme")];
+        let fresh = fresh_for("https://b.invalid", "t-acme", "ROTATED");
+        let (cfg, outcome) = apply_enrollment(Some(existing), fresh, None, false).unwrap();
+        assert_eq!(
+            outcome,
+            EnrollOutcome::RefreshedOrg {
+                label: "acme".into()
+            }
+        );
+        assert_eq!(cfg.orgs.len(), 1);
+        assert_eq!(cfg.orgs[0].agent_token, "ROTATED");
+        assert_eq!(cfg.orgs[0].agent_id, "aid-t-acme");
+        // The primary identity is untouched.
+        assert_eq!(cfg.agent_token, "tok");
+    }
+
+    #[test]
+    fn apply_enrollment_new_identity_appends_secondary() {
+        let existing = crate::config::test_fixture();
+        let fresh = fresh_for("https://roomler.ai", "t-new", "tok-new");
+        let (cfg, outcome) = apply_enrollment(Some(existing), fresh, None, false).unwrap();
+        let EnrollOutcome::AppendedOrg { label } = outcome else {
+            panic!("expected append, got {outcome:?}");
+        };
+        assert_eq!(label, "roomler-ai", "label derives from the server host");
+        assert_eq!(cfg.orgs.len(), 1);
+        let entry = &cfg.orgs[0];
+        assert_eq!(entry.tenant_id, "t-new");
+        assert!(entry.enabled);
+        assert_eq!(entry.overlay_mode, crate::config::OrgOverlayMode::Off);
+        // The primary is untouched — an append must never rebind it.
+        assert_eq!(cfg.agent_token, "tok");
+        assert_eq!(cfg.tenant_id, "tid");
+        // With an overlay surface compiled in, the org gets its OWN key —
+        // never a copy of the primary's.
+        #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+        {
+            assert!(entry.overlay_wg_secret_key.is_some());
+            assert_ne!(
+                entry.overlay_wg_secret_key, cfg.overlay_wg_secret_key,
+                "org WG key must not equal the primary's"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_enrollment_append_uses_requested_label_and_rejects_taken() {
+        let mut existing = crate::config::test_fixture();
+        existing.orgs = vec![org("acme", "https://b.invalid", "t-acme")];
+        let fresh = fresh_for("https://c.invalid", "t-c", "tok-c");
+        let (cfg, outcome) = apply_enrollment(
+            Some(existing.clone()),
+            fresh.clone(),
+            Some("Beta Corp"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            EnrollOutcome::AppendedOrg {
+                label: "beta-corp".into()
+            }
+        );
+        assert_eq!(cfg.orgs.len(), 2);
+
+        // Taken label → hard error (the operator named it deliberately).
+        let err = apply_enrollment(Some(existing.clone()), fresh.clone(), Some("acme"), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("already in use"), "{err}");
+        // Reserved label → hard error.
+        let err = apply_enrollment(Some(existing), fresh, Some("primary"), false).unwrap_err();
+        assert!(err.to_string().contains("invalid --label"), "{err}");
+    }
+
+    #[test]
+    fn apply_enrollment_replace_rebinds_primary_and_drops_dup_entry() {
+        let mut existing = crate::config::test_fixture();
+        existing.orgs = vec![
+            org("acme", "https://b.invalid", "t-acme"),
+            org("keep", "https://c.invalid", "t-keep"),
+        ];
+        // Replacing the primary with an identity that ALREADY exists as the
+        // "acme" secondary: the secondary is dropped (no duplicate identity).
+        let fresh = fresh_for("https://b.invalid", "t-acme", "tok-promoted");
+        let (cfg, outcome) = apply_enrollment(Some(existing), fresh, None, true).unwrap();
+        assert_eq!(outcome, EnrollOutcome::ReplacedPrimary);
+        assert_eq!(cfg.server_url, "https://b.invalid");
+        assert_eq!(cfg.tenant_id, "t-acme");
+        assert_eq!(cfg.agent_token, "tok-promoted");
+        assert_eq!(cfg.orgs.len(), 1, "the duplicate entry must be dropped");
+        assert_eq!(cfg.orgs[0].label, "keep");
+    }
+
+    #[test]
+    fn apply_enrollment_appended_label_uniquifies_on_collision() {
+        let mut existing = crate::config::test_fixture();
+        existing.orgs = vec![org("roomler-ai", "https://other.invalid", "t-x")];
+        let fresh = fresh_for("https://roomler.ai", "t-y", "tok-y");
+        let (_cfg, outcome) = apply_enrollment(Some(existing), fresh, None, false).unwrap();
+        assert_eq!(
+            outcome,
+            EnrollOutcome::AppendedOrg {
+                label: "roomler-ai-2".into()
+            }
         );
     }
 }

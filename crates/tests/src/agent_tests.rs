@@ -19,6 +19,17 @@ fn spawn_agent_signaling(
     cfg: AgentConfig,
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_agent_signaling_as(signaling::OrgCtx::primary(), cfg, stop_rx)
+}
+
+/// Multi-org P1 — like [`spawn_agent_signaling`] but with an explicit
+/// [`signaling::OrgCtx`], so a test can drive a SECONDARY enrollment's loop
+/// exactly the way `run_cmd`'s org supervisors do.
+fn spawn_agent_signaling_as(
+    ctx: signaling::OrgCtx,
+    cfg: AgentConfig,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Value type (OverlayView) is inferred from `run`'s Sender param, so
@@ -31,6 +42,7 @@ fn spawn_agent_signaling(
         )
         .expect("consent broker init");
         let _ = signaling::run(
+            ctx,
             cfg,
             EncoderPreference::Software,
             stop_rx,
@@ -147,6 +159,92 @@ async fn agent_library_connects_and_goes_online() {
     // watches the shutdown signal.
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(2), sig_task).await;
+}
+
+/// Poll one tenant's agent row for `is_online`.
+async fn agent_is_online(
+    app: &TestApp,
+    seeded: &crate::fixtures::seed::SeededTenant,
+    agent_id: &str,
+) -> bool {
+    let row: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    row["is_online"].as_bool() == Some(true)
+}
+
+#[tokio::test]
+async fn same_machine_enrolls_into_two_tenants_and_both_connect() {
+    // Multi-org P1 end-to-end: ONE machine fingerprint enrolled into TWO
+    // tenants of one server — the second enrollment APPENDS a secondary
+    // org (the pre-multi-org behavior rebound the whole config, dropping
+    // tenant 1) — then BOTH enrollments run their signaling loops from one
+    // process (exactly `run_cmd`'s primary + org-supervisor pattern) and
+    // hold their per-tenant agent rows online CONCURRENTLY.
+    let app = TestApp::spawn().await;
+    let t1 = app.seed_tenant("morg1").await;
+    let t2 = app.seed_tenant("morg2").await;
+
+    // First enrollment = fresh primary.
+    let fresh1 = enrol_via_agent_lib(&app, &t1, "mach-morg-1", "Multi-org box").await;
+    let (cfg, outcome) = enrollment::apply_enrollment(None, fresh1, None, false).unwrap();
+    assert_eq!(outcome, enrollment::EnrollOutcome::FreshPrimary);
+
+    // Second enrollment: same machine_id, DIFFERENT tenant → append.
+    let fresh2 = enrol_via_agent_lib(&app, &t2, "mach-morg-1", "Multi-org box").await;
+    let (cfg, outcome) =
+        enrollment::apply_enrollment(Some(cfg), fresh2, Some("acme"), false).unwrap();
+    assert_eq!(
+        outcome,
+        enrollment::EnrollOutcome::AppendedOrg {
+            label: "acme".into()
+        }
+    );
+    assert_eq!(cfg.tenant_id, t1.tenant_id, "primary identity untouched");
+    assert_eq!(cfg.orgs.len(), 1);
+    assert_eq!(cfg.orgs[0].tenant_id, t2.tenant_id);
+    assert_eq!(cfg.machine_id, cfg.for_org(&cfg.orgs[0]).machine_id);
+
+    // Drive both enrollments concurrently.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let prim_task = spawn_agent_signaling(cfg.clone(), stop_rx.clone());
+    let org_cfg = cfg.for_org(&cfg.orgs[0]);
+    let org_task = spawn_agent_signaling_as(
+        signaling::OrgCtx::secondary(&cfg.orgs[0].label),
+        org_cfg.clone(),
+        stop_rx,
+    );
+    assert_ne!(
+        cfg.agent_id, org_cfg.agent_id,
+        "distinct per-tenant agent ids"
+    );
+
+    let mut both_online = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if agent_is_online(&app, &t1, &cfg.agent_id).await
+            && agent_is_online(&app, &t2, &org_cfg.agent_id).await
+        {
+            both_online = true;
+            break;
+        }
+    }
+    assert!(
+        both_online,
+        "both org enrollments must be online at the same time"
+    );
+
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), prim_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), org_task).await;
 }
 
 #[tokio::test]
