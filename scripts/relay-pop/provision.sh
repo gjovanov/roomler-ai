@@ -43,6 +43,10 @@ iptables -t nat -C PREROUTING -d "$PUBLIC_IP" -p udp --dport 443 \
   -j DNAT --to-destination "$PUBLIC_IP":3478 2>/dev/null || \
 iptables -t nat -A PREROUTING -d "$PUBLIC_IP" -p udp --dport 443 \
   -j DNAT --to-destination "$PUBLIC_IP":3478
+# coturn's prometheus exporter (:9641) binds every interface and has no
+# listen-address option — keep it loopback-only (derp-relay's /stats scrape).
+iptables -C INPUT -p tcp --dport 9641 ! -i lo -j DROP 2>/dev/null || \
+iptables -A INPUT -p tcp --dport 9641 ! -i lo -j DROP
 netfilter-persistent save >/dev/null
 
 # ── TLS: acme.sh HTTP-01 standalone on :80, one cert covering both names ────

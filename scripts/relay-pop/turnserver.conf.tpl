@@ -20,5 +20,9 @@ ${EXTERNAL_IP_LINE}
 no-loopback-peers
 no-multicast-peers
 no-cli
+# Allocation/session gauges for the derp-relay /stats endpoint (the API's
+# load-aware routing input). Binds :9641 on all interfaces — provision.sh
+# firewalls it to loopback; only derp-relay's localhost scrape reaches it.
+prometheus
 log-file=stdout
 simple-log
