@@ -436,7 +436,7 @@ fn compute_caps() -> AgentCaps {
         has_input_permission: cfg!(feature = "enigo-input"),
         supports_clipboard: cfg!(feature = "clipboard"),
         supports_file_transfer: true,
-        max_simultaneous_sessions: 1,
+        max_simultaneous_sessions: rc_max_sessions(),
         transports,
         files,
         vp9_chroma,
@@ -445,6 +445,27 @@ fn compute_caps() -> AgentCaps {
         clipboard,
         layout,
     }
+}
+
+/// Multi-user P3 — how many CONCURRENT remote-control sessions this agent
+/// advertises (the server's `AgentBusy` gate enforces the value). Pinned to
+/// 1 since v1; the whole capacity model (server gate, per-session
+/// `AgentPeer`s, per-session consent/permissions) was already N-ready.
+///
+/// Default 2 — pair-working: each extra session runs its OWN capture +
+/// encoder until the P5 shared-floor encoder lands, so weak-GPU hosts
+/// (Iris-Xe-class) may prefer `rc_max_sessions = 1`; the DXGI
+/// duplication app-limit (~4) bounds the useful ceiling — clamp at 8.
+/// Concurrent-INPUT chaos is prevented server-side (one INPUT holder per
+/// agent until the P6 arbitration modes land).
+///
+/// `ROOMLER_AGENT_RC_MAX_SESSIONS` env > `rc_max_sessions` config key
+/// (bridged via the S2 fallback map) > built-in 2.
+pub(crate) fn rc_max_sessions() -> u8 {
+    tunnel_core::env::node_env("RC_MAX_SESSIONS")
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .map(|n| n.clamp(1, 8))
+        .unwrap_or(2)
 }
 
 /// Codec to probe. We only probe codecs that fail closed on activation

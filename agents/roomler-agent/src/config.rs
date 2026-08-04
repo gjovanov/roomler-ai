@@ -214,6 +214,13 @@ pub struct AgentConfig {
     /// demotions execute). Multi-state, so a string key, not a tribool.
     #[serde(default)]
     pub overlay_demote: Option<String>,
+    /// Multi-user P3 — concurrent remote-control sessions this agent
+    /// advertises (`ROOMLER_AGENT_RC_MAX_SESSIONS`, 1–8). Built-in
+    /// default: 2. Until the P5 shared encoder lands each session runs
+    /// its own capture + encoder — weak-GPU hosts may prefer 1. The
+    /// server keeps concurrent INPUT to one holder regardless.
+    #[serde(default)]
+    pub rc_max_sessions: Option<u32>,
     /// P4 — ingress filtering of INBOUND overlay packets
     /// (`ROOMLER_NODE_OVERLAY_RPF`): `off` | `warn` (count + log, still
     /// deliver — the built-in default) | `enforce` (drop). Two checks share
@@ -929,12 +936,13 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 18]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 4] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 5] {
     [
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
         ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
         ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
         ("RATE_FACTOR_AV1", cfg.rate_factor_av1),
+        ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
     ]
 }
 
@@ -1113,6 +1121,7 @@ mod tests {
             overlay_rtt_q: None,
             text_mod_neutralize: None,
             overlay_demote: None,
+            rc_max_sessions: None,
             overlay_rpf: None,
             last_known_good_version: None,
             crash_count: 0,

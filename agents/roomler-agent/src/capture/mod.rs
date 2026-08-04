@@ -137,6 +137,55 @@ impl ScreenCapture for NoopCapture {
 }
 
 /// Open the best-available capture backend for the current host. Falls
+/// Multi-user P3 — bounded backoff for the media pumps' capture-error
+/// REOPEN path. Pre-P3 every pump retried at a fixed 500 ms; with N
+/// concurrent sessions each running its own capturer, a PERSISTENT
+/// denial (the DXGI Desktop-Duplication per-output app limit, a
+/// session-0 desktop the worker can't reach, a wedged driver) had every
+/// affected pump re-running the full open cascade twice a second,
+/// forever. Grows 500 ms → 1 s → … → 10 s per CONSECUTIVE failure; a
+/// quiet spell (> 30 s since the last error — i.e. capture recovered
+/// and ran) resets to 500 ms so an isolated mode-change hiccup keeps
+/// the old snappy recovery.
+pub struct ReopenBackoff {
+    cur: std::time::Duration,
+    last_error: Option<std::time::Instant>,
+}
+
+impl ReopenBackoff {
+    const FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
+    const CEIL: std::time::Duration = std::time::Duration::from_secs(10);
+    const QUIET_RESET: std::time::Duration = std::time::Duration::from_secs(30);
+
+    pub fn new() -> Self {
+        Self {
+            cur: Self::FLOOR,
+            last_error: None,
+        }
+    }
+
+    /// Record an error NOW and return how long to sleep before reopening.
+    pub fn delay(&mut self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        let consecutive = self
+            .last_error
+            .is_some_and(|t| now.duration_since(t) <= Self::QUIET_RESET);
+        self.cur = if consecutive {
+            (self.cur * 2).min(Self::CEIL)
+        } else {
+            Self::FLOOR
+        };
+        self.last_error = Some(now);
+        self.cur
+    }
+}
+
+impl Default for ReopenBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// back to [`NoopCapture`] if no display is reachable or the crate was
 /// built without a capture backend feature.
 ///
