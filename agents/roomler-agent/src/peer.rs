@@ -1576,7 +1576,7 @@ async fn media_pump(
                     %session_id,
                     "media pump: AV1 over DataChannel (rc.190 — FFmpeg via vendor SDK)"
                 );
-                return media_pump_ffmpeg_dc(
+                return run_ffmpeg_dc_session(
                     FfmpegDcCodec::Av1,
                     session_id,
                     video_bytes_dc,
@@ -1614,7 +1614,7 @@ async fn media_pump(
                     %session_id,
                     "media pump: HEVC over DataChannel (rc.77 — FFmpeg via vendor SDK)"
                 );
-                return media_pump_ffmpeg_dc(
+                return run_ffmpeg_dc_session(
                     FfmpegDcCodec::Hevc,
                     session_id,
                     video_bytes_dc,
@@ -1652,7 +1652,7 @@ async fn media_pump(
                     %session_id,
                     "media pump: H.264 over DataChannel (P2 — FFmpeg via vendor SDK)"
                 );
-                return media_pump_ffmpeg_dc(
+                return run_ffmpeg_dc_session(
                     FfmpegDcCodec::H264,
                     session_id,
                     video_bytes_dc,
@@ -1712,7 +1712,7 @@ async fn media_pump(
                         %session_id,
                         "media pump: VP9 over DataChannel via FFmpeg vp9_qsv (Intel HW; rc.83 Iris Xe fps unlock)"
                     );
-                    return media_pump_ffmpeg_dc(
+                    return run_ffmpeg_dc_session(
                         FfmpegDcCodec::Vp9,
                         session_id,
                         video_bytes_dc,
@@ -1737,7 +1737,7 @@ async fn media_pump(
                 %session_id,
                 "media pump: VP9-444 over DataChannel (Phase Y.3 libvpx SW path)"
             );
-            return media_pump_vp9_444_dc(
+            return run_vp9_444_dc_session(
                 session_id,
                 video_bytes_dc,
                 keyframe_requested,
@@ -2390,6 +2390,164 @@ pub(crate) fn frame_video_bytes(payload: &[u8], is_keyframe: bool, timestamp_us:
     out
 }
 
+/// P5 — VP9 chroma resolution shared by the session dispatcher (pipeline
+/// key) and the pump's encoder build: session pref → env → 4:4:4 default.
+#[cfg(feature = "vp9-444")]
+fn vp9_chroma_is_444(chroma_pref: Option<&str>) -> bool {
+    chroma_pref
+        .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+            "yuv420" | "420" => Some(false),
+            "yuv444" | "444" => Some(true),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            matches!(
+                crate::encode::libvpx::vp9_chroma_from_env(),
+                crate::encode::libvpx::Vp9Chroma::Yuv444
+            )
+        })
+}
+
+/// P5 — session-level entry for the FFmpeg DC transports. JOIN a live
+/// same-profile shared pipeline as a follower when one exists (no capturer,
+/// no encoder — the owner's stream fans out to this session's DC); else run
+/// the pump as the owner. A follower whose pipeline closed re-dispatches
+/// (the first re-dispatcher becomes the new owner, the rest re-join); a
+/// SPILLED follower goes straight to its own pump and does not re-join the
+/// pipeline that evicted it.
+#[cfg(feature = "ffmpeg-encoder")]
+#[allow(clippy::too_many_arguments)]
+async fn run_ffmpeg_dc_session(
+    codec: FfmpegDcCodec,
+    session_id: bson::oid::ObjectId,
+    video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
+    quality_state: Arc<std::sync::atomic::AtomicU8>,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    pc: Arc<RTCPeerConnection>,
+    capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
+    encoded_dims: Arc<std::sync::atomic::AtomicU64>,
+    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    priority: Arc<std::sync::atomic::AtomicU8>,
+) {
+    loop {
+        let sink = crate::media_share::FollowerSink {
+            session_id,
+            video_bytes_dc: video_bytes_dc.clone(),
+            control_dc: control_dc.clone(),
+            keyframe_requested: keyframe_requested.clone(),
+            target_resolution: target_resolution.clone(),
+            quality_state: quality_state.clone(),
+            viewer_report: viewer_report.clone(),
+            priority: priority.clone(),
+            capture_native_dims: capture_native_dims.clone(),
+            encoded_dims: encoded_dims.clone(),
+        };
+        if let Some(guard) = crate::media_share::try_join(
+            crate::media_share::PipelineKey::FfmpegDc(codec.label()),
+            sink,
+            ffmpeg_target_fps(false),
+        ) {
+            match guard.detached().await {
+                crate::media_share::DetachReason::PipelineClosed => {
+                    info!(%session_id, codec = codec.label(), "P5: shared pipeline closed — re-dispatching");
+                    continue;
+                }
+                crate::media_share::DetachReason::Spilled => {
+                    info!(%session_id, codec = codec.label(), "P5: spilled from shared pipeline — starting own pump");
+                }
+            }
+        }
+        return media_pump_ffmpeg_dc(
+            codec,
+            session_id,
+            video_bytes_dc,
+            keyframe_requested,
+            target_resolution,
+            lock_state_rx,
+            quality_state,
+            control_dc,
+            pc,
+            capture_native_dims,
+            encoded_dims,
+            viewer_report,
+            priority,
+        )
+        .await;
+    }
+}
+
+/// P5 — session-level entry for the libvpx VP9-444 DC transport; twin of
+/// [`run_ffmpeg_dc_session`], keyed by chroma (444/420 are different VP9
+/// profiles and cannot share a stream).
+#[cfg(feature = "vp9-444")]
+#[allow(clippy::too_many_arguments)]
+async fn run_vp9_444_dc_session(
+    session_id: bson::oid::ObjectId,
+    video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    keyframe_requested: Arc<std::sync::atomic::AtomicBool>,
+    target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
+    lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
+    quality_state: Arc<std::sync::atomic::AtomicU8>,
+    chroma_pref: Option<String>,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    pc: Arc<RTCPeerConnection>,
+    capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
+    encoded_dims: Arc<std::sync::atomic::AtomicU64>,
+    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    priority: Arc<std::sync::atomic::AtomicU8>,
+) {
+    loop {
+        let sink = crate::media_share::FollowerSink {
+            session_id,
+            video_bytes_dc: video_bytes_dc.clone(),
+            control_dc: control_dc.clone(),
+            keyframe_requested: keyframe_requested.clone(),
+            target_resolution: target_resolution.clone(),
+            quality_state: quality_state.clone(),
+            viewer_report: viewer_report.clone(),
+            priority: priority.clone(),
+            capture_native_dims: capture_native_dims.clone(),
+            encoded_dims: encoded_dims.clone(),
+        };
+        if let Some(guard) = crate::media_share::try_join(
+            crate::media_share::PipelineKey::Vp9Dc {
+                chroma_444: vp9_chroma_is_444(chroma_pref.as_deref()),
+            },
+            sink,
+            vp9_444_target_fps_from_env(),
+        ) {
+            match guard.detached().await {
+                crate::media_share::DetachReason::PipelineClosed => {
+                    info!(%session_id, "P5: shared VP9 pipeline closed — re-dispatching");
+                    continue;
+                }
+                crate::media_share::DetachReason::Spilled => {
+                    info!(%session_id, "P5: spilled from shared VP9 pipeline — starting own pump");
+                }
+            }
+        }
+        return media_pump_vp9_444_dc(
+            session_id,
+            video_bytes_dc,
+            keyframe_requested,
+            target_resolution,
+            lock_state_rx,
+            quality_state,
+            chroma_pref,
+            control_dc,
+            pc,
+            capture_native_dims,
+            encoded_dims,
+            viewer_report,
+            priority,
+        )
+        .await;
+    }
+}
+
 /// Phase Y.3 alternate media pump: capture → libvpx VP9 4:4:4 encode
 /// → length-prefixed `video-bytes` DC. No webrtc track involvement.
 ///
@@ -2528,6 +2686,16 @@ async fn media_pump_vp9_444_dc(
     let mut video_info_sent = false;
     let mut last_video_info_attempt: Option<std::time::Instant> = None;
     let mut chroma_wire: &'static str = "yuv444";
+    // P5 — shared-floor pipeline (twin of the FFmpeg pump's registration).
+    // The hard key includes chroma: 444 vs 420 are different VP9 profiles,
+    // so their viewers can't share a stream.
+    let pipeline = crate::media_share::Pipeline::register(
+        crate::media_share::PipelineKey::Vp9Dc {
+            chroma_444: vp9_chroma_is_444(chroma_pref.as_deref()),
+        },
+        session_id,
+    );
+    let mut last_viewers: usize = 0;
 
     let mut frames_captured: u64 = 0;
     let mut frames_encoded: u64 = 0;
@@ -2760,6 +2928,14 @@ async fn media_pump_vp9_444_dc(
         // fell back to a transport-less selection-derived label. Attempted
         // whenever undelivered (encoder built + 500 ms since last try);
         // rebuilds and transport flips clear `video_info_sent`.
+        // P5 — a viewer joining/leaving the shared pipeline refreshes the
+        // badge (its "viewers" count changed for everyone).
+        let viewers = 1 + pipeline.follower_count();
+        if viewers != last_viewers {
+            last_viewers = viewers;
+            video_info_sent = false;
+        }
+
         if !video_info_sent
             && last_video_info_attempt.is_none_or(|t| t.elapsed() >= VIDEO_INFO_RETRY)
             && encoder.is_some()
@@ -2781,11 +2957,14 @@ async fn media_pump_vp9_444_dc(
                     constrained_transport,
                     native_w,
                     native_h,
+                    viewers,
                 );
                 let cdc = control_dc.lock().await.clone();
                 if let Some(cdc) = cdc {
-                    if cdc.send_text(payload).await.is_ok() {
+                    if cdc.send_text(payload.clone()).await.is_ok() {
                         video_info_sent = true;
+                        // P5 — mirror to the followers' badges.
+                        pipeline.publish_video_info(payload);
                     }
                 }
             }
@@ -2805,7 +2984,7 @@ async fn media_pump_vp9_444_dc(
             warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
             return;
         }
-        if send_tx.capacity() == 0 {
+        if send_tx.capacity() == 0 || pipeline.followers_congested() {
             frames_skipped_backpressure += 1;
             // Adaptive bitrate (rc.171) — a FULL send channel is the real DC
             // backpressure signal. Drive the multiplicative decrease HERE,
@@ -2814,6 +2993,8 @@ async fn media_pump_vp9_444_dc(
             // never ran → bitrate pinned at 12.4 Mbps, the ~2 fps starvation
             // bug). Apply to the existing encoder immediately so the next
             // frame that DOES get through is already smaller.
+            // P5 — a congested follower gates production identically (the
+            // shared stream paces to the slowest link; see media_share).
             if let Some(ctrl) = aimd.as_mut() {
                 ctrl.observe(send_depth as u32, true, std::time::Instant::now());
                 if let Some(bps) = ctrl.take_pending() {
@@ -2886,16 +3067,16 @@ async fn media_pump_vp9_444_dc(
         // downscales it. On HW paths (DownscalePolicy::Never) this is the
         // true monitor resolution; that's every host that hits the DC
         // video pumps in the field.
-        capture_native_dims.store(
-            pack_dims(frame.width, frame.height),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let native_dims_packed = pack_dims(frame.width, frame.height);
+        capture_native_dims.store(native_dims_packed, std::sync::atomic::Ordering::Relaxed);
         // rc.190 — compose the controller's request with the agent-side caps:
         // B2 soft cap (libvpx is ALWAYS software — a 4K panel crawled at
         // ~25 fps burning the host CPU, field GEAL8N6 2026-07-16) fills in
         // when the controller left Native; B1 hard cap clamps everything on
         // a constrained relay (a ~3 Mbps TURN-TCP path can't carry more).
-        let user_target = *target_resolution.lock().unwrap();
+        // P5 — resolution + Priority floor-merge across the shared
+        // pipeline's viewers (most conservative wins while shared).
+        let user_target = pipeline.merged_target(*target_resolution.lock().unwrap());
         let effective_target = effective_target_resolution(
             user_target,
             frame.width,
@@ -2904,8 +3085,11 @@ async fn media_pump_vp9_444_dc(
             // the link-physics hard cap on a relay, Sharper lifts it (native
             // override), Smoother caps harder on every path. The SW soft cap
             // below is independent (host-CPU protection, always applied).
-            crate::encode::priority_relay_cap(
-                priority.load(std::sync::atomic::Ordering::Relaxed),
+            pipeline.merged_priority_cap(
+                crate::encode::priority_relay_cap(
+                    priority.load(std::sync::atomic::Ordering::Relaxed),
+                    constrained_transport,
+                ),
                 constrained_transport,
             ),
             crate::encode::sw_res_cap_long_edge(),
@@ -2926,10 +3110,8 @@ async fn media_pump_vp9_444_dc(
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the caps can pick a smaller target than
         // the controller asked for, so TargetResolution alone is stale).
-        encoded_dims.store(
-            pack_dims(frame.width, frame.height),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let encoded_dims_packed = pack_dims(frame.width, frame.height);
+        encoded_dims.store(encoded_dims_packed, std::sync::atomic::Ordering::Relaxed);
 
         // Lock-screen overlay (M3 phase 3, Z-path). Same logic as
         // the legacy track pump — when the user-context worker
@@ -3038,7 +3220,11 @@ async fn media_pump_vp9_444_dc(
         }
         let enc = encoder.as_mut().unwrap();
         let mut force_keyframe_this_iter = false;
-        if keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // P5 — any viewer of the shared stream can ask (own atomic, a
+        // follower's atomic, or the pipeline's join/resync flag).
+        let own_kf = keyframe_requested.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let shared_kf = pipeline.take_keyframe_requested();
+        if own_kf || shared_kf {
             enc.request_keyframe();
             force_keyframe_this_iter = true;
         }
@@ -3075,7 +3261,10 @@ async fn media_pump_vp9_444_dc(
         if dp_now.duration_since(viewer_rate_window) >= Duration::from_secs(1) {
             let raw = viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed);
             let (reported_fps, struggling) = crate::encode::viewer_rate::unpack_report(raw);
-            let new_div = viewer_rate.observe(reported_fps, struggling, target_fps);
+            let own_div = viewer_rate.observe(reported_fps, struggling, target_fps);
+            // P5 — floor: fold every follower's decode report in, take the
+            // max divisor, and step the spill gate (see media_share).
+            let new_div = own_div.max(pipeline.step_viewer_windows(own_div, target_fps));
             if new_div != decode_skip_divisor || struggling {
                 info!(
                     %session_id,
@@ -3106,7 +3295,8 @@ async fn media_pump_vp9_444_dc(
         // under congestion / back up on recovery. The ceiling still lifts 4K
         // Quality=High to ~25-30 Mbps (the largest motion-smoothness lever)
         // and clamps to the relay cap on a constrained transport.
-        let q_now = quality_state.load(std::sync::atomic::Ordering::Relaxed);
+        // P5 — quality floor-merges across the shared pipeline's viewers.
+        let q_now = pipeline.min_quality(quality_state.load(std::sync::atomic::Ordering::Relaxed));
         if let Some((ew, eh)) = encoder_dims {
             let base = encode::initial_bitrate_for_fps(ew, eh, target_fps);
             // rc.185 — chroma-aware ceiling. `initial_bitrate_for_fps` is
@@ -3339,6 +3529,13 @@ async fn media_pump_vp9_444_dc(
         for p in packets {
             let ts_us = start.elapsed().as_micros() as u64;
             let wire = bytes::Bytes::from(frame_video_bytes(&p.data, p.is_keyframe, ts_us));
+            // P5 — fan out to the shared pipeline's followers first.
+            pipeline.fan_out(
+                &wire,
+                p.is_keyframe,
+                native_dims_packed,
+                encoded_dims_packed,
+            );
             match send_tx.try_send(wire) {
                 Ok(()) => {
                     // A key frame that actually entered the send queue
@@ -3479,6 +3676,7 @@ impl FfmpegDcCodec {
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
+#[allow(clippy::too_many_arguments)]
 fn video_info_payload(
     codec: &str,
     encoder: &str,
@@ -3491,9 +3689,13 @@ fn video_info_payload(
     // the browser omits the annotation, so the field is backward-compatible.
     native_w: u32,
     native_h: u32,
+    // P5 — how many viewers this encoded stream serves (1 = solo, >1 =
+    // shared-floor pipeline). The browser badge shows "shared ×N" so a
+    // capped/min-merged stream is explainable from the viewer side.
+    viewers: usize,
 ) -> String {
     format!(
-        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h}}}"#,
+        r#"{{"t":"rc:video-info","codec":"{codec}","encoder":"{encoder}","hardware":{hardware},"chroma":"{chroma}","transport":"{}","native_w":{native_w},"native_h":{native_h},"viewers":{viewers}}}"#,
         if constrained { "relay" } else { "direct" },
     )
 }
@@ -3555,6 +3757,19 @@ async fn media_pump_ffmpeg_dc(
     use crate::encode::ffmpeg::FfmpegEncoder;
 
     let codec_label = codec.label();
+    // P5 — shared-floor pipeline: this pump is the OWNER for its hard
+    // profile (transport codec). Same-profile sessions join as followers
+    // through `run_ffmpeg_dc_session`; their inputs merge into this loop as
+    // a floor (any-viewer keyframe, max frame-skip divisor, min dials,
+    // production gated on the slowest queue) and every encoded packet fans
+    // out to them. Standalone (never followed) when the key was already
+    // owned by another pump. Dropping it — including task abort at session
+    // teardown — detaches all followers, which then re-dispatch.
+    let pipeline = crate::media_share::Pipeline::register(
+        crate::media_share::PipelineKey::FfmpegDc(codec_label),
+        session_id,
+    );
+    let mut last_viewers: usize = 0;
     // rc.87 — emit `rc:video-info` so the browser stats badge shows the
     // TRUTH (real encoder + HW + chroma + transport). Badge-truth rc:
     // RETRIED until delivered (see the loop-top block) — the old
@@ -3860,6 +4075,14 @@ async fn media_pump_ffmpeg_dc(
             }
         }
 
+        // P5 — a viewer joining/leaving the shared pipeline refreshes the
+        // badge (its "viewers" count changed for everyone).
+        let viewers = 1 + pipeline.follower_count();
+        if viewers != last_viewers {
+            last_viewers = viewers;
+            video_info_sent = false;
+        }
+
         // Badge-truth — deliver `rc:video-info` reliably. Attempted whenever
         // undelivered (encoder built + 500 ms since the last try), instead of
         // the old once-at-encoder-build send: on relay sessions the control
@@ -3887,11 +4110,15 @@ async fn media_pump_ffmpeg_dc(
                     constrained,
                     native_w,
                     native_h,
+                    viewers,
                 );
                 let cdc = control_dc.lock().await.clone();
                 if let Some(cdc) = cdc {
-                    if cdc.send_text(payload).await.is_ok() {
+                    if cdc.send_text(payload.clone()).await.is_ok() {
                         video_info_sent = true;
+                        // P5 — followers' badges mirror the owner's (their
+                        // stats chips describe the SAME shared stream).
+                        pipeline.publish_video_info(payload);
                     }
                 }
             }
@@ -3938,13 +4165,16 @@ async fn media_pump_ffmpeg_dc(
             );
             return;
         }
-        if send_tx.capacity() == 0 {
+        if send_tx.capacity() == 0 || pipeline.followers_congested() {
             frames_skipped_backpressure += 1;
             // Phase B — a FULL send channel is the real DC backpressure signal.
             // Drive the multiplicative decrease HERE, before the `continue`, so
             // it runs DURING sustained congestion (the VP9 pump's rc.171
             // starvation-fix rationale) instead of never firing. Apply to the
             // live encoder so the next frame that gets through is already smaller.
+            // P5 — a congested FOLLOWER gates production the same way: the
+            // shared stream paces to the slowest link (the pre-encode floor;
+            // per-viewer delta drops would break that viewer's ref chain).
             if let Some(ctrl) = aimd.as_mut() {
                 ctrl.observe(ffmpeg_send_depth as u32, true, std::time::Instant::now());
                 if let Some(bps) = ctrl.take_pending() {
@@ -4056,24 +4286,28 @@ async fn media_pump_ffmpeg_dc(
         // downscales it. On HW paths (DownscalePolicy::Never) this is the
         // true monitor resolution; that's every host that hits the DC
         // video pumps in the field.
-        capture_native_dims.store(
-            pack_dims(frame.width, frame.height),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let native_dims_packed = pack_dims(frame.width, frame.height);
+        capture_native_dims.store(native_dims_packed, std::sync::atomic::Ordering::Relaxed);
         // rc.190 — compose the controller's request with the B1 relay hard
         // cap: a constrained TURN-TCP path (~3 Mbps ceiling) cannot carry a
         // 2560×1600 HEVC stream without the blur↔crystallize AIMD sawtooth
         // (field NEO16→PC50045 2026-07-16, target_bps pinned 1.8M↔3.0M).
         // No SW soft cap here — this pump is HW-encode by construction.
-        let user_target = *target_resolution.lock().unwrap();
+        // P5 — both dials floor-merge across the pipeline's viewers: the
+        // smallest resolution request and the most conservative Priority cap
+        // win while shared (the badge shows "shared ×N" to explain it).
+        let user_target = pipeline.merged_target(*target_resolution.lock().unwrap());
         let effective_target = effective_target_resolution(
             user_target,
             frame.width,
             frame.height,
             // rc.199 — Priority-resolved relay cap (see the VP9-444 pump). This
             // HW-encode pump has no SW soft cap, so Sharper reaches full native.
-            crate::encode::priority_relay_cap(
-                priority.load(std::sync::atomic::Ordering::Relaxed),
+            pipeline.merged_priority_cap(
+                crate::encode::priority_relay_cap(
+                    priority.load(std::sync::atomic::Ordering::Relaxed),
+                    constrained,
+                ),
                 constrained,
             ),
             // 2026-07-27 — encode-bound auto-downscale tier (soft slot: an
@@ -4096,10 +4330,8 @@ async fn media_pump_ffmpeg_dc(
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the relay cap can pick a smaller target
         // than the controller asked for).
-        encoded_dims.store(
-            pack_dims(frame.width, frame.height),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let encoded_dims_packed = pack_dims(frame.width, frame.height);
+        encoded_dims.store(encoded_dims_packed, std::sync::atomic::Ordering::Relaxed);
 
         // Lazily build / rebuild the encoder when the frame dims change.
         let (w, h) = (frame.width, frame.height);
@@ -4186,7 +4418,12 @@ async fn media_pump_ffmpeg_dc(
         }
 
         // Apply browser-requested keyframe (PLI/RTCP equivalent on DC).
-        if keyframe_requested.swap(false, std::sync::atomic::Ordering::SeqCst)
+        // P5 — ANY viewer of the shared stream can ask (own atomic, a
+        // follower's atomic, or the pipeline's join/resync flag); both
+        // sides are consumed every iteration.
+        let own_kf = keyframe_requested.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let shared_kf = pipeline.take_keyframe_requested();
+        if (own_kf || shared_kf)
             && let Some(enc) = encoder.as_mut()
         {
             enc.request_keyframe();
@@ -4254,7 +4491,12 @@ async fn media_pump_ffmpeg_dc(
         if dp_now.duration_since(viewer_rate_window) >= Duration::from_secs(1) {
             let raw = viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed);
             let (reported_fps, struggling) = crate::encode::viewer_rate::unpack_report(raw);
-            let new_div = viewer_rate.observe(reported_fps, struggling, target_fps);
+            let own_div = viewer_rate.observe(reported_fps, struggling, target_fps);
+            // P5 — the shared stream paces to the SLOWEST viewer: fold every
+            // follower's decode report in and take the max divisor. Also
+            // steps the spill gate (a sustained large deviation detaches the
+            // most deviant follower to its own encoder).
+            let new_div = own_div.max(pipeline.step_viewer_windows(own_div, target_fps));
             if new_div != decode_skip_divisor || struggling {
                 info!(
                     %session_id,
@@ -4386,6 +4628,15 @@ async fn media_pump_ffmpeg_dc(
                 pkt.is_keyframe,
                 frame.monotonic_us,
             ));
+            // P5 — fan the framed packet out to the shared pipeline's
+            // followers first (their sync gates + queues are independent of
+            // the owner's), then queue it for the owner's own DC.
+            pipeline.fan_out(
+                &wire,
+                pkt.is_keyframe,
+                native_dims_packed,
+                encoded_dims_packed,
+            );
             match send_tx.try_send(wire) {
                 Ok(()) => {
                     // A key frame that actually entered the send queue
@@ -7684,12 +7935,12 @@ mod tests {
     #[test]
     fn video_info_payload_wire_shape() {
         assert_eq!(
-            super::video_info_payload("h265", "hevc_nvenc", true, "yuv420", false, 1920, 1080),
-            r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080}"#
+            super::video_info_payload("h265", "hevc_nvenc", true, "yuv420", false, 1920, 1080, 1),
+            r#"{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":1}"#
         );
         assert_eq!(
-            super::video_info_payload("vp9", "libvpx", false, "yuv444", true, 2560, 1600),
-            r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600}"#
+            super::video_info_payload("vp9", "libvpx", false, "yuv444", true, 2560, 1600, 2),
+            r#"{"t":"rc:video-info","codec":"vp9","encoder":"libvpx","hardware":false,"chroma":"yuv444","transport":"relay","native_w":2560,"native_h":1600,"viewers":2}"#
         );
     }
 
