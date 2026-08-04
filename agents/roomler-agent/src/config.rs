@@ -222,11 +222,18 @@ pub struct AgentConfig {
     pub overlay_demote: Option<String>,
     /// Multi-user P3 — concurrent remote-control sessions this agent
     /// advertises (`ROOMLER_AGENT_RC_MAX_SESSIONS`, 1–8). Built-in
-    /// default: 2. Until the P5 shared encoder lands each session runs
-    /// its own capture + encoder — weak-GPU hosts may prefer 1. The
-    /// server keeps concurrent INPUT to one holder regardless.
+    /// default: 2. With the P5 shared encoder (default on) same-profile
+    /// DC viewers share one capture + encoder; distinct profiles still
+    /// run their own — weak-GPU hosts may prefer 1. The server keeps
+    /// concurrent INPUT to one holder regardless.
     #[serde(default)]
     pub rc_max_sessions: Option<u32>,
+    /// Multi-user P5 — shared-floor encoder for concurrent DC viewers
+    /// (`ROOMLER_AGENT_SHARED_ENCODER`): same-profile sessions share ONE
+    /// capture + encoder with floor-merged rate/dials; `off` reverts to
+    /// the rc.302 pump-per-session behaviour. Built-in default: on.
+    #[serde(default)]
+    pub shared_encoder: Option<bool>,
     /// P4 — ingress filtering of INBOUND overlay packets
     /// (`ROOMLER_NODE_OVERLAY_RPF`): `off` | `warn` (count + log, still
     /// deliver — the built-in default) | `enforce` (drop). Two checks share
@@ -917,8 +924,9 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 19] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 20] {
     [
+        ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
         ("OVERLAY_DERP", cfg.overlay_derp),
@@ -1130,6 +1138,7 @@ mod tests {
             text_mod_neutralize: None,
             overlay_demote: None,
             rc_max_sessions: None,
+            shared_encoder: None,
             overlay_rpf: None,
             last_known_good_version: None,
             crash_count: 0,
