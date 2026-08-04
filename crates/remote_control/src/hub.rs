@@ -361,20 +361,47 @@ impl Hub {
             list.retain(|t| !ptr_eq(t, tx));
         }
 
-        // Terminate any sessions this controller still owns. Without this
+        // Terminate any sessions THIS CONNECTION still owns. Without this
         // the agent's active_sessions counter never drops when a browser
         // tab closes mid-session, and subsequent Connect attempts fail
         // with AgentBusy until the agent itself disconnects.
+        //
+        // P3 — keyed by the departing TX, not the user_id: this was
+        // user-keyed and killed EVERY session of the user on ANY one tab
+        // close — tab A's org-switch redial (#307 `setTenantAffinity`
+        // closes the WS) tore down tab B's live session, and with
+        // N-session support one closing watcher tab would have killed the
+        // user's other sessions. A session mid-setup (tx not yet
+        // registered) keeps its live channel, so it is never a false
+        // positive; a session whose channel is already CLOSED is reaped
+        // regardless of which tab it belonged to (the rc.185 orphan sweep
+        // in `create_session` remains the belt for races).
         let orphaned: Vec<ObjectId> = self
             .inner
             .sessions
             .iter()
-            .filter(|e| e.value().lock().controller_user_id == user_id)
+            .filter(|e| {
+                let s = e.value().lock();
+                s.controller_user_id == user_id
+                    && s.controller_tx
+                        .as_ref()
+                        .map(|t| ptr_eq(t, tx) || t.is_closed())
+                        .unwrap_or(false)
+            })
             .map(|e| *e.key())
             .collect();
         for session_id in orphaned {
             let _ = self.terminate(session_id, EndReason::ControllerHangup);
         }
+    }
+
+    /// P3 — a live session's `(tenant_id, controller_user_id)`, for
+    /// route-side authz + cross-pod ctrl tenant checks. `None` when this
+    /// pod's hub doesn't hold the session (pod-local under S6).
+    pub fn session_snapshot(&self, session_id: ObjectId) -> Option<(ObjectId, ObjectId)> {
+        let arc = self.inner.sessions.get(&session_id)?;
+        let s = arc.value().lock();
+        Some((s.tenant_id, s.controller_user_id))
     }
 
     // ─── session lifecycle ────────────────────────────────────────────
@@ -861,6 +888,41 @@ pub struct DispatchCtx {
 }
 
 impl Hub {
+    /// Multi-user P3 security — is the dispatching CONNECTION a party to the
+    /// session (the controller that owns it, or the agent it targets)?
+    ///
+    /// Session ids are not secrets: every tenant member sees them in the
+    /// sessions listing/audit, and with N-session support watchers hold them
+    /// legitimately. Pre-P3, `dispatch` matched `Terminate` / `SdpOffer` /
+    /// `Ice` on session_id alone — any authenticated user who learned an id
+    /// could kill the session or inject SDP/ICE into its signalling.
+    /// Server-side paths with their own authz (the HTTP terminate route,
+    /// orphan reaps, teardown sweeps) call the underlying methods directly
+    /// and are unaffected.
+    fn check_session_party(&self, ctx: &DispatchCtx, session_id: ObjectId) -> Result<()> {
+        let arc = self
+            .inner
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| Error::SessionNotFound(session_id.to_hex()))?;
+        let s = arc.value().lock();
+        let is_party = match ctx.role {
+            Role::Controller => ctx.user_id == Some(s.controller_user_id),
+            Role::Agent => ctx.agent_id == Some(s.agent_id),
+        };
+        drop(s);
+        if is_party {
+            Ok(())
+        } else {
+            warn!(
+                "rc dispatch refused: {:?} connection is not a party to session {}",
+                ctx.role,
+                session_id.to_hex()
+            );
+            Err(Error::PermissionDenied("not a party to this session"))
+        }
+    }
+
     pub fn dispatch(&self, ctx: &DispatchCtx, msg: ClientMsg) -> Result<()> {
         match (ctx.role, msg) {
             (
@@ -909,9 +971,11 @@ impl Hub {
                 Ok(())
             }
             (Role::Controller, ClientMsg::SdpOffer { session_id, sdp }) => {
+                self.check_session_party(ctx, session_id)?;
                 self.forward_offer(session_id, sdp)
             }
             (Role::Agent, ClientMsg::SdpAnswer { session_id, sdp }) => {
+                self.check_session_party(ctx, session_id)?;
                 self.forward_answer(session_id, sdp)
             }
             (
@@ -920,15 +984,30 @@ impl Hub {
                     session_id,
                     granted,
                 },
-            ) => self.deliver_consent(session_id, granted),
+            ) => {
+                self.check_session_party(ctx, session_id)?;
+                self.deliver_consent(session_id, granted)
+            }
             (
                 role,
                 ClientMsg::Ice {
                     session_id,
                     candidate,
                 },
-            ) => self.forward_ice(role, session_id, candidate),
-            (_, ClientMsg::Terminate { session_id, reason }) => self.terminate(session_id, reason),
+            ) => {
+                self.check_session_party(ctx, session_id)?;
+                self.forward_ice(role, session_id, candidate)
+            }
+            (_, ClientMsg::Terminate { session_id, reason }) => {
+                // Terminate stays IDEMPOTENT on an already-gone session (the
+                // agent's overlay-badge disconnect and teardown races rely on
+                // it) — only a live session enforces the party check.
+                match self.check_session_party(ctx, session_id) {
+                    Ok(()) => self.terminate(session_id, reason),
+                    Err(Error::SessionNotFound(_)) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
             (_, ClientMsg::Ping { id: _ }) => Ok(()), // pong handled by WS layer
             (_, ClientMsg::AgentHello { .. } | ClientMsg::AgentHeartbeat { .. }) => {
                 // Hello is handled at registration time; heartbeat is logged by WS layer.
@@ -1023,6 +1102,199 @@ mod tests {
         // Controller should now have a Ready message.
         let m = ctl_rx.try_recv().unwrap();
         assert!(matches!(m, ServerMsg::Ready { .. }));
+    }
+
+    /// P3 security — `dispatch` refuses session verbs from a connection
+    /// that is not a party to the session (any authenticated user who
+    /// learned a session id could previously Terminate it or inject
+    /// SDP/ICE), while the owning controller and the session's agent pass,
+    /// and Terminate stays idempotent for an already-gone session.
+    #[tokio::test]
+    async fn dispatch_enforces_session_party() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let owner = ObjectId::new();
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                owner,
+                "Owner".into(),
+                ctl_tx.clone(),
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let ctx_for = |role: Role, user: Option<ObjectId>, agent: Option<ObjectId>| DispatchCtx {
+            role,
+            user_id: user,
+            agent_id: agent,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+        };
+        let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
+        let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
+        let session_agent = ctx_for(Role::Agent, None, Some(agent_id));
+        let other_agent = ctx_for(Role::Agent, None, Some(ObjectId::new()));
+
+        // A stranger cannot terminate, offer, or trickle ICE.
+        for msg in [
+            ClientMsg::Terminate {
+                session_id: sid,
+                reason: EndReason::ControllerHangup,
+            },
+            ClientMsg::SdpOffer {
+                session_id: sid,
+                sdp: "v=0".into(),
+            },
+            ClientMsg::Ice {
+                session_id: sid,
+                candidate: serde_json::json!({}),
+            },
+        ] {
+            let res = hub.dispatch(&stranger, msg);
+            assert!(
+                matches!(res, Err(Error::PermissionDenied(_))),
+                "stranger must be refused, got {res:?}"
+            );
+        }
+        // A DIFFERENT agent cannot answer/consent/ICE into the session.
+        for msg in [
+            ClientMsg::SdpAnswer {
+                session_id: sid,
+                sdp: "v=0".into(),
+            },
+            ClientMsg::Consent {
+                session_id: sid,
+                granted: true,
+            },
+            ClientMsg::Ice {
+                session_id: sid,
+                candidate: serde_json::json!({}),
+            },
+        ] {
+            let res = hub.dispatch(&other_agent, msg);
+            assert!(
+                matches!(res, Err(Error::PermissionDenied(_))),
+                "foreign agent must be refused, got {res:?}"
+            );
+        }
+        assert!(
+            hub.session_snapshot(sid).is_some(),
+            "session must survive every refused attempt"
+        );
+
+        // The session's OWN agent passes the check (consent resolves).
+        hub.dispatch(
+            &session_agent,
+            ClientMsg::Consent {
+                session_id: sid,
+                granted: true,
+            },
+        )
+        .unwrap();
+
+        // The owning controller may terminate; a repeat (session gone) is
+        // idempotent Ok, and a stranger's attempt on a MISSING session is
+        // also Ok (nothing to protect, matches pre-P3 idempotency).
+        hub.dispatch(
+            &owner_ctx,
+            ClientMsg::Terminate {
+                session_id: sid,
+                reason: EndReason::ControllerHangup,
+            },
+        )
+        .unwrap();
+        hub.dispatch(
+            &owner_ctx,
+            ClientMsg::Terminate {
+                session_id: sid,
+                reason: EndReason::ControllerHangup,
+            },
+        )
+        .unwrap();
+        hub.dispatch(
+            &stranger,
+            ClientMsg::Terminate {
+                session_id: sid,
+                reason: EndReason::ControllerHangup,
+            },
+        )
+        .unwrap();
+    }
+
+    /// P3 — `unregister_controller` is per-CONNECTION: closing tab A must
+    /// not tear down the same user's live session on tab B (pre-P3 it was
+    /// user-keyed and killed every session — #307's org-switch redial in
+    /// one tab killed the other tab's live session).
+    #[tokio::test]
+    async fn unregister_controller_kills_only_that_tabs_sessions() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+        let user = ObjectId::new();
+
+        let (tx_a, _rx_a) = hub.register_controller(user);
+        let (tx_b, _rx_b) = hub.register_controller(user);
+        let sid_a = hub
+            .create_session(
+                agent_id,
+                user,
+                "tab A".into(),
+                tx_a.clone(),
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+            )
+            .unwrap();
+        let sid_b = hub
+            .create_session(
+                agent_id,
+                user,
+                "tab B".into(),
+                tx_b.clone(),
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Tab A closes: only A's session goes.
+        hub.unregister_controller(user, &tx_a);
+        assert!(
+            hub.session_snapshot(sid_a).is_none(),
+            "tab A's session must be reaped"
+        );
+        assert!(
+            hub.session_snapshot(sid_b).is_some(),
+            "tab B's live session must SURVIVE tab A's close"
+        );
+
+        // Tab B closes: its session goes too.
+        hub.unregister_controller(user, &tx_b);
+        assert!(hub.session_snapshot(sid_b).is_none());
     }
 
     // rc.185 — the fast connect→disconnect reconnect fix. An orphaned
