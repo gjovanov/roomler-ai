@@ -505,6 +505,49 @@ impl Hub {
             agent.tenant_id
         };
 
+        // Multi-user P3 back-compat — the FILES bit becomes agent-ENFORCED in
+        // this release, but every pre-P3 viewer requests the legacy triple
+        // (VIEW|INPUT|CLIPBOARD, also `Permissions::default()`) and file
+        // transfer has ALWAYS worked under it. Grandfather exactly that grant
+        // to include FILES so a cached pre-P3 tab doesn't lose its file
+        // toolbar against a P3 agent; new viewers request FILES explicitly,
+        // and any OTHER combination (a genuine view-only watcher, a narrowed
+        // grant) is taken literally. Remove once pre-P3 viewers age out.
+        let permissions = if permissions == Permissions::default() {
+            permissions | Permissions::FILES
+        } else {
+            permissions
+        };
+
+        // Multi-user P3 — ONE INPUT holder per agent. With N concurrent
+        // sessions now reachable (rc_max_sessions ≥ 2) but no input
+        // arbitration yet, two typing users would merge on the host's single
+        // modifier plane (the agent injects real HID presses and the OS
+        // combines them: A holding Shift turns B's clicks into chords) and
+        // fight over the process-global keyboard layout. Until the P6
+        // arbitration modes (free-for-all + per-session modifier fencing /
+        // explicit handoff) land, a session requested while another LIVE
+        // session on this agent already holds INPUT is downgraded to
+        // view-effective (INPUT stripped; VIEW/CLIPBOARD/FILES kept). The
+        // effective grant travels in `SessionCreated.permissions` (viewer)
+        // and `Request.permissions` (agent, which enforces it on the input
+        // DC), and INPUT is RE-offered naturally when the holder's session
+        // ends and a new session is created.
+        let permissions = if permissions.contains(Permissions::INPUT)
+            && self.inner.sessions.iter().any(|e| {
+                let s = e.value().lock();
+                s.agent_id == agent_id && s.permissions.contains(Permissions::INPUT)
+            }) {
+            info!(
+                "agent {} already has an INPUT-holding session — new session is view-effective \
+                 (P3 single-holder rule; arbitration modes land with P6)",
+                agent_id.to_hex()
+            );
+            permissions - Permissions::INPUT
+        } else {
+            permissions
+        };
+
         let session_id = ObjectId::new();
         let (mut live, waiter) = LiveSession::new(
             session_id,
@@ -522,10 +565,12 @@ impl Hub {
             .sessions
             .insert(session_id, Arc::new(Mutex::new(live)));
 
-        // Tell the controller the session id.
+        // Tell the controller the session id + its EFFECTIVE grant (which the
+        // single-INPUT-holder rule above may have narrowed).
         let _ = controller_tx.try_send(ServerMsg::SessionCreated {
             session_id,
             agent_id,
+            permissions: Some(permissions),
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -560,7 +605,16 @@ impl Hub {
             consent_mode: Some(consent_mode),
         });
 
-        self.audit(session_id, agent_id, agent_org, AuditKind::SessionRequested);
+        self.audit(
+            session_id,
+            agent_id,
+            agent_org,
+            AuditKind::SessionRequested {
+                controller_user_id,
+                controller_name: controller_name.clone(),
+                permissions,
+            },
+        );
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
 
         // Phase 5 — record the break-glass BEFORE the session proceeds. The API
@@ -1272,6 +1326,71 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// Multi-user P3 — ONE INPUT holder per agent: a second concurrent
+    /// session is created view-effective (INPUT stripped, everything else
+    /// kept), the effective grant rides `SessionCreated.permissions`, and
+    /// INPUT becomes grantable again once the holder's session ends.
+    #[tokio::test]
+    async fn second_concurrent_session_is_input_stripped_until_holder_ends() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) =
+            hub.register_agent(agent_id, ObjectId::new(), ObjectId::new(), OsKind::Linux, 3);
+
+        let mk = |hub: &Hub, name: &str, tx: ClientTx| {
+            hub.create_session(
+                agent_id,
+                ObjectId::new(),
+                name.into(),
+                tx,
+                Permissions::default(), // VIEW | INPUT | CLIPBOARD
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+            )
+        };
+        let effective = |rx: &mut mpsc::Receiver<ServerMsg>| match rx.try_recv().unwrap() {
+            ServerMsg::SessionCreated { permissions, .. } => {
+                permissions.expect("P3 server always reports the effective grant")
+            }
+            other => panic!("expected SessionCreated, got {other:?}"),
+        };
+
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let sid_a = mk(&hub, "holder", tx_a).unwrap();
+        let perms_a = effective(&mut rx_a);
+        assert!(
+            perms_a.contains(Permissions::INPUT),
+            "first session holds INPUT"
+        );
+
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let sid_b = mk(&hub, "watcher", tx_b).unwrap();
+        let perms_b = effective(&mut rx_b);
+        assert!(
+            !perms_b.contains(Permissions::INPUT),
+            "second concurrent session must be view-effective, got {perms_b:?}"
+        );
+        assert!(perms_b.contains(Permissions::VIEW), "everything else kept");
+        assert!(perms_b.contains(Permissions::CLIPBOARD));
+        assert_ne!(sid_a, sid_b);
+
+        // Holder ends → the next session gets INPUT again (B keeps its
+        // narrowed grant — re-offer is by NEW session, not retro-upgrade).
+        hub.terminate(sid_a, EndReason::ControllerHangup).unwrap();
+        let (tx_c, mut rx_c) = mpsc::channel(8);
+        let _sid_c = mk(&hub, "next", tx_c).unwrap();
+        let perms_c = effective(&mut rx_c);
+        assert!(
+            perms_c.contains(Permissions::INPUT),
+            "INPUT re-offered once the holder ended, got {perms_c:?}"
+        );
     }
 
     /// P3 — `unregister_controller` is per-CONNECTION: closing tab A must

@@ -2875,6 +2875,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  agent's expected routing: input/control/clipboard/files. */
   const channels: Record<string, RTCDataChannel> = {}
   const inputChannelOpen = ref(false)
+  // Multi-user P3: the session's EFFECTIVE input grant, from
+  // `rc:session.created.permissions`. `true` until a server says otherwise
+  // (pre-P3 servers omit the field = as-requested). Reset on each connect.
+  const inputGranted = ref(true)
 
   // Pending clipboard:read requests. Keyed by `req_id` so interleaved
   // reads can resolve independently. The agent echoes the req_id back
@@ -3678,6 +3682,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   }
 
   function sendInput(msg: Record<string, unknown>) {
+    // Multi-user P3: a view-effective session (the server stripped INPUT
+    // because another live session holds it) sends nothing - the agent's
+    // input DC is in drop-only mode anyway; suppressing here saves the
+    // wire and makes the state observable (`inputGranted` export).
+    if (!inputGranted.value) return
     const ch = channels.input
     if (!ch || ch.readyState !== 'open') return
     try {
@@ -4981,19 +4990,42 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const pendingRemoteIce: RTCIceCandidateInit[] = []
   let remoteDescriptionSet = false
 
+  // Multi-user P3: THIS composable's unsubscribers. Registration is
+  // multi-subscriber now (ws.ts Set-based registry), so teardown must
+  // remove only OUR handlers — the old type-wide offRcMessage nuked a
+  // sibling composable's live handlers (device modal over the RC page,
+  // HMR double-mount).
+  let rcUnsubs: Array<() => void> = []
+
   function installRcHandlers() {
-    ws.onRcMessage('rc:session.created', (msg) => {
+    removeRcHandlers() // idempotent re-install (reconnect path)
+    const on = (t: string, h: (msg: any) => void) => {
+      rcUnsubs.push(ws.onRcMessage(t, h))
+    }
+    on('rc:session.created', (msg) => {
       // Only accept while we actually have a request in flight Ã¢ÂÂ a
       // late/stale create must not resurrect an abandoned attempt.
       if (phase.value !== 'requesting') return
       sessionId.value = msg.session_id
+      // Multi-user P3: the server reports the EFFECTIVE grant, which the
+      // single-INPUT-holder rule may have narrowed (another live session
+      // already drives this host). Absent from pre-P3 servers = treat as
+      // as-requested. `inputGranted=false` suppresses the input senders so
+      // we never stream events the agent drops anyway.
+      const perms = typeof msg.permissions === 'string' ? msg.permissions : null
+      inputGranted.value = perms === null || perms.includes('INPUT')
+      if (!inputGranted.value) {
+        console.info(
+          '[rc] session is VIEW-EFFECTIVE: another session already holds input on this host',
+        )
+      }
       phase.value = 'awaiting_consent'
       // Consent is human-paced on Prompt-mode devices; the SERVER owns
       // that timeout (consent_timeout). Ours only covers requesting/
       // negotiating.
       clearSignalingTimeout()
     })
-    ws.onRcMessage('rc:ready', async (msg) => {
+    on('rc:ready', async (msg) => {
       if (!pc) return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       phase.value = 'negotiating'
@@ -5010,7 +5042,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         failWith((e as Error).message || 'createOffer failed')
       }
     })
-    ws.onRcMessage('rc:sdp.answer', async (msg) => {
+    on('rc:sdp.answer', async (msg) => {
       if (!pc) return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       try {
@@ -5029,7 +5061,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         failWith((e as Error).message || 'setRemoteDescription failed')
       }
     })
-    ws.onRcMessage('rc:ice', async (msg) => {
+    on('rc:ice', async (msg) => {
       if (!pc || !msg.candidate) return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
       const init = msg.candidate as RTCIceCandidateInit
@@ -5043,7 +5075,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         /* ignore Ã¢ÂÂ happens on stale candidates during teardown */
       }
     })
-    ws.onRcMessage('rc:terminate', (msg) => {
+    on('rc:terminate', (msg) => {
       // While the ladder timer is pending every terminate refers to a
       // session we already abandoned Ã¢ÂÂ ignore.
       if (phase.value === 'reconnecting') return
@@ -5074,7 +5106,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       teardown()
     })
-    ws.onRcMessage('rc:error', (msg) => {
+    on('rc:error', (msg) => {
       // Ladder pending Ã¢ÂÂ errors are stale fallout from the abandoned
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
@@ -5104,12 +5136,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   }
 
   function removeRcHandlers() {
-    ws.offRcMessage('rc:session.created')
-    ws.offRcMessage('rc:ready')
-    ws.offRcMessage('rc:sdp.answer')
-    ws.offRcMessage('rc:ice')
-    ws.offRcMessage('rc:terminate')
-    ws.offRcMessage('rc:error')
+    // P3: remove only THIS composable's subscriptions (see rcUnsubs).
+    for (const un of rcUnsubs) un()
+    rcUnsubs = []
   }
 
   function failWith(message: string) {
@@ -5278,7 +5307,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
   async function connect(
     agentId: string,
-    permissions = 'VIEW | INPUT | CLIPBOARD',
+    // Multi-user P3: FILES is requested explicitly now that the agent
+    // ENFORCES it (it was always implicitly granted under the legacy
+    // triple; the server grandfathers exactly that legacy request).
+    permissions = 'VIEW | INPUT | CLIPBOARD | FILES',
     isReconnect = false,
   ) {
     // The reconnect path is allowed to drive `connect` while phase ==
@@ -5302,6 +5334,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     error.value = null
     sessionId.value = null
+    inputGranted.value = true // until rc:session.created reports otherwise
     phase.value = 'requesting'
 
     // Restore the per-agent resolution preference. This has to live
@@ -8411,6 +8444,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     remoteStream,
     hasMedia,
     inputChannelOpen,
+    inputGranted,
     stats,
     quality,
     setQuality,
