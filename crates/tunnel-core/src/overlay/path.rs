@@ -132,11 +132,11 @@ impl PathMonMode {
 
 /// B2 — score-driven demotion engagement (`overlay_demote` config /
 /// `ROOMLER_AGENT_OVERLAY_DEMOTE`): `off` | `shadow` (compute + count
-/// would-be demotions, never act — the first-ship default) | `on`
-/// (voluntary demotions execute as MBB probes). Flip to `on` only after
-/// a clean fleet shadow read (the acceptance analog: a shadow-demote
-/// whose incumbent then died ≤60 s was a CORRECT call; one whose
-/// incumbent kept passing traffic was wrong).
+/// would-be demotions, never act — the rc.296 first-ship default) |
+/// `on` (voluntary demotions execute as MBB probes — the default since
+/// B3/rc.303: the ~43 h fleet shadow read was spotless, ZERO would-be
+/// demotions across 10 agents incl. the corp laptops' full VPN workday,
+/// diverged=0 harmful=0 throughout — no wrong calls to grade).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DemoteMode {
     Off,
@@ -148,9 +148,10 @@ impl DemoteMode {
     pub(crate) fn parse(v: Option<&str>) -> Self {
         match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
             Some("off") | Some("0") | Some("false") => DemoteMode::Off,
-            Some("on") | Some("1") | Some("true") => DemoteMode::On,
-            // Unset / "shadow" / anything else → the safe default.
-            _ => DemoteMode::Shadow,
+            // The per-host revert rail (counted, never acted on).
+            Some("shadow") => DemoteMode::Shadow,
+            // Unset / "on" / anything else → authoritative.
+            _ => DemoteMode::On,
         }
     }
 
@@ -207,6 +208,12 @@ pub(crate) const DEMOTE_HOLD: Duration = Duration::from_secs(15);
 /// B2 — "slammed-bad" Q floor for the (advisory) direct→relay demotion
 /// class: within one heard-credit of the −100 slam.
 const DEMOTE_RELAY_Q_FLOOR: f64 = -99.0;
+/// B3 — mid-tier upward probes (srflx/public incumbent → an eligible
+/// HIGHER tier) fire at most this often per peer. Deliberately slower
+/// than the 60 s LAN spacing: the incumbent is healthy, so the probe is
+/// pure opportunity cost; a failed one books the normal tier penalty
+/// which paces retries further.
+pub(crate) const UPWARD_PROBE_SPACING: Duration = Duration::from_secs(120);
 
 /// Q clamp: quality lives in [−Q_CLAMP, +Q_CLAMP].
 const Q_CLAMP: f64 = 100.0;
@@ -335,6 +342,10 @@ struct PeerPath {
     probe: Option<(DirectTier, Instant)>,
     /// F2 — when the last LAN attempt (probe start or install) began.
     last_lan_attempt: Option<Instant>,
+    /// B3 — when the last mid-tier UPWARD probe attempt was booked
+    /// (candidate returned, whether or not the probe then resolved an
+    /// endpoint) — paces upward probing to [`UPWARD_PROBE_SPACING`].
+    last_upward_attempt: Option<Instant>,
     /// P7 — the server's forced-DERP pin window, as an annotation. Direct
     /// decisions ignore it entirely (see the module doc).
     forced_derp_until: Option<Instant>,
@@ -933,6 +944,55 @@ impl PathMonitor {
             }
             None => Some(PathAction::Relay),
         }
+    }
+
+    /// B3 — the mid-tier upward-probe candidate for an established
+    /// srflx/public incumbent: the highest-precedence STRICTLY-HIGHER
+    /// tier that is available + eligible (the F2 LAN spacing applies to
+    /// a LAN target on top — both gates), at most once per
+    /// [`UPWARD_PROBE_SPACING`] per peer. Booking happens at candidate
+    /// time — an unresolvable endpoint still spends the slot, so a
+    /// structurally dead target can't be hammered. A failed probe books
+    /// the tier's normal penalty (its own pacing); NO Q event on expiry
+    /// (F1). Executed as the same MBB probe (incumbent held until latch).
+    pub(crate) fn upward_candidate(
+        &mut self,
+        peer: &ObjectId,
+        cur: DirectTier,
+        avail: TierAvailability,
+        now: Instant,
+    ) -> Option<DirectTier> {
+        let cur_idx = tier_idx(cur)?;
+        if cur_idx == 0 {
+            return None; // LAN incumbent — nothing higher.
+        }
+        if self.probes_in_flight >= PROBE_CAP {
+            return None;
+        }
+        let p = self.peers.entry(*peer).or_default();
+        if p.probe.is_some() {
+            return None;
+        }
+        if p.last_upward_attempt
+            .is_some_and(|t| now.saturating_duration_since(t) < UPWARD_PROBE_SPACING)
+        {
+            return None;
+        }
+        let lan_spaced_out = p
+            .last_lan_attempt
+            .is_some_and(|t| now.saturating_duration_since(t) < LAN_PROBE_SPACING);
+
+        // First higher-precedence tier passing ALL gates (a penalized top
+        // tier falls through to the next one — eligibility needs `&self`,
+        // hence the re-borrow dance around `p`).
+        let target = DIRECT_TIERS[..cur_idx]
+            .iter()
+            .copied()
+            .filter(|&tier| avail.has(tier) && !(tier == DirectTier::Lan && lan_spaced_out))
+            .find(|&tier| self.eligible(peer, tier, now))?;
+        let p = self.peers.entry(*peer).or_default();
+        p.last_upward_attempt = Some(now);
+        Some(target)
     }
 
     /// The inbound-init decision (≡ `handle_direct_inbound`'s accept/refuse):
@@ -1721,6 +1781,117 @@ mod tests {
             PathAction::Relay,
             "slammed incumbent with no alternative → advisory relay demote"
         );
+    }
+
+    /// B3 — upward probing: precedence-ordered target pick, the 120 s
+    /// spacing (booked at candidate time), the LAN-spacing composition,
+    /// eligibility fall-through, and the structural gates.
+    #[test]
+    fn upward_probe_spacing_targets_and_gates() {
+        let a = oid(1);
+        let t0 = Instant::now();
+
+        // Srflx incumbent, all higher tiers clean: LAN preferred; the
+        // spacing books at candidate time (119 s → held, 121 s → fires).
+        let mut m = PathMonitor::default();
+        assert_eq!(
+            m.upward_candidate(&a, DirectTier::Srflx, all_avail(), t0),
+            Some(DirectTier::Lan)
+        );
+        assert_eq!(
+            m.upward_candidate(
+                &a,
+                DirectTier::Srflx,
+                all_avail(),
+                t0 + Duration::from_secs(119)
+            ),
+            None
+        );
+        assert_eq!(
+            m.upward_candidate(
+                &a,
+                DirectTier::Srflx,
+                all_avail(),
+                t0 + Duration::from_secs(121)
+            ),
+            Some(DirectTier::Lan)
+        );
+
+        // F2 composition: a fresh LAN attempt pins the LAN target out —
+        // Public is picked instead (both spacings apply).
+        let mut m = PathMonitor::default();
+        m.on_installed(&a, DirectTier::Lan, t0);
+        assert_eq!(
+            m.upward_candidate(
+                &a,
+                DirectTier::Srflx,
+                all_avail(),
+                t0 + Duration::from_secs(1)
+            ),
+            Some(DirectTier::Public)
+        );
+
+        // Eligibility fall-through: a penalized LAN is skipped, not a
+        // dead end — Public fires. (F1: the failed-probe penalty is the
+        // only pacing a failed upward target needs.)
+        let mut m = PathMonitor::default();
+        m.on_death(
+            &a,
+            DirectTier::Lan,
+            DeathReason::HandshakeDeadline,
+            true,
+            t0,
+        );
+        assert_eq!(
+            m.upward_candidate(
+                &a,
+                DirectTier::Srflx,
+                all_avail(),
+                t0 + Duration::from_secs(1)
+            ),
+            Some(DirectTier::Public)
+        );
+
+        // Public incumbent: only LAN is higher — unavailable ⇒ None.
+        // LAN incumbent: nothing higher, ever.
+        let mut m = PathMonitor::default();
+        let no_lan = TierAvailability {
+            lan: false,
+            public: true,
+            srflx: true,
+        };
+        assert_eq!(m.upward_candidate(&a, DirectTier::Public, no_lan, t0), None);
+        assert_eq!(
+            m.upward_candidate(&a, DirectTier::Lan, all_avail(), t0),
+            None
+        );
+
+        // Cap-full suppresses WITHOUT booking the spacing — the next
+        // free slot fires immediately.
+        let mut m = PathMonitor::default();
+        for i in 0..(PROBE_CAP as u8) {
+            m.on_probe_started(&oid(100 + i), DirectTier::Srflx, t0);
+        }
+        assert_eq!(
+            m.upward_candidate(&a, DirectTier::Srflx, all_avail(), t0),
+            None
+        );
+        m.on_probe_aborted(&oid(100));
+        assert_eq!(
+            m.upward_candidate(&a, DirectTier::Srflx, all_avail(), t0),
+            Some(DirectTier::Lan)
+        );
+    }
+
+    /// B2 flip — since the clean rc.296 soak the demote default is
+    /// authoritative; `shadow` stays the per-host revert rail.
+    #[test]
+    fn demote_mode_default_is_on() {
+        assert_eq!(DemoteMode::parse(None), DemoteMode::On);
+        assert_eq!(DemoteMode::parse(Some("on")), DemoteMode::On);
+        assert_eq!(DemoteMode::parse(Some("shadow")), DemoteMode::Shadow);
+        assert_eq!(DemoteMode::parse(Some("off")), DemoteMode::Off);
+        assert_eq!(DemoteMode::parse(Some("0")), DemoteMode::Off);
     }
 
     /// The forced-DERP pin is an annotation: direct decisions identical with
