@@ -223,6 +223,10 @@ pub struct AgentResponse {
     /// most recent rc:agent.hello. Default empty for pre-2A.1 agents
     /// that haven't reconnected since the schema change.
     pub capabilities: roomler_ai_remote_control::models::AgentCaps,
+    /// Multi-region relay PoPs: the agent's nearest relay region (derived
+    /// from its STUN probe reports). `None` = never probed / all timed out —
+    /// the default region serves it.
+    pub relay_home: Option<String>,
 }
 
 pub async fn list_agents(
@@ -715,6 +719,44 @@ pub struct TurnCredentialsResponse {
     pub ice_servers: Vec<IceServer>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RelayRegionsResponse {
+    pub regions_enabled: bool,
+    pub regions: Vec<RelayRegionSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RelayRegionSummary {
+    pub id: String,
+    pub turn_url: String,
+    pub derp_url: Option<String>,
+    pub enabled: bool,
+}
+
+/// GET /api/relay/regions — the configured relay PoP topology (region ids +
+/// endpoints; never secrets). Authed users only; the same hostnames every
+/// TURN grant already exposes to clients.
+pub async fn relay_regions(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+) -> Result<Json<RelayRegionsResponse>, ApiError> {
+    let regions = state
+        .turn_map
+        .specs
+        .iter()
+        .map(|s| RelayRegionSummary {
+            id: s.id.clone(),
+            turn_url: s.turn_url.clone(),
+            derp_url: s.derp_url.clone(),
+            enabled: s.enabled,
+        })
+        .collect();
+    Ok(Json(RelayRegionsResponse {
+        regions_enabled: state.turn_map.enabled,
+        regions,
+    }))
+}
+
 /// GET /api/turn/credentials — user-scoped, returns short-lived (10 min) TURN
 /// creds plus a STUN fallback. Used by the browser controller and by the
 /// native agent when it needs to trickle ICE.
@@ -821,6 +863,7 @@ fn to_agent_response(
         routes: a.routes,
         advertised_routes: a.advertised_routes,
         capabilities: a.capabilities,
+        relay_home: a.relay_home,
     }
 }
 
