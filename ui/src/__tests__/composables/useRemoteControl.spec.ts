@@ -2595,8 +2595,20 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
         transport: 'relay',
         native_w: 2560,
         native_h: 1600,
+        // P5 — absent on pre-P5 agents ⇒ defaults to solo.
+        viewers: 1,
       },
     })
+  })
+
+  it('parses the P5 shared-pipeline viewers count', () => {
+    const parsed = parseControlInbound(
+      '{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct","native_w":1920,"native_h":1080,"viewers":2}',
+    )
+    expect(parsed?.kind).toBe('video_info')
+    if (parsed?.kind === 'video_info') {
+      expect(parsed.info.viewers).toBe(2)
+    }
   })
 
   it('defaults native dims to 0 for older agents that omit them (back-compat)', () => {
