@@ -583,6 +583,7 @@ pub async fn pump_server_messages(
 
 /// Route a parsed `rc:*` message coming from a controller browser tab.
 /// Returns `true` if the message was handled, `false` if it wasn't rc:*.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_controller_rc(
     state: &AppState,
     user_id: ObjectId,
