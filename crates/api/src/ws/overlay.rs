@@ -1629,8 +1629,9 @@ fn stun_urls_from_turn_urls(turn_urls: &[String]) -> Vec<String> {
 /// last-good set rather than emit an unpinned grant that would round-robin the
 /// pair apart. (Both peers of a pair land on the SAME pod — the front LB
 /// hashes on tenant — so this process cache is authoritative per pair.)
-static WORKER_SET_CACHE: Mutex<Option<std::collections::HashMap<String, (Instant, Vec<IpAddr>)>>> =
-    Mutex::new(None);
+/// host → (resolved-at, worker IPs) — one entry per region's coturn hostname.
+type WorkerSets = std::collections::HashMap<String, (Instant, Vec<IpAddr>)>;
+static WORKER_SET_CACHE: Mutex<Option<WorkerSets>> = Mutex::new(None);
 const WORKER_SET_TTL: Duration = Duration::from_secs(300);
 
 /// Resolve a coturn host's worker IPs through [`WORKER_SET_CACHE`] so the pin
@@ -1674,10 +1675,9 @@ async fn resolve_workers_cached(host: &str, port: u16) -> Vec<IpAddr> {
 /// different PoPs and the relay carries nothing. TTL-expired entries recompute
 /// (a dead pair's next establishment cycle may then move regions).
 const PAIR_REGION_TTL: Duration = Duration::from_secs(600);
-#[allow(clippy::type_complexity)]
-static PAIR_REGION_CACHE: Mutex<
-    Option<std::collections::HashMap<String, (Option<String>, Instant)>>,
-> = Mutex::new(None);
+/// pair_key → (chosen region, decided-at). `None` region = the default.
+type PairRegions = std::collections::HashMap<String, (Option<String>, Instant)>;
+static PAIR_REGION_CACHE: Mutex<Option<PairRegions>> = Mutex::new(None);
 
 fn sticky_pair_region(
     map: &roomler_ai_remote_control::turn_creds::TurnMap,
