@@ -392,6 +392,19 @@
         {{ rc.error.value }}
       </v-alert>
 
+      <!-- PR-1 rehome: non-terminal progress notice (e.g. rerouting to
+           the device's pod). Retries continue underneath; never shown
+           as an error and never carries pod internals. -->
+      <v-alert
+        v-if="rc.notice.value && !rc.error.value"
+        type="info"
+        variant="tonal"
+        density="comfortable"
+        class="ma-4"
+      >
+        {{ rc.notice.value }}
+      </v-alert>
+
       <div v-if="rc.phase.value === 'idle' || rc.phase.value === 'closed'" class="empty-state">
         <v-icon size="96" color="grey-lighten-1">mdi-desktop-classic</v-icon>
         <p class="text-body-1 mt-2">
@@ -3077,7 +3090,9 @@ function startSession() {
   if (rc.clipboardAutoSyncEnabled.value) {
     void globalThis.navigator.clipboard?.readText?.().catch(() => {})
   }
-  rc.connect(agent.value.id)
+  // PR-1: thread the agent's org so the pre-flight keys the signalling
+  // socket to the right pod even when this view is hosted cross-org.
+  rc.connect(agent.value.id, undefined, false, tenantId.value)
 }
 
 // Phase 5 — admin break-glass. The reason is stashed on the composable and rides

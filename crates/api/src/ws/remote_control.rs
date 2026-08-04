@@ -31,8 +31,13 @@ pub async fn handle_agent_socket(
     agent_id: ObjectId,
     tenant_id: ObjectId,
     owner_user_id: ObjectId,
+    // PR-1 rehome — the affinity key this agent dialed with (None =
+    // pre-S6 agent build); direction input when THIS agent originates
+    // tunnel opens toward a foreign-homed target.
+    dialed_tid: Option<String>,
 ) {
     info!(%agent_id, %tenant_id, "remote-control agent WS connected");
+    let conn_established_ms = bson::DateTime::now().timestamp_millis();
 
     let (socket_tx, mut socket_rx) = socket.split();
     let socket_tx = Arc::new(Mutex::new(socket_tx));
@@ -172,6 +177,8 @@ pub async fn handle_agent_socket(
         client_version: agent_version.clone(),
         client_os: os,
         outbound_tx: registered_tx.clone(),
+        dialed_tid,
+        conn_established_ms,
     };
     let mut tunnel_orig_sessions: std::collections::HashMap<
         ObjectId,
@@ -589,6 +596,7 @@ pub async fn pump_server_messages(
 
 /// Route a parsed `rc:*` message coming from a controller browser tab.
 /// Returns `true` if the message was handled, `false` if it wasn't rc:*.
+#[allow(clippy::too_many_arguments)]
 pub async fn dispatch_controller_rc(
     state: &AppState,
     user_id: ObjectId,
@@ -597,6 +605,10 @@ pub async fn dispatch_controller_rc(
     text: &str,
     consent_mode: ConsentMode,
     override_reason: Option<String>,
+    // PR-1 rehome direction inputs: the affinity key this conn DIALED
+    // with (None = key-less legacy/racy dial) and when it established.
+    dialed_tid: Option<&str>,
+    conn_established_ms: i64,
 ) -> bool {
     let hub = &state.rc_hub;
     let Ok(parsed) = serde_json::from_str::<ClientMsg>(text) else {
@@ -633,17 +645,68 @@ pub async fn dispatch_controller_rc(
         {
             note_agent_offline_evidence(state, agent_hex.clone(), "controller_session");
             crate::cluster::metrics::bump(&crate::cluster::metrics::RC_REHOME_TOTAL);
-            let owner_pod = crate::cluster::directory::OwnerRecord::parse(&owner)
-                .map(|r| r.pod_id)
+            let record = crate::cluster::directory::OwnerRecord::parse(&owner);
+            let owner_pod = record
+                .as_ref()
+                .map(|r| r.pod_id.clone())
                 .unwrap_or_default();
+            let agent_since_ms = record.map(|r| r.since_ms).unwrap_or(0);
+            // PR-1 direction rule: only a correctly-keyed conn that is
+            // provably NEWER than the agent's registration justifies
+            // nudging the agent; every other shape means the CONTROLLER
+            // is the mis-placed party (the 2026-08-04 incident) and a
+            // nudge would bounce a correctly-homed, possibly busy agent.
+            // One agent lookup for its tenant; on failure the helper
+            // falls back to controller-moves (never nudge on doubt).
+            let agent_tenant_hex = match ObjectId::parse_str(agent_hex) {
+                Ok(aid) => state
+                    .agents
+                    .base
+                    .find_by_id(aid)
+                    .await
+                    .map(|a| a.tenant_id.to_hex())
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            let direction = crate::ws::rc_cluster::rehome_direction(
+                dialed_tid,
+                &agent_tenant_hex,
+                conn_established_ms,
+                agent_since_ms,
+                state.settings.rc.rehome_direction_guard_ms,
+            );
+            match direction {
+                crate::ws::rc_cluster::RehomeDirection::ControllerMove { reason } => {
+                    crate::cluster::metrics::bump(
+                        &crate::cluster::metrics::RC_REHOME_CONTROLLER_TOTAL,
+                    );
+                    info!(
+                        %user_id,
+                        agent = %agent_hex,
+                        %owner_pod,
+                        ?dialed_tid,
+                        reason,
+                        "cross-pod rc miss: controller re-dials (nudge suppressed)"
+                    );
+                }
+                crate::ws::rc_cluster::RehomeDirection::NudgeAgent => {
+                    info!(
+                        %user_id,
+                        agent = %agent_hex,
+                        %owner_pod,
+                        "cross-pod rc miss: agent judged parked; nudging owner pod"
+                    );
+                    spawn_agent_nudge(state, owner_pod, agent_hex.clone());
+                }
+            }
+            // Pod identity stays in server logs; the wire carries only
+            // the actionable fact (the UI re-keys + redials on it).
             let _ = controller_tx.try_send(ServerMsg::Error {
                 session_id: None,
                 code: "agent_on_other_pod".to_string(),
-                message: format!("agent is homed on pod {owner_pod}; re-dial and retry"),
+                message: "agent is homed on another pod; re-dial and retry".to_string(),
                 open_nonce: None,
             });
-            // Fire-and-forget idle nudge at the owner.
-            spawn_agent_nudge(state, owner_pod, agent_hex.clone());
             return true;
         }
         // Phase A-1 split-evidence probe for the remaining offline paths
@@ -787,6 +850,20 @@ pub(crate) fn spawn_agent_nudge(state: &AppState, owner_pod: String, agent_hex: 
     if owner_pod.is_empty() {
         return;
     }
+    // PR-1 requester-side throttle: a controller click storm + retry
+    // ladder sent 11 nudge RPCs in 15 s at one refusing owner in the
+    // 2026-08-04 incident. The owner has its own cooldown; this just
+    // keeps the bus quiet.
+    if let Ok(aid) = ObjectId::parse_str(&agent_hex)
+        && !crate::ws::rc_cluster::nudge_request_allowed(
+            &state.agent_nudge_throttle,
+            aid,
+            std::time::Duration::from_millis(state.settings.rc.nudge_requester_throttle_ms),
+        )
+    {
+        debug!(agent = %agent_hex, "agent nudge RPC suppressed (requester throttle)");
+        return;
+    }
     tokio::spawn(async move {
         match bus
             .request(
@@ -796,7 +873,22 @@ pub(crate) fn spawn_agent_nudge(state: &AppState, owner_pod: String, agent_hex: 
             )
             .await
         {
-            Ok(rep) => debug!(agent = %agent_hex, ?rep, "agent rehome nudge sent"),
+            Ok(rep) => {
+                let nudged = rep.get("nudged").and_then(|v| v.as_bool()).unwrap_or(false);
+                // `reason` is absent from pre-PR-1 peers (mixed-version
+                // roll) — tolerate.
+                let reason = rep.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                if nudged {
+                    info!(agent = %agent_hex, %owner_pod, "agent rehome nudge fired on owner pod");
+                } else {
+                    info!(
+                        agent = %agent_hex,
+                        %owner_pod,
+                        reason,
+                        "agent rehome nudge refused by owner pod"
+                    );
+                }
+            }
             Err(e) => debug!(agent = %agent_hex, %e, "agent rehome nudge failed"),
         }
     });

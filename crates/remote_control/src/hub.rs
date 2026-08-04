@@ -101,6 +101,34 @@ pub struct ConnectedController {
 ///
 /// The Hub stays DB-agnostic — it just publishes; the API consumer resolves the
 /// owner from `agent_id`.
+/// PR-1 — outcome of an idle-nudge attempt (`nudge_agent_if_idle`).
+/// The refusal reason rides the `rc.agent_nudge` bus reply so the
+/// requesting pod can log and count truthfully instead of a bare bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NudgeOutcome {
+    /// The WS cycle fired (cancel notify latched).
+    Nudged,
+    /// Live rc session(s) — never cycle a screen someone is viewing.
+    RcBusy,
+    /// Caller-computed tunnel busy-ness (sessions targeting the agent
+    /// or originated by it — the caller owns those indices).
+    ExtraBusy,
+    /// The agent is not registered in this pod's hub.
+    NotRegistered,
+}
+
+impl NudgeOutcome {
+    /// Wire label for the bus reply (`reason` field).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            NudgeOutcome::Nudged => "nudged",
+            NudgeOutcome::RcBusy => "rc_busy",
+            NudgeOutcome::ExtraBusy => "tunnel_busy",
+            NudgeOutcome::NotRegistered => "not_registered",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConsentEvent {
     pub session_id: ObjectId,
@@ -331,25 +359,34 @@ impl Hub {
     /// milliseconds and runs the normal teardown) so its reconnect
     /// re-hashes through the LB onto the pod the current map points at.
     /// STRICTLY idle-only: an active rc session or (per `extra_busy`,
-    /// the caller's tunnel-session check) a live tunnel flow means the
-    /// truthful answer to the requester is "busy", not a forced move.
-    /// Returns whether the nudge fired.
-    pub fn nudge_agent_if_idle(&self, agent_id: ObjectId, extra_busy: bool) -> bool {
+    /// the caller's tunnel-session checks) a live tunnel flow means the
+    /// truthful answer to the requester is "busy", not a forced move —
+    /// a cycle tears the agent's rc + tunnel + overlay planes for
+    /// seconds. PR-1: the outcome names the refusal reason so the bus
+    /// reply (and the requesting pod's logs) stay truthful.
+    pub fn nudge_agent_if_idle(&self, agent_id: ObjectId, extra_busy: bool) -> NudgeOutcome {
         if extra_busy {
-            return false;
+            return NudgeOutcome::ExtraBusy;
         }
         let Some(agent) = self.inner.agents.get(&agent_id) else {
-            return false;
+            return NudgeOutcome::NotRegistered;
         };
         if agent.active_sessions > 0 {
-            return false;
+            return NudgeOutcome::RcBusy;
         }
         info!(
             "agent {} nudged (idle) — cycling its WS for LB re-hash",
             agent_id
         );
-        agent.cancel.notify_waiters();
-        true
+        // `notify_one` (NOT notify_waiters) — same rationale as the
+        // displacement path in `register_agent`: notify_one LATCHES a
+        // permit when no waiter is parked, so a nudge landing while the
+        // read loop is between select iterations (mid-dispatch, mid-Mongo
+        // write) still fires on the next `cancel.notified()`. The old
+        // notify_waiters here silently LOST exactly those nudges while
+        // still reporting success to the requesting pod.
+        agent.cancel.notify_one();
+        NudgeOutcome::Nudged
     }
 
     /// Phase A-1 graceful shutdown: fire every registered agent's

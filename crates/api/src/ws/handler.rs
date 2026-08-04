@@ -111,7 +111,7 @@ async fn ws_upgrade_user(
 
     let username = claims.username.clone();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, username))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, username, tid))
 }
 
 fn ws_upgrade_tunnel_client(
@@ -205,6 +205,7 @@ fn ws_upgrade_tunnel_client(
             tunnel_client_id,
             tenant_id,
             owner_user_id,
+            tid,
         )
         .await;
     })
@@ -296,6 +297,7 @@ fn ws_upgrade_agent(
             agent_id,
             tenant_id,
             agent.owner_user_id,
+            tid,
         )
         .await;
     })
@@ -346,8 +348,18 @@ async fn send_goodbye_and_close<M: serde::Serialize>(
     // returned.
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, username: String) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    user_id: ObjectId,
+    username: String,
+    // PR-1 rehome — the (validated) affinity key this conn dialed with,
+    // kept for the cross-pod direction rule. None = key-less dial that
+    // hashed on client IP.
+    dialed_tid: Option<String>,
+) {
     let connection_id = Uuid::new_v4().to_string();
+    let conn_established_ms = bson::DateTime::now().timestamp_millis();
     info!(?user_id, %connection_id, "WebSocket connected");
 
     let (sender, mut receiver) = socket.split();
@@ -410,6 +422,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
                     &controller_display,
                     &rc_controller_tx,
                     &text,
+                    dialed_tid.as_deref(),
+                    conn_established_ms,
                 )
                 .await;
             }
@@ -514,6 +528,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, user_id: ObjectId, us
     info!(?user_id, %connection_id, "WebSocket disconnected");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     state: &AppState,
     user_id: &ObjectId,
@@ -521,6 +536,8 @@ async fn handle_client_message(
     username: &str,
     rc_controller_tx: &roomler_ai_remote_control::session::ClientTx,
     text: &str,
+    dialed_tid: Option<&str>,
+    conn_established_ms: i64,
 ) {
     // Remote-control messages use a `t` discriminator prefixed with "rc:".
     // Peek at the raw JSON before full parse so we don't pay the cost on
@@ -554,6 +571,8 @@ async fn handle_client_message(
             text,
             authz.mode,
             authz.override_reason,
+            dialed_tid,
+            conn_established_ms,
         )
         .await;
         if handled {

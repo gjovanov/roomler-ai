@@ -152,6 +152,20 @@ pub struct AppState {
     /// its socket, so every session targeting it is unrecoverable and its
     /// client must re-open rather than forward into a corpse forever.
     pub tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>>,
+    /// PR-1 rehome — which tunnel sessions a given agent ORIGINATED
+    /// (P3b-2 agent-as-tunnel-client, i.e. declared routes) —
+    /// `origin_agent_id → {tunnel_session_id}`. Twin of the by-target
+    /// index above, consulted by the `rc.agent_nudge` busy check: the
+    /// per-connection session map is invisible here, so without this a
+    /// routes-only agent read as IDLE and got its WS cycled (tearing
+    /// every declared route plus its overlay carriers).
+    pub tunnel_sessions_by_origin_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>>,
+    /// PR-1 rehome — owner-side per-agent nudge pacing (cooldown trio;
+    /// see `ws::rc_cluster`). Settings: `rc.nudge_*`.
+    pub agent_nudge_cooldowns: Arc<crate::ws::rc_cluster::NudgeCooldowns>,
+    /// PR-1 rehome — requester-side per-agent throttle for
+    /// `rc.agent_nudge` RPCs (click storms sent 11 in 15 s pre-PR-1).
+    pub agent_nudge_throttle: Arc<crate::ws::rc_cluster::NudgeRequestThrottle>,
 
     // Overlay-network subsystem (Tailscale-style L3 mesh)
     pub overlay_networks: Arc<OverlayNetworkDao>,
@@ -388,6 +402,8 @@ impl AppState {
         let tunnel_clients_by_session: TunnelClientOutbound = Arc::new(DashMap::new());
         let tunnel_sessions_by_target_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
             Arc::new(DashMap::new());
+        let tunnel_sessions_by_origin_agent: Arc<DashMap<ObjectId, HashSet<ObjectId>>> =
+            Arc::new(DashMap::new());
 
         // C-2 — the global-channel subscriber + forwarder, MOVED here from
         // main.rs so two-pod TestApps exercise cross-pod delivery (chat,
@@ -489,32 +505,90 @@ impl AppState {
             });
         }
 
-        // C-2 — the idle-agent nudge handler: the pod OWNING an agent's WS
-        // receives `rc.agent_nudge` from a pod whose controller found the
-        // agent foreign, and cycles that WS iff the agent is fully idle
-        // (no rc sessions, no tunnel sessions targeting it) so both ends
-        // re-land at the current LB hash.
+        // C-2/PR-1 — the idle-agent nudge handler: the pod OWNING an
+        // agent's WS receives `rc.agent_nudge` from a pod whose
+        // controller found the agent foreign, and cycles that WS iff the
+        // agent is FULLY idle — no rc sessions, no tunnel sessions
+        // targeting it, and (PR-1) none it ORIGINATED (declared routes) —
+        // so both ends re-land at the current LB hash. PR-1 adds the
+        // cooldown trio (a cycle tears the agent's rc/tunnel/overlay
+        // planes; it must never flap), truthful refusal reasons on the
+        // reply, and refusal/stuck counters.
         if let Some(bus) = &cluster_bus {
             let hub = rc_hub.clone();
             let tunnel_targets = tunnel_sessions_by_target_agent.clone();
+            let tunnel_origins = tunnel_sessions_by_origin_agent.clone();
+            let cooldowns = agent_nudge_cooldowns.clone();
+            let pacing = crate::ws::rc_cluster::NudgePacing {
+                cooldown: std::time::Duration::from_secs(settings.rc.nudge_cooldown_secs),
+                max_attempts: settings.rc.nudge_max_attempts,
+                attempts_reset_after: std::time::Duration::from_secs(
+                    settings.rc.nudge_attempts_reset_secs,
+                ),
+            };
             bus.register("rc.agent_nudge", move |body| {
                 let hub = hub.clone();
                 let tunnel_targets = tunnel_targets.clone();
+                let tunnel_origins = tunnel_origins.clone();
+                let cooldowns = cooldowns.clone();
                 Box::pin(async move {
+                    use roomler_ai_remote_control::hub::NudgeOutcome;
                     let hex = body
                         .get("agent_id")
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| "missing agent_id".to_string())?;
                     let aid = ObjectId::parse_str(hex).map_err(|_| "bad agent_id".to_string())?;
-                    let tunnel_busy = tunnel_targets
+                    let target_busy = tunnel_targets
                         .get(&aid)
                         .map(|s| !s.is_empty())
                         .unwrap_or(false);
-                    let nudged = hub.nudge_agent_if_idle(aid, tunnel_busy);
-                    if nudged {
+                    let origin_busy = tunnel_origins
+                        .get(&aid)
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    // Gate (peek) -> fire -> book: attempts count FIRED
+                    // cycles only, so busy refusals can never trip the
+                    // stuck/split-evidence signal.
+                    let outcome = if target_busy || origin_busy {
+                        NudgeOutcome::ExtraBusy
+                    } else {
+                        match crate::ws::rc_cluster::nudge_gate(&cooldowns, aid, pacing) {
+                            crate::ws::rc_cluster::NudgeGate::Allow => {
+                                let o = hub.nudge_agent_if_idle(aid, false);
+                                if o == NudgeOutcome::Nudged {
+                                    crate::ws::rc_cluster::nudge_book(&cooldowns, aid, pacing);
+                                }
+                                o
+                            }
+                            crate::ws::rc_cluster::NudgeGate::Cooldown
+                            | crate::ws::rc_cluster::NudgeGate::Stuck => {
+                                crate::cluster::metrics::bump(
+                                    &crate::cluster::metrics::AGENT_NUDGE_REFUSED_TOTAL,
+                                );
+                                return Ok(serde_json::json!({
+                                    "nudged": false,
+                                    "reason": "cooldown",
+                                }));
+                            }
+                        }
+                    };
+                    if outcome == NudgeOutcome::Nudged {
                         crate::cluster::metrics::bump(&crate::cluster::metrics::AGENT_NUDGE_TOTAL);
+                        return Ok(serde_json::json!({ "nudged": true, "reason": "nudged" }));
                     }
-                    Ok(serde_json::json!({ "nudged": nudged }))
+                    crate::cluster::metrics::bump(
+                        &crate::cluster::metrics::AGENT_NUDGE_REFUSED_TOTAL,
+                    );
+                    // The truthful reason, at info: pre-PR-1 refusals were
+                    // debug-only and the 2026-08-04 stuck loop was
+                    // invisible without pod-log spelunking.
+                    let reason = if origin_busy && !target_busy {
+                        "origin_busy"
+                    } else {
+                        outcome.reason()
+                    };
+                    tracing::info!(agent = %aid, reason, "agent nudge refused");
+                    Ok(serde_json::json!({ "nudged": false, "reason": reason }))
                 })
             });
         }
@@ -668,6 +742,9 @@ impl AppState {
             tunnel_audit,
             tunnel_clients_by_session: tunnel_clients_by_session.clone(),
             tunnel_sessions_by_target_agent: tunnel_sessions_by_target_agent.clone(),
+            tunnel_sessions_by_origin_agent: tunnel_sessions_by_origin_agent.clone(),
+            agent_nudge_cooldowns: Arc::new(DashMap::new()),
+            agent_nudge_throttle: Arc::new(DashMap::new()),
             overlay_networks,
             overlay_nodes,
             overlay_policies,
