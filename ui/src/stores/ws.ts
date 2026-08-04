@@ -34,7 +34,14 @@ export const useWsStore = defineStore('ws', () => {
   // instead of the `{type, data}` envelope, so they get their own channel.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type RcHandler = (msg: any) => void
-  const rcHandlers = new Map<string, RcHandler>()
+  // Multi-user P3: MULTI-subscriber per rc:* type. This was
+  // one-handler-per-type — a second mounted RC surface (a device modal
+  // over the RC page, two composable instances after an HMR remount)
+  // silently CLOBBERED the first's handlers, and its unmount cleanup then
+  // deleted the survivor's. Each subscriber now gets its own slot and an
+  // unsubscribe that removes only itself; per-session demux stays in the
+  // subscribers (`sessionGateAllows` in useRemoteControl).
+  const rcHandlers = new Map<string, Set<RcHandler>>()
 
   // S6 — tenant-affinity key. Carried as `tid=` on the WS URL so the
   // front load-balancer hashes this connection onto the pod that owns
@@ -129,8 +136,11 @@ export const useWsStore = defineStore('ws', () => {
         // rc:* messages use the flat `{t, ...}` shape from the signalling
         // protocol and don't go through the main dispatch.
         if (typeof msg.t === 'string' && msg.t.startsWith('rc:')) {
-          const h = rcHandlers.get(msg.t)
-          if (h) h(msg)
+          const hs = rcHandlers.get(msg.t)
+          if (hs) {
+            // Snapshot: a handler may (un)subscribe during dispatch.
+            for (const h of [...hs]) h(msg)
+          }
           return
         }
         handleMessage(msg)
@@ -292,12 +302,36 @@ export const useWsStore = defineStore('ws', () => {
     }
   }
 
-  /** Register a handler for an rc:* message type (e.g. `rc:sdp.answer`). */
-  function onRcMessage(t: string, handler: RcHandler) {
-    rcHandlers.set(t, handler)
+  /** Register a handler for an rc:* message type (e.g. `rc:sdp.answer`).
+   *  Multi-subscriber (P3): every registered handler for the type runs;
+   *  the returned function unsubscribes ONLY this handler. `offRcMessage`
+   *  (legacy surface, still exported) removes a specific handler when
+   *  given one, else every handler for the type. */
+  function onRcMessage(t: string, handler: RcHandler): () => void {
+    let hs = rcHandlers.get(t)
+    if (!hs) {
+      hs = new Set()
+      rcHandlers.set(t, hs)
+    }
+    hs.add(handler)
+    return () => {
+      const set = rcHandlers.get(t)
+      if (set) {
+        set.delete(handler)
+        if (set.size === 0) rcHandlers.delete(t)
+      }
+    }
   }
-  function offRcMessage(t: string) {
-    rcHandlers.delete(t)
+  function offRcMessage(t: string, handler?: RcHandler) {
+    if (!handler) {
+      rcHandlers.delete(t)
+      return
+    }
+    const set = rcHandlers.get(t)
+    if (set) {
+      set.delete(handler)
+      if (set.size === 0) rcHandlers.delete(t)
+    }
   }
 
   function cleanup() {

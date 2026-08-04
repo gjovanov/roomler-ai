@@ -113,17 +113,23 @@ pub(crate) enum ClipboardCmd {
         payload: Box<NativePayload>,
         reply: oneshot::Sender<Result<()>>,
     },
-    /// v2 — install the change watcher (replaces any existing one).
-    /// The worker switches from blocking `recv()` to a tick loop and
-    /// pushes [`ClipboardChange`]s into `tx` when the HOST clipboard
-    /// changes. Fire-and-forget: no reply.
+    /// v2 — install a change watcher subscription. The worker switches
+    /// from blocking `recv()` to a tick loop while ANY subscription is
+    /// live and pushes [`ClipboardChange`]s into each subscription's `tx`
+    /// when the HOST clipboard changes. Fire-and-forget: no reply.
+    ///
+    /// Multi-user P3: keyed by a caller-held token — pre-P3 this was a
+    /// single slot, so with two concurrent sessions the second session's
+    /// subscribe silently STOLE the first's change feed and either
+    /// session's unsubscribe killed both.
     Watch {
+        id: u64,
         events: WatchEvents,
         tx: tokio::sync::mpsc::Sender<ClipboardChange>,
     },
-    /// v2 — remove the change watcher (browser unsubscribed or the
-    /// DC closed). Fire-and-forget.
-    Unwatch,
+    /// v2 — remove ONE watcher subscription by its token (browser
+    /// unsubscribed or the DC closed). Fire-and-forget, idempotent.
+    Unwatch { id: u64 },
     /// Kept as an affordance for future deterministic shutdowns (e.g.
     /// a test harness that wants to join the worker). Today the
     /// `Clipboard` handle has no Drop impl — dropping the last
@@ -168,12 +174,17 @@ impl Clipboard {
                 // a browser-originated write is never echoed back to the
                 // browser as a "host change".
                 let mut marks = SelfMarks::default();
-                let mut watch: Option<WatcherState> = None;
+                // Multi-user P3 — N concurrent subscriptions (one per
+                // session), each with its OWN change baseline so a
+                // late-joining session isn't immediately pushed the
+                // pre-existing clipboard as a "change".
+                let mut watchers: std::collections::HashMap<u64, WatcherState> =
+                    std::collections::HashMap::new();
                 loop {
                     // Block indefinitely when nothing is watching (the
                     // pre-v2 behavior — zero idle wakeups); poll at the
-                    // tick cadence while a watcher is installed.
-                    let cmd = if watch.is_some() {
+                    // tick cadence while any watcher is installed.
+                    let cmd = if !watchers.is_empty() {
                         match rx.recv_timeout(WATCH_TICK) {
                             Ok(c) => Some(c),
                             Err(std_mpsc::RecvTimeoutError::Timeout) => None,
@@ -211,15 +222,19 @@ impl Clipboard {
                         Some(ClipboardCmd::WriteNative { payload, reply }) => {
                             let _ = reply.send(worker_write_native(&mut cb, &payload, &mut marks));
                         }
-                        Some(ClipboardCmd::Watch { events, tx }) => {
-                            watch = Some(install_watcher(&mut cb, events, tx));
+                        Some(ClipboardCmd::Watch { id, events, tx }) => {
+                            watchers.insert(id, install_watcher(&mut cb, events, tx));
                         }
-                        Some(ClipboardCmd::Unwatch) => {
-                            watch = None;
+                        Some(ClipboardCmd::Unwatch { id }) => {
+                            watchers.remove(&id);
                         }
                         Some(ClipboardCmd::Shutdown) => break,
                         None => {
-                            if let Some(w) = watch.as_mut() {
+                            // Dead receivers (session died without an
+                            // explicit unsubscribe) are dropped so the
+                            // worker can fall back to blocking recv.
+                            watchers.retain(|_, w| !w.receiver_gone());
+                            for w in watchers.values_mut() {
                                 watch_tick(&mut cb, w, &marks);
                             }
                         }
@@ -361,22 +376,29 @@ impl Clipboard {
             .clone()
     }
 
-    /// v2 — install the change watcher (replaces any existing one).
-    /// Changes arrive on `tx`; the worker drops pushes when the
-    /// channel is full and retries on the next tick.
+    /// v2 — install a change-watcher SUBSCRIPTION. Changes arrive on `tx`;
+    /// the worker drops pushes when the channel is full and retries on the
+    /// next tick. Returns the subscription token for [`Clipboard::unwatch`].
+    ///
+    /// Multi-user P3: N subscriptions coexist (one per session); pre-P3 the
+    /// single slot meant a 2nd session's subscribe stole the 1st's feed and
+    /// either unsubscribe killed both.
     pub(crate) fn watch(
         &self,
         events: WatchEvents,
         tx: tokio::sync::mpsc::Sender<ClipboardChange>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        static NEXT_WATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_WATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.tx
-            .send(ClipboardCmd::Watch { events, tx })
-            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))
+            .send(ClipboardCmd::Watch { id, events, tx })
+            .map_err(|_| anyhow::anyhow!("clipboard worker gone"))?;
+        Ok(id)
     }
 
-    /// v2 — remove the change watcher. Idempotent, fire-and-forget.
-    pub(crate) fn unwatch(&self) {
-        let _ = self.tx.send(ClipboardCmd::Unwatch);
+    /// v2 — remove ONE subscription by token. Idempotent, fire-and-forget.
+    pub(crate) fn unwatch(&self, id: u64) {
+        let _ = self.tx.send(ClipboardCmd::Unwatch { id });
     }
 }
 
@@ -515,6 +537,15 @@ struct WatcherState {
     /// transiently — the next tick bypasses the unchanged-seq early
     /// exit and re-attempts.
     retry: bool,
+}
+
+impl WatcherState {
+    /// Multi-user P3 — a subscription whose consumer died (session torn
+    /// down without an explicit unsubscribe): the worker reaps it on the
+    /// next tick so an all-dead registry falls back to blocking recv.
+    fn receiver_gone(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
 /// `GetClipboardSequenceNumber` via clipboard-win. `None` when the
