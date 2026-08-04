@@ -1363,7 +1363,24 @@ impl OverlayRuntime {
                 .and_then(|r| r.ok())
                 .unwrap_or(false);
             // Point the OS resolver at us for `<magic_domain>` (reverted on Drop).
-            _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
+            //
+            // Multi-org P2a: gated on `dns_bound` — steering the OS at a
+            // resolver that never bound (`:53` taken, netstack-style modes
+            // where the self-IP isn't an OS address, bind race) blackholes
+            // the magic domain HOST-WIDE (Windows NRPT is registry-global).
+            // The exit-DNS "." steer already had exactly this gate; the
+            // magic-domain steer predates it. Un-steered ⇒ names simply
+            // don't resolve via the OS (SOCKS DOMAIN resolution still
+            // works), surfaced below as `os_steer_active=false`.
+            if dns_bound {
+                _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
+            } else {
+                tracing::warn!(
+                    %magic_domain,
+                    "overlay dns: resolver did not bind :53 — NOT steering the OS \
+                     (would blackhole the magic domain); names resolve via SOCKS only"
+                );
+            }
             Some(names)
         } else {
             None
@@ -2030,6 +2047,21 @@ impl OverlayRuntime {
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
                         let t_arm = Instant::now();
+                        // Multi-org P2a — REMOVES FIRST. The tenant-block
+                        // renumber (P2b) re-IPs a node as a `remove(id) +
+                        // upsert(id, new_ip)` pair in ONE delta; with the old
+                        // upserts-first order the freshly-upserted peer was
+                        // immediately evicted by its own remove — the pair
+                        // netted to "peer gone". Removes-first makes the pair
+                        // a genuine re-IP primitive (evict old → clean
+                        // install new); disjoint-id deltas are order-blind.
+                        for node_id in removes {
+                            self.evict_peer(
+                                node_id, &mut wg, &mut by_node, &tun, &mut relay, &mut relay_bq,
+                                &mut alloc_q, &mut upgrade_probes, &mut current_peers,
+                                &mut relay_refresh_cooldown,
+                            ).await;
+                        }
                         for p in &upserts {
                             // rc.225 — endpoint change ⇒ clean cooldown slate
                             // (see the Netmap arm / `direct_endpoints_changed`).
@@ -2048,13 +2080,6 @@ impl OverlayRuntime {
                         let t0 = Instant::now();
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq, "delta").await;
                         warn_if_slow("install_peers(delta)", t0);
-                        for node_id in removes {
-                            self.evict_peer(
-                                node_id, &mut wg, &mut by_node, &tun, &mut relay, &mut relay_bq,
-                                &mut alloc_q, &mut upgrade_probes, &mut current_peers,
-                                &mut relay_refresh_cooldown,
-                            ).await;
-                        }
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
