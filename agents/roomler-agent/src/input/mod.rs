@@ -56,6 +56,12 @@ pub fn parse_virtual_screen_flag(value: Option<&str>) -> bool {
     }
 }
 
+// P6 — the multi-user InputArbiter: one injection worker for all sessions,
+// per-session held-state tracking, cross-session modifier fencing,
+// release-all on teardown, free|exclusive floor control, ghost cursors.
+// Compiles on every build (injection degrades to NoopInjector).
+pub mod arbiter;
+
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 
@@ -79,7 +85,7 @@ pub mod layout;
 ))]
 pub mod system_context_backend;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Button {
     Left,
@@ -109,7 +115,7 @@ pub enum TouchPhase {
 /// Input event from the controller. Coordinates are normalised 0..1 per
 /// monitor so the agent's resolution can change mid-session without
 /// needing a resync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum InputMsg {
     MouseMove {

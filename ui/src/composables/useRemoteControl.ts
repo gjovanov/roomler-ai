@@ -220,6 +220,35 @@ export interface RcVideoInfo {
   viewers: number
 }
 
+/** P6 — one participant on the agent's InputArbiter rail. */
+export interface RcParticipant {
+  session: string
+  name: string
+  /** Whether this session holds the INPUT permission. */
+  input: boolean
+}
+
+/** P6 — the arbiter state broadcast (`rc:control.state` on the control DC):
+ *  arbitration mode, the exclusive-mode floor holder (session hex or null),
+ *  and every session on the device. Old agents never send it — the ref
+ *  stays null and the multi-user UI self-hides. */
+export interface RcControlState {
+  mode: 'free' | 'exclusive'
+  holder: string | null
+  participants: RcParticipant[]
+}
+
+/** P6 — a ghost cursor: another session's pointer, rebroadcast by the
+ *  agent as `cursor:peer` on the cursor DC (normalized 0..1 per monitor). */
+export interface PeerCursor {
+  name: string
+  x: number
+  y: number
+  mon: number
+  /** Last-update wall time (ms) — the view fades ghosts that stop moving. */
+  ts: number
+}
+
 /** rc.NEXT Ã¢ÂÂ remote app selection & launch (virtual-desktop hosts). The
  *  agent enumerates windows on its desktop; the browser can focus one or
  *  launch a new allowlisted app. Rides the control DC (same request/reply
@@ -256,6 +285,7 @@ export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
+  | { kind: 'control_state'; state: RcControlState }
   | { kind: 'logs_fetch_reply'; reply: RcLogsFetchReply }
   | { kind: 'logs_fetch_start'; id: string | null; path?: string; totalLines?: number; truncated?: boolean }
   | { kind: 'logs_fetch_chunk'; id: string | null; lines: string[] }
@@ -307,6 +337,28 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         native_w: typeof obj.native_w === 'number' ? obj.native_w : 0,
         native_h: typeof obj.native_h === 'number' ? obj.native_h : 0,
         viewers: typeof obj.viewers === 'number' && obj.viewers > 0 ? obj.viewers : 1,
+      },
+    }
+  }
+  if (obj.t === 'rc:control.state') {
+    const rawParts = Array.isArray(obj.participants) ? obj.participants : []
+    const participants: RcParticipant[] = rawParts.flatMap((p) => {
+      const r = p as Record<string, unknown>
+      if (typeof r.session !== 'string') return []
+      return [
+        {
+          session: r.session,
+          name: typeof r.name === 'string' ? r.name : '',
+          input: r.input === true,
+        },
+      ]
+    })
+    return {
+      kind: 'control_state',
+      state: {
+        mode: obj.mode === 'exclusive' ? 'exclusive' : 'free',
+        holder: typeof obj.holder === 'string' ? obj.holder : null,
+        participants,
       },
     }
   }
@@ -2584,6 +2636,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  don't send it yet Ã¢ÂÂ badge falls back to a selection-derived
    *  label). The stats badge reads this for an honest readout. */
   const videoInfo = ref<RcVideoInfo | null>(null)
+  /** P6 — the agent's InputArbiter state (participants, mode, floor
+   *  holder). Null until the first `rc:control.state` broadcast; old
+   *  agents never send it, so the multi-user UI self-hides. */
+  const controlState = ref<RcControlState | null>(null)
+  /** P6 — ghost cursors: other sessions' pointers keyed by session hex. */
+  const peerCursors = ref<Record<string, PeerCursor>>({})
   /**
    * Current input desktop name reported by the SYSTEM-context
    * worker (agents 0.3.0+) via the `rc:desktop_changed` control-DC
@@ -3876,6 +3934,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  call while the channel is closed Ã¢ÂÂ it's a no-op until open. Also
    *  sent automatically when the channel first opens so the agent
    *  learns the restored preference without user interaction. */
+  /** P6 — ask the agent's InputArbiter for the exclusive-mode floor. The
+   *  reply is the next `rc:control.state` broadcast (granted = we become
+   *  the holder; an ACTIVE holder keeps it and state shows who). */
+  function requestControl() {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify({ t: 'rc:control.request' }))
+    } catch {
+      /* drop */
+    }
+  }
+
+  /** P6 — toggle the device's arbitration mode in-session (INPUT-granted
+   *  sessions only; the arbiter enforces). */
+  function setInputMode(mode: 'free' | 'exclusive') {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify({ t: 'rc:control.mode', mode }))
+    } catch {
+      /* drop */
+    }
+  }
+
   function sendQualityPreference() {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
@@ -5341,6 +5424,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     error.value = null
     sessionId.value = null
     inputGranted.value = true // until rc:session.created reports otherwise
+    // P6 — fresh session, fresh multi-user state.
+    controlState.value = null
+    peerCursors.value = {}
     phase.value = 'requesting'
 
     // Restore the per-agent resolution preference. This has to live
@@ -6196,6 +6282,24 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         if (Number.isFinite(id) && Number.isFinite(x) && Number.isFinite(y)) {
           cursor.value = { ...cursor.value, pos: { id, x, y } }
         }
+      } else if (msg.t === 'cursor:peer') {
+        // P6 — another session's pointer (ghost cursor), name-tagged,
+        // normalized 0..1 per monitor, throttled agent-side to ~30 Hz.
+        const sid = typeof msg.sid === 'string' ? msg.sid : ''
+        const x = Number(msg.x)
+        const y = Number(msg.y)
+        if (sid && Number.isFinite(x) && Number.isFinite(y)) {
+          peerCursors.value = {
+            ...peerCursors.value,
+            [sid]: {
+              name: typeof msg.name === 'string' ? msg.name : '',
+              x,
+              y,
+              mon: Number.isFinite(Number(msg.mon)) ? Number(msg.mon) : 0,
+              ts: Date.now(),
+            },
+          }
+        }
       } else if (msg.t === 'cursor:shape') {
         void applyCursorShape(msg)
       } else if (msg.t === 'cursor:hide') {
@@ -6281,6 +6385,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // honest stats badge (replaces the hardcoded "VP9 4:4:4 SW").
         videoInfo.value = parsed.info
         console.info('[rc] video-info', parsed.info)
+      } else if (parsed?.kind === 'control_state') {
+        // P6 - arbiter state: participants rail + exclusive floor. Prune
+        // ghost cursors of sessions that left.
+        controlState.value = parsed.state
+        const live = new Set(parsed.state.participants.map((p) => p.session))
+        const next: Record<string, PeerCursor> = {}
+        for (const [sid, pc] of Object.entries(peerCursors.value)) {
+          if (live.has(sid)) next[sid] = pc
+        }
+        peerCursors.value = next
       } else if (parsed?.kind === 'logs_fetch_reply') {
         agentLogs.value = parsed.reply
         agentLogsLoading.value = false
@@ -8486,6 +8600,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  Null on the legacy track / libvpx paths (no message); the
      *  badge falls back to a selection-derived label then. */
     videoInfo,
+    // P6 — multi-user: arbiter state, ghost cursors, floor control.
+    controlState,
+    peerCursors,
+    requestControl,
+    setInputMode,
     /**
      * Name of the input desktop the agent is currently bound to,
      * as reported by the SYSTEM-context worker via the
