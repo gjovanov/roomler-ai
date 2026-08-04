@@ -260,10 +260,16 @@ impl AgentPeer {
         // default-feature build doesn't warn on the unused binding.
         #[cfg_attr(not(feature = "audio"), allow(unused_variables))] audio_enabled: bool,
         // Session permission bitfield from `rc:request` (v2 — enforced
-        // per-DC; today the clipboard handler consumes it). Only read
-        // when the `clipboard` feature is compiled in.
-        #[cfg_attr(not(feature = "clipboard"), allow(unused_variables))]
+        // per-DC; the clipboard handler and the P6 arbiter registration
+        // consume it).
         permissions: roomler_ai_remote_control::permissions::Permissions,
+        // P6 — controller display name for the participants rail + ghost
+        // cursor labels (from `rc:request`).
+        controller_name: String,
+        // P6 — the device policy's input arbitration mode directive
+        // ("free"/"exclusive"; None = agent default, which is free). Only
+        // the FIRST session's hint seeds the mode — see input::arbiter.
+        input_mode: Option<String>,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -477,6 +483,28 @@ impl AgentPeer {
         // from its own task, both very briefly.
         let control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
             Arc::new(tokio::sync::Mutex::new(None));
+        // P6 — cursor-DC stash: the arbiter writes `cursor:peer` (ghost
+        // cursor) messages to OTHER sessions through this handle.
+        let cursor_dc_stash: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        // P6 — register this session with the process-global InputArbiter:
+        // it appears on every session's participants rail, and (when it
+        // holds INPUT) its events flow through the single fenced injection
+        // worker. Deregistration rides the control DC's on_close (the same
+        // canonical teardown signal display-match restore uses).
+        {
+            use roomler_ai_remote_control::permissions::Permissions;
+            crate::input::arbiter::global().session_open(
+                session_id,
+                controller_name,
+                permissions.contains(Permissions::INPUT),
+                input_mode
+                    .as_deref()
+                    .and_then(crate::input::arbiter::Mode::parse),
+                control_dc.clone(),
+                cursor_dc_stash.clone(),
+            );
+        }
         let rtcp_reader = {
             let flag = keyframe_requested.clone();
             let remb = remb_bps.clone();
@@ -861,6 +889,7 @@ impl AgentPeer {
         let priority_for_dc = priority.clone();
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
+        let cursor_dc_for_callback = cursor_dc_stash.clone();
         let lock_state_rx_for_dc = lock_state_rx.clone();
         pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
             let label = dc.label().to_string();
@@ -874,6 +903,7 @@ impl AgentPeer {
             let priority_for_dc = priority_for_dc.clone();
             let video_bytes_stash = video_bytes_dc_for_callback.clone();
             let control_stash = control_dc_for_callback.clone();
+            let cursor_stash = cursor_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
             Box::pin(async move {
                 use roomler_ai_remote_control::permissions::Permissions;
@@ -892,7 +922,7 @@ impl AgentPeer {
                         );
                         attach_log_only(dc, session_id);
                     }
-                    "input" => attach_input_handler(dc, lock_state_rx_for_input),
+                    "input" => attach_input_handler(dc, lock_state_rx_for_input, session_id),
                     "control" => {
                         // Stash a clone for the lock-state emitter
                         // BEFORE handing the DC to the inbound handler.
@@ -911,12 +941,17 @@ impl AgentPeer {
                             priority_for_dc,
                         )
                     }
-                    "cursor" => attach_cursor_handler(
-                        dc,
-                        session_id,
-                        native_dims_for_dc,
-                        encoded_dims_for_dc,
-                    ),
+                    "cursor" => {
+                        // P6 — stash a clone so the arbiter can push
+                        // `cursor:peer` (ghost cursors) to this session.
+                        *cursor_stash.lock().await = Some(dc.clone());
+                        attach_cursor_handler(
+                            dc,
+                            session_id,
+                            native_dims_for_dc,
+                            encoded_dims_for_dc,
+                        )
+                    }
                     #[cfg(feature = "clipboard")]
                     "clipboard" => attach_clipboard_handler(dc, session_id, permissions),
                     // Multi-user P3 — same enforcement for FILES. New viewers
@@ -4798,6 +4833,10 @@ fn ffmpeg_target_fps(constrained: bool) -> u32 {
 fn attach_input_handler(
     dc: Arc<RTCDataChannel>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
+    // P6 — events route through the process-global InputArbiter keyed by
+    // session (single fenced injection worker replaces the pre-P6
+    // injector-per-session).
+    session_id: bson::oid::ObjectId,
 ) {
     // rc.57 — reset the per-process `to_pixels` diagnostic counter so
     // the FIRST 50 input events of THIS session land at INFO level
@@ -4807,11 +4846,6 @@ fn attach_input_handler(
     // auto-downscale path, where the misposition reproduces but the
     // earlier rc.55 field log had no INFO dispatch lines to inspect).
     input::reset_input_diag_counter();
-    // Injector is wrapped in `parking_lot::Mutex`-equivalent-style — we
-    // don't have parking_lot imported here, so fall back to tokio's
-    // Mutex. The inject() call is fast (just a channel send), so lock
-    // contention is not a concern.
-    let injector = std::sync::Arc::new(tokio::sync::Mutex::new(input::open_default()));
     // Counter for batched suppression logging. Without this, a busy
     // session with the host locked would spam one debug line per
     // mouse-move (~60 Hz when the operator is jiggling). Log every
@@ -4829,28 +4863,16 @@ fn attach_input_handler(
             "input: SystemContext worker — Locked-state suppression disabled (remote unlock enabled)"
         );
     }
-    // 2026-08-04 — safety net: if the input DC dies mid-chord (browser
-    // crash, tab kill — paths where the viewer's blur-release can't run),
-    // release every modifier so the host isn't left holding a stuck
-    // Alt/Shift/Ctrl/Meta forever. HID 0xe0..=0xe7 = L/R Ctrl,Shift,Alt,Meta;
-    // releasing an un-pressed key is a no-op at the OS level.
-    let injector_for_close = injector.clone();
+    // 2026-08-04 / P6 — if the input DC dies mid-chord (browser crash, tab
+    // kill — paths where the viewer's blur-release can't run), release
+    // exactly what THIS session still holds (keys AND mouse buttons — the
+    // arbiter tracks them), superseding the old blanket 0xe0..=0xe7 sweep.
     dc.on_close(Box::new(move || {
-        let injector = injector_for_close.clone();
         Box::pin(async move {
-            let mut inj = injector.lock().await;
-            for code in 0xe0u32..=0xe7 {
-                let _ = inj.inject(input::InputMsg::Key {
-                    code,
-                    down: false,
-                    mods: 0,
-                });
-            }
-            info!("input: channel closed — released all modifier keys");
+            crate::input::arbiter::global().release_held(session_id);
         })
     }));
     dc.on_message(Box::new(move |msg| {
-        let injector = injector.clone();
         let lock_state_rx = lock_state_rx.clone();
         let suppressed_count = suppressed_count.clone();
         Box::pin(async move {
@@ -4904,10 +4926,9 @@ fn attach_input_handler(
                 }
                 return;
             }
-            let mut guard = injector.lock().await;
-            if let Err(e) = guard.inject(parsed) {
-                debug!(%e, "input: inject failed");
-            }
+            // P6 — hand the event to the arbiter (serialized injection,
+            // cross-session modifier fencing, floor control, ghosting).
+            crate::input::arbiter::global().event(session_id, parsed);
         })
     }));
 }
@@ -5015,6 +5036,11 @@ fn attach_control_handler(
     // driving session's mode).
     dc.on_close(Box::new(move || {
         Box::pin(async move {
+            // P6 — the control DC's close is the canonical session-death
+            // signal: deregister from the InputArbiter (release-all any
+            // held keys, drop off the participants rail, hand the
+            // exclusive floor to a surviving session). Idempotent.
+            crate::input::arbiter::global().session_closed(session_id);
             // Detach — restore is fire-and-forget (JoinHandle drop is fine).
             drop(tokio::task::spawn_blocking(move || {
                 if crate::display_match::restore_for(session_id) {
@@ -5097,6 +5123,26 @@ fn attach_control_handler(
                             new = crate::encode::priority::label(mode_val),
                             "control: rc:priority updated"
                         );
+                    }
+                }
+                // P6 — floor control. `rc:control.request` asks for the
+                // exclusive-mode floor (auto-granted from an idle holder);
+                // `rc:control.mode` toggles free|exclusive in-session. Both
+                // answer with an `rc:control.state` broadcast to every
+                // session (the arbiter owns the reply).
+                "rc:control.request" => {
+                    crate::input::arbiter::global().request_floor(session_id);
+                }
+                "rc:control.mode" => {
+                    let mode = val
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::input::arbiter::Mode::parse);
+                    match mode {
+                        Some(m) => crate::input::arbiter::global().set_mode(session_id, m),
+                        None => {
+                            debug!(%session_id, "control: rc:control.mode unknown value — dropped")
+                        }
                     }
                 }
                 "rc:resolution" => {

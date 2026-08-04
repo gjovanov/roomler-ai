@@ -554,6 +554,7 @@ async fn handle_client_message(
             text,
             authz.mode,
             authz.override_reason,
+            authz.input_mode,
         )
         .await;
         if handled {

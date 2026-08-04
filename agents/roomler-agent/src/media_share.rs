@@ -596,6 +596,10 @@ fn ratio_qualifies(lo: u32, hi: u32, ratio: u32) -> bool {
 }
 
 #[cfg(test)]
+// The SERIAL guard is deliberately held across awaits: it serializes whole
+// tests against the process-global registry, and every await inside is a
+// local Notify (no cross-test lock dependency → no deadlock).
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use bson::oid::ObjectId;
