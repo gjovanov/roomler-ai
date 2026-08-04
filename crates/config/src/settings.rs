@@ -30,7 +30,7 @@ pub struct Settings {
 ///    "caps":{"tls_443_tcp":false}}, …]`
 /// With `regions_enabled=false` (default) every issuance path uses the
 /// legacy `turn.*` single-region config — provably unchanged behaviour.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RelaySettings {
     /// Master gate for region-aware TURN/DERP issuance.
     /// Env: `ROOMLER__RELAY__REGIONS_ENABLED`.
@@ -42,6 +42,28 @@ pub struct RelaySettings {
     /// Generate: `openssl genpkey -algorithm ed25519 -outform DER | base64 -w0`.
     /// Env: `ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY`.
     pub derp_ticket_private_key: Option<String>,
+    /// PoP `/stats` poll cadence in seconds; 0 disables the poller (regions
+    /// then never mark busy). Env: `ROOMLER__RELAY__STATS_POLL_SECS`.
+    pub stats_poll_secs: u64,
+    /// Busy when a PoP's `load5 / cpus` exceeds this.
+    /// Env: `ROOMLER__RELAY__BUSY_LOAD`.
+    pub busy_load: f64,
+    /// Busy when a PoP's sustained egress exceeds this many Mbps (sized for
+    /// the 500 Mbps-capped OVH PoPs). Env: `ROOMLER__RELAY__BUSY_TX_MBPS`.
+    pub busy_tx_mbps: f64,
+}
+
+impl Default for RelaySettings {
+    fn default() -> Self {
+        Self {
+            regions_enabled: false,
+            regions: None,
+            derp_ticket_private_key: None,
+            stats_poll_secs: 30,
+            busy_load: 1.5,
+            busy_tx_mbps: 400.0,
+        }
+    }
 }
 
 /// Remote-control WS liveness (Phase A-1). Settings (not consts) so the
@@ -390,6 +412,9 @@ impl Settings {
             .set_default("relay.regions_enabled", false)?
             .set_default("relay.regions", None::<String>)?
             .set_default("relay.derp_ticket_private_key", None::<String>)?
+            .set_default("relay.stats_poll_secs", 30)?
+            .set_default("relay.busy_load", 1.5)?
+            .set_default("relay.busy_tx_mbps", 400.0)?
             .set_default("claude.model", "claude-sonnet-4-5-20250929")?
             .set_default("claude.max_tokens", 4096)?
             .set_default("oauth.base_url", "http://localhost:5001")?

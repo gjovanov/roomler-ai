@@ -114,9 +114,12 @@ pub async fn handle_agent_socket(
     // when regions are actually configured+enabled.
     let mut device_name = machine_name.clone();
     if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
+        // Prefs = the persisted probe table ordered by RTT (nearest first) —
+        // the load-aware fallback ladder until a fresh report replaces it.
+        let prefs = prefs_from_rtt(row.relay_rtt.as_deref().unwrap_or(&[]));
         state
             .rc_hub
-            .set_agent_relay_home(agent_id, row.relay_home.clone());
+            .set_agent_relay_home(agent_id, row.relay_home.clone(), prefs);
         // The row name wins over the hello machine_name — admins rename devices.
         device_name = row.name;
     }
@@ -460,6 +463,17 @@ async fn handle_derp_ticket_request(
     }
 }
 
+/// The agent's measured regions ordered by RTT (nearest first) — the
+/// load-aware fallback ladder handed to the Hub alongside `relay_home`.
+fn prefs_from_rtt(results: &[RelayRegionRtt]) -> Vec<String> {
+    let mut measured: Vec<(u32, &str)> = results
+        .iter()
+        .filter_map(|r| r.rtt_ms.map(|ms| (ms, r.region.as_str())))
+        .collect();
+    measured.sort_unstable();
+    measured.into_iter().map(|(_, r)| r.to_string()).collect()
+}
+
 /// Minimum spacing between Mongo persists of an agent's probe table. The
 /// Hub's live copy refreshes on EVERY report regardless.
 const PROBE_PERSIST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -509,7 +523,7 @@ async fn handle_relay_probe_report(
     };
     state
         .rc_hub
-        .set_agent_relay_home(agent_id, new_home.clone());
+        .set_agent_relay_home(agent_id, new_home.clone(), prefs_from_rtt(results));
     let due = last_persist
         .map(|t| t.elapsed() >= PROBE_PERSIST_MIN_INTERVAL)
         .unwrap_or(true);

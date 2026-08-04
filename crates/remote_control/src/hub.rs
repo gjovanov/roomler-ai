@@ -26,7 +26,9 @@ use crate::session::{ClientTx, LiveSession};
 use crate::signaling::{
     AgentCloseReason, ClientMsg, IceServer, LocalRelayDescriptor, Role, ServerMsg,
 };
-use crate::turn_creds::{TurnConfig, TurnMap, ice_servers_for_session};
+use crate::turn_creds::{
+    RelayLoadMap, TurnConfig, TurnMap, ice_servers_for_session, pick_region_with_load,
+};
 
 const SERVER_TX_CAPACITY: usize = 64;
 
@@ -78,6 +80,10 @@ pub struct ConnectedAgent {
     /// refreshed live when a probe report lands ([`Hub::set_agent_relay_home`]);
     /// `None` = the legacy default region.
     pub relay_home: Option<String>,
+    /// The agent's regions ordered by measured RTT (nearest first) — the
+    /// load-aware fallback ladder when [`relay_home`](Self::relay_home) is
+    /// busy. Empty until a probe report lands.
+    pub region_prefs: Vec<String>,
 }
 
 pub struct ConnectedController {
@@ -125,6 +131,11 @@ pub struct HubInner {
     /// like the old `Option<TurnConfig>` (its `default`).
     turn: TurnMap,
 
+    /// Live per-region load written by the API's `/stats` poller; consulted
+    /// when FREEZING a session's region at create time. Empty (tests / poller
+    /// off) = nothing is ever busy.
+    relay_load: RelayLoadMap,
+
     /// Audit sink.
     audit: AuditSink,
 
@@ -141,15 +152,16 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(audit: AuditSink, turn: Option<TurnConfig>) -> Self {
-        Self::new_with_consent(audit, TurnMap::single(turn), None)
+        Self::new_with_consent(audit, TurnMap::single(turn), None, Default::default())
     }
 
-    /// Like [`Hub::new`] but wires the Phase-4 async-consent event sender and
-    /// takes the full region-keyed [`TurnMap`].
+    /// Like [`Hub::new`] but wires the Phase-4 async-consent event sender,
+    /// the full region-keyed [`TurnMap`], and the live region-load table.
     pub fn new_with_consent(
         audit: AuditSink,
         turn: TurnMap,
         consent_tx: Option<mpsc::Sender<ConsentEvent>>,
+        relay_load: RelayLoadMap,
     ) -> Self {
         Self {
             inner: Arc::new(HubInner {
@@ -157,6 +169,7 @@ impl Hub {
                 sessions: DashMap::new(),
                 controllers: DashMap::new(),
                 turn,
+                relay_load,
                 audit,
                 consent_tx,
             }),
@@ -198,6 +211,7 @@ impl Hub {
             max_sessions,
             cancel: cancel.clone(),
             relay_home: None,
+            region_prefs: Vec::new(),
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -412,23 +426,38 @@ impl Hub {
         Some((s.tenant_id, s.controller_user_id))
     }
 
-    /// Refresh the cached relay home of a connected agent — called by the WS
-    /// layer at hello (from the DB row) and whenever a probe report changes
-    /// the agent's home. A disconnected agent is a no-op.
-    pub fn set_agent_relay_home(&self, agent_id: ObjectId, home: Option<String>) {
+    /// Refresh the cached relay home (+ RTT-ordered fallback ladder) of a
+    /// connected agent — called by the WS layer at hello (from the DB row)
+    /// and whenever a probe report changes the agent's picture. A
+    /// disconnected agent is a no-op.
+    pub fn set_agent_relay_home(
+        &self,
+        agent_id: ObjectId,
+        home: Option<String>,
+        prefs: Vec<String>,
+    ) {
         if let Some(mut a) = self.inner.agents.get_mut(&agent_id) {
             a.relay_home = home;
+            a.region_prefs = prefs;
         }
     }
 
-    /// The connected agent's relay home, if any — the region every
-    /// per-session TURN issuance for that agent uses. Pub for the WS layer's
+    /// The connected agent's relay home, if any. Pub for the WS layer's
     /// probe-report hysteresis (compare-before-move).
     pub fn agent_relay_home(&self, agent_id: ObjectId) -> Option<String> {
         self.inner
             .agents
             .get(&agent_id)
             .and_then(|a| a.relay_home.clone())
+    }
+
+    /// The region frozen on a live session at create time (`None` = default
+    /// region, or the session is gone).
+    fn session_relay_region(&self, session_id: ObjectId) -> Option<String> {
+        self.inner
+            .sessions
+            .get(&session_id)
+            .and_then(|arc| arc.value().lock().relay_region.clone())
     }
 
     // ─── session lifecycle ────────────────────────────────────────────
@@ -561,6 +590,23 @@ impl Hub {
         // agent TURN descriptor so `forward_offer` can hand the REMOTE agent a
         // relay it reaches over the overlay. Validated at use, not here.
         live.local_relay = local_relay;
+        // Multi-region relay: freeze the session's region NOW — a load-aware
+        // pick over the agent's home + its RTT-ordered prefs — so Ready/
+        // Offer/Answer all issue from the same PoP regardless of mid-setup
+        // home or busy-flag churn.
+        live.relay_region = self
+            .inner
+            .agents
+            .get(&agent_id)
+            .map(|a| (a.relay_home.clone(), a.region_prefs.clone()))
+            .and_then(|(home, prefs)| {
+                pick_region_with_load(
+                    &self.inner.turn,
+                    &self.inner.relay_load,
+                    home.as_deref(),
+                    &prefs,
+                )
+            });
         self.inner
             .sessions
             .insert(session_id, Arc::new(Mutex::new(live)));
@@ -685,15 +731,14 @@ impl Hub {
                 // Tell the controller it can send its offer.
                 if let Some(tx) = controller_tx {
                     let user_id = self.controller_for(session_id).unwrap_or_default();
-                    // Region policy: RC sessions use the AGENT's relay home —
-                    // TURN near the controlled host; the browser side rides the
-                    // public internet to it. Both session ends resolve the same
-                    // agent, so both get the same region.
-                    let home = self.agent_relay_home(agent_id);
+                    // Region policy: the session's region was FROZEN (load-
+                    // aware, agent-nearest) at create — all three issuance
+                    // pushes read it so both ICE ends land on one PoP.
+                    let region = self.session_relay_region(session_id);
                     let ice = ice_servers_for_session(
                         &user_id.to_hex(),
                         &session_id.to_hex(),
-                        self.inner.turn.cfg_for(home.as_deref()),
+                        self.inner.turn.cfg_for(region.as_deref()),
                     );
                     let _ = tx.try_send(ServerMsg::Ready {
                         session_id,
@@ -731,14 +776,14 @@ impl Hub {
 
     /// Forward controller's SDP offer to the agent.
     pub fn forward_offer(&self, session_id: ObjectId, sdp: String) -> Result<()> {
-        let (agent_id, local_relay) =
-            self.with_session(session_id, |s| Ok((s.agent_id, s.local_relay.clone())))?;
+        let (agent_id, local_relay, region) = self.with_session(session_id, |s| {
+            Ok((s.agent_id, s.local_relay.clone(), s.relay_region.clone()))
+        })?;
         let user_id = self.controller_for(session_id).unwrap_or_default();
-        let home = self.agent_relay_home(agent_id);
         let mut ice = ice_servers_for_session(
             &user_id.to_hex(),
             &session_id.to_hex(),
-            self.inner.turn.cfg_for(home.as_deref()),
+            self.inner.turn.cfg_for(region.as_deref()),
         );
         // Loopback-TURN corp-relay (Phase 2): if the controller forwarded its
         // local agent's TURN descriptor, hand the REMOTE agent a relay it can
@@ -780,21 +825,24 @@ impl Hub {
 
     /// Forward agent's SDP answer to the controller.
     pub fn forward_answer(&self, session_id: ObjectId, sdp: String) -> Result<()> {
-        let (controller_tx, user_id, agent_id) = {
+        let (controller_tx, user_id, region) = {
             let arc = self
                 .inner
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| Error::SessionNotFound(session_id.to_hex()))?;
             let s = arc.value().lock();
-            (s.controller_tx.clone(), s.controller_user_id, s.agent_id)
+            (
+                s.controller_tx.clone(),
+                s.controller_user_id,
+                s.relay_region.clone(),
+            )
         };
         let tx = controller_tx.ok_or(Error::SendFailed)?;
-        let home = self.agent_relay_home(agent_id);
         let ice = ice_servers_for_session(
             &user_id.to_hex(),
             &session_id.to_hex(),
-            self.inner.turn.cfg_for(home.as_deref()),
+            self.inner.turn.cfg_for(region.as_deref()),
         );
         tx.try_send(ServerMsg::SdpAnswer {
             session_id,

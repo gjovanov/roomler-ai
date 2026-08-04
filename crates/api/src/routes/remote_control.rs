@@ -731,6 +731,10 @@ pub struct RelayRegionSummary {
     pub turn_url: String,
     pub derp_url: Option<String>,
     pub enabled: bool,
+    /// P6b — the poller's latest load snapshot (`None` = never sampled).
+    pub load: Option<roomler_ai_remote_control::turn_creds::RegionLoad>,
+    /// P6b — currently steered around by the load-aware pick (fresh-busy).
+    pub busy: bool,
 }
 
 /// GET /api/relay/regions — the configured relay PoP topology (region ids +
@@ -745,6 +749,8 @@ pub async fn relay_regions(
         .specs
         .iter()
         .map(|s| RelayRegionSummary {
+            load: state.relay_load.get(&s.id).map(|l| l.value().clone()),
+            busy: roomler_ai_remote_control::turn_creds::region_busy(&state.relay_load, &s.id),
             id: s.id.clone(),
             turn_url: s.turn_url.clone(),
             derp_url: s.derp_url.clone(),
