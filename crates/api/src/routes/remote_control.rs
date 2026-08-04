@@ -722,12 +722,10 @@ pub async fn turn_credentials(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<Json<TurnCredentialsResponse>, ApiError> {
-    // Build a fresh TurnConfig view the same way AppState does — reuses
-    // `state::build_turn_config` (a former inline duplicate). This route is
-    // session-less (a pre-fetch), so it issues the generic URL list; the
-    // per-session same-worker affinity happens on the Hub's issuance paths.
-    let turn_cfg = crate::state::build_turn_config(&state.settings.turn);
-    let ice_servers = ice_servers_for(&auth.user_id.to_hex(), turn_cfg.as_ref());
+    // This route is session-less (a pre-fetch), so it issues the default
+    // region's generic URL list; the per-session same-worker affinity and the
+    // region pick happen on the Hub's issuance paths.
+    let ice_servers = ice_servers_for(&auth.user_id.to_hex(), state.turn_map.cfg_for(None));
     Ok(Json(TurnCredentialsResponse { ice_servers }))
 }
 

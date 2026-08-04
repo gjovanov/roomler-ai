@@ -82,6 +82,109 @@ impl TurnConfig {
     }
 }
 
+/// One relay region as configured in `ROOMLER__RELAY__REGIONS` (a JSON array
+/// of these). Mirrors the legacy `turn.*` settings shape per region: a generic
+/// base URL, optional per-worker URLs for same-worker affinity, and the
+/// variant capability set the PoP actually serves.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RelayRegionSpec {
+    /// Region id, e.g. `"us-east"` — the value carried in `relay_home`.
+    pub id: String,
+    /// Generic base URL, e.g. `"turn:coturn-us-east.roomler.ai:3478"`.
+    pub turn_url: String,
+    /// Optional per-worker base URLs (multi-worker regions), like
+    /// `ROOMLER__TURN__WORKER_URLS`.
+    #[serde(default)]
+    pub worker_urls: Vec<String>,
+    /// The region's DERP relay endpoint, e.g.
+    /// `"wss://derp-us-east.roomler.ai/derp"`. Absent = the region has no
+    /// regional DERP; pairs fall back to the central `/derp`.
+    #[serde(default)]
+    pub derp_url: Option<String>,
+    /// Per-region coturn `static-auth-secret`; falls back to the global
+    /// `turn.shared_secret` when absent (one secret fleet-wide, v1).
+    #[serde(default)]
+    pub shared_secret: Option<String>,
+    /// Which transport variants this PoP serves (absent fields = true).
+    #[serde(default)]
+    pub caps: crate::turn_url::VariantCaps,
+    /// Parsed-but-disabled regions never issue (procurement staging).
+    #[serde(default = "spec_enabled_default")]
+    pub enabled: bool,
+}
+
+fn spec_enabled_default() -> bool {
+    true
+}
+
+/// Region-keyed TURN issuance. `default` is the legacy single-region
+/// `turn.*` config; `regions` are the PoPs from `ROOMLER__RELAY__REGIONS`.
+/// With `enabled == false` (the default) `cfg_for` ALWAYS answers `default`,
+/// so every pre-region call path is provably unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct TurnMap {
+    pub default: Option<TurnConfig>,
+    pub regions: std::collections::HashMap<String, TurnConfig>,
+    /// The parsed specs (DERP endpoints, caps) for the wire push (PR3) and
+    /// the regional-DERP side (PR4).
+    pub specs: Vec<RelayRegionSpec>,
+    /// `relay.regions_enabled` — the master gate.
+    pub enabled: bool,
+}
+
+impl TurnMap {
+    /// Legacy single-region map (tests + the pre-region constructor path).
+    pub fn single(default: Option<TurnConfig>) -> Self {
+        Self {
+            default,
+            ..Self::default()
+        }
+    }
+
+    /// The issuing config for `region`: the region's own config when the map
+    /// is enabled and knows it; the legacy default otherwise (unknown region
+    /// ids and `None` both degrade safely).
+    pub fn cfg_for(&self, region: Option<&str>) -> Option<&TurnConfig> {
+        if self.enabled
+            && let Some(r) = region
+            && let Some(cfg) = self.regions.get(r)
+        {
+            return Some(cfg);
+        }
+        self.default.as_ref()
+    }
+}
+
+/// Pick the relay region for a PAIR from the two ends' `relay_home`s.
+/// Interim policy until RTT tables land: agreement wins; a single known home
+/// wins over none; two DIFFERENT homes fall to a deterministic FNV pick over
+/// the pair key (either end's PoP beats the default-region hairpin for a
+/// same-continent pair, and the broker computes this once so both grants
+/// agree). `None` = use the default region.
+pub fn select_pair_region(
+    map: &TurnMap,
+    home_a: Option<&str>,
+    home_b: Option<&str>,
+    pair_key: &str,
+) -> Option<String> {
+    if !map.enabled {
+        return None;
+    }
+    let known_a = home_a.filter(|r| map.regions.contains_key(*r));
+    let known_b = home_b.filter(|r| map.regions.contains_key(*r));
+    match (known_a, known_b) {
+        (Some(a), Some(b)) if a == b => Some(a.to_string()),
+        (Some(a), Some(b)) => {
+            // Sorted so the pick is symmetric in argument order.
+            let mut pair = [a, b];
+            pair.sort_unstable();
+            pick_index_fnv1a(pair_key, 2).map(|i| pair[i].to_string())
+        }
+        (Some(one), None) | (None, Some(one)) => Some(one.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Convenience: also include public STUN servers so trickle ICE has something
 /// to work with even before TURN auth completes.
 pub fn ice_servers_for(user_id: &str, turn: Option<&TurnConfig>) -> Vec<IceServer> {
@@ -206,5 +309,101 @@ mod tests {
     fn ice_list_includes_stun() {
         let list = ice_servers_for("u1", None);
         assert!(list[0].urls[0].starts_with("stun:"));
+    }
+
+    fn region_cfg(host: &str) -> TurnConfig {
+        TurnConfig {
+            urls: vec![format!("turn:{host}:3478")],
+            workers: vec![],
+            shared_secret: "topsecret".into(),
+            ttl_secs: 600,
+        }
+    }
+
+    fn two_region_map(enabled: bool) -> TurnMap {
+        let mut regions = std::collections::HashMap::new();
+        regions.insert("us-east".to_string(), region_cfg("coturn-us-east.example"));
+        regions.insert("eu-west".to_string(), region_cfg("coturn-eu-west.example"));
+        TurnMap {
+            default: Some(region_cfg("coturn.example")),
+            regions,
+            specs: vec![],
+            enabled,
+        }
+    }
+
+    /// The flag-off no-op guarantee: a DISABLED map answers the legacy
+    /// default for every input, including a known region id.
+    #[test]
+    fn disabled_map_always_answers_default() {
+        let map = two_region_map(false);
+        for region in [None, Some("us-east"), Some("nope")] {
+            let cfg = map.cfg_for(region).expect("default present");
+            assert_eq!(cfg.urls[0], "turn:coturn.example:3478");
+        }
+        assert_eq!(
+            select_pair_region(&map, Some("us-east"), Some("us-east"), "k"),
+            None
+        );
+    }
+
+    #[test]
+    fn enabled_map_resolves_regions_and_degrades() {
+        let map = two_region_map(true);
+        assert_eq!(
+            map.cfg_for(Some("us-east")).unwrap().urls[0],
+            "turn:coturn-us-east.example:3478"
+        );
+        // Unknown region + None both degrade to the default.
+        assert_eq!(
+            map.cfg_for(Some("mars")).unwrap().urls[0],
+            "turn:coturn.example:3478"
+        );
+        assert_eq!(
+            map.cfg_for(None).unwrap().urls[0],
+            "turn:coturn.example:3478"
+        );
+    }
+
+    #[test]
+    fn pair_region_agreement_and_fallbacks() {
+        let map = two_region_map(true);
+        // Agreement.
+        assert_eq!(
+            select_pair_region(&map, Some("us-east"), Some("us-east"), "k").as_deref(),
+            Some("us-east")
+        );
+        // One known home wins over none / over an UNKNOWN home.
+        assert_eq!(
+            select_pair_region(&map, Some("eu-west"), None, "k").as_deref(),
+            Some("eu-west")
+        );
+        assert_eq!(
+            select_pair_region(&map, Some("gone"), Some("eu-west"), "k").as_deref(),
+            Some("eu-west")
+        );
+        // No homes → default region.
+        assert_eq!(select_pair_region(&map, None, None, "k"), None);
+        // Differing homes: deterministic AND symmetric in argument order.
+        let ab = select_pair_region(&map, Some("us-east"), Some("eu-west"), "pair-1");
+        let ba = select_pair_region(&map, Some("eu-west"), Some("us-east"), "pair-1");
+        assert_eq!(ab, ba);
+        assert!(ab.as_deref() == Some("us-east") || ab.as_deref() == Some("eu-west"));
+    }
+
+    #[test]
+    fn region_spec_parses_with_defaults() {
+        let spec: RelayRegionSpec = serde_json::from_str(
+            r#"{"id":"us-east","turn_url":"turn:coturn-us-east.roomler.ai:3478",
+                "derp_url":"wss://derp-us-east.roomler.ai/derp",
+                "caps":{"tls_443_tcp":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.id, "us-east");
+        assert!(spec.enabled);
+        assert!(spec.worker_urls.is_empty());
+        assert!(spec.shared_secret.is_none());
+        assert!(!spec.caps.tls_443_tcp);
+        assert!(spec.caps.udp_443);
     }
 }

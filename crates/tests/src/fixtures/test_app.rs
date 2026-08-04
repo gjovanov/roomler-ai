@@ -332,7 +332,9 @@ fn test_settings() -> Settings {
             password: None,
             shared_secret: None,
             force_relay: None,
+            ttl_secs: None,
         },
+        relay: roomler_ai_config::RelaySettings::default(),
         claude: roomler_ai_config::ClaudeSettings {
             api_key: None,
             model: "claude-sonnet-4-5-20250929".to_string(),
