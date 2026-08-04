@@ -1348,7 +1348,11 @@ async fn setup_quic_over_relay(
         } else {
             ip.to_string()
         };
-        alloc_urls.push(format!("turn:{host}:3478?transport=udp"));
+        // Dial the grant's own UDP port on the pinned IP (regional PoPs may
+        // serve TURN off 3478; the granted url list is authoritative).
+        let udp_port =
+            roomler_ai_remote_control::turn_url::first_udp_port(urls.iter().map(String::as_str));
+        alloc_urls.push(format!("turn:{host}:{udp_port}?transport=udp"));
         info!(%ip, "QUIC client: pinning relay to the agent's coturn worker (hairpin)");
     }
     alloc_urls.extend_from_slice(urls);

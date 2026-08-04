@@ -1511,10 +1511,14 @@ async fn overlay_ice_servers(state: &AppState, pair_key: &str) -> Vec<IceServer>
         return turn_creds::ice_servers_for(pair_key, None);
     };
     let servers = turn_creds::ice_servers_for(pair_key, Some(&turn_cfg));
-    let Some(host) = turn_cfg.urls.first().and_then(|u| turn_url_host(u)) else {
+    let Some((host, port)) = turn_cfg
+        .urls
+        .first()
+        .and_then(|u| roomler_ai_remote_control::turn_url::host_port(u))
+    else {
         return servers;
     };
-    let Some(ip) = resolve_pick_worker(&host, pair_key).await else {
+    let Some(ip) = resolve_pick_worker(&host, port, pair_key).await else {
         warn!(%host, "overlay relay: coturn DNS resolve failed; not pinning a worker");
         return servers;
     };
@@ -1551,15 +1555,6 @@ fn rewrite_ice_hosts(servers: Vec<IceServer>, host: &str, ip: &str) -> Vec<IceSe
             s
         })
         .collect()
-}
-
-/// Hostname of a `turn:`/`turns:` url (strips scheme + `:port` + `?query`).
-fn turn_url_host(u: &str) -> Option<String> {
-    let rest = u
-        .strip_prefix("turns:")
-        .or_else(|| u.strip_prefix("turn:"))?;
-    let host = rest.split([':', '?']).next()?;
-    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// `host:port` of a `turn:`/`turns:` url (strips scheme + `?query`), e.g.
@@ -1625,7 +1620,7 @@ const WORKER_SET_TTL: Duration = Duration::from_secs(300);
 /// stable across grants. Returns the cached set while fresh; otherwise resolves,
 /// caches, and returns; on resolve failure reuses the last-good set (may be
 /// empty only before the first successful resolve).
-async fn resolve_workers_cached(host: &str) -> Vec<IpAddr> {
+async fn resolve_workers_cached(host: &str, port: u16) -> Vec<IpAddr> {
     {
         let guard = WORKER_SET_CACHE.lock().unwrap();
         if let Some((at, ips)) = guard.as_ref()
@@ -1635,7 +1630,7 @@ async fn resolve_workers_cached(host: &str) -> Vec<IpAddr> {
             return ips.clone();
         }
     }
-    let mut ips: Vec<IpAddr> = match lookup_host((host, 3478u16)).await {
+    let mut ips: Vec<IpAddr> = match lookup_host((host, port)).await {
         Ok(addrs) => addrs.map(|s| s.ip()).collect(),
         Err(_) => Vec::new(),
     };
@@ -1658,8 +1653,8 @@ async fn resolve_workers_cached(host: &str) -> Vec<IpAddr> {
 /// Resolve `host` (cached, stable) and pick one IPv4 worker, indexed by
 /// `pair_key`. Both ends of a pair get the identical result → intra-worker
 /// hairpin.
-async fn resolve_pick_worker(host: &str, pair_key: &str) -> Option<IpAddr> {
-    let ips = resolve_workers_cached(host).await;
+async fn resolve_pick_worker(host: &str, port: u16, pair_key: &str) -> Option<IpAddr> {
+    let ips = resolve_workers_cached(host, port).await;
     // Both peers of a pair share the `pair_key`, and the broker hands them
     // the SAME single result, so they co-locate. The pick is the ONE shared
     // `remote_control::worker_pick` implementation (invariant I6) — the
@@ -1747,19 +1742,6 @@ mod tests {
         let b = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
         assert_eq!(pair_key(a, b), pair_key(b, a));
         assert!(pair_key(a, b).contains(&a.to_hex()));
-    }
-
-    #[test]
-    fn turn_url_host_strips_scheme_port_query() {
-        assert_eq!(
-            turn_url_host("turn:coturn.roomler.ai:3478?transport=udp").as_deref(),
-            Some("coturn.roomler.ai")
-        );
-        assert_eq!(
-            turn_url_host("turns:coturn.roomler.ai:5349?transport=tcp").as_deref(),
-            Some("coturn.roomler.ai")
-        );
-        assert_eq!(turn_url_host("stun:stun.l.google.com:19302"), None);
     }
 
     #[test]
