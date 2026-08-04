@@ -231,6 +231,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "B1 - feed the 15 s overlay RTT probes into the PathMonitor quality plane (Q-only, never eligibility). Built-in default: on. Env: ROOMLER_AGENT_OVERLAY_RTT_Q.",
     ),
     (
+        "overlay_upward_probe",
+        "tribool",
+        "B3 - probe an eligible higher tier from a healthy srflx/public incumbent every >=120 s (MBB; incumbent held until latch). Built-in default: on. Env: ROOMLER_AGENT_OVERLAY_UPWARD_PROBE.",
+    ),
+    (
         "relay_probe",
         "tribool",
         "Multi-region relay PoPs - probe the server-pushed region list (timed STUN per PoP) and report RTTs; the server derives this node's relay_home from them. Built-in default: on. Env: ROOMLER_NODE_RELAY_PROBE.",
@@ -329,6 +334,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ice_overlay_host_deprioritize" => cfg.ice_overlay_host_deprioritize.map(fmt_bool),
         "overlay_tier_detect" => cfg.overlay_tier_detect.map(fmt_bool),
         "overlay_rtt_q" => cfg.overlay_rtt_q.map(fmt_bool),
+        "overlay_upward_probe" => cfg.overlay_upward_probe.map(fmt_bool),
         "relay_probe" => cfg.relay_probe.map(fmt_bool),
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "forward_acl" => serde_json::to_string(&cfg.forward_acl).ok(),
@@ -487,6 +493,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "overlay_tier_detect" => cfg.overlay_tier_detect = parse_tribool(value)?,
         "overlay_rtt_q" => cfg.overlay_rtt_q = parse_tribool(value)?,
+        "overlay_upward_probe" => cfg.overlay_upward_probe = parse_tribool(value)?,
         "relay_probe" => cfg.relay_probe = parse_tribool(value)?,
         "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
         "forward_acl" => {
@@ -940,6 +947,7 @@ mod tests {
             "ice_overlay_host_deprioritize",
             "overlay_tier_detect",
             "overlay_rtt_q",
+            "overlay_upward_probe",
             "relay_probe",
             "text_mod_neutralize",
         ] {
