@@ -58,6 +58,19 @@ enum Command {
         /// Friendly name shown in the admin agents list.
         #[arg(long)]
         name: String,
+        /// Multi-org: label for the enrollment when it resolves to a NEW
+        /// (server, org) pair and is APPENDED as a secondary org
+        /// (lowercase letters/digits/dashes). Default: derived from the
+        /// server host. Ignored when the enrollment refreshes an existing
+        /// one.
+        #[arg(long)]
+        label: Option<String>,
+        /// Legacy behaviour: REBIND the primary enrollment to this
+        /// (server, org) wholesale instead of appending a secondary org.
+        /// Operator state is preserved (rc.204 semantics); a secondary
+        /// entry duplicating the new primary identity is dropped.
+        #[arg(long)]
+        replace: bool,
         /// rc.52: write the enrolled config to the machine-global
         /// path (`%PROGRAMDATA%\roomler\roomler-agent\config.toml`)
         /// instead of the per-user `%APPDATA%` default. Required for
@@ -80,6 +93,20 @@ enum Command {
         /// Fresh enrollment JWT from the admin UI.
         #[arg(long)]
         token: String,
+        /// Multi-org: which enrollment to refresh — `primary` (default) or
+        /// a `[[orgs]]` label (`roomler-agent org ls`). The token is posted
+        /// to THAT org's server; the response must resolve to the same
+        /// org (a different-tenant token belongs in `enroll`).
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Multi-org: inspect + manage this machine's enrollments. The config's
+    /// scalar identity is the PRIMARY org; additional enrollments live in
+    /// `[[orgs]]` (appended by `enroll`). Changes apply at the next daemon
+    /// start.
+    Org {
+        #[command(subcommand)]
+        action: OrgAction,
     },
     /// Connect to the server and sit in the signaling loop (default command
     /// if none is given).
@@ -342,6 +369,30 @@ enum Command {
         #[arg(long)]
         expected_version: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum OrgAction {
+    /// List every enrollment (primary + secondaries).
+    Ls,
+    /// Remove a secondary enrollment from this machine's config. The
+    /// device row in THAT org remains until one of its admins removes it
+    /// (Devices → remove); this only stops the daemon from serving it.
+    /// `primary` cannot be removed — `set-primary` another org first.
+    Rm {
+        /// The org's label (`org ls`).
+        label: String,
+    },
+    /// Re-enable a disabled secondary enrollment.
+    Enable { label: String },
+    /// Disable a secondary enrollment without deleting it (no supervised
+    /// WS loop for it on the next daemon start).
+    Disable { label: String },
+    /// Swap a secondary enrollment into the PRIMARY slot (and the current
+    /// primary into `[[orgs]]` under the given secondary's old label). The
+    /// primary drives machine-wide effects: self-update source, attention
+    /// sentinels, the (P1) overlay TUN, and declared tunnel routes.
+    SetPrimary { label: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -663,8 +714,24 @@ async fn main() -> Result<()> {
             token,
             name,
             machine_global,
-        } => enroll_cmd(&config_path, &server, &token, &name, machine_global).await,
-        Command::ReEnroll { token } => re_enroll_cmd(&config_path, &token).await,
+            label,
+            replace,
+        } => {
+            enroll_cmd(
+                &config_path,
+                &server,
+                &token,
+                &name,
+                machine_global,
+                label.as_deref(),
+                replace,
+            )
+            .await
+        }
+        Command::ReEnroll { token, org } => {
+            re_enroll_cmd(&config_path, &token, org.as_deref()).await
+        }
+        Command::Org { action } => org_cmd(&config_path, action),
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
         Command::SystemCaptureSmoke {
@@ -968,6 +1035,8 @@ async fn enroll_cmd(
     enrollment_token: &str,
     machine_name: &str,
     machine_global: bool,
+    label: Option<&str>,
+    replace: bool,
 ) -> Result<()> {
     // rc.52: --machine-global retargets the write to
     // %PROGRAMDATA%\roomler\roomler-agent\config.toml so a perMachine
@@ -990,8 +1059,26 @@ async fn enroll_cmd(
         config_path.to_path_buf()
     };
 
-    let machine_id = machine::derive_machine_id(&target_path);
-    tracing::info!(%machine_id, machine_global, "derived machine fingerprint");
+    // Multi-org P1: when a config already exists at the target path, reuse
+    // ITS machine_id for the POST — every enrollment of this machine must
+    // present the SAME fingerprint so the server's `(tenant_id, machine_id)`
+    // key recognises the box across orgs (and across the %PROGRAMDATA% vs
+    // %APPDATA% path drift that re-enroll's rc.52 BLOCKER-6 guards against).
+    let existing = config::load(&target_path).ok();
+    let machine_id = match &existing {
+        Some(cfg) => {
+            tracing::info!(
+                machine_id = %cfg.machine_id,
+                "existing config found — reusing its machine fingerprint"
+            );
+            cfg.machine_id.clone()
+        }
+        None => {
+            let derived = machine::derive_machine_id(&target_path);
+            tracing::info!(machine_id = %derived, machine_global, "derived machine fingerprint");
+            derived
+        }
+    };
 
     let fresh = enrollment::enroll(enrollment::EnrollInputs {
         server_url: server,
@@ -1002,21 +1089,12 @@ async fn enroll_cmd(
     .await
     .context("enrollment failed")?;
 
-    // rc.204 — a RE-enroll over an existing install must not reset operator
-    // state: keep the existing config as the base (overlay opt-in + WG key,
-    // declared tunnel routes, ACL posture, encoder preference, …) and take
-    // only the enrollment-owned identity fields from the fresh one. A fresh
-    // machine (no config at the target path) writes the fresh config as-is.
-    let cfg = match config::load(&target_path) {
-        Ok(existing) => {
-            tracing::info!(
-                path = %target_path.display(),
-                "existing config found — preserving operator settings across re-enroll"
-            );
-            enrollment::preserve_operator_config(fresh, existing)
-        }
-        Err(_) => fresh,
-    };
+    // Multi-org P1 dispatch: fresh install → write as-is; same (server,
+    // tenant) as the primary or a `[[orgs]]` entry → refresh it in place
+    // (operator state preserved — rc.204 semantics); a NEW pair → APPEND a
+    // secondary org (with its own freshly minted WG key); `--replace` →
+    // legacy whole-primary rebind.
+    let (cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
 
     // rc.52: a machine-global write needs admin (%PROGRAMDATA% +, on
     // the installer path, an ACL-restricted parent dir). On a
@@ -1037,14 +1115,46 @@ async fn enroll_cmd(
             anyhow::anyhow!(e).context("saving config")
         }
     })?;
+    use enrollment::EnrollOutcome;
+    let enrolled_agent_id = match &outcome {
+        EnrollOutcome::RefreshedOrg { label } | EnrollOutcome::AppendedOrg { label } => cfg
+            .find_org(label)
+            .map(|o| o.agent_id.clone())
+            .unwrap_or_else(|| cfg.agent_id.clone()),
+        _ => cfg.agent_id.clone(),
+    };
     tracing::info!(
         path = %target_path.display(),
-        agent_id = %cfg.agent_id,
+        agent_id = %enrolled_agent_id,
+        ?outcome,
         "enrollment complete"
     );
-    println!("Enrollment successful. Agent id: {}", cfg.agent_id);
+    match &outcome {
+        EnrollOutcome::FreshPrimary => {
+            println!("Enrollment successful. Agent id: {enrolled_agent_id}");
+        }
+        EnrollOutcome::RefreshedPrimary => {
+            println!(
+                "Primary enrollment refreshed (same server + org). Agent id: {enrolled_agent_id}"
+            );
+        }
+        EnrollOutcome::ReplacedPrimary => {
+            println!("Primary enrollment REPLACED (--replace). Agent id: {enrolled_agent_id}");
+        }
+        EnrollOutcome::RefreshedOrg { label } => {
+            println!("Org {label:?} enrollment refreshed. Agent id: {enrolled_agent_id}");
+        }
+        EnrollOutcome::AppendedOrg { label } => {
+            println!("Enrolled into an ADDITIONAL org as {label:?}. Agent id: {enrolled_agent_id}");
+            println!(
+                "This machine now serves {} enrollment(s); manage them with \
+                 `roomler-agent org ls`.",
+                1 + cfg.orgs.len()
+            );
+        }
+    }
     println!("Config written to: {}", target_path.display());
-    println!("Run `roomler-agent run` to connect.");
+    println!("Run `roomler-agent run` (or restart the service) to connect.");
 
     // rc.53 Phase 7: CORPLAP-2's recurring pain — operator runs
     // `enroll --machine-global` from a user PowerShell, the config
@@ -1106,7 +1216,11 @@ Either:\n\
         .to_string()
 }
 
-async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<()> {
+async fn re_enroll_cmd(
+    config_path: &PathBuf,
+    enrollment_token: &str,
+    org: Option<&str>,
+) -> Result<()> {
     if !config_path.exists() {
         bail!(
             "no existing config at {}; use `enroll` for first-time setup",
@@ -1125,15 +1239,39 @@ async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<
     // own write path; only `re-enroll` of an unchanged host must
     // pin the id.)
     let machine_id = existing.machine_id.clone();
+
+    // Multi-org P1: `--org <label>` refreshes THAT enrollment (default:
+    // the primary). The token is posted to the selected org's server.
+    let org_label = org.unwrap_or(config::PRIMARY_ORG_LABEL);
+    let is_primary = org_label == config::PRIMARY_ORG_LABEL;
+    let (server_url, expect_tenant, old_agent_id) = if is_primary {
+        (
+            existing.server_url.clone(),
+            existing.tenant_id.clone(),
+            existing.agent_id.clone(),
+        )
+    } else {
+        let entry = existing.find_org(org_label).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no org labelled {org_label:?} in this config — see `roomler-agent org ls`"
+            )
+        })?;
+        (
+            entry.server_url.clone(),
+            entry.tenant_id.clone(),
+            entry.agent_id.clone(),
+        )
+    };
     tracing::info!(
         %machine_id,
-        agent_id = %existing.agent_id,
+        org = %org_label,
+        agent_id = %old_agent_id,
         machine_name = %existing.machine_name,
         "re-enrolling against existing config (machine_id preserved)"
     );
 
     let new_cfg = enrollment::enroll(enrollment::EnrollInputs {
-        server_url: &existing.server_url,
+        server_url: &server_url,
         enrollment_token,
         machine_id: &machine_id,
         machine_name: &existing.machine_name,
@@ -1141,10 +1279,142 @@ async fn re_enroll_cmd(config_path: &PathBuf, enrollment_token: &str) -> Result<
     .await
     .context("re-enrollment failed")?;
 
-    config::save(config_path, &new_cfg).context("saving updated config")?;
-    notify::clear_all_attention();
-    println!("Re-enrollment successful. Agent id: {}", new_cfg.agent_id);
+    // The refreshed token must resolve to the SAME org — a token for a
+    // different org is an ADD, which is `enroll`'s job (explicit intent).
+    if new_cfg.tenant_id != expect_tenant {
+        bail!(
+            "the enrollment token belongs to a different org (tenant {}) than \
+             {org_label:?} (tenant {expect_tenant}). To enroll this machine into an \
+             ADDITIONAL org run:\n\n\
+             \troomler-agent enroll --server {server_url} --token <jwt>",
+            new_cfg.tenant_id
+        );
+    }
+
+    // Fold through the same dispatch as `enroll` — this lands on the
+    // refresh-in-place arms and (fixing a pre-multi-org gap) preserves
+    // operator state for the primary too, instead of writing the fresh
+    // default-everything config wholesale.
+    let (merged, _outcome) = enrollment::apply_enrollment(Some(existing), new_cfg, None, false)?;
+    let refreshed_agent_id = if is_primary {
+        merged.agent_id.clone()
+    } else {
+        merged
+            .find_org(org_label)
+            .map(|o| o.agent_id.clone())
+            .unwrap_or_default()
+    };
+    config::save(config_path, &merged).context("saving updated config")?;
+    if is_primary {
+        notify::clear_all_attention();
+    }
+    println!("Re-enrollment successful for {org_label:?}. Agent id: {refreshed_agent_id}");
     println!("Run `roomler-agent run` (or wait for the supervisor to relaunch) to reconnect.");
+    Ok(())
+}
+
+/// Multi-org P1 — `roomler-agent org <ls|rm|enable|disable|set-primary>`.
+/// Direct config-file edits (same model as `enroll`): the daemon applies
+/// changes on its next start. Runtime org verbs over the LocalAPI land with
+/// the desktop org-management UI in a later phase.
+fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
+    let mut cfg = config::load(config_path).with_context(|| {
+        format!(
+            "loading config at {} (run `roomler-agent enroll` first)",
+            config_path.display()
+        )
+    })?;
+    match action {
+        OrgAction::Ls => {
+            println!(
+                "{:<14} {:<9} {:<8} {:<26} SERVER",
+                "LABEL", "PRIMARY", "ENABLED", "ORG (tenant)"
+            );
+            println!(
+                "{:<14} {:<9} {:<8} {:<26} {}",
+                config::PRIMARY_ORG_LABEL,
+                "yes",
+                "yes",
+                cfg.tenant_id,
+                cfg.server_url
+            );
+            for o in &cfg.orgs {
+                println!(
+                    "{:<14} {:<9} {:<8} {:<26} {}",
+                    o.label,
+                    "",
+                    if o.enabled { "yes" } else { "no" },
+                    o.tenant_id,
+                    o.server_url
+                );
+            }
+            let problems = cfg.validate_orgs();
+            for p in problems {
+                eprintln!("warning: {p}");
+            }
+            return Ok(());
+        }
+        OrgAction::Rm { label } => {
+            if label == config::PRIMARY_ORG_LABEL {
+                bail!(
+                    "the primary enrollment cannot be removed — `org set-primary <label>` \
+                     another org first (or re-`enroll --replace`)"
+                );
+            }
+            let before = cfg.orgs.len();
+            cfg.orgs.retain(|o| o.label != label);
+            if cfg.orgs.len() == before {
+                bail!("no org labelled {label:?} — see `roomler-agent org ls`");
+            }
+            println!(
+                "Removed org {label:?} from this machine. NOTE: the device row in that \
+                 org remains until one of its admins removes it (Devices page)."
+            );
+        }
+        OrgAction::Enable { label } => set_org_enabled(&mut cfg, &label, true)?,
+        OrgAction::Disable { label } => set_org_enabled(&mut cfg, &label, false)?,
+        OrgAction::SetPrimary { label } => {
+            config::promote_org_to_primary(&mut cfg, &label)?;
+            println!(
+                "Org {label:?} is now the PRIMARY enrollment; the previous primary \
+                 moved into [[orgs]] under the label {label:?}. Overlay participation \
+                 for the new primary starts OFF — re-enable with `roomler config set \
+                 overlay_enabled true` if wanted. Restart the daemon to apply."
+            );
+        }
+    }
+    config::save(config_path, &cfg).context("saving config")?;
+    Ok(())
+}
+
+/// Multi-org P1 — one runnable secondary enrollment's spawn bundle: the
+/// config entry, its pre-minted [`signaling::OrgCtx`], the connected flag
+/// its `ConnectedGuard` flips, and the terminal-error slot its supervisor
+/// writes (the latter two are the SAME instances seeded into the LocalAPI
+/// org-status registry).
+type OrgSpawn = (
+    config::OrgEntry,
+    signaling::OrgCtx,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::Mutex<Option<String>>>,
+);
+
+/// Flip a secondary org's soft-enable flag (see [`org_cmd`]).
+fn set_org_enabled(cfg: &mut config::AgentConfig, label: &str, enable: bool) -> Result<()> {
+    if label == config::PRIMARY_ORG_LABEL {
+        bail!(
+            "the primary enrollment is always enabled — use `org set-primary <label>` \
+             to change which enrollment is primary"
+        );
+    }
+    let Some(entry) = cfg.orgs.iter_mut().find(|o| o.label == label) else {
+        bail!("no org labelled {label:?} — see `roomler-agent org ls`");
+    };
+    entry.enabled = enable;
+    println!(
+        "Org {label:?} {}. Restart the daemon to apply.",
+        if enable { "enabled" } else { "disabled" }
+    );
     Ok(())
 }
 
@@ -1617,8 +1887,26 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // in `connect_once`); the next successful connect re-enables it
     // and `gate(true)` resets `last_tick` so each connection gets a
     // clean 90 s budget against the 25 s keepalive cadence.
+    // Multi-org P1 — partition `[[orgs]]` into runnable + rejected entries
+    // and pre-mint each entry's `OrgCtx` EXACTLY ONCE (its watchdog pump
+    // name is interned; the registry rows and the spawned supervisor must
+    // share the same instance). Rejects are logged + surfaced via the
+    // LocalAPI OrgStatus; they never stop the daemon or the healthy orgs.
+    let org_partition = cfg.partition_runnable_orgs();
+    let org_ctxs: Vec<signaling::OrgCtx> = org_partition
+        .iter()
+        .map(|(org, _)| signaling::OrgCtx::secondary(&org.label))
+        .collect();
+
     let wd = watchdog::Watchdog::new();
     wd.register("signaling", std::time::Duration::from_secs(90), false);
+    // Multi-org P1: one pump per secondary org loop, so one org's healthy
+    // ticks can't mask another org's stalled loop.
+    for ((org, problem), org_ctx) in org_partition.iter().zip(org_ctxs.iter()) {
+        if org.enabled && problem.is_none() {
+            wd.register(org_ctx.pump, std::time::Duration::from_secs(90), false);
+        }
+    }
     wd.register("encoder", std::time::Duration::from_secs(30), false);
     wd.register("capture", std::time::Duration::from_secs(30), false);
     let _ = watchdog::install(wd.clone());
@@ -1797,6 +2085,54 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         cfg.tunnel_routes.clone(),
     );
     route_reconciler.spawn(shutdown_rx.clone());
+    // Multi-org P1 — the primary loop's context + the per-enrollment status
+    // registry `NodeStatus.orgs` reads. Secondary handles (connected flag /
+    // terminal-error slot / OrgCtx) are minted here so the registry rows and
+    // the spawned supervisors share the SAME instances.
+    let primary_ctx = signaling::OrgCtx::primary();
+    let mut org_spawns: Vec<OrgSpawn> = Vec::new();
+    let org_registry: localapi_state::OrgStatusRegistry = {
+        let mut rows = vec![localapi_state::OrgRuntime {
+            label: config::PRIMARY_ORG_LABEL.to_string(),
+            server_url: cfg.server_url.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            agent_id: cfg.agent_id.clone(),
+            primary: true,
+            enabled: true,
+            connected: localapi_connected.clone(),
+            terminal_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            updates_ignored: primary_ctx.updates_ignored.clone(),
+        }];
+        for ((org, problem), org_ctx) in org_partition.iter().zip(org_ctxs.iter()) {
+            let org_ctx = org_ctx.clone();
+            let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let terminal = std::sync::Arc::new(std::sync::Mutex::new(problem.clone()));
+            rows.push(localapi_state::OrgRuntime {
+                label: org.label.clone(),
+                server_url: org.server_url.clone(),
+                tenant_id: org.tenant_id.clone(),
+                agent_id: org.agent_id.clone(),
+                primary: false,
+                enabled: org.enabled,
+                connected: connected.clone(),
+                terminal_error: terminal.clone(),
+                updates_ignored: org_ctx.updates_ignored.clone(),
+            });
+            if org.enabled && problem.is_none() {
+                org_spawns.push((org.clone(), org_ctx, connected, terminal));
+            } else if let Some(p) = problem {
+                tracing::warn!(org = %org.label, problem = %p, "skipping invalid [[orgs]] entry");
+            }
+        }
+        if !org_spawns.is_empty() {
+            tracing::info!(
+                secondary_orgs = org_spawns.len(),
+                "multi-org: spawning one signaling loop per enabled secondary enrollment"
+            );
+        }
+        std::sync::Arc::new(std::sync::Mutex::new(rows))
+    };
+
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(
             localapi_state::DaemonState::new(
@@ -1814,7 +2150,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             .with_routes(route_reconciler)
             // The rename verb persists through the daemon's own resolved
             // config path + the P6 write lock (profile-correct under SYSTEM).
-            .with_config_persist(config_path.clone(), cfg_write_lock.clone()),
+            .with_config_persist(config_path.clone(), cfg_write_lock.clone())
+            // Multi-org P1 — live per-enrollment rows for `roomler status`.
+            .with_orgs(org_registry.clone()),
         );
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
     // RTT_PROBE_INTERVAL into rtt_cache; exits on shutdown. A fresh
@@ -1866,6 +2204,55 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         shutdown_rx.clone(),
     );
 
+    // Multi-org P1 — one supervised signaling loop per enabled secondary
+    // org, spawned BEFORE the primary task consumes `cfg` and the broker.
+    // Each gets: a synthesized per-org config (overlay forced OFF in P1),
+    // its own connected flag + watchdog pump, an inert overlay-view channel
+    // + RTT slot, and an ISOLATED tunnel-client hub (daemon-originated
+    // flows stay primary-only in P1 — see the route reconciler's org gate).
+    // A terminal stop (server goodbye / duplicate duel) ends only that
+    // org's task and is recorded for `NodeStatus.orgs`.
+    let mut org_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    for (org, org_ctx, org_connected, org_terminal) in org_spawns {
+        let org_cfg = cfg.for_org(&org);
+        let (org_view_tx, _org_view_rx) =
+            tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+        let org_slot: signaling::RttSampleSlot = Default::default();
+        let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        let rx = shutdown_rx.clone();
+        let broker = consent_broker.clone();
+        let span = tracing::info_span!("org", label = %org.label);
+        org_tasks.push(tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                match signaling::run(
+                    org_ctx,
+                    org_cfg,
+                    encoder_preference,
+                    rx,
+                    org_connected,
+                    org_view_tx,
+                    org_slot,
+                    broker,
+                    org_hub,
+                )
+                .await
+                {
+                    Ok(()) => tracing::info!("org signaling loop ended (shutdown)"),
+                    Err(e) => {
+                        let chain = format!("{e:#}");
+                        tracing::error!(error = %chain, "org signaling loop terminated");
+                        if let Ok(mut t) = org_terminal.lock() {
+                            *t = Some(chain);
+                        }
+                    }
+                }
+            },
+            span,
+        )));
+    }
+
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
         let connected = localapi_connected.clone();
@@ -1873,6 +2260,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let sample_slot = rtt_sample_slot.clone();
         async move {
             signaling::run(
+                primary_ctx,
                 cfg,
                 encoder_preference,
                 rx,
@@ -1991,6 +2379,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     clean_run_task.abort();
     crash_drain_task.abort();
     localapi_task.abort();
+    // Multi-org P1 — the secondary org loops observe the same shutdown
+    // watch; the abort is belt-and-suspenders for loops mid-backoff.
+    for t in org_tasks {
+        t.abort();
+    }
     if let Some(t) = upd_task {
         t.abort();
     }
