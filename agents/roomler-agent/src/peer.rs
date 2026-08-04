@@ -876,7 +876,22 @@ impl AgentPeer {
             let control_stash = control_dc_for_callback.clone();
             let lock_state_rx_for_input = lock_state_rx_for_dc.clone();
             Box::pin(async move {
+                use roomler_ai_remote_control::permissions::Permissions;
                 match label.as_str() {
+                    // Multi-user P3 — the session's INPUT grant is enforced
+                    // HERE, mirroring the clipboard gate below (previously the
+                    // input DC injected unconditionally, so a view-only grant
+                    // was decorative). The server's single-INPUT-holder rule
+                    // strips INPUT from a 2nd concurrent session; without this
+                    // gate that stripping would be advisory.
+                    "input" if !permissions.contains(Permissions::INPUT) => {
+                        info!(
+                            session = %session_id,
+                            "input DC attached in DROP-ONLY mode — session lacks INPUT \
+                             permission (view-effective)"
+                        );
+                        attach_log_only(dc, session_id);
+                    }
                     "input" => attach_input_handler(dc, lock_state_rx_for_input),
                     "control" => {
                         // Stash a clone for the lock-state emitter
@@ -904,6 +919,13 @@ impl AgentPeer {
                     ),
                     #[cfg(feature = "clipboard")]
                     "clipboard" => attach_clipboard_handler(dc, session_id, permissions),
+                    // Multi-user P3 — same enforcement for FILES. New viewers
+                    // request the FILES bit by default; a session narrowed to
+                    // view-effective gets explicit errors instead of silent
+                    // transfers.
+                    "files" if !permissions.contains(Permissions::FILES) => {
+                        attach_files_denied(dc, session_id)
+                    }
                     "files" => attach_files_handler(dc, session_id),
                     "video-bytes" => {
                         // Phase Y.3 stash. The media pump (when caps
@@ -1775,6 +1797,9 @@ async fn media_pump(
         "media pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
+    // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
+    // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
+    let mut reopen_backoff = capture::ReopenBackoff::new();
     let mut encoder: Option<Box<dyn encode::VideoEncoder>> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
     // One-shot guard for the SW-HEVC-at-high-res auto-downscale
@@ -1905,10 +1930,13 @@ async fn media_pump(
                 // These used to kill the pump, leaving the data channels
                 // alive (mouse/keyboard still worked) but video frozen
                 // forever until session reconnect. Rebuild the capturer
-                // and the encoder, keep the pump running. 500ms backoff
-                // so a genuine infinite error loop doesn't spin a core.
+                // and the encoder, keep the pump running. P3: bounded
+                // exponential backoff (500 ms → 10 s on consecutive
+                // failures) — a PERSISTENT denial (DDA app limit with N
+                // concurrent sessions) must not re-run the open cascade
+                // twice a second forever.
                 warn!(%session_id, %e, "capture error — rebuilding capturer");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(reopen_backoff.delay()).await;
                 capturer = capture::open_default(target_fps, downscale);
                 // Force the encoder to rebuild on the next frame — new
                 // capturer may come back at a different resolution (e.g.
@@ -2444,6 +2472,9 @@ async fn media_pump_vp9_444_dc(
         "VP9-444 DC pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
+    // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
+    // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
+    let mut reopen_backoff = capture::ReopenBackoff::new();
     let mut encoder: Option<Vp9Encoder> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
     let mut last_capture_at = std::time::Instant::now();
@@ -2835,8 +2866,9 @@ async fn media_pump_vp9_444_dc(
                 }
             }
             Err(e) => {
+                // P3 — bounded backoff, same rationale as the track pump.
                 warn!(%session_id, %e, "VP9-444 capture error — rebuilding capturer");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(reopen_backoff.delay()).await;
                 capturer = capture::open_default(target_fps, downscale);
                 encoder = None;
                 encoder_dims = None;
@@ -3584,6 +3616,9 @@ async fn media_pump_ffmpeg_dc(
         "FFmpeg DC pump starting"
     );
     let mut capturer = capture::open_default(target_fps, downscale);
+    // P3 — bounded reopen backoff for the capture-error arm (500 ms → 10 s
+    // on consecutive failures; quiet spell resets). See `ReopenBackoff`.
+    let mut reopen_backoff = capture::ReopenBackoff::new();
     let mut encoder: Option<FfmpegEncoder> = None;
     let mut encoder_dims: Option<(u32, u32)> = None;
     // rc.93 — single keepalive clock, mirroring `media_pump`. The rc.92
@@ -3991,7 +4026,14 @@ async fn media_pump_ffmpeg_dc(
                 }
             }
             Err(e) => {
-                tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error");
+                // P3 — this arm used to bare-`continue`: a DEAD capturer
+                // (mode change mid-frame, DDA seat lost to another session)
+                // busy-spun the loop at full speed logging once per
+                // iteration, and never recovered. Reopen like the other
+                // pumps, under the same bounded backoff.
+                tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: capture error — rebuilding capturer");
+                tokio::time::sleep(reopen_backoff.delay()).await;
+                capturer = capture::open_default(target_fps, downscale);
                 continue;
             }
         };
@@ -4716,10 +4758,18 @@ fn attach_control_handler(
     // CDS_FULLSCREEN temporary-change semantics additionally auto-restore
     // if the agent PROCESS dies, so every exit path is covered. No-op when
     // display-match never switched anything.
+    //
+    // Multi-user P3: ownership-gated — only the session that APPLIED the
+    // current mode restores it (a closing watcher tab must not revert the
+    // driving session's mode).
     dc.on_close(Box::new(move || {
         Box::pin(async move {
             // Detach — restore is fire-and-forget (JoinHandle drop is fine).
-            drop(tokio::task::spawn_blocking(crate::display_match::restore));
+            drop(tokio::task::spawn_blocking(move || {
+                if crate::display_match::restore_for(session_id) {
+                    tracing::info!(session = %session_id, "display-match: restored on session close (owner)");
+                }
+            }));
         })
     }));
     dc.on_message(Box::new(move |msg| {
@@ -4959,15 +5009,24 @@ fn attach_control_handler(
                     let h = val.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                     tokio::task::spawn_blocking(move || {
                         if !enable {
-                            crate::display_match::restore();
-                            tracing::info!("display-match: restored original mode");
+                            // P3: only the owning session's toggle-off
+                            // restores; a non-owner disabling its OWN match
+                            // preference must not revert the mode another
+                            // session applied.
+                            if crate::display_match::restore_for(session_id) {
+                                tracing::info!("display-match: restored original mode");
+                            } else {
+                                tracing::debug!(
+                                    "display-match: disable from non-owner session — no-op"
+                                );
+                            }
                             return;
                         }
                         if w == 0 || h == 0 {
                             tracing::debug!("display-match: missing width/height — ignored");
                             return;
                         }
-                        match crate::display_match::apply(w, h) {
+                        match crate::display_match::apply_for(session_id, w, h) {
                             Ok((mw, mh)) => tracing::info!(
                                 req_w = w,
                                 req_h = h,
@@ -5774,17 +5833,29 @@ fn attach_clipboard_handler(
     let img_tx_lock = Arc::new(tokio::sync::Mutex::new(()));
     let watch_task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // Multi-user P3 — THIS session's subscription token on the shared
+    // clipboard worker. Tearing down by token removes only OUR feed (the
+    // pre-P3 global Unwatch killed every session's).
+    let watch_token: Arc<std::sync::Mutex<Option<u64>>> = Arc::new(std::sync::Mutex::new(None));
 
     // DC close → tear down the watcher + forwarder so the arboard
     // worker stops ticking and the task doesn't outlive the session.
     {
         let cb = cb.clone();
         let watch_task = watch_task.clone();
+        let watch_token = watch_token.clone();
         dc.on_close(Box::new(move || {
             let cb = cb.clone();
             let watch_task = watch_task.clone();
+            let watch_token = watch_token.clone();
             Box::pin(async move {
-                cb.unwatch();
+                if let Some(id) = watch_token
+                    .lock()
+                    .expect("clipboard watch_token poisoned")
+                    .take()
+                {
+                    cb.unwatch(id);
+                }
                 let old = watch_task
                     .lock()
                     .expect("clipboard watch_task poisoned")
@@ -5804,6 +5875,7 @@ fn attach_clipboard_handler(
         let rich_rx = rich_rx.clone();
         let img_tx_lock = img_tx_lock.clone();
         let watch_task = watch_task.clone();
+        let watch_token = watch_token.clone();
         Box::pin(async move {
             // v2 — binary frames are PNG chunks for the in-flight
             // browser → agent image transfer (announced by a preceding
@@ -6078,7 +6150,7 @@ fn attach_clipboard_handler(
                     let want_native = events.iter().any(|e| e == "native");
                     let (tx, mut rx) =
                         tokio::sync::mpsc::channel::<crate::clipboard::ClipboardChange>(4);
-                    if let Err(e) = cb.watch(
+                    let token = match cb.watch(
                         crate::clipboard::WatchEvents {
                             text: want_text,
                             image: want_image,
@@ -6087,8 +6159,21 @@ fn attach_clipboard_handler(
                         },
                         tx,
                     ) {
-                        warn!(%session_id, %e, "clipboard: subscribe failed (worker gone)");
-                        return;
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(%session_id, %e, "clipboard: subscribe failed (worker gone)");
+                            return;
+                        }
+                    };
+                    // A re-subscribe within THIS session replaces only its
+                    // own prior subscription (other sessions' feeds are
+                    // untouched — the P3 multi-subscriber registry).
+                    if let Some(old) = watch_token
+                        .lock()
+                        .expect("clipboard watch_token poisoned")
+                        .replace(token)
+                    {
+                        cb.unwatch(old);
                     }
                     info!(%session_id, text = want_text, image = want_image, html = want_html, native = want_native, "clipboard: change subscription installed");
                     let dc_for_events = dc.clone();
@@ -6149,7 +6234,13 @@ fn attach_clipboard_handler(
                     }
                 }
                 crate::clipboard::ClipboardIncoming::Unsubscribe => {
-                    cb.unwatch();
+                    if let Some(id) = watch_token
+                        .lock()
+                        .expect("clipboard watch_token poisoned")
+                        .take()
+                    {
+                        cb.unwatch(id);
+                    }
                     let old = watch_task
                         .lock()
                         .expect("clipboard watch_task poisoned")
@@ -6567,6 +6658,40 @@ async fn send_clipboard_image(
 /// dispatcher to a loopback DC and lock the wire format end-to-end.
 /// The dispatcher itself stays private (free fns below) — only the
 /// wiring entry point is needed across crates.
+/// Multi-user P3 — the FILES-denied handler: every control frame gets an
+/// explicit `files:error` (addressed by the frame's own `id` when present, so
+/// the browser's per-transfer waiter rejects instead of timing out) and
+/// binary chunks are dropped. Mirrors the clipboard gate's reject-don't-serve
+/// posture; installed when the session's grant lacks `Permissions::FILES`.
+pub fn attach_files_denied(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
+    info!(
+        session = %session_id,
+        "files DC attached in DENY mode — session lacks FILES permission"
+    );
+    let dc_for_handler = dc.clone();
+    dc.on_message(Box::new(move |msg| {
+        let dc = dc_for_handler.clone();
+        Box::pin(async move {
+            if !msg.is_string {
+                return; // chunk for a transfer that was never accepted
+            }
+            let id = std::str::from_utf8(&msg.data)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            send_files_json(
+                &dc,
+                &crate::files::FilesOutgoing::Error {
+                    id: &id,
+                    message: "FILES permission not granted for this session",
+                },
+            )
+            .await;
+        })
+    }));
+}
+
 pub fn attach_files_handler(dc: Arc<RTCDataChannel>, session_id: bson::oid::ObjectId) {
     let handler = crate::files::FilesHandler::new();
     let dc_for_handler = dc.clone();
