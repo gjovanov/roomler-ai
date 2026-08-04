@@ -44,6 +44,14 @@ pub struct LiveSession {
     /// to the REMOTE agent's ICE servers. `None` for every session that didn't
     /// forward one (the default). See [`LocalRelayDescriptor`].
     pub local_relay: Option<LocalRelayDescriptor>,
+
+    /// Multi-region relay: the region FROZEN at session create (load-aware
+    /// pick over the agent's home + RTT-ordered prefs). Frozen so all three
+    /// per-session issuance pushes (Ready / SdpOffer / SdpAnswer) carry the
+    /// SAME region even if the agent's home or a busy flag flips mid-setup —
+    /// a split would put the two ICE ends on different PoPs. `None` = the
+    /// default region.
+    pub relay_region: Option<String>,
 }
 
 impl LiveSession {
@@ -70,6 +78,7 @@ impl LiveSession {
             watchers: HashMap::new(),
             controller_tx: Some(controller_tx),
             local_relay: None,
+            relay_region: None,
         };
         (s, waiter)
     }
