@@ -562,12 +562,18 @@ async fn kick_ctrl_event_applies_cross_pod() {
 /// session that black-holes at forward time), and the idle target gets
 /// nudged. The CLI driver bails on open-errors and its reconnect loop
 /// dials a fresh WS — the redial-retry is structurally free client-side.
+/// PR-1: the origin dials KEYED (like every rc.29x+ agent/CLI build) and
+/// the guard band is zeroed — the direction rule only nudges for a
+/// keyed, provably-newer originator.
 #[tokio::test]
 async fn tunnel_open_rehome_cross_pod() {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    let (app1, app2) = TestApp::spawn_pair(|s| {
+        s.rc.rehome_direction_guard_ms = 0;
+    })
+    .await;
     if app1.state.cluster_bus.is_none() {
         eprintln!("skipping: no Redis available");
         return;
@@ -590,7 +596,9 @@ async fn tunnel_open_rehome_cross_pod() {
     let mut b_ws = crate::tunnel_tests::connect_agent_ws(&app1, &b_tok, "target-B").await;
     let (_a_id, a_tok) =
         crate::tunnel_tests::enroll_agent(&app2, &seeded, "mach-trehome-A", "origin-A").await;
-    let mut a_ws = crate::tunnel_tests::connect_agent_ws(&app2, &a_tok, "origin-A").await;
+    let mut a_ws =
+        crate::tunnel_tests::connect_agent_ws_keyed(&app2, &a_tok, "origin-A", &seeded.tenant_id)
+            .await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     a_ws.send(Message::Text(
