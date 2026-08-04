@@ -709,6 +709,13 @@ pub enum ServerMsg {
         session_id: ObjectId,
         #[serde(with = "oid_hex")]
         agent_id: ObjectId,
+        /// Multi-user P3 — the EFFECTIVE permission grant, which may be
+        /// narrower than requested (the single-INPUT-holder rule strips
+        /// INPUT while another live session on the agent holds it). Additive:
+        /// `None` from a pre-P3 server means "as requested" (the legacy
+        /// contract); serde-default so old viewers ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permissions: Option<crate::permissions::Permissions>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -1535,6 +1542,7 @@ mod tests {
         let created = ServerMsg::SessionCreated {
             session_id,
             agent_id,
+            permissions: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(

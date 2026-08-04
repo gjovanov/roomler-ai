@@ -208,6 +208,68 @@ pub fn restore() {
     win::restore();
 }
 
+// ── Multi-user P3: per-session ownership ────────────────────────────────────
+//
+// The host display mode is GLOBAL, but with N concurrent sessions the
+// restore must not be: pre-P3, ANY session's control-DC close (or explicit
+// `{enable:false}`) called `restore()` — a watcher tab closing reverted the
+// mode the driving session was actively using. The owner slot records WHICH
+// session last applied a mode; only that session's disable/close restores
+// (a new apply by another session is a takeover — last request wins, same
+// as the underlying `rc:display-match` semantics). The CDS_FULLSCREEN
+// process-exit auto-restore is untouched.
+
+static DM_OWNER: std::sync::Mutex<Option<bson::oid::ObjectId>> = std::sync::Mutex::new(None);
+
+/// [`apply`] with ownership: on success the session becomes the owner.
+pub fn apply_for(
+    session: bson::oid::ObjectId,
+    req_w: u32,
+    req_h: u32,
+) -> Result<(u32, u32), String> {
+    let picked = apply(req_w, req_h)?;
+    *DM_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
+    Ok(picked)
+}
+
+/// [`restore`] gated on ownership: restores (and clears the owner) only when
+/// `session` is the current owner. `true` when a restore actually ran.
+pub fn restore_for(session: bson::oid::ObjectId) -> bool {
+    let mut owner = DM_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+    if *owner == Some(session) {
+        *owner = None;
+        drop(owner);
+        restore();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    /// P3 — the owner slot: apply_for records the owner; only the owner's
+    /// restore_for runs (and clears the slot); a takeover moves ownership.
+    /// Off-Windows `apply` errs, so drive the slot directly where needed.
+    #[test]
+    fn restore_is_owner_gated_and_takeover_moves_ownership() {
+        let a = bson::oid::ObjectId::new();
+        let b = bson::oid::ObjectId::new();
+        // Seed ownership as a successful apply_for(a) would.
+        *DM_OWNER.lock().unwrap() = Some(a);
+        assert!(!restore_for(b), "non-owner must not restore");
+        assert_eq!(*DM_OWNER.lock().unwrap(), Some(a), "owner unchanged");
+        // Takeover: B applies (simulate the post-apply ownership write).
+        *DM_OWNER.lock().unwrap() = Some(b);
+        assert!(!restore_for(a), "displaced owner must not restore");
+        assert!(restore_for(b), "current owner restores");
+        assert_eq!(*DM_OWNER.lock().unwrap(), None, "slot cleared");
+        assert!(!restore_for(b), "idempotent once cleared");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::pick_display_mode;
