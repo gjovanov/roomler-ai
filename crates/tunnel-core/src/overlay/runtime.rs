@@ -79,8 +79,12 @@ use super::path;
 struct PathShadow {
     mode: path::PathMonMode,
     /// B2 — score-driven demotion engagement (off | shadow | on;
-    /// first-ship default: shadow — computed + counted, never executed).
+    /// default ON since the clean rc.296 shadow soak).
     demote: path::DemoteMode,
+    /// B3 — mid-tier upward probing (`OVERLAY_UPWARD_PROBE`, default
+    /// on): srflx/public incumbents probe an eligible higher tier every
+    /// ≥120 s via the same MBB machinery.
+    upward: bool,
     mon: path::PathMonitor,
     stats: path::ShadowStats,
     /// Per-peer divergence-warn rate limit (1/min/peer).
@@ -124,13 +128,16 @@ impl PathShadow {
             );
         }
         let demote = path::DemoteMode::parse(crate::env::node_env("OVERLAY_DEMOTE").as_deref());
+        let upward = crate::env::flag("OVERLAY_UPWARD_PROBE", true);
         info!(
             demote = demote.as_str(),
-            "overlay pathmon: score-driven demotion armed (B2; shadow = counted only)"
+            upward,
+            "overlay pathmon: voluntary moves armed (B2 demotion; B3 mid-tier upward probing)"
         );
         Self {
             mode,
             demote,
+            upward,
             mon: path::PathMonitor::default(),
             stats: path::ShadowStats::default(),
             last_div_log: HashMap::new(),
