@@ -853,7 +853,7 @@ async fn handle_media_join(
         // fallbacks. Also emit `turn:HOST:443?transport=udp` because many
         // corporate firewalls allow UDP/443 (QUIC) but block UDP/3478.
         let urls = roomler_ai_remote_control::turn_url::expand_turn_url(
-            &url,
+            url,
             &roomler_ai_remote_control::turn_url::VariantCaps::media(),
         );
         vec![serde_json::json!({
