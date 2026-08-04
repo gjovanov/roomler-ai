@@ -6,6 +6,9 @@ import { useMessageStore } from './messages'
 import { useNotificationStore } from './notification'
 import { useTaskStore } from './tasks'
 import { useConferenceStore } from './conference'
+import { useTenantStore } from './tenant'
+import { useOrgBadgesStore } from './orgBadges'
+import { useAgentStore } from './agents'
 
 type WsStatus = 'disconnected' | 'connecting' | 'connected'
 
@@ -184,19 +187,25 @@ export const useWsStore = defineStore('ws', () => {
 
     switch (msg.type) {
       case 'message:create': {
+        const msgData = msg.data as { room_id?: string; author_id?: string; tenant_id?: string }
+        const selfId = useAuthStore().user?.id
+        const isOwn = !!selfId && msgData.author_id === selfId
+        // P4 — cross-org routing: an event for an org this UI is NOT showing
+        // feeds the org-switcher badge store. Pre-P4 it fell through into the
+        // ACTIVE org's stores, inflating totalUnread with phantom room keys
+        // the sidebar could never render or navigate to.
+        const activeTid = useTenantStore().current?.id
+        if (msgData.tenant_id && activeTid && msgData.tenant_id !== activeTid) {
+          if (!isOwn) useOrgBadgesStore().noteForeignMessage(msgData.tenant_id)
+          break
+        }
         messageStore.addMessageFromWs(msg.data as never)
         // Increment unread count if user is not viewing this room — but
         // NEVER for the user's own messages: since 2026-08-04 the server
         // broadcasts to ALL members including the sender (so their other
         // browsers get realtime), and a self-echo must not inflate badges.
-        const msgData = msg.data as { room_id?: string; author_id?: string }
-        const selfId = useAuthStore().user?.id
-        const isOwn = !!selfId && msgData.author_id === selfId
-        if (msgData.room_id && !isOwn) {
-          const roomStore = useRoomStore()
-          if (roomStore.current?.id !== msgData.room_id) {
-            roomStore.incrementUnread(msgData.room_id)
-          }
+        if (msgData.room_id && !isOwn && roomStore.current?.id !== msgData.room_id) {
+          roomStore.incrementUnread(msgData.room_id)
         }
         break
       }
@@ -212,12 +221,37 @@ export const useWsStore = defineStore('ws', () => {
       case 'task:update':
         taskStore.updateFromWs(msg.data as never)
         break
-      case 'notification:new':
+      case 'notification:new': {
+        // The bell is user-scoped (cross-org), so the row always lands there;
+        // a non-active-org notification ADDITIONALLY bumps that org's badge.
         notificationStore.addFromWs(msg.data as never)
+        const nData = msg.data as { tenant_id?: string; notification_type?: string }
+        const activeNotifTid = useTenantStore().current?.id
+        if (nData.tenant_id && activeNotifTid && nData.tenant_id !== activeNotifTid) {
+          useOrgBadgesStore().noteForeignNotification(nData.tenant_id, nData.notification_type)
+        }
         break
+      }
       case 'notification:unread_count': {
         const ncData = msg.data as { count: number }
         notificationStore.setUnreadCount(ncData.count)
+        break
+      }
+      case 'device:presence': {
+        // P4 — realtime device transitions. Active org → patch the agents
+        // store in place; any other org → attention marker on its switcher
+        // row. Replaces most of the 30 s presence poll (a slow poll stays
+        // as belt).
+        const dp = msg.data as {
+          tenant_id?: string
+          agents?: Array<{ agent_id: string; name: string; presence: 'online' | 'stale' | 'offline' }>
+        }
+        if (!dp.tenant_id || !dp.agents?.length) break
+        if (dp.tenant_id === useTenantStore().current?.id) {
+          useAgentStore().applyPresence(dp.agents)
+        } else {
+          useOrgBadgesStore().noteDevicePresence(dp.tenant_id, dp.agents)
+        }
         break
       }
       case 'room:call_started': {
