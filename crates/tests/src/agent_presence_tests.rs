@@ -419,9 +419,17 @@ async fn rehome_teardown_does_not_announce_offline() {
     let _ = ws_old.close(None).await;
 
     // No offline may arrive: the ledger stayed "online" throughout, and the
-    // old teardown saw pod 2's foreign claim. (Bounded negative wait.)
-    let quiet = tokio::time::timeout(std::time::Duration::from_millis(1200), user_ws.next()).await;
-    if let Ok(Some(Ok(msg))) = quiet {
+    // old teardown saw pod 2's foreign claim. Drain the WHOLE quiet window —
+    // one unrelated frame must not mask a late wrongful offline behind it.
+    let quiet_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1200);
+    loop {
+        let remaining = quiet_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(Some(Ok(msg))) = tokio::time::timeout(remaining, user_ws.next()).await else {
+            break;
+        };
         let v: Value = serde_json::from_str(msg.to_text().unwrap_or_default()).unwrap_or_default();
         assert_ne!(
             (
