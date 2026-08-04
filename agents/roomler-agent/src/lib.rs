@@ -47,6 +47,7 @@ pub mod peer;
 pub mod post_install;
 pub mod preflight;
 pub mod rc_local_turn;
+pub mod relay_probe;
 pub mod service;
 pub mod signaling;
 pub mod subnet_detect;
