@@ -852,15 +852,10 @@ async fn handle_media_join(
         // UDP TURN often fails behind NAT/firewalls, so include TCP and TLS
         // fallbacks. Also emit `turn:HOST:443?transport=udp` because many
         // corporate firewalls allow UDP/443 (QUIC) but block UDP/3478.
-        let mut urls: Vec<String> = vec![url.clone()];
-        if url.starts_with("turn:") && !url.contains("?transport=") {
-            let turn_443 = url.replace(":3478", ":443");
-            urls.push(format!("{}?transport=udp", turn_443));
-            urls.push(format!("{}?transport=tcp", url));
-            // Derive TURNS (TLS) URL on port 5349
-            let turns_url = url.replacen("turn:", "turns:", 1).replace(":3478", ":5349");
-            urls.push(format!("{}?transport=tcp", turns_url));
-        }
+        let urls = roomler_ai_remote_control::turn_url::expand_turn_url(
+            url,
+            &roomler_ai_remote_control::turn_url::VariantCaps::media(),
+        );
         vec![serde_json::json!({
             "urls": urls,
             "username": turn_username,

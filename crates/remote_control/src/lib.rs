@@ -12,6 +12,7 @@
 //! - [`consent`]     — controller-requested-control consent flow
 //! - [`permissions`] — per-session capability bitfield (input, clipboard, files, audio)
 //! - [`turn_creds`]  — short-lived TURN credentials (HMAC over coturn shared secret)
+//! - [`turn_url`]    — port-correct TURN URL parsing + transport-variant expansion
 //! - [`audit`]       — write-side of the remote_audit collection
 //! - [`models`]      — Mongo-backed entities (Agent, RemoteSession, RemoteAuditEvent)
 //! - [`error`]       — unified error type
@@ -30,6 +31,7 @@ pub mod serde_helpers;
 pub mod session;
 pub mod signaling;
 pub mod turn_creds;
+pub mod turn_url;
 pub mod worker_pick;
 
 pub use error::{Error, Result};
