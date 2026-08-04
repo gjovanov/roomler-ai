@@ -1119,17 +1119,55 @@ impl OverlayNetwork {
     pub fn host_of_ip(&self, ip: &str) -> Option<u32> {
         overlay_host(&self.cidr, ip)
     }
+
+    /// Multi-org P2a — the highest host ordinal this network's CIDR can
+    /// lease. See [`cidr_max_host`]; `0` (nothing leasable) on a malformed
+    /// CIDR so a bad row FAILS CLOSED at allocation instead of handing out
+    /// unbounded addresses.
+    pub fn max_host(&self) -> u32 {
+        cidr_max_host(&self.cidr).unwrap_or(0)
+    }
+}
+
+/// Multi-org P2a — the highest leaseable host ordinal for `cidr`:
+/// `2^(32-prefix) - 2` (host 0 is the network address, the block's last
+/// address is reserved by convention), `None` for a malformed CIDR or a
+/// prefix ≥ 31 (no leasable hosts either way).
+///
+/// The forward-compat point: `allocate_host`'s cursor previously grew
+/// UNBOUNDED — under tenant-block addressing (P2b hands tenants sub-blocks
+/// of `100.64.0.0/10`, e.g. a `/22`) a busy tenant's cursor would have
+/// silently walked into the NEIGHBOR tenant's block: the exact cross-tenant
+/// address collision the blocks exist to kill. Every allocation is now
+/// bounded by the network's OWN CIDR — behaviour-neutral for today's
+/// `/10` tenants (max host 4 194 302, unreachable), binding the moment a
+/// tenant's `cidr` becomes a real block.
+pub fn cidr_max_host(cidr: &str) -> Option<u32> {
+    let (_base, prefix) = cidr.split_once('/')?;
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix >= 31 {
+        return None;
+    }
+    // 2^(32-prefix) - 2; prefix 0 would overflow the shift — cap at /1.
+    let size: u64 = 1u64 << (32 - prefix.min(31) as u64);
+    u32::try_from(size - 2).ok()
 }
 
 /// `base_cidr` + host number → dotted overlay IP. e.g.
 /// `("100.64.0.0/10", 7) → "100.64.0.7"`. No `ipnet` needed — the host
 /// number is added to the network base address as a `u32`.
 ///
-/// The PREFIX IS DISCARDED: the host is added to whatever address is written
-/// on the left of the `/`, not to the masked network address. [`overlay_host`]
-/// inverts this by parsing the same way, and the round-trip test in this module
-/// pins the pair together — do not "fix" one to mask without the other.
+/// The base is taken from the LEFT of the `/` (not the masked network
+/// address). [`overlay_host`] inverts this by parsing the same way, and the
+/// round-trip test in this module pins the pair together — do not "fix" one
+/// to mask without the other.
+///
+/// Multi-org P2a: `host` is bounded by [`cidr_max_host`] — a host past the
+/// block renders `None` instead of an address in the NEIGHBOR block.
 pub fn overlay_ip(cidr: &str, host: u32) -> Option<String> {
+    if host > cidr_max_host(cidr)? {
+        return None;
+    }
     let (base, _prefix) = cidr.split_once('/')?;
     let base: std::net::Ipv4Addr = base.parse().ok()?;
     let addr = std::net::Ipv4Addr::from(u32::from(base).checked_add(host)?);
@@ -1140,14 +1178,19 @@ pub fn overlay_ip(cidr: &str, host: u32) -> Option<String> {
 /// address was leased from, so a removed device's number can be returned to the
 /// network's free pool.
 ///
-/// `None` when `cidr`/`ip` are malformed, or when `ip` sorts BELOW the base:
-/// that is how a row leased under a DIFFERENT, since-changed CIDR is rejected
-/// instead of poisoning the pool with a bogus host number.
+/// `None` when `cidr`/`ip` are malformed, when `ip` sorts BELOW the base, or
+/// (multi-org P2a) ABOVE the block's last leaseable host: both directions are
+/// how a row leased under a DIFFERENT, since-changed CIDR is rejected instead
+/// of poisoning the pool with a bogus host number.
 pub fn overlay_host(cidr: &str, ip: &str) -> Option<u32> {
     let (base, _prefix) = cidr.split_once('/')?;
     let base: std::net::Ipv4Addr = base.parse().ok()?;
     let addr: std::net::Ipv4Addr = ip.parse().ok()?;
-    u32::from(addr).checked_sub(u32::from(base))
+    let host = u32::from(addr).checked_sub(u32::from(base))?;
+    if host > cidr_max_host(cidr)? {
+        return None;
+    }
+    Some(host)
 }
 
 #[cfg(test)]
@@ -1161,6 +1204,36 @@ mod tests {
         assert_eq!(overlay_ip(cidr, 7).as_deref(), Some("100.64.0.7"));
         assert_eq!(overlay_ip(cidr, 256).as_deref(), Some("100.64.1.0"));
         assert_eq!(overlay_ip("not-a-cidr", 1), None);
+    }
+
+    #[test]
+    fn cidr_bounds_cap_host_ordinals_to_the_block() {
+        // Multi-org P2a — the whole reason blocks can't bleed: /22 = 1024
+        // addresses ⇒ hosts 1..=1022 leaseable.
+        assert_eq!(cidr_max_host("100.68.12.0/22"), Some(1022));
+        assert_eq!(cidr_max_host("100.64.0.0/10"), Some((1 << 22) - 2));
+        assert_eq!(cidr_max_host("100.64.0.0/30"), Some(2));
+        assert_eq!(cidr_max_host("100.64.0.0/31"), None, "no leasable hosts");
+        assert_eq!(cidr_max_host("100.64.0.0/32"), None);
+        assert_eq!(cidr_max_host("garbage"), None);
+
+        // overlay_ip refuses to render past the block…
+        assert_eq!(
+            overlay_ip("100.68.12.0/22", 1022).as_deref(),
+            Some("100.68.15.254")
+        );
+        assert_eq!(
+            overlay_ip("100.68.12.0/22", 1023),
+            None,
+            "block's last address"
+        );
+        assert_eq!(overlay_ip("100.68.12.0/22", 1024), None, "neighbor block");
+        // …and overlay_host rejects an address above it (a row leased under a
+        // since-shrunk CIDR must not poison the pool).
+        assert_eq!(overlay_host("100.68.12.0/22", "100.68.15.254"), Some(1022));
+        assert_eq!(overlay_host("100.68.12.0/22", "100.68.16.1"), None);
+        // The below-base rejection is unchanged.
+        assert_eq!(overlay_host("100.68.12.0/22", "100.68.11.9"), None);
     }
 
     #[test]
