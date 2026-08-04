@@ -570,6 +570,7 @@ async fn handle_overlay_relay_request(
         // entry so every repush during this pin reuses it. `None` = central.
         let derp_url = sticky_pair_region(
             &state.turn_map,
+            &state.relay_load,
             &pair_key,
             self_node.relay_home.as_deref(),
             peer.relay_home.as_deref(),
@@ -1550,7 +1551,7 @@ async fn overlay_ice_servers(
     home_a: Option<&str>,
     home_b: Option<&str>,
 ) -> Vec<IceServer> {
-    let region = sticky_pair_region(&state.turn_map, pair_key, home_a, home_b);
+    let region = sticky_pair_region(&state.turn_map, &state.relay_load, pair_key, home_a, home_b);
     if region.is_some() {
         crate::cluster::metrics::bump(&crate::cluster::metrics::RELAY_REGION_PICK_TOTAL);
     }
@@ -1713,6 +1714,7 @@ static PAIR_REGION_CACHE: Mutex<Option<PairRegions>> = Mutex::new(None);
 
 fn sticky_pair_region(
     map: &roomler_ai_remote_control::turn_creds::TurnMap,
+    load: &roomler_ai_remote_control::turn_creds::RelayLoadMap,
     pair_key: &str,
     home_a: Option<&str>,
     home_b: Option<&str>,
@@ -1731,7 +1733,7 @@ fn sticky_pair_region(
     if cache.len() > 2048 {
         cache.retain(|_, (_, at)| at.elapsed() < PAIR_REGION_TTL);
     }
-    let region = turn_creds::select_pair_region(map, home_a, home_b, pair_key);
+    let region = turn_creds::select_pair_region(map, load, home_a, home_b, pair_key);
     cache.insert(pair_key.to_string(), (region.clone(), Instant::now()));
     region
 }

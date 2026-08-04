@@ -98,6 +98,9 @@ pub struct AppState {
     /// startup from `turn.*` + `relay.*` settings; `cfg_for(None)` == the
     /// legacy single-region config.
     pub turn_map: Arc<roomler_ai_remote_control::turn_creds::TurnMap>,
+    /// P6b — live per-region load written by the `/stats` poller; consulted
+    /// by the Hub (session freeze) and the overlay pair-region pick.
+    pub relay_load: roomler_ai_remote_control::turn_creds::RelayLoadMap,
     /// Multi-region DERP ticket signer (`relay.derp_ticket_private_key`).
     /// `None` = no key configured — ticket requests go unanswered and agents
     /// keep using the central `/derp`.
@@ -319,6 +322,11 @@ impl AppState {
         let consent_requests = Arc::new(ConsentRequestDao::new(&db));
 
         let turn_map = Arc::new(build_turn_map(&settings));
+        // P6b — live per-region load (written by the /stats poller, consulted
+        // at issuance). Spawned only when regions are enabled and at least
+        // one carries a derp_url (the stats host).
+        let relay_load: roomler_ai_remote_control::turn_creds::RelayLoadMap = Default::default();
+        crate::relay_load::spawn_poller(turn_map.clone(), relay_load.clone(), &settings.relay);
         // Multi-region DERP tickets: load the signer when a key is configured;
         // log the derived public key so the operator can copy it to PoPs.
         // Regions carrying derp_urls without a key = loud warn, never fatal.
@@ -358,6 +366,7 @@ impl AppState {
             audit_sink,
             (*turn_map).clone(),
             Some(consent_tx),
+            relay_load.clone(),
         ));
 
         // C-1 — the directory heartbeat: every 30 s, re-assert this pod's
@@ -647,6 +656,7 @@ impl AppState {
             consent_requests,
             rc_hub,
             turn_map,
+            relay_load,
             derp_ticket,
             agent_presence_tokens,
             presence_fanout: Arc::new(crate::ws::device_presence::PresenceFanout::default()),
