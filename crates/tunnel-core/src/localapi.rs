@@ -115,6 +115,43 @@ pub struct NodeStatus {
     /// the daemon predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsStatus>,
+    /// Multi-org P1 — one row per enrollment (the primary first, then each
+    /// `[[orgs]]` entry). Empty from a pre-multi-org daemon and omitted by a
+    /// single-org one; the top-level scalar fields (`node_id` / `tenant_id`
+    /// / `connected`) keep aliasing the PRIMARY enrollment so older tray /
+    /// CLI builds render unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orgs: Vec<OrgStatus>,
+}
+
+/// Multi-org P1 — one enrollment's live state (see [`NodeStatus::orgs`]).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OrgStatus {
+    /// `primary` for the scalar identity, else the `[[orgs]]` label.
+    pub label: String,
+    pub server_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// This org's server-assigned agent id (hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub primary: bool,
+    /// Config-level soft-enable; a disabled org has no supervised WS loop.
+    pub enabled: bool,
+    /// This org's signaling WS is currently established.
+    pub connected: bool,
+    /// The org's supervisor stopped permanently this run (server goodbye /
+    /// duplicate-instance escalation). Cleared by a daemon restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_error: Option<String>,
+    /// `rc:agent.update` pushes ignored on this org's WS because only the
+    /// primary enrollment may drive the machine-wide self-updater.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub updates_ignored: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// S2 — the MagicDNS state the overlay runtime publishes: what the
@@ -296,6 +333,14 @@ pub struct RouteDescriptor {
     /// config entry without the key is live.
     #[serde(default = "route_enabled_default")]
     pub enabled: bool,
+    /// Multi-org P1 — which enrollment this route rides. `None` (the wire
+    /// default every pre-multi-org client sends) and `"primary"` both mean
+    /// the config's scalar primary identity. A secondary org's label is
+    /// accepted in the schema today but the P1 reconciler surfaces it as
+    /// `Failed` (secondary-org route supervision lands with P2/P3 of the
+    /// multi-org program).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
 }
 
 fn route_enabled_default() -> bool {
@@ -1504,6 +1549,7 @@ mod tests {
                 exit_node: None,
                 config_path: None,
                 dns: None,
+                orgs: Vec::new(),
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -1916,6 +1962,7 @@ mod tests {
             remote: Some("db:5432".into()),
             transport: "auto".into(),
             enabled: true,
+            org: None,
         };
         assert_eq!(
             serde_json::to_string(&Request::RouteAdd {
@@ -1971,6 +2018,7 @@ mod tests {
                 remote: None,
                 transport: String::new(),
                 enabled: true,
+                org: None,
             }
         );
         // Terminal-state wire shape (the pane's re-enable affordance keys on
@@ -1982,6 +2030,48 @@ mod tests {
             .unwrap(),
             r#"{"state":"failed","reason":"revoked"}"#
         );
+    }
+
+    #[test]
+    fn org_status_wire_shape_and_omissions() {
+        // Multi-org P1 — lock the OrgStatus row shape + the NodeStatus.orgs
+        // omission rules (single-org daemons stay byte-identical on the wire;
+        // zero counters and absent errors are skipped).
+        let row = OrgStatus {
+            label: "acme".into(),
+            server_url: "https://acme.invalid".into(),
+            tenant_id: Some("aabbccddeeff001122334455".into()),
+            agent_id: Some("554433221100ffeeddccbbaa".into()),
+            primary: false,
+            enabled: true,
+            connected: false,
+            terminal_error: None,
+            updates_ignored: 0,
+        };
+        assert_eq!(
+            serde_json::to_string(&row).unwrap(),
+            r#"{"label":"acme","server_url":"https://acme.invalid","tenant_id":"aabbccddeeff001122334455","agent_id":"554433221100ffeeddccbbaa","primary":false,"enabled":true,"connected":false}"#
+        );
+        // Old-daemon JSON (no orgs field) parses to an empty list; a
+        // populated one round-trips.
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let st: NodeStatus = serde_json::from_str(old).unwrap();
+        assert!(st.orgs.is_empty());
+        let mut with = st.clone();
+        with.orgs = vec![OrgStatus {
+            terminal_error: Some("server goodbye".into()),
+            updates_ignored: 2,
+            ..row
+        }];
+        let s = serde_json::to_string(&with).unwrap();
+        assert!(
+            s.contains(r#""terminal_error":"server goodbye""#),
+            "got {s}"
+        );
+        assert!(s.contains(r#""updates_ignored":2"#), "got {s}");
+        assert_eq!(serde_json::from_str::<NodeStatus>(&s).unwrap(), with);
+        // Empty orgs is omitted entirely (old-CLI-identical wire).
+        assert!(!serde_json::to_string(&st).unwrap().contains("orgs"));
     }
 
     #[test]

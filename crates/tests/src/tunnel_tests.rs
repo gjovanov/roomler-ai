@@ -736,6 +736,7 @@ fn spawn_origin_signaling(
         )
         .expect("consent broker init");
         let _ = signaling::run(
+            signaling::OrgCtx::primary(),
             cfg,
             EncoderPreference::Software,
             stop_rx,
