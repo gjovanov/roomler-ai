@@ -4,6 +4,9 @@ import { api } from '@/api/client'
 
 export interface Notification {
   id: string
+  /** P4 — the org this notification belongs to (bell is cross-org). Optional
+   *  for rows fetched from a pre-P4 server. */
+  tenant_id?: string
   notification_type: string
   title: string
   body: string

@@ -11,6 +11,9 @@ use roomler_ai_services::dao::base::PaginationParams;
 #[derive(Debug, Serialize)]
 pub struct NotificationResponse {
     pub id: String,
+    /// P4 — the org the notification belongs to (the bell is user-scoped and
+    /// so cross-org; clients group/route rows per org with this).
+    pub tenant_id: String,
     pub notification_type: String,
     pub title: String,
     pub body: String,
@@ -78,6 +81,7 @@ pub async fn mark_read(
         .map_err(|_| ApiError::BadRequest("Invalid notification_id".to_string()))?;
 
     state.notifications.mark_read(nid, auth.user_id).await?;
+    emit_unread_count(&state, auth.user_id).await;
 
     Ok(Json(serde_json::json!({ "read": true })))
 }
@@ -87,12 +91,35 @@ pub async fn mark_all_read(
     auth: AuthUser,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let count = state.notifications.mark_all_read(auth.user_id).await?;
+    emit_unread_count(&state, auth.user_id).await;
     Ok(Json(serde_json::json!({ "marked": count })))
+}
+
+/// P4 — cross-device read sync: push the fresh unread total to EVERY one of
+/// the user's connections (the `notification:unread_count` client handler
+/// predates this; there was no server emitter, so a bell read in one tab
+/// left every other device's badge stuck until reload). Best-effort.
+async fn emit_unread_count(state: &AppState, user_id: ObjectId) {
+    let Ok(count) = state.notifications.unread_count(user_id).await else {
+        return;
+    };
+    let event = serde_json::json!({
+        "type": "notification:unread_count",
+        "data": { "count": count }
+    });
+    crate::ws::dispatcher::send_to_user_with_redis(
+        &state.ws_storage,
+        &state.redis_pubsub,
+        &user_id,
+        &event,
+    )
+    .await;
 }
 
 fn to_response(n: roomler_ai_db::models::Notification) -> NotificationResponse {
     NotificationResponse {
         id: n.id.unwrap().to_hex(),
+        tenant_id: n.tenant_id.to_hex(),
         notification_type: format!("{:?}", n.notification_type).to_lowercase(),
         title: n.title,
         body: n.body,

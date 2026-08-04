@@ -1,4 +1,5 @@
 use crate::fixtures::test_app::TestApp;
+use futures::StreamExt;
 use serde_json::Value;
 
 /// Helper: admin joins room, sends a message mentioning member, returns the message JSON.
@@ -323,4 +324,191 @@ async fn notifications_are_user_scoped() {
         !member_items.is_empty(),
         "Member should see at least 1 notification"
     );
+}
+
+// ─── P4 — cross-org payload contracts + read sync + unread summary ─────
+
+/// Await the next `{type: <ty>}` frame on a user WS, skipping others.
+async fn wait_for_event(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ty: &str,
+    secs: u64,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {ty}"))
+            .expect("ws stream ended")
+            .expect("ws frame error");
+        let Ok(v) = serde_json::from_str::<Value>(msg.to_text().unwrap_or_default()) else {
+            continue;
+        };
+        if v["type"] == ty {
+            return v;
+        }
+    }
+}
+
+/// P4 — `notification:new` (WS) and the REST rows both carry `tenant_id`
+/// so multi-org clients can route badges per org. Contract lock.
+#[tokio::test]
+async fn notification_payloads_carry_tenant_id() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("notif6").await;
+    let room_id = &tenant.rooms[0].id;
+
+    app.auth_post(
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
+        &tenant.member.access_token,
+    )
+    .send()
+    .await
+    .unwrap();
+
+    let ws_url = format!("ws://{}/ws?token={}", app.addr, tenant.member.access_token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws.next().await; // connected frame
+
+    send_mention_message(
+        &app,
+        &tenant.tenant_id,
+        room_id,
+        &tenant.admin.access_token,
+        &tenant.member.id,
+    )
+    .await;
+
+    let ev = wait_for_event(&mut ws, "notification:new", 5).await;
+    assert_eq!(
+        ev["data"]["tenant_id"],
+        tenant.tenant_id.as_str(),
+        "ev: {ev}"
+    );
+    assert_eq!(ev["data"]["notification_type"], "mention");
+
+    let resp = app
+        .auth_get("/api/notification", &tenant.member.access_token)
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    let items = json["items"].as_array().unwrap();
+    assert!(!items.is_empty());
+    assert_eq!(items[0]["tenant_id"], tenant.tenant_id.as_str());
+}
+
+/// P4 — marking all read pushes `notification:unread_count` over WS
+/// (cross-device read sync: the bell on every other device converges
+/// without a reload).
+#[tokio::test]
+async fn read_all_emits_unread_count_over_ws() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("notif7").await;
+    let room_id = &tenant.rooms[0].id;
+
+    app.auth_post(
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
+        &tenant.member.access_token,
+    )
+    .send()
+    .await
+    .unwrap();
+
+    send_mention_message(
+        &app,
+        &tenant.tenant_id,
+        room_id,
+        &tenant.admin.access_token,
+        &tenant.member.id,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Connect the member's "other device" AFTER the mention exists so the
+    // only expected frames are ours.
+    let ws_url = format!("ws://{}/ws?token={}", app.addr, tenant.member.access_token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    ws.next().await;
+
+    let resp = app
+        .auth_post("/api/notification/read-all", &tenant.member.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let ev = wait_for_event(&mut ws, "notification:unread_count", 5).await;
+    assert_eq!(ev["data"]["count"], 0, "ev: {ev}");
+}
+
+/// P4 — `GET /api/user/unread-summary`: per-org rows for EVERY membership,
+/// with unread messages/rooms + notification/mention counts scoped per
+/// tenant (a second, quiet org reports zeros).
+#[tokio::test]
+async fn unread_summary_reports_per_tenant_counts() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("notif8").await;
+    let room_id = &tenant.rooms[0].id;
+
+    // The member also owns a second, quiet org.
+    let resp = app
+        .auth_post("/api/tenant", &tenant.member.access_token)
+        .json(&serde_json::json!({ "name": "Second Org", "slug": "notif8-second" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "second tenant create");
+    let second: Value = resp.json().await.unwrap();
+    let second_id = second["id"].as_str().unwrap().to_string();
+
+    // Activity in the FIRST org: a mention (notification + unread message).
+    app.auth_post(
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
+        &tenant.member.access_token,
+    )
+    .send()
+    .await
+    .unwrap();
+    send_mention_message(
+        &app,
+        &tenant.tenant_id,
+        room_id,
+        &tenant.admin.access_token,
+        &tenant.member.id,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let resp = app
+        .auth_get("/api/user/unread-summary", &tenant.member.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let json: Value = resp.json().await.unwrap();
+    let rows = json["tenants"].as_array().unwrap();
+    assert!(rows.len() >= 2, "one row per membership: {json}");
+
+    let first = rows
+        .iter()
+        .find(|r| r["tenant_id"] == tenant.tenant_id.as_str())
+        .unwrap_or_else(|| panic!("first org missing from summary: {json}"));
+    assert!(
+        first["unread_messages"].as_u64().unwrap() >= 1,
+        "mention message unread: {first}"
+    );
+    assert!(first["unread_rooms"].as_u64().unwrap() >= 1);
+    assert!(first["notifications"].as_u64().unwrap() >= 1);
+    assert!(first["mentions"].as_u64().unwrap() >= 1);
+
+    let quiet = rows
+        .iter()
+        .find(|r| r["tenant_id"] == second_id.as_str())
+        .unwrap_or_else(|| panic!("second org missing from summary: {json}"));
+    assert_eq!(quiet["unread_messages"], 0);
+    assert_eq!(quiet["notifications"], 0);
 }
