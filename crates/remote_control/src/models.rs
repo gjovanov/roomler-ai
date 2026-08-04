@@ -723,7 +723,20 @@ impl RemoteSession {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditKind {
-    SessionRequested,
+    /// Multi-user P3 — carries the ACTOR + effective grant (the plan's
+    /// per-event attribution): with N concurrent sessions per agent, "who
+    /// asked" is no longer derivable from the one live session. The same
+    /// event now drives the `remote_sessions` row projection in the audit
+    /// sink. Fields are serde-defaulted so pre-P3 rows still deserialize
+    /// (defaults: zero ObjectId / empty name / default grant).
+    SessionRequested {
+        #[serde(default)]
+        controller_user_id: ObjectId,
+        #[serde(default)]
+        controller_name: String,
+        #[serde(default)]
+        permissions: Permissions,
+    },
     ConsentPrompted,
     ConsentGranted,
     ConsentDenied,
