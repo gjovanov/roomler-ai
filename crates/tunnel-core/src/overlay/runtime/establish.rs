@@ -895,6 +895,80 @@ impl OverlayRuntime {
                                 }
                             });
                         }
+                        // B3 — mid-tier upward probing: a HEALTHY established
+                        // srflx/public incumbent probes an eligible HIGHER
+                        // tier at most once per 120 s (the monitor books the
+                        // spacing at candidate time). Same MBB execution as
+                        // the demote branch above; mutually exclusive with it
+                        // by construction (a demote Probe took the branch
+                        // above; here decide said Keep).
+                        let upward_target: Option<DirectTier> = if wg.has_direct_probe(&pk) {
+                            None
+                        } else {
+                            self.shadow(|s| {
+                                if !s.upward {
+                                    return None;
+                                }
+                                let path::Incumbent::Direct(cur) = incumbent else {
+                                    return None;
+                                };
+                                s.mon.upward_candidate(&np.node_id, cur, avail, now)
+                            })
+                            .flatten()
+                        };
+                        if let Some(target) = upward_target {
+                            let probe_target = match target {
+                                DirectTier::Lan => {
+                                    if let (Some(ctx), Some((local_ip, dst))) =
+                                        (direct_ctx, direct_dst)
+                                    {
+                                        lan_egress_socket(ctx, local_ip, dst)
+                                            .await
+                                            .map(|s| (s, dst))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                DirectTier::Public => {
+                                    if let (Some(ctx), Some(dst)) = (direct_ctx, phase_a_dst) {
+                                        ctx.public_sock.clone().map(|s| (s, dst))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                DirectTier::Srflx => {
+                                    if let (Some(ctx), Some(dst)) = (direct_ctx, srflx_dst) {
+                                        ctx.punch.clone().map(|(_, s)| (s, dst))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                DirectTier::Relay => None,
+                            };
+                            if let Some((sock, dst)) = probe_target {
+                                self.shadow(|s| {
+                                    let c =
+                                        s.stats.by_class.entry("midtier_upward").or_insert((0, 0));
+                                    c.0 += 1;
+                                });
+                                info!(
+                                    peer = %np.node_id, from = ?tier, to = ?target,
+                                    "overlay pathmon[upward]: higher tier eligible — probing (incumbent held until latch)"
+                                );
+                                self.start_upgrade_probe(
+                                    wg,
+                                    upgrade_probes,
+                                    np.node_id,
+                                    &cfg,
+                                    sock,
+                                    dst,
+                                    target,
+                                    now,
+                                )
+                                .await;
+                                continue; // counted as midtier_upward, not keep
+                            }
+                        }
                         // P3 PR-A (F14) — the already-direct fall-through IS a
                         // decision (keep the incumbent); record it so the
                         // shadow compare covers this arm too.
