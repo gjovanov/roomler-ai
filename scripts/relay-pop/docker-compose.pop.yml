@@ -1,0 +1,33 @@
+# Relay-PoP stack: coturn + derp-relay + the SNI-splitting nginx. All three
+# on host networking (TURN needs real source addresses; one tiny VPS, no
+# port juggling). Rendered configs + certs live in /opt/relay-pop.
+services:
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /opt/relay-pop/turnserver.conf:/etc/turnserver.conf:ro
+      - /opt/relay-pop/certs:/certs:ro
+
+  derp-relay:
+    image: debian:trixie-slim
+    network_mode: host
+    restart: unless-stopped
+    command: ["/opt/derp-relay"]
+    environment:
+      DERP_BIND: 127.0.0.1:8443
+      DERP_TICKET_PUBLIC_KEY: ${DERP_TICKET_PUBLIC_KEY}
+      RUST_LOG: info
+    volumes:
+      # Linux x86_64 binary built by CI / the build host:
+      #   cargo build -p derp-relay --release
+      - /opt/relay-pop/bin/derp-relay:/opt/derp-relay:ro
+
+  nginx:
+    image: nginx:stable
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /opt/relay-pop/nginx-pop.conf:/etc/nginx/nginx.conf:ro
+      - /opt/relay-pop/certs:/certs:ro
