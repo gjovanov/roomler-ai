@@ -410,6 +410,48 @@ describe('useWsStore', () => {
       expect(handler).not.toHaveBeenCalled()
     })
 
+    // Multi-user P3 — the registry is multi-subscriber: a second mounted
+    // RC surface must not clobber the first, and each unsubscribe removes
+    // only its own handler.
+    it('dispatches one rc:* message to EVERY subscriber of the type', () => {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+
+      const a = vi.fn()
+      const b = vi.fn()
+      store.onRcMessage('rc:terminate', a)
+      store.onRcMessage('rc:terminate', b)
+
+      mockWsInstance.simulateMessage({ t: 'rc:terminate', session_id: 'x' })
+      expect(a).toHaveBeenCalledTimes(1)
+      expect(b).toHaveBeenCalledTimes(1)
+    })
+
+    it('the returned unsubscribe removes only its own handler', () => {
+      const store = useWsStore()
+      store.connect('tok')
+      mockWsInstance.simulateOpen()
+
+      const a = vi.fn()
+      const b = vi.fn()
+      const unA = store.onRcMessage('rc:ice', a)
+      store.onRcMessage('rc:ice', b)
+
+      unA()
+      mockWsInstance.simulateMessage({ t: 'rc:ice', session_id: 'x' })
+      expect(a).not.toHaveBeenCalled()
+      expect(b).toHaveBeenCalledTimes(1)
+
+      // Targeted off with the handler arg removes just that one too.
+      const c = vi.fn()
+      store.onRcMessage('rc:ice', c)
+      store.offRcMessage('rc:ice', b)
+      mockWsInstance.simulateMessage({ t: 'rc:ice', session_id: 'y' })
+      expect(b).toHaveBeenCalledTimes(1)
+      expect(c).toHaveBeenCalledTimes(1)
+    })
+
     it('sendRaw sends the object without a {type,data} envelope', () => {
       const store = useWsStore()
       store.connect('tok')
