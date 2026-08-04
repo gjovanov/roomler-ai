@@ -57,6 +57,14 @@ impl Ipam {
             .unwrap()
     }
 
+    /// Allocate a host bounded by the default `/10` ceiling — what
+    /// `handle_overlay_join` passes for an unmigrated tenant (P2a).
+    async fn alloc(&self) -> Result<u32, DaoError> {
+        self.networks
+            .allocate_host(self.network_id, default_max_host())
+            .await
+    }
+
     /// Insert a node holding `overlay_ip`, as `handle_overlay_join` would.
     async fn create_node(
         &self,
@@ -92,6 +100,77 @@ fn tid(hex: &str) -> ObjectId {
     ObjectId::parse_str(hex).unwrap()
 }
 
+/// The default `/10`'s block ceiling (multi-org P2a bound).
+fn default_max_host() -> u32 {
+    roomler_ai_remote_control::models::cidr_max_host(
+        roomler_ai_remote_control::models::OverlayNetwork::DEFAULT_CIDR,
+    )
+    .expect("default CIDR has a ceiling")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// IPAM: the block ceiling (multi-org P2a)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The cursor refuses to lease past the network's own block, exhaustion is a
+/// loud Validation error (never a neighbor-block address), and a pooled host
+/// stranded above a since-shrunk ceiling is discarded — leak, never conflict.
+#[tokio::test]
+async fn allocate_host_stops_at_the_block_ceiling() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovipamcap").await;
+    let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
+
+    // A /30-sized ceiling: hosts 1..=2 leaseable.
+    let max_host = 2u32;
+    let a = ipam
+        .networks
+        .allocate_host(ipam.network_id, max_host)
+        .await
+        .unwrap();
+    let b = ipam
+        .networks
+        .allocate_host(ipam.network_id, max_host)
+        .await
+        .unwrap();
+    assert_eq!((a, b), (1, 2));
+    let err = ipam
+        .networks
+        .allocate_host(ipam.network_id, max_host)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DaoError::Validation(m) if m.contains("exhausted")),
+        "expected loud exhaustion, got {err:?}"
+    );
+    // The cursor did NOT walk past the ceiling.
+    assert_eq!(ipam.network().await.next_host, 3);
+
+    // Release host 2 back to the pool, then shrink the ceiling below it: the
+    // pooled entry is discarded and allocation reports exhaustion (host 1 is
+    // still leased; the cursor is past the new ceiling of 1).
+    assert!(
+        ipam.networks
+            .release_host(ipam.network_id, 2)
+            .await
+            .unwrap()
+    );
+    let err = ipam
+        .networks
+        .allocate_host(ipam.network_id, 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, DaoError::Validation(m) if m.contains("exhausted")));
+    assert!(
+        ipam.network().await.free_hosts.is_empty(),
+        "the above-ceiling pooled host must be discarded, not re-leased"
+    );
+
+    // The full-range ceiling still hands out the next cursor host.
+    let c = ipam.alloc().await.unwrap();
+    assert_eq!(c, 3);
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // IPAM: the free pool
 // ────────────────────────────────────────────────────────────────────────────
@@ -104,7 +183,7 @@ async fn allocate_host_is_monotonic_when_the_pool_is_empty() {
 
     let mut got = Vec::new();
     for _ in 0..3 {
-        got.push(ipam.networks.allocate_host(ipam.network_id).await.unwrap());
+        got.push(ipam.alloc().await.unwrap());
     }
     assert_eq!(got, vec![1, 2, 3], "host 0 is the network address");
     let net = ipam.network().await;
@@ -119,7 +198,7 @@ async fn release_host_pools_the_number_and_the_next_allocate_reuses_it() {
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
 
     for _ in 0..3 {
-        ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+        ipam.alloc().await.unwrap();
     }
     assert!(
         ipam.networks
@@ -130,10 +209,7 @@ async fn release_host_pools_the_number_and_the_next_allocate_reuses_it() {
     assert_eq!(ipam.network().await.free_hosts, vec![2]);
 
     // The recycled number comes back BEFORE the cursor moves.
-    assert_eq!(
-        ipam.networks.allocate_host(ipam.network_id).await.unwrap(),
-        2
-    );
+    assert_eq!(ipam.alloc().await.unwrap(), 2);
     let net = ipam.network().await;
     assert_eq!(net.next_host, 4, "the cursor did not move");
     assert!(net.free_hosts.is_empty());
@@ -146,7 +222,7 @@ async fn release_host_is_fifo() {
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
 
     for _ in 0..4 {
-        ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+        ipam.alloc().await.unwrap();
     }
     ipam.networks
         .release_host(ipam.network_id, 2)
@@ -159,7 +235,7 @@ async fn release_host_is_fifo() {
 
     let mut got = Vec::new();
     for _ in 0..3 {
-        got.push(ipam.networks.allocate_host(ipam.network_id).await.unwrap());
+        got.push(ipam.alloc().await.unwrap());
     }
     assert_eq!(
         got,
@@ -178,7 +254,7 @@ async fn release_host_is_idempotent() {
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
 
     for _ in 0..3 {
-        ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+        ipam.alloc().await.unwrap();
     }
     ipam.networks
         .release_host(ipam.network_id, 2)
@@ -190,8 +266,8 @@ async fn release_host_is_idempotent() {
         .unwrap();
     assert_eq!(ipam.network().await.free_hosts, vec![2], "no duplicate");
 
-    let a = ipam.networks.allocate_host(ipam.network_id).await.unwrap();
-    let b = ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    let a = ipam.alloc().await.unwrap();
+    let b = ipam.alloc().await.unwrap();
     assert_eq!((a, b), (2, 4), "2 is handed out once, never twice");
 }
 
@@ -202,7 +278,7 @@ async fn release_host_rejects_hosts_the_cursor_never_issued() {
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
 
     for _ in 0..3 {
-        ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+        ipam.alloc().await.unwrap();
     }
     // Host 0 is the network address; 9_999 was never issued (cursor is at 4).
     assert!(
@@ -237,7 +313,7 @@ async fn concurrent_allocate_never_double_hands_a_pooled_host() {
     // Advance the cursor past the numbers we're about to pool (release_host
     // only accepts hosts the cursor actually issued), then pool them.
     for _ in 0..POOLED {
-        ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+        ipam.alloc().await.unwrap();
     }
     for h in 1..=POOLED {
         assert!(
@@ -252,7 +328,12 @@ async fn concurrent_allocate_never_double_hands_a_pooled_host() {
     let results = futures::future::join_all((0..RACERS).map(|_| {
         let networks = OverlayNetworkDao::new(&app.db);
         let nid = ipam.network_id;
-        async move { networks.allocate_host(nid).await.unwrap() }
+        async move {
+            networks
+                .allocate_host(nid, default_max_host())
+                .await
+                .unwrap()
+        }
     }))
     .await;
 
@@ -417,8 +498,8 @@ async fn evict_releases_the_ip_and_the_next_allocate_reuses_it() {
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
 
     // Two nodes; evict the one holding host 2.
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    ipam.alloc().await.unwrap();
+    ipam.alloc().await.unwrap();
     ipam.create_node("mach-A", "keep", "100.64.0.1")
         .await
         .unwrap();
@@ -464,7 +545,7 @@ async fn evict_releases_the_ip_and_the_next_allocate_reuses_it() {
 
     assert_eq!(ipam.network().await.free_hosts, vec![2]);
     assert_eq!(
-        ipam.networks.allocate_host(ipam.network_id).await.unwrap(),
+        ipam.alloc().await.unwrap(),
         2,
         "the next joiner recycles the released address"
     );
@@ -475,7 +556,7 @@ async fn evict_is_404_for_an_already_released_node() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("ovevict2").await;
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    ipam.alloc().await.unwrap();
     let node = ipam
         .create_node("mach-A", "box", "100.64.0.1")
         .await
@@ -509,11 +590,7 @@ async fn evict_is_cross_tenant_safe() {
     let a = app.seed_tenant("ovevictA").await;
     let b = app.seed_tenant("ovevictB").await;
     let ipam_b = Ipam::new(&app, tid(&b.tenant_id)).await;
-    ipam_b
-        .networks
-        .allocate_host(ipam_b.network_id)
-        .await
-        .unwrap();
+    ipam_b.alloc().await.unwrap();
     let victim = ipam_b
         .create_node("mach-B", "box", "100.64.0.1")
         .await
@@ -547,7 +624,7 @@ async fn evict_requires_manage_agents() {
     let app = TestApp::spawn().await;
     let seeded = app.seed_tenant("ovevict3").await;
     let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    ipam.alloc().await.unwrap();
     let node = ipam
         .create_node("mach-A", "box", "100.64.0.1")
         .await
@@ -625,7 +702,7 @@ async fn agent_delete_releases_the_overlay_node() {
     .await;
 
     // The node the agent's `rc:overlay.join` would have created.
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    ipam.alloc().await.unwrap();
     let node = ipam
         .nodes
         .create(
@@ -708,7 +785,7 @@ async fn a_re_enrolled_removed_machine_gets_a_fresh_overlay_node() {
         "mach-rejoin",
     )
     .await;
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    ipam.alloc().await.unwrap();
     let first = ipam
         .nodes
         .create(
@@ -824,7 +901,7 @@ async fn tunnel_client_delete_releases_the_overlay_node() {
         .unwrap();
     let client_id = enrolled["tunnel_client_id"].as_str().unwrap().to_string();
 
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    ipam.alloc().await.unwrap();
     let node = ipam
         .nodes
         .create(
@@ -899,7 +976,7 @@ async fn agent_delete_does_not_release_a_tunnel_clients_node() {
     .await;
 
     // The node on that machine belongs to a TUNNEL CLIENT, not the agent.
-    ipam.networks.allocate_host(ipam.network_id).await.unwrap();
+    ipam.alloc().await.unwrap();
     let node = ipam
         .nodes
         .create(
