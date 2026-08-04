@@ -213,6 +213,16 @@ pub struct Agent {
     pub agent_token_hash: String,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
+    /// P4 — the presence value (`online`/`stale`/`offline`) most recently
+    /// BROADCAST as a `device:presence` event. A cluster-wide transition
+    /// ledger: every emit path (register, teardown, staleness sweep, on any
+    /// pod) does a CAS on this field and fans out only when it actually
+    /// changed, so a transition is announced exactly once no matter how many
+    /// pods observe it. `None` on pre-P4 rows / fresh enrollments — the first
+    /// observed state always emits. NOT the read-path truth (that stays the
+    /// live hub + Redis directory + heartbeat derivation).
+    #[serde(default)]
+    pub last_presence: Option<String>,
     #[serde(default)]
     pub displays: Vec<DisplayInfo>,
     #[serde(default)]
