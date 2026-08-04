@@ -259,6 +259,29 @@ impl OverlayNodeDao {
     /// `lan_endpoints` (public NIC) so a srflx trickle never clobbers a relay/LAN
     /// address and vice-versa. `nat` (`Some("cone"|"symmetric")` / `None` when
     /// unknown) is stored alongside so peers can skip a both-symmetric punch.
+    /// Multi-region relay PoPs: mirror an AGENT's derived `relay_home` onto
+    /// its live overlay-node row(s) — the netmap already fans `relay_home`
+    /// per peer, and the broker's pair-region pick reads it from here.
+    pub async fn set_relay_home_for_agent(
+        &self,
+        agent_id: ObjectId,
+        relay_home: Option<&str>,
+    ) -> DaoResult<u64> {
+        self.base
+            .update_many(
+                doc! {
+                    "node_ref.kind": "agent",
+                    "node_ref.id": agent_id,
+                    "deleted_at": bson::Bson::Null,
+                },
+                doc! { "$set": {
+                    "relay_home": relay_home,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await
+    }
+
     pub async fn update_srflx_endpoints(
         &self,
         node_id: ObjectId,

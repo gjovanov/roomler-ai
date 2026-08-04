@@ -48,6 +48,8 @@ impl AgentDao {
             access_policy: AccessPolicy::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
+            relay_home: None,
+            relay_rtt: None,
             created_at: now,
             updated_at: now,
             deleted_at: None,
@@ -192,6 +194,28 @@ impl AgentDao {
                 doc! { "$set": {
                     "last_seen_at": DateTime::now(),
                     "status": bson::to_bson(&AgentStatus::Online).unwrap(),
+                } },
+            )
+            .await
+    }
+
+    /// Multi-region relay PoPs: persist the agent's derived `relay_home` and
+    /// its full probe table (observability). Called from the WS probe-report
+    /// handler, already hysteresis- and rate-limited there.
+    pub async fn set_relay_home(
+        &self,
+        agent_id: ObjectId,
+        relay_home: Option<&str>,
+        relay_rtt: &[roomler_ai_remote_control::signaling::RelayRegionRtt],
+    ) -> DaoResult<bool> {
+        let rtt_bson = bson::to_bson(relay_rtt).unwrap_or(bson::Bson::Array(vec![]));
+        self.base
+            .update_by_id(
+                agent_id,
+                doc! { "$set": {
+                    "relay_home": relay_home,
+                    "relay_rtt": rtt_bson,
+                    "updated_at": DateTime::now(),
                 } },
             )
             .await

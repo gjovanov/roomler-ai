@@ -422,8 +422,9 @@ impl Hub {
     }
 
     /// The connected agent's relay home, if any — the region every
-    /// per-session TURN issuance for that agent uses.
-    fn agent_relay_home(&self, agent_id: ObjectId) -> Option<String> {
+    /// per-session TURN issuance for that agent uses. Pub for the WS layer's
+    /// probe-report hysteresis (compare-before-move).
+    pub fn agent_relay_home(&self, agent_id: ObjectId) -> Option<String> {
         self.inner
             .agents
             .get(&agent_id)
@@ -1042,7 +1043,12 @@ impl Hub {
                 }
             }
             (_, ClientMsg::Ping { id: _ }) => Ok(()), // pong handled by WS layer
-            (_, ClientMsg::AgentHello { .. } | ClientMsg::AgentHeartbeat { .. }) => {
+            (
+                _,
+                ClientMsg::AgentHello { .. }
+                | ClientMsg::AgentHeartbeat { .. }
+                | ClientMsg::RelayProbeReport { .. },
+            ) => {
                 // Hello is handled at registration time; heartbeat is logged by WS layer.
                 Ok(())
             }
