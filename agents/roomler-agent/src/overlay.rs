@@ -70,7 +70,7 @@ struct RuntimeSlot {
     evt_tx: mpsc::Sender<OverlayEvent>,
 }
 
-/// rc.307 (B) — the process-lifetime runtime slot. The overlay runtime used
+/// rc.307 (B) — the process-lifetime runtime slots. The overlay runtime used
 /// to be scoped to ONE control-WS session (every server deploy / pod roll /
 /// receive-liveness cycle tore down all carriers and rebuilt from empty —
 /// which relay-locks a corp-VPN'd host whose firewall only grandfathers
@@ -79,7 +79,13 @@ struct RuntimeSlot {
 /// runtime swaps its outbound sender, re-joins, and reconciles the reply
 /// netmap against live state. The data plane (TUN, WG peers, carriers)
 /// keeps flowing through the whole control-plane outage.
-static RUNTIME_SLOT: std::sync::Mutex<Option<RuntimeSlot>> = std::sync::Mutex::new(None);
+///
+/// Multi-org P2c — keyed by TENANT: each org supervisor owns its own
+/// persistent runtime, so org B's fresh spawn can never evict org A's
+/// re-attach entry (a single slot would ping-pong and both orgs would
+/// rebuild-from-empty on every reconnect — exactly the churn rc.307 killed).
+static RUNTIME_SLOTS: std::sync::Mutex<std::collections::BTreeMap<String, RuntimeSlot>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// If overlay is enabled, spawn the node runtime (relay mode) and return
 /// the channel its control events arrive on. `None` when overlay is
@@ -92,13 +98,13 @@ pub async fn maybe_start(
     derp_ticket_slot: crate::relay_probe::DerpTicketSlot,
 ) -> Option<mpsc::Sender<OverlayEvent>> {
     if !cfg.overlay_enabled {
-        // Drop any persistent runtime's slot entry: once the sessions'
+        // Drop THIS org's persistent-runtime slot entry: once the sessions'
         // event-sender clones are gone too, its channel closes and it tears
-        // down cleanly.
-        RUNTIME_SLOT
+        // down cleanly. Other orgs' runtimes are untouched.
+        RUNTIME_SLOTS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take();
+            .remove(&cfg.tenant_id);
         return None;
     }
     let Some(keypair) = cfg
@@ -129,8 +135,9 @@ pub async fn maybe_start(
         },
     };
     let existing = {
-        let slot = RUNTIME_SLOT.lock().unwrap_or_else(|e| e.into_inner());
-        slot.as_ref()
+        let slots = RUNTIME_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .get(&cfg.tenant_id)
             .filter(|s| s.fingerprint == fingerprint)
             .map(|s| s.evt_tx.clone())
     };
@@ -159,12 +166,28 @@ pub async fn maybe_start(
     // when `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS` names a port, else the OS TUN.
     // Either surface can be absent at build time; the helper warns + `None`s,
     // and `?` aborts the (mis)configured start.
-    let tun_factory: TunFactory = match netstack_socks_port() {
-        // Give the netstack SOCKS front a live mesh view so it can resolve
-        // DOMAIN targets (peer name / MagicDNS FQDN → overlay IP). Same channel
-        // the runtime publishes to below, so it's stable across reconnects.
-        Some(port) => netstack_tun_factory(port, peer_view.subscribe())?,
-        None => systun_tun_factory()?,
+    //
+    // Multi-org P2c: with `overlay_multi_org` on, EVERY org (primary
+    // included) goes through the process-wide shared-TUN mux, keyed by its
+    // tenant id — and netstack mode is overridden (its SOCKS front and
+    // handle channel are process-global singletons; N netstack orgs would
+    // fight over them).
+    let tun_factory: TunFactory = if cfg.overlay_multi_org {
+        if netstack_socks_port().is_some() {
+            warn!(
+                "overlay: OVERLAY_NETSTACK_SOCKS is set but overlay_multi_org is on — \
+                 netstack mode is single-org; using the shared OS TUN instead"
+            );
+        }
+        mux_systun_factory(cfg.tenant_id.clone())?
+    } else {
+        match netstack_socks_port() {
+            // Give the netstack SOCKS front a live mesh view so it can resolve
+            // DOMAIN targets (peer name / MagicDNS FQDN → overlay IP). Same channel
+            // the runtime publishes to below, so it's stable across reconnects.
+            Some(port) => netstack_tun_factory(port, peer_view.subscribe())?,
+            None => systun_tun_factory()?,
+        }
     };
     // P5 exit-node client — resolve the coordination server's IPs NOW, while the
     // uplink is still clean (before any split-default is installed), so exit
@@ -240,13 +263,20 @@ pub async fn maybe_start(
     // trickles each relayed address post-allocation — so join carries none.
     tokio::spawn(rt.run(evt_rx, Vec::new()));
     info!("overlay: node runtime started (relay mode)");
-    // rc.307 (B) — remember it for the next session's re-attach. Replacing a
-    // fingerprint-mismatched slot drops the old runtime's last stored sender
-    // clone; it tears down once the old session's clones are gone too.
-    *RUNTIME_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(RuntimeSlot {
-        fingerprint,
-        evt_tx: evt_tx.clone(),
-    });
+    // rc.307 (B) — remember it for the next session's re-attach, under THIS
+    // org's key. Replacing a fingerprint-mismatched entry drops the old
+    // runtime's last stored sender clone; it tears down once the old
+    // session's clones are gone too.
+    RUNTIME_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            cfg.tenant_id.clone(),
+            RuntimeSlot {
+                fingerprint,
+                evt_tx: evt_tx.clone(),
+            },
+        );
     Some(evt_tx)
 }
 
@@ -371,6 +401,70 @@ fn systun_tun_factory() -> Option<TunFactory> {
     warn!(
         "overlay: OS-TUN mode requested but this build lacks `overlay-l3` \
          (set ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS for netstack mode); not joining"
+    );
+    None
+}
+
+/// Multi-org P2c — the process-wide shared device + its [`TunMux`], for the
+/// mux factory below. The FIRST org to establish creates the device with its
+/// own `(ip, netmask, mtu)` (exactly what `SystemTun::up` always took); every
+/// later org rides the same device with its own address added. Rebuilt from
+/// scratch when the device dies (`is_alive` false) — the stale mux's reader
+/// has EOF'd every old port by then, so each org's runtime rebuilds its
+/// session and re-registers on the fresh one.
+#[cfg(feature = "overlay-l3")]
+#[allow(clippy::type_complexity)]
+static SHARED_MUX: std::sync::Mutex<
+    Option<(Arc<SystemTun>, Arc<tunnel_core::overlay::tun_mux::TunMux>)>,
+> = std::sync::Mutex::new(None);
+
+/// Multi-org P2c — per-org TUN factory over the ONE shared device.
+///
+/// Differences from [`systun_tun_factory`], all deliberate:
+/// * the device is ALWAYS process-lifetime (the mux and its reader pump are
+///   shared state; the `overlay_tun_persist` kill-switch does not apply);
+/// * a registration can be REFUSED (`AddrInUse`) when another org already
+///   claims the same block — the two-un-migrated-tenants case. The runtime
+///   treats that like any TUN bring-up failure: this org's session aborts
+///   and retries on its next reconnect, while the OTHER orgs' meshes stay
+///   up. The fix is renumbering one tenant (docs/multi-org.md §4.3).
+#[cfg(feature = "overlay-l3")]
+fn mux_systun_factory(org_key: String) -> Option<TunFactory> {
+    use tunnel_core::overlay::tun_mux::TunMux;
+    Some(Box::new(move |ip, nm, mtu| {
+        let mut shared = SHARED_MUX.lock().unwrap();
+        let (dev, mux, fresh) = match shared.as_ref() {
+            Some((dev, mux)) if dev.is_alive() && mux.is_alive() => {
+                (dev.clone(), mux.clone(), false)
+            }
+            _ => {
+                // Dead or first use: release the old device BEFORE the new
+                // create (frees the adapter's device-install lock; the
+                // retry inside `up` covers the release latency).
+                *shared = None;
+                let dev = Arc::new(SystemTun::up(ip, nm, mtu)?);
+                let mux = TunMux::new(dev.clone() as Arc<dyn TunIo>);
+                *shared = Some((dev.clone(), mux.clone()));
+                info!("overlay: shared multi-org TUN device created");
+                (dev, mux, true)
+            }
+        };
+        // A later org's self address (its block's connected route rides the
+        // assignment). The creator's own address came up with the device;
+        // add_address_sync is idempotent, so only skip the exact create
+        // params to avoid a pointless netsh round-trip.
+        if !fresh {
+            let prefix = u32::from(nm).count_ones() as u8;
+            dev.add_address_sync(ip, prefix)?;
+        }
+        mux.register(&org_key, ip, nm).map(|p| p as Arc<dyn TunIo>)
+    }))
+}
+#[cfg(not(feature = "overlay-l3"))]
+fn mux_systun_factory(_org_key: String) -> Option<TunFactory> {
+    warn!(
+        "overlay: overlay_multi_org requires an `overlay-l3` build (the shared \
+         OS TUN); not joining"
     );
     None
 }
