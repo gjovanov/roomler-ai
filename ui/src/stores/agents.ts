@@ -316,6 +316,43 @@ export const useAgentStore = defineStore('agents', () => {
     )
   }
 
+  /** Multi-org — the organizations this device could be added to: every org
+   *  where the caller holds MANAGE_AGENTS, minus the current one. `supported`
+   *  is false for agents predating `rc:agent.join_org`, `online` false when
+   *  there is no socket to push down; the dialog explains rather than
+   *  letting the click fail. */
+  async function fetchJoinTargets(
+    tenantId: string,
+    agentId: string,
+  ): Promise<{
+    items: Array<{
+      tenant_id: string
+      name: string
+      slug: string
+      already_enrolled: boolean
+    }>
+    supported: boolean
+    online: boolean
+  }> {
+    return api.get(`/tenant/${tenantId}/agent/${agentId}/join-targets`)
+  }
+
+  /** Multi-org — add this device to another organization. Requires
+   *  MANAGE_AGENTS in BOTH; the server mints a short-lived enrollment token
+   *  and pushes it down the device's live socket. */
+  async function joinOrg(
+    tenantId: string,
+    agentId: string,
+    targetTenantId: string,
+    opts: { label?: string; overlayMode?: string } = {},
+  ): Promise<{ label: string; delivered: boolean; already_enrolled?: boolean }> {
+    return api.post(`/tenant/${tenantId}/agent/${agentId}/join-org`, {
+      target_tenant_id: targetTenantId,
+      ...(opts.label ? { label: opts.label } : {}),
+      ...(opts.overlayMode ? { overlay_mode: opts.overlayMode } : {}),
+    })
+  }
+
   async function deleteAgent(tenantId: string, agentId: string) {
     await api.delete(`/tenant/${tenantId}/agent/${agentId}`)
     agents.value = agents.value.filter((a) => a.id !== agentId)
@@ -370,6 +407,8 @@ export const useAgentStore = defineStore('agents', () => {
     fetchTenantMembers,
     triggerUpdate,
     triggerUpdateAll,
+    fetchJoinTargets,
+    joinOrg,
     deleteAgent,
     fetchCrashes,
     fetchLogs,

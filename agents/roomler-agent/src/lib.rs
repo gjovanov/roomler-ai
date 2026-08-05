@@ -51,6 +51,7 @@ pub mod mdns_resolve;
 )]
 pub(crate) mod media_share;
 pub mod notify;
+pub mod org_join;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
 pub mod peer;

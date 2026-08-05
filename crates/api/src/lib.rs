@@ -331,6 +331,14 @@ pub fn build_router(state: AppState) -> Router {
             "/{agent_id}/update",
             post(routes::remote_control::trigger_agent_update),
         )
+        // Multi-org — add an already-enrolled device to a SECOND org from the
+        // UI (MANAGE_AGENTS in both). `join-targets` is the picker's source
+        // of truth so the dialog can never offer a choice that 403s.
+        .route("/{agent_id}/join-org", post(routes::agent_org::join_org))
+        .route(
+            "/{agent_id}/join-targets",
+            get(routes::agent_org::join_targets),
+        )
         .route(
             "/{agent_id}",
             get(routes::remote_control::get_agent)
