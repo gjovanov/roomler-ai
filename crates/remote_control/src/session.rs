@@ -52,6 +52,21 @@ pub struct LiveSession {
     /// a split would put the two ICE ends on different PoPs. `None` = the
     /// default region.
     pub relay_region: Option<String>,
+
+    /// Whether the controller's SDP offer ever arrived. Read by the
+    /// post-consent negotiating reaper: consent granted + `Ready` pushed but
+    /// no offer within the window means the controller never heard back
+    /// (its socket died, or its reply raced a teardown) — the session would
+    /// otherwise sit in `Negotiating` forever while the browser shows
+    /// "awaiting consent" (2026-08-05 CORPLAP-1 incident).
+    pub offer_seen: bool,
+
+    /// The exact `ServerMsg::Request` pushed to the agent at create, kept
+    /// while consent is pending. An agent whose control WS flaps between
+    /// the Request and its `rc:consent` reply loses the exchange entirely;
+    /// `register_agent` re-pushes this on the agent's fresh connection so
+    /// the consent flow completes instead of timing out.
+    pub pending_request: Option<ServerMsg>,
 }
 
 impl LiveSession {
@@ -79,6 +94,8 @@ impl LiveSession {
             controller_tx: Some(controller_tx),
             local_relay: None,
             relay_region: None,
+            offer_seen: false,
+            pending_request: None,
         };
         (s, waiter)
     }
