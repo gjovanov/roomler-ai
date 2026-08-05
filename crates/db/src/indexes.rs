@@ -409,6 +409,97 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // ── Observability / analytics (stats PR-1) ────────────────────────────
+    // Sample collections use deterministic string `_id`s ("{key}:{bucket}")
+    // so every writer is an idempotent upsert — that, not a lease, is what
+    // makes the 2-pod deployment race-free. Raw samples are short-TTL; the
+    // rollup task compacts them into _1h (90 d) and _1d (730 d).
+
+    // Relay-PoP samples, one per region per 30 s poll tick (both pods write
+    // the same bucket id). `{region, ts}` backs the history queries.
+    create_indexes(
+        db,
+        "stats_relay",
+        vec![
+            index(bson::doc! { "region": 1, "ts": 1 }),
+            index_ttl(bson::doc! { "ts": 1 }, 7 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // Per-agent minute buckets from the heartbeat handler (the agent's
+    // owning pod is the single writer).
+    create_indexes(
+        db,
+        "stats_machine",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "ts": 1 }),
+            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "ts": 1 }),
+            index_ttl(bson::doc! { "ts": 1 }, 7 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // Presence transition ledger (online|stale|offline), appended after the
+    // `agents.last_presence` CAS — exactly-once across pods by construction.
+    // Long TTL: transitions are rare and the 1-year uptime strips need them.
+    create_indexes(
+        db,
+        "stats_events",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "agent_id": 1, "ts": 1 }),
+            index_ttl(bson::doc! { "ts": 1 }, 730 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // Per-conference-instance sample buckets from the mediasoup sampler
+    // (owner pod of the room is the single writer).
+    create_indexes(
+        db,
+        "stats_call",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "ts": 1 }),
+            index(bson::doc! { "tenant_id": 1, "room_id": 1, "ts": 1 }),
+            index(bson::doc! { "call_id": 1, "ts": 1 }),
+            index_ttl(bson::doc! { "ts": 1 }, 7 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // One document per call instance (PR-2 lifecycle). `ended_at: null`
+    // scan backs the orphan sweep; TTL on started_at bounds the ledger.
+    create_indexes(
+        db,
+        "call_sessions",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "started_at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "room_id": 1, "started_at": -1 }),
+            index(bson::doc! { "ended_at": 1 }),
+            index_ttl(bson::doc! { "started_at": 1 }, 730 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // Hourly rollups (90 d) and daily rollups (730 d). The rollup task
+    // whole-bucket-replaces via $merge on _id, so these are also upserts.
+    for (coll, ttl_days) in [
+        ("stats_relay_1h", 90u64),
+        ("stats_machine_1h", 90),
+        ("stats_call_1h", 90),
+        ("stats_relay_1d", 730),
+        ("stats_machine_1d", 730),
+        ("stats_call_1d", 730),
+    ] {
+        let mut idx = vec![index_ttl(bson::doc! { "ts": 1 }, ttl_days * 24 * 60 * 60)];
+        if coll.starts_with("stats_relay") {
+            idx.push(index(bson::doc! { "region": 1, "ts": 1 }));
+        } else {
+            idx.push(index(bson::doc! { "tenant_id": 1, "ts": 1 }));
+        }
+        create_indexes(db, coll, idx).await?;
+    }
+
     info!("All indexes ensured");
     Ok(())
 }

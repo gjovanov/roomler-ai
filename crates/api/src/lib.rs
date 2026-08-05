@@ -5,6 +5,7 @@ pub mod middleware;
 pub mod relay_load;
 pub mod routes;
 pub mod state;
+pub mod stats_rollup;
 pub mod storage;
 pub mod ws;
 

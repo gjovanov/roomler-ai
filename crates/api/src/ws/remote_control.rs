@@ -322,13 +322,44 @@ pub async fn handle_agent_socket(
                             // dispatch is a no-op for AgentHeartbeat (handled here);
                             // we still call dispatch so any future routing logic
                             // (e.g. metrics fan-out) only needs one entry point.
-                            let is_heartbeat = matches!(&parsed, ClientMsg::AgentHeartbeat { .. });
+                            // Stats PR-1: destructure the fields BEFORE `parsed`
+                            // moves into dispatch — the sample ingest below needs
+                            // them. The legacy rss/cpu scalars are hardcoded 0 on
+                            // every shipped agent, so they are deliberately NOT
+                            // persisted (a real zero must stay distinguishable
+                            // from "not measured"; the v2 `sys` block covers it).
+                            let heartbeat_sessions =
+                                if let ClientMsg::AgentHeartbeat { active_sessions, .. } = &parsed {
+                                    Some(*active_sessions)
+                                } else {
+                                    None
+                                };
                             if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
                                 warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
                             }
-                            if is_heartbeat {
+                            if let Some(active_sessions) = heartbeat_sessions {
                                 if let Err(e) = state.agents.touch_heartbeat(agent_id).await {
                                     warn!(%agent_id, %e, "agent touch_heartbeat failed");
+                                }
+                                if state.settings.stats.enabled {
+                                    let unix = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        as i64;
+                                    if let Err(e) = state
+                                        .stats
+                                        .upsert_machine_sample(
+                                            tenant_id,
+                                            agent_id,
+                                            unix,
+                                            active_sessions,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        debug!(%agent_id, %e, "machine sample persist failed");
+                                    }
                                 }
                                 // Phase A-1 — refresh the presence claim, gated
                                 // on STILL holding the hub slot (an admin-kicked

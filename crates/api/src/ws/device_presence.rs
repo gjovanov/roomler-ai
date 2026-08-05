@@ -88,6 +88,19 @@ pub async fn note_transition(
         }
     }
 
+    // Stats PR-1: the transition ledger behind the uptime strips. Appended
+    // HERE (after the CAS win) rather than at the call sites so the
+    // sweeper's stale/offline heals are captured too, and exactly-once
+    // across pods comes free from the CAS. Fail-soft like the fan-out.
+    if state.settings.stats.enabled
+        && let Err(e) = state
+            .stats
+            .append_presence_event(tenant_id, agent_id, presence)
+            .await
+    {
+        tracing::debug!(%agent_id, %presence, %e, "presence event persist failed");
+    }
+
     let update = PresenceUpdate {
         agent_id,
         name: name.to_string(),

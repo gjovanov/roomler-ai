@@ -336,6 +336,10 @@ fn test_settings() -> Settings {
         },
         relay: roomler_ai_config::RelaySettings::default(),
         releases: roomler_ai_config::ReleasesSettings::default(),
+        // Stats collection ON (the prod default) so collector-path tests
+        // exercise the real write path; platform_admins is set per-test
+        // via `spawn_with_settings`.
+        stats: roomler_ai_config::StatsSettings::default(),
         // P2b — blocks OFF by default, exactly like a fresh deployment. The
         // renumber tests carve explicitly; the block-carve test flips the
         // flag via `spawn_with_settings`.
