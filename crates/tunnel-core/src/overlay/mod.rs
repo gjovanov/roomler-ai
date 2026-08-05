@@ -44,6 +44,9 @@ pub(crate) mod route_events;
 pub mod router;
 pub mod runtime;
 pub mod tun;
+/// Multi-org P2c — one shared OS TUN carrying N per-org runtimes behind
+/// per-org [`tun::TunIo`] facades with dst-based longest-prefix demux.
+pub mod tun_mux;
 pub mod wg;
 
 /// WFP firewall override (Windows + `overlay-l3`): hard-permit the
