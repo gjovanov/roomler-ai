@@ -538,6 +538,22 @@ pub fn build_router(state: AppState) -> Router {
     // Multi-region relay PoP topology (user-scoped, read-only, no secrets).
     let relay_routes = Router::new().route("/regions", get(routes::remote_control::relay_regions));
 
+    // Stats PR-3 — observability queries. The /admin family is gated by
+    // the platform_admins ObjectId allowlist (404 on miss); the tenant
+    // family gates in-handler (member for overview, MANAGE_AGENTS for
+    // the queryable series — also 404, the client logs out on 403).
+    let admin_stats_routes = Router::new()
+        .route("/relay/current", get(routes::stats::admin_relay_current))
+        .route("/relay/history", get(routes::stats::admin_relay_history))
+        .route("/orgs", get(routes::stats::admin_orgs))
+        .route("/machines", get(routes::stats::admin_machines))
+        .route("/calls", get(routes::stats::admin_calls));
+    let tenant_stats_routes = Router::new()
+        .route("/overview", get(routes::stats::tenant_overview))
+        .route("/machines", get(routes::stats::tenant_machines))
+        .route("/calls", get(routes::stats::tenant_calls))
+        .route("/tunnels", get(routes::stats::tenant_tunnels));
+
     // Compose API
     let api = Router::new()
         // C-6 — per-pod cluster status (identity, counters, gauges).
@@ -558,6 +574,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/releases", releases_routes)
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
+        .nest("/admin/stats", admin_stats_routes)
         .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
@@ -581,6 +598,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/overlay-acl", overlay_policy_routes)
         .nest("/tenant/{tenant_id}/magic-dns", magic_dns_routes)
         .nest("/tenant/{tenant_id}/overlay-block", overlay_block_routes)
+        .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /

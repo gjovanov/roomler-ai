@@ -453,3 +453,191 @@ async fn orphan_sweep_closes_stale_call_state() {
     };
     assert!((3500..3700).contains(&d), "duration ≈1h, got {d}");
 }
+
+// ── Stats PR-3 — platform admin + query APIs ────────────────────────────
+
+#[tokio::test]
+async fn admin_stats_gate_is_objectid_allowlist_with_404_miss() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(admin_id.to_hex());
+    })
+    .await;
+    // The admin endpoints never read the users collection — a minted
+    // token for the allowlisted id suffices to exercise the gate.
+    let tokens = app
+        .state
+        .auth
+        .generate_tokens(admin_id, "padmin@test.io", "padmin")
+        .unwrap();
+    let r = app
+        .auth_get("/api/admin/stats/relay/current", &tokens.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["enabled"], serde_json::json!(true));
+    let r = app
+        .auth_get("/api/admin/stats/orgs", &tokens.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    // Any other authed user → 404 (NEVER 403: the web client wipes
+    // tokens and force-logs-out on 403).
+    let user = app
+        .register_user(
+            "nobody@test.io",
+            "nobody",
+            "No Body",
+            "Password123!",
+            None,
+            None,
+        )
+        .await;
+    let r = app
+        .auth_get("/api/admin/stats/relay/current", &user.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn tenant_stats_visibility_member_vs_admin_vs_outsider() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("statsvis").await;
+    let tid = &seeded.tenant_id;
+
+    // overview: any member 200.
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{tid}/stats/overview"),
+            &seeded.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["enabled"], serde_json::json!(true));
+    assert!(body["machines"]["total"].is_number());
+
+    // Queryable series: plain member (no MANAGE_AGENTS) → 404; owner → 200.
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{tid}/stats/machines?range=7d"),
+            &seeded.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{tid}/stats/machines?range=7d"),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{tid}/stats/tunnels"),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    // Outsider (authed, not a member): overview → 404.
+    let outsider = app
+        .register_user(
+            "out@statsvis.io",
+            "outsider",
+            "Out Sider",
+            "Password123!",
+            None,
+            None,
+        )
+        .await;
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{tid}/stats/overview"),
+            &outsider.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn me_payload_carries_platform_admin_flag() {
+    let app = TestApp::spawn().await;
+    let user = app
+        .register_user(
+            "flag@test.io",
+            "flaguser",
+            "Flag User",
+            "Password123!",
+            None,
+            None,
+        )
+        .await;
+    let r = app
+        .auth_get("/api/auth/me", &user.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["is_platform_admin"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn tenant_calls_series_reads_rollups() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("statsq").await;
+    let tid_oid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let hour = bucket_start(unix_now(), 3600) - 3600;
+    app.state
+        .db
+        .collection::<Document>("stats_call_1h")
+        .insert_one(doc! {
+            "_id": format!("{}:{}", tid_oid.to_hex(), hour),
+            "tenant_id": tid_oid,
+            "ts": bson::DateTime::from_millis(hour * 1000),
+            "sample_count": 10,
+            "participant_seconds": 600_i64,
+            "relayed_seconds": 60_i64,
+            "direct_seconds": 540_i64,
+            "call_seconds": 300_i64,
+            "peak_participants": 4,
+            "send_bps": 1_000_000.0,
+            "recv_bps": 800_000.0,
+            "loss_pct": 0.2,
+            "distinct_rooms": 1,
+        })
+        .await
+        .unwrap();
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{}/stats/calls?range=7d", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let series = body["series"].as_array().unwrap();
+    assert_eq!(series.len(), 1);
+    assert_eq!(series[0]["participant_seconds"], serde_json::json!(600));
+    assert!(series[0]["t"].is_number());
+    assert!(body["totals"]["calls"].is_number());
+}
