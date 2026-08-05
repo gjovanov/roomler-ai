@@ -145,8 +145,9 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_route_metric0: Option<bool>,
     /// Stable UDP port for the overlay's direct sockets
-    /// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`). Built-in default: **41648**
-    /// (per-interface LAN sockets; the public/srflx dialer takes port+1);
+    /// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`). Built-in default: **43648**
+    /// (per-interface LAN sockets; the public/srflx dialer takes base+32; a
+    /// swallowed base walks an 8-port band);
     /// `0` = ephemeral ports (the pre-rc.307 behavior). Rationale: stateful
     /// corp firewalls (Check Point) grandfather UDP flows that predate the
     /// VPN's session table — with a stable port a rebuilt carrier (agent
