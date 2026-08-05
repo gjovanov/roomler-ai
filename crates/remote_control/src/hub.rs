@@ -37,6 +37,12 @@ const SERVER_TX_CAPACITY: usize = 64;
 /// ([`DEFAULT_CONSENT_TIMEOUT`]). Also bounds the `ConsentRequest` link TTL.
 const ASYNC_CONSENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long a session may sit in `Negotiating` (consent granted, `Ready`
+/// pushed) without the controller's SDP offer before the Hub terminates it.
+/// Generous: a live controller sends its offer within milliseconds of
+/// `rc:ready`; only a controller that never received `Ready` waits longer.
+const NEGOTIATING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Loopback-TURN corp-relay (Phase 2) guard. The overlay assigns node IPs from
 /// the RFC 6598 CGNAT range 100.64.0.0/10 (v4) or a ULA `fc00::/7` (v6, derived
 /// from the v4). The Hub only appends a controller-supplied `local_relay` TURN
@@ -304,6 +310,31 @@ impl Hub {
             drop(prev);
         }
         info!("agent {} online", agent_id);
+        // Re-push any consent-pending Request to the fresh connection: an
+        // agent whose control WS flapped between the Request and its
+        // `rc:consent` reply lost the exchange (2026-08-05 pc50045 — three
+        // sessions parked in AwaitingConsent during a VPN-churn window). The
+        // agent handles a duplicate Request idempotently (its consent broker
+        // re-runs; a second `rc:consent` for an already-resolved slot is a
+        // benign "consent already delivered" warn).
+        for e in self.inner.sessions.iter() {
+            let request = {
+                let s = e.value().lock();
+                if s.agent_id == agent_id && s.phase == SessionPhase::AwaitingConsent {
+                    s.pending_request.clone()
+                } else {
+                    None
+                }
+            };
+            if let Some(req) = request {
+                info!(
+                    session = %e.key().to_hex(),
+                    "agent {} reconnected with consent pending — re-pushing Request",
+                    agent_id
+                );
+                let _ = tx.try_send(req);
+            }
+        }
         (tx, cancel, rx)
     }
 
@@ -680,9 +711,7 @@ impl Hub {
         // Move to AwaitingConsent and tell the agent. The agent always gets the
         // Request (it needs the codec / transport context) + the mode directive;
         // for Email/Push it will NOT respond — the owner resolves the slot.
-        self.with_session(session_id, |s| s.transition(SessionPhase::AwaitingConsent))?;
-        let agent_tx = self.agent_tx(agent_id)?;
-        let _ = agent_tx.try_send(ServerMsg::Request {
+        let request = ServerMsg::Request {
             session_id,
             controller_user_id,
             controller_name: controller_name.clone(),
@@ -699,7 +728,17 @@ impl Hub {
             // P6 — the device policy's arbitration mode for the agent's
             // InputArbiter (first session seeds; toggles win afterwards).
             input_mode,
-        });
+        };
+        // Keep the Request while consent is pending so `register_agent` can
+        // re-push it if the agent's control WS flaps before `rc:consent`
+        // lands (the exchange is otherwise lost and the session parks in
+        // AwaitingConsent until the consent timeout).
+        self.with_session(session_id, |s| {
+            s.pending_request = Some(request.clone());
+            s.transition(SessionPhase::AwaitingConsent)
+        })?;
+        let agent_tx = self.agent_tx(agent_id)?;
+        let _ = agent_tx.try_send(request);
 
         self.audit(
             session_id,
@@ -771,9 +810,10 @@ impl Hub {
         match outcome {
             ConsentOutcome::Granted => {
                 self.audit(session_id, agent_id, tenant_id, AuditKind::ConsentGranted);
-                if let Err(e) =
-                    self.with_session(session_id, |s| s.transition(SessionPhase::Negotiating))
-                {
+                if let Err(e) = self.with_session(session_id, |s| {
+                    s.pending_request = None;
+                    s.transition(SessionPhase::Negotiating)
+                }) {
                     warn!("post-consent transition failed: {e}");
                     let _ = self.terminate(session_id, EndReason::Error);
                     return;
@@ -795,6 +835,18 @@ impl Hub {
                         ice_servers: ice,
                     });
                 }
+                // Negotiating reaper: consent granted + `Ready` pushed, but the
+                // controller's offer never arrives when its socket died or its
+                // reply raced a client teardown. Without a deadline the session
+                // sits in `Negotiating` forever while the browser shows
+                // "awaiting consent" (2026-08-05 pc50045). `EndReason::Error`
+                // is deliberate — the controller's terminate handler treats it
+                // as retryable, so a live UI auto-reconnects cleanly.
+                let hub = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(NEGOTIATING_TIMEOUT).await;
+                    hub.reap_stalled_negotiation(session_id);
+                });
             }
             ConsentOutcome::Denied => {
                 self.audit(session_id, agent_id, tenant_id, AuditKind::ConsentDenied);
@@ -807,6 +859,30 @@ impl Hub {
         }
     }
 
+    /// Negotiating reaper body: terminate a session whose consent was granted
+    /// but whose controller never sent an offer (it never heard `Ready`).
+    /// No-op when the offer arrived or the session already moved on.
+    fn reap_stalled_negotiation(&self, session_id: ObjectId) {
+        let stalled = self
+            .inner
+            .sessions
+            .get(&session_id)
+            .map(|arc| {
+                let s = arc.value().lock();
+                s.phase == SessionPhase::Negotiating && !s.offer_seen
+            })
+            .unwrap_or(false);
+        if stalled {
+            warn!(
+                session = %session_id.to_hex(),
+                "consent granted but no SDP offer within {}s — the controller \
+                 likely never received Ready; terminating so its ladder can retry",
+                NEGOTIATING_TIMEOUT.as_secs()
+            );
+            let _ = self.terminate(session_id, EndReason::Error);
+        }
+    }
+
     /// Caller: WS dispatcher when it sees `rc:consent` from agent.
     pub fn deliver_consent(&self, session_id: ObjectId, granted: bool) -> Result<()> {
         let arc = self
@@ -816,6 +892,9 @@ impl Hub {
             .ok_or_else(|| Error::SessionNotFound(session_id.to_hex()))?;
         let slot = {
             let mut s = arc.value().lock();
+            // Consent is in flight — the agent evidently has the Request, so
+            // a later agent reconnect must not replay it.
+            s.pending_request = None;
             s.consent_slot.take()
         };
         slot.ok_or_else(|| Error::BadMessage("consent already delivered"))?
@@ -827,6 +906,9 @@ impl Hub {
     /// Forward controller's SDP offer to the agent.
     pub fn forward_offer(&self, session_id: ObjectId, sdp: String) -> Result<()> {
         let (agent_id, local_relay, region) = self.with_session(session_id, |s| {
+            // The negotiating reaper stands down once an offer exists — from
+            // here on the ICE layer owns liveness.
+            s.offer_seen = true;
             Ok((s.agent_id, s.local_relay.clone(), s.relay_region.clone()))
         })?;
         let user_id = self.controller_for(session_id).unwrap_or_default();
@@ -1307,6 +1389,157 @@ mod tests {
         // Controller should now have a Ready message.
         let m = ctl_rx.try_recv().unwrap();
         assert!(matches!(m, ServerMsg::Ready { .. }));
+    }
+
+    /// 2026-08-05 pc50045 wedge, leg A — an agent whose control WS flaps
+    /// between the `Request` and its `rc:consent` reply loses the exchange.
+    /// `register_agent` must re-push the pending Request on the fresh
+    /// connection, and must NOT re-push once consent was delivered.
+    #[tokio::test]
+    async fn request_repushed_on_agent_reregister() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let owner = ObjectId::new();
+        let (_tx1, _cancel1, mut rx1) =
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                ObjectId::new(),
+                "Goran".into(),
+                ctl_tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // Original connection got the Request…
+        let m = rx1.try_recv().unwrap();
+        assert!(matches!(m, ServerMsg::Request { session_id, .. } if session_id == sid));
+
+        // …then the agent's WS flaps (reply never arrives). The fresh
+        // registration must receive the Request again.
+        let (_tx2, _cancel2, mut rx2) =
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false);
+        let repushed = rx2.try_recv().unwrap();
+        assert!(
+            matches!(repushed, ServerMsg::Request { session_id, .. } if session_id == sid),
+            "fresh agent connection must get the consent-pending Request first"
+        );
+
+        // Consent lands → the pending Request is cleared; a further
+        // reconnect must NOT see it replayed.
+        hub.deliver_consent(sid, true).unwrap();
+        let (_tx3, _cancel3, mut rx3) =
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false);
+        assert!(
+            !matches!(rx3.try_recv(), Ok(ServerMsg::Request { .. })),
+            "no Request replay after consent was delivered"
+        );
+    }
+
+    /// 2026-08-05 pc50045 wedge, leg B — consent granted + `Ready` pushed but
+    /// the controller never sends an offer (it never received `Ready`).
+    /// The negotiating reaper must terminate with `EndReason::Error` (which
+    /// the controller's ladder treats as retryable); a session whose offer
+    /// DID arrive must be left alone.
+    #[tokio::test(start_paused = true)]
+    async fn negotiating_reaper_terminates_offerless_session() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, _agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                ObjectId::new(),
+                "Goran".into(),
+                ctl_tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let _created = ctl_rx.recv().await.unwrap();
+        hub.deliver_consent(sid, true).unwrap();
+        let m = ctl_rx.recv().await.unwrap();
+        assert!(matches!(m, ServerMsg::Ready { .. }));
+
+        // No offer follows. Paused-clock sleep auto-advances through both the
+        // consent watcher and the reaper timer.
+        tokio::time::sleep(NEGOTIATING_TIMEOUT + Duration::from_secs(1)).await;
+        let m = ctl_rx.recv().await.unwrap();
+        assert!(
+            matches!(m, ServerMsg::Terminate { session_id, reason: EndReason::Error } if session_id == sid),
+            "offerless Negotiating session must be reaped with the retryable Error reason"
+        );
+    }
+
+    /// Reaper stand-down: an offer arriving inside the window keeps the
+    /// session alive past the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn negotiating_reaper_spares_session_with_offer() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(),
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+        );
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let sid = hub
+            .create_session(
+                agent_id,
+                ObjectId::new(),
+                "Goran".into(),
+                ctl_tx,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let _created = ctl_rx.recv().await.unwrap();
+        hub.deliver_consent(sid, true).unwrap();
+        let _ready = ctl_rx.recv().await.unwrap();
+        // Drain the agent's Request so the offer forward has room.
+        let _req = agent_rx.recv().await.unwrap();
+
+        hub.forward_offer(sid, "v=0".into()).unwrap();
+        tokio::time::sleep(NEGOTIATING_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            matches!(ctl_rx.try_recv(), Err(_)),
+            "session with an offer must not be reaped at the deadline"
+        );
     }
 
     /// P3 security — `dispatch` refuses session verbs from a connection
