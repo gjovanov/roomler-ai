@@ -353,6 +353,68 @@ pub async fn run_stats_rollup_once(state: &AppState) -> usize {
     done
 }
 
+/// Stats PR-2 — close orphaned call state: `call_sessions` still open
+/// whose room is no longer `in_progress`, and member sessions still open
+/// in such rooms (a pod crash has no leave moment; the startup stale-reset
+/// only runs on boot, this runs every rollup cycle). Durations are stamped
+/// with the close time — bounded error ≤ one cycle. Returns
+/// `(calls_closed, member_docs_touched)`.
+pub async fn close_orphaned_call_state(state: &AppState) -> (u64, u64) {
+    let in_progress: Vec<Bson> = state
+        .db
+        .collection::<Document>("rooms")
+        .distinct("_id", doc! { "conference_status": "in_progress" })
+        .await
+        .unwrap_or_default();
+    let now = DateTime::now();
+    let calls = state
+        .db
+        .collection::<Document>(roomler_ai_services::dao::stats::CALL_SESSIONS)
+        .update_many(
+            doc! { "ended_at": Bson::Null, "room_id": { "$nin": in_progress.clone() } },
+            doc! { "$set": { "ended_at": now, "end_reason": "stale_reset" } },
+        )
+        .await
+        .map(|r| r.modified_count)
+        .unwrap_or_else(|e| {
+            debug!(%e, "orphan sweep: call close failed");
+            0
+        });
+    let now_b = Bson::DateTime(now);
+    let sessions = state
+        .db
+        .collection::<Document>("room_members")
+        .update_many(
+            doc! { "sessions.left_at": Bson::Null, "room_id": { "$nin": in_progress } },
+            vec![doc! { "$set": {
+                "sessions": { "$map": { "input": "$sessions", "as": "s", "in": {
+                    "$cond": [
+                        { "$eq": [ "$$s.left_at", null ] },
+                        { "$mergeObjects": [ "$$s", {
+                            "left_at": now_b.clone(),
+                            "duration": { "$toLong": { "$divide": [
+                                { "$subtract": [ now_b.clone(), "$$s.joined_at" ] },
+                                1000,
+                            ] } },
+                        } ] },
+                        "$$s",
+                    ]
+                }}},
+                "updated_at": now_b.clone(),
+            }}],
+        )
+        .await
+        .map(|r| r.modified_count)
+        .unwrap_or_else(|e| {
+            debug!(%e, "orphan sweep: session close failed");
+            0
+        });
+    if calls > 0 || sessions > 0 {
+        info!(calls, sessions, "orphaned call state closed");
+    }
+    (calls, sessions)
+}
+
 /// Spawn the periodic compactor. First tick a full interval out (so
 /// short-lived TestApps never race a test driving `run_stats_rollup_once`
 /// directly); cluster-singleton per cycle via the Redis NX claim.
@@ -377,6 +439,7 @@ pub fn spawn_stats_rollup(state: AppState) {
                 }
             }
             let done = run_stats_rollup_once(&state).await;
+            close_orphaned_call_state(&state).await;
             info!(passes = done, "stats rollup cycle complete");
         }
     });
