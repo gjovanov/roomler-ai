@@ -114,6 +114,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_demote: None,
         overlay_upward_probe: None,
         rc_max_sessions: None,
+        overlay_direct_port: None,
         shared_encoder: None,
         overlay_rpf: None,
         last_known_good_version: None,

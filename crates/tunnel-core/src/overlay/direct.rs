@@ -41,6 +41,42 @@ pub fn direct_enabled() -> bool {
     }
 }
 
+/// Built-in stable port for the direct sockets (see [`direct_port`]).
+/// Deliberately NOT 41641 (Tailscale's WireGuard port — fleet hosts run both)
+/// and not 51820 (kernel WireGuard's default).
+pub const DEFAULT_DIRECT_PORT: u16 = 41648;
+
+/// Stable UDP port for the overlay's direct sockets
+/// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`; config key `overlay_direct_port`).
+///
+/// Per-interface LAN sockets bind `(iface_ip, port)`; the public/srflx
+/// dialer binds `(0.0.0.0, port+1)` (a wildcard bind on the SAME port as a
+/// specific-IP bind fails without SO_REUSEADDR). `0` = ephemeral ports, the
+/// pre-rc.307 behavior.
+///
+/// Why a stable port: stateful corp firewalls (Check Point on CORPLAP-1)
+/// GRANDFATHER UDP flows that predate the VPN's session table — direct
+/// carriers established before the VPN connects keep working, but any
+/// rebuild (agent update, control-WS reconnect on a server deploy) used to
+/// bind fresh ephemeral ports, presenting a NEW 5-tuple the VPN then drops,
+/// relay-locking the node until the next VPN-off window. With both fleet
+/// ends on stable ports, a rebuilt carrier reproduces the SAME 5-tuple and
+/// keeps riding the grandfathered session (2026-08-05 field diagnosis:
+/// 7/7 VPN-off rebuilds promoted LAN direct, 10/10 VPN-on rebuilds never).
+///
+/// Unparseable values fall back to the default (a typo must not silently
+/// turn the feature off fleet-wide).
+pub fn direct_port() -> u16 {
+    match crate::env::node_env("OVERLAY_DIRECT_PORT") {
+        Some(v) => match v.trim().parse::<u32>() {
+            // 65535 excluded: the public dialer needs port+1.
+            Ok(n) if n <= 65534 => n as u16,
+            _ => DEFAULT_DIRECT_PORT,
+        },
+        None => DEFAULT_DIRECT_PORT,
+    }
+}
+
 /// Enumerate this node's usable LAN IPv4 addresses across **all** interfaces,
 /// so a multi-homed host advertises every LAN endpoint and a peer matches
 /// whichever is on its subnet.
@@ -962,6 +998,45 @@ mod tests {
         for v in ["0", "false", "FALSE", "No", "off", " off "] {
             unsafe { std::env::set_var(n, v) };
             assert!(!make_before_break_enabled(), "{v:?} → kill-switch OFF");
+        }
+        unsafe {
+            match rn {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+            match ra {
+                Some(v) => std::env::set_var(a, v),
+                None => std::env::remove_var(a),
+            }
+        }
+    }
+
+    /// rc.307 — stable direct-port resolution: unset → the built-in default;
+    /// a number → itself; `0` → ephemeral opt-out; 65535 (would overflow the
+    /// public dialer's `port+1`) and garbage → the default, NEVER silently
+    /// ephemeral (a typo must not turn the feature off fleet-wide).
+    #[test]
+    fn direct_port_resolution() {
+        let n = "ROOMLER_NODE_OVERLAY_DIRECT_PORT";
+        let a = "ROOMLER_AGENT_OVERLAY_DIRECT_PORT";
+        let (rn, ra) = (std::env::var(n).ok(), std::env::var(a).ok());
+        unsafe {
+            std::env::remove_var(n);
+            std::env::remove_var(a);
+        }
+        assert_eq!(direct_port(), DEFAULT_DIRECT_PORT, "unset → default");
+        for (v, want) in [
+            ("41648", 41648u16),
+            (" 12345 ", 12345),
+            ("0", 0),
+            ("65534", 65534),
+            ("65535", DEFAULT_DIRECT_PORT),
+            ("70000", DEFAULT_DIRECT_PORT),
+            ("porty", DEFAULT_DIRECT_PORT),
+            ("", DEFAULT_DIRECT_PORT),
+        ] {
+            unsafe { std::env::set_var(n, v) };
+            assert_eq!(direct_port(), want, "{v:?}");
         }
         unsafe {
             match rn {
