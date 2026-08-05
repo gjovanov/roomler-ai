@@ -17,9 +17,17 @@ name: Cache janitor
 #   - tag-ref caches                   → delete (never restorable by any
 #     other run; release workflows no longer create them, this catches
 #     stragglers from branches that predate the save-if gates)
+#   - master-ref release seeds AGE-based refresh: with the env-hash-free
+#     flat keys (PR #266), GitHub's cache immutability means every
+#     post-release reseed SKIPS its save ("cache already exists") — the
+#     seed slowly stales as Cargo.lock drifts from its snapshot (observed
+#     08-01→08-05: warm releases crept 10–12 → 14–17 min). So: delete
+#     master seeds CREATED > 7 days ago and immediately dispatch the
+#     artifacts-only rehearsal, so a fresh seed lands within ~25 min of
+#     the 04:43 sweep — before the day's first tag. No cold release.
 #
-# Master-ref seeds survive indefinitely: every tag build restores them
-# (access refresh) and the post-release reseed job replaces them anyway.
+# Master-ref seeds otherwise survive indefinitely: every tag build
+# restores them (access refresh keeps them out of the idle sweeps).
 
 on:
   schedule:
@@ -36,23 +44,37 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Delete stale entries
+        id: sweep
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           now=$(date +%s)
           gh api --paginate 'repos/${{ github.repository }}/actions/caches?per_page=100' \
-            --jq '.actions_caches[] | [.id, .ref, .last_accessed_at, .size_in_bytes, .key] | @tsv' > /tmp/caches.tsv
+            --jq '.actions_caches[] | [.id, .ref, .last_accessed_at, .size_in_bytes, .key, .created_at] | @tsv' > /tmp/caches.tsv
           before=$(awk -F'\t' '{s+=$4} END{printf "%d", s/1048576}' /tmp/caches.tsv)
           deleted=0
           freed=0
-          while IFS=$'\t' read -r id ref last size key; do
+          seed_refresh=0
+          while IFS=$'\t' read -r id ref last size key created; do
             last_s=$(date -d "$last" +%s)
             idle=$(( now - last_s ))
+            created_s=$(date -d "$created" +%s)
+            age=$(( now - created_s ))
             del=""
             case "$ref" in
               refs/pull/*) [ "$idle" -gt 172800 ] && del="pr-idle" ;;
               refs/tags/*|refs/heads/refs/tags/*) del="tag-ref" ;;
+              refs/heads/master)
+                # Release-lane seed refresh: flat keys are immutable, so a
+                # week-old seed must be deleted for the next reseed (which
+                # this workflow dispatches below) to save a fresh one.
+                case "$key" in
+                  v0-rust-agent-*|v0-rust-installer-smoke-windows*)
+                    [ "$age" -gt 604800 ] && { del="seed-age-7d"; seed_refresh=1; }
+                    ;;
+                esac
+                ;;
             esac
             [ -z "$del" ] && [ "$idle" -gt 345600 ] && del="idle-96h"
             if [ -n "$del" ]; then
@@ -65,3 +87,26 @@ jobs:
           done < /tmp/caches.tsv
           echo "---"
           echo "pool before: ${before} MB; deleted ${deleted} entries; freed $((freed / 1048576)) MB"
+          echo "seed_refresh=${seed_refresh}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch reseed rehearsal (seed was age-refreshed)
+        if: steps.sweep.outputs.seed_refresh == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Same GITHUB_TOKEN workflow_dispatch exception as
+          # seed-release-caches.yml; version read from master so
+          # validate-version passes.
+          version=$(gh api 'repos/${{ github.repository }}/contents/Cargo.toml?ref=master' --jq .content | base64 -d | awk '
+            /^\[workspace\.package\]/ {in_section=1; next}
+            /^\[/ {in_section=0}
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ')
+          echo "Re-seeding after age-based seed deletion (workspace ${version})"
+          gh workflow run release-agent.yml --ref master \
+            -f version="${version}" -f publish_release=false
