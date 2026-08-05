@@ -36,6 +36,13 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Join the L3 overlay mesh (WireGuard-style private network). Default: off.",
     ),
     (
+        "overlay_multi_org",
+        "bool",
+        "Multi-org: let secondary [[orgs]] entries with overlay_mode=\"tun\" join \
+         their own tenant's mesh over the ONE shared TUN (same server_url as the \
+         primary required). Default: off.",
+    ),
+    (
         "overlay_advertised_routes",
         "list",
         "CIDRs this node offers to route for overlay peers (subnet router); admin approval required. Comma-separated.",
@@ -291,6 +298,7 @@ pub fn entry_for(cfg: &AgentConfig, key: &str) -> Option<ConfigEntry> {
 fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
     match key {
         "overlay_enabled" => Some(fmt_bool(cfg.overlay_enabled)),
+        "overlay_multi_org" => Some(fmt_bool(cfg.overlay_multi_org)),
         "overlay_advertised_routes" => Some(cfg.overlay_advertised_routes.join(",")),
         "overlay_exit_node_enabled" => Some(fmt_bool(cfg.overlay_exit_node_enabled)),
         "overlay_exit_node" => cfg.overlay_exit_node.clone(),
@@ -356,6 +364,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
 pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<(), String> {
     match key {
         "overlay_enabled" => cfg.overlay_enabled = parse_bool_or(value, false)?,
+        "overlay_multi_org" => cfg.overlay_multi_org = parse_bool_or(value, false)?,
         "overlay_advertised_routes" => cfg.overlay_advertised_routes = parse_cidr_list(value)?,
         "overlay_exit_node_enabled" => cfg.overlay_exit_node_enabled = parse_bool_or(value, false)?,
         "overlay_exit_node" => {
@@ -1016,6 +1025,25 @@ mod tests {
         assert!(cfg.auto_grant_session, "default_auto_grant_session is true");
         apply(&mut cfg, "overlay_enabled", None).unwrap();
         assert!(!cfg.overlay_enabled, "overlay default is off");
+    }
+
+    /// P2c — the multi-org TUN opt-in round-trips through set/echo and
+    /// clears back to its off default.
+    #[test]
+    fn overlay_multi_org_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            current_value(&cfg, "overlay_multi_org").as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_multi_org", Some("true")).unwrap();
+        assert!(cfg.overlay_multi_org);
+        assert_eq!(
+            current_value(&cfg, "overlay_multi_org").as_deref(),
+            Some("true")
+        );
+        apply(&mut cfg, "overlay_multi_org", None).unwrap();
+        assert!(!cfg.overlay_multi_org, "multi-org TUN default is off");
     }
 
     #[test]

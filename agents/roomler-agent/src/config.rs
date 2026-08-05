@@ -337,6 +337,21 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_enabled: bool,
 
+    /// Multi-org P2c: let SECONDARY `[[orgs]]` entries with
+    /// `overlay_mode = "tun"` join their own tenant's mesh over the ONE
+    /// shared TUN device (per-org facades + destination demux — see
+    /// `tunnel_core::overlay::tun_mux`). Default off: the P1 stance
+    /// (secondaries never join) until the operator opts in. Requires the
+    /// secondary to share the primary's `server_url` (same control plane)
+    /// and to hold its own WG key; a tenant still on the shared legacy
+    /// `/10` can coexist with carved-block orgs, but TWO un-migrated
+    /// tenants on one host are refused at TUN registration (renumber one —
+    /// `docs/multi-org.md` §4.3). Mutually exclusive with netstack mode
+    /// (`ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`): when this is on, the OS
+    /// TUN path is used regardless.
+    #[serde(default)]
+    pub overlay_multi_org: bool,
+
     /// Phase 3b: this node's persisted WireGuard Curve25519 secret key
     /// (base64). Generated on the first overlay-enabled startup in `main`;
     /// the public key is what the netmap distributes. `None` until then.
@@ -534,9 +549,18 @@ impl AgentConfig {
 
     /// The AgentConfig an org supervisor runs with: machine identity +
     /// operator knobs from `self`, enrollment identity + org-scoped fields
-    /// from the entry. P1: the overlay is FORCED OFF for secondaries (no
-    /// second TUN/netstack runtime until P2's tenant-block addressing), and
-    /// declared tunnel routes are reconciled only by the primary-side
+    /// from the entry.
+    ///
+    /// Overlay participation for a secondary (P2c lifts the P1 force-off):
+    /// requires ALL of `overlay_multi_org` (the operator opt-in),
+    /// `overlay_mode = "tun"` on the entry, the SAME `server_url` as the
+    /// primary (one control plane — the shared TUN's demux is only decidable
+    /// against blocks one registry carved), and the org's OWN WG key (minted
+    /// at enroll-append; NEVER the primary's). Anything else keeps the P1
+    /// behaviour: overlay off for that org. Netstack mode for secondaries
+    /// stays unimplemented (the netstack statics are process-global), and
+    /// exit-node roles stay primary-only (split-defaults are host-global).
+    /// Declared tunnel routes are reconciled only by the primary-side
     /// reconciler.
     pub fn for_org(&self, org: &OrgEntry) -> AgentConfig {
         let mut c = self.clone();
@@ -545,7 +569,10 @@ impl AgentConfig {
         c.agent_token = org.agent_token.clone();
         c.agent_id = org.agent_id.clone();
         c.tenant_id = org.tenant_id.clone();
-        c.overlay_enabled = false;
+        c.overlay_enabled = self.overlay_multi_org
+            && org.overlay_mode == OrgOverlayMode::Tun
+            && org.server_url == self.server_url
+            && org.overlay_wg_secret_key.is_some();
         c.overlay_wg_secret_key = org.overlay_wg_secret_key.clone();
         c.overlay_advertised_routes = org.overlay_advertised_routes.clone();
         c.overlay_exit_node_enabled = false;
@@ -1170,6 +1197,7 @@ mod tests {
             forward_acl: AgentForwardAcl::default(),
             virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig::default(),
             overlay_enabled: false,
+            overlay_multi_org: false,
             overlay_wg_secret_key: None,
             overlay_advertised_routes: Vec::new(),
             overlay_exit_node_enabled: false,
@@ -1282,6 +1310,58 @@ mod tests {
         assert!(oc.overlay_exit_node.is_none());
         assert!(oc.tunnel_routes.is_empty());
         assert!(oc.orgs.is_empty(), "no recursive org table");
+    }
+
+    /// P2c — the secondary-overlay gate lifts ONLY when every condition
+    /// holds: the operator flag, `overlay_mode = tun`, the primary's own
+    /// control plane, and the org's own WG key. Each missing leg keeps the
+    /// P1 behaviour for exactly that org.
+    #[test]
+    fn for_org_lifts_overlay_only_under_the_p2c_gate() {
+        let mut cfg = fixture();
+        cfg.overlay_multi_org = true;
+        let mut org = org_fixture("acme", "tid-acme");
+        org.overlay_mode = OrgOverlayMode::Tun;
+        org.server_url = cfg.server_url.clone(); // same control plane
+        org.overlay_wg_secret_key = Some("ACME-KEY".into());
+
+        // All four conditions hold ⇒ the secondary joins.
+        assert!(cfg.for_org(&org).overlay_enabled, "full gate ⇒ ON");
+
+        // Flag off ⇒ P1 behaviour, everything else unchanged.
+        cfg.overlay_multi_org = false;
+        assert!(!cfg.for_org(&org).overlay_enabled, "no operator opt-in");
+        cfg.overlay_multi_org = true;
+
+        // A foreign control plane can't ride the shared TUN (its blocks come
+        // from a different registry — the demux would be undecidable).
+        let mut foreign = org.clone();
+        foreign.server_url = "https://other.invalid".into();
+        assert!(!cfg.for_org(&foreign).overlay_enabled, "foreign server");
+
+        // Netstack / off modes stay off (netstack statics are process-global).
+        let mut ns = org.clone();
+        ns.overlay_mode = OrgOverlayMode::Netstack;
+        assert!(!cfg.for_org(&ns).overlay_enabled, "netstack secondary");
+        let mut off = org.clone();
+        off.overlay_mode = OrgOverlayMode::Off;
+        assert!(!cfg.for_org(&off).overlay_enabled, "mode off");
+
+        // No per-org WG key ⇒ can't join (and must never borrow the
+        // primary's — cross-org pubkey correlation).
+        let mut keyless = org.clone();
+        keyless.overlay_wg_secret_key = None;
+        let oc = cfg.for_org(&keyless);
+        assert!(!oc.overlay_enabled, "keyless org stays off");
+        assert!(
+            oc.overlay_wg_secret_key.is_none(),
+            "never the primary's key"
+        );
+
+        // Exit roles remain primary-only regardless of the gate.
+        let on = cfg.for_org(&org);
+        assert!(!on.overlay_exit_node_enabled);
+        assert!(on.overlay_exit_node.is_none());
     }
 
     #[test]

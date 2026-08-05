@@ -220,15 +220,46 @@ its free pool → cycle every agent's WS.
 > primitive for them. They are listed in the response under
 > `reconnect_required` and pick the new address up on their next reconnect.
 
-### 4.4 What is NOT done: P2c
+### 4.4 P2c: the shared TUN (agent half)
 
-A multi-org host still runs TUN for its **primary org only** — P1 forces
-secondaries to `overlay_mode=off`. Turning a second org on needs the agent
-half: one shared `SystemTun` behind per-org `TunIo` facades, longest-prefix
-demux over the union of per-org tables, N self-IPs with per-block on-link
-routes, and single-owner rules for exit nodes and duplicate advertised
-subnets. **P2b is that work's prerequisite** — disjoint blocks are what make
-dst-based demux decidable in the first place.
+One `roomler` adapter, N per-org runtimes. Each org's `OverlayRuntime` gets a
+`MuxPort` facade (`tunnel_core::overlay::tun_mux`) that looks exactly like its
+own TUN; a single reader pump demuxes the real device's packets by
+**destination, longest prefix first**. The demux table needs no netmap
+plumbing — it is built from the very calls that install OS routes
+(`add_peer_route` `/32`s, `add_cidr_route` subnet routes + exit
+split-defaults, plus each org's own block from registration), so the OS table
+and the demux table cannot drift. Derived-ULA v6 unmaps to its embedded v4;
+non-ULA v6 (an exit client's egress) matches the installed v6 routes.
+
+Enable it (default **off**):
+
+```toml
+overlay_multi_org = true          # or: roomler config set overlay_multi_org true
+
+[[orgs]]
+label        = "acme"
+overlay_mode = "tun"              # + the org's own WG key, minted at enroll-append
+```
+
+The gate requires all of: the flag, `overlay_mode = "tun"`, the **same
+`server_url` as the primary** (one control plane — the demux is only decidable
+against blocks one registry carved), and the org's own WG key. The device
+comes up with the first org's address; each later org's self-IP is added to
+the adapter (`SystemTun::add_address_sync`), whose assignment carries the
+block's connected route.
+
+**Why P2b is the prerequisite:** a legacy `/10` org and any number of
+carved-block orgs coexist (longest prefix wins, and carved blocks start above
+the legacy reserve) — but **two un-migrated `/10` tenants are undecidable**,
+and the mux refuses the second at registration (`AddrInUse`, warn-logged).
+That org's overlay withholds until one tenant renumbers (§4.3); the other
+orgs' meshes stay up.
+
+Still primary-only, deliberately: **exit-node roles** (split-defaults and the
+NRPT "." steer are host-global) and **netstack mode** (its SOCKS front and
+handle channel are process-global singletons — with `overlay_multi_org` on,
+the OS TUN is used regardless of `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`).
 
 ---
 
@@ -351,11 +382,18 @@ RC session. Cross-org remote control means separate tabs.
 
 ## 12. Open items
 
-- **P2c** — the agent-side shared TUN + per-org demux (§4.4). Until then a
-  multi-org host meshes in its primary org only.
+- **P2c field validation** — the shared-TUN mux (§4.4) is shipped default-off
+  with the demux, refusal, and gate properties unit-locked; a two-org device
+  on real carved blocks still needs its field hours before the flag can be
+  recommended broadly. macOS is excluded (`add_address_sync` refuses — utun
+  aliasing is future work).
 - **Netstack per-org statics** (`NS_HANDLE`'s single watch channel,
-  `SOCKS_BOUND` once-ever) are untangled only as far as the foreign-server
-  fallback needs; more than one netstack org is validated-and-deferred.
+  `SOCKS_BOUND` once-ever) keep netstack single-org; `overlay_multi_org`
+  overrides netstack mode to the OS TUN, and a foreign-server org still has
+  no overlay path at all.
+- **A removed org's adapter addresses linger** until the daemon restarts —
+  `add_address_sync` has no remove twin yet; harmless (the address answers
+  nothing once its runtime is gone) but untidy on a long-lived host.
 - **Consent labelling per org** — a consent prompt does not yet say which org
   is asking.
 - **Block reclaim** — quarantined blocks are never automatically re-issued.
