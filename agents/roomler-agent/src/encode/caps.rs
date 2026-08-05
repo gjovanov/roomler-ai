@@ -449,6 +449,10 @@ fn compute_caps() -> AgentCaps {
         // hold), so the server can safely lift the P3 single-INPUT-holder
         // downgrade for this agent.
         input: vec!["arbiter".into(), "exclusive".into(), "ghost-cursor".into()],
+        // Multi-org — this agent honours `rc:agent.join_org` (enroll into an
+        // additional org from a pushed token, no restart). Build-independent:
+        // the enroll + config paths are in every flavour.
+        multi_org: vec!["join".into()],
     }
 }
 
