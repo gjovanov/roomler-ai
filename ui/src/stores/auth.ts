@@ -10,6 +10,9 @@ interface User {
   username: string
   display_name: string
   avatar?: string
+  /** Platform-operator allowlist member (stats PR-4) — gates the
+   *  Observability nav/view; the server re-checks every request. */
+  is_platform_admin?: boolean
 }
 
 export const useAuthStore = defineStore('auth', () => {
