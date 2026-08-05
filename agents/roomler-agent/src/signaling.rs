@@ -307,6 +307,13 @@ pub async fn run(
     // so the channel never fully closes — a closed receiver would busy-
     // spin the select! — even when the overlay is disabled.
     let (kill_tx, mut kill_rx) = mpsc::channel::<bson::oid::ObjectId>(4);
+    // rc.307 (B) — multi-region DERP admission-ticket cache, hoisted from
+    // connect_once scope: the PERSISTENT overlay runtime's regional-DERP
+    // factory captures this slot ONCE, so a per-connection slot went stale
+    // after the first reconnect (nothing refilled the captured copy →
+    // tickets expired → regional relays permanently degraded to central).
+    // Process-scope + threaded into every connection, like rtt_sample_slot.
+    let derp_ticket_slot: crate::relay_probe::DerpTicketSlot = Default::default();
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
     // just doesn't get the visual "you're being watched" cue.
@@ -348,6 +355,7 @@ pub async fn run(
             connected.clone(),
             overlay_view_tx.clone(),
             rtt_sample_slot.clone(),
+            derp_ticket_slot.clone(),
             tunnel_hub.clone(),
             &mut kill_rx,
         )
@@ -618,6 +626,8 @@ async fn connect_once(
     // B1 — this connection publishes its downgraded overlay event sender
     // here (the RTT prober bridge reads it).
     rtt_sample_slot: RttSampleSlot,
+    // rc.307 (B) — process-scope DERP admission-ticket cache (see run()).
+    derp_ticket_slot: crate::relay_probe::DerpTicketSlot,
     tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
@@ -724,9 +734,6 @@ async fn connect_once(
             outbound_tx.clone(),
         ));
     }
-    // Multi-region DERP: the per-connection admission-ticket cache the
-    // regional dialer reads (filled by the DerpTicket arm below).
-    let derp_ticket_slot: crate::relay_probe::DerpTicketSlot = Default::default();
     // P3b-2 PR-C: publish this connection's egress so tunnel-client flow
     // supervisors can open sessions over it; the guard clears it to `None` on
     // every exit path (like `_connected_guard`), so a supervisor holding the
