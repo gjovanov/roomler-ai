@@ -856,13 +856,16 @@ async fn connect_once(
     // `agents.last_seen_at` so a quiet but connected agent doesn't
     // appear "online forever" if its WS dies silently. 30 s cadence
     // pairs with a "online if last_seen_at > now - 90 s" rule on the
-    // server side. rss_mb / cpu_pct are 0 for v1 — populating them
-    // needs a process-self metrics crate (sysinfo) that we'd rather
-    // ship in a follow-up. active_sessions comes straight from the
-    // peer map.
+    // server side. active_sessions comes straight from the peer map.
+    // Stats PR-5: the promised sysinfo follow-up — every heartbeat now
+    // carries an `AgentSysStats` block (process rss/cpu, host net
+    // counters, overlay carrier tallies + median peer RTT from the
+    // published view). The legacy top-level rss/cpu fields are filled
+    // too, but the server reads only the block.
     let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // Swallow the immediate first tick.
+    let mut sys_sampler = crate::telemetry::SysSampler::new();
 
     // Receive-liveness stamp: refreshed on EVERY inbound frame (the Pongs the
     // server auto-sends for our keepalive Pings count), checked against
@@ -938,10 +941,13 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             _ = heartbeat.tick() => {
+                // The borrow guard is dropped before the send await.
+                let sys = sys_sampler.sample(&overlay_view_tx.borrow());
                 let hb = ClientMsg::AgentHeartbeat {
-                    rss_mb: 0,
-                    cpu_pct: 0.0,
+                    rss_mb: sys.rss_mb,
+                    cpu_pct: sys.cpu_pct,
                     active_sessions: peers.len().min(u8::MAX as usize) as u8,
+                    sys: Some(sys),
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
