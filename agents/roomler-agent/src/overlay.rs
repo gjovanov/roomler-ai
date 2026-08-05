@@ -40,6 +40,47 @@ use crate::config::AgentConfig;
 /// overhead on any path.
 const OVERLAY_MTU: u16 = 1280;
 
+/// rc.307 (B) — everything a spawned runtime's behavior was derived from.
+/// A reconnect with an EQUAL fingerprint re-attaches the persistent runtime
+/// (carriers survive); any difference spawns a fresh one (the old dies when
+/// its last event-sender clone drops). Live-read env flags (MBB, DERP, tier
+/// gates, …) are deliberately NOT here — `make_join` re-reads them on every
+/// re-join, so they don't need a rebuild.
+#[derive(Clone, PartialEq)]
+struct RuntimeFingerprint {
+    wg_public_key: String,
+    netstack_port: Option<u16>,
+    advertised_routes: Vec<String>,
+    exit_node: Option<String>,
+    tenant_id: String,
+    server_url: String,
+    /// The local LAN interface IP set (sorted). The config-derived fields
+    /// above are process-immutable (config changes restart the daemon), so
+    /// this is the ONE input that actually changes at runtime: after a
+    /// network move the persistent runtime's per-interface sockets are bound
+    /// to dead addresses and its punch socket STUNs from a corpse — a
+    /// changed set forces the full rebuild a move needs. IP set only (not
+    /// ifindexes): Windows renumbers ifindexes on adapter events without the
+    /// addresses changing, and the sockets are bound to addresses.
+    lan_ips: Vec<String>,
+}
+
+struct RuntimeSlot {
+    fingerprint: RuntimeFingerprint,
+    evt_tx: mpsc::Sender<OverlayEvent>,
+}
+
+/// rc.307 (B) — the process-lifetime runtime slot. The overlay runtime used
+/// to be scoped to ONE control-WS session (every server deploy / pod roll /
+/// receive-liveness cycle tore down all carriers and rebuilt from empty —
+/// which relay-locks a corp-VPN'd host whose firewall only grandfathers
+/// established UDP flows). Now the first session spawns the runtime and
+/// every later session RE-ATTACHES it (`OverlayEvent::Reattach`): the
+/// runtime swaps its outbound sender, re-joins, and reconciles the reply
+/// netmap against live state. The data plane (TUN, WG peers, carriers)
+/// keeps flowing through the whole control-plane outage.
+static RUNTIME_SLOT: std::sync::Mutex<Option<RuntimeSlot>> = std::sync::Mutex::new(None);
+
 /// If overlay is enabled, spawn the node runtime (relay mode) and return
 /// the channel its control events arrive on. `None` when overlay is
 /// disabled or the node has no persisted WG key (generated at startup in
@@ -51,6 +92,13 @@ pub async fn maybe_start(
     derp_ticket_slot: crate::relay_probe::DerpTicketSlot,
 ) -> Option<mpsc::Sender<OverlayEvent>> {
     if !cfg.overlay_enabled {
+        // Drop any persistent runtime's slot entry: once the sessions'
+        // event-sender clones are gone too, its channel closes and it tears
+        // down cleanly.
+        RUNTIME_SLOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         return None;
     }
     let Some(keypair) = cfg
@@ -61,6 +109,49 @@ pub async fn maybe_start(
         warn!("overlay enabled but no/invalid WG key persisted; not joining the mesh");
         return None;
     };
+
+    // rc.307 (B) — re-attach the persistent runtime when nothing that shaped
+    // it changed. Take the sender clone OUTSIDE the lock before awaiting.
+    let fingerprint = RuntimeFingerprint {
+        wg_public_key: keypair.public_base64(),
+        netstack_port: netstack_socks_port(),
+        advertised_routes: cfg.effective_overlay_advertised_routes(),
+        exit_node: cfg.overlay_exit_node.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        server_url: cfg.server_url.clone(),
+        lan_ips: {
+            let mut ips: Vec<String> = tunnel_core::overlay::direct::gather_lan_interfaces()
+                .into_iter()
+                .map(|(ip, _)| ip.to_string())
+                .collect();
+            ips.sort();
+            ips
+        },
+    };
+    let existing = {
+        let slot = RUNTIME_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref()
+            .filter(|s| s.fingerprint == fingerprint)
+            .map(|s| s.evt_tx.clone())
+    };
+    if let Some(evt_tx) = existing {
+        match evt_tx
+            .send(OverlayEvent::Reattach {
+                outbound: outbound.clone(),
+            })
+            .await
+        {
+            Ok(()) => {
+                info!("overlay: re-attached the persistent node runtime (carriers intact)");
+                return Some(evt_tx);
+            }
+            Err(_) => {
+                // The runtime exited (self_ip change, TUN failure). Fall
+                // through to a fresh spawn.
+                info!("overlay: previous node runtime exited; starting fresh");
+            }
+        }
+    }
 
     let (evt_tx, evt_rx) = mpsc::channel::<OverlayEvent>(64);
 
@@ -149,6 +240,13 @@ pub async fn maybe_start(
     // trickles each relayed address post-allocation — so join carries none.
     tokio::spawn(rt.run(evt_rx, Vec::new()));
     info!("overlay: node runtime started (relay mode)");
+    // rc.307 (B) — remember it for the next session's re-attach. Replacing a
+    // fingerprint-mismatched slot drops the old runtime's last stored sender
+    // clone; it tears down once the old session's clones are gone too.
+    *RUNTIME_SLOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(RuntimeSlot {
+        fingerprint,
+        evt_tx: evt_tx.clone(),
+    });
     Some(evt_tx)
 }
 
