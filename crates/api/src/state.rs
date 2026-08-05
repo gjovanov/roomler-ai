@@ -91,6 +91,10 @@ pub struct AppState {
     pub remote_audit: Arc<RemoteAuditDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
+    /// Observability sample sinks (`stats_*` collections) — idempotent
+    /// deterministic-`_id` upserts, so every collector is 2-pod safe.
+    /// Writers gate on `settings.stats.enabled`.
+    pub stats: Arc<roomler_ai_services::dao::stats::StatsDao>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
     pub rc_hub: Arc<Hub>,
@@ -331,13 +335,20 @@ impl AppState {
         let agent_logs = Arc::new(roomler_ai_services::dao::agent_log::AgentLogDao::new(&db));
 
         let consent_requests = Arc::new(ConsentRequestDao::new(&db));
+        let stats = Arc::new(roomler_ai_services::dao::stats::StatsDao::new(&db));
 
         let turn_map = Arc::new(build_turn_map(&settings));
         // P6b — live per-region load (written by the /stats poller, consulted
         // at issuance). Spawned only when regions are enabled and at least
-        // one carries a derp_url (the stats host).
+        // one carries a derp_url (the stats host). The stats sink makes each
+        // poll tick durable (`stats_relay` buckets) when stats are enabled.
         let relay_load: roomler_ai_remote_control::turn_creds::RelayLoadMap = Default::default();
-        crate::relay_load::spawn_poller(turn_map.clone(), relay_load.clone(), &settings.relay);
+        crate::relay_load::spawn_poller(
+            turn_map.clone(),
+            relay_load.clone(),
+            &settings.relay,
+            settings.stats.enabled.then(|| stats.clone()),
+        );
         // Multi-region DERP tickets: load the signer when a key is configured;
         // log the derived public key so the operator can copy it to PoPs.
         // Regions carrying derp_urls without a key = loud warn, never fatal.
@@ -757,6 +768,7 @@ impl AppState {
             remote_audit,
             agent_crashes,
             agent_logs,
+            stats,
             consent_requests,
             rc_hub,
             turn_map,
@@ -804,6 +816,10 @@ impl AppState {
         // out so tests driving `run_presence_sweep` directly stay
         // deterministic).
         crate::ws::device_presence::spawn_sweeper(state.clone());
+        // Stats PR-1 — the rollup compactor (raw → _1h → _1d), cluster-
+        // singleton per cycle via the same DB-name-scoped claim pattern.
+        // No-op task when `stats.enabled=false`.
+        crate::stats_rollup::spawn_stats_rollup(state.clone());
 
         Ok(state)
     }
