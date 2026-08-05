@@ -44,6 +44,12 @@ pub struct UserResponse {
     pub username: String,
     pub display_name: String,
     pub avatar: Option<String>,
+    /// Stats PR-3 — member of the platform-operator allowlist
+    /// (`ROOMLER__STATS__PLATFORM_ADMINS`, user OBJECTIDS). Purely
+    /// informational for the client (nav gating); every /api/admin/stats
+    /// route re-checks server-side.
+    #[serde(default)]
+    pub is_platform_admin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +213,7 @@ pub async fn register(
                     username: user.username,
                     display_name: user.display_name,
                     avatar: user.avatar,
+                    is_platform_admin: state.platform_admins.contains(&user_id),
                 }),
             }),
         ));
@@ -278,6 +285,7 @@ pub async fn login(
             username: user.username,
             display_name: user.display_name,
             avatar: user.avatar,
+            is_platform_admin: state.platform_admins.contains(&user_id),
         },
         invite_tenant: None,
     };
@@ -304,6 +312,7 @@ pub async fn me(
         username: user.username,
         display_name: user.display_name,
         avatar: user.avatar,
+        is_platform_admin: state.platform_admins.contains(&auth.user_id),
     }))
 }
 
@@ -339,6 +348,7 @@ pub async fn refresh(
             username: user.username,
             display_name: user.display_name,
             avatar: user.avatar,
+            is_platform_admin: state.platform_admins.contains(&user_id),
         },
         invite_tenant: None,
     };
