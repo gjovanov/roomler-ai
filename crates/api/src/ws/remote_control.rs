@@ -620,6 +620,9 @@ pub async fn dispatch_controller_rc(
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
     conn_established_ms: i64,
+    // PR-2 relay: this browser socket's connection id - the address the
+    // owner pod's proxy pump routes replies back to.
+    connection_id: &str,
 ) -> bool {
     let hub = &state.rc_hub;
     let Ok(parsed) = serde_json::from_str::<ClientMsg>(text) else {
@@ -633,7 +636,8 @@ pub async fn dispatch_controller_rc(
         controller_name: Some(controller_name.to_string()),
         controller_tx: Some(controller_tx.clone()),
         consent_mode,
-        override_reason,
+        // PR-2: the relay needs its own copy after ctx takes this one.
+        override_reason: override_reason.clone(),
         input_mode,
     };
     if let Err(e) = hub.dispatch(&ctx, parsed) {
@@ -663,6 +667,49 @@ pub async fn dispatch_controller_rc(
                 .map(|r| r.pod_id.clone())
                 .unwrap_or_default();
             let agent_since_ms = record.map(|r| r.since_ms).unwrap_or(0);
+            // PR-2 relay FIRST: make the cross-pod session WORK now;
+            // convergence (controller re-key, or the agent's own next
+            // natural reconnect) proceeds without user-visible errors.
+            // No nudge on the relay path - an idle-nudge racing the
+            // relayed create would tear the session it just built.
+            if let Ok(frame_val) = serde_json::from_str::<serde_json::Value>(text) {
+                match crate::ws::rc_relay::relay_rc_frame(
+                    state,
+                    &owner_pod,
+                    connection_id,
+                    user_id,
+                    controller_name,
+                    consent_mode,
+                    &override_reason,
+                    input_mode,
+                    &frame_val,
+                )
+                .await
+                {
+                    Ok(None) => {
+                        info!(
+                            %user_id,
+                            agent = %agent_hex,
+                            %owner_pod,
+                            "cross-pod rc miss: relayed to owner pod"
+                        );
+                        return true;
+                    }
+                    Ok(Some((code, message))) => {
+                        // The owner's Hub answered authoritatively
+                        // (agent_busy, permission_denied, ...) - same
+                        // surface as a local dispatch failure.
+                        let _ = controller_tx.try_send(ServerMsg::Error {
+                            session_id: None,
+                            code,
+                            message,
+                            open_nonce: None,
+                        });
+                        return true;
+                    }
+                    Err(()) => { /* relay unavailable - PR-1 path below */ }
+                }
+            }
             // PR-1 direction rule: only a correctly-keyed conn that is
             // provably NEWER than the agent's registration justifies
             // nudging the agent; every other shape means the CONTROLLER
@@ -720,6 +767,54 @@ pub async fn dispatch_controller_rc(
                 open_nonce: None,
             });
             return true;
+        }
+        // PR-2: a session-scoped frame (answer / ice / terminate) whose
+        // session lives on another pod - this conn relayed its create
+        // there. Forward it: the owner holding the session dispatches;
+        // an owner that lost it answers session_not_found, which is the
+        // honest surface either way.
+        if matches!(
+            &e,
+            roomler_ai_remote_control::error::Error::SessionNotFound(_)
+        ) {
+            let owners: Vec<String> = state
+                .remote_rc_conns
+                .get(connection_id)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+            if !owners.is_empty()
+                && let Ok(frame_val) = serde_json::from_str::<serde_json::Value>(text)
+            {
+                let mut refusal: Option<(String, String)> = None;
+                for owner in owners {
+                    match crate::ws::rc_relay::relay_rc_frame(
+                        state,
+                        &owner,
+                        connection_id,
+                        user_id,
+                        controller_name,
+                        consent_mode,
+                        &override_reason,
+                        input_mode,
+                        &frame_val,
+                    )
+                    .await
+                    {
+                        Ok(None) => return true,
+                        Ok(Some(cm)) => refusal = Some(cm),
+                        Err(()) => {}
+                    }
+                }
+                if let Some((code, message)) = refusal {
+                    let _ = controller_tx.try_send(ServerMsg::Error {
+                        session_id: error_session_id(&e),
+                        code,
+                        message,
+                        open_nonce: None,
+                    });
+                    return true;
+                }
+            }
         }
         // Phase A-1 split-evidence probe for the remaining offline paths
         // (non-session-request messages, probe timeouts).
@@ -1058,7 +1153,7 @@ pub(crate) fn note_agent_offline_evidence(
 /// Stable short code for the wire. Exhaustive match so a new
 /// `remote_control::Error` variant triggers a compile error here rather
 /// than silently being reported as "internal".
-fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
+pub(crate) fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
     use roomler_ai_remote_control::Error::*;
     match e {
         AgentOffline(_) => "agent_offline",
