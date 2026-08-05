@@ -25,6 +25,7 @@ pub mod remote_control;
 pub mod role;
 pub mod room;
 pub mod setup_release;
+pub mod stats;
 pub mod stripe;
 pub mod tenant;
 pub mod tunnel;
