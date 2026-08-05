@@ -278,6 +278,17 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Single-use token ledger (`_id` = the token's jti, so uniqueness is the
+    // primary key and a claim is one insert). Rows expire an hour after use —
+    // past every 10-minute enrollment token's lifetime, so a replay always
+    // finds its record, while the ledger stays bounded.
+    create_indexes(
+        db,
+        "used_tokens",
+        vec![index_ttl(bson::doc! { "used_at": 1 }, 60 * 60)],
+    )
+    .await?;
+
     // Multi-org P2b — the GLOBAL overlay block registry. Deliberately NOT
     // tenant-scoped: its entire job is guaranteeing that two tenants can
     // never hold overlapping slices of 100.64.0.0/10.

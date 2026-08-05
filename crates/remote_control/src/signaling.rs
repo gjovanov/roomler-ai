@@ -895,6 +895,45 @@ pub enum ServerMsg {
         pin: Option<String>,
     },
 
+    /// Multi-org — join an ADDITIONAL org from the admin UI ("Add to another
+    /// organization"), so a device that can't be reached for a hands-on
+    /// `roomler enroll` still gets a second enrollment.
+    ///
+    /// The agent exchanges the token for its own agent JWT in the target
+    /// tenant, APPENDS an `[[orgs]]` entry (with a freshly minted per-org WG
+    /// key — never a copy) and brings that org's supervised WS loop up
+    /// in-process, no restart.
+    ///
+    /// **There is deliberately no `server_url` field.** The agent always
+    /// enrolls against the control plane it is ALREADY talking to, so a
+    /// forged/relayed frame can never point a device at a foreign server —
+    /// and same-control-plane is a hard requirement for shared-TUN meshing
+    /// anyway (`docs/multi-org.md` §4.4).
+    ///
+    /// Honoured ONLY on the PRIMARY enrollment's socket (mirroring
+    /// [`Self::UpdateNow`]): a secondary org's admin must not be able to
+    /// enroll a device it merely borrows into further orgs.
+    ///
+    /// Back-compat mirrors `Goodbye`/`UpdateNow`: an agent that predates the
+    /// variant fails to decode the unknown tag in its `Err(e) => debug!`
+    /// branch and ignores it — no WS disruption. The server still gates on
+    /// `AgentCaps.multi_org` so the UI can be honest about which devices
+    /// support it.
+    #[serde(rename = "rc:agent.join_org")]
+    JoinOrg {
+        /// Single-use enrollment token for the TARGET tenant (10 min).
+        enrollment_token: String,
+        /// Label for the new `[[orgs]]` entry. `None` ⇒ the agent derives
+        /// one (server host), same as a CLI `enroll` without `--label`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// Overlay participation for the new org: `off` (default) |
+        /// `netstack` | `tun`. `tun` additionally needs the daemon's
+        /// `overlay_multi_org` opt-in to take effect.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overlay_mode: Option<String>,
+    },
+
     // ─── server → tunnel-client / agent (rc:tunnel.*) ────────────────
     /// Server → client: peer-channel is up. `dc_pool_size` confirms
     /// the negotiated DC pool size (8 in v1) so the client knows
