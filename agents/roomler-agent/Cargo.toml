@@ -36,6 +36,10 @@ futures = { workspace = true }
 if-addrs = "0.15"
 ipnet = "2"
 
+# Heartbeat telemetry v2 (stats PR-5): agent-process rss/cpu + host-total
+# network counters for the `sys` block on rc:agent.heartbeat.
+sysinfo = "0.33"
+
 # CLI + config
 clap = { workspace = true }
 directories = { workspace = true }
