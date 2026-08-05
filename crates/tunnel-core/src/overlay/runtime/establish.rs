@@ -117,6 +117,44 @@ pub(super) fn resolve_direct_candidates(
     DirectCandidates { lan, public, srflx }
 }
 
+/// Bind one direct socket, preferring the stable `direct::direct_port()`
+/// (rc.307). A stable-port conflict is retried briefly — during a runtime
+/// hand-over (control-WS reconnect) the previous runtime's socket may still
+/// be closing — then falls back to an ephemeral port so the interface keeps
+/// working (WARN: the reproducible-5-tuple benefit is lost for this run).
+/// `port == 0` skips straight to the ephemeral bind (the pre-rc.307 path).
+/// `None` only when even the ephemeral bind fails.
+pub(super) async fn bind_direct_socket(
+    ip: Ipv4Addr,
+    port: u16,
+    what: &'static str,
+) -> Option<UdpSocket> {
+    if port != 0 {
+        for attempt in 0u8..3 {
+            match UdpSocket::bind((ip, port)).await {
+                Ok(s) => return Some(s),
+                Err(e) => {
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    } else {
+                        warn!(
+                            %ip, port, %e, what,
+                            "overlay: stable direct-port bind failed; falling back to an ephemeral port"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    match UdpSocket::bind((ip, 0)).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(%ip, %e, what, "overlay: direct socket bind failed; skipping");
+            None
+        }
+    }
+}
+
 /// bind-to-interface-by-route (Phase 1, `OVERLAY_BIND_BY_ROUTE`) — pick the
 /// egress socket for a LAN direct carrier/probe to `dst`. Tailscale's
 /// `net/netns` `bindToInterfaceByRoute` adapted to roomler's per-interface
@@ -437,26 +475,29 @@ impl OverlayRuntime {
         // send and same-WiFi direct oscillates. Advertise each socket's own
         // `ip:port`; the peer dials whichever shares its subnet, and both sides
         // then send/receive over that interface's pinned socket.
+        // Stable direct port (rc.307): bind every direct socket to the SAME
+        // port across restarts/rebuilds so the carrier's UDP 5-tuple is
+        // reproducible — stateful corp firewalls (Check Point) grandfather
+        // flows that predate their VPN session table, and only a matching
+        // 5-tuple keeps riding that grandfathered session after a rebuild.
+        // 0 = ephemeral (pre-rc.307 behavior). See `direct::direct_port`.
+        let stable_port = direct::direct_port();
         let mut socks: Vec<(Ipv4Addr, Arc<UdpSocket>)> = Vec::new();
         let mut endpoints: Vec<String> = Vec::new();
         for (ip, ifindex) in &ifaces {
-            match UdpSocket::bind((*ip, 0)).await {
-                Ok(s) => {
-                    if let Some(idx) = ifindex {
-                        direct::force_egress_interface(&s, *idx);
-                    }
-                    match s.local_addr() {
-                        Ok(local) => {
-                            endpoints.push(format!("{ip}:{}", local.port()));
-                            socks.push((*ip, Arc::new(s)));
-                        }
-                        Err(e) => {
-                            warn!(%ip, %e, "overlay: direct socket local_addr failed; skipping")
-                        }
-                    }
+            let Some(s) = bind_direct_socket(*ip, stable_port, "lan").await else {
+                continue;
+            };
+            if let Some(idx) = ifindex {
+                direct::force_egress_interface(&s, *idx);
+            }
+            match s.local_addr() {
+                Ok(local) => {
+                    endpoints.push(format!("{ip}:{}", local.port()));
+                    socks.push((*ip, Arc::new(s)));
                 }
                 Err(e) => {
-                    warn!(%ip, %e, "overlay: bind direct socket on interface failed; skipping")
+                    warn!(%ip, %e, "overlay: direct socket local_addr failed; skipping")
                 }
             }
         }
@@ -474,8 +515,13 @@ impl OverlayRuntime {
         // it's bound when EITHER is on. Best-effort: a bind failure just leaves
         // both public-dial tiers off (relay still works).
         let public_sock = if direct::public_direct_enabled() || direct::srflx_enabled() {
-            match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
-                Ok(s) => {
+            // Stable-port twin: `port+1` because a wildcard bind on the SAME
+            // port as the specific-IP interface binds above fails without
+            // SO_REUSEADDR (which has unsafe double-delivery semantics on
+            // Windows UDP). `direct_port` caps at 65534 so +1 can't overflow.
+            let public_port = if stable_port != 0 { stable_port + 1 } else { 0 };
+            match bind_direct_socket(Ipv4Addr::UNSPECIFIED, public_port, "public-dial").await {
+                Some(s) => {
                     // VPN-bypass: pin this `0.0.0.0` public/srflx dialer's egress
                     // to the physical uplink so it leaves the real NIC instead
                     // of a full-tunnel corp VPN's captured default.
@@ -493,8 +539,8 @@ impl OverlayRuntime {
                     );
                     Some(Arc::new(s))
                 }
-                Err(e) => {
-                    warn!(%e, "overlay: public-dial egress socket bind failed; public/srflx tiers off");
+                None => {
+                    warn!("overlay: public-dial egress socket bind failed; public/srflx tiers off");
                     None
                 }
             }

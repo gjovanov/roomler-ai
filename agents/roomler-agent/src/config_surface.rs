@@ -136,6 +136,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Concurrent remote-control sessions this agent accepts (1-8). Same-profile DC viewers share one capture+encoder (see shared_encoder); distinct profiles run their own — weak-GPU hosts may prefer 1. Built-in default: 2.",
     ),
     (
+        "overlay_direct_port",
+        "number",
+        "Stable UDP port for the overlay's direct sockets (per-interface LAN; the public/srflx dialer takes port+1). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. 0 = ephemeral ports. Built-in default: 41648. Env: ROOMLER_NODE_OVERLAY_DIRECT_PORT.",
+    ),
+    (
         "shared_encoder",
         "tribool",
         "P5 shared-floor encoder: concurrent same-profile DC viewers share one capture+encoder with floor-merged rate/dials. off = one pipeline per session (rc.302 behaviour). Built-in default: on.",
@@ -313,6 +318,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
+        "overlay_direct_port" => cfg.overlay_direct_port.map(|v| v.to_string()),
         "shared_encoder" => cfg.shared_encoder.map(fmt_bool),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
@@ -455,6 +461,23 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         .map_err(|_| format!("rc_max_sessions must be a number (got {v:?})"))?;
                     if !(1..=8).contains(&n) {
                         return Err("rc_max_sessions must be between 1 and 8".into());
+                    }
+                    Some(n)
+                }
+            }
+        }
+        "overlay_direct_port" => {
+            cfg.overlay_direct_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| format!("overlay_direct_port must be a number (got {v:?})"))?;
+                    // 0 = ephemeral (explicit opt-out); otherwise a valid UDP
+                    // port. 65535 is excluded because the public/srflx dialer
+                    // binds port+1.
+                    if n > 65534 {
+                        return Err("overlay_direct_port must be 0 (ephemeral) or 1-65534".into());
                     }
                     Some(n)
                 }
@@ -837,6 +860,28 @@ mod tests {
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("1")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("301")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("fast")).is_err());
+    }
+
+    #[test]
+    fn overlay_direct_port_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_direct_port", Some("41648")).unwrap();
+        assert_eq!(cfg.overlay_direct_port, Some(41648));
+        assert_eq!(
+            entry_for(&cfg, "overlay_direct_port")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("41648")
+        );
+        // 0 = explicit ephemeral opt-out; stored, not rejected.
+        apply(&mut cfg, "overlay_direct_port", Some("0")).unwrap();
+        assert_eq!(cfg.overlay_direct_port, Some(0));
+        apply(&mut cfg, "overlay_direct_port", None).unwrap();
+        assert_eq!(cfg.overlay_direct_port, None);
+        // 65535 excluded (the public/srflx dialer binds port+1); garbage rejected.
+        assert!(apply(&mut cfg, "overlay_direct_port", Some("65535")).is_err());
+        assert!(apply(&mut cfg, "overlay_direct_port", Some("forty")).is_err());
     }
 
     #[test]

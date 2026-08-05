@@ -2261,6 +2261,35 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::Mutex;
 
+    /// rc.307 — the stable-port bind helper: honors a free stable port,
+    /// falls back to an ephemeral port on a conflict (after its brief
+    /// retry), and `0` means plain ephemeral.
+    #[tokio::test]
+    async fn bind_direct_socket_stable_conflict_and_ephemeral() {
+        use std::net::Ipv4Addr;
+        // 0 → plain ephemeral bind.
+        let holder = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, 0, "test")
+            .await
+            .expect("ephemeral bind");
+        let p = holder.local_addr().unwrap().port();
+        assert_ne!(p, 0);
+        // Conflict (holder still owns p) → ephemeral fallback, never a hang.
+        let fallback = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, p, "test")
+            .await
+            .expect("fallback bind");
+        assert_ne!(
+            fallback.local_addr().unwrap().port(),
+            p,
+            "must fall back off the taken port"
+        );
+        // Freed → the stable port is honored exactly.
+        drop(holder);
+        let stable = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, p, "test")
+            .await
+            .expect("stable bind");
+        assert_eq!(stable.local_addr().unwrap().port(), p);
+    }
+
     /// rc.211 — a fresh off-loop build queue for tests. The receiver is
     /// dropped: these tests exercise direct/LAN paths that never spawn a
     /// QUIC build, and a send into a closed channel is simply ignored.
