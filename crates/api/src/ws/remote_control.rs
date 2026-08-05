@@ -328,16 +328,20 @@ pub async fn handle_agent_socket(
                             // every shipped agent, so they are deliberately NOT
                             // persisted (a real zero must stay distinguishable
                             // from "not measured"; the v2 `sys` block covers it).
-                            let heartbeat_sessions =
-                                if let ClientMsg::AgentHeartbeat { active_sessions, .. } = &parsed {
-                                    Some(*active_sessions)
-                                } else {
-                                    None
-                                };
+                            let heartbeat_sessions = if let ClientMsg::AgentHeartbeat {
+                                active_sessions,
+                                sys,
+                                ..
+                            } = &parsed
+                            {
+                                Some((*active_sessions, sys.clone()))
+                            } else {
+                                None
+                            };
                             if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
                                 warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
                             }
-                            if let Some(active_sessions) = heartbeat_sessions {
+                            if let Some((active_sessions, sys)) = heartbeat_sessions {
                                 if let Err(e) = state.agents.touch_heartbeat(agent_id).await {
                                     warn!(%agent_id, %e, "agent touch_heartbeat failed");
                                 }
@@ -347,6 +351,23 @@ pub async fn handle_agent_socket(
                                         .unwrap_or_default()
                                         .as_secs()
                                         as i64;
+                                    // Stats PR-5: the v2 telemetry block —
+                                    // nested `transports` matches the rollup
+                                    // pipelines' `$sys.transports.*` paths.
+                                    let sys_doc = sys.map(|s| {
+                                        bson::doc! {
+                                            "rss_mb": s.rss_mb as i32,
+                                            "cpu_pct": f64::from(s.cpu_pct),
+                                            "net_rx_bytes": s.net_rx_bytes as i64,
+                                            "net_tx_bytes": s.net_tx_bytes as i64,
+                                            "transports": {
+                                                "direct": s.direct as i32,
+                                                "relay": s.relay as i32,
+                                                "derp": s.derp as i32,
+                                            },
+                                            "peer_rtt_ms": s.peer_rtt_ms.map(i64::from),
+                                        }
+                                    });
                                     if let Err(e) = state
                                         .stats
                                         .upsert_machine_sample(
@@ -354,7 +375,7 @@ pub async fn handle_agent_socket(
                                             agent_id,
                                             unix,
                                             active_sessions,
-                                            None,
+                                            sys_doc,
                                         )
                                         .await
                                     {

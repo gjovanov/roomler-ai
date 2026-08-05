@@ -216,11 +216,20 @@ pub enum ClientMsg {
     },
 
     /// Agent periodic stats.
+    ///
+    /// The legacy top-level `rss_mb`/`cpu_pct` were hardcoded 0 by every
+    /// shipped agent, so the server deliberately ignores them; real
+    /// telemetry rides the optional [`AgentSysStats`] block (stats PR-5),
+    /// whose ABSENCE means "not measured" — old agents simply omit it
+    /// (`#[serde(default)]` server-side, additive client→server = no
+    /// capability flag needed).
     #[serde(rename = "rc:agent.heartbeat")]
     AgentHeartbeat {
         rss_mb: u32,
         cpu_pct: f32,
         active_sessions: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sys: Option<AgentSysStats>,
     },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
@@ -1214,6 +1223,30 @@ pub struct RelayRegionInfo {
     pub derp_url: Option<String>,
 }
 
+/// Agent host/process telemetry riding [`ClientMsg::AgentHeartbeat`]
+/// (stats PR-5). Persisted into the `stats_machine` minute buckets; the
+/// carrier tallies come from the overlay runtime's live view. Absence of
+/// the whole block means "not measured" (pre-v2 agent).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct AgentSysStats {
+    /// Agent process resident set, MiB.
+    pub rss_mb: u32,
+    /// Agent process CPU share, percent of one core.
+    pub cpu_pct: f32,
+    /// Host-total cumulative network counters (bytes since boot, summed
+    /// over interfaces) — the server derives rates from successive
+    /// samples; a reboot reads as a counter reset.
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    /// Live overlay carriers by kind at sample time.
+    pub direct: u32,
+    pub relay: u32,
+    pub derp: u32,
+    /// Median prober RTT across live overlay peers, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_rtt_ms: Option<u32>,
+}
+
 /// One region's probe outcome in [`ClientMsg::RelayProbeReport`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RelayRegionRtt {
@@ -1646,12 +1679,15 @@ mod tests {
             rss_mb: 142,
             cpu_pct: 3.25,
             active_sessions: 2,
+            sys: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.heartbeat""#));
         assert!(s.contains(r#""rss_mb":142"#));
         assert!(s.contains(r#""cpu_pct":3.25"#));
         assert!(s.contains(r#""active_sessions":2"#));
+        // v1 shape stays byte-identical: `sys: None` must not serialize.
+        assert!(!s.contains("sys"));
 
         let back: ClientMsg = serde_json::from_str(&s).unwrap();
         match back {
@@ -1659,10 +1695,51 @@ mod tests {
                 rss_mb,
                 cpu_pct,
                 active_sessions,
+                sys,
             } => {
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
+                assert!(sys.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_heartbeat_sys_block_round_trips_and_v1_payload_parses() {
+        // Stats PR-5 wire lock. Old agents omit `sys` entirely — the
+        // server-side deserializer must default it.
+        let v1 = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":1}"#;
+        let back: ClientMsg = serde_json::from_str(v1).unwrap();
+        assert!(matches!(back, ClientMsg::AgentHeartbeat { sys: None, .. }));
+
+        let m = ClientMsg::AgentHeartbeat {
+            rss_mb: 0,
+            cpu_pct: 0.0,
+            active_sessions: 1,
+            sys: Some(AgentSysStats {
+                rss_mb: 87,
+                cpu_pct: 1.5,
+                net_rx_bytes: 123_456_789,
+                net_tx_bytes: 987_654,
+                direct: 3,
+                relay: 1,
+                derp: 1,
+                peer_rtt_ms: Some(42),
+            }),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""net_rx_bytes":123456789"#));
+        assert!(s.contains(r#""direct":3"#));
+        assert!(s.contains(r#""peer_rtt_ms":42"#));
+        let back: ClientMsg = serde_json::from_str(&s).unwrap();
+        match back {
+            ClientMsg::AgentHeartbeat { sys: Some(sys), .. } => {
+                assert_eq!(sys.rss_mb, 87);
+                assert_eq!(sys.net_tx_bytes, 987_654);
+                assert_eq!(sys.derp, 1);
+                assert_eq!(sys.peer_rtt_ms, Some(42));
             }
             other => panic!("wrong variant: {other:?}"),
         }
