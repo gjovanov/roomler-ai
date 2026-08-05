@@ -16,42 +16,16 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use std::time::Duration;
 
 use crate::{
     error::ApiError,
-    routes::agent_release::{AgentRelease, AgentReleaseAsset},
+    routes::{
+        agent_release::{AgentRelease, AgentReleaseAsset},
+        releases,
+    },
     state::AppState,
 };
-
-/// GitHub repo slug — same repo as the agent.
-const RELEASES_REPO: &str = "gjovanov/roomler-ai";
-
-/// Cache TTL — 1 hour. Operators download once during install; spike
-/// happens on each tunnel-v* tag. One upstream fetch per hour is
-/// plenty.
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
-
-const RELEASES_PER_PAGE: usize = 30;
-
-struct CacheEntry {
-    fetched_at: Instant,
-    payload: Vec<AgentRelease>,
-}
-
-pub struct LatestTunnelReleaseCache {
-    inner: RwLock<Option<CacheEntry>>,
-}
-
-impl LatestTunnelReleaseCache {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: RwLock::new(None),
-        })
-    }
-}
 
 #[derive(Deserialize)]
 pub struct InstallerQuery {
@@ -86,7 +60,7 @@ pub struct InstallerHealth {
 pub async fn latest_release(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     Ok(Json(
         crate::routes::agent_release::filter_component_releases(releases, "tunnel-v"),
     ))
@@ -101,7 +75,7 @@ pub async fn installer_health(
     Query(params): Query<InstallerQuery>,
 ) -> Result<Json<InstallerHealth>, ApiError> {
     let normalised = normalise_platform(&platform)?;
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     let release = pick_release(&releases, &params.version).ok_or_else(|| {
         ApiError::NotFound(format!("no release matching version={}", params.version))
     })?;
@@ -132,7 +106,7 @@ pub async fn installer_proxy(
     Query(params): Query<InstallerQuery>,
 ) -> Result<Response, ApiError> {
     let normalised = normalise_platform(&platform)?;
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     let release = pick_release(&releases, &params.version).ok_or_else(|| {
         ApiError::NotFound(format!("no release matching version={}", params.version))
     })?;
@@ -261,72 +235,6 @@ pub fn pick_installer_asset<'a>(
             _ => false,
         }
     })
-}
-
-async fn ensure_releases_cached(state: &AppState) -> Result<Vec<AgentRelease>, ApiError> {
-    let cache = state.tunnel_release_cache.clone();
-    {
-        let g = cache.inner.read().await;
-        if let Some(entry) = g.as_ref()
-            && entry.fetched_at.elapsed() < CACHE_TTL
-        {
-            return Ok(entry.payload.clone());
-        }
-    }
-    let url = format!(
-        "https://api.github.com/repos/{}/releases?per_page={}",
-        RELEASES_REPO, RELEASES_PER_PAGE
-    );
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| ApiError::Internal(format!("reqwest client build: {e}")))?;
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await;
-    let releases = match resp {
-        Ok(r) if r.status().is_success() => r
-            .json::<Vec<AgentRelease>>()
-            .await
-            .map_err(|e| ApiError::Internal(format!("github releases parse: {e}")))?,
-        Ok(r) => {
-            // Stale-on-error: if we have a prior cache entry, return
-            // it. Otherwise propagate.
-            let g = cache.inner.read().await;
-            if let Some(entry) = g.as_ref() {
-                tracing::warn!(
-                    status = %r.status(),
-                    "tunnel releases upstream fetch returned non-success; serving stale cache"
-                );
-                return Ok(entry.payload.clone());
-            }
-            return Err(ApiError::Internal(format!(
-                "tunnel releases upstream returned {}",
-                r.status()
-            )));
-        }
-        Err(e) => {
-            let g = cache.inner.read().await;
-            if let Some(entry) = g.as_ref() {
-                tracing::warn!(%e, "tunnel releases upstream fetch errored; serving stale cache");
-                return Ok(entry.payload.clone());
-            }
-            return Err(ApiError::Internal(format!(
-                "tunnel releases upstream fetch failed: {e}"
-            )));
-        }
-    };
-    {
-        let mut g = cache.inner.write().await;
-        *g = Some(CacheEntry {
-            fetched_at: Instant::now(),
-            payload: releases.clone(),
-        });
-    }
-    Ok(releases)
 }
 
 #[cfg(test)]

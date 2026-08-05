@@ -359,3 +359,41 @@ jobs:
             equivalent is served at `roomler.ai/api/setup/install.sh` (Linux/macOS) and
             `roomler.ai/api/setup/install.ps1` (Windows).
           files: release/*
+
+  # ---------------------------------------------------------------------------
+  # Bust the roomler.ai release cache — see the long-form rationale in
+  # release-agent.yml. `/api/{agent,tunnel,setup}/latest-release` share ONE
+  # per-pod cache, so every release family needs this step; one POST busts
+  # every pod (the receiving pod fans out over the C-1 control bus).
+  # Non-blocking: the 15-minute cache TTL is the backstop.
+  # ---------------------------------------------------------------------------
+  refresh-release-cache:
+    name: Refresh roomler.ai release cache
+    if: needs.validate-version.outputs.is_release == 'true'
+    needs: [validate-version, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: POST /api/releases/refresh
+        env:
+          TOKEN: ${{ secrets.ROOMLER_RELEASE_REFRESH_TOKEN }}
+          TAG: ${{ needs.validate-version.outputs.tag }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "::notice::ROOMLER_RELEASE_REFRESH_TOKEN unset (fork?); skipping cache refresh"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            body=$(curl -sS -m 90 -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "https://roomler.ai/api/releases/refresh?expect_tag=${TAG}")
+            if [ "$(jq -r '.all_ok' <<<"$body" 2>/dev/null)" = "true" ]; then
+              jq . <<<"$body"
+              echo "Release cache refreshed on every live pod for ${TAG}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: ${body:-<no response>}"
+            sleep 10
+          done
+          echo "::warning::release cache refresh did not confirm on every pod for ${TAG}; the cache TTL will heal it within 15 min"
