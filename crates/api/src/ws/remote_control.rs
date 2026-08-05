@@ -1175,6 +1175,40 @@ pub fn apply_rc_ctrl(hub: &roomler_ai_remote_control::Hub, ctrl: &serde_json::Va
                 info!(agent = %aid, "rc ctrl: overlay renumber cycle applied from another pod");
             }
         }
+        // Multi-org — deliver a cross-org join push to an agent homed on
+        // whichever pod holds its socket. `send_to_agent_in_tenant` re-checks
+        // the tenant: this envelope carries a live enrollment token and every
+        // pod applies it, so a mismatched one must not be able to hand a
+        // different tenant's device a token for an org it never asked to join.
+        Some("agent_join_org") => {
+            let (Some(aid), Some(tid), Some(token)) = (
+                ctrl.get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok()),
+                ctrl.get("tenant_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok()),
+                ctrl.get("enrollment_token")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            ) else {
+                return;
+            };
+            let msg = roomler_ai_remote_control::signaling::ServerMsg::JoinOrg {
+                enrollment_token: token,
+                label: ctrl
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                overlay_mode: ctrl
+                    .get("overlay_mode")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            };
+            if hub.send_to_agent_in_tenant(aid, tid, msg).is_ok() {
+                info!(agent = %aid, "rc ctrl: cross-org join delivered from another pod");
+            }
+        }
         _ => {}
     }
 }

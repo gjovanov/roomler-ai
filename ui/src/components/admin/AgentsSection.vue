@@ -124,6 +124,11 @@
                   />
                   <v-list-subheader>Access</v-list-subheader>
                   <v-list-item
+                    prepend-icon="mdi-domain-plus"
+                    title="Add to another organization"
+                    @click="openJoinOrg(a)"
+                  />
+                  <v-list-item
                     prepend-icon="mdi-account-switch"
                     title="Reassign owner"
                     @click="openReassign(a)"
@@ -458,6 +463,11 @@
                   />
                   <v-list-subheader>Access</v-list-subheader>
                   <v-list-item
+                    prepend-icon="mdi-domain-plus"
+                    title="Add to another organization"
+                    @click="openJoinOrg(a)"
+                  />
+                  <v-list-item
                     prepend-icon="mdi-account-switch"
                     title="Reassign owner"
                     @click="openReassign(a)"
@@ -791,6 +801,92 @@
   </v-dialog>
 
   <!-- Reassign device owner (MANAGE_AGENTS) -->
+  <!-- Multi-org — add an already-enrolled device to a second organization
+       without touching the machine. Needs MANAGE_AGENTS in both; the picker
+       only lists orgs where the caller actually has it. -->
+  <v-dialog v-model="joinOrgDialogOpen" max-width="520">
+    <v-card>
+      <v-card-title>Add to another organization</v-card-title>
+      <v-card-text>
+        <p class="text-body-2 mb-3">
+          <strong>{{ joinOrgTarget?.name }}</strong> keeps its current enrollment and gains a
+          second one. The device connects to both organizations at once; each sees only its
+          own sessions, and the new org gets its own encryption key.
+        </p>
+        <v-alert
+          v-if="joinOrgLoaded && !joinOrgSupported"
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-3"
+          text="This device runs an agent version that predates remote org-join. Update it
+                first, or enroll it at the keyboard."
+        />
+        <v-alert
+          v-else-if="joinOrgLoaded && !joinOrgOnline"
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-3"
+          text="This device is offline. It has to be connected to receive the invitation."
+        />
+        <v-alert
+          v-else-if="joinOrgLoaded && joinOrgItems.length === 0"
+          type="info"
+          variant="tonal"
+          density="compact"
+          class="mb-3"
+          text="You don't manage devices in any other organization. Ask an admin there to
+                grant you device management, then try again."
+        />
+        <v-select
+          v-model="joinOrgTargetTenant"
+          :items="joinOrgSelectItems"
+          :loading="joinOrgLoading"
+          :disabled="!joinOrgSupported || !joinOrgOnline || joinOrgItems.length === 0"
+          label="Organization"
+          density="compact"
+          variant="outlined"
+          class="mb-3"
+          hide-details
+        />
+        <v-select
+          v-model="joinOrgOverlayMode"
+          :items="[
+            { title: 'No mesh access (default)', value: 'off' },
+            { title: 'Join the mesh (needs multi-org TUN enabled)', value: 'tun' },
+          ]"
+          :disabled="!joinOrgSupported || !joinOrgOnline"
+          label="Private mesh"
+          density="compact"
+          variant="outlined"
+          hide-details
+        />
+        <v-alert
+          v-if="joinOrgError"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mt-3"
+          :text="joinOrgError"
+        />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="joinOrgDialogOpen = false">Cancel</v-btn>
+        <v-btn
+          color="primary"
+          variant="flat"
+          :loading="joinOrgBusy"
+          :disabled="!joinOrgTargetTenant || !joinOrgSupported || !joinOrgOnline"
+          @click="confirmJoinOrg"
+        >
+          Add device
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
   <v-dialog v-model="reassignDialogOpen" max-width="440">
     <v-card>
       <v-card-title>Reassign device owner</v-card-title>
@@ -1308,6 +1404,74 @@ async function performDelete() {
 
 // Owner reassignment (MANAGE_AGENTS). Resolve owner_user_id → a name via the
 // tenant members, and pick a new owner from that list.
+// Multi-org — "Add to another organization". The target list comes from the
+// server (orgs where this caller holds MANAGE_AGENTS), so the picker can
+// never offer a choice that 403s.
+const joinOrgDialogOpen = ref(false)
+const joinOrgTarget = ref<Agent | null>(null)
+const joinOrgTargetTenant = ref<string>('')
+const joinOrgOverlayMode = ref<string>('off')
+const joinOrgBusy = ref(false)
+const joinOrgLoading = ref(false)
+const joinOrgLoaded = ref(false)
+const joinOrgSupported = ref(true)
+const joinOrgOnline = ref(true)
+const joinOrgError = ref('')
+const joinOrgItems = ref<
+  Array<{ tenant_id: string; name: string; slug: string; already_enrolled: boolean }>
+>([])
+const joinOrgSelectItems = computed(() =>
+  joinOrgItems.value.map((o) => ({
+    title: o.already_enrolled ? `${o.name} — already added` : o.name,
+    value: o.tenant_id,
+    props: { disabled: o.already_enrolled },
+  })),
+)
+async function openJoinOrg(a: Agent) {
+  joinOrgTarget.value = a
+  joinOrgTargetTenant.value = ''
+  joinOrgOverlayMode.value = 'off'
+  joinOrgError.value = ''
+  joinOrgItems.value = []
+  joinOrgLoaded.value = false
+  joinOrgDialogOpen.value = true
+  joinOrgLoading.value = true
+  try {
+    const res = await agentStore.fetchJoinTargets(props.tenantId, a.id)
+    joinOrgItems.value = res.items
+    joinOrgSupported.value = res.supported
+    joinOrgOnline.value = res.online
+  } catch (e) {
+    joinOrgError.value = (e as Error).message
+  } finally {
+    joinOrgLoading.value = false
+    joinOrgLoaded.value = true
+  }
+}
+async function confirmJoinOrg() {
+  if (!joinOrgTarget.value || !joinOrgTargetTenant.value) return
+  joinOrgBusy.value = true
+  joinOrgError.value = ''
+  try {
+    const res = await agentStore.joinOrg(
+      props.tenantId,
+      joinOrgTarget.value.id,
+      joinOrgTargetTenant.value,
+      { overlayMode: joinOrgOverlayMode.value },
+    )
+    joinOrgDialogOpen.value = false
+    // The device enrolls itself a beat later; say what actually happened
+    // rather than implying the row is already there.
+    updateNotice.value = res.already_enrolled
+      ? `${joinOrgTarget.value.name} was already in that organization — its enrollment was refreshed.`
+      : `${joinOrgTarget.value.name} is joining as "${res.label}". It appears in that organization's device list shortly.`
+  } catch (e) {
+    joinOrgError.value = (e as Error).message
+  } finally {
+    joinOrgBusy.value = false
+  }
+}
+
 const reassignDialogOpen = ref(false)
 const reassignTarget = ref<Agent | null>(null)
 const reassignOwnerId = ref<string>('')

@@ -23,6 +23,7 @@ pub mod tenant;
 pub mod tunnel_audit;
 pub mod tunnel_client;
 pub mod tunnel_policy;
+pub mod used_token;
 
 pub mod activation_code;
 pub mod user;
