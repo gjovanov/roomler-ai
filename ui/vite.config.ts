@@ -22,6 +22,7 @@ export default defineConfig({
           vuetify: ['vuetify'],
           tiptap: ['@tiptap/starter-kit', '@tiptap/vue-3'],
           mediasoup: ['mediasoup-client'],
+          charts: ['d3-array', 'd3-scale', 'd3-shape', 'd3-time', 'd3-time-format'],
         },
       },
     },
