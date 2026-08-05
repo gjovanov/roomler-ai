@@ -1259,6 +1259,145 @@ pub fn overlay_host(cidr: &str, ip: &str) -> Option<u32> {
     Some(host)
 }
 
+// ---------------------------------------------------------------------------
+// Multi-org P2b — tenant-block addressing
+// ---------------------------------------------------------------------------
+
+/// The CGNAT root every tenant block is carved from.
+pub const OVERLAY_BLOCK_ROOT: &str = "100.64.0.0/10";
+
+/// Base address of [`OVERLAY_BLOCK_ROOT`] as a `u32`.
+const OVERLAY_BLOCK_ROOT_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
+
+/// The allocation grid: every block is an ALIGNED run of `/22`s. A `/22`
+/// (1024 addresses, 1022 leasable) is the smallest unit handed out, so the
+/// registry can enforce non-overlap with one integer per block.
+pub const OVERLAY_BLOCK_SLOT_PREFIX: u8 = 22;
+
+/// Addresses per slot (`2^(32-22)` = 1024).
+pub const OVERLAY_BLOCK_SLOT_SIZE: u32 = 1 << (32 - OVERLAY_BLOCK_SLOT_PREFIX as u32);
+
+/// The first slot the allocator may hand out — slot 64, i.e. `100.65.0.0`.
+///
+/// The whole of `100.64.0.0/16` (slots 0..63) is RESERVED for LEGACY tenants:
+/// every network created before blocks existed carries `100.64.0.0/10` with
+/// its host cursor seeded at 1, so all of them sit in `100.64.0.x` and grow
+/// upward. Starting new blocks above that reserve means a carved tenant can
+/// never collide with a legacy one, no matter how many devices the legacy
+/// tenant has leased (65 534 before it would reach slot 64).
+pub const OVERLAY_BLOCK_FIRST_SLOT: u32 = 64;
+
+/// Number of slots in the `/10` (`2^(22-10)`).
+pub const OVERLAY_BLOCK_SLOT_COUNT: u32 = 1 << (OVERLAY_BLOCK_SLOT_PREFIX as u32 - 10);
+
+/// Largest block a tenant may be carved (a `/16`, 64 slots, 65 534 hosts).
+pub const OVERLAY_BLOCK_MIN_PREFIX: u8 = 16;
+
+/// Smallest block a tenant may be carved — one slot.
+pub const OVERLAY_BLOCK_MAX_PREFIX: u8 = OVERLAY_BLOCK_SLOT_PREFIX;
+
+/// Lifecycle of a registry row.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayBlockState {
+    /// Currently backing a tenant's overlay network.
+    #[default]
+    Assigned,
+    /// Freed by a renumber. The slots are NEVER handed out again: a device
+    /// that missed the migration (offline, or a stale binary) still believes
+    /// it holds an address in here, and re-issuing the range to a different
+    /// tenant would hand that stale node a live neighbour's address. The row
+    /// is kept as the forensic record of who held the range.
+    Quarantined,
+}
+
+/// One entry in the GLOBAL overlay block registry (multi-org P2b).
+///
+/// Blocks are allocated MONOTONICALLY upward from
+/// [`OVERLAY_BLOCK_FIRST_SLOT`]: the allocator takes the highest `end_slot`
+/// in the collection, rounds up to this block's alignment, and inserts with a
+/// unique `slot`. Two racers either compute the SAME start (one loses the
+/// unique index and retries against the winner's row) or compute
+/// buddy-aligned, non-overlapping starts — so the registry never issues
+/// overlapping ranges without needing a lock. Quarantined rows keep their
+/// slots occupied, which is exactly what makes quarantine free.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OverlayBlock {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    /// Offset from `100.64.0.0` in [`OVERLAY_BLOCK_SLOT_SIZE`] units.
+    /// Globally unique — this is what makes overlap unrepresentable.
+    pub slot: u32,
+    /// How many contiguous slots this block spans (a power of two; the start
+    /// is always a multiple of it).
+    pub slots: u32,
+    /// `slot + slots`, denormalized so the allocator's "highest end" probe is
+    /// a single indexed `sort + limit 1` instead of a collection scan.
+    pub end_slot: u32,
+    /// The rendered range, e.g. `"100.65.0.0/22"`. This is copied to
+    /// `OverlayNetwork.cidr` — the registry is the authority.
+    pub cidr: String,
+    pub tenant_id: ObjectId,
+    pub network_id: ObjectId,
+    pub state: OverlayBlockState,
+    /// Why the block was quarantined (renumber, block grow, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<DateTime>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+impl OverlayBlock {
+    pub const COLLECTION: &'static str = "overlay_blocks";
+
+    /// Highest host ordinal this block can lease.
+    pub fn max_host(&self) -> u32 {
+        cidr_max_host(&self.cidr).unwrap_or(0)
+    }
+}
+
+/// Slots consumed by a block of `prefix`, or `None` when the prefix is outside
+/// the supported band ([`OVERLAY_BLOCK_MIN_PREFIX`] ..=
+/// [`OVERLAY_BLOCK_MAX_PREFIX`]). Anything longer than a `/22` would have to
+/// sub-divide a slot, which the registry deliberately does not model.
+pub fn block_slots_for_prefix(prefix: u8) -> Option<u32> {
+    if !(OVERLAY_BLOCK_MIN_PREFIX..=OVERLAY_BLOCK_MAX_PREFIX).contains(&prefix) {
+        return None;
+    }
+    Some(1 << (OVERLAY_BLOCK_SLOT_PREFIX as u32 - prefix as u32))
+}
+
+/// The rendered CIDR for an aligned run of `slots` slots starting at `slot`.
+/// `None` when the run is unaligned, empty, or would leave the `/10`.
+pub fn block_cidr_for_slot(slot: u32, slots: u32) -> Option<String> {
+    if slots == 0 || !slots.is_power_of_two() || !slot.is_multiple_of(slots) {
+        return None;
+    }
+    let end = slot.checked_add(slots)?;
+    if end > OVERLAY_BLOCK_SLOT_COUNT {
+        return None;
+    }
+    let base = OVERLAY_BLOCK_ROOT_BASE.checked_add(slot.checked_mul(OVERLAY_BLOCK_SLOT_SIZE)?)?;
+    let prefix = OVERLAY_BLOCK_SLOT_PREFIX as u32 - slots.trailing_zeros();
+    Some(format!(
+        "{}/{}",
+        std::net::Ipv4Addr::from(base),
+        prefix as u8
+    ))
+}
+
+/// The lowest aligned start for a `slots`-wide block that begins at or after
+/// `after`. Alignment (start is a multiple of the width) is what makes two
+/// concurrently-computed allocations either identical or disjoint.
+pub fn block_align_slot(after: u32, slots: u32) -> u32 {
+    if slots == 0 {
+        return after;
+    }
+    after.div_ceil(slots) * slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,5 +1478,97 @@ mod tests {
         assert_eq!(overlay_host(cidr, "10.0.0.1"), None);
         assert_eq!(overlay_host("not-a-cidr", "1.2.3.4"), None);
         assert_eq!(overlay_host(cidr, "nope"), None);
+    }
+
+    // --- P2b tenant blocks ------------------------------------------------
+
+    #[test]
+    fn block_cidr_renders_the_slot_grid() {
+        // The first allocatable slot is 100.65.0.0 — everything below it is
+        // the legacy reserve.
+        assert_eq!(
+            block_cidr_for_slot(OVERLAY_BLOCK_FIRST_SLOT, 1).as_deref(),
+            Some("100.65.0.0/22")
+        );
+        assert_eq!(block_cidr_for_slot(65, 1).as_deref(), Some("100.65.4.0/22"));
+        assert_eq!(
+            block_cidr_for_slot(128, 1).as_deref(),
+            Some("100.66.0.0/22")
+        );
+        // Wider blocks widen the prefix.
+        assert_eq!(block_cidr_for_slot(64, 4).as_deref(), Some("100.65.0.0/20"));
+        assert_eq!(
+            block_cidr_for_slot(64, 64).as_deref(),
+            Some("100.65.0.0/16")
+        );
+        // Unaligned / non-power-of-two / past the /10 are refused.
+        assert_eq!(block_cidr_for_slot(65, 4), None, "unaligned");
+        assert_eq!(block_cidr_for_slot(64, 3), None, "not a power of two");
+        assert_eq!(block_cidr_for_slot(OVERLAY_BLOCK_SLOT_COUNT, 1), None);
+        assert_eq!(block_cidr_for_slot(OVERLAY_BLOCK_SLOT_COUNT - 1, 2), None);
+        // The last slot IS allocatable.
+        assert_eq!(
+            block_cidr_for_slot(OVERLAY_BLOCK_SLOT_COUNT - 1, 1).as_deref(),
+            Some("100.127.252.0/22")
+        );
+    }
+
+    #[test]
+    fn block_prefix_maps_to_slot_width() {
+        assert_eq!(block_slots_for_prefix(22), Some(1));
+        assert_eq!(block_slots_for_prefix(20), Some(4));
+        assert_eq!(block_slots_for_prefix(16), Some(64));
+        assert_eq!(block_slots_for_prefix(23), None, "sub-slot");
+        assert_eq!(block_slots_for_prefix(15), None, "wider than /16");
+        assert_eq!(block_slots_for_prefix(0), None);
+    }
+
+    /// The allocator's safety property: starts are aligned and monotonic, so
+    /// two racers computing from the same "highest end" either collide on the
+    /// SAME slot (the unique index arbitrates) or claim disjoint ranges. This
+    /// walks every width against every possible predecessor end and asserts
+    /// the ranges never partially overlap.
+    #[test]
+    fn aligned_starts_are_never_partially_overlapping() {
+        for after in 0u32..512 {
+            let mut claims: Vec<(u32, u32)> = Vec::new();
+            for prefix in OVERLAY_BLOCK_MIN_PREFIX..=OVERLAY_BLOCK_MAX_PREFIX {
+                let slots = block_slots_for_prefix(prefix).expect("supported prefix");
+                let start = block_align_slot(after, slots);
+                assert!(start >= after, "monotonic: {start} >= {after}");
+                assert_eq!(start % slots, 0, "aligned");
+                assert!(
+                    start - after < slots,
+                    "no more than one width of waste (start {start}, after {after})"
+                );
+                claims.push((start, slots));
+            }
+            // Buddy property: any two claims are identical-start or disjoint.
+            for (i, (s1, w1)) in claims.iter().enumerate() {
+                for (s2, w2) in claims.iter().skip(i + 1) {
+                    let overlap = s1.max(s2) < &(s1 + w1).min(s2 + w2);
+                    assert!(
+                        !overlap || s1 == s2,
+                        "partial overlap: [{s1},{}) vs [{s2},{})",
+                        s1 + w1,
+                        s2 + w2
+                    );
+                }
+            }
+        }
+    }
+
+    /// A carved block's leasable range must stay strictly inside it — the
+    /// whole point of the P2a ceiling.
+    #[test]
+    fn block_leases_stay_inside_the_block() {
+        let cidr = block_cidr_for_slot(64, 1).expect("slot 64");
+        assert_eq!(cidr, "100.65.0.0/22");
+        assert_eq!(cidr_max_host(&cidr), Some(1022));
+        assert_eq!(overlay_ip(&cidr, 1).as_deref(), Some("100.65.0.1"));
+        assert_eq!(overlay_ip(&cidr, 1022).as_deref(), Some("100.65.3.254"));
+        // …and the first address of the NEXT block is unreachable from here.
+        assert_eq!(overlay_ip(&cidr, 1024), None);
+        assert_eq!(overlay_host(&cidr, "100.65.4.0"), None);
     }
 }

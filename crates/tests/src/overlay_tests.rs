@@ -1019,3 +1019,436 @@ async fn agent_delete_does_not_release_a_tunnel_clients_node() {
     );
     assert!(ipam.network().await.free_hosts.is_empty());
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Multi-org P2b — tenant blocks + the renumber migration
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Everything a renumber test needs on top of `Ipam`: two live nodes on the
+/// legacy `/10` at ordinals 1 and 2.
+async fn seed_two_nodes(ipam: &Ipam) {
+    ipam.alloc().await.unwrap();
+    ipam.alloc().await.unwrap();
+    ipam.create_node("mach-A", "alpha", "100.64.0.1")
+        .await
+        .unwrap();
+    ipam.create_node("mach-B", "bravo", "100.64.0.2")
+        .await
+        .unwrap();
+}
+
+/// The dry run is the default and it must be inert: a full before/after plan,
+/// zero writes — no block consumed, no address moved, no cursor touched.
+#[tokio::test]
+async fn renumber_dry_run_plans_without_writing() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovblk1").await;
+    let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
+    seed_two_nodes(&ipam).await;
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["applied"], false);
+    assert_eq!(body["old_cidr"], OverlayNetwork::DEFAULT_CIDR);
+    // The first block ever carved starts at slot 64 — the top of the legacy
+    // reserve.
+    assert_eq!(body["new_cidr"], "100.65.0.0/22");
+    let moves = body["moves"].as_array().unwrap();
+    assert_eq!(moves.len(), 2);
+    let mapped: Vec<(&str, &str)> = moves
+        .iter()
+        .map(|m| (m["old_ip"].as_str().unwrap(), m["new_ip"].as_str().unwrap()))
+        .collect();
+    assert!(mapped.contains(&("100.64.0.1", "100.65.0.1")));
+    assert!(mapped.contains(&("100.64.0.2", "100.65.0.2")));
+    assert!(moves.iter().all(|m| m["ordinal_preserved"] == true));
+
+    // Nothing moved.
+    let net = ipam.network().await;
+    assert_eq!(net.cidr, OverlayNetwork::DEFAULT_CIDR);
+    assert_eq!(net.next_host, 3);
+    let nodes = ipam
+        .nodes
+        .list_active_in_network(ipam.tenant_id, ipam.network_id)
+        .await
+        .unwrap();
+    assert!(nodes.iter().all(|n| n.overlay_ip.starts_with("100.64.0.")));
+    assert_eq!(
+        app.db
+            .collection::<bson::Document>("overlay_blocks")
+            .count_documents(doc! {})
+            .await
+            .unwrap(),
+        0,
+        "a dry run consumes no block"
+    );
+}
+
+/// The apply: the tenant lands on its own block, every live node is re-based
+/// with its ordinal intact, and the IPAM cursor + registry agree with the
+/// addresses actually written.
+#[tokio::test]
+async fn renumber_moves_the_tenant_onto_its_own_block() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovblk2").await;
+    let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
+    seed_two_nodes(&ipam).await;
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({ "dry_run": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["applied"], true);
+    let new_cidr = body["new_cidr"].as_str().unwrap().to_string();
+    assert_eq!(new_cidr, "100.65.0.0/22");
+
+    let net = ipam.network().await;
+    assert_eq!(net.cidr, new_cidr, "the network follows the registry");
+    assert_eq!(net.next_host, 3);
+    assert!(
+        net.free_hosts.is_empty(),
+        "old ordinals are not carried over"
+    );
+
+    let nodes = ipam
+        .nodes
+        .list_active_in_network(ipam.tenant_id, ipam.network_id)
+        .await
+        .unwrap();
+    let mut ips: Vec<String> = nodes.iter().map(|n| n.overlay_ip.clone()).collect();
+    ips.sort();
+    assert_eq!(ips, vec!["100.65.0.1", "100.65.0.2"]);
+    // The contract the free pool depends on: every written address inverts
+    // back to its ordinal under the NEW cidr.
+    for n in &nodes {
+        assert!(
+            roomler_ai_remote_control::models::overlay_host(&net.cidr, &n.overlay_ip).is_some(),
+            "{} must invert inside {}",
+            n.overlay_ip,
+            net.cidr
+        );
+    }
+
+    // The next joiner leases inside the block, not outside it.
+    let host = ipam
+        .networks
+        .allocate_host(ipam.network_id, net.max_host())
+        .await
+        .unwrap();
+    assert_eq!(host, 3);
+    assert_eq!(net.host_ip(host).as_deref(), Some("100.65.0.3"));
+}
+
+/// A tenant that renumbers twice must never see its old range re-issued: the
+/// predecessor is quarantined and its slots stay out of circulation.
+#[tokio::test]
+async fn a_second_renumber_quarantines_the_first_block() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovblk3").await;
+    let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
+    seed_two_nodes(&ipam).await;
+
+    let first: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({ "dry_run": false, "prefix": 22 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["new_cidr"], "100.65.0.0/22");
+
+    // A wider block: the allocator aligns it ABOVE the first one rather than
+    // reusing the quarantined slot.
+    let second: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({ "dry_run": false, "prefix": 20 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["new_cidr"], "100.65.16.0/20");
+    assert_eq!(second["old_cidr"], "100.65.0.0/22");
+
+    let status: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/overlay-block", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["cidr"], "100.65.16.0/20");
+    assert_eq!(status["legacy"], false);
+    assert_eq!(status["capacity"], 4094);
+    let blocks = status["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "the renumber trail is kept");
+    let states: Vec<(&str, &str)> = blocks
+        .iter()
+        .map(|b| (b["cidr"].as_str().unwrap(), b["state"].as_str().unwrap()))
+        .collect();
+    assert!(states.contains(&("100.65.0.0/22", "quarantined")));
+    assert!(states.contains(&("100.65.16.0/20", "assigned")));
+
+    // Nodes followed the second move too.
+    let nodes = ipam
+        .nodes
+        .list_active_in_network(ipam.tenant_id, ipam.network_id)
+        .await
+        .unwrap();
+    assert!(nodes.iter().all(|n| n.overlay_ip.starts_with("100.65.16.")));
+}
+
+/// The whole point of blocks: two tenants can never be handed overlapping
+/// ranges, whatever widths they pick.
+#[tokio::test]
+async fn blocks_are_disjoint_across_tenants() {
+    let app = TestApp::spawn().await;
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for (i, prefix) in [22u8, 20, 22, 16].into_iter().enumerate() {
+        let seeded = app.seed_tenant(&format!("ovblkdis{i}")).await;
+        let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
+        ipam.alloc().await.unwrap();
+        ipam.create_node("m", "n", "100.64.0.1").await.unwrap();
+        let body: Value = app
+            .auth_post(
+                &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+                &seeded.admin.access_token,
+            )
+            .json(&serde_json::json!({ "dry_run": false, "prefix": prefix }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let cidr = body["new_cidr"].as_str().unwrap();
+        let (base, p) = cidr.split_once('/').unwrap();
+        let base: u32 = base.parse::<std::net::Ipv4Addr>().unwrap().into();
+        let size = 1u32 << (32 - p.parse::<u32>().unwrap());
+        for (b, s) in &ranges {
+            assert!(
+                base >= b + s || base + size <= *b,
+                "{cidr} overlaps an earlier block at {b}+{s}"
+            );
+        }
+        ranges.push((base, size));
+    }
+    assert_eq!(ranges.len(), 4);
+}
+
+/// The migration refuses to run over a fleet that predates the P2a
+/// forward-compat set: those daemons purge their OWN on-link route at boot,
+/// which black-holes that host's mesh. `force` is the documented override.
+#[tokio::test]
+async fn renumber_refuses_a_fleet_below_the_version_floor() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovblkfloor").await;
+    let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
+
+    let agent_id = enroll_agent(
+        &app,
+        &seeded.tenant_id,
+        &seeded.admin.access_token,
+        "floor-machine",
+    )
+    .await;
+    // Roll that agent back below the floor.
+    app.db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&agent_id).unwrap() },
+            doc! { "$set": { "agent_version": "0.3.0-rc.299" } },
+        )
+        .await
+        .unwrap();
+    ipam.alloc().await.unwrap();
+    ipam.nodes
+        .create(
+            ipam.tenant_id,
+            NodeRef::Agent {
+                agent_id: ObjectId::parse_str(&agent_id).unwrap(),
+            },
+            ipam.network_id,
+            "floor-machine".to_string(),
+            "oldbox".to_string(),
+            "100.64.0.1".to_string(),
+            "pk".to_string(),
+            0,
+            vec![],
+            false,
+            false,
+            false,
+            false,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // The status endpoint surfaces the blocker before anyone tries.
+    let status: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/overlay-block", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["below_floor"].as_array().unwrap().len(), 1);
+    assert_eq!(status["below_floor"][0]["version"], "0.3.0-rc.299");
+
+    // The apply refuses…
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({ "dry_run": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    assert_eq!(
+        ipam.network().await.cidr,
+        OverlayNetwork::DEFAULT_CIDR,
+        "a refused migration writes nothing"
+    );
+
+    // …but a DRY RUN still plans, so an admin can see the damage first.
+    let dry: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(dry["below_floor"].as_array().unwrap().len(), 1);
+    assert_eq!(dry["moves"].as_array().unwrap().len(), 1);
+
+    // …and force overrides it.
+    let forced = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({ "dry_run": false, "force": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forced.status().as_u16(), 200);
+    assert_eq!(ipam.network().await.cidr, "100.65.0.0/22");
+}
+
+/// Renumbering is an agent-management action, not something bare tenant
+/// membership authorises.
+#[tokio::test]
+async fn renumber_requires_manage_agents() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovblkperm").await;
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/overlay-block/renumber", seeded.tenant_id),
+            &seeded.member.access_token,
+        )
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+/// With carving on, a FRESH network is born inside its own block — but a
+/// network that has already leased addresses is left alone (re-basing it
+/// under live nodes is the renumber endpoint's job, because only that path
+/// rewrites the node rows and cycles the sockets).
+#[tokio::test]
+async fn carving_claims_a_block_for_new_networks_only() {
+    let app = TestApp::spawn_with_settings(|s| {
+        s.overlay.blocks_enabled = true;
+        s.overlay.block_prefix = 22;
+    })
+    .await;
+
+    // A network that already leased an address, created the pre-P2b way.
+    let legacy_seeded = app.seed_tenant("ovcarve-legacy").await;
+    let legacy_dao = OverlayNetworkDao::new(&app.db);
+    let legacy = legacy_dao
+        .get_or_create(tid(&legacy_seeded.tenant_id))
+        .await
+        .unwrap();
+    legacy_dao
+        .allocate_host(legacy.id.unwrap(), default_max_host())
+        .await
+        .unwrap();
+
+    // A fresh one, through the DAO the app itself uses.
+    let fresh_seeded = app.seed_tenant("ovcarve-fresh").await;
+    let status: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/overlay-block", fresh_seeded.tenant_id),
+            &fresh_seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["cidr"], "100.65.0.0/22");
+    assert_eq!(status["legacy"], false);
+    assert_eq!(status["carving_enabled"], true);
+    assert_eq!(status["capacity"], 1022);
+
+    // The populated one still sits on the shared range.
+    let legacy_status: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/overlay-block", legacy_seeded.tenant_id),
+            &legacy_seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(legacy_status["cidr"], OverlayNetwork::DEFAULT_CIDR);
+    assert_eq!(legacy_status["legacy"], true);
+}

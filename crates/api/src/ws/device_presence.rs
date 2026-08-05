@@ -121,16 +121,7 @@ async fn flush_tenant(state: &AppState, tenant_id: ObjectId) {
         return;
     }
 
-    // Last-wins per agent: within one window "online then offline" must not
-    // fan out as two contradicting rows in a single event.
-    let mut latest: Vec<PresenceUpdate> = Vec::new();
-    for u in updates {
-        if let Some(existing) = latest.iter_mut().find(|e| e.agent_id == u.agent_id) {
-            *existing = u;
-        } else {
-            latest.push(u);
-        }
-    }
+    let latest = coalesce(updates);
 
     let members = match member_ids_cached(state, tenant_id).await {
         Some(m) if !m.is_empty() => m,
@@ -161,6 +152,34 @@ async fn flush_tenant(state: &AppState, tenant_id: ObjectId) {
         &event,
     )
     .await;
+}
+
+/// Collapse one window's transitions to a single row per agent, LAST write
+/// wins, first-seen order preserved.
+///
+/// This is the storm valve. A pod roll reconnects a whole fleet inside one
+/// batch window, and an agent that flaps (`online` → `offline` → `online`
+/// while its socket settles) must not ship two contradicting rows in the same
+/// event — the client applies them in array order and would latch whichever
+/// happened to be last in the queue, not last in TIME.
+///
+/// Indexed rather than a linear scan per update: the storm case is exactly
+/// the one where the batch is largest (P7 scale item), and the quadratic form
+/// grows with the square of the fleet.
+fn coalesce(updates: Vec<PresenceUpdate>) -> Vec<PresenceUpdate> {
+    let mut at: std::collections::HashMap<ObjectId, usize> =
+        std::collections::HashMap::with_capacity(updates.len());
+    let mut latest: Vec<PresenceUpdate> = Vec::with_capacity(updates.len());
+    for u in updates {
+        match at.get(&u.agent_id) {
+            Some(&i) => latest[i] = u,
+            None => {
+                at.insert(u.agent_id, latest.len());
+                latest.push(u);
+            }
+        }
+    }
+    latest
 }
 
 async fn member_ids_cached(state: &AppState, tenant_id: ObjectId) -> Option<Arc<Vec<ObjectId>>> {
@@ -304,4 +323,63 @@ pub fn spawn_sweeper(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upd(agent: u8, presence: &'static str) -> PresenceUpdate {
+        let mut raw = [0u8; 12];
+        raw[11] = agent;
+        PresenceUpdate {
+            agent_id: ObjectId::from_bytes(raw),
+            name: format!("box-{agent}"),
+            presence,
+        }
+    }
+
+    /// A flapping agent must contribute exactly ONE row, carrying its LAST
+    /// state — the client applies the array in order, so two rows for one
+    /// agent would latch whichever landed last in the queue.
+    #[test]
+    fn a_flapping_agent_collapses_to_its_last_state() {
+        let out = coalesce(vec![
+            upd(1, ONLINE),
+            upd(2, ONLINE),
+            upd(1, OFFLINE),
+            upd(1, ONLINE),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].presence, ONLINE, "agent 1 ends online");
+        assert_eq!(out[1].presence, ONLINE);
+        // First-seen order is preserved, so the event reads chronologically.
+        assert_eq!(out[0].agent_id, upd(1, ONLINE).agent_id);
+        assert_eq!(out[1].agent_id, upd(2, ONLINE).agent_id);
+    }
+
+    /// P7 scale: a pod roll reconnects the whole fleet inside one window.
+    /// The batch must collapse to one row per DEVICE, not per transition.
+    #[test]
+    fn a_fleet_wide_storm_collapses_to_one_row_per_device() {
+        let mut storm = Vec::new();
+        for round in 0..5 {
+            for agent in 1..=50u8 {
+                storm.push(upd(agent, if round % 2 == 0 { OFFLINE } else { ONLINE }));
+            }
+        }
+        // 250 transitions in…
+        assert_eq!(storm.len(), 250);
+        let out = coalesce(storm);
+        // …50 rows out, each holding the final round's state.
+        assert_eq!(out.len(), 50);
+        assert!(out.iter().all(|u| u.presence == OFFLINE));
+        let ids: std::collections::HashSet<_> = out.iter().map(|u| u.agent_id).collect();
+        assert_eq!(ids.len(), 50, "no duplicate agents survive");
+    }
+
+    #[test]
+    fn coalesce_of_nothing_is_nothing() {
+        assert!(coalesce(Vec::new()).is_empty());
+    }
 }
