@@ -132,6 +132,28 @@ export function isRetryableTerminateReason(reason: unknown): boolean {
  * mid-flap. `session_not_found`: stale state from the session we
  * already abandoned.
  */
+export type ReadyRecoveryAction = 'proceed' | 'ignore' | 'reschedule' | 'fail'
+
+/**
+ * Decision for an inbound `rc:ready`. The old handler silently returned on
+ * `!pc` or a gate mismatch, which parked the UI in `awaiting_consent`
+ * FOREVER when the server's reply won a race against a client teardown
+ * (2026-08-05 CORPLAP-1 incident: consent granted server-side, Ready
+ * processed by nobody, session stuck in Negotiating, operator stuck at
+ * "awaiting consent"). Gate mismatch = stale session, ignore; a missing
+ * PeerConnection with retry args = reschedule through the ladder; without
+ * args there is nothing to retry with = honest failure. Pure for tests.
+ */
+export function readyRecoveryAction(
+  gateOk: boolean,
+  hasPc: boolean,
+  hasRetryArgs: boolean,
+): ReadyRecoveryAction {
+  if (!gateOk) return 'ignore'
+  if (hasPc) return 'proceed'
+  return hasRetryArgs ? 'reschedule' : 'fail'
+}
+
 export function isRetryableRcErrorCode(code: unknown): boolean {
   return code === 'agent_busy' || code === 'agent_offline' || code === 'session_not_found'
 }
@@ -5165,7 +5187,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     on('rc:session.created', (msg) => {
       // Only accept while we actually have a request in flight Ã¢ÂÂ a
       // late/stale create must not resurrect an abandoned attempt.
-      if (phase.value !== 'requesting') return
+      // (2026-08-05 CORPLAP-1 wedge) ...but don't LEAK a rejected create:
+      // the server holds a live session pinned to the agent until someone
+      // terminates it (previously it survived until the next request's
+      // orphan reap or the consent timeout).
+      if (phase.value !== 'requesting') {
+        console.warn(
+          '[rc] rc:session.created outside an active request (phase',
+          phase.value,
+          ') - releasing the ghost session',
+        )
+        if (typeof msg.session_id === 'string' && msg.session_id) {
+          ws.sendRaw({
+            t: 'rc:terminate',
+            session_id: msg.session_id,
+            reason: 'controller_hangup',
+          })
+        }
+        return
+      }
       sessionId.value = msg.session_id
       // Multi-user P3: the server reports the EFFECTIVE grant, which the
       // single-INPUT-holder rule may have narrowed (another live session
@@ -5186,13 +5226,36 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       clearSignalingTimeout()
     })
     on('rc:ready', async (msg) => {
-      if (!pc) return
-      if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // (2026-08-05 CORPLAP-1 wedge) NEVER drop rc:ready silently: the server
+      // is now in Negotiating and sends nothing further, so a dropped Ready
+      // used to park the UI in 'awaiting_consent' forever. Stale-session
+      // Readys are ignored; a Ready whose PeerConnection lost a race
+      // against teardown re-enters through the ladder.
+      const action = readyRecoveryAction(
+        sessionGateAllows(msg.session_id, sessionId.value),
+        !!pc,
+        !!lastConnectArgs,
+      )
+      if (action === 'ignore') {
+        console.warn('[rc] rc:ready for a stale session - ignoring', msg.session_id)
+        return
+      }
+      if (action === 'reschedule') {
+        console.warn('[rc] rc:ready arrived with no PeerConnection - retrying the attempt')
+        scheduleReconnect()
+        return
+      }
+      if (action === 'fail') {
+        failWith('session setup raced teardown')
+        return
+      }
+      const livePc = pc
+      if (!livePc) return // unreachable: 'proceed' implies pc exists (TS narrowing only)
       phase.value = 'negotiating'
       armSignalingTimeout()
       try {
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
+        const offer = await livePc.createOffer()
+        await livePc.setLocalDescription(offer)
         ws.sendRaw({
           t: 'rc:sdp.offer',
           session_id: msg.session_id,
@@ -5306,6 +5369,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      // (2026-08-05 CORPLAP-1 wedge) An un-scoped transient (no session_id -
+      // e.g. agent_offline bounced by our own hangup for the PREVIOUS
+      // session while the agent's WS flaps) passes the gate and used to
+      // failWith a LIVE attempt mid-flight. With an attempt in flight,
+      // ride the ladder instead - never kill a live attempt on an
+      // un-scoped transient code.
+      if (!msg.session_id && sessionId.value && isRetryableRcErrorCode(msg.code) && lastConnectArgs) {
+        console.info('[rc] un-scoped transient rc:error (', msg.code, ') during an active attempt - retrying')
+        scheduleReconnect({ notifyServer: false })
+        return
+      }
       // Mid-ladder transients (agent_busy while the old slot frees,
       // agent_offline while the agent WS flaps back) advance the
       // ladder instead of killing it. First-connect errors still fail
