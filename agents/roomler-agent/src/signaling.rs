@@ -1037,7 +1037,7 @@ async fn connect_once(
                                 &cfg.forward_acl,
                                 &relay_regions_slot,
                                 &derp_ticket_slot,
-                                &cfg,
+                                cfg,
                             )
                             .await?;
                         }
