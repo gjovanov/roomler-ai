@@ -708,7 +708,16 @@ impl AppState {
         let tunnel_audit = Arc::new(TunnelAuditDao::new(&db));
 
         // Overlay-network subsystem
-        let overlay_networks = Arc::new(OverlayNetworkDao::new(&db));
+        // P2b — carving is opt-in per deployment. With the flag off the DAO
+        // behaves exactly as it did pre-P2b (no registry reads at all).
+        let overlay_networks = Arc::new(
+            OverlayNetworkDao::new(&db).with_block_prefix(
+                settings
+                    .overlay
+                    .blocks_enabled
+                    .then_some(settings.overlay.block_prefix),
+            ),
+        );
         let overlay_nodes = Arc::new(OverlayNodeDao::new(&db));
         let overlay_policies = Arc::new(OverlayPolicyDao::new(&db));
 

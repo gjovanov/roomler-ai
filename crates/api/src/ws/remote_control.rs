@@ -1097,6 +1097,23 @@ pub fn apply_rc_ctrl(hub: &roomler_ai_remote_control::Hub, ctrl: &serde_json::Va
                 info!(session = %sid, "rc ctrl: terminate applied from another pod");
             }
         }
+        // P2b — cycle an agent's WS so it re-establishes its overlay session
+        // on the tenant's NEW block (self_ip binds once, at establish). Rides
+        // the ctrl lane rather than a directed RPC because the renumber
+        // touches a whole tenant at once and the HTTP call can land on any
+        // pod: every pod applies, the one holding the socket acts.
+        Some("overlay_cycle") => {
+            let Some(aid) = ctrl
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| ObjectId::parse_str(s).ok())
+            else {
+                return;
+            };
+            if hub.cycle_agent_ws(aid) {
+                info!(agent = %aid, "rc ctrl: overlay renumber cycle applied from another pod");
+            }
+        }
         _ => {}
     }
 }
