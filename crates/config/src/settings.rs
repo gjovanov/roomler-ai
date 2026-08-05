@@ -21,6 +21,7 @@ pub struct Settings {
     pub relay: RelaySettings,
     pub releases: ReleasesSettings,
     pub overlay: OverlaySettings,
+    pub stats: StatsSettings,
 }
 
 /// Multi-org P2b — tenant-block addressing for the overlay mesh.
@@ -106,6 +107,36 @@ impl Default for RelaySettings {
             stats_poll_secs: 30,
             busy_load: 1.5,
             busy_tx_mbps: 400.0,
+        }
+    }
+}
+
+/// Observability / analytics (stats collectors, rollups, platform admin).
+///
+/// Collectors are additive writers (relay-PoP samples, per-agent heartbeat
+/// buckets, presence transition events, call sessions) into `stats_*`
+/// collections with deterministic `_id`s — every writer is an idempotent
+/// upsert, which is what makes the 2-pod deployment safe without leases.
+/// `enabled=false` is a kill switch that stops all stats writes and the
+/// rollup task; read endpoints then serve `{enabled:false}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatsSettings {
+    /// Master gate for stats collection + rollups.
+    /// Env: `ROOMLER__STATS__ENABLED`.
+    pub enabled: bool,
+    /// Comma-separated **user ObjectIds** (24-hex) granted the platform
+    /// observability dashboards. Deliberately ids, not emails: OAuth
+    /// linking matches accounts by bare email, so an email allowlist
+    /// would turn a provider-asserted address into platform-root.
+    /// Env: `ROOMLER__STATS__PLATFORM_ADMINS`.
+    pub platform_admins: Option<String>,
+}
+
+impl Default for StatsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            platform_admins: None,
         }
     }
 }
@@ -529,6 +560,8 @@ impl Settings {
             .set_default("relay.busy_tx_mbps", 400.0)?
             .set_default("releases.refresh_token", None::<String>)?
             .set_default("releases.cache_ttl_secs", 900)?
+            .set_default("stats.enabled", true)?
+            .set_default("stats.platform_admins", None::<String>)?
             .set_default("overlay.blocks_enabled", false)?
             .set_default("overlay.block_prefix", 22)?
             .set_default("overlay.block_version_floor", "0.3.0-rc.301")?
