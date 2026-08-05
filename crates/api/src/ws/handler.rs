@@ -447,6 +447,10 @@ async fn handle_socket(
         .rc_hub
         .unregister_controller(user_id, &rc_controller_tx);
     rc_pump.abort();
+    // PR-2 — this conn may have rc sessions proxied on OTHER pods: tell
+    // each owner (fire-and-forget; the relay's janitor sweep is the
+    // belt), mirroring the C-4 media leave-forwarding below.
+    crate::ws::rc_relay::forward_conn_closed(&state, &connection_id);
     state.ws_storage.remove(&user_id, &connection_id, &sender);
 
     // S6 — drop this pod's online-registry claim once the user's LAST
@@ -574,6 +578,7 @@ async fn handle_client_message(
             authz.input_mode,
             dialed_tid,
             conn_established_ms,
+            connection_id,
         )
         .await;
         if handled {
