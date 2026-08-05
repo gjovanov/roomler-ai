@@ -95,6 +95,11 @@ pub struct AppState {
     /// deterministic-`_id` upserts, so every collector is 2-pod safe.
     /// Writers gate on `settings.stats.enabled`.
     pub stats: Arc<roomler_ai_services::dao::stats::StatsDao>,
+    /// Stats PR-3 — platform-operator allowlist parsed from
+    /// `ROOMLER__STATS__PLATFORM_ADMINS` (user OBJECTIDS, deliberately not
+    /// emails: OAuth links accounts by bare email, so an email allowlist
+    /// would turn a provider-asserted address into platform-root).
+    pub platform_admins: Arc<std::collections::HashSet<ObjectId>>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
     pub rc_hub: Arc<Hub>,
@@ -336,6 +341,35 @@ impl AppState {
 
         let consent_requests = Arc::new(ConsentRequestDao::new(&db));
         let stats = Arc::new(roomler_ai_services::dao::stats::StatsDao::new(&db));
+        // Stats PR-3 — malformed allowlist entries are skipped LOUDLY (a
+        // silent skip would read as "dashboards mysteriously 404").
+        let platform_admins: std::collections::HashSet<ObjectId> = settings
+            .stats
+            .platform_admins
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                match ObjectId::parse_str(s) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        tracing::warn!(
+                            entry = %s,
+                            "ROOMLER__STATS__PLATFORM_ADMINS entry is not a 24-hex ObjectId — skipped"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+        if !platform_admins.is_empty() {
+            tracing::info!(count = platform_admins.len(), "platform admins configured");
+        }
+        let platform_admins = Arc::new(platform_admins);
 
         let turn_map = Arc::new(build_turn_map(&settings));
         // P6b — live per-region load (written by the /stats poller, consulted
@@ -769,6 +803,7 @@ impl AppState {
             agent_crashes,
             agent_logs,
             stats,
+            platform_admins,
             consent_requests,
             rc_hub,
             turn_map,
