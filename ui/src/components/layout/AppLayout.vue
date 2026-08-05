@@ -473,8 +473,11 @@ watch(
 )
 
 // S6 — keep the WS's tenant-affinity key in sync with the active
-// tenant. The store redials the socket when it actually changes so the
-// front LB re-routes this session onto the tenant's pod.
+// tenant. PR-1 made this LAZY: the store only records the key (the
+// next natural dial carries it) — eagerly redialing here killed live
+// rc sessions and conference calls on every org switch. The rc
+// pre-flight does its own compare-and-redial for the one flow that is
+// genuinely placement-critical.
 watch(
   () => tenantStore.current?.id ?? null,
   (tid, prevTid) => {

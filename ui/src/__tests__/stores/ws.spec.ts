@@ -588,3 +588,87 @@ describe('useWsStore', () => {
     })
   })
 })
+
+// PR-1: tenant-affinity seeding + lazy affinity + dialedTid tracking.
+describe('useWsStore tenant affinity (PR-1)', () => {
+  const org = '69a1dbbad2000f26adc875ce'
+  const other = '68eeeeeeeeeeeeeeeeeeeeee'
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+    globalThis.localStorage?.clear?.()
+    vi.stubGlobal('location', { protocol: 'http:', host: 'localhost:5000', pathname: '/' })
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    globalThis.localStorage?.clear?.()
+  })
+
+  function dialedUrl(): string {
+    return String((mockWsInstance as unknown as Record<string, unknown>).url)
+  }
+
+  it('seeds tid from the URL path on a deep link (first dial is keyed)', () => {
+    vi.stubGlobal('location', {
+      protocol: 'http:',
+      host: 'localhost:5000',
+      pathname: `/tenant/${org}/agent/6a6c974930177702c77e3430/remote`,
+    })
+    const store = useWsStore()
+    store.connect('tok')
+    expect(dialedUrl()).toContain(`&tid=${org}`)
+    expect(store.getDialedTid()).toBe(org)
+  })
+
+  it('prefers the app-set affinity over the URL path', () => {
+    vi.stubGlobal('location', {
+      protocol: 'http:',
+      host: 'localhost:5000',
+      pathname: `/tenant/${org}/dashboard`,
+    })
+    const store = useWsStore()
+    store.setTenantAffinity(other)
+    store.connect('tok')
+    expect(dialedUrl()).toContain(`&tid=${other}`)
+  })
+
+  it('falls back to the persisted tenant when off tenant pages', () => {
+    globalThis.localStorage.setItem('roomler-current-tenant', org)
+    const store = useWsStore()
+    store.connect('tok')
+    expect(dialedUrl()).toContain(`&tid=${org}`)
+  })
+
+  it('dials key-less only when nothing is known', () => {
+    const store = useWsStore()
+    store.connect('tok')
+    expect(dialedUrl()).not.toContain('tid=')
+    expect(store.getDialedTid()).toBeNull()
+  })
+
+  it('setTenantAffinity is lazy: no redial of the live socket', () => {
+    const store = useWsStore()
+    store.connect('tok')
+    mockWsInstance.simulateOpen()
+    const live = mockWsInstance
+    store.setTenantAffinity(other)
+    expect(mockWsInstance).toBe(live)
+    expect(store.status).toBe('connected')
+    expect(store.getDialedTid()).toBeNull() // still the dialed key, not the pending one
+  })
+
+  it('forceRedial dials a fresh socket carrying the current affinity', () => {
+    const store = useWsStore()
+    store.connect('tok')
+    mockWsInstance.simulateOpen()
+    const old = mockWsInstance
+    store.setTenantAffinity(other)
+    store.forceRedial()
+    expect(mockWsInstance).not.toBe(old)
+    expect(dialedUrl()).toContain(`&tid=${other}`)
+    expect(store.getDialedTid()).toBe(other)
+  })
+})
