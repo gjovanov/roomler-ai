@@ -34,6 +34,10 @@ struct TokenResponse {
 struct GoogleUser {
     id: String,
     email: Option<String>,
+    /// Google explicitly documents that consumers MUST check this before
+    /// trusting `email` — an unverified address must never drive the
+    /// find-by-email account-linking step (account-takeover vector).
+    verified_email: Option<bool>,
     name: Option<String>,
     given_name: Option<String>,
     family_name: Option<String>,
@@ -317,10 +321,22 @@ impl OAuthService {
                     .trim()
                     .to_string()
                 });
+                // Stats PR-3 hardening: an UNVERIFIED Google email must not
+                // reach the email-linking step in find_or_create_oauth —
+                // blank it so the account matches by provider_id only.
+                let email = if user.verified_email == Some(false) {
+                    tracing::warn!(
+                        provider_id = %user.id,
+                        "google oauth: unverified email — skipping email-based account linking"
+                    );
+                    String::new()
+                } else {
+                    user.email.unwrap_or_default()
+                };
                 Ok(OAuthUserInfo {
                     provider: "google".to_string(),
                     provider_id: user.id,
-                    email: user.email.unwrap_or_default(),
+                    email,
                     name,
                     avatar_url: user.picture,
                 })
