@@ -477,8 +477,31 @@ pub(crate) async fn connect_agent_ws(
     agent_token: &str,
     machine_name: &str,
 ) -> AgentWs {
+    connect_agent_ws_inner(app, agent_token, machine_name, None).await
+}
+
+/// PR-1 — keyed variant: dials with the S6 tenant-affinity `tid=` like a
+/// real (rc.29x+) agent build does. The rehome direction rule only trusts
+/// keyed, provably-newer conns, so cross-pod tests that expect a NUDGE
+/// must dial keyed.
+pub(crate) async fn connect_agent_ws_keyed(
+    app: &TestApp,
+    agent_token: &str,
+    machine_name: &str,
+    tid: &str,
+) -> AgentWs {
+    connect_agent_ws_inner(app, agent_token, machine_name, Some(tid)).await
+}
+
+async fn connect_agent_ws_inner(
+    app: &TestApp,
+    agent_token: &str,
+    machine_name: &str,
+    tid: Option<&str>,
+) -> AgentWs {
+    let tid_param = tid.map(|t| format!("&tid={t}")).unwrap_or_default();
     let ws_url = format!(
-        "ws://{}/ws?token={}&role=agent",
+        "ws://{}/ws?token={}&role=agent{tid_param}",
         app.addr,
         urlencode(agent_token)
     );

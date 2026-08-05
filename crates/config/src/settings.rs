@@ -86,6 +86,32 @@ pub struct RcSettings {
     /// (stale/offline transitions have no socket-teardown moment to hook).
     /// Env: `ROOMLER__RC__PRESENCE_SWEEP_SECS`.
     pub presence_sweep_secs: u64,
+    /// PR-1 rehome — direction guard band. On a cross-pod rc/tunnel miss
+    /// the agent is judged PARKED (and nudged) only when the requesting
+    /// conn is at least this much newer than the agent's presence record;
+    /// anything closer is ambiguous (an LB map flip between two dials)
+    /// and resolves to the free move: the controller re-dials. Ambiguity
+    /// self-heals toward nudging — the record's since_ms is frozen while
+    /// every controller retry re-establishes the conn, so the delta grows.
+    /// Env: `ROOMLER__RC__REHOME_DIRECTION_GUARD_MS`.
+    pub rehome_direction_guard_ms: i64,
+    /// PR-1 rehome — owner-side pacing: minimum seconds between agent-WS
+    /// nudge cycles per agent. A cycle tears the agent's rc/tunnel/overlay
+    /// planes for seconds, so it must never flap.
+    /// Env: `ROOMLER__RC__NUDGE_COOLDOWN_SECS`.
+    pub nudge_cooldown_secs: u64,
+    /// PR-1 rehome — nudge attempts inside the reset window before the
+    /// agent is declared stuck (split evidence) and further nudges pause.
+    /// Env: `ROOMLER__RC__NUDGE_MAX_ATTEMPTS`.
+    pub nudge_max_attempts: u32,
+    /// PR-1 rehome — quiet period after which the attempt counter resets.
+    /// Env: `ROOMLER__RC__NUDGE_ATTEMPTS_RESET_SECS`.
+    pub nudge_attempts_reset_secs: u64,
+    /// PR-1 rehome — requester-side throttle: minimum ms between
+    /// `rc.agent_nudge` RPCs per agent from this pod (a click storm sent
+    /// 11 RPCs in 15 s at one refusing owner in the 2026-08-04 incident).
+    /// Env: `ROOMLER__RC__NUDGE_REQUESTER_THROTTLE_MS`.
+    pub nudge_requester_throttle_ms: u64,
 }
 
 impl Default for RcSettings {
@@ -95,6 +121,11 @@ impl Default for RcSettings {
             ws_liveness_tick_secs: 30,
             presence_batch_ms: 2000,
             presence_sweep_secs: 30,
+            rehome_direction_guard_ms: 5000,
+            nudge_cooldown_secs: 60,
+            nudge_max_attempts: 3,
+            nudge_attempts_reset_secs: 600,
+            nudge_requester_throttle_ms: 5000,
         }
     }
 }
@@ -392,6 +423,11 @@ impl Settings {
             .set_default("rc.ws_liveness_tick_secs", 30)?
             .set_default("rc.presence_batch_ms", 2000)?
             .set_default("rc.presence_sweep_secs", 30)?
+            .set_default("rc.rehome_direction_guard_ms", 5000)?
+            .set_default("rc.nudge_cooldown_secs", 60)?
+            .set_default("rc.nudge_max_attempts", 3)?
+            .set_default("rc.nudge_attempts_reset_secs", 600)?
+            .set_default("rc.nudge_requester_throttle_ms", 5000)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?

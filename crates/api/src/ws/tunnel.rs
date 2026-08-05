@@ -70,8 +70,10 @@ pub async fn handle_tunnel_client_socket(
     tunnel_client_id: ObjectId,
     tenant_id: ObjectId,
     owner_user_id: ObjectId,
+    dialed_tid: Option<String>,
 ) {
     info!(%tunnel_client_id, %tenant_id, %owner_user_id, "tunnel-client WS connected");
+    let conn_established_ms = bson::DateTime::now().timestamp_millis();
 
     let (socket_tx, mut socket_rx) = socket.split();
     let socket_tx = Arc::new(Mutex::new(socket_tx));
@@ -136,6 +138,8 @@ pub async fn handle_tunnel_client_socket(
         client_version,
         client_os,
         outbound_tx: outbound_tx.clone(),
+        dialed_tid,
+        conn_established_ms,
     };
 
     // Periodic revocation re-check task — same as T1 stub, but now
@@ -460,6 +464,13 @@ pub(crate) struct Originator {
     /// answers relayed via `tunnel_clients_by_session[session_id]` reach
     /// the agent's socket through its EXISTING pump — no target-side change.
     pub(crate) outbound_tx: mpsc::Sender<ServerMsg>,
+    /// PR-1 rehome — the affinity key this conn DIALED with (`None` =
+    /// key-less legacy dial that hashed on client IP) and when it
+    /// established. Direction inputs for the cross-pod open-reject: only
+    /// a correctly-keyed, provably-newer conn justifies nudging the
+    /// target agent's WS.
+    pub(crate) dialed_tid: Option<String>,
+    pub(crate) conn_established_ms: i64,
 }
 
 impl Originator {
@@ -571,21 +582,54 @@ async fn handle_tunnel_open(
         )
         .await
     {
-        let owner_pod = crate::cluster::directory::OwnerRecord::parse(&owner)
-            .map(|r| r.pod_id)
+        let record = crate::cluster::directory::OwnerRecord::parse(&owner);
+        let owner_pod = record
+            .as_ref()
+            .map(|r| r.pod_id.clone())
             .unwrap_or_default();
+        let agent_since_ms = record.map(|r| r.since_ms).unwrap_or(0);
         warn!(
             origin = %orig.log_id(), %agent_id, %owner_pod,
             "tunnel open rejected: agent homed on another pod (rehome)"
         );
-        crate::ws::remote_control::spawn_agent_nudge(state, owner_pod.clone(), agent_id.to_hex());
+        // PR-1 direction rule (twin of the rc path): only a correctly-
+        // keyed conn that is provably NEWER than the target agent's
+        // registration justifies cycling that agent's WS; a key-less /
+        // wrong-keyed / older-or-ambiguous originator is itself the
+        // mis-placed party and its own fresh redial converges it.
+        // `agent` (the target's row) is already fetched above.
+        match crate::ws::rc_cluster::rehome_direction(
+            orig.dialed_tid.as_deref(),
+            &agent.tenant_id.to_hex(),
+            orig.conn_established_ms,
+            agent_since_ms,
+            state.settings.rc.rehome_direction_guard_ms,
+        ) {
+            crate::ws::rc_cluster::RehomeDirection::ControllerMove { reason } => {
+                crate::cluster::metrics::bump(&crate::cluster::metrics::RC_REHOME_CONTROLLER_TOTAL);
+                info!(
+                    origin = %orig.log_id(), %agent_id, %owner_pod, reason,
+                    "cross-pod tunnel miss: originator re-dials (nudge suppressed)"
+                );
+            }
+            crate::ws::rc_cluster::RehomeDirection::NudgeAgent => {
+                crate::ws::remote_control::spawn_agent_nudge(
+                    state,
+                    owner_pod.clone(),
+                    agent_id.to_hex(),
+                );
+            }
+        }
         crate::cluster::metrics::bump(&crate::cluster::metrics::TUNNEL_REHOME_TOTAL);
+        // Pod identity stays in server logs; the wire carries only the
+        // actionable fact + the open_nonce so the CLI fails the exact
+        // pending flow and its reconnect loop dials fresh.
         send_msg(
             &orig.outbound_tx,
             ServerMsg::Error {
                 session_id: None,
                 code: "agent_on_other_pod".into(),
-                message: format!("agent is homed on pod {owner_pod}; re-dial and retry"),
+                message: "agent is homed on another pod; re-dial and retry".into(),
                 open_nonce: open_nonce.clone(),
             },
         )
@@ -1512,6 +1556,16 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
             )
             .await
             {
+                // PR-1 — mirror into the by-ORIGIN index (the per-conn
+                // map below is invisible to the nudge busy check; without
+                // this a routes-only agent read as idle and got cycled).
+                if let Some(origin_agent) = orig.origin_agent_id() {
+                    state
+                        .tunnel_sessions_by_origin_agent
+                        .entry(origin_agent)
+                        .or_default()
+                        .insert(s.tunnel_session_id);
+                }
                 sessions.insert(s.tunnel_session_id, s);
             }
             None
@@ -1668,6 +1722,13 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
                     s.agent_id,
                     s.tunnel_session_id,
                 );
+                if let Some(origin_agent) = orig.origin_agent_id() {
+                    unindex_session_target(
+                        &state.tunnel_sessions_by_origin_agent,
+                        origin_agent,
+                        s.tunnel_session_id,
+                    );
+                }
                 audit_peer_close(state, &s, orig).await;
                 None
             } else {
@@ -1696,6 +1757,15 @@ pub(crate) async fn teardown_agent_originated_sessions(
             s.agent_id,
             s.tunnel_session_id,
         );
+        // PR-1 — the by-ORIGIN twin (same shape, keyed by the closing
+        // originator; see the TunnelOpen relay arm's mirror insert).
+        if let Some(origin_agent) = orig.origin_agent_id() {
+            unindex_session_target(
+                &state.tunnel_sessions_by_origin_agent,
+                origin_agent,
+                s.tunnel_session_id,
+            );
+        }
         let _ = state.rc_hub.send_to_agent(
             s.agent_id,
             ServerMsg::TunnelTerminate {
