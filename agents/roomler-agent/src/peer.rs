@@ -931,6 +931,15 @@ impl AgentPeer {
                         // pre-clone-and-stash, the emitter task would
                         // have no way to write outbound messages.
                         *control_stash.lock().await = Some(dc.clone());
+                        // P6 field fix — the arbiter registration + the
+                        // shared-pipeline badge replay both happened at
+                        // `AgentPeer::new`, when this stash was still None,
+                        // so a FOLLOWER never received `rc:control.state`
+                        // (no participants rail; no Request-control button
+                        // in exclusive mode) nor `rc:video-info` (no
+                        // `shared ×N` badge). Deliver both now.
+                        crate::input::arbiter::global().control_ready(session_id);
+                        crate::media_share::replay_video_info(session_id);
                         attach_control_handler(
                             dc,
                             session_id,
@@ -1182,6 +1191,35 @@ impl AgentPeer {
         if let Err(e) = self.pc.close().await {
             warn!(session = %self.session_id, %e, "PC close failed");
         }
+    }
+}
+
+/// P6 field fix (2026-08-05) — session-scoped teardown that MUST run on
+/// every exit path.
+///
+/// The arbiter registration and the display-match ownership were both
+/// released from the control DC's `on_close`. Field-observed on zeus: that
+/// callback does NOT fire when the whole PeerConnection is torn down, so
+/// arbiter entries LEAKED (server reported 0 open sessions while a fresh
+/// registration logged `sessions=3`). A leaked entry inflates the
+/// participants rail and — worse — can leave the exclusive-mode floor held
+/// by a session that no longer exists.
+///
+/// `AgentPeer` is owned by the signalling loop's `peers` map, so its Drop
+/// is the one point every path funnels through (Terminate, agent-side
+/// hangup, WS drop, displacement, task abort). Both calls are idempotent,
+/// so the `on_close` hook stays as a belt for the DC-only case.
+impl Drop for AgentPeer {
+    fn drop(&mut self) {
+        let session_id = self.session_id;
+        crate::input::arbiter::global().session_closed(session_id);
+        // `restore_for` touches the OS display API; keep it off this
+        // (possibly async-context) thread. Ownership-gated + idempotent.
+        std::thread::spawn(move || {
+            if crate::display_match::restore_for(session_id) {
+                tracing::info!(session = %session_id, "display-match: restored on peer drop (owner)");
+            }
+        });
     }
 }
 
