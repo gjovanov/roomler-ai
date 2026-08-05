@@ -87,6 +87,9 @@ pub struct AppState {
 
     // Remote-control subsystem
     pub agents: Arc<AgentDao>,
+    /// Single-use ledger for enrollment-token jtis. See
+    /// [`roomler_ai_services::dao::used_token`].
+    pub used_tokens: Arc<roomler_ai_services::dao::used_token::UsedTokenDao>,
     pub remote_sessions: Arc<RemoteSessionDao>,
     pub remote_audit: Arc<RemoteAuditDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
@@ -332,6 +335,7 @@ impl AppState {
 
         // Remote-control subsystem
         let agents = Arc::new(AgentDao::new(&db));
+        let used_tokens = Arc::new(roomler_ai_services::dao::used_token::UsedTokenDao::new(&db));
         let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
@@ -798,6 +802,7 @@ impl AppState {
             redis_sub_alive,
             storage,
             agents,
+            used_tokens,
             remote_sessions,
             remote_audit,
             agent_crashes,

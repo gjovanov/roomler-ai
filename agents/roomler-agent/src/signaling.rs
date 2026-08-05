@@ -1037,6 +1037,7 @@ async fn connect_once(
                                 &cfg.forward_acl,
                                 &relay_regions_slot,
                                 &derp_ticket_slot,
+                                cfg,
                             )
                             .await?;
                         }
@@ -1103,6 +1104,10 @@ async fn handle_server_msg(
     forward_acl: &crate::tunnel::acl::AgentForwardAcl,
     relay_regions_slot: &crate::relay_probe::RegionSlot,
     derp_ticket_slot: &crate::relay_probe::DerpTicketSlot,
+    // Multi-org: this loop's OWN enrollment — the server_url + machine
+    // identity a pushed `rc:agent.join_org` enrolls with. Never a value
+    // taken off the wire.
+    agent_cfg: &AgentConfig,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -1851,6 +1856,47 @@ async fn handle_server_msg(
                      (ROOMLER_AGENT_AUTO_UPDATE=0?) or a trigger is already queued"
                 );
             }
+        }
+
+        // Multi-org — "Add to another organization" from the admin UI: enroll
+        // this machine into a SECOND org on the same server, from a pushed
+        // single-use token, and bring that org's loop up without a restart.
+        ServerMsg::JoinOrg {
+            enrollment_token,
+            label,
+            overlay_mode,
+        } => {
+            // Same escalation guard as `rc:agent.update`: only the PRIMARY
+            // enrollment may add orgs. A secondary org's admin borrows this
+            // device — it must not be able to hand it to further orgs.
+            if !ctx.is_primary {
+                warn!(
+                    org = %ctx.label,
+                    "rc:agent.join_org ignored — only the primary enrollment may \
+                     add organizations"
+                );
+                return Ok(());
+            }
+            // Off-loop: the join makes an HTTP round-trip and takes the
+            // config write lock. The message loop must keep pumping (a
+            // blocked loop trips the watchdog + the receive-liveness
+            // deadline).
+            let cfg = agent_cfg.clone();
+            tokio::spawn(async move {
+                match crate::org_join::join_from_push(
+                    &cfg,
+                    &enrollment_token,
+                    label.as_deref(),
+                    overlay_mode.as_deref(),
+                )
+                .await
+                {
+                    Ok(outcome) => info!(?outcome, "rc:agent.join_org applied"),
+                    Err(e) => {
+                        warn!(error = %format!("{e:#}"), "rc:agent.join_org failed")
+                    }
+                }
+            });
         }
 
         // Remaining tunnel-flow `ServerMsg` variants

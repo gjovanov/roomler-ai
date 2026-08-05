@@ -1042,6 +1042,46 @@ mod system {
             }
         }
 
+        /// Multi-org P2c — take a secondary org's address back off the
+        /// shared adapter (its runtime is gone, or its registration was
+        /// refused). Best-effort: a failure here only leaves an idle address
+        /// behind, never breaks a live org.
+        pub fn del_address_sync(&self, ip: Ipv4Addr, prefix: u8) {
+            let run = |prog: &str, args: &[String]| {
+                let _ = std::process::Command::new(prog).args(args).output();
+            };
+            #[cfg(target_os = "windows")]
+            {
+                let _ = prefix;
+                run(
+                    "netsh",
+                    &[
+                        "interface".into(),
+                        "ipv4".into(),
+                        "delete".into(),
+                        "address".into(),
+                        format!("name={IF_NAME}"),
+                        format!("addr={ip}"),
+                    ],
+                );
+            }
+            #[cfg(target_os = "linux")]
+            run(
+                "ip",
+                &[
+                    "addr".into(),
+                    "del".into(),
+                    format!("{ip}/{prefix}"),
+                    "dev".into(),
+                    IF_NAME.into(),
+                ],
+            );
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            {
+                let _ = (ip, prefix, run);
+            }
+        }
+
         /// Create the device, assign `self_ip` with `netmask`, set `mtu`,
         /// and bring it up. `netmask` is the overlay *network* mask (e.g.
         /// `/10` → `255.192.0.0`) so the whole overlay CIDR routes here

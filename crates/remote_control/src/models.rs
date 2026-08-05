@@ -88,6 +88,18 @@ pub struct AgentCaps {
     /// Empty / unset = a pre-P6 agent → the P3 single-holder rule stays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    /// Multi-org capabilities. Recognised values:
+    ///
+    /// * `join` — the agent honours `rc:agent.join_org`: it enrolls itself
+    ///   into an ADDITIONAL org on the same server from a pushed enrollment
+    ///   token and brings that org's supervisor up without a restart.
+    ///
+    /// Empty / unset = a pre-rc.310 agent. The admin UI greys out
+    /// "Add to another organization" for those; the server refuses to mint a
+    /// token it knows can't be consumed, rather than pushing a message that
+    /// lands in the agent's unknown-variant debug branch and vanishes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multi_org: Vec<String>,
     /// VP9 chroma format the agent will emit on the
     /// `data-channel-vp9-444` transport. Values: `"yuv444"` (default,
     /// current behaviour, VP9 profile 1) for sharpest text via
