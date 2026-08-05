@@ -234,11 +234,19 @@ mod tests {
         );
         let entry = merged.orgs.iter().find(|o| o.label == "acme").unwrap();
         assert_eq!(entry.tenant_id, "tid-acme");
-        assert!(entry.overlay_wg_secret_key.is_some());
+        // The invariant that holds in EVERY build: a secondary never carries
+        // the primary's key. (The mint itself is `cfg`-gated on an overlay
+        // surface — a signalling-only build leaves it None and mints on the
+        // first overlay-enabled start, mirroring the primary's lazy path.)
         assert_ne!(
             entry.overlay_wg_secret_key.as_deref(),
             Some("PRIMARY-KEY"),
             "a secondary must never borrow the primary's WG key"
+        );
+        #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+        assert!(
+            entry.overlay_wg_secret_key.is_some(),
+            "an overlay-capable build mints the org's own key at append time"
         );
         // The primary identity is untouched.
         assert_eq!(merged.tenant_id, "tid-primary");

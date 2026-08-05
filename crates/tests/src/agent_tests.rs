@@ -757,15 +757,22 @@ async fn join_org_pushes_a_live_device_into_a_second_organization() {
         "the device should enroll into the target org and come online there"
     );
 
-    // The config on disk grew a labelled secondary with its OWN key.
+    // The config on disk grew a labelled secondary alongside an untouched
+    // primary.
     let saved = roomler_agent::config::load(&cfg_path).unwrap();
     assert_eq!(saved.tenant_id, src.tenant_id, "primary identity untouched");
+    assert_eq!(saved.agent_id, cfg.agent_id, "primary agent id untouched");
     assert_eq!(saved.orgs.len(), 1);
     assert_eq!(saved.orgs[0].label, "second");
     assert_eq!(saved.orgs[0].tenant_id, target);
-    assert!(saved.orgs[0].overlay_wg_secret_key.is_some());
-    assert_ne!(
-        saved.orgs[0].overlay_wg_secret_key, saved.overlay_wg_secret_key,
+    assert!(saved.orgs[0].enabled);
+    // The per-org WG mint is `cfg`-gated on an overlay surface and these
+    // tests build the agent with default features, so assert the invariant
+    // that holds either way — a secondary never carries the primary's key.
+    // (The mint itself is pinned by the agent's overlay-feature unit test.)
+    assert!(
+        saved.orgs[0].overlay_wg_secret_key.is_none()
+            || saved.orgs[0].overlay_wg_secret_key != saved.overlay_wg_secret_key,
         "a secondary must never borrow the primary's WG key"
     );
 
