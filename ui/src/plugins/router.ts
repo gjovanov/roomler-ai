@@ -71,6 +71,14 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/profile/ProfileEditView.vue'),
       },
       {
+        // Stats PR-4 — platform-operator observability (relay fleet,
+        // orgs, calls). Client-gated by user.is_platform_admin; the
+        // server 404s everyone else.
+        path: 'observability',
+        name: 'observability',
+        component: () => import('@/views/observability/ObservabilityView.vue'),
+      },
+      {
         path: 'profile/:userId',
         name: 'profile',
         component: () => import('@/views/profile/ProfileView.vue'),
@@ -112,6 +120,15 @@ const routes: RouteRecordRaw[] = [
             path: 'invites',
             name: 'invites',
             component: () => import('@/views/invite/InviteManageView.vue'),
+          },
+          {
+            // Stats PR-4 — org analytics (machines/calls/tunnels over
+            // time). The component fail-closes on membership permissions
+            // before firing any query.
+            path: 'analytics',
+            name: 'analytics',
+            props: true,
+            component: () => import('@/views/analytics/AnalyticsView.vue'),
           },
           {
             // S4 pivot — the fleet page, promoted out of Admin. The old

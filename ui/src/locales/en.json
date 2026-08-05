@@ -22,6 +22,8 @@
     "tunnelAcl": "ACL",
     "subnetRoutes": "Overlay routes",
     "magicDns": "MagicDNS",
+    "analytics": "Analytics",
+    "observability": "Observability",
     "collaboration": "Collaboration",
     "rooms": "Rooms",
     "explore": "Explore",

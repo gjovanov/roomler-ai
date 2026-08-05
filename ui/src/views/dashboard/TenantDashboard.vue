@@ -42,6 +42,58 @@
       </v-col>
     </v-row>
 
+    <!-- Insights (stats PR-4): the basic org graphs, visible to EVERY
+         member — the overview endpoint is member-safe; deep queries live
+         behind Analytics (org admins). Hidden entirely while stats are
+         disabled server-side. -->
+    <template v-if="statsStore.overview?.enabled">
+      <h2 class="text-h6 mt-4 mb-2">Insights</h2>
+      <v-row>
+        <v-col cols="12" md="6">
+          <v-card>
+            <v-card-title class="text-subtitle-1 d-flex align-center">
+              Machines online — 24h
+              <v-spacer />
+              <span class="text-h6">
+                {{ statsStore.overview?.machines?.online ?? 0 }}/{{
+                  statsStore.overview?.machines?.total ?? 0
+                }}
+              </span>
+            </v-card-title>
+            <v-card-text>
+              <time-series-chart
+                :points="statsStore.overview?.spark_machines ?? []"
+                :series="[{ key: 'online', label: 'Online' }]"
+                :height="140"
+                area
+                empty-text="No samples yet — data appears within the hour"
+              />
+            </v-card-text>
+          </v-card>
+        </v-col>
+        <v-col cols="12" md="6">
+          <v-card>
+            <v-card-title class="text-subtitle-1 d-flex align-center">
+              Call minutes — 7d
+              <v-spacer />
+              <span class="text-h6">
+                {{ Math.round(statsStore.overview?.calls?.minutes_today ?? 0) }} today
+              </span>
+            </v-card-title>
+            <v-card-text>
+              <time-series-chart
+                :points="statsStore.overview?.spark_minutes ?? []"
+                :series="[{ key: 'minutes', label: 'Minutes' }]"
+                :height="140"
+                area
+                empty-text="No calls in the last 7 days"
+              />
+            </v-card-text>
+          </v-card>
+        </v-col>
+      </v-row>
+    </template>
+
     <!-- Quick actions -->
     <h2 class="text-h6 mt-4 mb-2">Quick Actions</h2>
     <v-row>
@@ -115,23 +167,38 @@
           </v-card-text>
         </v-card>
       </v-col>
+      <v-col v-if="showAnalytics" cols="12" sm="6" md="3">
+        <v-card :to="`/tenant/${tenantId}/analytics`" hover>
+          <v-card-text>
+            <v-icon color="primary" class="mr-2">mdi-chart-areaspline</v-icon>
+            <span class="text-subtitle-1 font-weight-medium">Analytics</span>
+            <div class="text-body-2 text-medium-emphasis mt-1">
+              Machines, calls, tunnel traffic over time
+            </div>
+          </v-card-text>
+        </v-card>
+      </v-col>
     </v-row>
   </v-container>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTenantStore } from '@/stores/tenant'
 import { useRoomStore } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
-import { canSeeFleetNav } from '@/utils/permissions'
+import { useStatsStore } from '@/stores/stats'
+import { usePolling } from '@/composables/usePolling'
+import { canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
+import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 
 const route = useRoute()
 const router = useRouter()
 const tenantStore = useTenantStore()
 const roomStore = useRoomStore()
 const agentStore = useAgentStore()
+const statsStore = useStatsStore()
 
 const tenantId = computed(() => route.params.tenantId as string)
 const activeCallCount = computed(
@@ -142,6 +209,19 @@ const totalMessageCount = computed(
 )
 const onlineDevices = computed(() => agentStore.agents.filter((a) => a.is_online).length)
 const showFleet = computed(() => canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner))
+const showAnalytics = computed(() =>
+  canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
+)
+
+// Insights panel: member-safe overview, refreshed every 60 s (paused
+// while hidden). The store swallows 404s so a member of a stats-disabled
+// deployment just sees no panel.
+usePolling(async () => {
+  if (tenantId.value) await statsStore.fetchOverview(tenantId.value)
+}, 60_000)
+watch(tenantId, (tid) => {
+  if (tid) void statsStore.fetchOverview(tid)
+})
 
 async function startCall() {
   const now = new Date()
