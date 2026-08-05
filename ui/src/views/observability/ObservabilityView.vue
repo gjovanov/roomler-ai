@@ -238,14 +238,23 @@ const globalCalls = ref<SeriesPayload | null>(null)
 
 // Realtime: 15 s poll of the current snapshot (reads the newest persisted
 // buckets — cheap), paused while the tab is hidden.
-usePolling(async () => {
+async function loadRelayCurrent() {
   if (!isPlatformAdmin.value) return
   await statsStore.fetchRelayCurrent()
   if (!selectedRegion.value) {
     const first = regionCards.value.find((r) => r.monitored)
     if (first) selectedRegion.value = first.id
   }
-}, 15_000)
+}
+usePolling(loadRelayCurrent, 15_000)
+// First paint must not depend on the poll: at mount the auth flag may not
+// have loaded yet (immediate call no-ops) and a background tab skips every
+// tick — so ALSO fetch when isPlatformAdmin flips true, like the org
+// watcher below. Field-found on the first prod render: orgs table filled,
+// relay cards empty until the tab was focused for a poll interval.
+watch(isPlatformAdmin, (v) => {
+  if (v) void loadRelayCurrent()
+})
 
 interface RegionCard {
   id: string
