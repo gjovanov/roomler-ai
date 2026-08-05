@@ -10,7 +10,7 @@ use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParam
 /// Outcome of `leave_participant`: whether an open session was actually
 /// closed, and whether it was the user's last one (⇒ the count was
 /// decremented and the caller may need to auto-end the call).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LeaveOutcome {
     pub closed: bool,
     pub was_last_session: bool,
