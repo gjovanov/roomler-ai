@@ -20,6 +20,49 @@ pub struct Settings {
     pub rc: RcSettings,
     pub relay: RelaySettings,
     pub releases: ReleasesSettings,
+    pub overlay: OverlaySettings,
+}
+
+/// Multi-org P2b — tenant-block addressing for the overlay mesh.
+///
+/// Every tenant shares `100.64.0.0/10` today, with each network's host cursor
+/// seeded at 1 — so tenant A's `100.64.0.7` and tenant B's `100.64.0.7` are
+/// the same address on a host enrolled in both. Blocks carve each tenant a
+/// disjoint slice so one daemon can carry N orgs on one interface.
+///
+/// The rollout is deliberately staged: `blocks_enabled=false` (the shipped
+/// default) is provably the pre-P2b behaviour, and turning it on affects only
+/// networks created AFTER the flip. Migrating an existing tenant is always an
+/// explicit admin action (`POST …/overlay-block/renumber`), because it has to
+/// cycle every node's WS to re-bind their addresses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OverlaySettings {
+    /// Carve a fresh block for every NEWLY created tenant overlay network.
+    /// Env: `ROOMLER__OVERLAY__BLOCKS_ENABLED`.
+    pub blocks_enabled: bool,
+    /// Prefix of a carved block, `/16` … `/22`. `/22` = 1022 devices per
+    /// tenant and 4 032 tenants inside the `/10`.
+    /// Env: `ROOMLER__OVERLAY__BLOCK_PREFIX`.
+    pub block_prefix: u8,
+    /// Minimum agent/tunnel-client version allowed on a renumbered tenant.
+    /// Below this the boot reconciler purges the node's OWN on-link route at
+    /// daemon start (it kept only the literal `100.64.0.0/…`), which
+    /// blackholes the mesh for that host — so a migration refuses to run over
+    /// a fleet that hasn't caught up. `--force` on the endpoint overrides.
+    /// Env: `ROOMLER__OVERLAY__BLOCK_VERSION_FLOOR`.
+    pub block_version_floor: String,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            blocks_enabled: false,
+            block_prefix: 22,
+            // rc.301 shipped the P2a forward-compat set (prefix-aware
+            // keep-set, bounded IPAM, remove-before-upsert deltas, gated DNS).
+            block_version_floor: "0.3.0-rc.301".to_string(),
+        }
+    }
 }
 
 /// Multi-region relay PoPs (regional coturn + DERP). Regions are fleet
@@ -486,6 +529,9 @@ impl Settings {
             .set_default("relay.busy_tx_mbps", 400.0)?
             .set_default("releases.refresh_token", None::<String>)?
             .set_default("releases.cache_ttl_secs", 900)?
+            .set_default("overlay.blocks_enabled", false)?
+            .set_default("overlay.block_prefix", 22)?
+            .set_default("overlay.block_version_floor", "0.3.0-rc.301")?
             .set_default("claude.model", "claude-sonnet-4-5-20250929")?
             .set_default("claude.max_tokens", 4096)?
             .set_default("oauth.base_url", "http://localhost:5001")?
