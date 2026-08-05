@@ -29,6 +29,17 @@ pub static DERP_REHOME_CLOSE_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static SPLIT_EVIDENCE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Relay grants issued on a NON-default region (multi-region PoPs).
 pub static RELAY_REGION_PICK_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// PR-1 rehome — cross-pod rc/tunnel misses resolved by MOVING THE
+/// CONTROLLER (mis-keyed / stale / ambiguous dial): rehome reply sent,
+/// agent nudge deliberately suppressed. The 2026-08-04 incident class.
+pub static RC_REHOME_CONTROLLER_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// PR-1 rehome — owner-side nudge refusals (rc/tunnel/origin busy). A
+/// persistently growing value = a parked-busy population that only
+/// converges on idle; the deferred-fire follow-up feeds on this signal.
+pub static AGENT_NUDGE_REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// PR-1 rehome — nudges suppressed by the cooldown cap (split evidence:
+/// repeated convergence attempts are not converging).
+pub static AGENT_NUDGE_STUCK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -93,6 +104,9 @@ pub async fn snapshot(state: &crate::state::AppState) -> serde_json::Value {
                 crate::ws::derp_cluster::DERP_REHOME_STUCK_TOTAL.load(Ordering::Relaxed),
             "split_evidence_total": SPLIT_EVIDENCE_TOTAL.load(Ordering::Relaxed),
             "relay_region_pick_total": RELAY_REGION_PICK_TOTAL.load(Ordering::Relaxed),
+            "rc_rehome_controller_total": RC_REHOME_CONTROLLER_TOTAL.load(Ordering::Relaxed),
+            "agent_nudge_refused_total": AGENT_NUDGE_REFUSED_TOTAL.load(Ordering::Relaxed),
+            "agent_nudge_stuck_total": AGENT_NUDGE_STUCK_TOTAL.load(Ordering::Relaxed),
         },
         "local": {
             "agents_online": state.rc_hub.online_agents().len(),

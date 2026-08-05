@@ -86,6 +86,13 @@ export const RC_RECONNECT_STEADY_MS = 8000
  */
 export const RC_PC_DISCONNECTED_GRACE_MS = 4000
 export const RC_SIGNALING_TIMEOUT_MS = 15000
+
+/**
+ * PR-1 pre-flight: how long connect() waits for the signalling socket
+ * to reach 'connected' after a re-key redial (or a plain cold socket)
+ * before proceeding anyway and letting the ladder pace retries.
+ */
+export const RC_PREFLIGHT_WS_WAIT_MS = 5000
 export const RC_WATCHDOG_TICK_MS = 1000
 export const RC_STALL_PROBE_TICKS = 6
 export const RC_STALL_FAIL_TICKS = 10
@@ -149,6 +156,66 @@ export function nextStallAction(stallTicks: number): 'none' | 'probe' | 'reconne
   if (stallTicks >= RC_STALL_FAIL_TICKS) return 'reconnect'
   if (stallTicks === RC_STALL_PROBE_TICKS) return 'probe'
   return 'none'
+}
+
+/**
+ * PR-1 rehome: how many consecutive `agent_on_other_pod` errors trigger
+ * a socket re-key + redial before we stop cycling the socket. Past the
+ * cap the dial inputs are evidently not the problem (a parked agent
+ * still converging server-side, or a stale directory record) and the
+ * retry rides the normal infinite ladder instead (rc.23: no terminal).
+ */
+export const RC_REHOME_MAX_REDIALS = 6
+
+export type RehomeAction = 'redial_retry' | 'ladder_only'
+
+/**
+ * Decision for one `agent_on_other_pod` occurrence. `consecutive` is
+ * 1-based (incremented before the call) and resets on any successful
+ * connect or user-initiated action. Pure for unit tests.
+ */
+export function rehomeRetryDecision(consecutive: number): RehomeAction {
+  return consecutive <= RC_REHOME_MAX_REDIALS ? 'redial_retry' : 'ladder_only'
+}
+
+/**
+ * The tenant whose pod the rc session must originate from: the AGENT's
+ * org. An explicit id (threaded from the view; authoritative for
+ * cross-org device modals) wins over the page URL. Pure for tests.
+ */
+export function expectedOrgTid(
+  explicitOrgId: string | null | undefined,
+  pathname: string,
+): string | null {
+  if (explicitOrgId && /^[0-9a-f]{24}$/.test(explicitOrgId)) return explicitOrgId
+  return pathname.match(/^\/tenant\/([0-9a-f]{24})\b/)?.[1] ?? null
+}
+
+/**
+ * User-facing text for `rc:error` codes. Server prose can carry
+ * internals (pod IPs, agent hexes) and must never render for codes we
+ * know; unknown codes fall back to the server message so genuinely
+ * novel failures stay diagnosable.
+ */
+export function friendlyRcError(code: unknown, serverMessage: unknown): string {
+  switch (code) {
+    case 'agent_on_other_pod':
+      return 'Your device is connected to a different server right now. Automatic retries could not reach it yet; try again in a moment.'
+    case 'agent_offline':
+      return 'This device is offline. Check that it is powered on and connected.'
+    case 'agent_busy':
+      return 'This device has reached its concurrent session limit. Try again in a moment.'
+    case 'forbidden':
+      return 'You do not have permission to control this device.'
+    case 'invalid_token':
+      return 'Your session has expired. Refresh the page and sign in again.'
+    default:
+      return (
+        (typeof serverMessage === 'string' && serverMessage)
+        || (typeof code === 'string' && code)
+        || 'signalling error'
+      )
+  }
 }
 
 /** Degraded classification Ã¢ÂÂ pure so the priority order is testable. */
@@ -2452,12 +2519,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * stream go dark. `reconnectTimer` is private; managed by
    * scheduleReconnect / cancelReconnect.
    */
-  let lastConnectArgs: { agentId: string; permissions: string } | null = null
+  let lastConnectArgs: { agentId: string; permissions: string; orgId?: string } | null = null
   const reconnectAttempt = ref(0)
-  // C-2 — one-shot rehome guard: `agent_on_other_pod` triggers a forced
-  // WS redial (the LB re-hashes the fresh dial onto the agent's pod) and
-  // ONE retry. The cap prevents ping-pong on a stale directory record.
-  let rehomedOnce = false
+  // PR-1 rehome: consecutive `agent_on_other_pod` streak. Each one
+  // re-keys + redials the WS (bounded by RC_REHOME_MAX_REDIALS, then
+  // the infinite ladder carries on without socket cycling). Reset by
+  // cancelReconnect (user action / successful connect).
+  let rehomeStreak = 0
+  // Non-terminal, user-facing progress notice (e.g. "rerouting...").
+  // Shown by the view alongside the spinner; never blocks retries.
+  const notice = ref<string | null>(null)
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   // Ã¢ÂÂÃ¢ÂÂ S3 viewer resilience state Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -5196,21 +5267,45 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       teardown()
     })
     on('rc:error', (msg) => {
+      // PR-1 rehome: handled BEFORE the reconnecting-guard below. A
+      // mid-ladder `agent_on_other_pod` is the live signal that our
+      // socket keys to the wrong pod, not stale fallout from an
+      // abandoned session. Server prose may name pod internals, so
+      // diagnostics stay in the console, never in the UI.
+      if (msg.code === 'agent_on_other_pod') {
+        if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+        if (!lastConnectArgs) {
+          failWith(friendlyRcError(msg.code, msg.message))
+          return
+        }
+        rehomeStreak += 1
+        if (rehomeRetryDecision(rehomeStreak) === 'redial_retry') {
+          const expected = expectedOrgTid(lastConnectArgs.orgId, location.pathname)
+          if (expected) ws.setTenantAffinity(expected)
+          console.info(
+            `[rc] device homed on another pod; re-keying the socket and retrying (${rehomeStreak}/${RC_REHOME_MAX_REDIALS})`,
+            msg.message,
+          )
+          notice.value = "Rerouting to your device's server..."
+          ws.forceRedial()
+        } else {
+          // The dial key evidently is not the problem (a parked agent
+          // still converging server-side). Stop cycling the socket but
+          // keep the infinite ladder (rc.23: no terminal) with honest
+          // copy in place of raw server prose.
+          console.warn(
+            `[rc] still cross-pod after ${RC_REHOME_MAX_REDIALS} redials; riding the ladder`,
+            msg.message,
+          )
+          notice.value = 'Still reaching your device through the cluster. Retrying automatically...'
+        }
+        scheduleReconnect({ notifyServer: false })
+        return
+      }
       // Ladder pending Ã¢ÂÂ errors are stale fallout from the abandoned
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
-      // C-2 rehome: the server says the agent's socket is registered on
-      // ANOTHER pod (our WS parked on a stale hash). Force-redial the WS
-      // (the LB re-hashes the fresh dial) and retry exactly once — the
-      // cap prevents ping-pong on a stale directory record.
-      if (msg.code === 'agent_on_other_pod' && !rehomedOnce && lastConnectArgs) {
-        rehomedOnce = true
-        console.info('[rc] agent is homed on another pod; re-dialing the WS and retrying once')
-        ws.forceRedial()
-        scheduleReconnect({ notifyServer: false })
-        return
-      }
       // Mid-ladder transients (agent_busy while the old slot frees,
       // agent_offline while the agent WS flaps back) advance the
       // ladder instead of killing it. First-connect errors still fail
@@ -5220,7 +5315,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         scheduleReconnect({ notifyServer: false })
         return
       }
-      failWith(msg.message || msg.code || 'signalling error')
+      failWith(friendlyRcError(msg.code, msg.message))
     })
   }
 
@@ -5251,7 +5346,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       reconnectTimer = null
     }
     reconnectAttempt.value = 0
-    rehomedOnce = false
+    rehomeStreak = 0
+    notice.value = null
   }
 
   /**
@@ -5315,6 +5411,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   function fireReconnectAttempt() {
     const args = lastConnectArgs
     if (!args) return
+    if (ws.status !== 'connected') {
+      // Firing into a CONNECTING/closed socket silently drops the
+      // request (sendRaw only warns) and costs the full signalling
+      // timeout. Re-arm instead; the ws.status watcher fast-paths the
+      // retry the moment the socket opens.
+      scheduleReconnect({ notifyServer: false })
+      return
+    }
     // `connect()` resets phase / sessionId on entry; the early-
     // return guard for non-{idle,closed,error} states is OK
     // because we set 'reconnecting' which falls outside those.
@@ -5323,6 +5427,32 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // unhandled.
     void connect(args.agentId, args.permissions, /* isReconnect */ true).catch(() => {
       scheduleReconnect()
+    })
+  }
+
+  /**
+   * Resolve true the moment the signalling socket reports 'connected',
+   * or false after `timeoutMs`. Used by the rc pre-flight so the
+   * session request never fires into a CONNECTING socket.
+   */
+  function waitForWsConnected(timeoutMs: number): Promise<boolean> {
+    if (ws.status === 'connected') return Promise.resolve(true)
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null
+      const stop = watch(
+        () => ws.status,
+        (s) => {
+          if (s === 'connected') {
+            if (timer !== null) clearTimeout(timer)
+            stop()
+            resolve(true)
+          }
+        },
+      )
+      timer = setTimeout(() => {
+        stop()
+        resolve(false)
+      }, timeoutMs)
     })
   }
 
@@ -5401,6 +5531,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // triple; the server grandfathers exactly that legacy request).
     permissions = 'VIEW | INPUT | CLIPBOARD | FILES',
     isReconnect = false,
+    // The agent's org (tenant hex). Placement-critical: the session
+    // request must originate from the pod this org hashes to, and the
+    // page URL alone is wrong for cross-org device modals. Optional;
+    // falls back to the URL inside expectedOrgTid().
+    orgId?: string,
   ) {
     // The reconnect path is allowed to drive `connect` while phase ==
     // 'reconnecting'; user-initiated calls must still be blocked from
@@ -5417,7 +5552,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // Don't clobber on an isReconnect call Ã¢ÂÂ that path already has
     // the right args from the original user click.
     if (!isReconnect) {
-      lastConnectArgs = { agentId, permissions }
+      lastConnectArgs = { agentId, permissions, orgId }
       // Fresh user-initiated connect Ã¢ÂÂ reset reconnect state.
       cancelReconnect()
     }
@@ -5428,6 +5563,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     controlState.value = null
     peerCursors.value = {}
     phase.value = 'requesting'
+
+    // PR-1 rc pre-flight: rc is pod-local, so the request must go out
+    // on a socket keyed to the agent's org. A live socket dialed with
+    // a different key (deep-link race before the org resolved, an org
+    // switch under lazy affinity, a cross-org device modal) re-keys +
+    // redials FIRST; then wait for OPEN, because sendRaw into a
+    // CONNECTING socket is silently dropped and costs the full
+    // signalling timeout.
+    const expectedOrg = expectedOrgTid(
+      isReconnect ? lastConnectArgs?.orgId : orgId,
+      location.pathname,
+    )
+    if (expectedOrg) {
+      ws.setTenantAffinity(expectedOrg)
+      if (ws.getDialedTid() !== expectedOrg && ws.status !== 'disconnected') {
+        console.info('[rc] pre-flight: re-keying the signalling socket to the device org')
+        ws.forceRedial()
+      }
+    }
+    if (ws.status !== 'connected') {
+      const ready = await waitForWsConnected(RC_PREFLIGHT_WS_WAIT_MS)
+      if (!ready) {
+        console.warn('[rc] pre-flight: signalling socket not ready; proceeding (ladder will retry)')
+      }
+    }
 
     // Restore the per-agent resolution preference. This has to live
     // here (not at composable-init) because `useRemoteControl()` runs
@@ -8559,6 +8719,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   return {
     phase,
     error,
+    notice,
     sessionId,
     overrideReason,
     remoteStream,
