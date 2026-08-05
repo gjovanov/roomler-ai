@@ -585,6 +585,13 @@ pub enum OverlayEvent {
         upserts: Vec<NetmapPeer>,
         removes: Vec<ObjectId>,
     },
+    /// rc.307 (B) — a fresh control-WS session re-binding a PERSISTENT
+    /// runtime: swap the outbound sender, re-send the join (the server
+    /// replies with a full netmap the authoritative reconcile arm applies),
+    /// re-advertise srflx. Carriers, TUN, WG state all stay up — a server
+    /// deploy / pod roll no longer tears the data plane down (the corp-VPN
+    /// relay-lock trigger, 2026-08-05).
+    Reattach { outbound: mpsc::Sender<ClientMsg> },
     /// Coturn creds for a relay leg to `peer_node_id` (relay mode only).
     /// `pair_key` is the server's symmetric `sorted(a,b)` key — both ends
     /// receive an identical value and use it to pick the same coturn worker.
@@ -677,60 +684,91 @@ async fn run_srflx_keepalive(
     own_ips: Vec<Ipv4Addr>,
     mut advertised: Vec<String>,
     nat: Option<String>,
-    outbound: mpsc::Sender<ClientMsg>,
+    outbound: ControlTx,
     interval: Duration,
+    // rc.307 (B) — bumped by the runtime's Reattach arm. The re-join's
+    // server-side rehydrate WIPES srflx_endpoints, and only THIS task owns
+    // the evolving advert (the runtime's copy is a startup snapshot), so the
+    // restore must come from here.
+    mut reattach_rx: tokio::sync::watch::Receiver<u64>,
 ) {
     const RERESOLVE_AFTER: u32 = 3;
     let mut failures: u32 = 0;
+    // rc.307 (B) — a pending (re-)advertise: set when the mapping changed or
+    // a reattach fired, cleared by a successful send. A send failure now
+    // means DETACHED (the runtime outlives sessions), never "runtime gone" —
+    // so no `break`: keep the advert dirty and retry every tick until a
+    // fresh session carries it. (Pre-B this task broke on send failure AND
+    // committed `advertised[0]` before sending — a mapping change during an
+    // outage was lost forever.)
+    let mut resend_pending = false;
     loop {
         // Small jitter (≤25% of the interval) so a fleet doesn't STUN in
         // lockstep; scaled to the interval so short test intervals stay quick.
         let jitter =
             Duration::from_millis(rand::random::<u64>() % (interval.as_millis() as u64 / 4 + 1));
-        tokio::time::sleep(interval + jitter).await;
-        match crate::transport::stun::srflx_query_via_sink(
-            &punch_sock,
-            &mut stun_rx,
-            stun_server,
-            SRFLX_ATTEMPT_TIMEOUT,
-        )
-        .await
-        {
-            Ok(mapped) => {
-                failures = 0;
-                let ep = mapped.to_string();
-                if advertised.first().map(String::as_str) != Some(ep.as_str()) {
-                    // Mapping changed → update the punch candidate `[0]` and
-                    // re-advertise (keeping any other multi-homed candidates).
-                    if advertised.is_empty() {
-                        advertised.push(ep.clone());
-                    } else {
-                        advertised[0] = ep.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(interval + jitter) => {
+                match crate::transport::stun::srflx_query_via_sink(
+                    &punch_sock,
+                    &mut stun_rx,
+                    stun_server,
+                    SRFLX_ATTEMPT_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(mapped) => {
+                        failures = 0;
+                        let ep = mapped.to_string();
+                        if advertised.first().map(String::as_str) != Some(ep.as_str()) {
+                            // Mapping changed → update the punch candidate `[0]`
+                            // (keeping any other multi-homed candidates).
+                            if advertised.is_empty() {
+                                advertised.push(ep.clone());
+                            } else {
+                                advertised[0] = ep.clone();
+                            }
+                            info!(new_srflx = %ep, "overlay: srflx mapping changed — re-advertising (Phase C keepalive)");
+                            resend_pending = true;
+                        }
                     }
-                    info!(new_srflx = %ep, "overlay: srflx mapping changed — re-advertising (Phase C keepalive)");
-                    if outbound
-                        .send(ClientMsg::OverlaySrflx {
-                            candidates: advertised.clone(),
-                            // Re-send our NAT type — the mapping changed, not the
-                            // NAT class — so the server never clears it.
-                            nat: nat.clone(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break; // control channel closed → runtime gone
+                    Err(e) => {
+                        failures += 1;
+                        debug!(%e, failures, "overlay: srflx keepalive query failed — retaining last advert");
+                        if failures >= RERESOLVE_AFTER {
+                            if let Some(fresh) =
+                                direct::resolve_stun_server(&stun_urls, &own_ips).await
+                            {
+                                stun_server = fresh;
+                            }
+                            failures = 0;
+                        }
                     }
                 }
             }
-            Err(e) => {
-                failures += 1;
-                debug!(%e, failures, "overlay: srflx keepalive query failed — retaining last advert");
-                if failures >= RERESOLVE_AFTER {
-                    if let Some(fresh) = direct::resolve_stun_server(&stun_urls, &own_ips).await {
-                        stun_server = fresh;
-                    }
-                    failures = 0;
+            changed = reattach_rx.changed() => {
+                if changed.is_err() {
+                    // The runtime dropped its sender = it exited; end with it.
+                    break;
                 }
+                if !advertised.is_empty() {
+                    debug!("overlay: reattach — restoring the current srflx advert");
+                    resend_pending = true;
+                }
+            }
+        }
+        if resend_pending {
+            resend_pending = outbound
+                .send(ClientMsg::OverlaySrflx {
+                    candidates: advertised.clone(),
+                    // Re-send our NAT type with every advert so the server
+                    // never clears it.
+                    nat: nat.clone(),
+                })
+                .await
+                .is_err();
+            if resend_pending {
+                debug!("overlay: srflx advert send failed (detached) — retrying next tick");
             }
         }
     }
@@ -746,12 +784,49 @@ enum CarrierMode {
     Relay,
 }
 
+/// rc.307 (B) — swappable control-plane sender. The overlay runtime OUTLIVES
+/// a control-WS session now (`OverlayEvent::Reattach` re-binds it to each
+/// fresh session), so every long-lived holder of the outbound `ClientMsg`
+/// sender — the runtime itself, the [`RelayCoordinator`], the srflx
+/// keepalive task — goes through this handle and picks up the swap without
+/// being restarted. Send discipline: clone the CURRENT sender under the read
+/// lock, await OUTSIDE it (never hold a std lock across an await). While
+/// detached (the old session died, no reattach yet) sends fail exactly like
+/// the old dead-channel sends did — every caller already tolerates that.
+#[derive(Clone)]
+pub struct ControlTx(Arc<std::sync::RwLock<mpsc::Sender<ClientMsg>>>);
+
+impl From<mpsc::Sender<ClientMsg>> for ControlTx {
+    fn from(tx: mpsc::Sender<ClientMsg>) -> Self {
+        Self::new(tx)
+    }
+}
+
+impl ControlTx {
+    pub fn new(tx: mpsc::Sender<ClientMsg>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(tx)))
+    }
+    /// Re-bind to a fresh session's outbound sender.
+    pub fn swap(&self, tx: mpsc::Sender<ClientMsg>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = tx;
+    }
+    fn current(&self) -> mpsc::Sender<ClientMsg> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    pub async fn send(
+        &self,
+        msg: ClientMsg,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<ClientMsg>> {
+        self.current().send(msg).await
+    }
+}
+
 /// One node's overlay runtime. Construct with [`OverlayRuntime::new`] (or
 /// [`new_relay`](OverlayRuntime::new_relay)), then
 /// `tokio::spawn(rt.run(events, endpoints))`.
 pub struct OverlayRuntime {
     keypair: WgKeypair,
-    outbound: mpsc::Sender<ClientMsg>,
+    outbound: ControlTx,
     mode: CarrierMode,
     tun_factory: TunFactory,
     mtu: u16,
@@ -944,7 +1019,7 @@ impl OverlayRuntime {
     ) -> Self {
         Self {
             keypair,
-            outbound,
+            outbound: ControlTx::new(outbound),
             mode: CarrierMode::Direct(links),
             tun_factory,
             mtu,
@@ -969,7 +1044,7 @@ impl OverlayRuntime {
     ) -> Self {
         Self {
             keypair,
-            outbound,
+            outbound: ControlTx::new(outbound),
             mode: CarrierMode::Relay,
             tun_factory,
             mtu,
@@ -1077,28 +1152,18 @@ impl OverlayRuntime {
     }
 
     /// Run until the event channel closes (WS disconnect). Sends
-    /// `OverlayJoin`, waits for the first full netmap (which yields the
-    /// node's overlay IP), brings up the TUN + inbound writer, then
-    /// steady-state pumps TUN traffic and applies netmap deltas.
-    pub async fn run(mut self, mut events: mpsc::Receiver<OverlayEvent>, endpoints: Vec<String>) {
-        // rc.131 — direct LAN path: bind a shared UDP socket + discover our
-        // LAN endpoint so a same-subnet peer dials us directly and skips the
-        // relay. Off in Direct mode (the test/helper path) and when disabled.
-        // `mut` — the srflx gather (below, after the first netmap) records the
-        // punch socket into it (Phase C).
-        let mut direct_ctx = self.setup_direct().await;
-        let mut advertised = endpoints;
-        if let Some(ctx) = &direct_ctx {
-            advertised.extend(ctx.endpoints.iter().cloned());
-        }
-
-        let join = ClientMsg::OverlayJoin {
+    /// Build the `rc:overlay.join` for this node. Called at start AND on
+    /// every rc.307 `Reattach` re-join — capability flags are re-read from
+    /// the env each time, so a config change bridged via env lands on the
+    /// next reconnect without a runtime rebuild.
+    fn make_join(&self, endpoints: Vec<String>) -> ClientMsg {
+        ClientMsg::OverlayJoin {
             network_hint: None,
             wg_public_key: self.keypair.public_base64(),
             key_epoch: 0,
             supported: vec!["wireguard-v1".to_string()],
             mtu: self.mtu,
-            endpoints: advertised,
+            endpoints,
             // rc.142 — advertise the QUIC-over-TURN capability so the server
             // only tells a peer to attempt QUIC when BOTH ends support it.
             supports_quic: overlay_quic_enabled(),
@@ -1120,12 +1185,38 @@ impl OverlayRuntime {
             supports_forced_derp: crate::overlay::direct::derp_enabled(),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
-        };
-        if self.outbound.send(join).await.is_err() {
-            warn!("overlay: control channel closed before join");
-            return;
         }
-        info!("overlay: rc:overlay.join sent");
+    }
+
+    /// `OverlayJoin`, waits for the first full netmap (which yields the
+    /// node's overlay IP), brings up the TUN + inbound writer, then
+    /// steady-state pumps TUN traffic and applies netmap deltas.
+    pub async fn run(mut self, mut events: mpsc::Receiver<OverlayEvent>, endpoints: Vec<String>) {
+        // rc.131 — direct LAN path: bind a shared UDP socket + discover our
+        // LAN endpoint so a same-subnet peer dials us directly and skips the
+        // relay. Off in Direct mode (the test/helper path) and when disabled.
+        // `mut` — the srflx gather (below, after the first netmap) records the
+        // punch socket into it (Phase C).
+        let mut direct_ctx = self.setup_direct().await;
+        let mut advertised = endpoints;
+        if let Some(ctx) = &direct_ctx {
+            advertised.extend(ctx.endpoints.iter().cloned());
+        }
+
+        if self
+            .outbound
+            .send(self.make_join(advertised.clone()))
+            .await
+            .is_err()
+        {
+            // rc.307 (B): the spawning session died within ms. Don't die with
+            // it — the runtime is persistent now; the next session's Reattach
+            // re-joins. (If the process is exiting, the event channel closes
+            // and the wait below returns.)
+            warn!("overlay: control channel closed before join; awaiting reattach");
+        } else {
+            info!("overlay: rc:overlay.join sent");
+        }
 
         // Phase 1 — wait for the first full netmap (it carries self_ip).
         let (self_ip, network, first_peers) = loop {
@@ -1135,6 +1226,22 @@ impl OverlayRuntime {
                     network,
                     peers,
                 }) => break (self_ip, network, peers),
+                // rc.307 (B) — the session died before the first netmap:
+                // re-bind + re-join on the fresh one, keep waiting.
+                Some(OverlayEvent::Reattach { outbound }) => {
+                    self.outbound.swap(outbound);
+                    if self
+                        .outbound
+                        .send(self.make_join(advertised.clone()))
+                        .await
+                        .is_err()
+                    {
+                        warn!("overlay: reattach join failed (session died immediately)");
+                    } else {
+                        info!("overlay: rc:overlay.join re-sent (reattach before first netmap)");
+                    }
+                    continue;
+                }
                 Some(OverlayEvent::NetmapDelta { .. }) => continue, // pre-netmap; ignore
                 Some(OverlayEvent::RelayGrant { .. }) => continue,  // pre-netmap; ignore
                 Some(OverlayEvent::ForceDerp { .. }) => continue,   // pre-netmap; ignore
@@ -1309,6 +1416,11 @@ impl OverlayRuntime {
         // demux STUN sink wired just above) to hold an idle NAT mapping open and
         // re-advertise a changed one. Only when: srflx tier on, a punch socket +
         // STUN server resolved, an advert exists, and the interval isn't 0 (off).
+        // rc.307 (B) — Reattach signal to the keepalive: bumped on every
+        // re-join so the task (the sole owner of the EVOLVING advert)
+        // restores it on the fresh session. Dropped when run() returns,
+        // which ends the task.
+        let (srflx_reattach_tx, srflx_reattach_rx) = tokio::sync::watch::channel(0u64);
         let srflx_keepalive = {
             let secs = direct::srflx_keepalive_secs();
             match (
@@ -1332,6 +1444,7 @@ impl OverlayRuntime {
                         srflx_my_nat.clone(),
                         self.outbound.clone(),
                         Duration::from_secs(secs),
+                        srflx_reattach_rx,
                     )))
                 }
                 _ => None,
@@ -1981,10 +2094,94 @@ impl OverlayRuntime {
                     }
                 },
                 evt = events.recv() => match evt {
-                    // Re-sync: install any newly-listed peers (deltas drive
-                    // removals; a full diff/prune is a later refinement).
-                    Some(OverlayEvent::Netmap { peers, .. }) => {
+                    // rc.307 (B) — a fresh control-WS session re-binding this
+                    // persistent runtime: swap the sender, re-join (the server
+                    // replies with a full netmap → the authoritative reconcile
+                    // arm below), re-advertise srflx (the server's copy may not
+                    // survive the re-join, and the keepalive only re-trickles
+                    // on a CHANGE). Carriers/TUN/WG stay untouched — that is
+                    // the point.
+                    Some(OverlayEvent::Reattach { outbound }) => {
                         let t_arm = Instant::now();
+                        self.outbound.swap(outbound);
+                        // Join-send failure = the new session died within ms.
+                        // NEVER exit here (a rapid double-flap must not kill
+                        // the persistent runtime) — stay detached; the next
+                        // Reattach retries.
+                        if self
+                            .outbound
+                            .send(self.make_join(advertised.clone()))
+                            .await
+                            .is_err()
+                        {
+                            warn!("overlay: reattach join failed; awaiting the next session");
+                        } else {
+                            info!("overlay: control-WS reattached — re-joined with carriers intact");
+                        }
+                        // srflx restore: the re-join's server-side rehydrate
+                        // WIPED srflx_endpoints. The keepalive task owns the
+                        // EVOLVING advert — signal it; only when it doesn't
+                        // exist fall back to the startup snapshot.
+                        if srflx_keepalive.is_some() {
+                            srflx_reattach_tx.send_modify(|n| *n += 1);
+                        } else if !srflx_advertised.is_empty() {
+                            let _ = self
+                                .outbound
+                                .send(ClientMsg::OverlaySrflx {
+                                    candidates: srflx_advertised.clone(),
+                                    nat: srflx_my_nat.clone(),
+                                })
+                                .await;
+                        }
+                        if let Some(r) = relay.as_mut() {
+                            // A grant lost in flight (WS died between request
+                            // and grant) would park its pair FOREVER now that
+                            // the coordinator outlives sessions — `is_tracking`
+                            // dedupes every later request. Forget ungranted
+                            // pendings; the next netmap/sweep re-requests.
+                            let dropped = r.forget_ungranted_pending();
+                            if dropped > 0 {
+                                info!(dropped, "overlay: reattach — re-requesting relays whose grant was lost in flight");
+                            }
+                            // The rehydrate also replaced our endpoints with
+                            // the join's LAN-only list, wiping every LIVE
+                            // relayed address (surviving allocations don't
+                            // re-allocate, so nothing would re-trickle them).
+                            // Restore the full union; per-connection FIFO
+                            // guarantees it lands AFTER the join's rehydrate.
+                            let _ = self
+                                .outbound
+                                .send(ClientMsg::OverlayEndpoints {
+                                    candidates: r.all_endpoints(),
+                                })
+                                .await;
+                        }
+                        // NB: peers see our endpoints wiped-then-restored and
+                        // clear their path-monitor evidence for us twice
+                        // (`direct_endpoints_changed`) — harmless, converges.
+                        warn_if_slow("arm:reattach", t_arm);
+                    }
+                    // Re-sync: a full netmap is the reconcile point — today it
+                    // arrives on every rc.307 re-join (reattach), and the arm
+                    // below applies it AUTHORITATIVELY against live state.
+                    Some(OverlayEvent::Netmap { self_ip: new_self_ip, network: new_network, peers }) => {
+                        let t_arm = Instant::now();
+                        // A re-join can only reconcile onto the SAME identity.
+                        // A different self_ip (re-enroll / tenant renumber) or
+                        // network shape (cidr → netmask/NAT guard, magic
+                        // domain → DNS resolver — both baked from the FIRST
+                        // netmap) needs the full rebuild this persistent
+                        // runtime deliberately avoids — exit; the agent-side
+                        // slot spawns a fresh runtime on the next session
+                        // (its Reattach send fails).
+                        if new_self_ip != self_ip
+                            || new_network.cidr != network.cidr
+                            || new_network.magic_domain != network.magic_domain
+                        {
+                            warn!(old = %self_ip, new = %new_self_ip,
+                                "overlay: re-join returned a different identity/network — exiting for a clean rebuild");
+                            break;
+                        }
                         #[cfg(test)]
                         {
                             let stall = TEST_NETMAP_STALL_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -2014,31 +2211,16 @@ impl OverlayRuntime {
                         // hold that it does not list is gone — released, or
                         // ACL'd out.
                         //
-                        // DEFENSIVE ONLY — do not read this as fixing a live
-                        // leak. `run()` sends ONE `OverlayJoin` and consumes the
-                        // first full netmap before this loop starts, and the
-                        // server only emits a full `OverlayNetmap` in reply to a
-                        // join, so today a second full netmap never reaches a
-                        // running loop. The runtime is scoped to ONE WS session
-                        // (`overlay::maybe_start` runs per connection and the
-                        // runtime ends when `overlay_evt_tx` drops), so a
-                        // disconnect tears down `by_node`, the WgDevice and the
-                        // TUN wholesale and the reconnect rebuilds from empty —
-                        // which already covers "a peer vanished while we were
-                        // away", more thoroughly than a diff could. Field-checked
-                        // 2026-08-02: cutting an agent's WS produced a second
-                        // `node runtime started` / `rc:overlay.join sent` /
-                        // `TUN up` and a full reinstall of every peer.
-                        //
-                        // It stays because it is cheap and it is the correct
-                        // behaviour the day anything does re-push a full netmap
-                        // into a live loop (a server-side re-fan, or a re-join
-                        // that keeps the connection). The removal paths that
-                        // actually run today are the delta `removes` arm and
-                        // `sweep_carrier_health` — those are what make
-                        // `Router::remove_by_pubkey` and
-                        // `del_peer_route_if_unowned` load-bearing under
-                        // address recycling, NOT this arm.
+                        // LIVE since rc.307 (B): the runtime persists across
+                        // control-WS sessions, and every `Reattach` re-join is
+                        // answered with a full netmap that lands HERE — this
+                        // arm is the reconcile that replaces the old
+                        // rebuild-from-empty ("a peer vanished while we were
+                        // away" is now covered by the prune below; endpoint
+                        // changes by `direct_endpoints_changed` + upsert).
+                        // (Kept verbatim from its #278 "defensive" era, whose
+                        // comment predicted exactly this use: "a re-join that
+                        // keeps the connection".)
                         //
                         // MEMBERSHIP, not presence: P9 ghost rows are still
                         // LISTED (with `reachable = false`), so they are not
@@ -3943,6 +4125,7 @@ mod tests {
 
         let (out_tx, mut out_rx) = mpsc::channel::<ClientMsg>(16);
         let advertised = vec!["203.0.113.7:1111".to_string()];
+        let (_reattach_tx, reattach_rx) = tokio::sync::watch::channel(0u64);
         let task = tokio::spawn(run_srflx_keepalive(
             punch,
             sink_rx,
@@ -3951,8 +4134,9 @@ mod tests {
             vec![], // own_ips (co-located-worker exclusion — none in this test)
             advertised,
             Some("cone".into()),
-            out_tx,
+            out_tx.into(),
             Duration::from_millis(60),
+            reattach_rx,
         ));
 
         // First tick: mapping == advert → NO trickle. Second tick: changed to
@@ -3989,6 +4173,7 @@ mod tests {
         let (_sink_tx, sink_rx) = mpsc::channel::<crate::transport::stun::StunInbound>(1);
         let (out_tx, mut out_rx) = mpsc::channel::<ClientMsg>(4);
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (_reattach_tx, reattach_rx) = tokio::sync::watch::channel(0u64);
         let task = tokio::spawn(run_srflx_keepalive(
             punch,
             sink_rx,
@@ -3997,8 +4182,9 @@ mod tests {
             vec![], // own_ips
             vec!["203.0.113.7:1111".to_string()],
             Some("cone".into()),
-            out_tx,
+            out_tx.into(),
             Duration::from_millis(30),
+            reattach_rx,
         ));
         assert!(
             tokio::time::timeout(Duration::from_millis(500), out_rx.recv())
@@ -4006,6 +4192,79 @@ mod tests {
                 .is_err(),
             "a STUN outage must not produce a re-trickle"
         );
+        task.abort();
+    }
+
+    /// rc.307 (B) — the keepalive OUTLIVES control-WS sessions: a send
+    /// failure while detached must NOT kill the task or lose a mapping
+    /// change, and a reattach signal must restore the task's CURRENT
+    /// (evolving) advert on the fresh session — the re-join's server-side
+    /// rehydrate wiped it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn srflx_keepalive_survives_detach_and_restores_on_reattach() {
+        let punch = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let (sink_tx, sink_rx) = mpsc::channel::<crate::transport::stun::StunInbound>(16);
+        // Every query maps to :2222 — a CHANGE from the initial :1111 advert.
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((_n, _from)) = server.recv_from(&mut buf).await else {
+                    break;
+                };
+                let txn: [u8; 12] = buf[8..20].try_into().unwrap();
+                let _ = sink_tx
+                    .send(crate::transport::stun::StunInbound {
+                        src: server_addr,
+                        packet: stun_success(txn, [203, 0, 113, 7], 2222),
+                    })
+                    .await;
+            }
+        });
+
+        // Detached from the start: the receiver is dropped immediately.
+        let (dead_tx, dead_rx) = mpsc::channel::<ClientMsg>(4);
+        drop(dead_rx);
+        let ctl = ControlTx::new(dead_tx);
+        let (reattach_tx, reattach_rx) = tokio::sync::watch::channel(0u64);
+        let task = tokio::spawn(run_srflx_keepalive(
+            punch,
+            sink_rx,
+            server_addr,
+            vec![],
+            vec![],
+            vec!["203.0.113.7:1111".to_string()],
+            Some("cone".into()),
+            ctl.clone(),
+            Duration::from_millis(40),
+            reattach_rx,
+        ));
+
+        // Give it a few ticks: the mapping change lands, its send fails
+        // (detached), and — the pre-B bug — the task must NOT exit.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !task.is_finished(),
+            "detached send failure must not kill the keepalive"
+        );
+
+        // Reattach: swap in a live session and signal. The task must push its
+        // CURRENT advert (:2222 — the evolved one, not the startup snapshot).
+        let (live_tx, mut live_rx) = mpsc::channel::<ClientMsg>(4);
+        ctl.swap(live_tx);
+        reattach_tx.send_modify(|n| *n += 1);
+        let msg = tokio::time::timeout(Duration::from_secs(3), live_rx.recv())
+            .await
+            .expect("expected the advert restore after reattach")
+            .expect("channel closed");
+        match msg {
+            ClientMsg::OverlaySrflx { candidates, nat } => {
+                assert_eq!(candidates, vec!["203.0.113.7:2222".to_string()]);
+                assert_eq!(nat.as_deref(), Some("cone"));
+            }
+            other => panic!("expected OverlaySrflx, got {other:?}"),
+        }
         task.abort();
     }
 
@@ -4362,6 +4621,233 @@ mod tests {
             }
         }
         panic!("packet did not traverse the runtime in time");
+    }
+
+    /// rc.307 (B) — the reattach flow end to end: a runtime whose control-WS
+    /// died gets a `Reattach` from the next session, re-JOINS on the new
+    /// sender, reconciles the re-join's full netmap against LIVE state
+    /// (`install_peers` leaves the installed carrier alone), and the data
+    /// plane keeps working across the whole exchange. Then the authoritative
+    /// prune: a re-join netmap that no longer lists the peer tears it down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reattach_rejoins_reconciles_and_then_prunes() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let (out_a, mut out_a_rx) = mpsc::channel::<ClientMsg>(16);
+        let (out_b, mut out_b_rx) = mpsc::channel::<ClientMsg>(16);
+        let (evt_a, evt_a_rx) = mpsc::channel::<OverlayEvent>(16);
+        let (evt_b, evt_b_rx) = mpsc::channel::<OverlayEvent>(16);
+
+        let (mock_a, inject_a, _del_a) = MockTun::new();
+        let (mock_b, _inj_b, mut del_b) = MockTun::new();
+        let tf_a: TunFactory = {
+            let m = mock_a.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let tf_b: TunFactory = {
+            let m = mock_b.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+
+        let rt_a = OverlayRuntime::new(
+            a.clone(),
+            out_a,
+            Arc::new(LoopbackLinks {
+                sock: sock_a,
+                dst: addr_b,
+            }),
+            tf_a,
+            1280,
+        );
+        let rt_b = OverlayRuntime::new(
+            b.clone(),
+            out_b,
+            Arc::new(LoopbackLinks {
+                sock: sock_b,
+                dst: addr_a,
+            }),
+            tf_b,
+            1280,
+        );
+        tokio::spawn(rt_a.run(evt_a_rx, vec![]));
+        tokio::spawn(rt_b.run(evt_b_rx, vec![]));
+        assert!(matches!(
+            out_a_rx.recv().await,
+            Some(ClientMsg::OverlayJoin { .. })
+        ));
+        assert!(matches!(
+            out_b_rx.recv().await,
+            Some(ClientMsg::OverlayJoin { .. })
+        ));
+
+        let peer_b = peer(&b, "100.64.0.2");
+        let peer_a = peer(&a, "100.64.0.1");
+        evt_a
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.1".into(),
+                network: net(),
+                peers: vec![peer_b.clone()],
+            })
+            .await
+            .unwrap();
+        evt_b
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.2".into(),
+                network: net(),
+                peers: vec![peer_a.clone()],
+            })
+            .await
+            .unwrap();
+
+        // Bring the pair up.
+        let pkt = synthetic_ipv4(IP_A, IP_B, b"pre-reattach");
+        let mut up = false;
+        for _ in 0..100 {
+            let _ = inject_a.send(pkt.clone());
+            if tokio::time::timeout(Duration::from_millis(150), del_b.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                up = true;
+                break;
+            }
+        }
+        assert!(up, "pair did not come up");
+
+        // The session dies (old outbound receiver dropped) and a NEW session
+        // reattaches. The runtime must re-join on the NEW sender…
+        drop(out_a_rx);
+        let (out_a2, mut out_a2_rx) = mpsc::channel::<ClientMsg>(16);
+        evt_a
+            .send(OverlayEvent::Reattach { outbound: out_a2 })
+            .await
+            .unwrap();
+        let rejoin = tokio::time::timeout(Duration::from_secs(3), out_a2_rx.recv())
+            .await
+            .expect("expected the re-join on the fresh session")
+            .expect("new session channel closed");
+        assert!(
+            matches!(rejoin, ClientMsg::OverlayJoin { .. }),
+            "first message after reattach must be the re-join, got {rejoin:?}"
+        );
+
+        // …and the re-join's full netmap (same peer) reconciles WITHOUT
+        // touching the carrier: traffic keeps flowing.
+        evt_a
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.1".into(),
+                network: net(),
+                peers: vec![peer_b.clone()],
+            })
+            .await
+            .unwrap();
+        let pkt2 = synthetic_ipv4(IP_A, IP_B, b"post-reattach");
+        let mut alive = false;
+        for _ in 0..100 {
+            let _ = inject_a.send(pkt2.clone());
+            if let Ok(Some(got)) =
+                tokio::time::timeout(Duration::from_millis(150), del_b.recv()).await
+                && got == pkt2
+            {
+                alive = true;
+                break;
+            }
+        }
+        assert!(alive, "carrier must survive reattach + reconcile");
+
+        // Authoritative prune: a re-join netmap WITHOUT the peer tears it
+        // down — injected packets stop arriving.
+        evt_a
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.1".into(),
+                network: net(),
+                peers: vec![],
+            })
+            .await
+            .unwrap();
+        // Let the prune land, then drain anything already in flight.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        while tokio::time::timeout(Duration::from_millis(100), del_b.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {}
+        for _ in 0..5 {
+            let _ = inject_a.send(pkt2.clone());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), del_b.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "pruned peer must stop receiving traffic"
+        );
+    }
+
+    /// rc.307 (B) — a re-join that comes back with a DIFFERENT identity
+    /// (re-enroll / tenant renumber while detached) cannot be reconciled in
+    /// place: the runtime exits so the agent-side slot spawns a fresh one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejoin_with_different_self_ip_exits_runtime() {
+        let a = WgKeypair::generate();
+        let b = WgKeypair::generate();
+        let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_b: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (out_a, mut out_a_rx) = mpsc::channel::<ClientMsg>(16);
+        let (evt_a, evt_a_rx) = mpsc::channel::<OverlayEvent>(16);
+        let (mock_a, _inj_a, _del_a) = MockTun::new();
+        let tf_a: TunFactory = {
+            let m = mock_a.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt_a = OverlayRuntime::new(
+            a.clone(),
+            out_a,
+            Arc::new(LoopbackLinks {
+                sock: sock_a,
+                dst: addr_b,
+            }),
+            tf_a,
+            1280,
+        );
+        let handle = tokio::spawn(rt_a.run(evt_a_rx, vec![]));
+        assert!(matches!(
+            out_a_rx.recv().await,
+            Some(ClientMsg::OverlayJoin { .. })
+        ));
+        evt_a
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.1".into(),
+                network: net(),
+                peers: vec![peer(&b, "100.64.0.2")],
+            })
+            .await
+            .unwrap();
+        // Give it a beat to enter the steady-state loop, then re-join with a
+        // different identity.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        evt_a
+            .send(OverlayEvent::Netmap {
+                self_ip: "100.64.0.9".into(),
+                network: net(),
+                peers: vec![],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("runtime must exit on a self_ip change")
+            .expect("runtime task panicked");
     }
 
     /// P1 (S6) — the permanent RE-COUPLING TRIPWIRE. A fat control arm (a
