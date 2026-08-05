@@ -4,19 +4,51 @@ use mongodb::options::ReturnDocument;
 use roomler_ai_remote_control::models::{OverlayAclMode, OverlayNetwork};
 
 use super::base::{BaseDao, DaoError, DaoResult};
+use super::overlay_block::OverlayBlockDao;
 
 /// IPAM authority for tenant overlay networks. One row per tenant; the
 /// host cursor (`next_host`) is bumped atomically so concurrent joins
 /// never collide on an overlay IP.
 pub struct OverlayNetworkDao {
     pub base: BaseDao<OverlayNetwork>,
+    /// P2b — the global block registry. Owned here (not injected) because
+    /// carving a block is part of creating a network: every caller of
+    /// `get_or_create` must get a network whose CIDR already matches the
+    /// registry, or the two authorities drift.
+    blocks: OverlayBlockDao,
+    /// P2b — when set, a NEWLY created network is carved a block of this
+    /// prefix instead of sharing the legacy `100.64.0.0/10`. `None` (the
+    /// default, and the shipped default until the flag is flipped per
+    /// deployment) keeps the pre-P2b behaviour exactly.
+    block_prefix: Option<u8>,
 }
 
 impl OverlayNetworkDao {
     pub fn new(db: &Database) -> Self {
         Self {
             base: BaseDao::new(db, OverlayNetwork::COLLECTION),
+            blocks: OverlayBlockDao::new(db),
+            block_prefix: None,
         }
+    }
+
+    /// P2b — enable tenant-block carving for networks created from here on.
+    /// Existing networks are NOT migrated: that is the explicit, admin-driven
+    /// renumber endpoint's job (it has to cycle every node's WS).
+    pub fn with_block_prefix(mut self, prefix: Option<u8>) -> Self {
+        self.block_prefix = prefix;
+        self
+    }
+
+    /// The block registry, for callers that need to read or retire a block
+    /// (the renumber endpoint).
+    pub fn blocks(&self) -> &OverlayBlockDao {
+        &self.blocks
+    }
+
+    /// P2b — the prefix new networks are carved at, when carving is on.
+    pub fn block_prefix(&self) -> Option<u8> {
+        self.block_prefix
     }
 
     /// Fetch the tenant's overlay network, creating it with the default
@@ -24,7 +56,7 @@ impl OverlayNetworkDao {
     /// index: a losing concurrent insert re-reads the winner's row.
     pub async fn get_or_create(&self, tenant_id: ObjectId) -> DaoResult<OverlayNetwork> {
         if let Some(net) = self.base.find_one(doc! { "tenant_id": tenant_id }).await? {
-            return Ok(net);
+            return self.ensure_block(net).await;
         }
         let now = DateTime::now();
         let net = OverlayNetwork {
@@ -41,17 +73,110 @@ impl OverlayNetworkDao {
             created_at: now,
             updated_at: now,
         };
-        match self.base.insert_one(&net).await {
-            Ok(id) => self.base.find_by_id(id).await,
+        let created = match self.base.insert_one(&net).await {
+            Ok(id) => self.base.find_by_id(id).await?,
             // Lost the create race — the other writer's row is now
             // present; read it back.
             Err(DaoError::DuplicateKey(_)) => self
                 .base
                 .find_one(doc! { "tenant_id": tenant_id })
                 .await?
-                .ok_or(DaoError::NotFound),
-            Err(e) => Err(e),
-        }
+                .ok_or(DaoError::NotFound)?,
+            Err(e) => return Err(e),
+        };
+        self.ensure_block(created).await
+    }
+
+    /// P2b — give a VIRGIN network its own block out of the global registry.
+    ///
+    /// Idempotent and cheap: with carving off (the default) it is a pure
+    /// return, and once a network's CIDR is a block the guard below short-
+    /// circuits on the very next call, so the overlay join path pays at most
+    /// one extra query per network — ever.
+    ///
+    /// The virginity guard is deliberate. A network that has already leased
+    /// an address (`next_host > 1`, or anything in the free pool) must NOT be
+    /// silently re-based under live nodes: changing `cidr` alone would leave
+    /// every leased `overlay_ip` outside the new block, which
+    /// [`overlay_host`](roomler_ai_remote_control::models::overlay_host) then
+    /// refuses to invert — the fleet would keep its old addresses while the
+    /// server believed they were unleased. Migrating a populated network is
+    /// the renumber endpoint's job: it rewrites the node rows and cycles the
+    /// sockets in the same operation.
+    async fn ensure_block(&self, net: OverlayNetwork) -> DaoResult<OverlayNetwork> {
+        let Some(prefix) = self.block_prefix else {
+            return Ok(net);
+        };
+        let virgin = net.cidr == OverlayNetwork::DEFAULT_CIDR
+            && net.next_host <= 1
+            && net.free_hosts.is_empty();
+        let Some(network_id) = net.id.filter(|_| virgin) else {
+            return Ok(net);
+        };
+
+        // A block from an interrupted carve (row inserted, CIDR write lost)
+        // is reused rather than leaking a second one.
+        let block = match self.blocks.find_assigned_for_network(network_id).await? {
+            Some(b) => b,
+            None => match self
+                .blocks
+                .allocate(net.tenant_id, network_id, prefix)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    // Never fail the join over this: the tenant simply stays
+                    // on the legacy shared range, which is exactly where it
+                    // was before P2b. Loud, because a full registry needs an
+                    // operator.
+                    tracing::error!(
+                        tenant_id = %net.tenant_id, %network_id, %e,
+                        "overlay blocks: carve failed; tenant stays on the shared /10"
+                    );
+                    return Ok(net);
+                }
+            },
+        };
+
+        self.base
+            .update_one(
+                doc! { "_id": network_id },
+                doc! { "$set": { "cidr": &block.cidr, "updated_at": DateTime::now() } },
+            )
+            .await?;
+        tracing::info!(
+            tenant_id = %net.tenant_id, %network_id, cidr = %block.cidr, slot = block.slot,
+            "overlay blocks: carved a tenant block"
+        );
+        let mut net = net;
+        net.cidr = block.cidr;
+        Ok(net)
+    }
+
+    /// P2b — commit a renumber: re-base the network on `new_cidr` and reset
+    /// the IPAM cursor to match the freshly-written node addresses.
+    ///
+    /// The free pool is CLEARED, not translated: its entries are ordinals of
+    /// the OLD block, and the renumber has already compacted every live node
+    /// into the new one, so anything below the new cursor is genuinely free
+    /// and will be handed out by the cursor branch anyway.
+    pub async fn apply_renumber(
+        &self,
+        network_id: ObjectId,
+        new_cidr: &str,
+        next_host: u32,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": network_id },
+                doc! { "$set": {
+                    "cidr": new_cidr,
+                    "next_host": next_host,
+                    "free_hosts": Vec::<i64>::new(),
+                    "updated_at": DateTime::now(),
+                }},
+            )
+            .await
     }
 
     /// Set the tenant's overlay ACL posture (`off` | `warn` | `enforce`).

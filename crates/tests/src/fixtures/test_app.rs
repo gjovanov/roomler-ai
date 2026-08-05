@@ -336,6 +336,10 @@ fn test_settings() -> Settings {
         },
         relay: roomler_ai_config::RelaySettings::default(),
         releases: roomler_ai_config::ReleasesSettings::default(),
+        // P2b — blocks OFF by default, exactly like a fresh deployment. The
+        // renumber tests carve explicitly; the block-carve test flips the
+        // flag via `spawn_with_settings`.
+        overlay: roomler_ai_config::OverlaySettings::default(),
         claude: roomler_ai_config::ClaudeSettings {
             api_key: None,
             model: "claude-sonnet-4-5-20250929".to_string(),

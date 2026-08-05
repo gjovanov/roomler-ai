@@ -278,6 +278,34 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Multi-org P2b — the GLOBAL overlay block registry. Deliberately NOT
+    // tenant-scoped: its entire job is guaranteeing that two tenants can
+    // never hold overlapping slices of 100.64.0.0/10.
+    //
+    // `slot` unique is the structural half of that guarantee — the allocator
+    // computes aligned, monotonic starts, so two racers either collide on the
+    // same slot (this index arbitrates) or claim disjoint ranges. Without it
+    // the allocator would need a lock.
+    //
+    // `network_id` unique is scoped to ASSIGNED rows: a renumbered tenant
+    // keeps its quarantined predecessors forever (they hold their slots out
+    // of circulation), and only one of its blocks may be live at a time.
+    create_indexes(
+        db,
+        "overlay_blocks",
+        vec![
+            index_unique(bson::doc! { "slot": 1 }),
+            index_unique_partial(
+                bson::doc! { "network_id": 1 },
+                bson::doc! { "state": "assigned" },
+            ),
+            // The allocator's "highest end" probe — one indexed sort+limit.
+            index(bson::doc! { "end_slot": -1 }),
+            index(bson::doc! { "tenant_id": 1 }),
+        ],
+    )
+    .await?;
+
     // Overlay nodes — virtual-LAN membership above agents/tunnel_clients.
     //
     // All three unique indexes are scoped to LIVE rows, because removing a

@@ -399,6 +399,33 @@ impl Hub {
         NudgeOutcome::Nudged
     }
 
+    /// Multi-org P2b — cycle an agent's WS UNCONDITIONALLY, for a tenant
+    /// overlay renumber. `false` when this pod doesn't hold the socket (the
+    /// ctrl event reaches every pod; exactly one acts).
+    ///
+    /// Unlike [`Self::nudge_agent_if_idle`] this does NOT refuse a busy
+    /// agent, and that is the point: the agent's overlay `self_ip` is bound
+    /// once at establish, so a renumbered node keeps using its OLD address
+    /// until the socket is re-established — there is no idle moment to wait
+    /// for on a mesh that is in use. The caller is an explicit admin action
+    /// that already reported which nodes it would cycle.
+    ///
+    /// ⚠️ A cycle tears the agent's rc/tunnel/overlay planes for seconds, and
+    /// a host behind a strict corporate VPN can come back RELAY-LOCKED (it
+    /// loses its established direct path and can't re-punch while the VPN
+    /// client is armed). Renumber during a maintenance window.
+    pub fn cycle_agent_ws(&self, agent_id: ObjectId) -> bool {
+        let Some(agent) = self.inner.agents.get(&agent_id) else {
+            return false;
+        };
+        info!("agent {agent_id} WS cycled (overlay renumber)");
+        // notify_one, not notify_waiters — same latching rationale as the
+        // nudge path: a cycle landing while the read loop is mid-dispatch
+        // must still fire on the next `cancel.notified()`.
+        agent.cancel.notify_one();
+        true
+    }
+
     /// Phase A-1 graceful shutdown: fire every registered agent's
     /// displacement-cancel notify so each read loop exits within
     /// milliseconds and runs its OWN teardown (unregister, gated

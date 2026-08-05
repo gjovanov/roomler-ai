@@ -7,6 +7,7 @@ pub mod file;
 pub mod invite;
 pub mod message;
 pub mod notification;
+pub mod overlay_block;
 pub mod overlay_network;
 pub mod overlay_node;
 pub mod overlay_policy;

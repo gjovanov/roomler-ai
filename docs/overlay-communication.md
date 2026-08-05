@@ -9,8 +9,9 @@
 > Companion docs: the carrier-selection mechanics live in
 > [`overlay-nat-traversal.md`](./overlay-nat-traversal.md); the Windows firewall
 > override in [`overlay-wfp.md`](./overlay-wfp.md); full-tunnel egress in
-> [`overlay-exit-nodes.md`](./overlay-exit-nodes.md); the subsystem this belongs
-> to in [`remote-control.md`](./remote-control.md).
+> [`overlay-exit-nodes.md`](./overlay-exit-nodes.md); **per-tenant address
+> blocks and the renumber runbook** in [`multi-org.md`](./multi-org.md) §4; the
+> subsystem this belongs to in [`remote-control.md`](./remote-control.md).
 
 ---
 
