@@ -117,34 +117,55 @@ pub(super) fn resolve_direct_candidates(
     DirectCandidates { lan, public, srflx }
 }
 
-/// Bind one direct socket, preferring the stable `direct::direct_port()`
-/// (rc.307). A stable-port conflict is retried briefly — during a runtime
-/// hand-over (control-WS reconnect) the previous runtime's socket may still
-/// be closing — then falls back to an ephemeral port so the interface keeps
-/// working (WARN: the reproducible-5-tuple benefit is lost for this run).
-/// `port == 0` skips straight to the ephemeral bind (the pre-rc.307 path).
-/// `None` only when even the ephemeral bind fails.
+/// Bind one direct socket on a STABLE port so a rebuilt carrier reproduces
+/// the UDP 5-tuple a stateful corp firewall already grandfathered (rc.307).
+///
+/// Three tiers, in order:
+/// 1. **The base port, retried briefly.** During a runtime hand-over (MSI
+///    upgrade, service restart) the exiting worker may still hold it for a
+///    moment; retrying beats walking, because walking would silently change
+///    the port and forfeit the very 5-tuple we are protecting.
+/// 2. **The rest of the band** (`direct_port_candidates`). Hyper-V / WSL2 /
+///    HNS reserve large port pools that are invisible to `netstat` AND
+///    `netsh excludedportrange`, and they MOVE between boots — a base can be
+///    swallowed whole (field-measured on a WSL-mirrored host, 2026-08-05).
+///    A band walk keeps a stable port instead of losing the feature.
+/// 3. **Ephemeral**, the pre-rc.307 behaviour, so the interface always works.
+///
+/// `base == 0` skips straight to ephemeral (explicit opt-out). `None` only
+/// when even the ephemeral bind fails.
 pub(super) async fn bind_direct_socket(
     ip: Ipv4Addr,
-    port: u16,
+    base: u16,
     what: &'static str,
 ) -> Option<UdpSocket> {
-    if port != 0 {
+    let mut candidates = direct::direct_port_candidates(base);
+    if let Some(first) = candidates.next() {
         for attempt in 0u8..3 {
-            match UdpSocket::bind((ip, port)).await {
+            match UdpSocket::bind((ip, first)).await {
                 Ok(s) => return Some(s),
-                Err(e) => {
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    } else {
-                        warn!(
-                            %ip, port, %e, what,
-                            "overlay: stable direct-port bind failed; falling back to an ephemeral port"
-                        );
-                    }
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
+                Err(_) => {}
             }
         }
+        // The base is held by something that isn't just a slow hand-over.
+        for port in candidates {
+            if let Ok(s) = UdpSocket::bind((ip, port)).await {
+                warn!(
+                    %ip, base, port, what,
+                    "overlay: stable direct-port base unavailable (Hyper-V/WSL reservation?) — \
+                     using the next port in the band"
+                );
+                return Some(s);
+            }
+        }
+        warn!(
+            %ip, base, band = direct::DIRECT_PORT_BAND, what,
+            "overlay: the whole stable direct-port band is unavailable; falling back to an \
+             ephemeral port (carriers will not survive a corp-firewall session table)"
+        );
     }
     match UdpSocket::bind((ip, 0)).await {
         Ok(s) => Some(s),
@@ -515,11 +536,16 @@ impl OverlayRuntime {
         // it's bound when EITHER is on. Best-effort: a bind failure just leaves
         // both public-dial tiers off (relay still works).
         let public_sock = if direct::public_direct_enabled() || direct::srflx_enabled() {
-            // Stable-port twin: `port+1` because a wildcard bind on the SAME
-            // port as the specific-IP interface binds above fails without
-            // SO_REUSEADDR (which has unsafe double-delivery semantics on
-            // Windows UDP). `direct_port` caps at 65534 so +1 can't overflow.
-            let public_port = if stable_port != 0 { stable_port + 1 } else { 0 };
+            // Stable-port twin on its OWN band: a wildcard bind collides with
+            // the interface-specific LAN binds above on the same port (no
+            // SO_REUSEADDR — unsafe double-delivery semantics on Windows
+            // UDP), and the offset keeps a LAN band walk from ever running
+            // into it. `direct_port` caps the base so this can't overflow.
+            let public_port = if stable_port != 0 {
+                stable_port + direct::PUBLIC_DIAL_PORT_OFFSET
+            } else {
+                0
+            };
             match bind_direct_socket(Ipv4Addr::UNSPECIFIED, public_port, "public-dial").await {
                 Some(s) => {
                     // VPN-bypass: pin this `0.0.0.0` public/srflx dialer's egress

@@ -21,6 +21,14 @@
 use crate::config::{AgentConfig, EncoderPreferenceChoice};
 use tunnel_core::localapi::ConfigEntry;
 
+/// Mirror of `tunnel_core::overlay::direct::MAX_DIRECT_PORT_BASE`
+/// (`u16::MAX - PUBLIC_DIAL_PORT_OFFSET - DIRECT_PORT_BAND`): the largest
+/// `overlay_direct_port` base whose public-dial band still fits under 65535.
+/// Duplicated rather than imported because `tunnel_core::overlay` lives
+/// behind the `overlay` CARGO FEATURE and this surface must compile in every
+/// feature combination. Source of truth is `direct.rs`; keep in sync.
+const MAX_OVERLAY_DIRECT_PORT_BASE: u32 = 65_495;
+
 /// `(key, kind, description)` for the whole surface, in display order.
 /// `kind` is the client-side editor hint contract — see [`ConfigEntry`].
 /// CONTRACT (rc.280): a key whose daemon read goes through
@@ -138,7 +146,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_direct_port",
         "number",
-        "Stable UDP port for the overlay's direct sockets (per-interface LAN; the public/srflx dialer takes port+1). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. 0 = ephemeral ports. Built-in default: 41648. Env: ROOMLER_NODE_OVERLAY_DIRECT_PORT.",
+        "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+32). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band (Hyper-V/WSL reserve invisible pools). 0 = ephemeral ports. Built-in default: 43648. Env: ROOMLER_NODE_OVERLAY_DIRECT_PORT.",
     ),
     (
         "shared_encoder",
@@ -473,11 +481,15 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                     let n: u32 = v
                         .parse()
                         .map_err(|_| format!("overlay_direct_port must be a number (got {v:?})"))?;
-                    // 0 = ephemeral (explicit opt-out); otherwise a valid UDP
-                    // port. 65535 is excluded because the public/srflx dialer
-                    // binds port+1.
-                    if n > 65534 {
-                        return Err("overlay_direct_port must be 0 (ephemeral) or 1-65534".into());
+                    // 0 = ephemeral (explicit opt-out); otherwise a base whose
+                    // public-dial band must still fit under the port space.
+
+                    let max = MAX_OVERLAY_DIRECT_PORT_BASE;
+                    if n > max {
+                        return Err(format!(
+                            "overlay_direct_port must be 0 (ephemeral) or 1-{max} \
+                             (the public-dial band must fit under 65535)"
+                        ));
                     }
                     Some(n)
                 }
@@ -865,21 +877,33 @@ mod tests {
     #[test]
     fn overlay_direct_port_set_echo_clear_and_validate() {
         let mut cfg = crate::config::test_fixture();
-        apply(&mut cfg, "overlay_direct_port", Some("41648")).unwrap();
-        assert_eq!(cfg.overlay_direct_port, Some(41648));
+        apply(&mut cfg, "overlay_direct_port", Some("43648")).unwrap();
+        assert_eq!(cfg.overlay_direct_port, Some(43648));
         assert_eq!(
             entry_for(&cfg, "overlay_direct_port")
                 .unwrap()
                 .value
                 .as_deref(),
-            Some("41648")
+            Some("43648")
         );
         // 0 = explicit ephemeral opt-out; stored, not rejected.
         apply(&mut cfg, "overlay_direct_port", Some("0")).unwrap();
         assert_eq!(cfg.overlay_direct_port, Some(0));
         apply(&mut cfg, "overlay_direct_port", None).unwrap();
         assert_eq!(cfg.overlay_direct_port, None);
-        // 65535 excluded (the public/srflx dialer binds port+1); garbage rejected.
+        // A base whose public-dial band would overflow the port space is
+        // rejected (mirrors `direct::MAX_DIRECT_PORT_BASE`); garbage too.
+        let max = MAX_OVERLAY_DIRECT_PORT_BASE;
+        apply(&mut cfg, "overlay_direct_port", Some(&max.to_string())).unwrap();
+        assert_eq!(cfg.overlay_direct_port, Some(max));
+        assert!(
+            apply(
+                &mut cfg,
+                "overlay_direct_port",
+                Some(&(max + 1).to_string())
+            )
+            .is_err()
+        );
         assert!(apply(&mut cfg, "overlay_direct_port", Some("65535")).is_err());
         assert!(apply(&mut cfg, "overlay_direct_port", Some("forty")).is_err());
     }
