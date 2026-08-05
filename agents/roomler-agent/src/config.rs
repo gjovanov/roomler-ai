@@ -144,6 +144,18 @@ pub struct AgentConfig {
     /// opt-in experiment, auto-yields to metric 1 when it doesn't stick.
     #[serde(default)]
     pub overlay_route_metric0: Option<bool>,
+    /// Stable UDP port for the overlay's direct sockets
+    /// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`). Built-in default: **41648**
+    /// (per-interface LAN sockets; the public/srflx dialer takes port+1);
+    /// `0` = ephemeral ports (the pre-rc.307 behavior). Rationale: stateful
+    /// corp firewalls (Check Point) grandfather UDP flows that predate the
+    /// VPN's session table — with a stable port a rebuilt carrier (agent
+    /// update, control-WS reconnect) reproduces the SAME 5-tuple and keeps
+    /// riding the grandfathered session instead of relay-locking until the
+    /// next VPN-off window (CORPLAP-1, 2026-08-05). A bind conflict falls back
+    /// to an ephemeral port with a WARN, restoring the old behavior.
+    #[serde(default)]
+    pub overlay_direct_port: Option<u32>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -957,13 +969,14 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 21]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 5] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 6] {
     [
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
         ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
         ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
         ("RATE_FACTOR_AV1", cfg.rate_factor_av1),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
+        ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
     ]
 }
 
@@ -1127,6 +1140,7 @@ mod tests {
             overlay_route_evict: None,
             overlay_tun_persist: None,
             overlay_route_metric0: None,
+            overlay_direct_port: None,
             local_turn: None,
             dns_aaaa: None,
             auto_update: None,
