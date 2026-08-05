@@ -14,6 +14,10 @@ use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParam
 pub struct LeaveOutcome {
     pub closed: bool,
     pub was_last_session: bool,
+    /// Stats PR-2 — the `(joined_at, left_at)` of every session THIS call
+    /// closed (multi-close happens on the legacy user-level leave). The
+    /// caller books call minutes from these, clamped to the call window.
+    pub closed_sessions: Vec<(DateTime, DateTime)>,
 }
 
 pub struct RoomDao {
@@ -81,6 +85,7 @@ impl RoomDao {
             media_settings,
             conference_settings,
             conference_status: None,
+            current_call_id: None,
             meeting_code,
             join_url,
             organizer_id: None,
@@ -403,32 +408,55 @@ impl RoomDao {
 
     // ── Conference / Call operations ────────────────────────────
 
-    pub async fn start_call(&self, room_id: ObjectId) -> DaoResult<bool> {
-        self.base
-            .update_by_id(
-                room_id,
+    /// Transition-gated call start (stats PR-2): only the caller that
+    /// actually flips the room to `in_progress` gets `Some(started_at)` —
+    /// `call/start` is re-invokable by design (two pods racing, UI
+    /// retries), and a second start must neither reset
+    /// `actual_start_time` nor mint a second call instance.
+    pub async fn start_call(
+        &self,
+        room_id: ObjectId,
+        call_id: ObjectId,
+    ) -> DaoResult<Option<DateTime>> {
+        let now = DateTime::now();
+        let pre = self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": room_id, "conference_status": { "$ne": "in_progress" } },
                 doc! {
                     "$set": {
                         "conference_status": "in_progress",
-                        "actual_start_time": DateTime::now(),
+                        "actual_start_time": now,
+                        "current_call_id": call_id,
+                        "updated_at": now,
                     }
                 },
             )
             .await
+            .map_err(DaoError::Mongo)?;
+        Ok(pre.map(|_| now))
     }
 
-    pub async fn end_call(&self, room_id: ObjectId) -> DaoResult<bool> {
-        self.base
-            .update_by_id(
-                room_id,
+    /// End the call, clearing `current_call_id` and returning it so the
+    /// caller can close the matching `call_sessions` document.
+    pub async fn end_call(&self, room_id: ObjectId) -> DaoResult<Option<ObjectId>> {
+        let pre = self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! { "_id": room_id },
                 doc! {
                     "$set": {
                         "conference_status": "ended",
                         "actual_end_time": DateTime::now(),
-                    }
+                    },
+                    "$unset": { "current_call_id": "" },
                 },
             )
             .await
+            .map_err(DaoError::Mongo)?;
+        Ok(pre.and_then(|r| r.current_call_id))
     }
 
     /// Join a call as a participant (add session, update media state on RoomMember).
@@ -534,9 +562,7 @@ impl RoomDao {
                 .await
                 .map_err(DaoError::Mongo)?;
 
-            self.base
-                .update_by_id(room_id, doc! { "$inc": { "participant_count": 1 } })
-                .await?;
+            self.bump_participant_count(room_id, false).await?;
 
             return self.members.find_by_id(rid).await;
         }
@@ -571,14 +597,44 @@ impl RoomDao {
         let id = self.members.insert_one(&member).await?;
 
         // Increment both member_count and participant_count
-        self.base
-            .update_by_id(
-                room_id,
-                doc! { "$inc": { "member_count": 1, "participant_count": 1 } },
-            )
-            .await?;
+        self.bump_participant_count(room_id, true).await?;
 
         self.members.find_by_id(id).await
+    }
+
+    /// `$inc` the distinct-user participant count (and `member_count` for a
+    /// brand-new member), then `$max` the previously-dead
+    /// `peak_participant_count` from the post-inc value (stats PR-2). The
+    /// two writes aren't atomic together, so the peak can be off by one
+    /// under concurrent joins — accepted; the per-call peak on
+    /// `call_sessions` comes from the media sampler's gauge instead.
+    async fn bump_participant_count(&self, room_id: ObjectId, also_member: bool) -> DaoResult<()> {
+        let inc = if also_member {
+            doc! { "member_count": 1, "participant_count": 1 }
+        } else {
+            doc! { "participant_count": 1 }
+        };
+        let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+            .return_document(mongodb::options::ReturnDocument::After)
+            .build();
+        let post = self
+            .base
+            .collection()
+            .find_one_and_update(doc! { "_id": room_id }, doc! { "$inc": inc })
+            .with_options(opts)
+            .await
+            .map_err(DaoError::Mongo)?;
+        if let Some(room) = post {
+            self.base
+                .collection()
+                .update_one(
+                    doc! { "_id": room_id },
+                    doc! { "$max": { "peak_participant_count": room.participant_count as i64 } },
+                )
+                .await
+                .map_err(DaoError::Mongo)?;
+        }
+        Ok(())
     }
 
     /// Close call session(s) for a user. `connection_id: Some(_)` closes ONLY
@@ -599,32 +655,47 @@ impl RoomDao {
         connection_id: Option<&str>,
     ) -> DaoResult<LeaveOutcome> {
         let now = DateTime::now();
-        let (filter, array_filters) = match connection_id {
-            Some(cid) => (
-                doc! {
-                    "room_id": room_id,
-                    "user_id": user_id,
-                    "sessions": { "$elemMatch": { "connection_id": cid, "left_at": null } },
-                },
-                vec![doc! { "elem.connection_id": cid, "elem.left_at": null }],
-            ),
-            None => (
-                doc! {
-                    "room_id": room_id,
-                    "user_id": user_id,
-                    "sessions.left_at": null,
-                },
-                vec![doc! { "elem.left_at": null }],
-            ),
+        let now_b = bson::Bson::DateTime(now);
+        let filter = match connection_id {
+            Some(cid) => doc! {
+                "room_id": room_id,
+                "user_id": user_id,
+                "sessions": { "$elemMatch": { "connection_id": cid, "left_at": null } },
+            },
+            None => doc! {
+                "room_id": room_id,
+                "user_id": user_id,
+                "sessions.left_at": null,
+            },
         };
-        let update = doc! {
-            "$set": {
-                "sessions.$[elem].left_at": now,
-                "updated_at": now,
-            }
+        // Pipeline update (stats PR-2): array-filter `$set` can't write a
+        // DIFFERENT duration per matched element, so the close is a `$map`
+        // that stamps `left_at` AND the per-session `duration` (previously
+        // declared-but-never-written) in the same atomic write.
+        let close_cond = match connection_id {
+            Some(cid) => doc! { "$and": [
+                { "$eq": [ "$$s.connection_id", cid ] },
+                { "$eq": [ "$$s.left_at", null ] },
+            ]},
+            None => doc! { "$eq": [ "$$s.left_at", null ] },
         };
+        let update = vec![doc! { "$set": {
+            "sessions": { "$map": { "input": "$sessions", "as": "s", "in": {
+                "$cond": [
+                    close_cond,
+                    { "$mergeObjects": [ "$$s", {
+                        "left_at": now_b.clone(),
+                        "duration": { "$toLong": { "$divide": [
+                            { "$subtract": [ now_b.clone(), "$$s.joined_at" ] },
+                            1000,
+                        ] } },
+                    } ] },
+                    "$$s",
+                ]
+            }}},
+            "updated_at": now_b,
+        }}];
         let opts = mongodb::options::FindOneAndUpdateOptions::builder()
-            .array_filters(array_filters)
             .return_document(mongodb::options::ReturnDocument::After)
             .build();
         let post = self
@@ -639,9 +710,33 @@ impl RoomDao {
             return Ok(LeaveOutcome {
                 closed: false,
                 was_last_session: false,
+                closed_sessions: Vec::new(),
             });
         };
         let was_last_session = post.sessions.iter().all(|s| s.left_at.is_some());
+        let closed_sessions: Vec<(DateTime, DateTime)> = post
+            .sessions
+            .iter()
+            .filter(|s| s.left_at == Some(now))
+            .map(|s| (s.joined_at, now))
+            .collect();
+        // Fill the previously-dead lifetime counter from what just closed.
+        let closed_secs: i64 = closed_sessions
+            .iter()
+            .map(|(j, l)| (l.timestamp_millis() - j.timestamp_millis()).max(0) / 1000)
+            .sum();
+        if closed_secs > 0
+            && let Some(mid) = post.id
+        {
+            self.members
+                .collection()
+                .update_one(
+                    doc! { "_id": mid },
+                    doc! { "$inc": { "total_duration": closed_secs } },
+                )
+                .await
+                .map_err(DaoError::Mongo)?;
+        }
 
         if was_last_session {
             // Guarded decrement: only when participant_count > 0, so a stray
@@ -663,6 +758,7 @@ impl RoomDao {
         Ok(LeaveOutcome {
             closed: true,
             was_last_session,
+            closed_sessions,
         })
     }
 

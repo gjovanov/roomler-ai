@@ -303,7 +303,20 @@ pub async fn call_start(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    state.rooms.start_call(rid).await?;
+    // Stats PR-2 — transition-gated: only the caller that actually flips
+    // the room to in_progress mints the call instance; a re-invoked
+    // call/start (retry, second pod, second user) neither resets
+    // actual_start_time nor creates a duplicate call_sessions doc.
+    let call_id = ObjectId::new();
+    if let Some(started_at) = state.rooms.start_call(rid, call_id).await?
+        && state.settings.stats.enabled
+        && let Err(e) = state
+            .stats
+            .create_call_session(call_id, tid, rid, auth.user_id, started_at)
+            .await
+    {
+        tracing::debug!(room = %rid, %e, "call session create failed");
+    }
     // C-4 — claim-or-route: creation is NX-claim-gated, so two pods
     // racing call/start build exactly ONE router. The claim loser skips
     // local creation — its members' `media:join` then routes to the
@@ -540,6 +553,12 @@ pub(crate) async fn finalize_call_leave_db(
         .rooms
         .leave_participant(rid, user_id, connection_id)
         .await?;
+    // Stats PR-2 — book the closed sessions' seconds into the live call,
+    // clamped to the call window (a stale orphan closed by the legacy
+    // close-all path must not book days into the current call).
+    if !outcome.closed_sessions.is_empty() && state.settings.stats.enabled {
+        book_call_minutes(state, rid, &outcome.closed_sessions).await;
+    }
     if !outcome.was_last_session {
         // Another session of this user is still open (or nothing was closed):
         // the distinct-user count is unchanged — nothing to broadcast.
@@ -576,7 +595,13 @@ pub(crate) async fn finalize_call_leave_db(
             .await;
         }
     } else if status.as_deref() == Some("in_progress") {
-        state.rooms.end_call(rid).await?;
+        let ended_call = state.rooms.end_call(rid).await?;
+        if let Some(call_id) = ended_call
+            && state.settings.stats.enabled
+            && let Err(e) = state.stats.close_call_session(call_id, "last_left").await
+        {
+            tracing::debug!(room = %rid, %e, "call session close failed (last_left)");
+        }
         // C-4 — the media island may live on another pod.
         crate::ws::media_cluster::close_room_everywhere(state, &rid).await;
 
@@ -600,6 +625,48 @@ pub(crate) async fn finalize_call_leave_db(
     Ok(())
 }
 
+/// Stats PR-2 — attribute just-closed session seconds to the room's live
+/// call, clamped to the call window. Sessions that PRE-DATE the call
+/// (orphans from a crash gap, closed late by the legacy close-all leave)
+/// are skipped entirely — they must not book days into the current call.
+async fn book_call_minutes(
+    state: &AppState,
+    rid: ObjectId,
+    closed: &[(bson::DateTime, bson::DateTime)],
+) {
+    let Ok(room) = state.rooms.base.find_by_id(rid).await else {
+        return;
+    };
+    let Some(call_id) = room.current_call_id else {
+        return;
+    };
+    let Ok(Some((started_at, ended_at))) = state.stats.call_window(call_id).await else {
+        return;
+    };
+    let start_ms = started_at.timestamp_millis();
+    let end_cap_ms = ended_at.map(|e| e.timestamp_millis());
+    let mut secs = 0i64;
+    for (joined, left) in closed {
+        let j_ms = joined.timestamp_millis();
+        if j_ms < start_ms {
+            continue;
+        }
+        let mut l_ms = left.timestamp_millis();
+        if let Some(cap) = end_cap_ms {
+            l_ms = l_ms.min(cap);
+        }
+        secs += (l_ms - j_ms).max(0) / 1000;
+    }
+    if secs > 0
+        && let Err(e) = state
+            .stats
+            .add_call_participant_seconds(call_id, secs)
+            .await
+    {
+        tracing::debug!(room = %rid, %e, "call minutes booking failed");
+    }
+}
+
 pub async fn call_end(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -614,7 +681,13 @@ pub async fn call_end(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    state.rooms.end_call(rid).await?;
+    let ended_call = state.rooms.end_call(rid).await?;
+    if let Some(call_id) = ended_call
+        && state.settings.stats.enabled
+        && let Err(e) = state.stats.close_call_session(call_id, "ended").await
+    {
+        tracing::debug!(room = %rid, %e, "call session close failed (ended)");
+    }
     // C-4 — close the media island wherever it lives (local remove +
     // claim release, or `media.close_room` RPC to the owning pod, which
     // notifies its participants). The old local-only remove_room +
