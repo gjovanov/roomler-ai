@@ -81,6 +81,12 @@ pub struct RoomManager {
     announced_ip: Option<String>,
 }
 
+/// Stats PR-2 — one participant's cloned transport handles:
+/// `(user_id, send_transport, recv_transport)`.
+pub type ParticipantTransports = (ObjectId, WebRtcTransport, WebRtcTransport);
+/// One room's sampled topology: `(room_id, participants)`.
+pub type RoomTransportSnapshot = (ObjectId, Vec<ParticipantTransports>);
+
 impl RoomManager {
     /// Stats PR-2 — snapshot the live conference topology for the media
     /// sampler: per room, per participant, CLONED transport handles
@@ -88,9 +94,7 @@ impl RoomManager {
     /// guards and the guards are dropped before the caller awaits
     /// `get_stats()` — holding a guard across an await can deadlock
     /// against join/leave writers on the same shard.
-    pub fn sample_transports(
-        &self,
-    ) -> Vec<(ObjectId, Vec<(ObjectId, WebRtcTransport, WebRtcTransport)>)> {
+    pub fn sample_transports(&self) -> Vec<RoomTransportSnapshot> {
         self.rooms
             .iter()
             .map(|room| {
