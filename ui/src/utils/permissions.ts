@@ -158,3 +158,17 @@ export function canSeeFleetNav(mask: number | null, isOwner: boolean): boolean {
     hasPermission(mask, byKeys(['REMOTE_CONTROL']))
   )
 }
+
+/**
+ * Gate for the org Analytics queries (stats PR-4). Unlike
+ * `canSeeFleetNav` this is deliberately FAIL-CLOSED on `mask === null`:
+ * the stats endpoints answer 404 to a caller without MANAGE_AGENTS, and
+ * more importantly the api client force-logs-out on any 403 — so the UI
+ * must never fire an analytics request it isn't sure is authorized.
+ * Server gate: `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass included).
+ */
+export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
