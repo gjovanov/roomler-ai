@@ -2,6 +2,11 @@
 
 > Adds TeamViewer / RustDesk-style unattended remote desktop access to roomler-ai, reusing the existing mediasoup SFU, WebSocket signaling, and COTURN cluster. Targets sub-150 ms input-to-glass latency on LAN, sub-300 ms over WAN.
 
+> **One device in N orgs, N users on one host, events from every org:** see
+> [`multi-org.md`](./multi-org.md) — the `[[orgs]]` config, per-org supervisors,
+> tenant address blocks + the renumber runbook, concurrent sessions and the
+> InputArbiter, and cross-org `device:presence`.
+
 ## 1. Goals & Non-Goals
 
 **Goals**

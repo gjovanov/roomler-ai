@@ -10,6 +10,13 @@ A `roomler-tunnel` connection has three sides:
 
 This guide walks through the Win11-on-both-sides flavour. Linux and macOS commands are inline where they diverge.
 
+> **Enrolling one machine into several organisations** (a contractor's laptop, a
+> shared jump host): a second `enroll` against a different tenant now APPENDS an
+> org instead of rebinding the daemon. See [`multi-org.md`](./multi-org.md) §3
+> for the `[[orgs]]` config and the `roomler org ls|rm|enable|disable|set-primary`
+> verbs — and §4.4 for the one thing that is still primary-only: the overlay
+> mesh.
+
 ---
 
 ## Transport: QUIC by default, WebRTC fallback
