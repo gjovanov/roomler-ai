@@ -63,6 +63,7 @@ pub mod signaling;
 pub mod subnet_detect;
 #[cfg(feature = "system-context")]
 pub mod system_context;
+pub mod telemetry;
 pub mod tunnel;
 pub mod updater;
 pub mod version_sweep;
