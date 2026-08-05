@@ -209,23 +209,13 @@ pub struct AppState {
     /// a size-capped retain sweep — see [`crate::ws::overlay::PairChurn`].
     pub relay_pair_churn: Arc<DashMap<String, crate::ws::overlay::PairChurn>>,
 
-    /// 1h-TTL in-memory cache backing `/api/agent/latest-release`.
-    /// All agents share this single cache; one upstream GitHub fetch
-    /// per hour vs N-agents-each-once-per-cycle. See
-    /// `routes::agent_release` for the lifecycle.
-    pub latest_release_cache: Arc<crate::routes::agent_release::LatestReleaseCache>,
-    /// 1h-TTL in-memory cache backing `/api/tunnel/latest-release` +
-    /// `/api/tunnel/installer/{platform}`. Same lifecycle as the
-    /// agent cache, separate instance so the two namespaces don't
-    /// share their fetched payload (different tag prefixes).
-    pub tunnel_release_cache: Arc<crate::routes::tunnel_release::LatestTunnelReleaseCache>,
-    /// 1h-TTL in-memory cache backing the `/api/setup/*` family (the
-    /// unified roomler-setup wizard; the mixed release list is
-    /// filtered to `setup-v*` per request — see
-    /// `routes::setup_release`). Separate from `tunnel_release_cache`
-    /// so wizard tags don't pollute the CLI's `tunnel-v*` lookups.
-    /// Same lifecycle as the agent + CLI caches.
-    pub setup_release_cache: Arc<crate::routes::setup_release::LatestSetupReleaseCache>,
+    /// The one GitHub-releases cache, shared by `/api/agent/*`,
+    /// `/api/tunnel/*` and `/api/setup/*` — they all read the same
+    /// upstream list and only differ in the tag prefix they filter on.
+    /// TTL comes from `settings.releases.cache_ttl_secs`;
+    /// `POST /api/releases/refresh` busts it cluster-wide on a release.
+    /// See `routes::releases` for the lifecycle.
+    pub releases_cache: Arc<crate::routes::releases::ReleasesCache>,
 }
 
 impl AppState {
@@ -601,6 +591,28 @@ impl AppState {
                 })
             });
         }
+        // The releases cache is constructed here rather than inline in the
+        // struct literal because the bus handler below has to capture it:
+        // `POST /api/releases/refresh` lands on ONE pod, and this handler is
+        // how the other pods get busted too.
+        let releases_cache = crate::routes::releases::ReleasesCache::new();
+        if let Some(bus) = &cluster_bus {
+            let cache = releases_cache.clone();
+            let pod_id = pod.pod_id.clone();
+            bus.register(crate::routes::releases::BUS_CLASS_REFRESH, move |body| {
+                let cache = cache.clone();
+                let pod_id = pod_id.clone();
+                Box::pin(async move {
+                    let expect = body
+                        .get("expect_tag")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let report = cache.force_refresh(&pod_id, expect.as_deref()).await;
+                    serde_json::to_value(report).map_err(|e| e.to_string())
+                })
+            });
+        }
+
         if let Some(dir) = &cluster_directory {
             let dir = dir.clone();
             let hub = rc_hub.clone();
@@ -766,9 +778,7 @@ impl AppState {
             derp_presence_tokens: derp_presence_tokens.clone(),
             derp_rehome_cooldowns: Arc::new(DashMap::new()),
             relay_pair_churn: Arc::new(DashMap::new()),
-            latest_release_cache: crate::routes::agent_release::LatestReleaseCache::new(),
-            tunnel_release_cache: crate::routes::tunnel_release::LatestTunnelReleaseCache::new(),
-            setup_release_cache: crate::routes::setup_release::LatestSetupReleaseCache::new(),
+            releases_cache,
         };
 
         // C-4 — media claim-or-route: bus handlers (owner-side command
