@@ -52,30 +52,60 @@ export const useWsStore = defineStore('ws', () => {
   // The server validates membership; other-tenant notifications still
   // arrive via the Redis fan-out, so a multi-tenant user loses nothing.
   let affinityTid: string | null = null
+  // The affinity the LIVE socket was actually dialed with. `affinityTid`
+  // can move ahead of it (lazy affinity — org switches don't redial);
+  // placement-critical flows (rc pre-flight) compare against THIS.
+  let dialedTid: string | null = null
   let lastToken: string | null = null
   // True once a socket has opened — a later open is a RE-connect and the
   // shell must resync state that WS pushes would have delivered meanwhile.
   let hadConnection = false
 
-  function wsUrl(token: string): string {
+  /**
+   * The affinity key an about-to-happen dial should carry. Resolution:
+   * app-set affinity (active org of THIS tab; also how the rc
+   * pre-flight pins a cross-org agent's tenant over the page URL) →
+   * URL path (synchronously correct before the router/pinia boot —
+   * THE deep-link fix: the first dial used to go out key-less and hash
+   * on client IP, landing tenants on the wrong pod 50% of the time) →
+   * persisted last tenant (may be a sibling tab's org — harmless, the
+   * rc pre-flight corrects).
+   */
+  function effectiveTid(): string | null {
+    if (affinityTid) return affinityTid
+    const fromPath = (location.pathname ?? '').match(/^\/tenant\/([0-9a-f]{24})\b/)?.[1]
+    if (fromPath) return fromPath
+    try {
+      return globalThis.localStorage?.getItem('roomler-current-tenant') ?? null
+    } catch {
+      return null
+    }
+  }
+
+  function wsUrl(token: string, tid: string | null): string {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
     // In dev mode, connect directly to the API server to bypass Vite proxy (which doesn't relay WS frames)
     const wsHost = import.meta.env.DEV ? 'localhost:5001' : location.host
-    const tidParam = affinityTid ? `&tid=${affinityTid}` : ''
+    const tidParam = tid ? `&tid=${tid}` : ''
     return `${protocol}//${wsHost}/ws?token=${token}${tidParam}`
   }
 
   /**
-   * Set (or clear) the tenant-affinity key. When it actually changes
-   * while a socket is live, the connection re-dials immediately so the
-   * LB can re-route it. Deliberately NOT `disconnect()` — that would
-   * wipe the rc/media handler registrations that outlive a reconnect;
-   * this path mirrors a transient drop instead (handlers intact).
+   * Set (or clear) the tenant-affinity key — LAZILY. The next natural
+   * dial (drop-reconnect, forceRedial) carries it; nothing on this
+   * socket is placement-critical outside the rc pre-flight, which does
+   * its own compare-and-redial against `dialedTid`. Eagerly redialing
+   * here (the pre-lazy behavior) killed live rc sessions and conference
+   * calls on every org switch, and cross-org pushes ride the Redis
+   * fan-out regardless of which pod holds the socket.
    */
   function setTenantAffinity(tid: string | null) {
-    if (tid === affinityTid) return
     affinityTid = tid
-    forceRedial()
+  }
+
+  /** The affinity key the LIVE socket was dialed with (null = key-less). */
+  function getDialedTid(): string | null {
+    return dialedTid
   }
 
   /**
@@ -110,7 +140,8 @@ export const useWsStore = defineStore('ws', () => {
 
     status.value = 'connecting'
     lastToken = token
-    socket = new WebSocket(wsUrl(token))
+    dialedTid = effectiveTid()
+    socket = new WebSocket(wsUrl(token, dialedTid))
 
     socket.onopen = () => {
       status.value = 'connected'
@@ -396,6 +427,7 @@ export const useWsStore = defineStore('ws', () => {
     connect,
     disconnect,
     setTenantAffinity,
+    getDialedTid,
     forceRedial,
     send,
     sendRaw,
