@@ -959,6 +959,89 @@ mod system {
             }
         }
 
+        /// Multi-org P2c — assign an ADDITIONAL local address (a secondary
+        /// org's self-IP with its block's prefix) to the live device.
+        ///
+        /// The shared TUN comes up with the FIRST org's address via [`up`];
+        /// each further org adds its own here so the host answers on every
+        /// org's address and each block's connected route exists. Idempotent:
+        /// re-adding an address the device already holds succeeds (the
+        /// reconnect path re-registers every session). Sync + blocking by
+        /// design — it runs inside the TUN factory, exactly like the blocking
+        /// bring-up work in [`up`] itself.
+        ///
+        /// [`up`]: Self::up
+        pub fn add_address_sync(&self, ip: Ipv4Addr, prefix: u8) -> std::io::Result<()> {
+            let run = |prog: &str, args: &[String]| -> std::io::Result<String> {
+                let out = std::process::Command::new(prog).args(args).output()?;
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if out.status.success() {
+                    Ok(stdout)
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "{prog} {args:?} exited {}: {stderr} {stdout}",
+                        out.status
+                    )))
+                }
+            };
+            #[cfg(target_os = "windows")]
+            {
+                // `netsh … add address` refuses an address that already
+                // exists; probing by delete-first would flap the connected
+                // route under live traffic, so tolerate that error instead.
+                let mask = Ipv4Addr::from(if prefix == 0 {
+                    0
+                } else {
+                    !0u32 << (32 - u32::from(prefix.min(32)))
+                });
+                let args: Vec<String> = vec![
+                    "interface".into(),
+                    "ipv4".into(),
+                    "add".into(),
+                    "address".into(),
+                    format!("name={IF_NAME}"),
+                    format!("addr={ip}"),
+                    format!("mask={mask}"),
+                ];
+                match run("netsh", &args) {
+                    Ok(_) => Ok(()),
+                    Err(e)
+                        if e.to_string()
+                            .to_ascii_lowercase()
+                            .contains("already exists")
+                            || e.to_string().contains("0x80071392") =>
+                    {
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // `replace` is add-or-update — naturally idempotent.
+                let args: Vec<String> = vec![
+                    "addr".into(),
+                    "replace".into(),
+                    format!("{ip}/{prefix}"),
+                    "dev".into(),
+                    IF_NAME.into(),
+                ];
+                run("ip", &args).map(|_| ())
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            {
+                let _ = (ip, prefix, run);
+                // macOS utun aliasing is possible via ifconfig, but multi-org
+                // TUN is not offered there yet — the agent's config gate keeps
+                // secondaries off, so reaching here is a bug: refuse loudly
+                // rather than silently half-work.
+                Err(std::io::Error::other(
+                    "multi-address TUN is not supported on this platform",
+                ))
+            }
+        }
+
         /// Create the device, assign `self_ip` with `netmask`, set `mtu`,
         /// and bring it up. `netmask` is the overlay *network* mask (e.g.
         /// `/10` → `255.192.0.0`) so the whole overlay CIDR routes here
