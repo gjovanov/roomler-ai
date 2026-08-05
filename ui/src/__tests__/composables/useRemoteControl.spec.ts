@@ -57,6 +57,7 @@ import {
   RC_STALL_FAIL_TICKS,
   isRetryableTerminateReason,
   isRetryableRcErrorCode,
+  readyRecoveryAction,
   sessionGateAllows,
   nextStallAction,
   classifyDegraded,
@@ -3041,6 +3042,28 @@ describe('S3 resilience: isRetryableRcErrorCode', () => {
     expect(isRetryableRcErrorCode('invalid_token')).toBe(false)
     expect(isRetryableRcErrorCode(undefined)).toBe(false)
     expect(isRetryableRcErrorCode('')).toBe(false)
+  })
+})
+
+describe('2026-08-05 consent wedge: readyRecoveryAction', () => {
+  it('proceeds on a gate-matched Ready with a live PeerConnection', () => {
+    expect(readyRecoveryAction(true, true, true)).toBe('proceed')
+    expect(readyRecoveryAction(true, true, false)).toBe('proceed')
+  })
+
+  it('ignores a Ready for a stale session regardless of pc state', () => {
+    expect(readyRecoveryAction(false, true, true)).toBe('ignore')
+    expect(readyRecoveryAction(false, false, false)).toBe('ignore')
+  })
+
+  it('reschedules (never silently drops) a current-session Ready that lost the pc race', () => {
+    // The eternal awaiting_consent wedge: server in Negotiating, Ready
+    // processed by nobody. With retry args the ladder must take over.
+    expect(readyRecoveryAction(true, false, true)).toBe('reschedule')
+  })
+
+  it('fails honestly when there is nothing to retry with', () => {
+    expect(readyRecoveryAction(true, false, false)).toBe('fail')
   })
 })
 
