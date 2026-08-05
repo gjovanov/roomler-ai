@@ -312,6 +312,12 @@ struct Installed {
     /// measuring volume — and volume is exactly what decides whether `enforce`
     /// is safe to flip.
     rx_denied: u64,
+    /// Stats PR-5 — the prober's last RTT measurement for this peer (the
+    /// B1 `RttSample` events previously fed only the path-monitor Q).
+    /// Published through [`build_overlay_view`] so `roomler peers` and the
+    /// agent's heartbeat telemetry get a real `rtt_ms` instead of the
+    /// historical hardcoded `None`.
+    last_rtt_ms: Option<u32>,
     /// Monotonic instant we last HEARD from this peer — a real "last seen"
     /// (P3b-3). Seeded to `since` at install; advanced by `sweep_carrier_health`
     /// whenever the keepalive-inclusive `rx_any` liveness counter climbed since
@@ -391,6 +397,7 @@ impl Installed {
             carrier_local: None,
             carrier_dst: None,
             relay_kind_dbg: None,
+            last_rtt_ms: None,
             last_rx_at: now,
             relay_local: None,
             relay_dst: None,
@@ -906,8 +913,10 @@ pub type RegionalDerpFactory = Box<dyn Fn(&str) -> Option<Arc<DerpMux>> + Send +
 /// - not server-reachable → [`ConnectionType::Offline`]
 ///
 /// `Tunnel` is never produced here — that's the userspace-tunnel fallback the
-/// daemon labels once the tunnel-client folds in (P3). `rtt_ms` isn't tracked by
-/// the runtime (the daemon fills it from an ICMP prober); `last_seen_ms` is the
+/// daemon labels once the tunnel-client folds in (P3). `rtt_ms` is the prober's
+/// last `RttSample` for the peer's installed carrier (stats PR-5 — previously
+/// hardcoded `None`; the daemon may still overlay its own ICMP measurement in
+/// the LocalAPI merge); `last_seen_ms` is the
 /// absolute epoch-ms of the peer's last inbound packet (P3b-3), `None` for a peer
 /// with no installed carrier.
 ///
@@ -952,7 +961,7 @@ fn build_overlay_view(
                 upgrading: connection == ConnectionType::Relay && probing.contains_key(&np.node_id),
                 // rc.275 honesty — the sweep's silently-one-way verdict.
                 stalled: inst.is_some_and(|i| i.stalled),
-                rtt_ms: None,
+                rtt_ms: inst.and_then(|i| i.last_rtt_ms),
                 last_seen_ms,
                 // P3b-3 — carry the backing agent id (hex) so the daemon can join
                 // this peer to a tunnel flow and label it `Tunnel`.
@@ -2393,6 +2402,12 @@ impl OverlayRuntime {
                     // INCUMBENT tier (the ping rode the installed carrier).
                     // Uninstalled peer ⇒ drop (no carrier attribution).
                     Some(OverlayEvent::RttSample { node_id, rtt_ms }) => {
+                        // Stats PR-5: remember the measurement for the
+                        // LocalAPI / heartbeat views regardless of the
+                        // Q-credit flag — `rtt_ms` was hardcoded None there.
+                        if let Some(e) = by_node.get_mut(&node_id) {
+                            e.last_rtt_ms = Some(rtt_ms);
+                        }
                         if rtt_q_enabled()
                             && let Some(tier) = by_node.get(&node_id).map(|e| e.tier)
                         {
