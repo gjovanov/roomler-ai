@@ -6,6 +6,7 @@ import {
   DEFAULT_MEMBER,
   PERMISSION_FLAGS,
   PERMISSION_GROUPS,
+  canQueryAnalytics,
   canSeeFleetNav,
   describePermissions,
   hasPermission,
@@ -138,5 +139,32 @@ describe('canSeeFleetNav (Devices + Network nav gating)', () => {
 
   it('DEFAULT_ADMIN sees fleet nav (sanity vs the role preset)', () => {
     expect(canSeeFleetNav(DEFAULT_ADMIN, false)).toBe(true)
+  })
+})
+
+describe('canQueryAnalytics (org analytics gating — stats PR-4)', () => {
+  const MANAGE_AGENTS = 1 << 24
+
+  it('fails CLOSED while the membership has not loaded (null mask)', () => {
+    // Opposite convention to canSeeFleetNav — the analytics endpoints
+    // 404 without MANAGE_AGENTS and the api client logs out on 403, so
+    // the UI must never optimistically fire a query.
+    expect(canQueryAnalytics(null, false)).toBe(false)
+  })
+
+  it('owner always allowed, even before the mask loads', () => {
+    expect(canQueryAnalytics(null, true)).toBe(true)
+    expect(canQueryAnalytics(0, true)).toBe(true)
+  })
+
+  it('MANAGE_AGENTS or ADMINISTRATOR allowed', () => {
+    expect(canQueryAnalytics(MANAGE_AGENTS, false)).toBe(true)
+    expect(canQueryAnalytics(ADMINISTRATOR, false)).toBe(true)
+    expect(canQueryAnalytics(DEFAULT_ADMIN, false)).toBe(true)
+  })
+
+  it('plain member denied', () => {
+    expect(canQueryAnalytics(DEFAULT_MEMBER, false)).toBe(false)
+    expect(canQueryAnalytics(0, false)).toBe(false)
   })
 })
