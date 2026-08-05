@@ -191,7 +191,7 @@ pub fn plan_renumber(
     // Pass 1 — who keeps their ordinal. Sorted by id so the plan is
     // deterministic (a dry-run must predict what the apply will do).
     let mut ordered: Vec<&PlanNode> = nodes.iter().collect();
-    ordered.sort_by(|a, b| a.id.cmp(&b.id));
+    ordered.sort_by_key(|n| n.id);
 
     let mut taken: HashSet<u32> = HashSet::new();
     let mut keep: HashMap<ObjectId, u32> = HashMap::new();
