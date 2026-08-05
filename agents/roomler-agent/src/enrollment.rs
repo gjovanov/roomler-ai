@@ -131,6 +131,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig::default(),
         // Phase 3b: overlay opt-in, off until the operator enables it.
         overlay_enabled: false,
+        // Multi-org P2c: secondary-org TUN sharing, off until opted in.
+        overlay_multi_org: false,
         overlay_wg_secret_key: None,
         // Phase 1: no advertised subnet routes until the operator configures them.
         overlay_advertised_routes: Vec::new(),
