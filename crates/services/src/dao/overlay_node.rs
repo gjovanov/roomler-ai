@@ -314,6 +314,33 @@ impl OverlayNodeDao {
             .await
     }
 
+    /// P2b — move a LIVE node to a new overlay address as part of a tenant
+    /// renumber. Scoped to `(node_id, network_id)` so a plan computed against
+    /// one network can never write into another's row.
+    ///
+    /// Ordering matters at the call site: the unique
+    /// `(tenant_id, network_id, overlay_ip)` index is over LIVE rows, so a
+    /// renumber that lands two nodes on the same address fails loudly on the
+    /// second write instead of silently duplicating a lease. Since a plan
+    /// always targets a DIFFERENT block than the one currently in use, no
+    /// intermediate state can collide with an unmoved node.
+    pub async fn set_overlay_ip(
+        &self,
+        node_id: ObjectId,
+        network_id: ObjectId,
+        overlay_ip: &str,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": node_id, "network_id": network_id, "deleted_at": null },
+                doc! { "$set": {
+                    "overlay_ip": overlay_ip,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await
+    }
+
     /// Phase 1 — set the admin-APPROVED subnet routes for a node and return the
     /// updated row. The caller must first verify the node belongs to the admin's
     /// tenant and that each route is among the node's `advertised_routes`.
