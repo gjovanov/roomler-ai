@@ -1,6 +1,7 @@
 pub mod cluster;
 pub mod error;
 pub mod extractors;
+pub mod media_stats;
 pub mod middleware;
 pub mod relay_load;
 pub mod routes;

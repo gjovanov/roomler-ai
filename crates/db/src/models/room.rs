@@ -30,6 +30,12 @@ pub struct Room {
     pub media_settings: Option<MediaSettings>,
     pub conference_settings: Option<ConferenceSettings>,
     pub conference_status: Option<String>,
+    /// Stats PR-2 — the `call_sessions` document of the call currently in
+    /// progress. Set by the transition-gated `start_call`, cleared on end;
+    /// lets join/leave attribute minutes to a call INSTANCE (the
+    /// status/start/end triple above is overwritten by every new call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_call_id: Option<ObjectId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meeting_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
