@@ -2443,33 +2443,60 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::Mutex;
 
-    /// rc.307 — the stable-port bind helper: honors a free stable port,
-    /// falls back to an ephemeral port on a conflict (after its brief
-    /// retry), and `0` means plain ephemeral.
+    /// rc.307 — the stable-port bind helper: prefers the base, WALKS THE BAND
+    /// when the base is swallowed (the Hyper-V/WSL reservation case that ate
+    /// the original default), and `0` means plain ephemeral.
     #[tokio::test]
-    async fn bind_direct_socket_stable_conflict_and_ephemeral() {
+    async fn bind_direct_socket_prefers_base_then_walks_the_band() {
         use std::net::Ipv4Addr;
         // 0 → plain ephemeral bind.
-        let holder = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, 0, "test")
+        let scratch = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, 0, "test")
             .await
             .expect("ephemeral bind");
-        let p = holder.local_addr().unwrap().port();
-        assert_ne!(p, 0);
-        // Conflict (holder still owns p) → ephemeral fallback, never a hang.
-        let fallback = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, p, "test")
+        assert_ne!(scratch.local_addr().unwrap().port(), 0);
+        drop(scratch);
+
+        // Find a base whose whole band is free, then occupy the base only.
+        let mut base = 43648u16;
+        let mut held: Vec<UdpSocket> = Vec::new();
+        loop {
+            held.clear();
+            let mut all_free = true;
+            for p in direct::direct_port_candidates(base) {
+                match UdpSocket::bind((Ipv4Addr::LOCALHOST, p)).await {
+                    Ok(s) => held.push(s),
+                    Err(_) => {
+                        all_free = false;
+                        break;
+                    }
+                }
+            }
+            if all_free {
+                break;
+            }
+            base = base
+                .checked_add(direct::DIRECT_PORT_BAND)
+                .expect("a free band");
+            held.clear();
+        }
+        held.clear(); // release the whole band
+
+        // Base free → bound exactly (the stability property).
+        let on_base = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, base, "test")
             .await
-            .expect("fallback bind");
-        assert_ne!(
-            fallback.local_addr().unwrap().port(),
-            p,
-            "must fall back off the taken port"
+            .expect("base bind");
+        assert_eq!(on_base.local_addr().unwrap().port(), base);
+
+        // Base occupied → the NEXT band member, never ephemeral.
+        let walked = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, base, "test")
+            .await
+            .expect("band walk bind");
+        let wp = walked.local_addr().unwrap().port();
+        assert_ne!(wp, base, "base is taken");
+        assert!(
+            direct::direct_port_candidates(base).any(|c| c == wp),
+            "must stay INSIDE the band (got {wp}), not fall to ephemeral"
         );
-        // Freed → the stable port is honored exactly.
-        drop(holder);
-        let stable = establish::bind_direct_socket(Ipv4Addr::LOCALHOST, p, "test")
-            .await
-            .expect("stable bind");
-        assert_eq!(stable.local_addr().unwrap().port(), p);
     }
 
     /// rc.211 — a fresh off-loop build queue for tests. The receiver is

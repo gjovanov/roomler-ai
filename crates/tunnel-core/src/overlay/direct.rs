@@ -41,10 +41,40 @@ pub fn direct_enabled() -> bool {
     }
 }
 
-/// Built-in stable port for the direct sockets (see [`direct_port`]).
+/// Built-in stable base port for the direct sockets (see [`direct_port`]).
 /// Deliberately NOT 41641 (Tailscale's WireGuard port — fleet hosts run both)
 /// and not 51820 (kernel WireGuard's default).
-pub const DEFAULT_DIRECT_PORT: u16 = 41648;
+///
+/// ⚠️ Chosen ABOVE the Hyper-V / WSL2-mirrored / HNS reservation zone. Those
+/// stacks reserve large port pools that are invisible to BOTH `netstat` AND
+/// `netsh interface ipv4 show excludedportrange` — the same trap
+/// `rc_local_turn`'s fallback band documents. Field-measured on NEO16
+/// (WSL-mirrored) 2026-08-05: **41000–41800+ all unbindable**, 41989 and up
+/// free — which swallowed the original 41648 default whole. The zones are
+/// allocated dynamically and MOVE between boots, so the band walk below is
+/// the real defense; this constant only picks a good starting point.
+pub const DEFAULT_DIRECT_PORT: u16 = 43648;
+
+/// How many consecutive ports [`direct_port_candidates`] walks before giving
+/// up on a stable port. A swallowed base costs us one port, not the feature.
+pub const DIRECT_PORT_BAND: u16 = 8;
+
+/// Offset from the LAN band to the public/srflx dialer's band. The dialer
+/// binds `0.0.0.0`, which collides with the interface-specific LAN binds on
+/// the SAME port (no SO_REUSEADDR — its Windows UDP semantics allow unsafe
+/// double delivery), so it needs its own band, far enough away that a LAN
+/// walk can never run into it.
+pub const PUBLIC_DIAL_PORT_OFFSET: u16 = 32;
+
+/// The stable-port candidates for one socket, in a FIXED order: the same
+/// host re-binds the same port after a restart as long as availability is
+/// unchanged — which is the whole point (a reproducible UDP 5-tuple that a
+/// stateful corp firewall keeps treating as the flow it already
+/// grandfathered). `base == 0` yields nothing (ephemeral opt-out).
+pub fn direct_port_candidates(base: u16) -> impl Iterator<Item = u16> + Clone {
+    let n = if base == 0 { 0 } else { DIRECT_PORT_BAND };
+    (0..n).filter_map(move |i| base.checked_add(i))
+}
 
 /// Stable UDP port for the overlay's direct sockets
 /// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`; config key `overlay_direct_port`).
@@ -69,13 +99,19 @@ pub const DEFAULT_DIRECT_PORT: u16 = 41648;
 pub fn direct_port() -> u16 {
     match crate::env::node_env("OVERLAY_DIRECT_PORT") {
         Some(v) => match v.trim().parse::<u32>() {
-            // 65535 excluded: the public dialer needs port+1.
-            Ok(n) if n <= 65534 => n as u16,
+            // Cap leaves room for the public dialer's band
+            // (`base + PUBLIC_DIAL_PORT_OFFSET + DIRECT_PORT_BAND`).
+            Ok(n) if n <= MAX_DIRECT_PORT_BASE as u32 => n as u16,
             _ => DEFAULT_DIRECT_PORT,
         },
         None => DEFAULT_DIRECT_PORT,
     }
 }
+
+/// Largest accepted `overlay_direct_port` base — the whole public-dial band
+/// must still fit under 65535. Mirrored by the agent's config-surface
+/// validation.
+pub const MAX_DIRECT_PORT_BASE: u16 = u16::MAX - PUBLIC_DIAL_PORT_OFFSET - DIRECT_PORT_BAND;
 
 /// Enumerate this node's usable LAN IPv4 addresses across **all** interfaces,
 /// so a multi-homed host advertises every LAN endpoint and a peer matches
@@ -1026,10 +1062,9 @@ mod tests {
         }
         assert_eq!(direct_port(), DEFAULT_DIRECT_PORT, "unset → default");
         for (v, want) in [
-            ("41648", 41648u16),
+            ("43648", 43648u16),
             (" 12345 ", 12345),
             ("0", 0),
-            ("65534", 65534),
             ("65535", DEFAULT_DIRECT_PORT),
             ("70000", DEFAULT_DIRECT_PORT),
             ("porty", DEFAULT_DIRECT_PORT),
@@ -1038,6 +1073,15 @@ mod tests {
             unsafe { std::env::set_var(n, v) };
             assert_eq!(direct_port(), want, "{v:?}");
         }
+        // A base whose public-dial band would overflow is rejected → default.
+        unsafe { std::env::set_var(n, MAX_DIRECT_PORT_BASE.to_string()) };
+        assert_eq!(direct_port(), MAX_DIRECT_PORT_BASE, "max base accepted");
+        unsafe { std::env::set_var(n, (MAX_DIRECT_PORT_BASE as u32 + 1).to_string()) };
+        assert_eq!(
+            direct_port(),
+            DEFAULT_DIRECT_PORT,
+            "base past the band cap → default"
+        );
         unsafe {
             match rn {
                 Some(v) => std::env::set_var(n, v),
@@ -1048,6 +1092,28 @@ mod tests {
                 None => std::env::remove_var(a),
             }
         }
+    }
+
+    /// rc.307 — the stable-port BAND: a fixed order (so a restart re-binds
+    /// the same port), the base first, and nothing at all when disabled.
+    #[test]
+    fn direct_port_candidates_walk_in_fixed_order() {
+        let c: Vec<u16> = direct_port_candidates(43648).collect();
+        assert_eq!(c.len(), DIRECT_PORT_BAND as usize);
+        assert_eq!(c[0], 43648, "the base must be tried FIRST (stability)");
+        assert!(c.windows(2).all(|w| w[1] == w[0] + 1), "consecutive: {c:?}");
+        assert_eq!(
+            direct_port_candidates(43648).collect::<Vec<_>>(),
+            c,
+            "the walk must be deterministic across calls"
+        );
+        assert_eq!(
+            direct_port_candidates(0).count(),
+            0,
+            "0 = ephemeral opt-out: no stable candidates"
+        );
+        // Never overflows off the end of the port space.
+        assert!(direct_port_candidates(u16::MAX).all(|p| p >= u16::MAX - DIRECT_PORT_BAND));
     }
 
     /// rc.275 hygiene — the LAN-gather deny-list over the field-observed
