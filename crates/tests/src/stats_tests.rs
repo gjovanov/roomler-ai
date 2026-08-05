@@ -287,3 +287,169 @@ async fn presence_events_ledger_appends() {
         2
     );
 }
+
+// ── Stats PR-2 — call lifecycle + orphan sweep ──────────────────────────
+
+#[tokio::test]
+async fn call_lifecycle_books_call_session_and_fills_dead_fields() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("statscall").await;
+    let tid = &seeded.tenant_id;
+    let rid_hex = &seeded.rooms[0].id;
+    let token = &seeded.admin.access_token;
+    let rid = ObjectId::parse_str(rid_hex).unwrap();
+    let base = format!("/api/tenant/{tid}/room/{rid_hex}");
+
+    // start ×2 → exactly ONE call instance, started_at stable (the
+    // transition gate: a re-invoked start must not reset the clock).
+    let r = app
+        .auth_post(&format!("{base}/call/start"), token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let call1 = find_one(&app, "call_sessions", doc! { "room_id": rid })
+        .await
+        .expect("call doc created");
+    let started_first = *call1.get_datetime("started_at").unwrap();
+    let r = app
+        .auth_post(&format!("{base}/call/start"), token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(
+        count(&app, "call_sessions", doc! { "room_id": rid }).await,
+        1
+    );
+    let room = find_one(&app, "rooms", doc! { "_id": rid }).await.unwrap();
+    let call_id = room
+        .get_object_id("current_call_id")
+        .expect("current_call_id set");
+    let call_again = find_one(&app, "call_sessions", doc! { "_id": call_id })
+        .await
+        .unwrap();
+    assert_eq!(
+        *call_again.get_datetime("started_at").unwrap(),
+        started_first
+    );
+
+    // join → previously-dead rooms.peak_participant_count fills.
+    let r = app
+        .auth_post(&format!("{base}/call/join"), token)
+        .json(&serde_json::json!({ "connection_id": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let room = find_one(&app, "rooms", doc! { "_id": rid }).await.unwrap();
+    assert!(int(&room, "peak_participant_count") >= 1);
+
+    // Hold the session >1 s so the booked seconds are non-zero.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // leave (last participant) → session closed WITH duration (dead field),
+    // total_duration incremented, call minutes booked, call auto-ended.
+    let r = app
+        .auth_post(&format!("{base}/call/leave"), token)
+        .json(&serde_json::json!({ "connection_id": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    let member = find_one(
+        &app,
+        "room_members",
+        doc! { "room_id": rid, "sessions.duration": { "$gte": 1 } },
+    )
+    .await;
+    assert!(member.is_some(), "closed session should carry a duration");
+    let member = member.unwrap();
+    assert!(int(&member, "total_duration") >= 1);
+
+    let call = find_one(&app, "call_sessions", doc! { "_id": call_id })
+        .await
+        .unwrap();
+    assert!(int(&call, "participant_seconds") >= 1);
+    assert!(
+        call.get_datetime("ended_at").is_ok(),
+        "last leaver must auto-end the call instance"
+    );
+    assert_eq!(call.get_str("end_reason").unwrap(), "last_left");
+    let room = find_one(&app, "rooms", doc! { "_id": rid }).await.unwrap();
+    assert!(
+        room.get_object_id("current_call_id").is_err(),
+        "current_call_id cleared on end"
+    );
+}
+
+#[tokio::test]
+async fn orphan_sweep_closes_stale_call_state() {
+    let app = TestApp::spawn().await;
+    let tenant = ObjectId::new();
+    let room = ObjectId::new();
+    let call = ObjectId::new();
+    let hour_ago =
+        bson::DateTime::from_millis(bson::DateTime::now().timestamp_millis() - 3_600_000);
+
+    // A call doc + an open member session for a room that is NOT
+    // in_progress (no room doc at all — same class as a crashed pod's
+    // leftovers).
+    app.state
+        .db
+        .collection::<Document>("call_sessions")
+        .insert_one(doc! {
+            "_id": call,
+            "tenant_id": tenant,
+            "room_id": room,
+            "started_by": tenant,
+            "started_at": hour_ago,
+            "ended_at": bson::Bson::Null,
+            "peak_participants": 2_i32,
+            "participant_seconds": 0_i64,
+        })
+        .await
+        .unwrap();
+    app.state
+        .db
+        .collection::<Document>("room_members")
+        .insert_one(doc! {
+            "tenant_id": tenant,
+            "room_id": room,
+            "sessions": [ {
+                "joined_at": hour_ago,
+                "left_at": bson::Bson::Null,
+                "duration": bson::Bson::Null,
+                "device_type": "web",
+                "connection_id": "dead-conn",
+            } ],
+            "total_duration": 0_i64,
+        })
+        .await
+        .unwrap();
+
+    let (calls, sessions) =
+        roomler_ai_api::stats_rollup::close_orphaned_call_state(&app.state).await;
+    assert_eq!(calls, 1);
+    assert_eq!(sessions, 1);
+
+    let call_doc = find_one(&app, "call_sessions", doc! { "_id": call })
+        .await
+        .unwrap();
+    assert!(call_doc.get_datetime("ended_at").is_ok());
+    assert_eq!(call_doc.get_str("end_reason").unwrap(), "stale_reset");
+    let member = find_one(&app, "room_members", doc! { "room_id": room })
+        .await
+        .unwrap();
+    let sess = member.get_array("sessions").unwrap()[0]
+        .as_document()
+        .unwrap();
+    assert!(sess.get_datetime("left_at").is_ok());
+    let d = match sess.get("duration") {
+        Some(bson::Bson::Int64(v)) => *v,
+        Some(bson::Bson::Int32(v)) => i64::from(*v),
+        other => panic!("duration not filled: {other:?}"),
+    };
+    assert!((3500..3700).contains(&d), "duration ≈1h, got {d}");
+}

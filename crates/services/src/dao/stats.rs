@@ -12,7 +12,7 @@
 //! could ("healthy if any pod reached it", matching the load poller's
 //! fail-open philosophy).
 
-use bson::{DateTime, Document, doc, oid::ObjectId};
+use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use mongodb::{Collection, Database};
 
 use super::base::DaoResult;
@@ -177,6 +177,100 @@ impl StatsDao {
                 "ts": DateTime::now(),
                 "presence": presence,
             })
+            .await?;
+        Ok(())
+    }
+
+    // ── call_sessions lifecycle (stats PR-2) ─────────────────────────────
+
+    /// One document per call INSTANCE, `_id` = the room's
+    /// `current_call_id`. Insert-once: the transition-gated `start_call`
+    /// already guarantees a single winner, and a duplicate insert (retry)
+    /// is swallowed as success.
+    pub async fn create_call_session(
+        &self,
+        call_id: ObjectId,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        started_by: ObjectId,
+        started_at: DateTime,
+    ) -> DaoResult<()> {
+        match self
+            .coll(CALL_SESSIONS)
+            .insert_one(doc! {
+                "_id": call_id,
+                "tenant_id": tenant_id,
+                "room_id": room_id,
+                "started_by": started_by,
+                "started_at": started_at,
+                "ended_at": Bson::Null,
+                "peak_participants": 0_i32,
+                "participant_seconds": 0_i64,
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if is_dup_key(&e) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Close a call — three closers can race (explicit end, last-leaver
+    /// auto-end, stale reset); the `ended_at: null` filter picks ONE
+    /// winner. Returns whether this caller closed it.
+    pub async fn close_call_session(&self, call_id: ObjectId, reason: &str) -> DaoResult<bool> {
+        let r = self
+            .coll(CALL_SESSIONS)
+            .update_one(
+                doc! { "_id": call_id, "ended_at": Bson::Null },
+                doc! { "$set": { "ended_at": DateTime::now(), "end_reason": reason } },
+            )
+            .await?;
+        Ok(r.modified_count > 0)
+    }
+
+    /// The call's accounting window: `(started_at, ended_at)`.
+    pub async fn call_window(
+        &self,
+        call_id: ObjectId,
+    ) -> DaoResult<Option<(DateTime, Option<DateTime>)>> {
+        let found = self
+            .coll(CALL_SESSIONS)
+            .find_one(doc! { "_id": call_id })
+            .await?;
+        Ok(found.map(|d| {
+            let started = d
+                .get_datetime("started_at")
+                .copied()
+                .unwrap_or_else(|_| DateTime::now());
+            let ended = d.get_datetime("ended_at").ok().copied();
+            (started, ended)
+        }))
+    }
+
+    pub async fn add_call_participant_seconds(
+        &self,
+        call_id: ObjectId,
+        secs: i64,
+    ) -> DaoResult<()> {
+        self.coll(CALL_SESSIONS)
+            .update_one(
+                doc! { "_id": call_id },
+                doc! { "$inc": { "participant_seconds": secs } },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `$max` the per-call participant peak from the media sampler's gauge
+    /// (consistent with the rest of the call stats; the join-path
+    /// room-level `$max` is ±1 under races).
+    pub async fn max_call_peak(&self, call_id: ObjectId, participants: i32) -> DaoResult<()> {
+        self.coll(CALL_SESSIONS)
+            .update_one(
+                doc! { "_id": call_id },
+                doc! { "$max": { "peak_participants": participants } },
+            )
             .await?;
         Ok(())
     }

@@ -82,6 +82,34 @@ pub struct RoomManager {
 }
 
 impl RoomManager {
+    /// Stats PR-2 — snapshot the live conference topology for the media
+    /// sampler: per room, per participant, CLONED transport handles
+    /// (cheap `Arc` clones). The clones are taken under the DashMap shard
+    /// guards and the guards are dropped before the caller awaits
+    /// `get_stats()` — holding a guard across an await can deadlock
+    /// against join/leave writers on the same shard.
+    pub fn sample_transports(
+        &self,
+    ) -> Vec<(ObjectId, Vec<(ObjectId, WebRtcTransport, WebRtcTransport)>)> {
+        self.rooms
+            .iter()
+            .map(|room| {
+                let parts = room
+                    .participants
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.user_id,
+                            p.send_transport.clone(),
+                            p.recv_transport.clone(),
+                        )
+                    })
+                    .collect();
+                (*room.key(), parts)
+            })
+            .collect()
+    }
+
     pub fn new(worker_pool: Arc<WorkerPool>, settings: &MediasoupSettings) -> Self {
         let listen_ip: IpAddr = settings
             .listen_ip
