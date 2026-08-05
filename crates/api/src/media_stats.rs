@@ -21,8 +21,10 @@ use std::net::IpAddr;
 
 use bson::{Document, doc, oid::ObjectId};
 use futures::{StreamExt, TryStreamExt};
-use mediasoup::data_structures::TransportTuple;
+// `mediasoup::data_structures` is private — the public path to the shared
+// types is the `types` re-export of the mediasoup-types crate.
 use mediasoup::prelude::*;
+use mediasoup::types::data_structures::TransportTuple;
 use mediasoup::webrtc_transport::WebRtcTransportStat;
 use tracing::{debug, info};
 
