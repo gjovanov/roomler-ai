@@ -384,14 +384,6 @@ pub async fn handle_agent_socket(
     // killed too; its flow supervisor re-opens it within seconds.)
     crate::ws::tunnel::terminate_sessions_targeting_agent(&state, agent_id).await;
 
-    // If this agent was an overlay node, mark it offline + drop it from
-    // peers' netmaps (best-effort; it re-syncs on its next join).
-    crate::ws::overlay::handle_overlay_leave(
-        &state,
-        crate::ws::overlay::NodeIdentity::Agent(agent_id),
-    )
-    .await;
-
     // Phase A-1 — the Mongo Offline write + presence release are GATED on
     // the hub removal being OURS: a displaced handler's late teardown must
     // not clobber the displacing connection's Online status or its fresh
@@ -401,6 +393,23 @@ pub async fn handle_agent_socket(
         .unregister_agent(agent_id, Some(&registered_tx));
     pump.abort();
     if removal_was_ours {
+        // If this agent was an overlay node, mark it offline + drop it from
+        // peers' netmaps (best-effort; it re-syncs on its next join).
+        //
+        // rc.307 (B): gated on `removal_was_ours` — previously unconditional,
+        // so a displaced/draining old connection's late teardown could mark
+        // the overlay row Offline AFTER the replacing connection's re-join
+        // set it Online, ghosting the node fleet-wide (`reachability()`
+        // requires status==Online). Today's client rebuilt carriers every
+        // reconnect and the resulting endpoint trickles healed the mis-mark
+        // within seconds; the rc.307 persistent runtime's clean reattach
+        // produces no such trickles, so the mis-mark would stick. Same
+        // pattern as the A-1 status gate directly below.
+        crate::ws::overlay::handle_overlay_leave(
+            &state,
+            crate::ws::overlay::NodeIdentity::Agent(agent_id),
+        )
+        .await;
         if let Err(e) = state
             .agents
             .mark_status(
