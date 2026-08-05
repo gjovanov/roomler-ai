@@ -455,3 +455,327 @@ fn urlencode(s: &str) -> String {
 fn extract_oid(v: &Value) -> Option<String> {
     v.as_str().map(str::to_owned)
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Multi-org — cross-org device enrollment from the UI (`rc:agent.join_org`)
+// + the single-use enrollment-token ledger
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Create a SECOND org owned by the same user, so one caller legitimately
+/// holds MANAGE_AGENTS in both — the only shape the join endpoint accepts,
+/// and the real-world one (a person who administers two orgs).
+async fn second_org_for(app: &TestApp, admin_token: &str, slug: &str) -> String {
+    let resp = app
+        .auth_post("/api/tenant", admin_token)
+        .json(&json!({ "name": format!("{slug} Corp"), "slug": slug }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "create second tenant");
+    let t: Value = resp.json().await.unwrap();
+    t["id"].as_str().unwrap().to_string()
+}
+
+/// Enrollment tokens were single-use BY DESIGN and never enforced — a token
+/// stayed replayable for its whole TTL, which the 2026-08-05 field test hit
+/// by accident (a token rejected by the device cap was accepted on retry).
+#[tokio::test]
+async fn an_enrollment_token_cannot_be_used_twice() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("jtionce").await;
+
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = et["enrollment_token"].as_str().unwrap().to_string();
+
+    let enroll = |machine: &'static str| {
+        let app = &app;
+        let token = token.clone();
+        async move {
+            app.client
+                .post(app.url("/api/agent/enroll"))
+                .json(&json!({
+                    "enrollment_token": token,
+                    "machine_id": machine,
+                    "machine_name": "Replay box",
+                    "os": "linux",
+                    "agent_version": "0.3.0",
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(enroll("mach-jti-1").await.status().as_u16(), 200);
+    // Same token, DIFFERENT machine: the replay that used to mint a second
+    // device (and a second agent JWT) off one authorization.
+    let replay = enroll("mach-jti-2").await;
+    assert_eq!(replay.status().as_u16(), 401, "replay must be refused");
+
+    // …and a fresh token still works, so the ledger only spends what it must.
+    let et2: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/enroll-token", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let resp = app
+        .client
+        .post(app.url("/api/agent/enroll"))
+        .json(&json!({
+            "enrollment_token": et2["enrollment_token"].as_str().unwrap(),
+            "machine_id": "mach-jti-2",
+            "machine_name": "Replay box",
+            "os": "linux",
+            "agent_version": "0.3.0",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+/// The authorization contract: MANAGE_AGENTS in BOTH orgs. Target-only would
+/// let anyone pull a stranger's device into their org; source-only would let
+/// a device's admin push it into an org that never asked for it.
+#[tokio::test]
+async fn join_org_requires_manage_agents_in_both_organizations() {
+    let app = TestApp::spawn().await;
+    let src = app.seed_tenant("joinsrc").await;
+    // A completely separate org the src admin has nothing to do with.
+    let stranger = app.seed_tenant("joinstranger").await;
+
+    let fresh = enrol_via_agent_lib(&app, &src, "mach-join-authz", "Join box").await;
+    let agent_id = fresh.agent_id.clone();
+
+    // Source admin, target they don't administer ⇒ refused.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/{agent_id}/join-org", src.tenant_id),
+            &src.admin.access_token,
+        )
+        .json(&json!({ "target_tenant_id": stranger.tenant_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "no MANAGE_AGENTS in the target org"
+    );
+
+    // A plain member of the SOURCE org can't push their org's devices
+    // anywhere either.
+    let target = second_org_for(&app, &src.admin.access_token, "joindst-a").await;
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/{agent_id}/join-org", src.tenant_id),
+            &src.member.access_token,
+        )
+        .json(&json!({ "target_tenant_id": target }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403, "member lacks MANAGE_AGENTS");
+
+    // Same org as target is a no-op, not a half-applied join.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/{agent_id}/join-org", src.tenant_id),
+            &src.admin.access_token,
+        )
+        .json(&json!({ "target_tenant_id": src.tenant_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+/// Two gates that exist so a click can't fail silently: an agent that
+/// predates the feature (its decoder drops the unknown variant), and an
+/// offline one (nothing to push down). Neither may mint a token.
+#[tokio::test]
+async fn join_org_refuses_incapable_or_offline_devices() {
+    let app = TestApp::spawn().await;
+    let src = app.seed_tenant("joincap").await;
+    let target = second_org_for(&app, &src.admin.access_token, "joincap-dst").await;
+
+    // Enrolled but never connected ⇒ no caps at all, and offline.
+    let fresh = enrol_via_agent_lib(&app, &src, "mach-join-caps", "Old box").await;
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/agent/{}/join-org",
+                src.tenant_id, fresh.agent_id
+            ),
+            &src.admin.access_token,
+        )
+        .json(&json!({ "target_tenant_id": target }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: Value = resp.json().await.unwrap();
+    let msg = body["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        msg.contains("predates remote org-join"),
+        "capability gate should explain itself: {msg}"
+    );
+
+    // The picker endpoint tells the UI the same thing up front, so the
+    // action can be greyed out instead of failing on click.
+    let targets: Value = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/agent/{}/join-targets",
+                src.tenant_id, fresh.agent_id
+            ),
+            &src.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(targets["supported"], false);
+    assert_eq!(targets["online"], false);
+    // It still lists the org the caller manages — the dialog explains why
+    // it's unavailable rather than showing an empty list.
+    let items = targets["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|i| i["tenant_id"] == target),
+        "the manageable org should be listed: {items:?}"
+    );
+}
+
+/// The whole point, end to end: a LIVE agent in org A is pushed into org B
+/// from the API, enrolls itself, appends an `[[orgs]]` entry, and the new
+/// org's supervised loop brings the device online there — no restart, no
+/// shell on the device (the exact thing that blocked PC50045 in the field).
+#[tokio::test]
+async fn join_org_pushes_a_live_device_into_a_second_organization() {
+    let app = TestApp::spawn().await;
+    let src = app.seed_tenant("joinlive").await;
+    let target = second_org_for(&app, &src.admin.access_token, "joinlive-dst").await;
+
+    // A real enrollment + a real signaling loop, so the agent is ONLINE and
+    // its hello advertises `multi_org: ["join"]`.
+    let cfg = enrol_via_agent_lib(&app, &src, "mach-join-live", "Live box").await;
+    let agent_id = cfg.agent_id.clone();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let primary = spawn_agent_signaling(cfg.clone(), stop_rx.clone());
+
+    // Install the join runtime the way `run_cmd` does: a temp config file,
+    // a fresh write lock, and a spawner that supervises the appended org
+    // exactly like a boot-time one.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    roomler_agent::config::save(&cfg_path, &cfg).unwrap();
+    let spawn_rx = stop_rx.clone();
+    let spawn_path = cfg_path.clone();
+    roomler_agent::org_join::install(roomler_agent::org_join::JoinRuntime {
+        config_path: cfg_path.clone(),
+        write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        spawn_org: Box::new(move |org| {
+            let base = roomler_agent::config::load(&spawn_path).expect("reload");
+            spawn_agent_signaling_as(
+                signaling::OrgCtx::secondary(&org.label),
+                base.for_org(&org),
+                spawn_rx.clone(),
+            );
+        }),
+    });
+
+    // Wait for the device to be online in the source org — the push needs a
+    // live socket by design.
+    let mut online = false;
+    for _ in 0..100 {
+        if agent_is_online(&app, &src, &agent_id).await {
+            online = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(online, "agent never came online in the source org");
+
+    // The click.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/{agent_id}/join-org", src.tenant_id),
+            &src.admin.access_token,
+        )
+        .json(&json!({ "target_tenant_id": target, "label": "second" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "join push accepted");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["delivered"], true, "pushed down the live socket");
+    assert_eq!(body["label"], "second");
+
+    // The agent enrolls itself into the target org and its new supervisor
+    // connects — so the device appears, and comes ONLINE, over there.
+    let mut appeared = false;
+    for _ in 0..150 {
+        let list: Value = app
+            .auth_get(
+                &format!("/api/tenant/{target}/agent"),
+                &src.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(items) = list["items"].as_array()
+            && items.iter().any(|a| a["is_online"].as_bool() == Some(true))
+        {
+            appeared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        appeared,
+        "the device should enroll into the target org and come online there"
+    );
+
+    // The config on disk grew a labelled secondary alongside an untouched
+    // primary.
+    let saved = roomler_agent::config::load(&cfg_path).unwrap();
+    assert_eq!(saved.tenant_id, src.tenant_id, "primary identity untouched");
+    assert_eq!(saved.agent_id, cfg.agent_id, "primary agent id untouched");
+    assert_eq!(saved.orgs.len(), 1);
+    assert_eq!(saved.orgs[0].label, "second");
+    assert_eq!(saved.orgs[0].tenant_id, target);
+    assert!(saved.orgs[0].enabled);
+    // The per-org WG mint is `cfg`-gated on an overlay surface and these
+    // tests build the agent with default features, so assert the invariant
+    // that holds either way — a secondary never carries the primary's key.
+    // (The mint itself is pinned by the agent's overlay-feature unit test.)
+    assert!(
+        saved.orgs[0].overlay_wg_secret_key.is_none()
+            || saved.orgs[0].overlay_wg_secret_key != saved.overlay_wg_secret_key,
+        "a secondary must never borrow the primary's WG key"
+    );
+
+    let _ = stop_tx.send(true);
+    let _ = primary.await;
+}

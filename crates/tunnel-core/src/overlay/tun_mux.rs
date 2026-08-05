@@ -214,6 +214,22 @@ impl TunMux {
     pub fn is_alive(&self) -> bool {
         !self.dead.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Drop an org's port (its runtime is gone / never started). Returns the
+    /// port's block so the caller can take the OS address back down.
+    ///
+    /// Field 2026-08-05: the factory used to assign the org's address to the
+    /// adapter BEFORE `register` could refuse it, so a REFUSED org (the
+    /// two-un-migrated-tenants case) left a live address behind on every
+    /// host — an address nothing answered on, which is exactly the sort of
+    /// litter that makes a later diagnosis lie. Registration now happens
+    /// first and the address only follows a successful claim.
+    pub fn deregister(&self, org: &str) -> Option<(Ipv4Addr, u8)> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = st.ports.iter().position(|p| p.org == org)?;
+        let port = st.ports.remove(idx);
+        Some((Ipv4Addr::from(port.block.0), port.block.1))
+    }
 }
 
 /// Longest-prefix demux of one inbound packet, then a non-blocking handoff to
