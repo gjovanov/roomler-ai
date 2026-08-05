@@ -60,6 +60,10 @@ import {
   sessionGateAllows,
   nextStallAction,
   classifyDegraded,
+  RC_REHOME_MAX_REDIALS,
+  rehomeRetryDecision,
+  expectedOrgTid,
+  friendlyRcError,
   nextDirPath,
   parseControlInbound,
   layoutSetWireMessage,
@@ -3175,5 +3179,69 @@ describe('createHeldInputTracker (stuck-Alt release, 2026-08-04)', () => {
     t.key(0x04, true)
     t.key(0x04, true)
     expect(t.releaseAll().keys).toEqual([0x04])
+  })
+})
+
+describe('PR-1 rehome: rehomeRetryDecision', () => {
+  it('re-keys and redials for every attempt up to the cap', () => {
+    for (let n = 1; n <= RC_REHOME_MAX_REDIALS; n++) {
+      expect(rehomeRetryDecision(n)).toBe('redial_retry')
+    }
+  })
+
+  it('falls back to the plain ladder past the cap (no terminal, rc.23)', () => {
+    expect(rehomeRetryDecision(RC_REHOME_MAX_REDIALS + 1)).toBe('ladder_only')
+    expect(rehomeRetryDecision(100)).toBe('ladder_only')
+  })
+})
+
+describe('PR-1 rehome: expectedOrgTid', () => {
+  const org = '69a1dbbad2000f26adc875ce'
+  const other = '68ffffffffffffffffffffff'
+
+  it('prefers the explicit org id (cross-org device modals)', () => {
+    expect(expectedOrgTid(other, `/tenant/${org}/agent/x/remote`)).toBe(other)
+  })
+
+  it('ignores a malformed explicit id and falls back to the URL', () => {
+    expect(expectedOrgTid('not-hex', `/tenant/${org}/agent/x/remote`)).toBe(org)
+    expect(expectedOrgTid('', `/tenant/${org}/dashboard`)).toBe(org)
+  })
+
+  it('extracts the tenant from any /tenant/<hex> path', () => {
+    expect(expectedOrgTid(null, `/tenant/${org}/agent/abc/remote`)).toBe(org)
+    expect(expectedOrgTid(undefined, `/tenant/${org}`)).toBe(org)
+  })
+
+  it('returns null off tenant-scoped pages', () => {
+    expect(expectedOrgTid(null, '/dashboard')).toBeNull()
+    expect(expectedOrgTid(null, '/tenant/nothex/agent')).toBeNull()
+    expect(expectedOrgTid(null, '')).toBeNull()
+  })
+})
+
+describe('PR-1 rehome: friendlyRcError', () => {
+  it('never echoes server prose for agent_on_other_pod (pod IPs stay internal)', () => {
+    const msg = friendlyRcError(
+      'agent_on_other_pod',
+      'agent is homed on pod 10.10.20.11; re-dial and retry',
+    )
+    expect(msg).not.toContain('10.10.20.11')
+    expect(msg).not.toContain('pod')
+  })
+
+  it('maps the known codes to human copy', () => {
+    expect(friendlyRcError('agent_offline', 'agent 6a6c9749 is not online')).toContain('offline')
+    expect(friendlyRcError('agent_busy', null)).toContain('session limit')
+    expect(friendlyRcError('forbidden', null)).toContain('permission')
+    expect(friendlyRcError('invalid_token', null)).toContain('expired')
+  })
+
+  it('falls back to the server message for unknown codes', () => {
+    expect(friendlyRcError('weird_new_code', 'something novel happened')).toBe(
+      'something novel happened',
+    )
+    expect(friendlyRcError('weird_new_code', null)).toBe('weird_new_code')
+    expect(friendlyRcError(undefined, undefined)).toBe('signalling error')
   })
 })
