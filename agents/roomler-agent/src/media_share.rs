@@ -522,6 +522,40 @@ pub fn try_join(
     })
 }
 
+/// P6/P5 field fix (2026-08-05) — a follower's control DC just opened.
+///
+/// `try_join` replays the owner's last `rc:video-info` at JOIN time, but a
+/// follower registers during `AgentPeer::new`, before any data channel
+/// exists — the replay found an empty stash and was dropped, so a
+/// follower's badge fell back to the selection-derived label and never
+/// showed `shared ×N`. Re-send it now that the DC is live. No-op when the
+/// session isn't a follower or the owner hasn't published yet.
+pub fn replay_video_info(session: bson::oid::ObjectId) {
+    let pipelines: Vec<Arc<Mutex<PipelineInner>>> =
+        registry().lock().unwrap().values().cloned().collect();
+    for inner in pipelines {
+        let guard = inner.lock().unwrap();
+        let Some(info) = guard.video_info.clone() else {
+            continue;
+        };
+        let Some(f) = guard
+            .followers
+            .iter()
+            .find(|f| f.sink.session_id == session)
+        else {
+            continue;
+        };
+        let cdc = f.sink.control_dc.clone();
+        drop(guard);
+        tokio::spawn(async move {
+            if let Some(dc) = cdc.lock().await.clone() {
+                let _ = dc.send_text(info).await;
+            }
+        });
+        return;
+    }
+}
+
 /// The follower's DC send task — the same 16 KiB chunk discipline as the
 /// owner pumps' send tasks (single consumer per DC keeps chunk order for
 /// the browser reassembler).

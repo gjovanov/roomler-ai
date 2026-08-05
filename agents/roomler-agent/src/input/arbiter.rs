@@ -60,6 +60,10 @@ pub const IDLE_TAKEOVER: Duration = Duration::from_secs(2);
 /// Per-source ghost-cursor rebroadcast floor (~30 Hz).
 pub const GHOST_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Field diagnostic — ghost-cursor payloads handed to the DC layer since
+/// process start (see the log in `ghost_broadcast`).
+static GHOSTS_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Input arbitration mode. `Free` (the program's decided default) lets
 /// every INPUT-granted session inject, serialized + modifier-fenced;
 /// `Exclusive` funnels injection through one floor holder.
@@ -424,6 +428,14 @@ enum Cmd {
     ReleaseHeld {
         session: ObjectId,
     },
+    /// P6 field fix — a session's control DC just OPENED. Registration
+    /// happens at `AgentPeer::new`, before any DC exists, so the join-time
+    /// `rc:control.state` broadcast found an empty stash and was dropped:
+    /// followers never saw the participants rail (and in exclusive mode
+    /// could not render the Request-control button). Re-broadcast now.
+    ControlReady {
+        session: ObjectId,
+    },
     Event {
         session: ObjectId,
         msg: InputMsg,
@@ -493,6 +505,10 @@ impl Arbiter {
     pub fn release_held(&self, session: ObjectId) {
         let _ = self.tx.try_send(Cmd::ReleaseHeld { session });
     }
+    /// A session's control DC opened — (re)deliver `rc:control.state`.
+    pub fn control_ready(&self, session: ObjectId) {
+        let _ = self.tx.try_send(Cmd::ControlReady { session });
+    }
     pub fn event(&self, session: ObjectId, msg: InputMsg) {
         if self.tx.try_send(Cmd::Event { session, msg }).is_err() {
             tracing::debug!(%session, "input arbiter queue full — event dropped");
@@ -554,6 +570,10 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 if state.session_count() > 0 {
                     broadcast_state(&state, &sinks, &handle);
                 }
+            }
+            Cmd::ControlReady { session } => {
+                tracing::debug!(%session, "input arbiter: control DC ready — re-broadcasting state");
+                broadcast_state(&state, &sinks, &handle);
             }
             Cmd::ReleaseHeld { session } => {
                 let releases = state.release_held(session);
@@ -669,6 +689,22 @@ fn ghost_broadcast(
         return;
     }
     own.last_ghost = now;
+    // Field diagnostic (2026-08-05): ghost cursors were not observed in the
+    // first two-viewer field test. The viewer coalesces `mouse_move` through
+    // `requestAnimationFrame`, which Chrome SUSPENDS in a background tab — so
+    // a test driving two tabs (only one foreground at a time) may simply
+    // never send the moves. Log the first send and then every 300th so the
+    // field can tell "agent never sent" from "viewer never rendered" without
+    // a debug build.
+    let n = GHOSTS_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(300) {
+        tracing::info!(
+            source = %from,
+            targets = sinks.len().saturating_sub(1),
+            total = n,
+            "input arbiter: ghost cursor broadcast"
+        );
+    }
     let name = state
         .snapshot()
         .participants
@@ -895,6 +931,37 @@ mod tests {
                 .iter()
                 .any(|p| p.name == "Watcher" && !p.input)
         );
+    }
+
+    /// Field regression (2026-08-05): arbiter entries LEAKED because
+    /// deregistration hung off the control DC's `on_close`, which does not
+    /// fire on PeerConnection teardown — a fresh session then registered as
+    /// `sessions=3` while the server reported zero open sessions. The state
+    /// machine itself is correct (close removes the entry); the fix is the
+    /// CALLER (`Drop for AgentPeer`). This locks the invariant the leak
+    /// violated: registering N sessions and closing them all leaves zero,
+    /// and a later session sees a count of exactly 1.
+    #[test]
+    fn close_leaves_no_residue_for_the_next_session() {
+        let mut st = ArbiterState::default();
+        let now = Instant::now();
+        let (a, b) = (sid(), sid());
+        st.open(a, "A".into(), true, None, now);
+        st.open(b, "B".into(), true, None, now);
+        assert_eq!(st.session_count(), 2);
+        st.close(a);
+        st.close(b);
+        assert_eq!(st.session_count(), 0, "both entries released");
+        let c = sid();
+        st.open(c, "C".into(), true, None, now);
+        assert_eq!(
+            st.session_count(),
+            1,
+            "a later session must see a clean arbiter, not stale peers"
+        );
+        // And the reused-close path stays idempotent.
+        assert!(st.close(a).is_empty());
+        assert_eq!(st.session_count(), 1);
     }
 
     #[test]
