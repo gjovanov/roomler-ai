@@ -115,6 +115,16 @@
           prepend-icon="mdi-monitor-multiple"
           :title="$t('nav.devices')"
         />
+        <!-- Analytics (stats PR-4): FAIL-CLOSED gating (canQueryAnalytics)
+             — the stats query endpoints 404 without MANAGE_AGENTS and the
+             api client logs out on 403, so this nav never leads a plain
+             member to a request they can't make. -->
+        <v-list-item
+          v-if="showAnalyticsNav"
+          :to="`/tenant/${tenantId}/analytics`"
+          prepend-icon="mdi-chart-areaspline"
+          :title="$t('nav.analytics')"
+        />
         <v-list-group v-if="showFleetNav" value="network">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-lan" :title="$t('nav.network')" />
@@ -144,6 +154,14 @@
           <v-list-item :to="`/tenant/${tenantId}/admin/roles`" prepend-icon="mdi-shield-account" :title="$t('nav.roles')" />
           <v-list-item :to="`/tenant/${tenantId}/billing`" prepend-icon="mdi-credit-card" :title="$t('nav.billing')" />
         </v-list-group>
+        <!-- Platform observability (stats PR-4): visible only to the
+             platform-operator allowlist; the server 404s everyone else. -->
+        <v-list-item
+          v-if="isPlatformAdmin"
+          to="/observability"
+          prepend-icon="mdi-chart-timeline-variant-shimmer"
+          :title="$t('nav.observability')"
+        />
       </v-list>
 
       <!-- Rooms with unread badges -->
@@ -352,7 +370,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
 import { useTenantStore } from '@/stores/tenant'
-import { canSeeFleetNav } from '@/utils/permissions'
+import { canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
 import { useRoomStore } from '@/stores/rooms'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
@@ -502,6 +520,10 @@ watch(
 const showFleetNav = computed(() =>
   canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner),
 )
+const showAnalyticsNav = computed(() =>
+  canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
+)
+const isPlatformAdmin = computed(() => auth.user?.is_platform_admin === true)
 
 const settingsRoute = computed(() =>
   tenantId.value ? `/tenant/${tenantId.value}/admin` : '/',
