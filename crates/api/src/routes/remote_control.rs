@@ -127,6 +127,37 @@ pub async fn enroll_agent(
         .agents
         .find_by_tenant_and_machine(tid, &body.machine_id)
         .await?;
+    // S5 — plan device cap. Only a NEW row consumes a slot; a known machine
+    // rehydrates below regardless of the cap (re-enrolling your existing
+    // fleet must never brick). Checked BEFORE the single-use claim on
+    // purpose: a token burnt by a rejection the operator can only fix
+    // elsewhere (upgrade the plan, remove a device) would fail their retry a
+    // second time, for a new and confusing reason.
+    if existing.is_none() {
+        let tenant = state.tenants.base.find_by_id(tid).await?;
+        let max = tenant.plan.limits().max_devices as u64;
+        let used = state.agents.count_active_for_tenant(tid).await?;
+        if used >= max {
+            return Err(ApiError::Forbidden(format!(
+                "Device limit reached for the {:?} plan ({used} of {max} devices used). \
+                 Upgrade the plan or remove a device first.",
+                tenant.plan
+            )));
+        }
+    }
+
+    // Enrollment tokens are single-use BY DESIGN and were never enforced —
+    // field 2026-08-05 replayed one after a cap rejection. Claimed on BOTH
+    // branches: a replay against a KNOWN machine still mints a fresh agent
+    // JWT, which is the credential worth protecting.
+    state
+        .used_tokens
+        .claim(&claims.jti, "agent-enroll")
+        .await
+        .map_err(|_| {
+            ApiError::Unauthorized("This enrollment token has already been used".into())
+        })?;
+
     let agent = match existing {
         Some(a) => {
             let id =
@@ -137,19 +168,6 @@ pub async fn enroll_agent(
                 .await?
         }
         None => {
-            // S5 — plan device cap. Only a NEW row consumes a slot; a
-            // known machine rehydrates in place above regardless of the
-            // cap (re-enrolling your existing fleet must never brick).
-            let tenant = state.tenants.base.find_by_id(tid).await?;
-            let max = tenant.plan.limits().max_devices as u64;
-            let used = state.agents.count_active_for_tenant(tid).await?;
-            if used >= max {
-                return Err(ApiError::Forbidden(format!(
-                    "Device limit reached for the {:?} plan ({used} of {max} devices used). \
-                     Upgrade the plan or remove a device first.",
-                    tenant.plan
-                )));
-            }
             state
                 .agents
                 .create(

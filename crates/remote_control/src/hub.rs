@@ -1105,6 +1105,31 @@ impl Hub {
     /// `TcpClosed` / `TunnelTerminate` to the agent on behalf of a
     /// connected tunnel-client. Distinct from the remote-control
     /// session flow which goes through `dispatch`.
+    /// Multi-org — send to an agent ONLY when it is registered here under
+    /// `tenant_id`. `Err(AgentOffline)` when this pod doesn't hold it.
+    ///
+    /// The tenant re-check is what makes the cross-pod ctrl fan-out safe:
+    /// that envelope carries a live enrollment token, and every pod applies
+    /// it, so a mismatched (or forged) envelope must not be able to hand
+    /// another tenant's agent a token for an org it was never meant to join.
+    pub fn send_to_agent_in_tenant(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        let registered_tenant = self
+            .inner
+            .agents
+            .get(&agent_id)
+            .map(|a| a.tenant_id)
+            .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+        if registered_tenant != tenant_id {
+            return Err(Error::AgentOffline(agent_id.to_hex()));
+        }
+        self.send_to_agent(agent_id, msg)
+    }
+
     pub fn send_to_agent(&self, agent_id: ObjectId, msg: ServerMsg) -> Result<()> {
         let tx = self.agent_tx(agent_id)?;
         tx.try_send(msg).map_err(|e| match e {

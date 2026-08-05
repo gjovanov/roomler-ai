@@ -449,15 +449,28 @@ fn mux_systun_factory(org_key: String) -> Option<TunFactory> {
                 (dev, mux, true)
             }
         };
-        // A later org's self address (its block's connected route rides the
-        // assignment). The creator's own address came up with the device;
-        // add_address_sync is idempotent, so only skip the exact create
-        // params to avoid a pointless netsh round-trip.
+        // Claim the block FIRST. A REFUSED registration (another org already
+        // holds this block) must not leave an address on the adapter — field
+        // 2026-08-05 left three of them behind across the fleet, addresses
+        // nothing answered on, which is exactly the litter that makes a
+        // later diagnosis lie.
+        let port = mux.register(&org_key, ip, nm)?;
+        // Then the org's own address: its block's connected route rides the
+        // assignment. The creator's address came up with the device;
+        // add_address_sync is idempotent, so skipping the create params only
+        // avoids a pointless netsh round-trip.
         if !fresh {
             let prefix = u32::from(nm).count_ones() as u8;
-            dev.add_address_sync(ip, prefix)?;
+            if let Err(e) = dev.add_address_sync(ip, prefix) {
+                // Roll the claim back — a block held by an org with no
+                // address to receive on would refuse every later joiner.
+                if let Some((addr, plen)) = mux.deregister(&org_key) {
+                    dev.del_address_sync(addr, plen);
+                }
+                return Err(e);
+            }
         }
-        mux.register(&org_key, ip, nm).map(|p| p as Arc<dyn TunIo>)
+        Ok(port as Arc<dyn TunIo>)
     }))
 }
 #[cfg(not(feature = "overlay-l3"))]

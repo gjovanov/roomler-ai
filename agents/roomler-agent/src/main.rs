@@ -2253,6 +2253,102 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         )));
     }
 
+    // Multi-org — the same supervisor recipe as the boot loop above, but
+    // callable LATER: `rc:agent.join_org` appends an org at runtime and needs
+    // its loop up without a daemon restart. Everything captured here is a
+    // process-wide singleton (config path, write lock, shutdown signal,
+    // consent broker), so a join arriving hours from now produces a
+    // supervisor indistinguishable from one started at boot.
+    {
+        let shutdown = shutdown_rx.clone();
+        let broker = consent_broker.clone();
+        let registry = org_registry.clone();
+        let enc = encoder_preference;
+        let config_path_for_join = config_path.clone();
+        roomler_agent::org_join::install(roomler_agent::org_join::JoinRuntime {
+            config_path: config_path.clone(),
+            write_lock: cfg_write_lock.clone(),
+            spawn_org: Box::new(move |org: config::OrgEntry| {
+                let org_ctx = signaling::OrgCtx::secondary(&org.label);
+                let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let terminal = std::sync::Arc::new(std::sync::Mutex::new(None));
+                // Surface it in `roomler status` / the LocalAPI immediately,
+                // replacing any stale row for the same label.
+                if let Ok(mut rows) = registry.lock() {
+                    rows.retain(|r| r.label != org.label);
+                    rows.push(localapi_state::OrgRuntime {
+                        label: org.label.clone(),
+                        server_url: org.server_url.clone(),
+                        tenant_id: org.tenant_id.clone(),
+                        agent_id: org.agent_id.clone(),
+                        primary: false,
+                        enabled: org.enabled,
+                        connected: connected.clone(),
+                        terminal_error: terminal.clone(),
+                        updates_ignored: org_ctx.updates_ignored.clone(),
+                    });
+                }
+                // The per-org config is synthesized from the CURRENT on-disk
+                // config, so operator knobs (including `overlay_multi_org`)
+                // apply to the newcomer exactly as they do to boot-time orgs.
+                let base = match config::load(&config_path_for_join) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // The join already wrote this file, so a failure here
+                        // means something else broke it. Skip the spawn
+                        // rather than run an org on an invented config — the
+                        // entry is on disk and comes up at the next start.
+                        tracing::error!(
+                            org = %org.label, error = %format!("{e:#}"),
+                            "join: config reload failed; the new org connects at the next start"
+                        );
+                        if let Ok(mut t) = terminal.lock() {
+                            *t = Some(format!("config reload failed: {e:#}"));
+                        }
+                        return;
+                    }
+                };
+                let org_cfg = base.for_org(&org);
+                let (org_view_tx, _rx) =
+                    tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+                let org_slot: signaling::RttSampleSlot = Default::default();
+                let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
+                    env!("CARGO_PKG_VERSION").to_string(),
+                );
+                let rx = shutdown.clone();
+                let broker = broker.clone();
+                let span = tracing::info_span!("org", label = %org.label);
+                tokio::spawn(tracing::Instrument::instrument(
+                    async move {
+                        match signaling::run(
+                            org_ctx,
+                            org_cfg,
+                            enc,
+                            rx,
+                            connected,
+                            org_view_tx,
+                            org_slot,
+                            broker,
+                            org_hub,
+                        )
+                        .await
+                        {
+                            Ok(()) => tracing::info!("joined-org signaling loop ended (shutdown)"),
+                            Err(e) => {
+                                let chain = format!("{e:#}");
+                                tracing::error!(error = %chain, "joined-org signaling loop terminated");
+                                if let Ok(mut t) = terminal.lock() {
+                                    *t = Some(chain);
+                                }
+                            }
+                        }
+                    },
+                    span,
+                ));
+            }),
+        });
+    }
+
     let sig_task = tokio::spawn({
         let rx = shutdown_rx.clone();
         let connected = localapi_connected.clone();
