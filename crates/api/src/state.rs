@@ -820,6 +820,9 @@ impl AppState {
         // singleton per cycle via the same DB-name-scoped claim pattern.
         // No-op task when `stats.enabled=false`.
         crate::stats_rollup::spawn_stats_rollup(state.clone());
+        // Stats PR-2 — per-pod mediasoup conference sampler (this pod's
+        // own rooms only; media ownership is single-pod per room).
+        crate::media_stats::spawn_media_sampler(state.clone());
 
         Ok(state)
     }
