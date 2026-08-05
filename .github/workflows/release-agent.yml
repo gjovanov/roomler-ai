@@ -1451,3 +1451,54 @@ jobs:
           echo "Dispatching post-release seed rehearsal for ${version}"
           gh workflow run release-agent.yml --ref master \
             -f version="${version}" -f publish_release=false
+
+  # ---------------------------------------------------------------------------
+  # 7. Bust the roomler.ai release cache.
+  #
+  #    `/api/{agent,tunnel,setup}/latest-release` is served from a per-pod,
+  #    in-process cache, so without this step a freshly published tag stays
+  #    invisible to the fleet for up to one TTL — and, with more than one pod,
+  #    non-deterministically so (which answer you get depends on which pod the
+  #    LB picked). Field repro 2026-08-04: agent-v0.3.0-rc.305 published 21:14
+  #    UTC, `roomlerd self-update` still reported rc.304 at 21:33 because both
+  #    pods had warmed their caches at 21:05.
+  #
+  #    One POST busts the whole cluster: the receiving pod refetches and fans
+  #    the same request out to every live peer over the C-1 control bus.
+  #    `expect_tag` makes the call meaningful rather than advisory — a pod only
+  #    reports ok once it can actually SEE the tag we just published (GitHub's
+  #    releases LIST endpoint trails release creation by a few seconds).
+  #
+  #    Deliberately non-blocking: the 15-minute cache TTL is the backstop, and
+  #    a transient prod blip must not mark an already-shipped release failed.
+  # ---------------------------------------------------------------------------
+  refresh-release-cache:
+    name: Refresh roomler.ai release cache
+    if: needs.validate-version.outputs.is_release == 'true'
+    needs: [validate-version, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: POST /api/releases/refresh
+        env:
+          TOKEN: ${{ secrets.ROOMLER_RELEASE_REFRESH_TOKEN }}
+          TAG: ${{ needs.validate-version.outputs.tag }}
+        run: |
+          set -uo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "::notice::ROOMLER_RELEASE_REFRESH_TOKEN unset (fork?); skipping cache refresh"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            body=$(curl -sS -m 90 -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              "https://roomler.ai/api/releases/refresh?expect_tag=${TAG}")
+            if [ "$(jq -r '.all_ok' <<<"$body" 2>/dev/null)" = "true" ]; then
+              jq . <<<"$body"
+              echo "Release cache refreshed on every live pod for ${TAG}"
+              exit 0
+            fi
+            echo "attempt ${attempt}: ${body:-<no response>}"
+            sleep 10
+          done
+          echo "::warning::release cache refresh did not confirm on every pod for ${TAG}; the cache TTL will heal it within 15 min"

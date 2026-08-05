@@ -515,6 +515,13 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::setup_release::setup_installer_proxy),
         );
 
+    // `/api/releases/refresh` — bearer-authenticated cache-bust called by
+    // the release workflows on every published tag. One HTTP call busts
+    // every pod (the receiving pod fans out over the C-1 bus), so a new
+    // release is visible fleet-wide in seconds instead of after one TTL.
+    let releases_routes =
+        Router::new().route("/refresh", axum::routing::post(routes::releases::refresh));
+
     // TURN credentials (user-scoped, no tenant prefix)
     let turn_routes = Router::new().route(
         "/credentials",
@@ -540,6 +547,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tunnel-client", public_tunnel_routes)
         .nest("/tunnel", public_tunnel_release_routes)
         .nest("/setup", public_setup_routes)
+        .nest("/releases", releases_routes)
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/log", log_routes)

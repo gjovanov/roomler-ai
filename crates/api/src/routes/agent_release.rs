@@ -14,12 +14,10 @@
 //!   - Stale-on-error: if GitHub is down, we serve the last cached
 //!     value rather than failing every agent's check simultaneously.
 //!
-//! Cache lifecycle: lazy + TTL. First request after a cold cache
-//! triggers a fetch; subsequent requests within `CACHE_TTL` return
-//! the cached payload without touching GitHub. On a fetch error
-//! after the TTL has expired we fall back to the stale value (with
-//! a warn-level log) to keep the field path working through
-//! upstream blips.
+//! Cache lifecycle: lazy + TTL, and shared with the tunnel + setup
+//! release routes — see [`crate::routes::releases`], which owns the
+//! cache itself and the `POST /api/releases/refresh` cache-bust the
+//! release workflows call on every tag push.
 //!
 //! No auth: agents call this endpoint before they have a session
 //! and pretty much all the data is already public anyway via
@@ -33,25 +31,9 @@ use axum::{
     response::Response,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use std::time::Duration;
 
-use crate::{error::ApiError, state::AppState};
-
-/// GitHub repo slug. A fork can override here without touching
-/// agents.
-const RELEASES_REPO: &str = "gjovanov/roomler-ai";
-
-/// Cache TTL — 1 hour. With agents on a 24h poll cadence (post-0.1.44)
-/// the back-pressure on this endpoint is dominated by the install
-/// burst right after a tag push, so any window > a few minutes
-/// effectively coalesces into one upstream call.
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
-
-/// Cap on releases we'll return — same per_page used by the agent's
-/// pre-proxy fetch path.
-const RELEASES_PER_PAGE: usize = 30;
+use crate::{error::ApiError, routes::releases, state::AppState};
 
 /// Subset of GitHub's release JSON the agent actually consults. We
 /// don't need authors, body, html_url, or hundreds of bytes of CI
@@ -86,26 +68,6 @@ pub struct AgentRelease {
     pub assets: Vec<AgentReleaseAsset>,
 }
 
-struct CacheEntry {
-    fetched_at: Instant,
-    payload: Vec<AgentRelease>,
-}
-
-/// Latest-release cache lives on AppState. Shared `Arc` so cloning
-/// AppState is cheap; `RwLock` so concurrent agent reads don't
-/// serialize through a mutex.
-pub struct LatestReleaseCache {
-    inner: RwLock<Option<CacheEntry>>,
-}
-
-impl LatestReleaseCache {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: RwLock::new(None),
-        })
-    }
-}
-
 /// `GET /api/agent/latest-release` — returns the cached releases
 /// list. No auth.
 ///
@@ -115,49 +77,8 @@ impl LatestReleaseCache {
 pub async fn latest_release(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentRelease>>, ApiError> {
-    let cache = state.latest_release_cache.clone();
-
-    // Fast path: serve a fresh cache without any upstream call.
-    {
-        let g = cache.inner.read().await;
-        if let Some(entry) = g.as_ref()
-            && entry.fetched_at.elapsed() < CACHE_TTL
-        {
-            return Ok(Json(filter_component_releases(
-                entry.payload.clone(),
-                "agent-v",
-            )));
-        }
-    }
-
-    // Slow path: TTL expired (or cold cache). Refetch from GitHub.
-    match fetch_releases().await {
-        Ok(releases) => {
-            let mut g = cache.inner.write().await;
-            *g = Some(CacheEntry {
-                fetched_at: Instant::now(),
-                payload: releases.clone(),
-            });
-            Ok(Json(filter_component_releases(releases, "agent-v")))
-        }
-        Err(e) => {
-            // Stale-on-error: if we have any prior payload, serve
-            // it instead of breaking every agent's check on a
-            // single GitHub blip. Log so the operator can see
-            // upstream is unhappy.
-            tracing::warn!(error = %e, "GitHub releases fetch failed; serving stale cache if any");
-            let g = cache.inner.read().await;
-            if let Some(entry) = g.as_ref() {
-                return Ok(Json(filter_component_releases(
-                    entry.payload.clone(),
-                    "agent-v",
-                )));
-            }
-            Err(ApiError::Internal(format!(
-                "upstream releases fetch failed and no cache: {e}"
-            )))
-        }
-    }
+    let releases = releases::cached(&state).await?;
+    Ok(Json(filter_component_releases(releases, "agent-v")))
 }
 
 /// Keep only non-draft releases whose tag starts with `prefix` (`agent-v` /
@@ -239,7 +160,7 @@ pub async fn installer_health(
     Query(params): Query<InstallerQuery>,
 ) -> Result<Json<InstallerHealth>, ApiError> {
     let normalised = normalise_flavour(&flavour)?;
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     let release = pick_release(&releases, &params.version).ok_or_else(|| {
         ApiError::NotFound(format!("no release matching version={}", params.version))
     })?;
@@ -269,7 +190,7 @@ pub async fn installer_proxy(
     Query(params): Query<InstallerQuery>,
 ) -> Result<Response, ApiError> {
     let normalised = normalise_flavour(&flavour)?;
-    let releases = ensure_releases_cached(&state).await?;
+    let releases = releases::cached(&state).await?;
     let release = pick_release(&releases, &params.version).ok_or_else(|| {
         ApiError::NotFound(format!("no release matching version={}", params.version))
     })?;
@@ -384,41 +305,6 @@ pub fn pick_installer_asset<'a>(
             _ => false,
         }
     })
-}
-
-/// Ensure the release cache is populated and fresh. Reuses the same
-/// fast-path / slow-path / stale-on-error semantics as
-/// [`latest_release`].
-async fn ensure_releases_cached(state: &AppState) -> Result<Vec<AgentRelease>, ApiError> {
-    let cache = state.latest_release_cache.clone();
-    {
-        let g = cache.inner.read().await;
-        if let Some(entry) = g.as_ref()
-            && entry.fetched_at.elapsed() < CACHE_TTL
-        {
-            return Ok(entry.payload.clone());
-        }
-    }
-    match fetch_releases().await {
-        Ok(releases) => {
-            let mut g = cache.inner.write().await;
-            *g = Some(CacheEntry {
-                fetched_at: Instant::now(),
-                payload: releases.clone(),
-            });
-            Ok(releases)
-        }
-        Err(e) => {
-            let g = cache.inner.read().await;
-            if let Some(entry) = g.as_ref() {
-                tracing::warn!(error = %e, "GitHub releases fetch failed; serving stale cache");
-                return Ok(entry.payload.clone());
-            }
-            Err(ApiError::Internal(format!(
-                "upstream releases fetch failed and no cache: {e}"
-            )))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -579,24 +465,4 @@ mod tests {
             "evilinjection.msi"
         );
     }
-}
-
-async fn fetch_releases() -> anyhow::Result<Vec<AgentRelease>> {
-    let url = format!(
-        "https://api.github.com/repos/{RELEASES_REPO}/releases?per_page={RELEASES_PER_PAGE}"
-    );
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("GitHub returned {}", resp.status());
-    }
-    let releases: Vec<AgentRelease> = resp.json().await?;
-    Ok(releases)
 }
