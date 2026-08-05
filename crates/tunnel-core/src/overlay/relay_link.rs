@@ -136,7 +136,13 @@ struct Allocated {
 
 /// Drives the relay handshake for every peer the node wants to reach.
 pub struct RelayCoordinator {
-    outbound: tokio::sync::mpsc::Sender<ClientMsg>,
+    /// rc.307 (B) — swappable: the runtime outlives control-WS sessions and
+    /// re-binds this on every `Reattach`, so relay re-requests after a
+    /// reconnect ride the fresh session without rebuilding the coordinator.
+    outbound: crate::overlay::runtime::ControlTx,
+    /// rc.307 (B) — detached-mode log damper: `true` after the first failed
+    /// control send, cleared by the first success (post-reattach).
+    warned_detached: bool,
     /// Requested (and maybe granted), not yet allocated.
     pending: HashMap<ObjectId, PendingPeer>,
     /// Allocated + advertised; awaiting the peer's relayed address.
@@ -230,14 +236,20 @@ pub struct RelayCoordinator {
 
 impl RelayCoordinator {
     pub fn new(
-        outbound: tokio::sync::mpsc::Sender<ClientMsg>,
+        // rc.307 (B): `impl Into<ControlTx>` keeps the ~14 test call sites
+        // (bare mpsc senders) source-compatible; PRODUCTION passes the
+        // runtime's shared `ControlTx` CLONE so a `Reattach` swap propagates
+        // here — a coordinator wrapping its own private sender would never
+        // see it.
+        outbound: impl Into<crate::overlay::runtime::ControlTx>,
         my_public_key: [u8; 32],
         my_udp_relay_ok: bool,
         lan_endpoints: Vec<String>,
         derp_mux: Option<Arc<DerpMux>>,
     ) -> Self {
         Self {
-            outbound,
+            outbound: outbound.into(),
+            warned_detached: false,
             pending: HashMap::new(),
             allocated: HashMap::new(),
             advertised: HashMap::new(),
@@ -449,9 +461,29 @@ impl RelayCoordinator {
         RelayStrategy::BothAllocate
     }
 
+    /// rc.307 (B) — the control-WS died between a relay REQUEST and its
+    /// GRANT: the grant is gone forever, and `is_tracking` (pending counts)
+    /// would dedupe every later request for the pair — a permanent park now
+    /// that the coordinator OUTLIVES sessions. Called from the runtime's
+    /// `Reattach` arm; the next netmap/sweep re-requests cleanly. Entries
+    /// WITH creds are left alone — those have an (in-flight or complete)
+    /// allocation the alloc-queue epoch guard already owns.
+    pub fn forget_ungranted_pending(&mut self) -> usize {
+        let stale: Vec<ObjectId> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.ice.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &stale {
+            self.pending.remove(id);
+        }
+        stale.len()
+    }
+
     /// LAN endpoints ∪ every current relay address — the full candidate set the
     /// server should store (it replaces on each trickle, so LAN must be here).
-    fn all_endpoints(&self) -> Vec<String> {
+    pub(crate) fn all_endpoints(&self) -> Vec<String> {
         let mut eps = self.lan_endpoints.clone();
         eps.extend(self.advertised.values().cloned());
         eps
@@ -507,9 +539,16 @@ impl RelayCoordinator {
             .await
             .is_err()
         {
-            warn!(peer = %node_id, "overlay relay: control channel closed; cannot request");
+            // rc.307 (B): while DETACHED (session died, reattach pending)
+            // the 5 s sweep hits this for every relay peer every tick — log
+            // the transition once, not thousands of lines per outage.
+            if !self.warned_detached {
+                self.warned_detached = true;
+                warn!(peer = %node_id, "overlay relay: control channel closed; requests paused until reattach");
+            }
             return;
         }
+        self.warned_detached = false;
         self.roles.insert(node_id, strat);
         self.pending.insert(
             node_id,
