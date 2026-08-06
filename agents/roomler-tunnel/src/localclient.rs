@@ -102,6 +102,303 @@ pub async fn ping(target: &str, timeout_ms: u64, prefer_v6: bool, json: bool) ->
     Ok(())
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Fleet RPC — `roomler exec` / `roomler diag`
+// ────────────────────────────────────────────────────────────────────────────
+
+/// One remote command's result, in the shape the printers want.
+struct RemoteRun {
+    node: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    truncated: bool,
+    duration_ms: u64,
+    error: Option<String>,
+}
+
+/// Ask the local daemon to run `command` on `node` and wait for the answer.
+async fn run_remote(node: &str, shell: &str, command: &str, timeout_ms: u64) -> Result<RemoteRun> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let req = localapi::Request::ExecRemote {
+        node: node.to_string(),
+        shell: shell.to_string(),
+        command: command.to_string(),
+        timeout_ms,
+    };
+    match client.request(&req).await.map_err(|e| anyhow!("{e}"))? {
+        localapi::Response::ExecResult {
+            node,
+            exit_code,
+            stdout,
+            stderr,
+            truncated,
+            duration_ms,
+            error,
+            ..
+        } => Ok(RemoteRun {
+            node,
+            exit_code,
+            stdout,
+            stderr,
+            truncated,
+            duration_ms,
+            error,
+        }),
+        localapi::Response::Error { message } => Err(anyhow!("{message}")),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// `roomler exec <device> -- <command…>`
+///
+/// Exit status mirrors the remote command's, so this composes in a script:
+/// a refused or failed command is a non-zero exit here too, never a silent 0.
+pub async fn exec(
+    device: &str,
+    shell: &str,
+    command: &str,
+    timeout_ms: u64,
+    json: bool,
+) -> Result<()> {
+    let run = run_remote(device, shell, command, timeout_ms).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "node": run.node,
+                "exit_code": run.exit_code,
+                "stdout": run.stdout,
+                "stderr": run.stderr,
+                "truncated": run.truncated,
+                "duration_ms": run.duration_ms,
+                "error": run.error,
+            })
+        );
+    } else {
+        print!("{}", run.stdout);
+        if !run.stderr.is_empty() {
+            eprint!("{}", run.stderr);
+        }
+        if run.truncated {
+            eprintln!("[output truncated at the device's limit]");
+        }
+        if let Some(e) = &run.error {
+            eprintln!("{}: {e}", run.node);
+        }
+    }
+    // `error` set = never ran (a gate said no, offline, timed out). 1 is the
+    // conventional "didn't work"; a real exit code passes straight through.
+    match (run.error.is_some(), run.exit_code) {
+        (true, _) => std::process::exit(1),
+        (false, Some(0)) | (false, None) => Ok(()),
+        (false, Some(code)) => std::process::exit(code),
+    }
+}
+
+/// A named section of a diagnostic bundle.
+struct BundleSection {
+    title: &'static str,
+    command: &'static str,
+}
+
+/// The Windows evidence set for "why is this pair not direct?".
+///
+/// Everything here is READ-ONLY — a bundle must be safe to run on a
+/// production host without a second thought.
+const WINDOWS_BUNDLE: &[BundleSection] = &[
+    BundleSection {
+        title: "adapters",
+        command: "Get-NetAdapter | Sort-Object ifIndex | Format-Table -Auto ifIndex,Name,Status,LinkSpeed,InterfaceDescription | Out-String -Width 200",
+    },
+    BundleSection {
+        title: "addresses",
+        command: "Get-NetIPAddress -AddressFamily IPv4 | Format-Table -Auto ifIndex,IPAddress,PrefixLength,InterfaceAlias | Out-String -Width 200",
+    },
+    BundleSection {
+        title: "routes (lowest metric first)",
+        command: "Get-NetRoute -AddressFamily IPv4 | Sort-Object RouteMetric | Select-Object -First 25 | Format-Table -Auto DestinationPrefix,NextHop,RouteMetric,ifIndex | Out-String -Width 200",
+    },
+    BundleSection {
+        title: "firewall profiles",
+        command: "Get-NetFirewallProfile | Format-Table -Auto Name,Enabled,DefaultInboundAction,DefaultOutboundAction | Out-String -Width 200",
+    },
+    BundleSection {
+        title: "firewall rules mentioning roomler",
+        command: "Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*oomler*' } | Format-Table -Auto DisplayName,Enabled,Direction,Action,Profile | Out-String -Width 200",
+    },
+    BundleSection {
+        title: "udp dynamic port range",
+        command: "netsh int ipv4 show dynamicport udp",
+    },
+    BundleSection {
+        title: "udp excluded port ranges (Hyper-V/WSL reservations)",
+        command: "netsh int ipv4 show excludedportrange protocol=udp",
+    },
+    BundleSection {
+        title: "overlay peers",
+        command: "& \"$env:ProgramFiles\\Roomler\\roomler.exe\" peers 2>&1 | Out-String -Width 200",
+    },
+    BundleSection {
+        title: "node status",
+        command: "& \"$env:ProgramFiles\\Roomler\\roomler.exe\" status 2>&1 | Out-String -Width 200",
+    },
+];
+
+/// The Linux/macOS evidence set. Same questions, different tools; also
+/// strictly read-only.
+const UNIX_BUNDLE: &[BundleSection] = &[
+    BundleSection {
+        title: "addresses",
+        command: "ip -br addr 2>/dev/null || ifconfig",
+    },
+    BundleSection {
+        title: "routes",
+        command: "ip route 2>/dev/null || netstat -rn",
+    },
+    BundleSection {
+        title: "routes (v6)",
+        command: "ip -6 route 2>/dev/null || true",
+    },
+    BundleSection {
+        title: "firewall",
+        command: "(nft list ruleset 2>/dev/null | head -40) || (iptables -S 2>/dev/null | head -40) || echo 'no nft/iptables visible'",
+    },
+    BundleSection {
+        title: "overlay peers",
+        command: "roomler peers 2>&1 || /usr/bin/roomler peers 2>&1",
+    },
+    BundleSection {
+        title: "node status",
+        command: "roomler status 2>&1 || /usr/bin/roomler status 2>&1",
+    },
+    BundleSection {
+        title: "recent overlay log lines",
+        command: "journalctl -u roomler -n 400 --no-pager 2>/dev/null | grep -iE 'overlay|carrier|relay' | tail -30 || echo 'no journal access'",
+    },
+];
+
+/// Marker the bundle prints between sections, so one exec can carry the whole
+/// set and the client can split it apart. Chosen to be something no diagnostic
+/// output produces on its own.
+const SECTION_MARK: &str = "===ROOMLER-DIAG-SECTION===";
+
+/// Detect the target's family with ONE cheap round trip.
+///
+/// `echo $env:OS` is valid in both shells and disambiguates them: PowerShell
+/// expands `$env:OS` to `Windows_NT`, while bash sees an unset `$env` followed
+/// by the literal `:OS`. Cheaper and more reliable than trying to run `uname`
+/// under PowerShell, and it needs no OS field on the wire.
+async fn detect_windows(node: &str) -> Result<bool> {
+    let run = run_remote(node, "", "echo $env:OS", 15_000).await?;
+    if let Some(e) = run.error {
+        return Err(anyhow!("{node}: {e}"));
+    }
+    Ok(run.stdout.contains("Windows_NT"))
+}
+
+/// `roomler diag host|pair` — run the canned bundle on each device and print
+/// the sections.
+///
+/// The bundle lives HERE, in the CLI, not in the agent: a new probe is then a
+/// CLI release rather than a fleet-wide agent rollout, which is the whole
+/// reason this shipped as free-form exec first.
+pub async fn diag_bundle(devices: &[String], json: bool) -> Result<()> {
+    let mut all = Vec::new();
+    for device in devices {
+        let is_windows = detect_windows(device).await?;
+        let sections = if is_windows {
+            WINDOWS_BUNDLE
+        } else {
+            UNIX_BUNDLE
+        };
+        // One exec per host, not one per section: the round trips dominate,
+        // and a single command keeps the whole bundle atomic in time — two
+        // halves of a route table captured 5 s apart can disagree.
+        let script = sections
+            .iter()
+            .map(|s| {
+                if is_windows {
+                    format!("Write-Output '{SECTION_MARK}{}'; {}", s.title, s.command)
+                } else {
+                    format!("echo '{SECTION_MARK}{}'; {}", s.title, s.command)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let run = run_remote(device, "", &script, 120_000).await?;
+        all.push((device.clone(), run));
+    }
+
+    if json {
+        let payload: Vec<serde_json::Value> = all
+            .iter()
+            .map(|(device, run)| {
+                serde_json::json!({
+                    "device": device,
+                    "error": run.error,
+                    "duration_ms": run.duration_ms,
+                    "truncated": run.truncated,
+                    "sections": split_sections(&run.stdout),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!(payload));
+        return Ok(());
+    }
+
+    for (device, run) in &all {
+        println!("\n╔══ {device} ══════════════════════════════════════════");
+        if let Some(e) = &run.error {
+            println!("║ FAILED: {e}");
+            continue;
+        }
+        for (title, body) in split_sections(&run.stdout) {
+            println!("║\n║ ── {title} ──");
+            for line in body.lines() {
+                println!("║ {line}");
+            }
+        }
+        if run.truncated {
+            println!("║ [output truncated at the device's limit]");
+        }
+        if !run.stderr.is_empty() {
+            println!("║\n║ ── stderr ──");
+            for line in run.stderr.lines() {
+                println!("║ {line}");
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// Split a bundle's combined output back into `(title, body)` pairs on the
+/// section marker. Pure — unit-tested without a daemon.
+fn split_sections(out: &str) -> Vec<(String, String)> {
+    let mut sections = Vec::new();
+    let mut title: Option<String> = None;
+    let mut body = String::new();
+    for line in out.lines() {
+        if let Some(rest) = line.trim().strip_prefix(SECTION_MARK) {
+            if let Some(t) = title.take() {
+                sections.push((t, std::mem::take(&mut body)));
+            }
+            title = Some(rest.to_string());
+            continue;
+        }
+        if title.is_some() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(t) = title {
+        sections.push((t, body));
+    }
+    sections
+}
+
 /// `roomler forward --daemon --agent <node> --local L --remote R` — ask the
 /// LOCAL daemon to open + supervise a static forward over its OWN agent WS
 /// (identity model b: no separate tunnel-client token — the pipe/socket ACL is
@@ -849,5 +1146,84 @@ mod tests {
         assert_eq!(short_id("0123456789abcdef0123"), "0123456789ab…");
         assert_eq!(opt::<&str>(None), "—");
         assert_eq!(opt(Some("x")), "x");
+    }
+
+    // ─── Fleet-RPC diag bundle ───────────────────────────────────────
+
+    #[test]
+    fn splits_a_bundle_into_sections() {
+        let out = format!(
+            "{SECTION_MARK}adapters\neth0 UP\nwlan0 DOWN\n{SECTION_MARK}routes\ndefault via 1.1.1.1\n"
+        );
+        let sections = split_sections(&out);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, "adapters");
+        assert_eq!(sections[0].1, "eth0 UP\nwlan0 DOWN\n");
+        assert_eq!(sections[1].0, "routes");
+        assert_eq!(sections[1].1, "default via 1.1.1.1\n");
+    }
+
+    #[test]
+    fn preamble_before_the_first_marker_is_dropped() {
+        // PowerShell profiles and shell rc files love printing banners. They
+        // belong to no section, and attributing them to the first one would
+        // quietly corrupt the evidence.
+        let out = format!("Windows PowerShell\nCopyright (c)\n{SECTION_MARK}routes\n0.0.0.0/0\n");
+        let sections = split_sections(&out);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, "routes");
+        assert_eq!(sections[0].1, "0.0.0.0/0\n");
+    }
+
+    #[test]
+    fn an_empty_section_still_appears() {
+        // "the firewall has no roomler rules" is a FINDING, not a missing
+        // section — dropping it would read as "we didn't check".
+        let out =
+            format!("{SECTION_MARK}firewall rules mentioning roomler\n{SECTION_MARK}routes\nx\n");
+        let sections = split_sections(&out);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, "firewall rules mentioning roomler");
+        assert_eq!(sections[0].1, "");
+    }
+
+    #[test]
+    fn output_with_no_markers_yields_nothing() {
+        assert!(split_sections("just some output\n").is_empty());
+        assert!(split_sections("").is_empty());
+    }
+
+    #[test]
+    fn bundles_are_read_only() {
+        // A bundle must be safe to run unthinkingly on a production node —
+        // three of the fleet's Linux hosts are live k8s cluster members.
+        // This is a coarse guard, not a sandbox, but it catches the obvious
+        // slip of pasting a mutating command into the evidence set.
+        const FORBIDDEN: &[&str] = &[
+            "Stop-Service",
+            "Restart-Service",
+            "Set-Net",
+            "New-Net",
+            "Remove-",
+            "systemctl stop",
+            "systemctl restart",
+            "pkill",
+            "kill -",
+            "reboot",
+            "shutdown",
+            " rm ",
+            "iptables -A",
+            "iptables -I",
+            "nft add",
+        ];
+        for section in WINDOWS_BUNDLE.iter().chain(UNIX_BUNDLE.iter()) {
+            for bad in FORBIDDEN {
+                assert!(
+                    !section.command.contains(bad),
+                    "bundle section {:?} contains a mutating command {bad:?}",
+                    section.title
+                );
+            }
+        }
     }
 }
