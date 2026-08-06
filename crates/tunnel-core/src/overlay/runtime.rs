@@ -370,9 +370,14 @@ struct Installed {
     /// dst or the accepted peer's observed src; relay: the peer's relayed
     /// address).
     carrier_dst: Option<std::net::SocketAddr>,
-    /// rc.276 diagnostics — relay flavor label for the peers view (`"turn"` /
-    /// `"derp"`). `None` for direct carriers.
-    relay_kind_dbg: Option<&'static str>,
+    /// Which relay flavour this carrier is; `None` for direct carriers.
+    ///
+    /// Started life (rc.276) as a `&'static str` label purely for the peers
+    /// view. It is now also LOAD-BEARING: the DERP regrade
+    /// ([`RelayCoordinator::derp_regrade_due`]) branches on it, so it is typed —
+    /// a carrier decision must not hang off a debug string that a stray edit to
+    /// the display label could silently change.
+    relay_kind: Option<crate::overlay::relay_link::RelayKind>,
 }
 
 impl Installed {
@@ -396,7 +401,7 @@ impl Installed {
             hs_done: false,
             carrier_local: None,
             carrier_dst: None,
-            relay_kind_dbg: None,
+            relay_kind: None,
             last_rtt_ms: None,
             last_rx_at: now,
             relay_local: None,
@@ -994,7 +999,7 @@ fn build_overlay_view(
                     tx: i.last_traffic.0,
                     rx: i.last_traffic.1,
                     last_rx_age_s: now.saturating_duration_since(i.last_rx_at).as_secs(),
-                    relay_kind: i.relay_kind_dbg.map(str::to_string),
+                    relay_kind: i.relay_kind.map(|k| k.as_str().to_string()),
                     rx_denied: i.rx_denied,
                 }),
             }
