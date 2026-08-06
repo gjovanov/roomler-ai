@@ -268,6 +268,13 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder"
 
+      # The `roomler` CLI lives in the roomler-tunnel package and is now a .deb
+      # asset, so it has to exist before `cargo deb --no-build` runs. Without
+      # this the .deb shipped only the daemon and every upgrade left a stale
+      # CLI behind (field-caught 2026-08-06: rc.205 CLI vs rc.311 daemon).
+      - name: Build the roomler CLI (shipped in the .deb alongside roomlerd)
+        run: cargo build -p roomler-tunnel --release
+
       - name: Bundle FFmpeg into the .deb (self-contained, RPATH)
         run: |
           set -euo pipefail
