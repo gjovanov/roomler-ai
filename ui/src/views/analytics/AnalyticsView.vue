@@ -89,6 +89,22 @@
                 </v-card-text>
               </v-card>
             </v-col>
+            <v-col cols="12">
+              <v-card>
+                <v-card-title class="text-subtitle-1">
+                  Device uptime
+                  <span class="text-caption text-medium-emphasis ml-2">
+                    presence over the selected range
+                  </span>
+                </v-card-title>
+                <v-card-text>
+                  <uptime-strip
+                    :agents="machines?.uptime ?? []"
+                    empty-text="No presence transitions recorded in this range"
+                  />
+                </v-card-text>
+              </v-card>
+            </v-col>
           </v-row>
         </v-window-item>
 
@@ -201,6 +217,7 @@ import { useTenantStore } from '@/stores/tenant'
 import { useStatsStore, type SeriesPayload, type SeriesPoint } from '@/stores/stats'
 import { canQueryAnalytics } from '@/utils/permissions'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
+import UptimeStrip from '@/components/stats/UptimeStrip.vue'
 import RangePicker, { type StatsRange } from '@/components/stats/RangePicker.vue'
 
 const props = defineProps<{ tenantId: string }>()
