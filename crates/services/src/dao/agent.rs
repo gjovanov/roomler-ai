@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DisplayInfo, OsKind,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DisplayInfo, ExecPolicy, OsKind,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -47,6 +47,9 @@ impl AgentDao {
             displays: Vec::new(),
             capabilities: AgentCaps::default(),
             access_policy: AccessPolicy::default(),
+            // Fleet RPC off on a new device — enabling it is a deliberate
+            // admin act, never a side effect of enrollment.
+            exec_policy: ExecPolicy::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
@@ -315,6 +318,25 @@ impl AgentDao {
             .update_one(
                 doc! { "_id": agent_id, "tenant_id": tenant_id },
                 doc! { "$set": { "access_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// Replace the device's Fleet-RPC policy (gate 3). A `MANAGE_AGENTS`
+    /// admin action, deliberately separate from `update_access_policy`:
+    /// "may watch your screen" and "may run a root shell" must never be
+    /// reachable through the same call.
+    pub async fn update_exec_policy(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        policy: &ExecPolicy,
+    ) -> DaoResult<bool> {
+        let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "exec_policy": policy_bson } },
             )
             .await
     }

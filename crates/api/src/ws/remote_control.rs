@@ -106,6 +106,10 @@ pub async fn handle_agent_socket(
     // P6 — an arbiter-capable agent serializes + fences concurrent input
     // itself; the hub then skips the P3 single-INPUT-holder downgrade.
     let input_arbiter = caps.input.iter().any(|c| c == "arbiter");
+    // Fleet RPC — distilled here so the Hub can refuse a pre-feature agent
+    // with 412 instead of pushing a frame it drops in its unknown-tag branch,
+    // which would leave the caller waiting out its whole deadline.
+    let supports_exec = caps.rpc.iter().any(|c| c == "exec");
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -113,6 +117,7 @@ pub async fn handle_agent_socket(
         os,
         max_sessions,
         input_arbiter,
+        supports_exec,
     );
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
@@ -318,6 +323,66 @@ pub async fn handle_agent_socket(
                                 handle_derp_ticket_request(&state, agent_id, &registered_tx).await;
                                 continue;
                             }
+                            // Fleet RPC. Rebinding through a `match` rather
+                            // than two `if let`s keeps `parsed` un-moved on
+                            // the fall-through path that still reaches the
+                            // Hub dispatch below.
+                            let parsed = match parsed {
+                                // A command's answer — resolve whoever is
+                                // parked on it. An unknown id is normal: that
+                                // caller already hit its deadline and gave up.
+                                ClientMsg::RpcResult {
+                                    request_id,
+                                    exit_code,
+                                    stdout,
+                                    stderr,
+                                    truncated,
+                                    duration_ms,
+                                    error,
+                                } => {
+                                    let delivered = state.rc_hub.deliver_exec_result(
+                                        &request_id,
+                                        roomler_ai_remote_control::models::ExecOutcome {
+                                            exit_code,
+                                            stdout,
+                                            stderr,
+                                            truncated,
+                                            duration_ms,
+                                            error,
+                                        },
+                                    );
+                                    if !delivered {
+                                        debug!(
+                                            %agent_id, %request_id,
+                                            "rc:rpc.result for an unknown request — caller gave up"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                // A device asking to run something on ANOTHER
+                                // device (`roomler exec`). Spawned: the
+                                // target's command can take minutes and this
+                                // is the REQUESTING agent's read loop.
+                                ClientMsg::RpcExecRequest {
+                                    request_id,
+                                    target,
+                                    shell,
+                                    command,
+                                    timeout_ms,
+                                } => {
+                                    let state = state.clone();
+                                    let reply_tx = registered_tx.clone();
+                                    tokio::spawn(async move {
+                                        handle_agent_exec_request(
+                                            &state, tenant_id, agent_id, request_id, target, shell,
+                                            command, timeout_ms, reply_tx,
+                                        )
+                                        .await;
+                                    });
+                                    continue;
+                                }
+                                other => other,
+                            };
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
                             // dispatch is a no-op for AgentHeartbeat (handled here);
                             // we still call dispatch so any future routing logic
@@ -509,6 +574,139 @@ pub async fn handle_agent_socket(
         debug!(%agent_id, "teardown skipped Offline+presence (newer connection owns the slot)");
     }
     info!(%agent_id, "remote-control agent WS disconnected");
+}
+
+/// Fleet RPC — a device asked to run a command on another device
+/// (`roomler exec`, whose CLI has no user credentials of its own and so goes
+/// through the daemon's already-authenticated agent WS).
+///
+/// Two things make this leg safe beyond the four normal gates:
+///
+/// * The acting principal is the ORIGINATING device's `owner_user_id`, never
+///   anything taken off the wire — so `EXEC_DEVICE` is still evaluated against
+///   a real person.
+/// * `ExecPolicy::can_originate` must be set on the origin device (checked in
+///   [`routes::agent_exec::authorize`]). Without it, one compromised laptop
+///   would inherit its owner's exec rights across the whole fleet.
+///
+/// Cross-tenant is impossible by construction: the target is resolved WITHIN
+/// `tenant_id`, which is this socket's own enrollment.
+#[allow(clippy::too_many_arguments)]
+async fn handle_agent_exec_request(
+    state: &AppState,
+    tenant_id: bson::oid::ObjectId,
+    origin_agent_id: bson::oid::ObjectId,
+    request_id: String,
+    target: String,
+    shell: String,
+    command: String,
+    timeout_ms: u64,
+    reply_tx: roomler_ai_remote_control::session::ClientTx,
+) {
+    use roomler_ai_remote_control::models::ExecOutcome;
+
+    let reply = |outcome: ExecOutcome| ServerMsg::RpcExecResponse {
+        request_id: request_id.clone(),
+        exit_code: outcome.exit_code,
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        truncated: outcome.truncated,
+        duration_ms: outcome.duration_ms,
+        error: outcome.error,
+    };
+    let fail = |msg: String| {
+        reply(ExecOutcome {
+            error: Some(msg),
+            ..Default::default()
+        })
+    };
+
+    // Resolve the origin's owner — the person whose permissions this runs
+    // under. A device whose row vanished mid-flight has no principal, so it
+    // gets nothing.
+    let origin = match state
+        .agents
+        .find_in_tenant(tenant_id, origin_agent_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = reply_tx.try_send(fail(format!("origin device unknown: {e}")));
+            return;
+        }
+    };
+
+    // Target by hex id, else by device name — an operator types `CORPLAP-1`,
+    // not an ObjectId.
+    let agent = match resolve_exec_target(state, tenant_id, &target).await {
+        Some(a) => a,
+        None => {
+            let _ = reply_tx.try_send(fail(format!("no device named {target:?} in this org")));
+            return;
+        }
+    };
+
+    // "<person> (via <device>)" — the consent prompt on the target names both
+    // the human accountable for the command and the box it came from.
+    let who = state
+        .users
+        .base
+        .find_by_id(origin.owner_user_id)
+        .await
+        .map(|u| u.display_name)
+        .unwrap_or_else(|_| origin.owner_user_id.to_hex());
+    let caller = crate::routes::agent_exec::Caller {
+        user_id: origin.owner_user_id,
+        display: format!("{who} (via {})", origin.name),
+        origin_agent_id: Some(origin_agent_id),
+        source: "cli",
+    };
+    let body = crate::routes::agent_exec::ExecRequestBody {
+        shell,
+        command,
+        timeout_ms,
+        max_output_bytes: 0,
+        cwd: None,
+    };
+    let res = crate::routes::agent_exec::dispatch(state, tenant_id, &agent, &caller, &body).await;
+    if reply_tx.try_send(reply(res.outcome)).is_err() {
+        warn!(%origin_agent_id, %request_id, "rc:rpc.response undeliverable — origin WS gone");
+    }
+}
+
+/// Resolve an exec target within one org: hex agent id first, then an
+/// exact-then-case-insensitive device name.
+async fn resolve_exec_target(
+    state: &AppState,
+    tenant_id: bson::oid::ObjectId,
+    target: &str,
+) -> Option<roomler_ai_remote_control::models::Agent> {
+    if let Ok(oid) = bson::oid::ObjectId::parse_str(target)
+        && let Ok(a) = state.agents.find_in_tenant(tenant_id, oid).await
+    {
+        return Some(a);
+    }
+    let page = state
+        .agents
+        .list_for_tenant(
+            tenant_id,
+            &roomler_ai_services::dao::base::PaginationParams {
+                page: 1,
+                per_page: 500,
+                before: None,
+            },
+        )
+        .await
+        .ok()?;
+    page.items
+        .iter()
+        .find(|a| a.name == target)
+        .or_else(|| {
+            page.items
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(target))
+        })
+        .cloned()
 }
 
 /// Multi-region DERP: answer a ticket request. The ticket binds the agent's
@@ -1278,6 +1476,10 @@ pub(crate) fn error_code(e: &roomler_ai_remote_control::Error) -> &'static str {
         PermissionDenied(_) => "permission_denied",
         BadMessage(_) => "bad_message",
         SendFailed => "send_failed",
+        // Fleet RPC. Distinct codes because the operator actions differ:
+        // "update the agent" vs "the device stopped answering".
+        ExecUnsupported(_) => "exec_unsupported",
+        ExecTimeout(_) => "exec_timeout",
         Mongo(_) => "internal",
         Bson(_) => "internal",
         Json(_) => "internal",

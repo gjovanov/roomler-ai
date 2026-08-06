@@ -453,6 +453,12 @@ fn compute_caps() -> AgentCaps {
         // additional org from a pushed token, no restart). Build-independent:
         // the enroll + config paths are in every flavour.
         multi_org: vec!["join".into()],
+        // Fleet RPC — build-independent (the exec engine is std process
+        // spawning, no feature-gated backend). Advertising the capability
+        // says only "this agent understands the verbs": the org kill-switch,
+        // the device's ExecPolicy, and the agent's own `exec_enabled` config
+        // key all still have to say yes before anything runs.
+        rpc: vec!["exec".into(), "originate".into()],
     }
 }
 
