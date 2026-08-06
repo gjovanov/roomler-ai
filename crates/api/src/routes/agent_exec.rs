@@ -300,7 +300,11 @@ pub async fn dispatch(
 ) -> ExecResponse {
     let agent_id = agent.id.unwrap_or_default();
     let request_id = ObjectId::new().to_hex();
-    let shell = body.shell.trim().to_string();
+    // Resolve BEFORE the allowlist check, and send the resolved name on the
+    // wire, so the policy decision and the execution can never disagree about
+    // which shell ran. An empty request means "the host default", which the
+    // allowlist must be compared against by NAME — not as a literal "".
+    let shell = ExecPolicy::resolve_shell(&body.shell, agent.os);
     let timeout_ms = exec_limits::clamp_timeout_ms(body.timeout_ms);
     let max_output_bytes = exec_limits::clamp_output_bytes(body.max_output_bytes);
 
