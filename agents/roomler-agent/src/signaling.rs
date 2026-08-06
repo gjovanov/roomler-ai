@@ -946,13 +946,23 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             _ = heartbeat.tick() => {
-                // The borrow guard is dropped before the send await.
+                // The borrow guards are dropped before the send await.
                 let sys = sys_sampler.sample(&overlay_view_tx.borrow());
+                // NAT-traversal health. `None` only while the overlay runtime
+                // hasn't published a gather yet — once it has, a measured 0 is
+                // reported as 0, which is the value the server actually needs
+                // (it means this node can't hole-punch at all).
+                let srflx_count = overlay_view_tx
+                    .borrow()
+                    .srflx
+                    .as_ref()
+                    .map(|s| s.candidates.len().min(u8::MAX as usize) as u8);
                 let hb = ClientMsg::AgentHeartbeat {
                     rss_mb: sys.rss_mb,
                     cpu_pct: sys.cpu_pct,
                     active_sessions: peers.len().min(u8::MAX as usize) as u8,
                     sys: Some(sys),
+                    srflx_count,
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");

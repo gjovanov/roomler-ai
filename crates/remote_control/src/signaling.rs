@@ -235,6 +235,21 @@ pub enum ClientMsg {
         active_sessions: u8,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sys: Option<AgentSysStats>,
+        /// NAT-traversal health: how many server-reflexive candidates this
+        /// node currently advertises.
+        ///
+        /// `Some(0)` is the interesting value — it means the node cannot
+        /// hole-punch and every peer reads it as UDP-blocked, so all its pairs
+        /// degrade to the relay/DERP tier. That state existed **fleet-wide and
+        /// unnoticed** until 2026-08-06 because the only signals were `debug!`
+        /// log lines on each device; one server-side counter would have caught
+        /// it immediately. `None` = an agent that predates the field, which is
+        /// distinct from a measured zero.
+        ///
+        /// Additive agent→server, so no capability flag is needed (unlike a
+        /// `ServerMsg` a caller awaits).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        srflx_count: Option<u8>,
     },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
@@ -1840,6 +1855,7 @@ mod tests {
             cpu_pct: 3.25,
             active_sessions: 2,
             sys: None,
+            srflx_count: Some(2),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.heartbeat""#));
@@ -1856,11 +1872,13 @@ mod tests {
                 cpu_pct,
                 active_sessions,
                 sys,
+                srflx_count,
             } => {
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
                 assert!(sys.is_none());
+                assert_eq!(srflx_count, Some(2));
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1873,6 +1891,15 @@ mod tests {
         let v1 = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":1}"#;
         let back: ClientMsg = serde_json::from_str(v1).unwrap();
         assert!(matches!(back, ClientMsg::AgentHeartbeat { sys: None, .. }));
+        // A pre-feature agent omits the field entirely — that must decode as
+        // None ("not reported"), never as a measured Some(0).
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(v1).unwrap(),
+            ClientMsg::AgentHeartbeat {
+                srflx_count: None,
+                ..
+            }
+        ));
 
         let m = ClientMsg::AgentHeartbeat {
             rss_mb: 0,
@@ -1888,8 +1915,15 @@ mod tests {
                 derp: 1,
                 peer_rtt_ms: Some(42),
             }),
+            // The value that matters operationally: a measured ZERO must be
+            // distinguishable on the wire from an agent that doesn't report.
+            srflx_count: Some(0),
         };
         let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            s.contains(r#""srflx_count":0"#),
+            "a measured zero must serialise, not be skipped: {s}"
+        );
         assert!(s.contains(r#""net_rx_bytes":123456789"#));
         assert!(s.contains(r#""direct":3"#));
         assert!(s.contains(r#""peer_rtt_ms":42"#));
