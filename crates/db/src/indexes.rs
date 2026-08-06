@@ -400,6 +400,24 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Fleet-RPC audit log — 90-day retention, same posture as remote_audit /
+    // tunnel_audit. Every exec ATTEMPT lands here, allowed or denied, so the
+    // (tenant_id, at) index backs the org-wide "what ran on my fleet?" view
+    // and (agent_id, at) backs the per-device console history. The
+    // (tenant_id, user_id, at) entry answers "what did this person run?" —
+    // the question an incident review actually starts from.
+    create_indexes(
+        db,
+        "exec_audit",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "agent_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Centralized log batches (rc.58). 7-day TTL on `created_at` so
     // operators have a one-week diagnostic window. The compound
     // tenant+agent+created_at index drives the admin UI query "last N

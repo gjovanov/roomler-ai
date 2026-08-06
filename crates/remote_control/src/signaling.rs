@@ -199,7 +199,12 @@ pub enum ClientMsg {
         os: OsKind,
         agent_version: String,
         displays: Vec<DisplayInfo>,
-        caps: AgentCaps,
+        /// Boxed: `AgentCaps` is ~15 `Vec` fields and dominates the size of
+        /// the WHOLE `ClientMsg` enum — every message in every per-peer
+        /// channel (`PEER_OUTBOUND_CAP` slots each) was paying for it, though
+        /// only the once-per-connection hello carries one. Serde is
+        /// transparent through `Box`, so the wire format is unchanged.
+        caps: Box<AgentCaps>,
         /// Subnet CIDRs the agent advertises it can route for the tunnel mesh
         /// subnet-router (from its `advertise_routes` config). Admin-gated —
         /// stored as untrusted suggestions until approved into `Agent.routes`.
@@ -245,6 +250,52 @@ pub enum ClientMsg {
     /// list carrying a DERP endpoint, so an old server never receives it.
     #[serde(rename = "rc:relay.derp_ticket_request")]
     DerpTicketRequest {},
+
+    // ─── Fleet RPC (rc:rpc.*) ────────────────────────────────────────
+    /// Result of a [`ServerMsg::RpcExec`]. Always sent — a gate-4 refusal, a
+    /// timeout, or a cancel come back carrying `error` rather than as
+    /// silence, because a caller is blocked on this.
+    #[serde(rename = "rc:rpc.result")]
+    RpcResult {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// Redacted (agent token / `Bearer …` / JWT-shaped strings masked)
+        /// and capped at the request's `max_output_bytes`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        stdout: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        stderr: String,
+        /// Output hit the cap and was cut.
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        duration_ms: u64,
+        /// Set when the command never ran or was killed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Device-originated exec against ANOTHER device — the `roomler exec`
+    /// CLI leg, where the local daemon's own agent WS carries the request so
+    /// the CLI needs no user credentials of its own.
+    ///
+    /// The server resolves this device's `owner_user_id` as the acting
+    /// principal, requires that user to hold `EXEC_DEVICE`, and additionally
+    /// requires THIS device to be blessed with
+    /// [`crate::models::ExecPolicy::can_originate`] — otherwise a single
+    /// compromised laptop would inherit its owner's exec rights fleet-wide.
+    /// Answered with [`ServerMsg::RpcExecResponse`].
+    #[serde(rename = "rc:rpc.request")]
+    RpcExecRequest {
+        /// Client-minted correlation id, echoed on the response.
+        request_id: String,
+        /// Target device: an agent id (hex) or its device name.
+        target: String,
+        shell: String,
+        command: String,
+        timeout_ms: u64,
+    },
 
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
@@ -934,6 +985,76 @@ pub enum ServerMsg {
         overlay_mode: Option<String>,
     },
 
+    // ─── Fleet RPC (rc:rpc.*) ────────────────────────────────────────
+    /// Run one bounded shell command on this device and answer with
+    /// [`ClientMsg::RpcResult`].
+    ///
+    /// The server has already cleared gates 1–3 (org kill-switch, caller
+    /// permission, device [`crate::models::ExecPolicy`]) before this is sent;
+    /// the agent enforces gate 4 — its own `exec_enabled` config key — plus
+    /// consent and the execution bounds below. A gate-4 refusal comes back as
+    /// an `RpcResult` carrying `error`, never as silence.
+    ///
+    /// Unlike `Goodbye`/`UpdateNow`, this variant must NOT rely on the
+    /// unknown-tag debug branch: a caller is blocked on the answer, so
+    /// silence reads as a hang. The server gates on `AgentCaps.rpc`
+    /// containing `exec` and fails the request with `412` when it is absent.
+    #[serde(rename = "rc:rpc.exec")]
+    RpcExec {
+        /// Correlates with [`ClientMsg::RpcResult`]. Server-minted.
+        request_id: String,
+        /// `pwsh` | `powershell` | `cmd` on Windows; `bash` | `sh` elsewhere.
+        shell: String,
+        command: String,
+        /// Server-clamped wall-clock budget. The agent kills the whole
+        /// process tree when it expires.
+        timeout_ms: u64,
+        /// Server-clamped output ceiling across both streams combined.
+        max_output_bytes: u64,
+        /// Working directory; `None` ⇒ the daemon's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// Display name of the acting principal — shown in the consent prompt
+        /// and written to the agent's local log, so the person at the device
+        /// can see who asked.
+        caller: String,
+        /// Server-resolved consent directive from the device's
+        /// [`crate::models::ExecPolicy`], mirroring how [`Self::Request`]
+        /// carries `consent_mode` for a session. `Auto` runs immediately
+        /// (unattended servers); anything else prompts the person at the
+        /// device and denies on timeout. Absent ⇒ the agent prompts, because
+        /// the fail-safe direction for a gate that grants root is "ask".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent_mode: Option<crate::models::ConsentMode>,
+    },
+
+    /// Kill an in-flight [`Self::RpcExec`] and its whole process tree. The
+    /// agent still answers with an [`ClientMsg::RpcResult`] (carrying
+    /// `error`), so a cancelled caller is never left waiting.
+    #[serde(rename = "rc:rpc.cancel")]
+    RpcCancel { request_id: String },
+
+    /// Answer to a device-originated [`ClientMsg::RpcExecRequest`] — the
+    /// `roomler exec` CLI leg. Carries the same payload the HTTP caller would
+    /// have received, plus `error` for a gate refusal the server itself made.
+    #[serde(rename = "rc:rpc.response")]
+    RpcExecResponse {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        stdout: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        stderr: String,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        duration_ms: u64,
+        /// Set when the command never ran (gate refusal, offline, timeout).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     // ─── server → tunnel-client / agent (rc:tunnel.*) ────────────────
     /// Server → client: peer-channel is up. `dc_pool_size` confirms
     /// the negotiated DC pool size (8 in v1) so the client knows
@@ -1493,7 +1614,7 @@ mod tests {
             os: OsKind::Linux,
             agent_version: "0.3.0".into(),
             displays: vec![],
-            caps: AgentCaps::default(),
+            caps: Box::new(AgentCaps::default()),
             advertised_routes: vec!["192.168.1.0/24".into()],
             supports_relay_regions: true,
         };
@@ -2670,6 +2791,183 @@ mod tests {
             }
             other => panic!("expected UpdateNow, got {other:?}"),
         }
+    }
+
+    // ─── Fleet RPC wire locks ────────────────────────────────────────
+
+    #[test]
+    fn rpc_exec_roundtrip() {
+        let m = ServerMsg::RpcExec {
+            request_id: "r1".into(),
+            shell: "pwsh".into(),
+            command: "Get-NetRoute -AddressFamily IPv4".into(),
+            timeout_ms: 30_000,
+            max_output_bytes: 262_144,
+            cwd: None,
+            caller: "goran".into(),
+            consent_mode: Some(crate::models::ConsentMode::Auto),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:rpc.exec""#));
+        assert!(s.contains(r#""consent_mode":"auto""#));
+        // `cwd` omitted entirely when None — an older decoder must never see
+        // a null it has to special-case.
+        assert!(!s.contains("cwd"), "cwd must be omitted when None: {s}");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::RpcExec {
+                request_id,
+                shell,
+                timeout_ms,
+                max_output_bytes,
+                caller,
+                ..
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(shell, "pwsh");
+                assert_eq!(timeout_ms, 30_000);
+                assert_eq!(max_output_bytes, 262_144);
+                assert_eq!(caller, "goran");
+            }
+            other => panic!("expected RpcExec, got {other:?}"),
+        }
+
+        // An absent consent_mode must decode to None — which the agent reads
+        // as "prompt". The fail-safe direction for a gate that grants root is
+        // to ask, so a frame from an older/partial server can never be taken
+        // as blanket unattended approval.
+        let bare = r#"{"t":"rc:rpc.exec","request_id":"r2","shell":"bash",
+            "command":"id","timeout_ms":1000,"max_output_bytes":1024,"caller":"x"}"#;
+        match serde_json::from_str::<ServerMsg>(bare).unwrap() {
+            ServerMsg::RpcExec { consent_mode, .. } => assert_eq!(consent_mode, None),
+            other => panic!("expected RpcExec, got {other:?}"),
+        }
+
+        let c = ServerMsg::RpcCancel {
+            request_id: "r1".into(),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains(r#""t":"rc:rpc.cancel""#));
+        assert!(matches!(
+            serde_json::from_str::<ServerMsg>(&s).unwrap(),
+            ServerMsg::RpcCancel { .. }
+        ));
+    }
+
+    #[test]
+    fn rpc_result_roundtrip() {
+        let m = ClientMsg::RpcResult {
+            request_id: "r1".into(),
+            exit_code: Some(0),
+            stdout: "ok".into(),
+            stderr: String::new(),
+            truncated: false,
+            duration_ms: 12,
+            error: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:rpc.result""#));
+        // Empty streams + a None error stay off the wire: a fleet-wide
+        // heartbeat-rate message shouldn't carry three empty strings.
+        assert!(!s.contains("stderr"), "empty stderr must be omitted: {s}");
+        assert!(!s.contains("error"), "None error must be omitted: {s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::RpcResult {
+                exit_code,
+                stdout,
+                stderr,
+                error,
+                ..
+            } => {
+                assert_eq!(exit_code, Some(0));
+                assert_eq!(stdout, "ok");
+                assert_eq!(stderr, "");
+                assert_eq!(error, None);
+            }
+            other => panic!("expected RpcResult, got {other:?}"),
+        }
+
+        // A refusal / timeout carries `error` and no exit code — the shape a
+        // caller must be able to distinguish from "ran and exited 0".
+        let m = ClientMsg::RpcResult {
+            request_id: "r2".into(),
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            truncated: false,
+            duration_ms: 30_000,
+            error: Some("timed out after 30000ms".into()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::RpcResult {
+                exit_code, error, ..
+            } => {
+                assert_eq!(exit_code, None);
+                assert_eq!(error.as_deref(), Some("timed out after 30000ms"));
+            }
+            other => panic!("expected RpcResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpc_request_and_response_roundtrip() {
+        let m = ClientMsg::RpcExecRequest {
+            request_id: "c1".into(),
+            target: "CORPLAP-1".into(),
+            shell: "pwsh".into(),
+            command: "Get-NetAdapter".into(),
+            timeout_ms: 0,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:rpc.request""#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::RpcExecRequest { target, shell, .. } => {
+                assert_eq!(target, "CORPLAP-1");
+                assert_eq!(shell, "pwsh");
+            }
+            other => panic!("expected RpcExecRequest, got {other:?}"),
+        }
+
+        let r = ServerMsg::RpcExecResponse {
+            request_id: "c1".into(),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "boom".into(),
+            truncated: true,
+            duration_ms: 5,
+            error: None,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""t":"rc:rpc.response""#));
+        assert!(s.contains(r#""truncated":true"#));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::RpcExecResponse {
+                exit_code,
+                stderr,
+                truncated,
+                ..
+            } => {
+                assert_eq!(exit_code, Some(1));
+                assert_eq!(stderr, "boom");
+                assert!(truncated);
+            }
+            other => panic!("expected RpcExecResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpc_caps_absent_on_older_agents() {
+        // An agent that predates Fleet RPC sends no `rpc` key at all; the
+        // server must read that as "no exec capability" and refuse with 412
+        // rather than pushing a message into its unknown-tag debug branch.
+        let caps: crate::models::AgentCaps =
+            serde_json::from_str(r#"{"hw_encoders":[],"codecs":[],"has_input_permission":false,"supports_clipboard":false,"supports_file_transfer":false,"max_simultaneous_sessions":1}"#)
+                .unwrap();
+        assert!(caps.rpc.is_empty());
+
+        // And an empty list must not be serialised back onto the wire.
+        let s = serde_json::to_string(&caps).unwrap();
+        assert!(!s.contains("rpc"), "empty rpc caps must be omitted: {s}");
     }
 
     #[test]

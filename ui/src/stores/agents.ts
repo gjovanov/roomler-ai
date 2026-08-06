@@ -68,6 +68,12 @@ export interface AgentCapabilities {
    *  when this doesn't contain `'opus'`. Mirrors `AgentCaps.audio` in
    *  `crates/remote_control/src/models.rs`. */
   audio?: string[]
+  /** Fleet RPC. Known values: `'exec'` (honours rc:rpc.exec) and
+   *  `'originate'` (its LocalAPI can drive `roomler exec` at other
+   *  devices). Empty / unset on agents that predate the feature — the
+   *  console tells the operator to update the agent rather than letting
+   *  them send a frame it would silently drop. */
+  rpc?: string[]
   /** rc.NEXT — remote app selection & launch on virtual-desktop hosts.
    *  Known values: 'list', 'focus', 'launch'. Empty / unset on older
    *  agents or non-VD hosts — the browser hides the Apps menu. Mirrors
@@ -123,10 +129,91 @@ export interface Agent {
   advertised_routes?: string[]
   /** Optional because pre-2A.1 agents (and tests) may not include it. */
   capabilities?: AgentCapabilities
+  /** Fleet RPC gate 3. Absent on API bodies that predate the feature —
+   *  consumers must treat that as `mode: 'off'`, never as permissive. */
+  exec_policy?: ExecPolicy
   /** Multi-region relay PoPs: the agent's nearest relay region id (derived
    *  server-side from its STUN probe reports), e.g. "us-east". Absent/null =
    *  never probed or all probes timed out — the default region serves it. */
   relay_home?: string | null
+}
+
+/** Fleet RPC — whether a device accepts remote commands at all. Mirrors the
+ *  Rust `ExecMode`. Default `off` on every device, including every device
+ *  that existed before the feature. */
+export type ExecMode = 'off' | 'on'
+
+/** Fleet RPC gate 3 — the per-device execution policy.
+ *
+ *  Deliberately separate from {@link AccessPolicy}: that grants screen-view,
+ *  and "may watch your screen" must never be the same checkbox as "may run a
+ *  root shell". Commands inherit the daemon's identity — SYSTEM on a
+ *  perMachine Windows install, root under systemd — so turning `mode` on is
+ *  granting root on that device, which the dialog says in those words. */
+export interface ExecPolicy {
+  mode: ExecMode
+  /** May this device ORIGINATE commands against others (`roomler exec` from
+   *  its CLI)? Default false — without it, one compromised laptop would
+   *  inherit its owner's exec rights across the whole fleet. */
+  can_originate: boolean
+  allowed_user_ids: string[]
+  allowed_role_ids: string[]
+  /** Only `auto` (unattended) and `prompt` are honoured; the session-shaped
+   *  email/push modes collapse to `prompt`. `null` = prompt. */
+  consent_mode: ConsentMode | null
+  /** Empty = any shell the host supports. */
+  shells: string[]
+}
+
+/** One remote command's result. `exit_code: null` together with a non-null
+ *  `error` is how "never ran" (a gate refused, device offline, timed out)
+ *  is distinguished from "ran and exited 0". */
+export interface ExecResult {
+  request_id: string
+  agent_id: string
+  agent_name: string
+  exit_code: number | null
+  stdout: string
+  stderr: string
+  truncated: boolean
+  duration_ms: number
+  error: string | null
+}
+
+/** Why an attempt was refused; `null` on the audit row means it ran. */
+export type ExecDenyReason =
+  | 'org_disabled'
+  | 'no_permission'
+  | 'device_disabled'
+  | 'caller_not_allowed'
+  | 'shell_not_allowed'
+  | 'origin_not_allowed'
+  | 'unsupported'
+  | 'offline'
+  | 'consent_denied'
+  | 'rate_limited'
+  | 'agent_disabled'
+
+/** One row of the Fleet-RPC attempt log. Every attempt lands here, allowed
+ *  or denied — a refused exec is the interesting one. */
+export interface ExecAuditEntry {
+  id?: string
+  tenant_id: string
+  agent_id: string
+  user_id: string
+  origin_agent_id?: string | null
+  request_id: string
+  source: string
+  shell: string
+  command: string
+  at: string
+  exit_code?: number | null
+  duration_ms?: number | null
+  denied?: ExecDenyReason | null
+  output_sample?: string
+  output_sha256?: string
+  output_bytes?: number
+  truncated?: boolean
 }
 
 /** A tenant member as returned by `GET /tenant/{id}/member` — enough to populate
@@ -391,6 +478,95 @@ export const useAgentStore = defineStore('agents', () => {
     return resp.batches
   }
 
+  // ── Fleet RPC ────────────────────────────────────────────────────
+
+  /** Whether the ORG allows remote execution at all (gate 1). `null` until
+   *  fetched. Every device refuses while this is false, whatever its own
+   *  policy says — the console shows that as the reason rather than letting
+   *  an admin hunt through per-device settings. */
+  const orgExecEnabled = ref<boolean | null>(null)
+
+  async function fetchOrgExecEnabled(tenantId: string) {
+    try {
+      const resp = await api.get<{ remote_exec_enabled: boolean }>(
+        `/tenant/${tenantId}/exec-settings`,
+      )
+      orgExecEnabled.value = resp.remote_exec_enabled
+    } catch {
+      // A 403 here means "not an admin", not "disabled" — leave it unknown
+      // rather than claiming the org is off.
+      orgExecEnabled.value = null
+    }
+  }
+
+  /** Flip gate 1. MANAGE_TENANT server-side. */
+  async function setOrgExecEnabled(tenantId: string, enabled: boolean) {
+    const resp = await api.put<{ remote_exec_enabled: boolean }>(
+      `/tenant/${tenantId}/exec-settings`,
+      { remote_exec_enabled: enabled },
+    )
+    orgExecEnabled.value = resp.remote_exec_enabled
+  }
+
+  /** Replace a device's exec policy (gate 3). MANAGE_AGENTS server-side. */
+  async function updateExecPolicy(tenantId: string, agentId: string, policy: ExecPolicy) {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}/exec-policy`, policy)
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) agents.value[idx]!.exec_policy = policy
+  }
+
+  /** Run a command on one device.
+   *
+   *  Resolves even when the command was REFUSED — the server answers 200 with
+   *  `error` set, so the caller renders one shape and never has to guess
+   *  whether a rejection was a policy decision or a network failure. Only a
+   *  malformed request or a missing device throws. */
+  async function execOnAgent(
+    tenantId: string,
+    agentId: string,
+    body: { shell?: string; command: string; timeout_ms?: number },
+  ): Promise<ExecResult> {
+    return await api.post<ExecResult>(`/tenant/${tenantId}/agent/${agentId}/exec`, body)
+  }
+
+  /** Run one command across several devices. An empty `agentIds` means every
+   *  device in the org whose policy allows it. */
+  async function execOnFleet(
+    tenantId: string,
+    agentIds: string[],
+    body: { shell?: string; command: string; timeout_ms?: number },
+  ): Promise<ExecResult[]> {
+    const resp = await api.post<{ results: ExecResult[] }>(`/tenant/${tenantId}/agent/exec`, {
+      agent_ids: agentIds,
+      ...body,
+    })
+    return resp.results
+  }
+
+  /** Kill an in-flight command. The device still answers, so the pending
+   *  request resolves with an error rather than hanging. */
+  async function cancelExec(tenantId: string, agentId: string, requestId: string) {
+    await api.post(`/tenant/${tenantId}/agent/${agentId}/exec/${requestId}/cancel`, {})
+  }
+
+  /** The attempt log. `agentId` narrows to one device's console history;
+   *  `userId` answers "what did this person run?" — where an incident review
+   *  starts. VIEW_EXEC_AUDIT server-side. */
+  async function fetchExecAudit(
+    tenantId: string,
+    opts: { agentId?: string; userId?: string; page?: number; perPage?: number } = {},
+  ): Promise<{ items: ExecAuditEntry[]; total: number }> {
+    const q = new URLSearchParams()
+    if (opts.agentId) q.set('agent_id', opts.agentId)
+    if (opts.userId) q.set('user_id', opts.userId)
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: ExecAuditEntry[]; total: number }>(
+      `/tenant/${tenantId}/exec-audit?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
   return {
     agents,
     total,
@@ -412,5 +588,13 @@ export const useAgentStore = defineStore('agents', () => {
     deleteAgent,
     fetchCrashes,
     fetchLogs,
+    orgExecEnabled,
+    fetchOrgExecEnabled,
+    setOrgExecEnabled,
+    updateExecPolicy,
+    execOnAgent,
+    execOnFleet,
+    cancelExec,
+    fetchExecAudit,
   }
 })

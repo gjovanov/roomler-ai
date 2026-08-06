@@ -122,6 +122,11 @@
                     title="Agent logs"
                     @click="openLogs(a)"
                   />
+                  <v-list-item
+                    prepend-icon="mdi-console"
+                    title="Device console"
+                    @click="openConsole(a)"
+                  />
                   <v-list-subheader>Access</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-domain-plus"
@@ -132,6 +137,11 @@
                     prepend-icon="mdi-account-switch"
                     title="Reassign owner"
                     @click="openReassign(a)"
+                  />
+                  <v-list-item
+                    prepend-icon="mdi-shield-key-outline"
+                    title="Execution policy"
+                    @click="openExecPolicy(a)"
                   />
                   <v-list-subheader>Network</v-list-subheader>
                   <v-list-item
@@ -461,6 +471,11 @@
                     title="Agent logs"
                     @click="openLogs(a)"
                   />
+                  <v-list-item
+                    prepend-icon="mdi-console"
+                    title="Device console"
+                    @click="openConsole(a)"
+                  />
                   <v-list-subheader>Access</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-domain-plus"
@@ -471,6 +486,11 @@
                     prepend-icon="mdi-account-switch"
                     title="Reassign owner"
                     @click="openReassign(a)"
+                  />
+                  <v-list-item
+                    prepend-icon="mdi-shield-key-outline"
+                    title="Execution policy"
+                    @click="openExecPolicy(a)"
                   />
                   <v-list-subheader>Network</v-list-subheader>
                   <v-list-item
@@ -738,6 +758,22 @@
     :tenant-id="tenantId"
     :agent-id="logsTarget?.id ?? ''"
     :agent-name="logsTarget?.name ?? ''"
+  />
+
+  <!-- Fleet RPC — run a command on the device, and edit the policy that
+       decides whether anyone may. Both are guarded by `v-if` on the target
+       so a null agent can never reach a dialog that assumes one. -->
+  <DeviceConsoleDialog
+    v-if="consoleTarget"
+    v-model="consoleDialogOpen"
+    :tenant-id="tenantId"
+    :agent="consoleTarget"
+  />
+  <ExecPolicyDialog
+    v-if="execPolicyTarget"
+    v-model="execPolicyDialogOpen"
+    :tenant-id="tenantId"
+    :agent="execPolicyTarget"
   />
 
   <!-- S1a — Update-all confirmation -->
@@ -1010,6 +1046,8 @@ import {
 import { codecChips } from './agentCodecChips'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
+import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
+import ExecPolicyDialog from './ExecPolicyDialog.vue'
 import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 import {
   useOverlayRoutesStore,
@@ -1243,6 +1281,25 @@ const logsTarget = ref<Agent | null>(null)
 function openLogs(a: Agent) {
   logsTarget.value = a
   logsDialogOpen.value = true
+}
+
+// Fleet RPC — the device console and its policy editor. Same fetch-on-open
+// pattern as the dialogs above; the console additionally reads the ORG
+// kill-switch so it can explain a refusal before the operator types anything.
+const consoleDialogOpen = ref(false)
+const consoleTarget = ref<Agent | null>(null)
+
+function openConsole(a: Agent) {
+  consoleTarget.value = a
+  consoleDialogOpen.value = true
+}
+
+const execPolicyDialogOpen = ref(false)
+const execPolicyTarget = ref<Agent | null>(null)
+
+function openExecPolicy(a: Agent) {
+  execPolicyTarget.value = a
+  execPolicyDialogOpen.value = true
 }
 
 function osIcon(os: string) {

@@ -14,13 +14,13 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::audit::AuditSink;
 use crate::consent::{ConsentOutcome, DEFAULT_CONSENT_TIMEOUT};
 use crate::error::{Error, Result};
-use crate::models::{AuditKind, ConsentMode, EndReason, OsKind, SessionPhase};
+use crate::models::{AuditKind, ConsentMode, EndReason, ExecOutcome, OsKind, SessionPhase};
 use crate::permissions::Permissions;
 use crate::session::{ClientTx, LiveSession};
 use crate::signaling::{
@@ -96,11 +96,32 @@ pub struct ConnectedAgent {
     /// load-aware fallback ladder when [`relay_home`](Self::relay_home) is
     /// busy. Empty until a probe report lands.
     pub region_prefs: Vec<String>,
+    /// Fleet RPC — the agent advertises `AgentCaps.rpc` containing `exec`.
+    /// Distilled to a bool at registration so the Hub stays caps-agnostic,
+    /// like [`ConnectedAgent::input_arbiter`]. `false` ⇒ refuse the request
+    /// with [`Error::ExecUnsupported`] rather than pushing a frame the agent
+    /// will silently drop.
+    pub supports_exec: bool,
 }
 
 pub struct ConnectedController {
     pub user_id: ObjectId,
     pub tx: ClientTx,
+}
+
+/// Deregisters an exec waiter on every exit path from
+/// [`Hub::exec_on_agent`] — an early `send_to_agent` error or an expired
+/// deadline must not leave a slot behind that a later request id could be
+/// delivered into.
+struct ExecWaiterGuard {
+    hub: Hub,
+    request_id: String,
+}
+
+impl Drop for ExecWaiterGuard {
+    fn drop(&mut self) {
+        self.hub.inner.exec_waiters.remove(&self.request_id);
+    }
 }
 
 /// Emitted by [`Hub::create_session`] to have the API layer notify the device
@@ -183,6 +204,12 @@ pub struct HubInner {
     /// configured) drops the events and those sessions fall back to the waiter
     /// timeout.
     consent_tx: Option<mpsc::Sender<ConsentEvent>>,
+
+    /// Fleet RPC — callers parked on a `rc:rpc.result`, keyed by request id.
+    /// Same-pod only: the agent's WS receive path and the HTTP handler that
+    /// is awaiting live in one process, and the API layer routes a request to
+    /// the owner pod BEFORE reaching the Hub (see `ws/rc_relay.rs`).
+    exec_waiters: DashMap<String, oneshot::Sender<ExecOutcome>>,
 }
 
 #[derive(Clone)]
@@ -212,6 +239,7 @@ impl Hub {
                 relay_load,
                 audit,
                 consent_tx,
+                exec_waiters: DashMap::new(),
             }),
         }
     }
@@ -231,6 +259,11 @@ impl Hub {
     ///     displacement triggers an immediate read-loop exit, NOT a 25 s
     ///     wait for the agent's own keepalive ping to fail.
     ///   * `rx` — pump source for `pump_server_messages`.
+    // Eight positional args, all of them distinct facts about the connecting
+    // agent that the Hub must hold. Bundling them into a struct would move the
+    // "did you pass the right bool?" hazard from the call site to the literal
+    // without removing it, for one call site in production code.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_agent(
         &self,
         agent_id: ObjectId,
@@ -241,6 +274,9 @@ impl Hub {
         // P6 — whether the agent's caps advertise the InputArbiter (see
         // [`ConnectedAgent::input_arbiter`]).
         input_arbiter: bool,
+        // Fleet RPC — whether the agent's caps advertise `rpc: ["exec", …]`
+        // (see [`ConnectedAgent::supports_exec`]).
+        supports_exec: bool,
     ) -> (ClientTx, Arc<Notify>, mpsc::Receiver<ServerMsg>) {
         let (tx, rx) = mpsc::channel(SERVER_TX_CAPACITY);
         let cancel = Arc::new(Notify::new());
@@ -256,6 +292,7 @@ impl Hub {
             cancel: cancel.clone(),
             relay_home: None,
             region_prefs: Vec::new(),
+            supports_exec,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1130,6 +1167,98 @@ impl Hub {
         self.send_to_agent(agent_id, msg)
     }
 
+    // ─── Fleet RPC broker ────────────────────────────────────────────
+    //
+    // Push a command to a device and park the caller on its answer. Purely
+    // same-pod: the API layer has already routed the request to whichever pod
+    // holds the agent's WS (`ws/rc_relay.rs`), so by the time we're here the
+    // agent's tx and the waiter live in one process.
+
+    /// Does this device's agent understand `rc:rpc.exec`? `None` = not online
+    /// here.
+    pub fn agent_supports_exec(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner.agents.get(&agent_id).map(|a| a.supports_exec)
+    }
+
+    /// Push `rc:rpc.exec` and await the matching `rc:rpc.result`.
+    ///
+    /// `msg` must be a [`ServerMsg::RpcExec`] carrying `request_id`; the
+    /// caller mints it so it can also address a later cancel. The `deadline`
+    /// is the CALLER's patience and should exceed the command's own
+    /// `timeout_ms` — the agent answers its own timeout, and getting that
+    /// answer ("timed out after 30000ms") is strictly more useful than the
+    /// server giving up first and reporting nothing.
+    ///
+    /// The tenant re-check mirrors [`Self::send_to_agent_in_tenant`]: a device
+    /// borrowed by a second org must not be reachable from a first org's
+    /// request just because both know its id.
+    pub async fn exec_on_agent(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        request_id: String,
+        msg: ServerMsg,
+        deadline: std::time::Duration,
+    ) -> Result<ExecOutcome> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            // Refuse loudly rather than push a frame a pre-feature agent
+            // drops in its unknown-tag branch — that would spend the whole
+            // deadline waiting for silence and read to the operator as a
+            // hung device.
+            if !entry.supports_exec {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.inner.exec_waiters.insert(request_id.clone(), tx);
+        // Deregister on EVERY exit from here on, so an early error or an
+        // expired deadline can't leave a slot a later id would deliver into.
+        let _guard = ExecWaiterGuard {
+            hub: self.clone(),
+            request_id: request_id.clone(),
+        };
+
+        self.send_to_agent(agent_id, msg)?;
+
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(outcome)) => Ok(outcome),
+            // The waiter slot was dropped without a result — the agent's WS
+            // died mid-command.
+            Ok(Err(_)) => Err(Error::AgentOffline(agent_id.to_hex())),
+            Err(_) => Err(Error::ExecTimeout(agent_id.to_hex())),
+        }
+    }
+
+    /// Hand a `rc:rpc.result` to whoever is parked on it. `false` = nobody
+    /// was, which just means that caller already gave up.
+    pub fn deliver_exec_result(&self, request_id: &str, outcome: ExecOutcome) -> bool {
+        match self.inner.exec_waiters.remove(request_id) {
+            Some((_, tx)) => tx.send(outcome).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Push `rc:rpc.cancel`. The device still answers with a `rc:rpc.result`
+    /// carrying `error`, so the parked caller resolves rather than waiting out
+    /// its deadline.
+    pub fn cancel_exec(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        request_id: String,
+    ) -> Result<()> {
+        self.send_to_agent_in_tenant(agent_id, tenant_id, ServerMsg::RpcCancel { request_id })
+    }
+
     pub fn send_to_agent(&self, agent_id: ObjectId, msg: ServerMsg) -> Result<()> {
         let tx = self.agent_tx(agent_id)?;
         tx.try_send(msg).map_err(|e| match e {
@@ -1408,6 +1537,7 @@ mod tests {
             OsKind::Linux,
             3,
             false,
+            false,
         );
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
         let sid = hub
@@ -1454,7 +1584,7 @@ mod tests {
         let tenant = ObjectId::new();
         let owner = ObjectId::new();
         let (_tx1, _cancel1, mut rx1) =
-            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false);
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
         let (ctl_tx, _ctl_rx) = mpsc::channel(8);
         let sid = hub
             .create_session(
@@ -1480,7 +1610,7 @@ mod tests {
         // …then the agent's WS flaps (reply never arrives). The fresh
         // registration must receive the Request again.
         let (_tx2, _cancel2, mut rx2) =
-            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false);
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
         let repushed = rx2.try_recv().unwrap();
         assert!(
             matches!(repushed, ServerMsg::Request { session_id, .. } if session_id == sid),
@@ -1491,7 +1621,7 @@ mod tests {
         // reconnect must NOT see it replayed.
         hub.deliver_consent(sid, true).unwrap();
         let (_tx3, _cancel3, mut rx3) =
-            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false);
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
         assert!(
             !matches!(rx3.try_recv(), Ok(ServerMsg::Request { .. })),
             "no Request replay after consent was delivered"
@@ -1513,6 +1643,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             3,
+            false,
             false,
         );
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
@@ -1560,6 +1691,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             3,
+            false,
             false,
         );
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
@@ -1609,6 +1741,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             3,
+            false,
             false,
         );
         let owner = ObjectId::new();
@@ -1747,6 +1880,7 @@ mod tests {
             OsKind::Linux,
             3,
             false,
+            false,
         );
 
         let mk = |hub: &Hub, name: &str, tx: ClientTx| {
@@ -1819,6 +1953,7 @@ mod tests {
             OsKind::Linux,
             3,
             true, // P6 — arbiter-capable
+            false,
         );
 
         let mk = |hub: &Hub, name: &str, tx: ClientTx| {
@@ -1878,6 +2013,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             3,
+            false,
             false,
         );
         let user = ObjectId::new();
@@ -1949,6 +2085,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             1,
+            false,
             false,
         );
 
@@ -2055,6 +2192,7 @@ mod tests {
             OsKind::Linux,
             3,
             false,
+            false,
         );
         let (ctl_tx, _ctl_rx) = mpsc::channel(8);
         let sid = hub
@@ -2113,6 +2251,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             3,
+            false,
             false,
         );
         let (ctl_tx, _ctl_rx) = mpsc::channel(8);
@@ -2194,6 +2333,7 @@ mod tests {
             OsKind::Linux,
             3,
             false,
+            false,
         );
         let (_tx2, _cancel2, _rx2) = hub.register_agent(
             agent_id,
@@ -2201,6 +2341,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             3,
+            false,
             false,
         );
 
@@ -2254,6 +2395,7 @@ mod tests {
             OsKind::Linux,
             3,
             false,
+            false,
         );
         let (_tx2, _cancel2, _rx2) = hub.register_agent(
             agent_id,
@@ -2261,6 +2403,7 @@ mod tests {
             ObjectId::new(),
             OsKind::Linux,
             3,
+            false,
             false,
         );
 
@@ -2288,6 +2431,7 @@ mod tests {
             OsKind::Linux,
             3,
             false,
+            false,
         );
         assert!(hub.is_agent_online(agent_id));
 
@@ -2310,6 +2454,7 @@ mod tests {
             OsKind::Linux,
             3,
             false,
+            false,
         );
         assert!(hub.is_agent_online(agent_id));
 
@@ -2317,6 +2462,165 @@ mod tests {
         assert!(
             !hub.is_agent_online(agent_id),
             "matching-tx unregister must remove the entry"
+        );
+    }
+
+    // ─── Fleet RPC broker ────────────────────────────────────────────
+
+    fn exec_msg(request_id: &str) -> ServerMsg {
+        ServerMsg::RpcExec {
+            request_id: request_id.to_string(),
+            shell: "bash".into(),
+            command: "id".into(),
+            timeout_ms: 1_000,
+            max_output_bytes: 1024,
+            cwd: None,
+            caller: "tester".into(),
+            consent_mode: Some(ConsentMode::Auto),
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_round_trips_push_and_result() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true, // exec-capable
+        );
+
+        let h = hub.clone();
+        let waiter = tokio::spawn(async move {
+            h.exec_on_agent(
+                agent_id,
+                tenant,
+                "req-1".into(),
+                exec_msg("req-1"),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        });
+
+        // The push must actually reach the agent's channel...
+        match agent_rx.recv().await.expect("agent got a frame") {
+            ServerMsg::RpcExec { request_id, .. } => assert_eq!(request_id, "req-1"),
+            other => panic!("expected RpcExec, got {other:?}"),
+        }
+        // ...and the result must resolve the parked caller.
+        assert!(hub.deliver_exec_result(
+            "req-1",
+            ExecOutcome {
+                exit_code: Some(0),
+                stdout: "uid=0(root)".into(),
+                ..Default::default()
+            },
+        ));
+
+        let out = waiter.await.unwrap().expect("exec resolved");
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(out.stdout, "uid=0(root)");
+    }
+
+    #[tokio::test]
+    async fn exec_refuses_an_agent_without_the_capability() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (_tx, _cancel, mut agent_rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            false, // pre-Fleet-RPC agent
+        );
+
+        let err = hub
+            .exec_on_agent(
+                agent_id,
+                tenant,
+                "req-2".into(),
+                exec_msg("req-2"),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("must refuse");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+        // And crucially: nothing was pushed. Sending anyway would spend the
+        // caller's whole deadline waiting for a frame the agent silently
+        // drops, which reads as a hung device rather than an old one.
+        assert!(
+            agent_rx.try_recv().is_err(),
+            "must not push to an old agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_refuses_cross_tenant() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, _rx) = hub.register_agent(
+            agent_id,
+            ObjectId::new(), // registered under one org…
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+
+        let err = hub
+            .exec_on_agent(
+                agent_id,
+                ObjectId::new(), // …asked for by another
+                "req-3".into(),
+                exec_msg("req-3"),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a borrowed device must not be reachable cross-org");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn exec_deadline_expires_and_deregisters_the_waiter() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let (_tx, _cancel, _rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+
+        let err = hub
+            .exec_on_agent(
+                agent_id,
+                tenant,
+                "req-4".into(),
+                exec_msg("req-4"),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect_err("nobody answered");
+        assert!(matches!(err, Error::ExecTimeout(_)), "got {err:?}");
+
+        // The slot must be gone — otherwise a late result (or a reused id)
+        // would be delivered into an abandoned waiter.
+        assert!(
+            !hub.deliver_exec_result("req-4", ExecOutcome::default()),
+            "waiter must have been deregistered"
         );
     }
 }

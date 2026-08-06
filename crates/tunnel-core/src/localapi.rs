@@ -507,6 +507,30 @@ pub enum Request {
         #[serde(default)]
         max_bytes: Option<u64>,
     },
+    /// Fleet RPC — run a command on ANOTHER device in this org and return its
+    /// output (`roomler exec <device> -- <cmd>`).
+    ///
+    /// The daemon relays this over its own already-authenticated agent WS, so
+    /// the CLI needs no user credentials of its own. The server resolves this
+    /// device's owner as the acting principal and applies all four gates —
+    /// the pipe/socket ACL only establishes that the caller is on THIS box,
+    /// which is not by itself authority to run commands on another one.
+    ///
+    /// Mutating in the strongest sense available, so unlike the other verbs
+    /// this one's trust boundary is deliberately NOT just the pipe ACL: the
+    /// device must also carry `ExecPolicy::can_originate` server-side.
+    /// Returns [`Response::ExecResult`].
+    ExecRemote {
+        /// Target device: a name (e.g. `CORPLAP-1`) or a hex agent id.
+        node: String,
+        /// `pwsh` | `powershell` | `cmd` | `bash` | `sh`; empty ⇒ host default.
+        #[serde(default)]
+        shell: String,
+        command: String,
+        /// 0 ⇒ the server's default; clamped server- and agent-side.
+        #[serde(default)]
+        timeout_ms: u64,
+    },
 }
 
 /// One editable config entry (S2 config surface). Values travel as
@@ -602,6 +626,27 @@ pub enum Response {
         path: String,
         size: u64,
         content: String,
+    },
+    /// Result of [`Request::ExecRemote`]. `exit_code: None` + `error: Some`
+    /// covers every way the command didn't run (any of the four gates, an
+    /// offline device, a timeout) — a caller must be able to tell that from
+    /// "ran and exited 0".
+    ExecResult {
+        /// Server-minted; addresses a later cancel.
+        request_id: String,
+        node: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        stdout: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        stderr: String,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// The verb couldn't be served (bad request, state unavailable).
     Error {
@@ -758,6 +803,20 @@ pub trait LocalApiState: Send + Sync {
             message: "log tailing is not supported on this node".into(),
         }
     }
+    /// Fleet RPC — relay an exec request to another device over this daemon's
+    /// agent WS and await the answer (async — a full server round-trip).
+    /// Default: unsupported — a node with no agent WS can't originate one.
+    async fn exec_remote(
+        &self,
+        _node: &str,
+        _shell: &str,
+        _command: &str,
+        _timeout_ms: u64,
+    ) -> Response {
+        Response::Error {
+            message: "this node cannot originate remote commands (no server connection)".into(),
+        }
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -789,7 +848,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::ConfigCleanupStale
         | Request::ConfigGet
         | Request::ConfigSet { .. }
-        | Request::TailLog { .. } => Response::Error {
+        | Request::TailLog { .. }
+        | Request::ExecRemote { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -847,6 +907,12 @@ where
             Ok(Request::ConfigGet) => state.config_entries().await,
             Ok(Request::ConfigSet { key, value }) => state.config_set(&key, value.as_deref()).await,
             Ok(Request::TailLog { source, max_bytes }) => state.tail_log(&source, max_bytes).await,
+            Ok(Request::ExecRemote {
+                node,
+                shell,
+                command,
+                timeout_ms,
+            }) => state.exec_remote(&node, &shell, &command, timeout_ms).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
