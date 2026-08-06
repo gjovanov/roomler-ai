@@ -669,6 +669,89 @@ impl LocalApiState for DaemonState {
         })
     }
 
+    /// Fleet RPC — relay an exec to another device over this daemon's own
+    /// agent WS and wait for the answer.
+    ///
+    /// The daemon is the right actor for three reasons: it already holds an
+    /// authenticated server connection (so the CLI needs no credentials of its
+    /// own), the server can resolve THIS device's owner as the acting
+    /// principal, and the answer arrives asynchronously on the WS receive path
+    /// where only the daemon can catch it.
+    ///
+    /// Note the trust boundary here is deliberately NOT just the pipe ACL,
+    /// unlike every other mutating verb: being on this box is not by itself
+    /// authority to run commands on a different one. The server applies all
+    /// four gates and additionally requires this device to be blessed with
+    /// `ExecPolicy::can_originate`.
+    async fn exec_remote(
+        &self,
+        node: &str,
+        shell: &str,
+        command: &str,
+        timeout_ms: u64,
+    ) -> Response {
+        let Some(sink) = self.tunnel_hub.sink_now() else {
+            return Response::Error {
+                message: "not connected to the server — remote commands need the control \
+                          connection (check `roomler status`)"
+                    .into(),
+            };
+        };
+
+        let request_id = bson::oid::ObjectId::new().to_hex();
+        // Register the waiter BEFORE sending, or a fast answer could arrive
+        // with nowhere to go.
+        let (_guard, rx) = crate::exec::expect_response(&request_id);
+
+        if sink
+            .send(roomler_ai_remote_control::ClientMsg::RpcExecRequest {
+                request_id: request_id.clone(),
+                target: node.to_string(),
+                shell: shell.to_string(),
+                command: command.to_string(),
+                timeout_ms,
+            })
+            .await
+            .is_err()
+        {
+            return Response::Error {
+                message: "the server connection dropped while sending the command".into(),
+            };
+        }
+
+        // Our own patience: the command's budget, the server's grace, plus
+        // slack for the two extra WS hops this leg adds over the HTTP path.
+        let budget = roomler_ai_remote_control::models::exec_limits::clamp_timeout_ms(timeout_ms);
+        let deadline = Duration::from_millis(budget) + Duration::from_secs(30);
+        let outcome = match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(o)) => o,
+            // The waiter was dropped without a value — only happens if the
+            // signalling loop tore down mid-flight.
+            Ok(Err(_)) => crate::exec::ExecOutcome {
+                error: Some("the server connection dropped while awaiting the result".into()),
+                ..Default::default()
+            },
+            Err(_) => crate::exec::ExecOutcome {
+                error: Some(format!(
+                    "no answer from {node} within {}s",
+                    deadline.as_secs()
+                )),
+                ..Default::default()
+            },
+        };
+
+        Response::ExecResult {
+            request_id,
+            node: node.to_string(),
+            exit_code: outcome.exit_code,
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
+            truncated: outcome.truncated,
+            duration_ms: outcome.duration_ms,
+            error: outcome.error,
+        }
+    }
+
     /// S1b — archive the STALE config copy on a split-config host (the
     /// desktop's "Two configurations found" banner finally gets a button).
     /// The daemon is the only safe actor: it knows which copy it LOADED and

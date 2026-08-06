@@ -72,6 +72,22 @@ pub struct AgentConfig {
     #[serde(default = "default_auto_grant_session")]
     pub auto_grant_session: bool,
 
+    /// Fleet RPC — gate 4 of four. Whether this device will run a
+    /// `rc:rpc.exec` command at all.
+    ///
+    /// Default **`false`**, unlike every other capability flag here. The
+    /// other three gates (org kill-switch, caller permission, the device's
+    /// server-side `ExecPolicy`) all live on the control plane; this one
+    /// belongs to whoever physically holds the box, and it is the only
+    /// refusal that survives a compromised server. Defaulting it on would
+    /// make the other three the whole story.
+    ///
+    /// Commands inherit the daemon's identity — SYSTEM under a perMachine
+    /// Windows install, root under systemd. Turning this on is granting
+    /// root, and the admin UI says so.
+    #[serde(default)]
+    pub exec_enabled: bool,
+
     // ─── S2: env-bridged operator knobs ──────────────────────────────────
     // Each mirrors an env var read through `tunnel_core::env::node_env`
     // (precedence: env — either prefix — > this config key > built-in
@@ -1155,6 +1171,7 @@ mod tests {
             update_check_interval_h: None,
             enable_remote_browse: true,
             auto_grant_session: true,
+            exec_enabled: false,
             overlay_quic: None,
             overlay_direct: None,
             overlay_derp: None,

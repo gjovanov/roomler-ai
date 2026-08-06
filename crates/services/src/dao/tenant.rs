@@ -40,6 +40,26 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// Fleet RPC gate 1 — the org-wide kill-switch. Off by default on every
+    /// row; turning it on still leaves each device closed until its own
+    /// `ExecPolicy` is enabled.
+    pub async fn set_remote_exec_enabled(
+        &self,
+        tenant_id: ObjectId,
+        enabled: bool,
+    ) -> DaoResult<Tenant> {
+        self.base
+            .update_by_id(
+                tenant_id,
+                doc! { "$set": {
+                    "settings.remote_exec_enabled": enabled,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     pub async fn create(
         &self,
         name: String,

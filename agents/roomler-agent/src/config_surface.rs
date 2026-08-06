@@ -86,6 +86,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Answer remote filesystem-browse requests from the controller. Default: on.",
     ),
     (
+        "exec_enabled",
+        "bool",
+        "Run Fleet-RPC commands sent by the server (commands inherit the daemon's SYSTEM/root identity). Default: OFF.",
+    ),
+    (
         "encoder_preference",
         "enum:auto|hardware|software",
         "Video encoder selection: auto (HW probe then fallback), hardware, or software.",
@@ -314,6 +319,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "advertise_local_subnets" => Some(fmt_bool(cfg.advertise_local_subnets)),
         "auto_grant_session" => Some(fmt_bool(cfg.auto_grant_session)),
         "enable_remote_browse" => Some(fmt_bool(cfg.enable_remote_browse)),
+        "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
                 EncoderPreferenceChoice::Auto => "auto",
@@ -385,6 +391,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "advertise_local_subnets" => cfg.advertise_local_subnets = parse_bool_or(value, true)?,
         "auto_grant_session" => cfg.auto_grant_session = parse_bool_or(value, true)?,
         "enable_remote_browse" => cfg.enable_remote_browse = parse_bool_or(value, true)?,
+        // Clearing the key (`value: None`) resets to OFF, not ON — the
+        // fail-safe direction for a gate that grants root.
+        "exec_enabled" => cfg.exec_enabled = parse_bool_or(value, false)?,
         "encoder_preference" => {
             cfg.encoder_preference = match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
                 None | Some("") | Some("auto") => EncoderPreferenceChoice::Auto,
@@ -1038,6 +1047,29 @@ mod tests {
             apply(&mut cfg, key, None).unwrap();
             assert_eq!(entry_for(&cfg, key).unwrap().value, None, "clear {key}");
         }
+    }
+
+    /// Fleet RPC gate 4 — set/echo/clear, and above all: clearing must land
+    /// on OFF. This is the one refusal that survives a compromised control
+    /// plane, so a `roomler config set exec_enabled` with no value must never
+    /// be a way to turn it on.
+    #[test]
+    fn exec_enabled_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            current_value(&cfg, "exec_enabled").as_deref(),
+            Some("false"),
+            "Fleet RPC must be off on a fresh device"
+        );
+        apply(&mut cfg, "exec_enabled", Some("true")).unwrap();
+        assert!(cfg.exec_enabled);
+        assert_eq!(
+            entry_for(&cfg, "exec_enabled").unwrap().value.as_deref(),
+            Some("true")
+        );
+        apply(&mut cfg, "exec_enabled", None).unwrap();
+        assert!(!cfg.exec_enabled, "clearing must fail SAFE, not open");
+        assert!(apply(&mut cfg, "exec_enabled", Some("perhaps")).is_err());
     }
 
     #[test]
