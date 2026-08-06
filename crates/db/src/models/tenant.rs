@@ -57,6 +57,13 @@ pub struct TenantSettings {
     /// existing system resolvers as the fallback.
     #[serde(default)]
     pub magic_dns_nameservers: Vec<String>,
+    /// Fleet RPC — the org-wide kill-switch (gate 1 of four). `false` (the
+    /// default, and what every pre-feature row deserialises to) means no
+    /// device in this org accepts a remote command, whatever its own
+    /// `ExecPolicy` says. Flipping it on still leaves each device off until
+    /// its own policy is enabled.
+    #[serde(default)]
+    pub remote_exec_enabled: bool,
 }
 
 impl Default for TenantSettings {
@@ -70,6 +77,7 @@ impl Default for TenantSettings {
             file_upload_limit: default_file_upload_limit(),
             magic_dns_domain: None,
             magic_dns_nameservers: Vec::new(),
+            remote_exec_enabled: false,
         }
     }
 }

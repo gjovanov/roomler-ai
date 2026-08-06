@@ -82,6 +82,10 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         update_check_interval_h: None,
         enable_remote_browse: true,
         auto_grant_session: true,
+        // Fleet RPC stays OFF on a freshly enrolled device: enabling it is a
+        // deliberate act by whoever holds the box, never a side effect of
+        // joining an org.
+        exec_enabled: false,
         // S2 env-bridged knobs: unset → built-in defaults.
         overlay_quic: None,
         overlay_direct: None,

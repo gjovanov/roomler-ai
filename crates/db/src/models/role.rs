@@ -61,6 +61,14 @@ pub mod permissions {
     pub const REMOTE_CONTROL: u64 = 1 << 25;
     /// View the remote-control audit log (`remote_audit`).
     pub const VIEW_REMOTE_AUDIT: u64 = 1 << 26;
+    /// Run a command on a device via Fleet RPC (`roomler exec`, the device
+    /// console). Gate 2 of four — the org kill-switch, the device's own
+    /// `ExecPolicy`, and the agent-local `exec_enabled` key each deny
+    /// independently. Deliberately NOT implied by `MANAGE_AGENTS`: managing a
+    /// device's metadata and running a root shell on it are different powers.
+    pub const EXEC_DEVICE: u64 = 1 << 27;
+    /// View the Fleet-RPC audit log (`exec_audit`) — who ran what, where.
+    pub const VIEW_EXEC_AUDIT: u64 = 1 << 28;
 
     /// Default member permissions
     pub const DEFAULT_MEMBER: u64 = VIEW_CHANNELS
@@ -90,12 +98,19 @@ pub mod permissions {
         | MANAGE_DOCUMENTS
         | MANAGE_AGENTS
         | REMOTE_CONTROL
-        | VIEW_REMOTE_AUDIT;
+        | VIEW_REMOTE_AUDIT
+        // VIEW_EXEC_AUDIT but deliberately NOT EXEC_DEVICE: an admin should
+        // see every command the fleet ran without silently gaining the power
+        // to run one. REMOTE_CONTROL is not the same power — it is
+        // consent-gated, visible to whoever is at the machine, and runs as
+        // the interactive user; exec runs as SYSTEM/root with nobody
+        // watching. Granting exec stays an explicit act.
+        | VIEW_EXEC_AUDIT;
 
     /// Owner permissions (everything). Bump the mask whenever a new bit is
     /// added above so `ALL` literally contains every defined permission (owner
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
-    pub const ALL: u64 = (1 << 27) - 1;
+    pub const ALL: u64 = (1 << 29) - 1;
 
     pub fn has(permissions: u64, flag: u64) -> bool {
         permissions & ADMINISTRATOR != 0 || permissions & flag == flag
