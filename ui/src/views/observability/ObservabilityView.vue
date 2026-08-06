@@ -35,6 +35,9 @@
             <v-card-text>
               <div class="d-flex align-center">
                 <span class="text-subtitle-1 font-weight-medium">{{ r.id }}</span>
+                <span v-if="r.workers > 1" class="text-caption text-medium-emphasis ml-2">
+                  {{ r.workers }} workers
+                </span>
                 <v-spacer />
                 <v-chip
                   v-if="!r.monitored"
@@ -260,6 +263,8 @@ interface RegionCard {
   id: string
   enabled: boolean
   monitored: boolean
+  /** stats endpoints behind this region (multi-worker regions aggregate) */
+  workers: number
   busy: boolean
   healthy?: boolean
   latest?: SeriesPoint & { healthy?: boolean }
@@ -276,6 +281,7 @@ const regionCards = computed<RegionCard[]>(() => {
       id: r.id,
       enabled: r.enabled,
       monitored: r.monitored,
+      workers: r.workers ?? 1,
       busy: r.busy,
       healthy: latest?.healthy,
       latest,
