@@ -396,17 +396,18 @@ pub async fn handle_agent_socket(
                             let heartbeat_sessions = if let ClientMsg::AgentHeartbeat {
                                 active_sessions,
                                 sys,
+                                srflx_count,
                                 ..
                             } = &parsed
                             {
-                                Some((*active_sessions, sys.clone()))
+                                Some((*active_sessions, sys.clone(), *srflx_count))
                             } else {
                                 None
                             };
                             if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
                                 warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
                             }
-                            if let Some((active_sessions, sys)) = heartbeat_sessions {
+                            if let Some((active_sessions, sys, srflx_count)) = heartbeat_sessions {
                                 if let Err(e) = state.agents.touch_heartbeat(agent_id).await {
                                     warn!(%agent_id, %e, "agent touch_heartbeat failed");
                                 }
@@ -431,6 +432,19 @@ pub async fn handle_agent_socket(
                                                 "derp": s.derp as i32,
                                             },
                                             "peer_rtt_ms": s.peer_rtt_ms.map(i64::from),
+                                            // NAT-traversal coverage. A node
+                                            // reporting 0 cannot hole-punch and
+                                            // reads as UDP-blocked to every
+                                            // peer, so all its pairs degrade to
+                                            // relay/DERP. Counting these across
+                                            // the fleet is the one number that
+                                            // would have surfaced the 2026-08-06
+                                            // coturn TTL=1 outage on day one
+                                            // instead of after the whole mesh
+                                            // had silently fallen to DERP.
+                                            // `null` = a pre-feature agent, which
+                                            // must stay distinct from a real 0.
+                                            "srflx_count": srflx_count.map(i64::from),
                                         }
                                     });
                                     if let Err(e) = state

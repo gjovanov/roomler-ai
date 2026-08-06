@@ -115,6 +115,13 @@ pub struct NodeStatus {
     /// the daemon predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsStatus>,
+    /// NAT-traversal — the outcome of this node's srflx (STUN) gather, copied
+    /// verbatim from [`OverlayView::srflx`]. `None` from a daemon that predates
+    /// the field or one with the overlay off. An **empty `candidates`** list is
+    /// the fleet-health signal: this node cannot hole-punch, and every peer
+    /// reads it as UDP-blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srflx: Option<SrflxStatus>,
     /// Multi-org P1 — one row per enrollment (the primary first, then each
     /// `[[orgs]]` entry). Empty from a pre-multi-org daemon and omitted by a
     /// single-org one; the top-level scalar fields (`node_id` / `tenant_id`
@@ -171,6 +178,43 @@ pub struct DnsStatus {
     pub upstream: String,
     /// AAAA (derived overlay IPv6) answers are enabled.
     pub answer_aaaa: bool,
+}
+
+/// NAT-traversal: the outcome of this node's server-reflexive (STUN) gather.
+///
+/// Exists because the srflx tier failed **fleet-wide and silently** for an
+/// unknown period (2026-08-06: coturn emitted its UDP replies with `TTL=1`, so
+/// every forwarded reply was dropped before the FORWARD chain). Both failure
+/// paths logged at `debug!`, so nothing above DEBUG ever said a word — while
+/// every pair in the mesh silently degraded to the DERP carrier, its slowest
+/// tier. An empty `candidates` here is the single most useful number for
+/// "why is everything on relay?".
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct SrflxStatus {
+    /// Public `ip:port` candidates STUN reported for our direct sockets.
+    /// **Empty = the whole srflx tier is dead on this node**: no hole-punch,
+    /// and every peer reads us as UDP-blocked.
+    #[serde(default)]
+    pub candidates: Vec<String>,
+    /// The STUN server actually queried, once resolved. `None` = none of the
+    /// netmap's `stun_urls` resolved to a usable v4 endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_server: Option<String>,
+    /// Our probed NAT class — `cone` (hole-punchable) / `symmetric` /
+    /// `None` = unclassified (the punch is still attempted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat: Option<String>,
+    /// Why the gather produced nothing, when it produced nothing. `None` on
+    /// success. Rendered verbatim by `roomler status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl SrflxStatus {
+    /// Did the srflx tier come up at all?
+    pub fn is_healthy(&self) -> bool {
+        !self.candidates.is_empty()
+    }
 }
 
 /// A peer device as this node currently sees it.
@@ -557,7 +601,11 @@ pub struct ConfigEntry {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "t", content = "d", rename_all = "snake_case")]
 pub enum Response {
-    Status(NodeStatus),
+    /// Boxed: `NodeStatus` is ~408 bytes against a 137-byte second-largest,
+    /// so EVERY `Response` (including the frequent `Peers` / `Pong`) paid for a
+    /// variant only `status` uses. Serde is transparent through `Box`, so the
+    /// wire format is unchanged.
+    Status(Box<NodeStatus>),
     Peers(Vec<PeerInfo>),
     Flows(Vec<FlowInfo>),
     /// Sessions awaiting a consent decision.
@@ -681,6 +729,10 @@ pub struct OverlayView {
     /// bring-up. `None` when MagicDNS is off. The daemon copies it
     /// verbatim into [`NodeStatus::dns`].
     pub dns: Option<DnsStatus>,
+    /// NAT-traversal — the srflx gather outcome, filled by the overlay runtime
+    /// on every gather (success or failure). The daemon copies it verbatim
+    /// into [`NodeStatus::srflx`]. `None` before the first gather.
+    pub srflx: Option<SrflxStatus>,
 }
 
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
@@ -824,7 +876,7 @@ pub trait LocalApiState: Send + Sync {
 /// [`Request`], calls this, and writes the [`Response`] back.
 pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
     match req {
-        Request::Status => Response::Status(state.status()),
+        Request::Status => Response::Status(Box::new(state.status())),
         Request::Peers => Response::Peers(state.peers()),
         Request::Flows => Response::Flows(state.flows()),
         Request::ConsentPending => Response::ConsentPending(state.consent_pending()),
@@ -1341,7 +1393,7 @@ impl Client {
     /// `Request::Status` → [`NodeStatus`]. A `Response::Error` maps to `Err`.
     pub async fn status(&mut self) -> std::io::Result<NodeStatus> {
         match self.request(&Request::Status).await? {
-            Response::Status(s) => Ok(s),
+            Response::Status(s) => Ok(*s),
             other => Err(unexpected_response(other)),
         }
     }
@@ -1615,6 +1667,7 @@ mod tests {
                 exit_node: None,
                 config_path: None,
                 dns: None,
+                srflx: None,
                 orgs: Vec::new(),
             }
         }
@@ -2289,5 +2342,54 @@ mod tests {
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── srflx health ────────────────────────────────────────────────
+
+    #[test]
+    fn srflx_health_is_candidate_presence() {
+        // The whole point of the field: "no candidates" is the failure, and it
+        // must be readable without interpreting an error string.
+        assert!(!SrflxStatus::default().is_healthy());
+        assert!(
+            !SrflxStatus {
+                stun_server: Some("1.2.3.4:3478".into()),
+                error: Some("timed out".into()),
+                ..Default::default()
+            }
+            .is_healthy()
+        );
+        assert!(
+            SrflxStatus {
+                candidates: vec!["94.130.141.98:43649".into()],
+                nat: Some("cone".into()),
+                ..Default::default()
+            }
+            .is_healthy()
+        );
+    }
+
+    #[test]
+    fn srflx_absent_and_empty_are_different_on_the_wire() {
+        // A daemon that predates the field omits `srflx` entirely; a daemon
+        // that MEASURED zero candidates sends an empty list. Collapsing those
+        // two would turn "we don't know" into "it's broken" for every older
+        // node in the fleet.
+        let mut s: NodeStatus = serde_json::from_str(
+            r#"{"node_id":"n","name":"x","version":"v","mode":"service","connected":true}"#,
+        )
+        .unwrap();
+        assert!(s.srflx.is_none(), "absent must decode to None");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("srflx"), "None must not serialise: {json}");
+
+        s.srflx = Some(SrflxStatus::default());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains(r#""srflx":{"candidates":[]}"#),
+            "a measured zero MUST serialise: {json}"
+        );
+        let back: NodeStatus = serde_json::from_str(&json).unwrap();
+        assert!(!back.srflx.unwrap().is_healthy());
     }
 }
