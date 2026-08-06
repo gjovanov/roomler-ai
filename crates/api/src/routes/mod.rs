@@ -1,4 +1,5 @@
 pub mod agent_crash;
+pub mod agent_exec;
 pub mod agent_log;
 pub mod agent_org;
 pub mod agent_release;

@@ -130,6 +130,20 @@ pub struct AgentCaps {
     /// agents, non-VD hosts) → the browser hides the Apps menu.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<String>,
+    /// Fleet-RPC capabilities. Recognised values:
+    ///
+    /// * `exec` — the agent honours `rc:rpc.exec` / `rc:rpc.cancel`: it runs
+    ///   one bounded shell command and replies `rc:rpc.result`.
+    /// * `originate` — the agent honours `rc:rpc.response`, i.e. its LocalAPI
+    ///   can originate an exec against ANOTHER device (the `roomler exec`
+    ///   CLI path).
+    ///
+    /// Empty / unset = a pre-fleet-RPC agent. Same rule as [`Self::multi_org`]:
+    /// the server refuses the request with `412` rather than pushing a message
+    /// that lands in the agent's unknown-variant debug branch and vanishes,
+    /// leaving the caller to hang until its deadline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rpc: Vec<String>,
     /// Clipboard-DC protocol-v2 capability list. Extends the coarse
     /// `supports_clipboard` bool (kept for older browsers) with
     /// per-feature flags. Recognised values:
@@ -235,6 +249,122 @@ pub enum InputMode {
     Exclusive,
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Fleet RPC (remote command execution)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Execution bounds. The server clamps an incoming request to these before it
+/// reaches the wire; the agent enforces them again on its own side, so a
+/// forged or replayed frame can't ask for an unbounded run.
+pub mod exec_limits {
+    /// Wall-clock budget when the caller doesn't specify one.
+    pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    /// Hard ceiling. Longer work belongs in a job the command kicks off, not
+    /// in a request a caller is blocked on.
+    pub const MAX_TIMEOUT_MS: u64 = 300_000;
+    /// Combined stdout+stderr ceiling when the caller doesn't specify one.
+    pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 256 * 1024;
+    /// Hard ceiling on combined output.
+    pub const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+    /// Concurrent commands one device will run. Beyond this the agent
+    /// refuses rather than queues — a caller blocked on a deadline would
+    /// rather get a fast "busy" than a slow timeout.
+    pub const MAX_CONCURRENT_PER_AGENT: usize = 4;
+    /// Requests per minute per (caller, device) pair.
+    pub const RATE_LIMIT_PER_MINUTE: u32 = 30;
+
+    /// Clamp a caller-supplied timeout into range, substituting the default
+    /// for `None`/0.
+    pub fn clamp_timeout_ms(requested: u64) -> u64 {
+        match requested {
+            0 => DEFAULT_TIMEOUT_MS,
+            n => n.min(MAX_TIMEOUT_MS),
+        }
+    }
+
+    /// Clamp a caller-supplied output ceiling into range, substituting the
+    /// default for `None`/0.
+    pub fn clamp_output_bytes(requested: u64) -> u64 {
+        match requested {
+            0 => DEFAULT_MAX_OUTPUT_BYTES,
+            n => n.min(MAX_OUTPUT_BYTES),
+        }
+    }
+}
+
+/// Whether a device accepts remote command execution at all.
+///
+/// Default `Off` — every existing row deserialises to it, so enabling the
+/// feature can never retroactively open a device.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMode {
+    /// Refuse every exec request. The default.
+    #[default]
+    Off,
+    /// Accept exec from callers that clear every other gate.
+    On,
+}
+
+/// Per-device remote-execution policy — gate 3 of four (see
+/// `docs/fleet-rpc.md`). Deliberately NOT folded into [`AccessPolicy`]:
+/// that grants screen-view, and "may watch your screen" must never be the
+/// same checkbox as "may run a root shell".
+///
+/// ⚠️ On a perMachine Windows install the daemon runs as **SYSTEM**, and on a
+/// systemd host as **root** — so `ExecMode::On` is root-equivalent by
+/// construction. That is required for the diagnostics this exists for
+/// (`Get-NetFirewallRule`, `netsh`, route tables, service state) and is stated
+/// in the admin UI's opt-in copy rather than buried here.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ExecPolicy {
+    /// Does this device accept exec requests? Gate 3.
+    #[serde(default)]
+    pub mode: ExecMode,
+    /// May this device *originate* exec against other devices (the
+    /// `roomler exec` CLI path, where the daemon's own agent WS carries the
+    /// request)? Default `false` — without this, compromising any enrolled
+    /// laptop would inherit its owner's exec rights across the whole fleet.
+    #[serde(default)]
+    pub can_originate: bool,
+    /// Restrict callers to these users. Empty = no user restriction (the
+    /// permission bit + the other gates still apply).
+    #[serde(default)]
+    pub allowed_user_ids: Vec<ObjectId>,
+    /// Restrict callers to holders of these roles. Empty = no role
+    /// restriction.
+    #[serde(default)]
+    pub allowed_role_ids: Vec<ObjectId>,
+    /// How consent is obtained before a command runs. `None` = the safe
+    /// default ([`ConsentMode::Prompt`]); unattended servers set `Auto`.
+    /// Only `Auto` and `Prompt` are honoured — the email/push variants are
+    /// session-shaped and resolve to `Prompt`.
+    #[serde(default)]
+    pub consent_mode: Option<ConsentMode>,
+    /// Shells the device will accept, e.g. `["pwsh", "powershell"]`. Empty =
+    /// every shell the host supports.
+    #[serde(default)]
+    pub shells: Vec<String>,
+}
+
+impl ExecPolicy {
+    /// Effective consent mode. Unset ⇒ [`ConsentMode::Prompt`] (attended);
+    /// the session-shaped variants collapse to `Prompt` because there is no
+    /// exec equivalent of an approve-link flow.
+    pub fn effective_consent_mode(&self) -> ConsentMode {
+        match self.consent_mode {
+            Some(ConsentMode::Auto) => ConsentMode::Auto,
+            _ => ConsentMode::Prompt,
+        }
+    }
+
+    /// Is `shell` permitted by this policy? An empty list allows everything
+    /// the host itself supports.
+    pub fn allows_shell(&self, shell: &str) -> bool {
+        self.shells.is_empty() || self.shells.iter().any(|s| s.eq_ignore_ascii_case(shell))
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Agent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -272,6 +402,10 @@ pub struct Agent {
     pub capabilities: AgentCaps,
     #[serde(default)]
     pub access_policy: AccessPolicy,
+    /// Fleet-RPC policy for this device (gate 3). `#[serde(default)]` → every
+    /// pre-feature row deserialises to [`ExecMode::Off`].
+    #[serde(default)]
+    pub exec_policy: ExecPolicy,
     /// Subnet-router CIDRs this agent is a gateway for (Phase 2). The SOCKS
     /// mesh longest-prefix-matches a LAN-IP target against these to pick the
     /// covering agent, which then dials the real IP (still gated by the
@@ -718,6 +852,123 @@ pub struct TunnelAuditEvent {
 
 impl TunnelAuditEvent {
     pub const COLLECTION: &'static str = "tunnel_audit";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Fleet-RPC audit
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The result of one remote command — the Hub's currency, the HTTP response
+/// body, and the payload of the cross-pod `exec.dispatch` reply. Mirrors
+/// `ClientMsg::RpcResult` minus the correlation id.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOutcome {
+    /// `None` when the command never ran or was killed — see
+    /// [`Self::error`]. A caller must be able to tell that apart from
+    /// "ran and exited 0".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Already redacted + capped by the agent.
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Why an exec request was refused. `None` on the audit row means it ran.
+///
+/// Every denial is recorded — a refused exec is the interesting one, and
+/// without it a probing caller leaves no trace.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecDenyReason {
+    /// Gate 1 — the org's `remote_exec_enabled` kill-switch is off.
+    OrgDisabled,
+    /// Gate 2 — the caller lacks `EXEC_DEVICE`.
+    NoPermission,
+    /// Gate 3 — the target device's [`ExecPolicy::mode`] is `Off`.
+    DeviceDisabled,
+    /// Gate 3 — the caller isn't in the device's allowed users/roles.
+    CallerNotAllowed,
+    /// Gate 3 — the requested shell isn't in the device's allowed list.
+    ShellNotAllowed,
+    /// The CLI origin device isn't blessed with `can_originate`.
+    OriginNotAllowed,
+    /// The agent doesn't advertise the `exec` RPC capability.
+    Unsupported,
+    /// The device is offline.
+    Offline,
+    /// The operator denied the consent prompt (or it timed out).
+    ConsentDenied,
+    /// Per-(user, device) rate limit.
+    RateLimited,
+    /// Gate 4 — the agent's own `exec_enabled` config key is false. Reported
+    /// by the agent rather than decided server-side.
+    AgentDisabled,
+}
+
+/// One remote-execution attempt. Written on EVERY attempt, allowed or denied.
+/// TTL-expired after 90 days like [`RemoteAuditEvent`].
+///
+/// `stdout` / `stderr` here are the REDACTED, truncated samples — the agent
+/// sweeps its output for the agent token, `Bearer …`, and JWT-shaped strings
+/// before anything leaves the host, so a secret echoed by a command never
+/// reaches this collection.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExecAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// The device the command was aimed at.
+    pub agent_id: ObjectId,
+    /// The acting principal. For a CLI-originated request this is the
+    /// originating device's `owner_user_id`.
+    pub user_id: ObjectId,
+    /// Set when the request came from a device's LocalAPI (`roomler exec`)
+    /// rather than an authenticated HTTP caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_agent_id: Option<ObjectId>,
+    /// Correlates the audit row with the wire `request_id`.
+    pub request_id: String,
+    /// `cli` | `ui` | `api`.
+    pub source: String,
+    pub shell: String,
+    /// The command verbatim, as submitted.
+    pub command: String,
+    pub at: DateTime,
+    /// `None` when the request never ran (see [`Self::denied`]) or the agent
+    /// failed to report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Refusal reason; `None` = the command ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<ExecDenyReason>,
+    /// Redacted, truncated output sample (both streams, capped).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_sample: String,
+    /// SHA-256 of the full redacted output, so a truncated sample can still
+    /// be tied to what actually ran.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_sha256: String,
+    #[serde(default)]
+    pub output_bytes: u64,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl ExecAuditEvent {
+    pub const COLLECTION: &'static str = "exec_audit";
+    /// Cap on the persisted output sample. Keeps a busy fleet's audit
+    /// collection bounded while retaining enough to read at a glance.
+    pub const SAMPLE_BYTES: usize = 4096;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1413,6 +1664,83 @@ pub fn block_align_slot(after: u32, slots: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_policy_defaults_are_closed() {
+        // The whole safety story rests on this: a device row that predates
+        // Fleet RPC — i.e. every device in the fleet today — must deserialise
+        // to a policy that refuses.
+        let p: ExecPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.mode, ExecMode::Off);
+        assert!(!p.can_originate);
+        assert_eq!(p.effective_consent_mode(), ConsentMode::Prompt);
+
+        // …and so must an Agent row with no `exec_policy` key at all.
+        let caps_free = r#"{
+            "tenant_id":"000000000000000000000001",
+            "owner_user_id":"000000000000000000000002",
+            "name":"old","machine_id":"m","os":"windows",
+            "agent_version":"0.1.0","agent_token_hash":"",
+            "status":"offline","last_seen_at":{"$date":{"$numberLong":"0"}},
+            "created_at":{"$date":{"$numberLong":"0"}},
+            "updated_at":{"$date":{"$numberLong":"0"}},
+            "deleted_at":null
+        }"#;
+        let a: Agent = serde_json::from_str(caps_free).unwrap();
+        assert_eq!(a.exec_policy.mode, ExecMode::Off);
+    }
+
+    #[test]
+    fn exec_policy_consent_collapses_session_shaped_modes() {
+        // Email / Push / PromptThenEmail are approve-link flows with no exec
+        // equivalent. They must collapse to Prompt, never silently to Auto.
+        for m in [
+            ConsentMode::Email,
+            ConsentMode::Push,
+            ConsentMode::PromptThenEmail,
+        ] {
+            let p = ExecPolicy {
+                consent_mode: Some(m),
+                ..Default::default()
+            };
+            assert_eq!(p.effective_consent_mode(), ConsentMode::Prompt, "{m:?}");
+        }
+        let p = ExecPolicy {
+            consent_mode: Some(ConsentMode::Auto),
+            ..Default::default()
+        };
+        assert_eq!(p.effective_consent_mode(), ConsentMode::Auto);
+    }
+
+    #[test]
+    fn exec_policy_shell_allowlist() {
+        let open = ExecPolicy::default();
+        assert!(open.allows_shell("pwsh"), "empty list allows everything");
+
+        let narrowed = ExecPolicy {
+            shells: vec!["pwsh".into()],
+            ..Default::default()
+        };
+        assert!(narrowed.allows_shell("pwsh"));
+        assert!(
+            narrowed.allows_shell("PWSH"),
+            "shell names are ASCII-insensitive"
+        );
+        assert!(!narrowed.allows_shell("cmd"));
+    }
+
+    #[test]
+    fn exec_limits_clamp() {
+        use exec_limits::*;
+        // 0 means "unspecified" on the wire, not "instant timeout".
+        assert_eq!(clamp_timeout_ms(0), DEFAULT_TIMEOUT_MS);
+        assert_eq!(clamp_timeout_ms(1_000), 1_000);
+        assert_eq!(clamp_timeout_ms(u64::MAX), MAX_TIMEOUT_MS);
+
+        assert_eq!(clamp_output_bytes(0), DEFAULT_MAX_OUTPUT_BYTES);
+        assert_eq!(clamp_output_bytes(1024), 1024);
+        assert_eq!(clamp_output_bytes(u64::MAX), MAX_OUTPUT_BYTES);
+    }
 
     #[test]
     fn overlay_ip_adds_host_to_cgnat_base() {

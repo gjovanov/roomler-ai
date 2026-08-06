@@ -358,6 +358,22 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{agent_id}/logs",
             post(routes::agent_log::ingest_agent).get(routes::agent_log::list_for_agent),
+        )
+        // Fleet RPC — remote command execution. `/exec` (the fleet sweep) and
+        // `/{agent_id}/exec` (one device) sit at different depths, so they
+        // can't shadow each other whatever the declaration order.
+        .route("/exec", post(routes::agent_exec::exec_bulk))
+        .route("/{agent_id}/exec", post(routes::agent_exec::exec))
+        .route(
+            "/{agent_id}/exec/{request_id}/cancel",
+            post(routes::agent_exec::cancel),
+        )
+        // Gate 3 — the per-device policy. MANAGE_AGENTS, not EXEC_DEVICE:
+        // deciding a device MAY be exec'd is a management act; performing
+        // the exec is a separate power.
+        .route(
+            "/{agent_id}/exec-policy",
+            put(routes::agent_exec::set_policy),
         );
 
     // Remote-control session routes (tenant-scoped)
@@ -467,6 +483,15 @@ pub fn build_router(state: AppState) -> Router {
                 .put(routes::overlay_policy::update)
                 .delete(routes::overlay_policy::delete),
         );
+
+    // Fleet RPC — the org kill-switch (gate 1) and the attempt log. Both are
+    // tenant-scoped rather than per-device: the switch governs every device,
+    // and the log is the org-wide "what ran on my fleet?" view.
+    let exec_audit_routes = Router::new().route("/", get(routes::agent_exec::audit));
+    let exec_settings_routes = Router::new().route(
+        "/",
+        get(routes::agent_exec::get_org_settings).put(routes::agent_exec::set_org_settings),
+    );
 
     // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
     let magic_dns_routes = Router::new().route(
@@ -607,6 +632,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/magic-dns", magic_dns_routes)
         .nest("/tenant/{tenant_id}/overlay-block", overlay_block_routes)
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
+        .nest("/tenant/{tenant_id}/exec-audit", exec_audit_routes)
+        .nest("/tenant/{tenant_id}/exec-settings", exec_settings_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /

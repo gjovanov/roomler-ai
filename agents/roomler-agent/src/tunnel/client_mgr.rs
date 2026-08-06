@@ -186,6 +186,16 @@ impl TunnelClientHub {
         SinkGuard { hub: self.clone() }
     }
 
+    /// The live agent-WS egress, or `None` while disconnected.
+    ///
+    /// Flow supervisors `subscribe()` and wait; the Fleet-RPC LocalAPI verb
+    /// instead needs a one-shot answer, because "the daemon isn't connected to
+    /// the server right now" is a real result for `roomler exec` and telling
+    /// the operator that beats blocking until it reconnects.
+    pub fn sink_now(&self) -> Option<mpsc::Sender<ClientMsg>> {
+        self.inner.sink_tx.borrow().clone()
+    }
+
     /// Snapshot the registry as LocalAPI [`FlowInfo`]. Live throughput
     /// (`bytes_in`/`bytes_out`/`active_flows`) is read from each flow's shared
     /// [`SessionThroughput`] aggregate (P3b-3): `bytes_*` are cumulative for
