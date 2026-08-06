@@ -829,6 +829,24 @@ fn print_status(s: &NodeStatus) {
             dns.magic_domain, dns.upstream
         );
     }
+
+    // NAT-traversal — the srflx line exists because an empty srflx tier is the
+    // single most useful answer to "why is every peer on relay?", and it used
+    // to be invisible: both failure paths logged at debug! only.
+    if let Some(srflx) = &s.srflx {
+        if srflx.candidates.is_empty() {
+            let why = srflx.error.as_deref().unwrap_or("no public candidate");
+            println!("  srflx       NONE — cannot hole-punch ({why})");
+        } else {
+            let nat = srflx.nat.as_deref().unwrap_or("unknown NAT");
+            let via = srflx
+                .stun_server
+                .as_deref()
+                .map(|s| format!(" via {s}"))
+                .unwrap_or_default();
+            println!("  srflx       {} ({nat}{via})", srflx.candidates.join(", "));
+        }
+    }
 }
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {
