@@ -476,6 +476,24 @@ peer-to-peer; the server never sees raw pixels or keystrokes."""
 depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
 section = "net"
 priority = "optional"
+# `/usr/bin/roomler` was owned by the legacy standalone `roomler-tunnel` .deb.
+# Shipping the CLI from this package (see the assets below) therefore collides
+# with it, and dpkg refuses the whole upgrade:
+#
+#   dpkg: trying to overwrite '/usr/bin/roomler', which is also in package
+#         roomler-tunnel 0.3.0~rc.205-1
+#
+# Field-caught on jupiter, 2026-08-06 — rc.312 would not install anywhere the
+# old tunnel package was present, which is exactly the set of hosts carrying
+# the stale CLI this change exists to fix.
+#
+# `replaces` is the Debian mechanism for taking a file over from another
+# package: dpkg allows the overwrite and transfers ownership, so later removing
+# `roomler-tunnel` does NOT delete the CLI. Deliberately WITHOUT a matching
+# `breaks` — that would demand the old package be removed first, which plain
+# `dpkg -i` (the self-updater's fallback) cannot do, turning a clean upgrade
+# into a manual one on every affected host.
+replaces = "roomler-tunnel"
 assets = [
     # P3d Slice B: installed binary is `roomlerd` (the [[bin]] output name).
     ["target/release/roomlerd", "usr/bin/", "755"],
