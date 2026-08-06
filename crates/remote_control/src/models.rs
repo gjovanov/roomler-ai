@@ -358,8 +358,38 @@ impl ExecPolicy {
         }
     }
 
+    /// The shell an empty / `auto` request resolves to on `os`.
+    ///
+    /// The server resolves BEFORE checking [`Self::allows_shell`], so the
+    /// allowlist is compared against the shell that will actually run. Without
+    /// this, a device allowing `["powershell"]` refuses the default-shell
+    /// request that would have become powershell — which is what
+    /// `roomler exec <device> -- …` and every `roomler diag` bundle sends.
+    /// Field-caught 2026-08-06: it made `diag` unusable on every device with a
+    /// narrowed allowlist.
+    ///
+    /// MUST stay in lockstep with the agent's `exec::resolve_shell`, or the
+    /// policy check and the execution would disagree about what ran.
+    pub fn default_shell_for(os: OsKind) -> &'static str {
+        match os {
+            OsKind::Windows => "powershell",
+            _ => "bash",
+        }
+    }
+
+    /// Normalise a requested shell: empty / `auto` become the host default.
+    pub fn resolve_shell(requested: &str, os: OsKind) -> String {
+        let t = requested.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+            Self::default_shell_for(os).to_string()
+        } else {
+            t.to_string()
+        }
+    }
+
     /// Is `shell` permitted by this policy? An empty list allows everything
-    /// the host itself supports.
+    /// the host itself supports. Callers pass an already-resolved name (see
+    /// [`Self::resolve_shell`]) — never a bare `""`.
     pub fn allows_shell(&self, shell: &str) -> bool {
         self.shells.is_empty() || self.shells.iter().any(|s| s.eq_ignore_ascii_case(shell))
     }
@@ -1710,6 +1740,41 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(p.effective_consent_mode(), ConsentMode::Auto);
+    }
+
+    #[test]
+    fn empty_shell_resolves_before_the_allowlist_is_checked() {
+        // Field-caught: `roomler exec <dev> -- …` and every `roomler diag`
+        // bundle send an EMPTY shell meaning "the host default". Comparing
+        // that literal "" against ["powershell","pwsh","cmd"] refused them
+        // all, which made diag unusable on every device that had narrowed its
+        // allowlist — i.e. every device an admin had actually configured.
+        let narrowed = ExecPolicy {
+            shells: vec!["powershell".into(), "pwsh".into(), "cmd".into()],
+            ..Default::default()
+        };
+        assert!(
+            !narrowed.allows_shell(""),
+            "the raw empty string must NOT match — that is why resolution has to happen first"
+        );
+        assert!(narrowed.allows_shell(&ExecPolicy::resolve_shell("", OsKind::Windows)));
+        assert!(narrowed.allows_shell(&ExecPolicy::resolve_shell("auto", OsKind::Windows)));
+        assert!(narrowed.allows_shell(&ExecPolicy::resolve_shell("  ", OsKind::Windows)));
+
+        // …and a genuinely disallowed shell is still refused after resolution.
+        assert!(!narrowed.allows_shell(&ExecPolicy::resolve_shell("bash", OsKind::Windows)));
+    }
+
+    #[test]
+    fn resolve_shell_matches_the_agents_own_defaults() {
+        // These MUST equal the agent's `exec::resolve_shell` mapping, or the
+        // policy check and the execution would disagree about what ran.
+        assert_eq!(ExecPolicy::resolve_shell("", OsKind::Windows), "powershell");
+        assert_eq!(ExecPolicy::resolve_shell("", OsKind::Linux), "bash");
+        assert_eq!(ExecPolicy::resolve_shell("", OsKind::Macos), "bash");
+        // An explicit request passes through untouched (trimmed).
+        assert_eq!(ExecPolicy::resolve_shell(" pwsh ", OsKind::Windows), "pwsh");
+        assert_eq!(ExecPolicy::resolve_shell("sh", OsKind::Linux), "sh");
     }
 
     #[test]
