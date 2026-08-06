@@ -23,6 +23,7 @@ pub mod displays;
 pub mod dpi;
 pub mod encode;
 pub mod enrollment;
+pub mod exec;
 pub mod files;
 pub mod fp16;
 pub mod gpu_clock;

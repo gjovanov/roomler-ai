@@ -28,6 +28,8 @@ mod agent_crash_tests;
 #[cfg(test)]
 mod agent_e2e_tests;
 #[cfg(test)]
+mod agent_exec_tests;
+#[cfg(test)]
 mod agent_presence_tests;
 #[cfg(test)]
 mod agent_tests;

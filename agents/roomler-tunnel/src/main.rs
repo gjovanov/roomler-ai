@@ -225,6 +225,64 @@ enum Command {
         #[command(flatten)]
         fmt: OutputFmt,
     },
+    /// Run a command on another device in this organization (Fleet RPC).
+    ///
+    /// The local daemon relays it over its own server connection, so no
+    /// separate login is needed — but the SERVER decides, not this CLI:
+    /// the org kill-switch, your EXEC_DEVICE permission, the target's
+    /// policy, and the target's own `exec_enabled` key must all allow it,
+    /// and this device must be marked as permitted to originate.
+    ///
+    /// Commands run as the target daemon's identity (SYSTEM on Windows,
+    /// root under systemd) and every attempt is audited.
+    Exec {
+        /// Target device — a name (e.g. `pc50045`) or a hex agent id.
+        device: String,
+        /// `pwsh` | `powershell` | `cmd` | `bash` | `sh`. Default: the
+        /// target host's own default shell.
+        #[arg(long, default_value = "")]
+        shell: String,
+        /// Command timeout in seconds on the target (max 300).
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        #[command(flatten)]
+        fmt: OutputFmt,
+        /// The command. Put it after `--` so its own flags aren't parsed
+        /// by roomler: `roomler exec pc50045 -- Get-NetRoute -AddressFamily IPv4`
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Collect a standard diagnostic bundle from one or two devices and
+    /// print it side by side.
+    ///
+    /// Distinct from `diagnose`, which probes MTU/ICE from THIS host. This
+    /// one runs a canned, OS-appropriate evidence set ON the target devices
+    /// via Fleet RPC — adapters, routes, firewall posture, overlay carrier
+    /// state, recent overlay warnings — which is the evidence set a
+    /// "why is this pair on relay?" question actually needs.
+    Diag {
+        #[command(subcommand)]
+        action: DiagAction,
+    },
+}
+
+/// `roomler diag …` — remote evidence bundles over Fleet RPC.
+#[derive(Debug, Subcommand)]
+enum DiagAction {
+    /// Bundle from one device.
+    Host {
+        device: String,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
+    /// Bundle from BOTH ends of a pair — the shape of the question
+    /// "why can't these two reach each other directly?".
+    Pair {
+        a: String,
+        b: String,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
 }
 
 /// Shared output flag for the read-only LocalAPI verbs (`status`/`peers`/
@@ -421,6 +479,26 @@ async fn main() -> Result<()> {
             prefer_v6,
             fmt,
         } => localclient::ping(&target, timeout_ms, prefer_v6, fmt.json).await,
+        Command::Exec {
+            device,
+            shell,
+            timeout,
+            fmt,
+            command,
+        } => {
+            localclient::exec(
+                &device,
+                &shell,
+                &command.join(" "),
+                timeout.saturating_mul(1000),
+                fmt.json,
+            )
+            .await
+        }
+        Command::Diag { action } => match action {
+            DiagAction::Host { device, fmt } => localclient::diag_bundle(&[device], fmt.json).await,
+            DiagAction::Pair { a, b, fmt } => localclient::diag_bundle(&[a, b], fmt.json).await,
+        },
     }
 }
 
