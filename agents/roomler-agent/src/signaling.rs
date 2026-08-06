@@ -690,13 +690,18 @@ async fn connect_once(
     // is primary-only (see `ConnectedGuard::mark`).
     let _connected_guard = ConnectedGuard::mark(connected, ctx.is_primary);
 
+    // Fleet RPC — teach the redactor THIS org's agent token before any exec
+    // can run. Registered per-org (the registry is process-wide) so a command
+    // asked for by org A can never leak org B's token in its output.
+    crate::exec::register_secret(&cfg.agent_token);
+
     // Say hello.
     let hello = ClientMsg::AgentHello {
         machine_name: cfg.machine_name.clone(),
         os: detect_os(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         displays: stub_displays(),
-        caps: stub_caps(),
+        caps: Box::new(stub_caps()),
         // Tunnel mesh subnet-router: advertise the CIDRs this host offers to
         // route — explicit `advertise_routes` config unioned with auto-detected
         // local subnets. Admin-gated server-side (untrusted until an admin
@@ -1855,6 +1860,146 @@ async fn handle_server_msg(
                     "update trigger dropped — auto-updater not running \
                      (ROOMLER_AGENT_AUTO_UPDATE=0?) or a trigger is already queued"
                 );
+            }
+        }
+
+        // Fleet RPC — run one bounded command and answer with rc:rpc.result.
+        //
+        // The server has already cleared gates 1–3 (org kill-switch, caller
+        // permission, the device's ExecPolicy). Gate 4 is ours: `exec_enabled`
+        // belongs to whoever holds this box and is the only refusal that
+        // survives a compromised control plane.
+        //
+        // Everything after the gate runs on a SPAWNED task: a command may take
+        // up to 300 s and this handler is on the WS receive path — blocking
+        // here would stall every other message on this org's socket, including
+        // the heartbeat that keeps the device marked online.
+        ServerMsg::RpcExec {
+            request_id,
+            shell,
+            command,
+            timeout_ms,
+            max_output_bytes,
+            cwd,
+            caller,
+            consent_mode,
+        } => {
+            if !agent_cfg.exec_enabled {
+                warn!(
+                    %request_id, %caller,
+                    "rc:rpc.exec refused — exec_enabled is off on this device"
+                );
+                // Always answer. A caller is blocked on this; silence would
+                // read as a hang rather than a refusal.
+                let _ = outbound_tx
+                    .send(ClientMsg::RpcResult {
+                        request_id,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        truncated: false,
+                        duration_ms: 0,
+                        error: Some(
+                            "remote execution is disabled on this device \
+                             (`roomler config set exec_enabled true` to allow it)"
+                                .to_string(),
+                        ),
+                    })
+                    .await;
+                return Ok(());
+            }
+
+            // Absent directive ⇒ prompt. Fail-safe for a gate that grants root.
+            let auto = matches!(
+                consent_mode,
+                Some(roomler_ai_remote_control::models::ConsentMode::Auto)
+            );
+            let consent_mode = if auto {
+                crate::consent::Mode::AutoGrant
+            } else {
+                crate::consent::Mode::Prompt {
+                    timeout: crate::consent::DEFAULT_PROMPT_TIMEOUT,
+                }
+            };
+
+            let broker = consent_broker.clone();
+            let outbound = outbound_tx.clone();
+            let req = crate::exec::ExecRequest {
+                request_id: request_id.clone(),
+                shell,
+                command,
+                timeout_ms,
+                max_output_bytes,
+                cwd,
+                caller: caller.clone(),
+            };
+            tokio::spawn(async move {
+                let decision = broker.request_with_mode(&request_id, consent_mode).await;
+                let outcome = if decision.granted() {
+                    crate::exec::shared()
+                        .run(req, &crate::exec::redactor())
+                        .await
+                } else {
+                    warn!(%request_id, %caller, ?decision, "rc:rpc.exec denied at the device");
+                    crate::exec::ExecOutcome {
+                        error: Some(format!(
+                            "the operator at this device did not approve the command ({decision:?})"
+                        )),
+                        ..Default::default()
+                    }
+                };
+                if let Err(e) = outbound
+                    .send(ClientMsg::RpcResult {
+                        request_id: request_id.clone(),
+                        exit_code: outcome.exit_code,
+                        stdout: outcome.stdout,
+                        stderr: outcome.stderr,
+                        truncated: outcome.truncated,
+                        duration_ms: outcome.duration_ms,
+                        error: outcome.error,
+                    })
+                    .await
+                {
+                    warn!(%request_id, %e, "rc:rpc.result send failed (channel closed)");
+                }
+            });
+        }
+
+        // Fleet RPC — kill an in-flight command. The run itself still answers
+        // with an rc:rpc.result carrying `error`, so the caller isn't left
+        // waiting on a request nobody will finish.
+        ServerMsg::RpcCancel { request_id } => {
+            tokio::spawn(async move {
+                let found = crate::exec::shared().cancel(&request_id).await;
+                info!(%request_id, found, "rc:rpc.cancel");
+            });
+        }
+
+        // Fleet RPC — the answer to a command THIS device asked another device
+        // to run (`roomler exec`). Handed to whichever LocalAPI call is parked
+        // on it; an unknown id means that caller already gave up.
+        ServerMsg::RpcExecResponse {
+            request_id,
+            exit_code,
+            stdout,
+            stderr,
+            truncated,
+            duration_ms,
+            error,
+        } => {
+            let delivered = crate::exec::deliver_response(
+                &request_id,
+                crate::exec::ExecOutcome {
+                    exit_code,
+                    stdout,
+                    stderr,
+                    truncated,
+                    duration_ms,
+                    error,
+                },
+            );
+            if !delivered {
+                debug!(%request_id, "rc:rpc.response for an unknown request — caller gave up");
             }
         }
 
