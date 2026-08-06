@@ -26,6 +26,7 @@ use axum::{
 use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use futures::TryStreamExt;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_db::models::role::permissions;
@@ -446,12 +447,150 @@ async fn machines_payload(
         ],
     )
     .await?;
+    let uptime = uptime_intervals(state, tid, floor).await?;
     Ok(Json(serde_json::json!({
         "enabled": true,
         "range": range.unwrap_or("24h"),
         "series": series,
         "agents": per_agent,
+        "uptime": uptime,
     })))
+}
+
+/// Cap on agents/intervals returned by the uptime view — a fleet-wide
+/// year query must not turn into an unbounded payload.
+const UPTIME_MAX_AGENTS: usize = 100;
+const UPTIME_MAX_INTERVALS: usize = 500;
+
+/// Per-agent presence intervals over the window, reconstructed from the
+/// `stats_events` transition ledger.
+///
+/// The ledger records CHANGES, so three pieces are needed to render a
+/// continuous strip: the state the agent was already in when the window
+/// opened (its last transition BEFORE the floor), the transitions inside
+/// the window, and the live tail (`agents.last_presence`) closing the
+/// final interval at "now". An agent with no prior transition starts as
+/// `unknown` — honest about "we weren't recording yet" rather than
+/// back-filling a state we never observed.
+async fn uptime_intervals(
+    state: &AppState,
+    tid: ObjectId,
+    floor: DateTime,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    // Live tail + display names, and the agent set we report on.
+    let agents = agg(
+        state,
+        "agents",
+        vec![
+            doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
+            doc! { "$set": { "id": { "$toString": "$_id" } } },
+            doc! { "$project": { "_id": 0, "id": 1, "name": 1, "last_presence": 1 } },
+            doc! { "$limit": UPTIME_MAX_AGENTS as i64 },
+        ],
+    )
+    .await?;
+    if agents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // State at window open: the newest transition strictly before floor.
+    let mut prior: HashMap<String, String> = HashMap::new();
+    for d in agg(
+        state,
+        roomler_ai_services::dao::stats::STATS_EVENTS,
+        vec![
+            doc! { "$match": { "tenant_id": tid, "ts": { "$lt": floor } } },
+            doc! { "$sort": { "ts": -1 } },
+            doc! { "$group": { "_id": "$agent_id", "presence": { "$first": "$presence" } } },
+            doc! { "$set": { "agent_id": { "$toString": "$_id" } } },
+            doc! { "$unset": "_id" },
+        ],
+    )
+    .await?
+    {
+        if let (Some(a), Some(p)) = (
+            d.get("agent_id").and_then(|v| v.as_str()),
+            d.get("presence").and_then(|v| v.as_str()),
+        ) {
+            prior.insert(a.to_string(), p.to_string());
+        }
+    }
+
+    // Transitions inside the window, oldest first per agent.
+    let mut events: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for d in agg(
+        state,
+        roomler_ai_services::dao::stats::STATS_EVENTS,
+        vec![
+            doc! { "$match": { "tenant_id": tid, "ts": { "$gte": floor } } },
+            doc! { "$sort": { "ts": 1 } },
+            doc! { "$set": {
+                "agent_id": { "$toString": "$agent_id" },
+                "t": { "$toLong": { "$divide": [ { "$toLong": "$ts" }, 1000 ] } },
+            }},
+            doc! { "$project": { "_id": 0, "agent_id": 1, "t": 1, "presence": 1 } },
+        ],
+    )
+    .await?
+    {
+        if let (Some(a), Some(t), Some(p)) = (
+            d.get("agent_id").and_then(|v| v.as_str()),
+            d.get("t").and_then(|v| v.as_i64()),
+            d.get("presence").and_then(|v| v.as_str()),
+        ) {
+            events
+                .entry(a.to_string())
+                .or_default()
+                .push((t, p.to_string()));
+        }
+    }
+
+    let from = floor.timestamp_millis() / 1000;
+    let now = DateTime::now().timestamp_millis() / 1000;
+    let mut out = Vec::with_capacity(agents.len());
+    for a in &agents {
+        let Some(id) = a.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let mut cursor = from;
+        let mut state_now = prior
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut intervals: Vec<serde_json::Value> = Vec::new();
+        for (t, presence) in events.get(id).map(Vec::as_slice).unwrap_or(&[]) {
+            let t = (*t).clamp(from, now);
+            if t > cursor {
+                intervals.push(serde_json::json!({
+                    "from": cursor, "to": t, "presence": state_now,
+                }));
+                cursor = t;
+            }
+            state_now = presence.clone();
+            if intervals.len() >= UPTIME_MAX_INTERVALS {
+                break;
+            }
+        }
+        // Live tail: the ledger's last word is authoritative for history,
+        // but the CURRENT state comes from the agents row (the sweeper
+        // heals stale/offline there even when no event was queued).
+        let tail = a
+            .get("last_presence")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&state_now)
+            .to_string();
+        if now > cursor {
+            intervals.push(serde_json::json!({
+                "from": cursor, "to": now, "presence": tail,
+            }));
+        }
+        out.push(serde_json::json!({
+            "agent_id": id,
+            "name": a.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            "intervals": intervals,
+        }));
+    }
+    Ok(out)
 }
 
 /// GET /api/tenant/{tid}/stats/calls?range= — MANAGE_AGENTS.
@@ -624,7 +763,11 @@ pub async fn admin_relay_current(
             serde_json::json!({
                 "id": s.id,
                 "enabled": s.enabled,
-                "monitored": s.derp_url.is_some(),
+                // Monitored = the poller has somewhere to fetch: a
+                // regional DERP host, or the explicit `stats_urls`
+                // override (multi-worker regions like the central fleet).
+                "monitored": s.derp_url.is_some() || !s.stats_urls.is_empty(),
+                "workers": (s.stats_urls.len().max(1)) as i64,
                 "busy": busy,
             })
         })

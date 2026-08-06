@@ -31,12 +31,25 @@ export interface SeriesPayload {
   }>
   /** calls endpoint */
   totals?: { calls?: number; minutes?: number; participant_minutes?: number }
+  /** machines endpoint: per-agent presence intervals for the uptime strip */
+  uptime?: Array<{
+    agent_id: string
+    name?: string
+    intervals: Array<{ from: number; to: number; presence: string }>
+  }>
 }
 
 export interface RelayCurrent {
   enabled: boolean
   regions_enabled?: boolean
-  regions?: Array<{ id: string; enabled: boolean; monitored: boolean; busy: boolean }>
+  regions?: Array<{
+    id: string
+    enabled: boolean
+    monitored: boolean
+    /** stats endpoints behind the region (>1 = aggregated multi-worker) */
+    workers?: number
+    busy: boolean
+  }>
   latest?: Array<SeriesPoint & { region?: string; healthy?: boolean }>
   agent_rtt?: Array<{ region: string; rtt_avg_ms: number; agents: number }>
 }
