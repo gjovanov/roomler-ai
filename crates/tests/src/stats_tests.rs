@@ -641,3 +641,97 @@ async fn tenant_calls_series_reads_rollups() {
     assert!(series[0]["t"].is_number());
     assert!(body["totals"]["calls"].is_number());
 }
+
+// ── Stats follow-up — uptime strips from the presence ledger ────────────
+
+#[tokio::test]
+async fn uptime_intervals_reconstruct_presence_and_admit_ignorance() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("statsup").await;
+    let tid = ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let now = unix_now();
+
+    // Two devices: one that transitioned inside the window, one that has
+    // never transitioned since the ledger began.
+    let flappy = ObjectId::new();
+    let quiet = ObjectId::new();
+    for (id, name, presence) in [(flappy, "flappy", "offline"), (quiet, "quiet", "online")] {
+        app.state
+            .db
+            .collection::<Document>("agents")
+            .insert_one(doc! {
+                "_id": id, "tenant_id": tid, "name": name,
+                "last_presence": presence, "deleted_at": bson::Bson::Null,
+            })
+            .await
+            .unwrap();
+    }
+    // Ledger begins 6 h ago (the feature's own start), flappy goes
+    // offline 2 h ago. `quiet` never appears in the ledger.
+    let ev = |agent: ObjectId, secs_ago: i64, presence: &str| {
+        doc! {
+            "tenant_id": tid, "agent_id": agent,
+            "ts": bson::DateTime::from_millis((now - secs_ago) * 1000),
+            "presence": presence,
+        }
+    };
+    app.state
+        .db
+        .collection::<Document>("stats_events")
+        .insert_many(vec![
+            ev(flappy, 6 * 3600, "online"),
+            ev(flappy, 2 * 3600, "offline"),
+        ])
+        .await
+        .unwrap();
+
+    let r = app
+        .auth_get(
+            &format!("/api/tenant/{}/stats/machines?range=24h", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    let uptime = body["uptime"].as_array().expect("uptime array");
+
+    let row = |name: &str| -> serde_json::Value {
+        uptime
+            .iter()
+            .find(|u| u["name"] == serde_json::json!(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("no uptime row for {name}"))
+    };
+
+    // flappy: unknown before the ledger existed → online → offline (tail).
+    let f = row("flappy");
+    let ivs = f["intervals"].as_array().unwrap();
+    let seq: Vec<&str> = ivs
+        .iter()
+        .map(|i| i["presence"].as_str().unwrap())
+        .collect();
+    assert_eq!(seq, vec!["unknown", "online", "offline"], "got {seq:?}");
+    // Intervals tile the window contiguously.
+    for w in ivs.windows(2) {
+        assert_eq!(w[0]["to"], w[1]["from"], "intervals must be contiguous");
+    }
+    assert!(ivs.last().unwrap()["to"].as_i64().unwrap() >= now - 5);
+
+    // quiet: never transitioned. The stretch BEFORE the ledger existed is
+    // `unknown` — not back-filled with today's state — and only the
+    // recorded era claims its current presence.
+    let q = row("quiet");
+    let ivs = q["intervals"].as_array().unwrap();
+    let seq: Vec<&str> = ivs
+        .iter()
+        .map(|i| i["presence"].as_str().unwrap())
+        .collect();
+    assert_eq!(seq, vec!["unknown", "online"], "got {seq:?}");
+    let boundary = ivs[0]["to"].as_i64().unwrap();
+    assert!(
+        (boundary - (now - 6 * 3600)).abs() <= 5,
+        "the unknown stretch must end where the ledger starts, got {boundary}"
+    );
+}
