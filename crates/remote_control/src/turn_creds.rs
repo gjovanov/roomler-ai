@@ -101,6 +101,15 @@ pub struct RelayRegionSpec {
     /// regional DERP; pairs fall back to the central `/derp`.
     #[serde(default)]
     pub derp_url: Option<String>,
+    /// Explicit `/stats` endpoints for the load poller, overriding the
+    /// URL normally derived from `derp_url`. Needed by regions that serve
+    /// TURN without a regional DERP — the CENTRAL fleet, whose `/derp` is
+    /// JWT-authed (so it carries no `derp_url`) but whose coturn workers
+    /// each run a stats producer. Multiple entries = a multi-worker
+    /// region: the poller polls all and aggregates (healthy if ANY answers,
+    /// worst-case load, summed traffic).
+    #[serde(default)]
+    pub stats_urls: Vec<String>,
     /// Per-region coturn `static-auth-secret`; falls back to the global
     /// `turn.shared_secret` when absent (one secret fleet-wide, v1).
     #[serde(default)]
@@ -595,6 +604,7 @@ mod tests {
             turn_url: url.into(),
             worker_urls: vec![],
             derp_url: Some(format!("wss://derp-{id}.example/derp")),
+            stats_urls: vec![],
             shared_secret: None,
             caps: Default::default(),
             enabled,
