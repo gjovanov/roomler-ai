@@ -243,6 +243,31 @@ fn mask_jwt_shaped(input: &str) -> String {
 ///
 /// The caller's command is appended as ONE further argv element — never
 /// concatenated — so it cannot escape into the agent's own argv.
+/// Prefix that forces a Windows shell to emit UTF-8.
+///
+/// PowerShell writes its pipe in the host's ANSI/OEM codepage, not UTF-8. On a
+/// German-locale host `whoami` returns `nt-autorität\system`, which arrives as
+/// `nt-autorit<?>t\system` after our lossy decode — field-caught on PC50045,
+/// 2026-08-06. Setting the console output encoding per-process is the standard
+/// fix; it does not leak outside this child, and an assignment before the
+/// caller's command does not affect the exit code PowerShell reports.
+#[cfg(windows)]
+const PS_UTF8_PREFIX: &str = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ";
+/// `cmd.exe` equivalent — switch the console codepage to UTF-8 first.
+#[cfg(windows)]
+const CMD_UTF8_PREFIX: &str = "chcp 65001>nul&";
+
+/// Wrap the caller's command so the shell emits UTF-8. Still ONE argv element,
+/// so the injection story is unchanged.
+#[cfg(windows)]
+fn utf8_wrapped(shell_program: &str, command: &str) -> String {
+    if shell_program.eq_ignore_ascii_case("cmd.exe") {
+        format!("{CMD_UTF8_PREFIX}{command}")
+    } else {
+        format!("{PS_UTF8_PREFIX}{command}")
+    }
+}
+
 fn resolve_shell(requested: &str) -> Result<(&'static str, Vec<&'static str>), String> {
     let want = requested.trim().to_ascii_lowercase();
     #[cfg(windows)]
@@ -473,11 +498,16 @@ impl ExecEngine {
         max_output: u64,
         cancel_rx: oneshot::Receiver<()>,
     ) -> ExecOutcome {
+        #[cfg(windows)]
+        let command = utf8_wrapped(program, &req.command);
+        #[cfg(not(windows))]
+        let command = req.command.clone();
+
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args)
             // The caller's command is ONE argv element. Nothing in it can
             // escape into our own argv.
-            .arg(&req.command)
+            .arg(&command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -755,6 +785,49 @@ mod tests {
             "captured {} bytes, cap was 4096",
             out.output_bytes()
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn non_ascii_output_survives_a_non_utf8_console_codepage() {
+        // Field-caught on PC50045 (German locale): `whoami` returns
+        // `nt-autorität\system`, which PowerShell wrote in the host ANSI
+        // codepage and our lossy decode turned into `nt-autorit<?>t\system`.
+        // A diagnostic that garbles the machine's own output is worse than
+        // useless — it invites the reader to doubt the tool, not the finding.
+        let out = engine()
+            .run(req("Write-Output 'ä ö ü ß — 日本'"), &Redactor::default())
+            .await;
+        assert_eq!(out.error, None, "stderr: {}", out.stderr);
+        assert!(
+            out.stdout.contains("ä ö ü ß"),
+            "non-ASCII was mangled: {:?}",
+            out.stdout
+        );
+        assert!(
+            !out.stdout.contains('\u{FFFD}'),
+            "replacement chars in output: {:?}",
+            out.stdout
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utf8_prefix_is_shell_appropriate() {
+        assert!(utf8_wrapped("powershell.exe", "X").starts_with("[Console]::OutputEncoding"));
+        assert!(utf8_wrapped("pwsh.exe", "X").starts_with("[Console]::OutputEncoding"));
+        assert!(utf8_wrapped("cmd.exe", "X").starts_with("chcp 65001"));
+        // The caller's command is still there, unmodified, at the end.
+        assert!(utf8_wrapped("cmd.exe", "echo hi").ends_with("echo hi"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn utf8_prefix_does_not_disturb_the_exit_code() {
+        // The prefix is an assignment before the caller's command; PowerShell
+        // must still report the command's own exit code.
+        let out = engine().run(req("exit 7"), &Redactor::default()).await;
+        assert_eq!(out.exit_code, Some(7), "error: {:?}", out.error);
     }
 
     #[tokio::test]
