@@ -195,4 +195,120 @@ describe('useAgentStore', () => {
     expect(s.error).toBeNull()
     expect(s.loading).toBe(false)
   })
+
+  // ── Fleet RPC ──────────────────────────────────────────────────────
+
+  it('an agent with no exec_policy is treated as closed, not permissive', () => {
+    // Every device that existed before the feature deserialises without the
+    // field. Reading that as anything but "off" would retroactively open the
+    // whole fleet the moment the org switch is flipped.
+    const a = mkAgent()
+    expect(a.exec_policy).toBeUndefined()
+    expect(a.exec_policy?.mode ?? 'off').toBe('off')
+  })
+
+  it('execOnAgent posts the command and returns the result verbatim', async () => {
+    mockApi.post.mockResolvedValueOnce({
+      request_id: 'req1',
+      agent_id: 'a1',
+      agent_name: 'Laptop',
+      exit_code: 0,
+      stdout: 'uid=0(root)',
+      stderr: '',
+      truncated: false,
+      duration_ms: 12,
+      error: null,
+    })
+    const s = useAgentStore()
+    const out = await s.execOnAgent(TENANT_ID, 'a1', { command: 'id', timeout_ms: 5000 })
+    expect(mockApi.post).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/exec`, {
+      command: 'id',
+      timeout_ms: 5000,
+    })
+    expect(out.exit_code).toBe(0)
+    expect(out.stdout).toBe('uid=0(root)')
+  })
+
+  it('a policy refusal RESOLVES with an error, it does not reject', async () => {
+    // The server answers 200 with `error` set for every gate refusal, so the
+    // UI renders one shape and never has to guess whether a rejection was a
+    // policy decision or a network failure.
+    mockApi.post.mockResolvedValueOnce({
+      request_id: 'req2',
+      agent_id: 'a1',
+      agent_name: 'Laptop',
+      exit_code: null,
+      stdout: '',
+      stderr: '',
+      truncated: false,
+      duration_ms: 0,
+      error: 'remote execution is not enabled on this device',
+    })
+    const s = useAgentStore()
+    const out = await s.execOnAgent(TENANT_ID, 'a1', { command: 'id' })
+    expect(out.error).toContain('not enabled on this device')
+    // The distinction the whole result shape exists to preserve.
+    expect(out.exit_code).toBeNull()
+  })
+
+  it('execOnFleet unwraps the results array', async () => {
+    mockApi.post.mockResolvedValueOnce({
+      results: [
+        { request_id: 'r1', agent_id: 'a1', agent_name: 'A', exit_code: 0, stdout: 'x', stderr: '', truncated: false, duration_ms: 3, error: null },
+        { request_id: 'r2', agent_id: 'a2', agent_name: 'B', exit_code: null, stdout: '', stderr: '', truncated: false, duration_ms: 0, error: 'device is offline' },
+      ],
+    })
+    const s = useAgentStore()
+    const out = await s.execOnFleet(TENANT_ID, ['a1', 'a2'], { command: 'id' })
+    expect(mockApi.post).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/exec`, {
+      agent_ids: ['a1', 'a2'],
+      command: 'id',
+    })
+    expect(out).toHaveLength(2)
+    expect(out[1]!.error).toBe('device is offline')
+  })
+
+  it('updateExecPolicy PUTs and patches the local agent', async () => {
+    mockApi.put.mockResolvedValueOnce({})
+    const s = useAgentStore()
+    s.agents = [mkAgent({ id: 'a1' })]
+    const policy = {
+      mode: 'on' as const,
+      can_originate: false,
+      allowed_user_ids: [],
+      allowed_role_ids: [],
+      consent_mode: 'auto' as const,
+      shells: [],
+    }
+    await s.updateExecPolicy(TENANT_ID, 'a1', policy)
+    expect(mockApi.put).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/exec-policy`, policy)
+    expect(s.agents[0]!.exec_policy?.mode).toBe('on')
+  })
+
+  it('a 403 on the org switch leaves it UNKNOWN, not "off"', async () => {
+    // "You are not an admin" and "the org has it switched off" are different
+    // facts. Collapsing the former into the latter would have the console
+    // tell a non-admin something false about their org.
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    const s = useAgentStore()
+    await s.fetchOrgExecEnabled(TENANT_ID)
+    expect(s.orgExecEnabled).toBeNull()
+  })
+
+  it('fetchOrgExecEnabled stores the flag', async () => {
+    mockApi.get.mockResolvedValueOnce({ remote_exec_enabled: true })
+    const s = useAgentStore()
+    await s.fetchOrgExecEnabled(TENANT_ID)
+    expect(s.orgExecEnabled).toBe(true)
+  })
+
+  it('fetchExecAudit passes the narrowing filters through', async () => {
+    mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+    const s = useAgentStore()
+    await s.fetchExecAudit(TENANT_ID, { agentId: 'a1', perPage: 25 })
+    const url = mockApi.get.mock.calls.at(-1)![0] as string
+    expect(url).toContain(`/tenant/${TENANT_ID}/exec-audit?`)
+    expect(url).toContain('agent_id=a1')
+    expect(url).toContain('per_page=25')
+  })
 })

@@ -18,13 +18,13 @@ use roomler_ai_services::{
     TaskService,
     dao::{
         activation_code::ActivationCodeDao, agent::AgentDao, consent_request::ConsentRequestDao,
-        file::FileDao, invite::InviteDao, message::MessageDao, notification::NotificationDao,
-        overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
-        overlay_policy::OverlayPolicyDao, push_subscription::PushSubscriptionDao,
-        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
-        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao, tenant::TenantDao,
-        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
-        tunnel_policy::TunnelPolicyDao, user::UserDao,
+        exec_audit::ExecAuditDao, file::FileDao, invite::InviteDao, message::MessageDao,
+        notification::NotificationDao, overlay_network::OverlayNetworkDao,
+        overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
+        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
+        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
+        room::RoomDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
+        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -92,6 +92,8 @@ pub struct AppState {
     pub used_tokens: Arc<roomler_ai_services::dao::used_token::UsedTokenDao>,
     pub remote_sessions: Arc<RemoteSessionDao>,
     pub remote_audit: Arc<RemoteAuditDao>,
+    /// Fleet-RPC attempt log — every exec, allowed or denied.
+    pub exec_audit: Arc<ExecAuditDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
     /// Observability sample sinks (`stats_*` collections) — idempotent
@@ -338,6 +340,7 @@ impl AppState {
         let used_tokens = Arc::new(roomler_ai_services::dao::used_token::UsedTokenDao::new(&db));
         let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
+        let exec_audit = Arc::new(ExecAuditDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
         ));
@@ -805,6 +808,7 @@ impl AppState {
             used_tokens,
             remote_sessions,
             remote_audit,
+            exec_audit,
             agent_crashes,
             agent_logs,
             stats,
