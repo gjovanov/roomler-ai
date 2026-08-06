@@ -545,6 +545,26 @@ async fn uptime_intervals(
         }
     }
 
+    // When the ledger itself starts. Before this instant we recorded
+    // nothing, so no agent's state can be claimed for that stretch — it
+    // renders `unknown` rather than back-filling today's state across
+    // history that predates the feature. AFTER it, silence is real
+    // information: `note_transition` records every change, so an agent
+    // with no events simply never changed state.
+    let ledger_start = agg(
+        state,
+        roomler_ai_services::dao::stats::STATS_EVENTS,
+        vec![
+            doc! { "$match": { "tenant_id": tid } },
+            doc! { "$group": { "_id": Bson::Null, "first": { "$min": "$ts" } } },
+            doc! { "$set": { "t": { "$toLong": { "$divide": [ { "$toLong": "$first" }, 1000 ] } } } },
+            doc! { "$project": { "_id": 0, "t": 1 } },
+        ],
+    )
+    .await?
+    .first()
+    .and_then(|d| d.get("t").and_then(|v| v.as_i64()));
+
     let from = floor.timestamp_millis() / 1000;
     let now = DateTime::now().timestamp_millis() / 1000;
     let mut out = Vec::with_capacity(agents.len());
@@ -552,12 +572,25 @@ async fn uptime_intervals(
         let Some(id) = a.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
+        let has_prior = prior.contains_key(id);
         let mut cursor = from;
         let mut state_now = prior
             .get(id)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         let mut intervals: Vec<serde_json::Value> = Vec::new();
+        // No transition before the window ⇒ the state at window-open is
+        // only knowable from when the ledger began recording.
+        if !has_prior
+            && let Some(start) = ledger_start
+            && start > from
+        {
+            let start = start.min(now);
+            intervals.push(serde_json::json!({
+                "from": from, "to": start, "presence": "unknown",
+            }));
+            cursor = start;
+        }
         for (t, presence) in events.get(id).map(Vec::as_slice).unwrap_or(&[]) {
             let t = (*t).clamp(from, now);
             if t > cursor {
