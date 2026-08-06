@@ -32,6 +32,18 @@ pub enum Error {
     #[error("ws send failed")]
     SendFailed,
 
+    /// Fleet RPC — the device runs an agent that predates `rc:rpc.exec`.
+    /// Surfaced as `412 Precondition Failed`, never as a hang: a pre-feature
+    /// agent drops the unknown tag in its debug branch, so pushing anyway
+    /// would leave the caller waiting out its whole deadline for silence.
+    #[error("device {0} runs an agent without Fleet-RPC support")]
+    ExecUnsupported(String),
+
+    /// Fleet RPC — the device accepted the request but produced no result
+    /// before the caller's deadline.
+    #[error("no result from device {0} within the deadline")]
+    ExecTimeout(String),
+
     #[error(transparent)]
     Mongo(#[from] mongodb::error::Error),
 

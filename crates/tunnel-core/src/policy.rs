@@ -977,6 +977,7 @@ mod tests {
             displays: vec![],
             capabilities: AgentCaps::default(),
             access_policy: Default::default(),
+            exec_policy: Default::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
