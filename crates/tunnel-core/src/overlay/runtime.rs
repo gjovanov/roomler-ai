@@ -881,6 +881,14 @@ pub struct OverlayRuntime {
     /// after the resolver/OS-steer attempt and grafted onto every
     /// published [`OverlayView`]. `None` when MagicDNS is off.
     dns_status: Option<DnsStatus>,
+    /// NAT-traversal — the srflx (STUN) gather outcome, set by [`run`](Self::run)
+    /// on every gather and grafted onto every published [`OverlayView`], exactly
+    /// like [`dns_status`](Self::dns_status). `None` before the first gather.
+    ///
+    /// Exists so an empty srflx tier is VISIBLE: it failed fleet-wide and
+    /// silently on 2026-08-06 because both failure paths only logged at
+    /// `debug!`.
+    srflx_status: Option<localapi::SrflxStatus>,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1040,6 +1048,7 @@ impl OverlayRuntime {
             regional_derp_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
+            srflx_status: None,
         }
     }
 
@@ -1065,6 +1074,7 @@ impl OverlayRuntime {
             regional_derp_factory: None,
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
+            srflx_status: None,
         }
     }
 
@@ -1154,6 +1164,9 @@ impl OverlayRuntime {
             view.exit_node = exit_status;
             // S2 — ditto for the DNS bring-up outcome.
             view.dns = self.dns_status.clone();
+            // NAT-traversal — ditto for the srflx gather outcome. An empty
+            // candidate list here is the "why is everything on relay?" signal.
+            view.srflx = self.srflx_status.clone();
             // send_replace never fails (unlike send) even if the receiver is
             // transiently absent, and keeps the value for the next borrow.
             tx.send_replace(view);
@@ -1326,6 +1339,8 @@ impl OverlayRuntime {
         let mut srflx_stun_server: Option<SocketAddr> = None;
         let mut srflx_advertised: Vec<String> = Vec::new();
         let mut srflx_my_nat: Option<String> = None;
+        // One-shot latch for the failure WARN — see the no-candidate arm below.
+        let mut srflx_warned = false;
         // Phase D — also gather+advertise our srflx when single-relay is on (even
         // with srflx-direct off): a single-relay DIALER advertises no relay, so
         // the ANCHOR permits its inbound by the IP it learns from our srflx.
@@ -1349,7 +1364,36 @@ impl OverlayRuntime {
                         .await
                         .unwrap_or_default();
                         if pairs.is_empty() {
-                            debug!(%stun_server, "overlay: srflx gather yielded no public candidate");
+                            // WARN, not debug. This exact line was `debug!` when
+                            // the srflx tier died fleet-wide on 2026-08-06 (coturn
+                            // replying with TTL=1, so every forwarded reply was
+                            // dropped before FORWARD) — and nothing above DEBUG
+                            // said a word while every pair in the mesh silently
+                            // degraded to the DERP carrier. `srflx_warned` makes
+                            // it one-shot per transition: the gather re-runs
+                            // often, and a per-attempt WARN would be noise nobody
+                            // reads, which is how you get back to silence.
+                            if !srflx_warned {
+                                srflx_warned = true;
+                                warn!(
+                                    %stun_server,
+                                    sockets = socks.len(),
+                                    "overlay: srflx gather yielded NO public candidate — this node \
+                                     cannot hole-punch and every peer will read it as UDP-blocked \
+                                     (pairs fall back to the relay/DERP tier). Check that the STUN \
+                                     server answers UDP from the internet."
+                                );
+                            }
+                            self.srflx_status = Some(localapi::SrflxStatus {
+                                candidates: Vec::new(),
+                                stun_server: Some(stun_server.to_string()),
+                                nat: None,
+                                error: Some(format!(
+                                    "STUN yielded no public candidate from {stun_server} \
+                                     ({} socket(s) probed)",
+                                    socks.len()
+                                )),
+                            });
                         } else {
                             // The FIRST pair is the punch socket: its candidate
                             // is advertised at index 0, which the peer's dial-side
@@ -1379,6 +1423,15 @@ impl OverlayRuntime {
                             let candidates: Vec<String> =
                                 pairs.into_iter().map(|(c, _)| c).collect();
                             srflx_advertised = candidates.clone();
+                            // Recovered — re-arm the one-shot so a LATER failure
+                            // warns again instead of being swallowed.
+                            srflx_warned = false;
+                            self.srflx_status = Some(localapi::SrflxStatus {
+                                candidates: candidates.clone(),
+                                stun_server: Some(stun_server.to_string()),
+                                nat: my_nat.clone(),
+                                error: None,
+                            });
                             info!(?candidates, ?my_nat, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B/C)");
                             let _ = self
                                 .outbound
@@ -1390,7 +1443,27 @@ impl OverlayRuntime {
                         }
                     }
                     None => {
-                        debug!(urls = ?network.stun_urls, "overlay: no resolvable STUN server; srflx off this run");
+                        // Also promoted from debug! — same reasoning as the
+                        // no-candidate arm: with no STUN server the entire
+                        // srflx tier is off for this run, which is a fleet-level
+                        // fact, not a detail.
+                        if !srflx_warned {
+                            srflx_warned = true;
+                            warn!(
+                                urls = ?network.stun_urls,
+                                "overlay: no resolvable STUN server — srflx tier OFF this run; \
+                                 this node will read as UDP-blocked to every peer"
+                            );
+                        }
+                        self.srflx_status = Some(localapi::SrflxStatus {
+                            candidates: Vec::new(),
+                            stun_server: None,
+                            nat: None,
+                            error: Some(format!(
+                                "no resolvable STUN server among {:?}",
+                                network.stun_urls
+                            )),
+                        });
                     }
                 }
             }

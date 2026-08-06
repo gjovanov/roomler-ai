@@ -307,6 +307,9 @@ impl LocalApiState for DaemonState {
                 .map(|(p, _)| p.display().to_string()),
             // S2 — MagicDNS status the overlay runtime published.
             dns: self.overlay.borrow().dns.clone(),
+            // NAT-traversal — the srflx gather outcome. Empty candidates means
+            // this node can't hole-punch and reads as UDP-blocked to every peer.
+            srflx: self.overlay.borrow().srflx.clone(),
             // Multi-org P1 — one row per enrollment; empty (and omitted on
             // the wire) for a single-org daemon or a state built without
             // the registry.
@@ -997,6 +1000,7 @@ mod tests {
             }],
             exit_node: None,
             dns: None,
+            srflx: None,
         }
     }
 
