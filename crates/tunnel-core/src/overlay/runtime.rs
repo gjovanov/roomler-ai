@@ -888,7 +888,7 @@ pub struct OverlayRuntime {
     /// Exists so an empty srflx tier is VISIBLE: it failed fleet-wide and
     /// silently on 2026-08-06 because both failure paths only logged at
     /// `debug!`.
-    srflx_status: Option<localapi::SrflxStatus>,
+    srflx_status: Option<crate::localapi::SrflxStatus>,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1011,6 +1011,7 @@ fn build_overlay_view(
         // and DNS bring-up state (S2).
         exit_node: None,
         dns: None,
+        srflx: None,
     }
 }
 
@@ -1339,8 +1340,6 @@ impl OverlayRuntime {
         let mut srflx_stun_server: Option<SocketAddr> = None;
         let mut srflx_advertised: Vec<String> = Vec::new();
         let mut srflx_my_nat: Option<String> = None;
-        // One-shot latch for the failure WARN — see the no-candidate arm below.
-        let mut srflx_warned = false;
         // Phase D — also gather+advertise our srflx when single-relay is on (even
         // with srflx-direct off): a single-relay DIALER advertises no relay, so
         // the ANCHOR permits its inbound by the IP it learns from our srflx.
@@ -1365,26 +1364,22 @@ impl OverlayRuntime {
                         .unwrap_or_default();
                         if pairs.is_empty() {
                             // WARN, not debug. This exact line was `debug!` when
-                            // the srflx tier died fleet-wide on 2026-08-06 (coturn
-                            // replying with TTL=1, so every forwarded reply was
-                            // dropped before FORWARD) — and nothing above DEBUG
-                            // said a word while every pair in the mesh silently
-                            // degraded to the DERP carrier. `srflx_warned` makes
-                            // it one-shot per transition: the gather re-runs
-                            // often, and a per-attempt WARN would be noise nobody
-                            // reads, which is how you get back to silence.
-                            if !srflx_warned {
-                                srflx_warned = true;
-                                warn!(
-                                    %stun_server,
-                                    sockets = socks.len(),
-                                    "overlay: srflx gather yielded NO public candidate — this node \
-                                     cannot hole-punch and every peer will read it as UDP-blocked \
-                                     (pairs fall back to the relay/DERP tier). Check that the STUN \
-                                     server answers UDP from the internet."
-                                );
-                            }
-                            self.srflx_status = Some(localapi::SrflxStatus {
+                            // the srflx tier died fleet-wide on 2026-08-06
+                            // (coturn replying with TTL=1, so every forwarded
+                            // reply was dropped before FORWARD) — and nothing
+                            // above DEBUG said a word while every pair in the
+                            // mesh silently degraded to the DERP carrier.
+                            // Naturally one-shot: this gather runs once per
+                            // runtime start, so it can't become log spam.
+                            warn!(
+                                %stun_server,
+                                sockets = socks.len(),
+                                "overlay: srflx gather yielded NO public candidate — this node \
+                                 cannot hole-punch and every peer will read it as UDP-blocked \
+                                 (pairs fall back to the relay/DERP tier). Check that the STUN \
+                                 server answers UDP from the internet."
+                            );
+                            self.srflx_status = Some(crate::localapi::SrflxStatus {
                                 candidates: Vec::new(),
                                 stun_server: Some(stun_server.to_string()),
                                 nat: None,
@@ -1423,10 +1418,7 @@ impl OverlayRuntime {
                             let candidates: Vec<String> =
                                 pairs.into_iter().map(|(c, _)| c).collect();
                             srflx_advertised = candidates.clone();
-                            // Recovered — re-arm the one-shot so a LATER failure
-                            // warns again instead of being swallowed.
-                            srflx_warned = false;
-                            self.srflx_status = Some(localapi::SrflxStatus {
+                            self.srflx_status = Some(crate::localapi::SrflxStatus {
                                 candidates: candidates.clone(),
                                 stun_server: Some(stun_server.to_string()),
                                 nat: my_nat.clone(),
@@ -1447,15 +1439,12 @@ impl OverlayRuntime {
                         // no-candidate arm: with no STUN server the entire
                         // srflx tier is off for this run, which is a fleet-level
                         // fact, not a detail.
-                        if !srflx_warned {
-                            srflx_warned = true;
-                            warn!(
-                                urls = ?network.stun_urls,
-                                "overlay: no resolvable STUN server — srflx tier OFF this run; \
-                                 this node will read as UDP-blocked to every peer"
-                            );
-                        }
-                        self.srflx_status = Some(localapi::SrflxStatus {
+                        warn!(
+                            urls = ?network.stun_urls,
+                            "overlay: no resolvable STUN server — srflx tier OFF this run; \
+                             this node will read as UDP-blocked to every peer"
+                        );
+                        self.srflx_status = Some(crate::localapi::SrflxStatus {
                             candidates: Vec::new(),
                             stun_server: None,
                             nat: None,
