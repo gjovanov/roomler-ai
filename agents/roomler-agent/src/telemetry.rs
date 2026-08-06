@@ -152,6 +152,7 @@ mod tests {
             ],
             exit_node: None,
             dns: None,
+            srflx: None,
         };
         let out = s.sample(&view);
         assert_eq!(out.direct, 1);

@@ -479,6 +479,15 @@ priority = "optional"
 assets = [
     # P3d Slice B: installed binary is `roomlerd` (the [[bin]] output name).
     ["target/release/roomlerd", "usr/bin/", "755"],
+    # The `roomler` CLI (the [[bin]] output of the roomler-tunnel package).
+    #
+    # It was MISSING from this list, so every .deb upgrade replaced the daemon
+    # and left whatever CLI the host happened to have. Field-caught 2026-08-06:
+    # zeus and mars were running a **rc.205 CLI from Jul 22** against an rc.311
+    # daemon — `roomler config set` did not exist (it is the documented way to
+    # set agent config), and `roomler peers --json` silently misrendered fields
+    # the newer daemon had added. The Windows MSI has always shipped both.
+    ["target/release/roomler", "usr/bin/", "755"],
     # Bundled FFmpeg 8.1.2 (LGPL) for the ffmpeg-encoder HEVC backend. Populated
     # by the "Bundle FFmpeg" CI step (SONAME-named real files, $ORIGIN RPATH) so
     # the .deb is self-contained — stock Ubuntu ships an ABI-incompatible FFmpeg
