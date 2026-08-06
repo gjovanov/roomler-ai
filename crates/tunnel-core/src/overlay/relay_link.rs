@@ -48,6 +48,17 @@ use crate::transport::relay::RelayConn;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
 use roomler_ai_remote_control::worker_pick::pick_worker_fnv1a;
 
+/// Minimum spacing between break-before-make regrades OFF an established DERP
+/// link for the same peer (see [`RelayCoordinator::derp_regrade_due`]).
+///
+/// Sized against the failure mode, not the happy path: if the rebuilt TURN tier
+/// turns out not to carry the pair, the peer is dark until the next attempt —
+/// and the server's own force-DERP escalation (P7), which pins the pair back to
+/// DERP on sustained churn, needs room to observe that churn and act. Ten
+/// minutes leaves the steady state cheap (one disturbance, then quiet) while
+/// keeping a genuinely-stuck pair recoverable without an agent restart.
+const DERP_REGRADE_COOLDOWN: Duration = Duration::from_secs(600);
+
 /// Which relay carrier a [`ReadyLink`] rides. `install_ready` gates the
 /// QUIC-over-relay upgrade on `Turn`: a `Derp` link is RAW WG over the
 /// pubkey-addressed `/derp` WS relay — v1 never rides QUIC-over-DERP (QUIC over
@@ -59,6 +70,17 @@ pub enum RelayKind {
     Turn,
     /// The DERP `/derp` WS relay (both-UDP-blocked pair).
     Derp,
+}
+
+impl RelayKind {
+    /// The stable LocalAPI label (`roomler peers --json` → `relay_kind`).
+    /// Wire-visible: keep these strings as-is.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayKind::Turn => "turn",
+            RelayKind::Derp => "derp",
+        }
+    }
 }
 
 /// The relay carrier tier chosen for a peer at the relay tier. A 3-way split so
@@ -232,6 +254,12 @@ pub struct RelayCoordinator {
     /// (server-pushed, identical on both ends). Entry present ONLY when the
     /// matching regional mux exists; pruned alongside `forced_derp_until`.
     forced_urls: HashMap<ObjectId, String>,
+    /// Earliest instant a peer may be re-graded off DERP again — booked by
+    /// [`derp_regrade_due`](Self::derp_regrade_due) each time it says yes.
+    /// The regrade is break-before-make, so a pair whose strategy oscillates
+    /// (srflx appearing and lapsing) must not be able to tear its carrier
+    /// down every netmap tick.
+    derp_regrade_at: HashMap<ObjectId, Instant>,
 }
 
 impl RelayCoordinator {
@@ -269,6 +297,7 @@ impl RelayCoordinator {
             forced_derp_until: HashMap::new(),
             regional_muxes: HashMap::new(),
             forced_urls: HashMap::new(),
+            derp_regrade_at: HashMap::new(),
         }
     }
 
@@ -459,6 +488,51 @@ impl RelayCoordinator {
             return RelayStrategy::Derp;
         }
         RelayStrategy::BothAllocate
+    }
+
+    /// An **established** DERP link whose strategy inputs have since changed:
+    /// the pair should be re-established on a better relay tier.
+    ///
+    /// `maybe_complete`'s flip-recompute only runs while `is_tracking`, and
+    /// `try_build_derp` drops the peer from `derping` the moment the link is
+    /// BUILT — so a DERP carrier established while both ends looked UDP-blocked
+    /// was frozen there for the life of the link. That is exactly what the
+    /// fleet hit on 2026-08-06: coturn had been answering STUN with `TTL=1`, so
+    /// every node gathered an empty `srflx_endpoints` and every pair read as
+    /// both-UDP-blocked ⇒ DERP. Once the TTL fix restored srflx, pairs with a
+    /// public reflexive address on BOTH ends stayed on DERP indefinitely,
+    /// because nothing re-asked the question after the link was up.
+    ///
+    /// `roles` survives the build (only `forget` clears it), so it still holds
+    /// the strategy the link was established with — that is the comparison
+    /// point. A force-DERP pin keeps this false for free: `relay_strategy`
+    /// checks the pin FIRST and keeps returning `Derp`.
+    ///
+    /// ⚠️ The regrade is **break-before-make** (same as the P7 force-DERP
+    /// teardown/rebuild it mirrors): the caller drops a WORKING carrier to
+    /// rebuild it on the new tier. Hence the cooldown, and hence the caller's
+    /// requirement that no direct probe be in flight — a pair that oscillates
+    /// must cost at most one disturbance per [`DERP_REGRADE_COOLDOWN`].
+    pub fn derp_regrade_due(
+        &mut self,
+        node_id: &ObjectId,
+        peer: &PeerConfig,
+        now: Instant,
+    ) -> bool {
+        // Established ON Derp, and not mid-establishment (the tracked window
+        // belongs to `maybe_complete`'s recompute, which heals it in place).
+        if self.roles.get(node_id) != Some(&RelayStrategy::Derp) || self.is_tracking(node_id) {
+            return false;
+        }
+        if matches!(self.relay_strategy(node_id, peer), RelayStrategy::Derp) {
+            return false;
+        }
+        if self.derp_regrade_at.get(node_id).is_some_and(|&t| now < t) {
+            return false;
+        }
+        self.derp_regrade_at
+            .insert(*node_id, now + DERP_REGRADE_COOLDOWN);
+        true
     }
 
     /// rc.307 (B) — the control-WS died between a relay REQUEST and its
@@ -1387,6 +1461,82 @@ mod tests {
     }
 
     // ───────────────────── Phase D — DERP tier selection ─────────────────────
+
+    /// An ESTABLISHED DERP link is re-graded once srflx settles — the gap that
+    /// left the whole fleet on DERP after the coturn TTL fix restored srflx
+    /// (2026-08-06). `maybe_complete`'s flip-recompute only fires while the peer
+    /// is still tracked, and `try_build_derp` untracks it at build time.
+    #[test]
+    fn established_derp_regrades_once_srflx_settles() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let blocked = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec![],
+            ..base_peer()
+        };
+        // Same peer, now advertising a public reflexive address.
+        let udp_ok = PeerConfig {
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..blocked.clone()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        let t0 = Instant::now();
+
+        // Nothing established yet ⇒ nothing to regrade.
+        assert!(!c.derp_regrade_due(&nid, &udp_ok, t0));
+
+        // Establish on DERP, then BUILD it — the build untracks the peer
+        // (`derping` cleared) while `roles` keeps the established strategy.
+        c.roles.insert(nid, RelayStrategy::Derp);
+        c.derping.insert(nid, blocked.clone());
+        assert!(c.try_build_derp(&nid).is_some());
+        assert!(!c.is_tracking(&nid), "build must untrack the peer");
+
+        // Peer still UDP-blocked ⇒ DERP is still right ⇒ no churn.
+        assert!(!c.derp_regrade_due(&nid, &blocked, t0));
+        // srflx arrived ⇒ single-relay now beats DERP ⇒ regrade.
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t0));
+        // …but only once per cooldown, so an oscillating pair can't tear its
+        // carrier down every netmap tick.
+        assert!(!c.derp_regrade_due(&nid, &udp_ok, t0));
+        assert!(!c.derp_regrade_due(
+            &nid,
+            &udp_ok,
+            t0 + DERP_REGRADE_COOLDOWN - Duration::from_secs(1)
+        ));
+        // Allowed again once the cooldown has fully elapsed.
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t0 + DERP_REGRADE_COOLDOWN));
+    }
+
+    /// A server force-DERP pin (P7) outranks the regrade: `relay_strategy`
+    /// checks the pin first, so a pinned pair keeps answering `Derp` and is
+    /// never torn off the tier the server just escalated it onto.
+    #[test]
+    fn forced_derp_pin_suppresses_the_regrade() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let udp_ok = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        c.roles.insert(nid, RelayStrategy::Derp);
+        // Pinned by the server ⇒ suppressed even though srflx says otherwise.
+        c.force_derp(nid, Duration::from_secs(300), None);
+        assert!(!c.derp_regrade_due(&nid, &udp_ok, Instant::now()));
+    }
 
     #[test]
     fn relay_strategy_falls_to_derp_only_when_both_udp_blocked() {
