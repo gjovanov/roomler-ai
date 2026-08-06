@@ -631,6 +631,79 @@ impl OverlayRuntime {
         removed
     }
 
+    /// Re-establish a peer stuck on an **established DERP** carrier whose
+    /// strategy inputs have since improved (the peer's — or our own — srflx
+    /// arrived after the link was built), so the pair moves DERP → TURN.
+    ///
+    /// Called only from the installed-on-relay arm of [`Self::install_peers`],
+    /// and only on the paths that would otherwise KEEP the relay: a direct tier
+    /// beats every relay tier, so an available direct upgrade always wins and
+    /// this never competes with it. `RelayCoordinator::derp_regrade_due` owns
+    /// the decision (and its cooldown); this owns the mechanics, which mirror
+    /// the P7 force-DERP teardown/rebuild in the other direction.
+    ///
+    /// Returns whether a regrade was performed.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn maybe_regrade_derp(
+        &self,
+        node_id: ObjectId,
+        cfg: &PeerConfig,
+        pk: &[u8; 32],
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        tun: &Arc<dyn TunIo>,
+        relay: &mut Option<RelayCoordinator>,
+        relay_bq: &mut RelayBuildQueue,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        now: Instant,
+    ) -> bool {
+        // Only an installed DERP carrier is in scope, and never while a
+        // make-before-break direct probe is in flight — that probe may be about
+        // to retire the relay entirely, and tearing the peer down here would
+        // drop its shadow carrier with it.
+        if by_node.get(&node_id).and_then(|e| e.relay_kind)
+            != Some(crate::overlay::relay_link::RelayKind::Derp)
+            || wg.has_direct_probe(pk)
+        {
+            return false;
+        }
+        if !relay
+            .as_mut()
+            .is_some_and(|r| r.derp_regrade_due(&node_id, cfg, now))
+        {
+            return false;
+        }
+        info!(
+            peer = %node_id,
+            "overlay relay: DERP no longer the best tier for this pair (srflx settled since it was built) — re-establishing"
+        );
+        // `PeerRoute::Keep`: the peer's overlay IP is unchanged and we reinstall
+        // immediately, so dropping and re-adding its OS route would only blip
+        // the data path.
+        self.remove_peer_state(
+            node_id,
+            wg,
+            by_node,
+            tun,
+            relay,
+            relay_bq,
+            None,
+            upgrade_probes,
+            PeerRoute::Keep,
+        )
+        .await;
+        if let Some(r) = relay.as_mut() {
+            r.request(node_id, cfg.clone()).await;
+            // A DERP→single-relay DIALER build can complete synchronously off
+            // the netmap we already hold; an ANCHOR/both-allocate needs the
+            // server's grant and lands later via the alloc queue.
+            if let Some(link) = r.maybe_complete(node_id, cfg) {
+                self.install_ready(wg, by_node, tun, link, relay_bq).await;
+            }
+        }
+        true
+    }
+
     /// A full EVICTION: [`Self::remove_peer_state`] plus the netmap/monitor
     /// bookkeeping that only makes sense when the peer is GONE (as opposed to
     /// being re-installed).
@@ -1102,6 +1175,23 @@ impl OverlayRuntime {
                             // unavailable, or one already in flight) = keep
                             // the relay; record the decision.
                             record("install_peers:upgrade", path::PathAction::Keep);
+                            // …but "keep the relay" must not mean "keep the
+                            // WRONG relay tier": a DERP carrier built while the
+                            // pair looked both-UDP-blocked is re-graded here
+                            // once srflx says otherwise.
+                            self.maybe_regrade_derp(
+                                np.node_id,
+                                &cfg,
+                                &pk,
+                                wg,
+                                by_node,
+                                tun,
+                                relay,
+                                relay_bq,
+                                upgrade_probes,
+                                now,
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -1155,8 +1245,23 @@ impl OverlayRuntime {
                         self.install_srflx_direct(wg, by_node, tun, ctx, np.node_id, &cfg, dst)
                             .await;
                     } else {
-                        // P3 PR-A — nothing dialable: the relay stays.
+                        // P3 PR-A — nothing dialable: the relay stays. Same as
+                        // the make-before-break arm above — the relay staying
+                        // still leaves the DERP-vs-TURN question to re-ask.
                         record("install_peers:upgrade", path::PathAction::Keep);
+                        self.maybe_regrade_derp(
+                            np.node_id,
+                            &cfg,
+                            &pk,
+                            wg,
+                            by_node,
+                            tun,
+                            relay,
+                            relay_bq,
+                            upgrade_probes,
+                            now,
+                        )
+                        .await;
                     }
                     continue;
                 }
@@ -1838,10 +1943,7 @@ impl OverlayRuntime {
                 initiated: true,
                 carrier_local: relay_local,
                 carrier_dst: relay_dst,
-                relay_kind_dbg: (!is_direct).then_some(match link.relay_kind {
-                    crate::overlay::relay_link::RelayKind::Turn => "turn",
-                    crate::overlay::relay_link::RelayKind::Derp => "derp",
-                }),
+                relay_kind: (!is_direct).then_some(link.relay_kind),
                 relay_local,
                 relay_dst,
                 // A relay carrier, or the loopback carrier used in Direct/test
