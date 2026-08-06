@@ -4,7 +4,11 @@ RUN apt-get update && apt-get install -y libclang-dev cmake python3-pip && rm -r
 RUN rustup component add rustfmt
 WORKDIR /app
 COPY . .
-RUN cargo build --release --bin roomler-ai-api
+# `derp-relay` rides along so the SAME image can run as the central
+# coturn workers' `/stats` sidecar (stats follow-up): one image, two
+# binaries, no second build+push pipeline. A few MB, and it keeps the
+# stats producer byte-identical between the PoPs and the central fleet.
+RUN cargo build --release --bin roomler-ai-api --bin derp-relay
 
 # --- Stage 2: Vue SPA build ---
 FROM oven/bun:1 AS ui-builder
@@ -18,6 +22,7 @@ RUN bun run build
 FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y ca-certificates nginx && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/roomler-ai-api /usr/local/bin/
+COPY --from=builder /app/target/release/derp-relay /usr/local/bin/
 COPY --from=ui-builder /app/ui/dist /var/www/roomler-ai
 COPY files/nginx-pod.conf /etc/nginx/conf.d/default.conf
 RUN rm -f /etc/nginx/sites-enabled/default
