@@ -196,6 +196,21 @@ impl OverlayNodeDao {
     /// deliberately KEPT — the tombstone is the record of who held an address,
     /// which matters precisely because addresses now recycle. Uniqueness on the
     /// IP and the name is scoped to live rows, so a tombstone holds neither.
+    /// Every live node's overlay address, across ALL tenants.
+    ///
+    /// Cross-tenant on purpose: the block registry is global, so "is this
+    /// range still occupied?" is a global question. Only the reclaim path
+    /// asks it, and only when an operator does.
+    pub async fn all_live_overlay_ips(&self) -> DaoResult<Vec<String>> {
+        Ok(self
+            .base
+            .find_many(doc! { "deleted_at": null }, None)
+            .await?
+            .into_iter()
+            .map(|n| n.overlay_ip)
+            .collect())
+    }
+
     pub async fn release(&self, node_id: ObjectId) -> DaoResult<Option<OverlayNode>> {
         let now = DateTime::now();
         Ok(self
