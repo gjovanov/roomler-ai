@@ -59,6 +59,35 @@ use roomler_ai_remote_control::worker_pick::pick_worker_fnv1a;
 /// keeping a genuinely-stuck pair recoverable without an agent restart.
 const DERP_REGRADE_COOLDOWN: Duration = Duration::from_secs(600);
 
+/// How soon after a regrade a server force-DERP pin still counts as the server
+/// OVERRULING that regrade (see [`RelayCoordinator::note_regrade_overruled`]).
+///
+/// Field-measured: every overruled regrade on NEO16 drew its pin 2m45s–4m14s
+/// later — the churn has to happen before the server can see it. Ten minutes
+/// covers that with margin without swallowing an unrelated later escalation.
+const REGRADE_OVERRULE_WINDOW: Duration = Duration::from_secs(600);
+
+/// Backoff after consecutive OVERRULED regrades for the same peer, indexed by
+/// strike count.
+///
+/// Without this the flat [`DERP_REGRADE_COOLDOWN`] is useless against the P7
+/// pin, because the pin (1800 s) always outlives it: the pin expires, the
+/// regrade re-fires seconds later, TURN churns again, the server re-pins —
+/// a permanent ~30-minute cycle on pairs that were previously STABLE on DERP.
+/// Observed on NEO16 2026-08-07: neo16-wsl's pin lapsed at 09:32:01 and the
+/// regrade re-fired at 09:32:16, 15 s later.
+///
+/// So the first strike must exceed the pin TTL, and repeats must decay hard.
+/// A pair that truly cannot carry TURN converges on one cheap retry a day —
+/// still self-correcting if its network changes — while a pair that can is
+/// unaffected, because a regrade that is NOT overruled never books a strike.
+const REGRADE_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(2_400),  // 40 min — clears the 30-min pin with margin
+    Duration::from_secs(7_200),  // 2 h
+    Duration::from_secs(28_800), // 8 h
+    Duration::from_secs(86_400), // 24 h
+];
+
 /// Which relay carrier a [`ReadyLink`] rides. `install_ready` gates the
 /// QUIC-over-relay upgrade on `Turn`: a `Derp` link is RAW WG over the
 /// pubkey-addressed `/derp` WS relay — v1 never rides QUIC-over-DERP (QUIC over
@@ -260,6 +289,12 @@ pub struct RelayCoordinator {
     /// (srflx appearing and lapsing) must not be able to tear its carrier
     /// down every netmap tick.
     derp_regrade_at: HashMap<ObjectId, Instant>,
+    /// When the last regrade FIRED for a peer, so a subsequent force-DERP pin
+    /// can be attributed to it ([`note_regrade_overruled`](Self::note_regrade_overruled)).
+    derp_regrade_last: HashMap<ObjectId, Instant>,
+    /// Consecutive regrades for a peer that the server overruled with a pin.
+    /// Indexes [`REGRADE_BACKOFF`]; cleared once a regrade survives.
+    derp_regrade_strikes: HashMap<ObjectId, usize>,
 }
 
 impl RelayCoordinator {
@@ -298,6 +333,8 @@ impl RelayCoordinator {
             regional_muxes: HashMap::new(),
             forced_urls: HashMap::new(),
             derp_regrade_at: HashMap::new(),
+            derp_regrade_last: HashMap::new(),
+            derp_regrade_strikes: HashMap::new(),
         }
     }
 
@@ -389,6 +426,9 @@ impl RelayCoordinator {
             peer = %node_id, ttl_s = ttl.as_secs(),
             "overlay relay: pair force-pinned to DERP (server escalation — TURN churn)"
         );
+        // If this pin lands right after WE moved the pair off DERP, the churn
+        // it is reacting to is ours — back off before trying that again.
+        self.note_regrade_overruled(&node_id, Instant::now());
         let peer_cfg = if let Some(pp) = self.pending.remove(&node_id) {
             Some(pp.peer)
         } else if let Some(p) = self.dialing.remove(&node_id) {
@@ -530,9 +570,66 @@ impl RelayCoordinator {
         if self.derp_regrade_at.get(node_id).is_some_and(|&t| now < t) {
             return false;
         }
-        self.derp_regrade_at
-            .insert(*node_id, now + DERP_REGRADE_COOLDOWN);
+        // `derp_regrade_last` means "a regrade is awaiting judgement": an
+        // overrule CONSUMES it (guilty), so an entry still here once the
+        // attribution window has passed was acquitted — that regrade held, and
+        // the peer starts fresh. Otherwise a pair that recovers (its network
+        // changed) would stay stuck on yesterday's backoff forever.
+        //
+        // Judging on age ALONE would be wrong: after a strike the next attempt
+        // is deliberately far in the future, so every overruled regrade would
+        // also look "old" by the time we asked again and would silently reset
+        // its own strike — the backoff could never escalate past 1.
+        if self
+            .derp_regrade_last
+            .remove(node_id)
+            .is_some_and(|t| now.saturating_duration_since(t) > REGRADE_OVERRULE_WINDOW)
+        {
+            self.derp_regrade_strikes.remove(node_id);
+        }
+        let wait = match self.derp_regrade_strikes.get(node_id) {
+            Some(&s) => REGRADE_BACKOFF[s.min(REGRADE_BACKOFF.len() - 1)],
+            None => DERP_REGRADE_COOLDOWN,
+        };
+        self.derp_regrade_at.insert(*node_id, now + wait);
+        self.derp_regrade_last.insert(*node_id, now);
         true
+    }
+
+    /// The server force-pinned a pair to DERP right after we re-graded it off
+    /// DERP — i.e. the tier we moved it to churned, and the server's P7
+    /// escalation overruled us. Book a strike so the next attempt for this peer
+    /// waits [`REGRADE_BACKOFF`] rather than the flat cooldown.
+    ///
+    /// Without this the two mechanisms fight forever: the pin (1800 s) outlives
+    /// the 600 s cooldown, so the instant it lapses the regrade re-fires,
+    /// re-churns, and is re-pinned — a ~30-minute cycle that makes a pair which
+    /// was STABLE on DERP permanently unstable. Field-observed on NEO16
+    /// (neo16-wsl, regal, clk00017265) within an hour of the rc.314 rollout.
+    ///
+    /// Called from [`force_derp`](Self::force_derp), which is the only place a
+    /// pin is applied; a pin for a peer we did NOT just regrade is left alone.
+    fn note_regrade_overruled(&mut self, node_id: &ObjectId, now: Instant) {
+        if self
+            .derp_regrade_last
+            .get(node_id)
+            .is_none_or(|&t| now.saturating_duration_since(t) > REGRADE_OVERRULE_WINDOW)
+        {
+            return;
+        }
+        // Consume the pending judgement — this regrade is convicted, so it
+        // must not later be mistaken for one that held (see `derp_regrade_due`).
+        self.derp_regrade_last.remove(node_id);
+        let strikes = self.derp_regrade_strikes.entry(*node_id).or_insert(0);
+        let idx = (*strikes).min(REGRADE_BACKOFF.len() - 1);
+        let wait = REGRADE_BACKOFF[idx];
+        *strikes = strikes.saturating_add(1);
+        let strikes = *strikes;
+        self.derp_regrade_at.insert(*node_id, now + wait);
+        info!(
+            peer = %node_id, strikes, backoff_s = wait.as_secs(),
+            "overlay relay: server overruled our DERP regrade — backing off before retrying this pair"
+        );
     }
 
     /// rc.307 (B) — the control-WS died between a relay REQUEST and its
@@ -1512,6 +1609,114 @@ mod tests {
         ));
         // Allowed again once the cooldown has fully elapsed.
         assert!(c.derp_regrade_due(&nid, &udp_ok, t0 + DERP_REGRADE_COOLDOWN));
+    }
+
+    /// The regrade↔pin churn loop measured on NEO16 on 2026-08-07: the P7 pin
+    /// (1800 s) outlives the flat 600 s cooldown, so the moment it lapsed the
+    /// regrade re-fired (15 s later, in the field), re-churned TURN, and was
+    /// re-pinned — forever, on pairs that had been STABLE on DERP.
+    /// A pin that lands right after our own regrade must book a strike.
+    #[test]
+    fn overruled_regrade_backs_off_past_the_pin() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let udp_ok = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        c.roles.insert(nid, RelayStrategy::Derp);
+
+        let t0 = Instant::now();
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t0), "first regrade fires");
+
+        // ~3 min later the server pins the pair — that is our churn.
+        c.note_regrade_overruled(&nid, t0 + Duration::from_secs(180));
+        assert_eq!(c.derp_regrade_strikes.get(&nid), Some(&1));
+
+        // The pin lapses at +1800 s. Pre-fix the regrade re-fired here.
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(
+            !c.derp_regrade_due(&nid, &udp_ok, t0 + Duration::from_secs(1_815)),
+            "must NOT re-fire the moment the 30-min pin lapses"
+        );
+        // First backoff (40 min from the pin) has to clear it.
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t0 + Duration::from_secs(180 + 2_400)));
+
+        // A second overrule escalates further, past the previous backoff.
+        let t2 = t0 + Duration::from_secs(180 + 2_400);
+        c.note_regrade_overruled(&nid, t2 + Duration::from_secs(180));
+        assert_eq!(c.derp_regrade_strikes.get(&nid), Some(&2));
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(!c.derp_regrade_due(&nid, &udp_ok, t2 + Duration::from_secs(2_400)));
+    }
+
+    /// A regrade the server never overruled counts as having HELD: the peer's
+    /// strikes reset, so a pair whose network later recovers is not stuck on
+    /// yesterday's 24 h backoff forever.
+    #[test]
+    fn surviving_regrade_clears_the_backoff() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let udp_ok = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t0 = Instant::now();
+
+        // Two overruled regrades put the peer deep into the backoff.
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t0));
+        c.note_regrade_overruled(&nid, t0 + Duration::from_secs(120));
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t1 = t0 + Duration::from_secs(3_000);
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t1));
+        c.note_regrade_overruled(&nid, t1 + Duration::from_secs(120));
+        assert_eq!(c.derp_regrade_strikes.get(&nid), Some(&2));
+
+        // The next regrade is NOT overruled — it survives the window.
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t2 = t1 + Duration::from_secs(7_500);
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t2));
+        // Asking again well after the window judges that regrade as held.
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t3 = t2 + Duration::from_secs(30_000);
+        assert!(c.derp_regrade_due(&nid, &udp_ok, t3));
+        assert!(
+            !c.derp_regrade_strikes.contains_key(&nid),
+            "a regrade that held must clear the backoff"
+        );
+    }
+
+    /// A pin for a peer we did NOT just regrade is somebody else's escalation —
+    /// it must not book a strike against us.
+    #[test]
+    fn unrelated_pin_books_no_strike() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        // Never regraded at all.
+        c.note_regrade_overruled(&nid, Instant::now());
+        assert!(!c.derp_regrade_strikes.contains_key(&nid));
+        // Regraded, but far outside the attribution window.
+        let t0 = Instant::now();
+        c.derp_regrade_last.insert(nid, t0);
+        c.note_regrade_overruled(&nid, t0 + REGRADE_OVERRULE_WINDOW + Duration::from_secs(1));
+        assert!(!c.derp_regrade_strikes.contains_key(&nid));
     }
 
     /// A server force-DERP pin (P7) outranks the regrade: `relay_strategy`
