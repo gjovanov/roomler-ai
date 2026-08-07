@@ -34,7 +34,7 @@ use roomler_ai_db::models::role::permissions;
 // ── Guards ──────────────────────────────────────────────────────────────
 
 /// Platform-operator gate. 404 by design (see module docs).
-fn require_platform_admin(state: &AppState, auth: &AuthUser) -> Result<(), ApiError> {
+pub(crate) fn require_platform_admin(state: &AppState, auth: &AuthUser) -> Result<(), ApiError> {
     if state.platform_admins.contains(&auth.user_id) {
         Ok(())
     } else {
@@ -45,7 +45,7 @@ fn require_platform_admin(state: &AppState, auth: &AuthUser) -> Result<(), ApiEr
 /// Tenant-scope gate: membership (+ optionally MANAGE_AGENTS). Failures
 /// are 404, not 403 — the web client wipes tokens on 403, and a member
 /// removed from the org mid-poll must not be logged out of everything.
-async fn require_tenant_stats(
+pub(crate) async fn require_tenant_stats(
     state: &AppState,
     tenant_id: ObjectId,
     user_id: ObjectId,
@@ -62,7 +62,7 @@ async fn require_tenant_stats(
     Ok(())
 }
 
-fn parse_tid(tenant_id: &str) -> Result<ObjectId, ApiError> {
+pub(crate) fn parse_tid(tenant_id: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(tenant_id).map_err(|_| ApiError::BadRequest("Invalid tenant_id".into()))
 }
 
@@ -79,7 +79,7 @@ pub struct RangeQuery {
 }
 
 /// (window secs, tier). Tier picks the source collection suffix.
-fn range_spec(range: Option<&str>) -> Result<(i64, Tier), ApiError> {
+pub(crate) fn range_spec(range: Option<&str>) -> Result<(i64, Tier), ApiError> {
     match range.unwrap_or("24h") {
         "24h" => Ok((86_400, Tier::Raw)),
         "7d" => Ok((7 * 86_400, Tier::Hour)),
@@ -92,13 +92,13 @@ fn range_spec(range: Option<&str>) -> Result<(i64, Tier), ApiError> {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Tier {
+pub(crate) enum Tier {
     Raw,
     Hour,
     Day,
 }
 
-fn floor_dt(window_secs: i64) -> DateTime {
+pub(crate) fn floor_dt(window_secs: i64) -> DateTime {
     DateTime::from_millis(DateTime::now().timestamp_millis() - window_secs * 1000)
 }
 
@@ -112,11 +112,11 @@ fn bucket_expr(tier: Tier) -> Document {
 }
 
 /// `_id` (a date) → `t` unix seconds.
-fn t_secs() -> Document {
+pub(crate) fn t_secs() -> Document {
     doc! { "$toLong": { "$divide": [ { "$toLong": "$_id" }, 1000 ] } }
 }
 
-async fn agg(
+pub(crate) async fn agg(
     state: &AppState,
     coll: &str,
     pipeline: Vec<Document>,
@@ -138,7 +138,7 @@ async fn agg(
     Ok(out)
 }
 
-fn disabled_payload() -> Json<serde_json::Value> {
+pub(crate) fn disabled_payload() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "enabled": false }))
 }
 

@@ -137,7 +137,12 @@ pub async fn run_media_sample_once(state: &AppState, turn_ips: &HashSet<IpAddr>)
         let mut recv_bps = 0f64; // clients → SFU (their upload)
         let mut loss_sum = 0f64;
         let mut loss_n = 0u32;
-        for (_user, s, r) in &results {
+        // Per-participant rows for the usage ledger (wave 3). The room
+        // totals below are sums of exactly these, so the two can never
+        // disagree — and unlike the room bucket, this one can answer
+        // "how much did THIS user move", which usage accounting needs.
+        let mut per_user: Vec<(ObjectId, f64, f64)> = Vec::with_capacity(results.len());
+        for (user, s, r) in &results {
             participants += 1;
             let s_ip = stat_of(s)
                 .and_then(|st| st.ice_selected_tuple.as_ref())
@@ -150,16 +155,24 @@ pub async fn run_media_sample_once(state: &AppState, turn_ips: &HashSet<IpAddr>)
             {
                 relayed += 1;
             }
+            // Named from the USER's side: their upload is what the SFU
+            // receives on their send transport, their download is what it
+            // sends on their recv transport.
+            let mut up_bps = 0f64;
+            let mut down_bps = 0f64;
             if let Some(st) = stat_of(s) {
-                recv_bps += f64::from(st.recv_bitrate);
+                up_bps = f64::from(st.recv_bitrate);
+                recv_bps += up_bps;
                 if let Some(l) = st.rtp_packet_loss_received {
                     loss_sum += l;
                     loss_n += 1;
                 }
             }
             if let Some(st) = stat_of(r) {
-                send_bps += f64::from(st.send_bitrate);
+                down_bps = f64::from(st.send_bitrate);
+                send_bps += down_bps;
             }
+            per_user.push((*user, up_bps, down_bps));
         }
         let loss_pct = if loss_n > 0 {
             loss_sum / f64::from(loss_n) * 100.0
@@ -200,6 +213,18 @@ pub async fn run_media_sample_once(state: &AppState, turn_ips: &HashSet<IpAddr>)
             && let Err(e) = state.stats.max_call_peak(cid, participants).await
         {
             debug!(room = %room_id, %e, "media sampler: peak update failed");
+        }
+        // Per-participant rows. A failure here is logged and skipped, never
+        // fatal to the tick — the room bucket is already durable, and one
+        // missing usage sample must not cost the whole room's series.
+        for (user, up_bps, down_bps) in per_user {
+            if let Err(e) = state
+                .stats
+                .upsert_call_user_sample(tenant_id, room_id, call_id, user, unix, up_bps, down_bps)
+                .await
+            {
+                debug!(room = %room_id, user = %user, %e, "media sampler: per-user upsert failed");
+            }
         }
         sampled += 1;
     }

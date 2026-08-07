@@ -582,13 +582,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/orgs", get(routes::stats::admin_orgs))
         .route("/users", get(routes::stats::admin_users))
         .route("/machines", get(routes::stats::admin_machines))
-        .route("/calls", get(routes::stats::admin_calls));
+        .route("/calls", get(routes::stats::admin_calls))
+        // Wave 3 — per-user usage. `/usage/{uid}` spans every org, which is
+        // what makes "in which org did this happen" answerable.
+        .route("/usage", get(routes::usage::admin_usage))
+        .route("/usage/{user_id}", get(routes::usage::admin_usage_detail));
     let tenant_stats_routes = Router::new()
         .route("/overview", get(routes::stats::tenant_overview))
         .route("/mesh", get(routes::stats::tenant_mesh))
         .route("/machines", get(routes::stats::tenant_machines))
         .route("/calls", get(routes::stats::tenant_calls))
-        .route("/tunnels", get(routes::stats::tenant_tunnels));
+        .route("/tunnels", get(routes::stats::tenant_tunnels))
+        // `/usage` needs MANAGE_AGENTS (everyone's activity); `/usage/{uid}`
+        // is self-service for your OWN row, MANAGE_AGENTS for anyone else's.
+        .route("/usage", get(routes::usage::tenant_usage))
+        .route("/usage/{user_id}", get(routes::usage::tenant_usage_detail));
 
     // Compose API
     let api = Router::new()
