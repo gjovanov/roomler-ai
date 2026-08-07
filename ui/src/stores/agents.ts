@@ -419,6 +419,11 @@ export const useAgentStore = defineStore('agents', () => {
       already_enrolled: boolean
     }>
     supported: boolean
+    /** The daemon's TUN is already muxed, so a `tun` join reaches the mesh
+     *  live. False ⇒ the join still works, but the mesh waits for the next
+     *  daemon start (the agent can't re-open an adapter its primary org
+     *  already holds). Optional: older servers omit it. */
+    mesh_ready?: boolean
     online: boolean
   }> {
     return api.get(`/tenant/${tenantId}/agent/${agentId}/join-targets`)
@@ -432,7 +437,13 @@ export const useAgentStore = defineStore('agents', () => {
     agentId: string,
     targetTenantId: string,
     opts: { label?: string; overlayMode?: string } = {},
-  ): Promise<{ label: string; delivered: boolean; already_enrolled?: boolean }> {
+  ): Promise<{
+    label: string
+    delivered: boolean
+    already_enrolled?: boolean
+    /** A `tun` join whose mesh only comes up after a daemon restart. */
+    restart_required?: boolean
+  }> {
     return api.post(`/tenant/${tenantId}/agent/${agentId}/join-org`, {
       target_tenant_id: targetTenantId,
       ...(opts.label ? { label: opts.label } : {}),
