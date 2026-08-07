@@ -43,6 +43,65 @@ pub async fn status(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `roomler logs` — surface the S2 `TailLog` verb on the CLI.
+///
+/// The verb and the daemon side already existed; without a command in front of
+/// them the only way to read a remote agent's log was to guess its path through
+/// a shell, and that path is genuinely hard: it depends on whether the process
+/// carries a service role and, failing that, on which USER it runs as. A
+/// Windows host therefore has three plausible `roomlerd.log*` files and two are
+/// decoys — the SCM supervisor's (~30 lines/day, no overlay events) and the
+/// updater's (a few KB, written only at update time). On 2026-08-07 that cost a
+/// wrong "the agent's logging is dead" conclusion.
+///
+/// The daemon opened the file, so it is the only thing that reliably knows.
+/// Composes with Fleet RPC: `roomler exec <host> -- roomler logs --grep ICE`.
+/// The resolved path is always printed — remotely, that IS half the answer.
+pub async fn logs(
+    source: String,
+    max_bytes: Option<u64>,
+    grep: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let (path, size, content) = client
+        .tail_log(&source, max_bytes)
+        .await
+        .map_err(daemon_err)?;
+    // Filter client-side: the daemon's verb is a byte-bounded tail, and
+    // narrowing there would silently change what "the last N bytes" means.
+    let body: String = match &grep {
+        Some(g) => {
+            let needle = g.to_lowercase();
+            content
+                .lines()
+                .filter(|l| l.to_lowercase().contains(&needle))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        None => content,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": path, "size": size, "content": body,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("{path}  ({size} bytes total)");
+    if body.is_empty() {
+        println!(
+            "(no matching lines{})",
+            grep.map(|g| format!(" for {g:?}")).unwrap_or_default()
+        );
+    } else {
+        println!("{body}");
+    }
+    Ok(())
+}
+
 /// `roomler peers` — every peer this node sees, with its live connection type.
 pub async fn peers(json: bool) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
