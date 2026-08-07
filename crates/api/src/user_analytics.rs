@@ -106,11 +106,13 @@ impl GeoIp {
         self.reader.is_some()
     }
 
-    /// ISO country code for an address, or `None` when unresolvable.
+    /// ISO country code for an address, or `None` when unresolvable —
+    /// an address the database doesn't cover is a normal outcome, not an
+    /// error worth logging on every connection.
     pub fn country(&self, ip: IpAddr) -> Option<String> {
         let r = self.reader.as_ref()?;
-        let c: maxminddb::geoip2::Country = r.lookup(ip).ok()??;
-        c.country?.iso_code.map(str::to_string)
+        let looked: maxminddb::geoip2::Country = r.lookup(ip).ok()?;
+        looked.country?.iso_code.map(str::to_string)
     }
 }
 
