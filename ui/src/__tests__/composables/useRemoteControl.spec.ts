@@ -50,6 +50,7 @@ import {
   decideKeyAction,
   RC_RECONNECT_LADDER_MS,
   nextReconnectDelayMs,
+  deadAirDelayMs,
   RC_PC_DISCONNECTED_GRACE_MS,
   RC_SIGNALING_TIMEOUT_MS,
   RC_WATCHDOG_TICK_MS,
@@ -2148,6 +2149,42 @@ describe('apps wire builders', () => {
     })
     expect(appsLaunchWireMessage('a1', '')).toBeNull()
     expect(appsLaunchWireMessage('', 'bash')).toBeNull()
+  })
+})
+
+describe('deadAirDelayMs', () => {
+  it('stays out of the way for the first couple of frameless cycles', () => {
+    // A lock-screen / SYSTEM-context handoff or a codec renegotiation can
+    // legitimately produce one frameless session; those must still recover at
+    // ladder speed, so the dead-air floor is zero until the pattern repeats.
+    expect(deadAirDelayMs(0)).toBe(0)
+    expect(deadAirDelayMs(1)).toBe(0)
+    expect(deadAirDelayMs(2)).toBe(0)
+  })
+
+  it('backs off to minutes once dead air is clearly the steady state', () => {
+    // From the 3rd consecutive frameless session the pair almost certainly has
+    // no media path at all (pc50045: 388 sessions in 24 h, each ~10.9 s of
+    // dead air). Retrying every ~19 s buys nothing.
+    expect(deadAirDelayMs(3)).toBe(30_000)
+    expect(deadAirDelayMs(4)).toBe(60_000)
+    expect(deadAirDelayMs(5)).toBe(120_000)
+    expect(deadAirDelayMs(6)).toBe(300_000)
+  })
+
+  it('caps rather than growing without bound, and never returns a negative', () => {
+    expect(deadAirDelayMs(7)).toBe(300_000)
+    expect(deadAirDelayMs(10_000)).toBe(300_000)
+    expect(deadAirDelayMs(-1)).toBe(0)
+  })
+
+  it('dominates the connection ladder exactly when it should', () => {
+    // The scheduler takes Math.max of the two. Early on the fast ladder wins
+    // (recovery stays quick); once dead air repeats, the floor takes over.
+    expect(Math.max(nextReconnectDelayMs(0), deadAirDelayMs(1))).toBe(250)
+    expect(Math.max(nextReconnectDelayMs(5), deadAirDelayMs(2))).toBe(8000)
+    expect(Math.max(nextReconnectDelayMs(5), deadAirDelayMs(3))).toBe(30_000)
+    expect(Math.max(nextReconnectDelayMs(100), deadAirDelayMs(6))).toBe(300_000)
   })
 })
 
