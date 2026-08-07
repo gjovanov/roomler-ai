@@ -130,6 +130,12 @@ pub struct StatsSettings {
     /// would turn a provider-asserted address into platform-root.
     /// Env: `ROOMLER__STATS__PLATFORM_ADMINS`.
     pub platform_admins: Option<String>,
+    /// Path to a MaxMind-format country database (GeoLite2 / DB-IP) for
+    /// the platform user analytics. Unset ⇒ every session records
+    /// `unknown` — an honest gap, never a guessed country. Deliberately
+    /// operator-supplied: no licensed dataset is vendored into the repo
+    /// or the image. Env: `ROOMLER__STATS__GEOIP_MMDB`.
+    pub geoip_mmdb: Option<String>,
 }
 
 impl Default for StatsSettings {
@@ -137,6 +143,7 @@ impl Default for StatsSettings {
         Self {
             enabled: true,
             platform_admins: None,
+            geoip_mmdb: None,
         }
     }
 }
@@ -562,6 +569,7 @@ impl Settings {
             .set_default("releases.cache_ttl_secs", 900)?
             .set_default("stats.enabled", true)?
             .set_default("stats.platform_admins", None::<String>)?
+            .set_default("stats.geoip_mmdb", None::<String>)?
             .set_default("overlay.blocks_enabled", false)?
             .set_default("overlay.block_prefix", 22)?
             .set_default("overlay.block_version_floor", "0.3.0-rc.301")?
