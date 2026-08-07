@@ -74,6 +74,13 @@ struct PortEntry {
     org: String,
     /// The org's own block, from registration. Also a demux entry.
     block: V4Entry,
+    /// The org's own address on the shared device — the exact thing
+    /// `add_address_sync` assigned, so teardown can hand back the SAME
+    /// value. Distinct from [`Self::block`], which is masked to the block
+    /// base and is a routing key, not an address: `ip addr del 100.66.0.0/22`
+    /// deletes nothing when the interface holds `100.66.0.7/22`, and the
+    /// failure is silent (the CI kernel test caught exactly that).
+    self_ip: Ipv4Addr,
     /// Live v4 routes this org's runtime installed (peer `/32`s, subnet
     /// routes, the v4 split-default halves).
     v4: Vec<V4Entry>,
@@ -189,6 +196,7 @@ impl TunMux {
             st.ports.push(PortEntry {
                 org: org.to_string(),
                 block,
+                self_ip,
                 v4: Vec::new(),
                 v6: Vec::new(),
                 tx,
@@ -228,7 +236,10 @@ impl TunMux {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let idx = st.ports.iter().position(|p| p.org == org)?;
         let port = st.ports.remove(idx);
-        Some((Ipv4Addr::from(port.block.0), port.block.1))
+        // The org's own ADDRESS, not its block base — the caller hands this
+        // straight to `del_address_sync`, and deleting the base is a silent
+        // no-op that leaves the real address on the adapter forever.
+        Some((port.self_ip, port.block.1))
     }
 }
 
@@ -662,6 +673,35 @@ mod tests {
             "255.192.0.0".parse().unwrap(),
         );
         assert!(again.is_ok());
+    }
+
+    /// Deregistering hands back the org's OWN ADDRESS, not its block base.
+    ///
+    /// The caller feeds this straight to `del_address_sync`, and the two are
+    /// not interchangeable: `ip addr del 100.66.0.0/22` deletes nothing when
+    /// the interface holds `100.66.0.7/22`, and the failure is silent — the
+    /// address stays up forever, answering for an org that has left. The CI
+    /// kernel test caught it against a real device; this pins it without one.
+    #[tokio::test]
+    async fn deregister_returns_the_address_that_was_assigned() {
+        let (_feed, dev) = mock();
+        let mux = TunMux::new(dev);
+        let _p = mux
+            .register(
+                "orgA",
+                "100.66.0.7".parse().unwrap(),
+                "255.255.252.0".parse().unwrap(),
+            )
+            .unwrap();
+
+        let (addr, prefix) = mux.deregister("orgA").expect("registered org");
+        assert_eq!(
+            addr,
+            "100.66.0.7".parse::<Ipv4Addr>().unwrap(),
+            "the org's address, NOT its block base 100.66.0.0"
+        );
+        assert_eq!(prefix, 22);
+        assert!(mux.deregister("orgA").is_none(), "gone after the first");
     }
 
     /// Re-registration EOFs the old port (its runtime is stale) and the new
