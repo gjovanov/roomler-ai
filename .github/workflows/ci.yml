@@ -148,6 +148,32 @@ jobs:
         # default --workspace clippy never sees it. Lint it explicitly.
         run: cargo clippy -p roomler-agent --features overlay-l3 -- -D warnings
 
+      - name: Multi-org shared TUN against real kernel networking
+        # The mux's bookkeeping is unit-tested against a fake device; the half
+        # that touches the OS — a REFUSED registration leaving no address
+        # behind, a disjoint block really getting one, a released org really
+        # losing it — was never run against a kernel, because reproducing it
+        # in the field needs a third organization and there is no way to
+        # retire a throwaway one (docs/multi-org.md §12). A `tun` device is
+        # free here, so it runs on every push instead.
+        #
+        # Needs CAP_NET_ADMIN, hence sudo + the env opt-in (the test skips
+        # itself silently everywhere else, including developer machines).
+        # Built as the normal user and only RUN under sudo, so root never
+        # takes ownership of the shared cargo cache.
+        run: |
+          sudo modprobe tun || true
+          # Build FIRST with human diagnostics. The json pass below would
+          # otherwise swallow a compile error into records jq drops, leaving
+          # only an empty $BIN and "sudo: : command not found".
+          cargo test -p roomler-agent --features overlay-l3 --lib --no-run
+          BIN=$(cargo test -p roomler-agent --features overlay-l3 --lib \
+                  --no-run --message-format=json \
+                | jq -r 'select(.profile.test == true) | .executable' | head -1)
+          echo "test binary: $BIN"
+          sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" tun_kernel_tests \
+            --test-threads=1 --nocapture
+
   macos-overlay-check:
     # The agent's macOS build exists ONLY in release-agent.yml, so a
     # macOS-only compile error is invisible until an `agent-v*` tag is
