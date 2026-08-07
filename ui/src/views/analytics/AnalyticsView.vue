@@ -23,6 +23,7 @@
         <v-tab value="machines">Machines</v-tab>
         <v-tab value="calls">Calls</v-tab>
         <v-tab value="tunnels">Tunnels</v-tab>
+        <v-tab value="usage">People</v-tab>
       </v-tabs>
 
       <v-window v-model="tab">
@@ -206,6 +207,19 @@
             </v-col>
           </v-row>
         </v-window-item>
+
+        <v-window-item value="usage">
+          <v-card>
+            <v-card-title class="text-subtitle-1">Usage by person</v-card-title>
+            <v-card-subtitle>
+              Minutes and traffic per member. Select someone to see when they viewed which
+              machine.
+            </v-card-subtitle>
+            <v-card-text>
+              <usage-panel scope="org" :tenant-id="props.tenantId" :range="range" />
+            </v-card-text>
+          </v-card>
+        </v-window-item>
       </v-window>
     </template>
   </v-container>
@@ -218,6 +232,7 @@ import { useStatsStore, type SeriesPayload, type SeriesPoint } from '@/stores/st
 import { canQueryAnalytics } from '@/utils/permissions'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 import UptimeStrip from '@/components/stats/UptimeStrip.vue'
+import UsagePanel from '@/components/stats/UsagePanel.vue'
 import RangePicker, { type StatsRange } from '@/components/stats/RangePicker.vue'
 
 const props = defineProps<{ tenantId: string }>()
@@ -229,7 +244,7 @@ const allowed = computed(() =>
   canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
 )
 
-const tab = ref<'machines' | 'calls' | 'tunnels'>('machines')
+const tab = ref<'machines' | 'calls' | 'tunnels' | 'usage'>('machines')
 const range = ref<StatsRange>('7d')
 const machines = ref<SeriesPayload | null>(null)
 const calls = ref<SeriesPayload | null>(null)

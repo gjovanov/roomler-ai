@@ -318,6 +318,18 @@
           </v-card>
         </v-col>
       </v-row>
+
+      <!-- ── Per-user usage (every org) ──────────────────────────────── -->
+      <h2 class="text-h6 mt-6 mb-2">Usage by person</h2>
+      <v-card>
+        <v-card-subtitle class="pt-3">
+          Minutes and traffic per user across every org. Select someone to see when they
+          viewed which machine, and where.
+        </v-card-subtitle>
+        <v-card-text>
+          <usage-panel scope="platform" :range="range" />
+        </v-card-text>
+      </v-card>
     </template>
   </v-container>
 </template>
@@ -334,6 +346,7 @@ import {
 } from '@/stores/stats'
 import { usePolling } from '@/composables/usePolling'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
+import UsagePanel from '@/components/stats/UsagePanel.vue'
 import RangePicker, { type StatsRange } from '@/components/stats/RangePicker.vue'
 
 const authStore = useAuthStore()
