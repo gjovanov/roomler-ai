@@ -716,9 +716,32 @@ pub async fn tenant_mesh(
         stalled: bool,
         reports: u8,
     }
+    // The two ends of an edge arrive in DIFFERENT id spaces: a snapshot
+    // is keyed by the reporting AGENT, while the links inside it name
+    // peers by their OVERLAY NODE id (that's what the overlay runtime
+    // knows). Translate the reporter into node-space first, or every
+    // edge silently fails to match a node and the graph draws nothing.
+    let node_of_agent: HashMap<String, String> = nodes
+        .iter()
+        .filter_map(|n| {
+            Some((
+                n.get("agent_id_hex")?.as_str()?.to_string(),
+                n.get("id")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+
     let mut edges: HashMap<(String, String), Edge> = HashMap::new();
     for snap in &snapshots {
-        let Some(from) = snap.get("from").and_then(|v| v.as_str()) else {
+        let Some(from) = snap
+            .get("from")
+            .and_then(|v| v.as_str())
+            .and_then(|a| node_of_agent.get(a))
+            .map(String::as_str)
+        else {
+            // A snapshot from an agent with no live overlay node (left
+            // the mesh, or reported before joining) has nothing to
+            // anchor its edges to.
             continue;
         };
         let Some(links) = snap.get("links").and_then(|v| v.as_array()) else {
