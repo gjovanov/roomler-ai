@@ -338,6 +338,28 @@ RC session. Cross-org remote control means separate tabs.
 
 ---
 
+## 8b. Consent names the asking org (#356)
+
+A device in N orgs runs N signalling loops into one host, so "**Alice** is
+requesting to control this device" is only half the decision: the same person
+can be a colleague in one org and an outside contractor in another.
+
+`ServerMsg::Request` carries `tenant_name`, resolved in
+`resolve_session_authz` from the agent row it already loads (one extra tenant
+read, only on a real session request) and threaded through `SessionAuthz` →
+`DispatchCtx` → `create_session` — the path `consent_mode` and `input_mode`
+already take. The cross-pod `rc.cmd` relay forwards it too, so a
+foreign-homed device isn't left with an unlabelled prompt.
+
+The agent falls back to its own org **label** when the server sends nothing
+(older server), and to nothing at all on the primary enrollment — so a
+single-org device looks exactly as it always did. `localapi::ConsentRequest`
+carries `org`, and the tray modal renders an "On behalf of …" row, hidden
+when the field is empty (an empty value is omitted from the JSON entirely, so
+no blank row can render).
+
+---
+
 ## 9. Failure modes
 
 | Failure | Behaviour | Where |
@@ -382,20 +404,22 @@ RC session. Cross-org remote control means separate tabs.
 
 ## 12. Open items
 
-- **P2c field validation** — the shared-TUN mux (§4.4) is shipped default-off
-  with the demux, refusal, and gate properties unit-locked; a two-org device
-  on real carved blocks still needs its field hours before the flag can be
-  recommended broadly. macOS is excluded (`add_address_sync` refuses — utun
-  aliasing is future work).
+- **P2c field validation** — the shared-TUN mux (§4.4) is field-proven for
+  the two-org case (five hosts, full cross-org reachability, 2026-08-05) and
+  for the clean-join path. What is NOT field-tested is the REFUSAL path
+  leaving no address behind: it needs a third org still on the legacy `/10`,
+  and there is no tenant-delete endpoint, so creating one would leave a
+  permanent tenant behind. Unit-locked only (`tun_mux` tests). macOS is
+  excluded (`add_address_sync` refuses — utun aliasing is future work).
 - **Netstack per-org statics** (`NS_HANDLE`'s single watch channel,
   `SOCKS_BOUND` once-ever) keep netstack single-org; `overlay_multi_org`
   overrides netstack mode to the OS TUN, and a foreign-server org still has
   no overlay path at all.
-- **A removed org's adapter addresses linger** until the daemon restarts —
-  `add_address_sync` has no remove twin yet; harmless (the address answers
-  nothing once its runtime is gone) but untidy on a long-lived host.
-- **Consent labelling per org** — a consent prompt does not yet say which org
-  is asking.
+- **A removed org's adapter addresses linger** until the daemon restarts. A
+  REFUSED registration now rolls its address back (`TunMux::deregister` +
+  `SystemTun::del_address_sync`), but an org that is disabled or removed at
+  runtime still leaves its address up. Harmless — the address answers nothing
+  once its runtime is gone — but untidy on a long-lived host.
 - **Block reclaim** — quarantined blocks are never automatically re-issued.
   With 4032 slots this is deliberate; a reclaim path can be added if a
   deployment ever churns tenants hard enough to matter.
