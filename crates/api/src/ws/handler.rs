@@ -51,12 +51,17 @@ fn tid_matches_claim(tid: &Option<String>, claim_tenant_hex: &str) -> bool {
 pub async fn ws_upgrade(
     State(state): State<AppState>,
     Query(params): Query<WsParams>,
+    // Wave 2 — the User-Agent and forwarded-for header are read HERE,
+    // at the only point where they exist. The UA yields a browser
+    // family; the IP resolves to a country and is then dropped (see
+    // `user_analytics`) — neither the address nor the raw UA is stored.
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     match params.role.as_deref() {
         Some("agent") => ws_upgrade_agent(state, params.token, params.tid, ws),
         Some("tunnel-client") => ws_upgrade_tunnel_client(state, params.token, params.tid, ws),
-        _ => ws_upgrade_user(state, params.token, params.tid, ws).await,
+        _ => ws_upgrade_user(state, params.token, params.tid, headers, ws).await,
     }
 }
 
@@ -64,6 +69,7 @@ async fn ws_upgrade_user(
     state: AppState,
     token: String,
     tid: Option<String>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     let claims = match state.auth.verify_access_token(&token) {
@@ -111,7 +117,29 @@ async fn ws_upgrade_user(
 
     let username = claims.username.clone();
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, username, tid))
+    // Wave 2 — analytics identity, resolved before the upgrade consumes
+    // the headers. `client_ip_from_headers` applies the same trusted-hop
+    // rule the rate limiter uses, so a client-forged XFF can't move
+    // itself to another country.
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let ip = crate::middleware::client_ip::client_ip_from_headers(
+        &headers,
+        state.settings.app.rate_limit_trusted_hops,
+    );
+    let analytics_tenant = tid.as_deref().and_then(|t| ObjectId::parse_str(t).ok());
+
+    ws.on_upgrade(move |socket| async move {
+        let session =
+            crate::user_analytics::open_session(&state, user_id, analytics_tenant, &ua, ip).await;
+        handle_socket(socket, state.clone(), user_id, username, tid).await;
+        if let Some(id) = session {
+            crate::user_analytics::close_session(&state, id).await;
+        }
+    })
 }
 
 fn ws_upgrade_tunnel_client(
