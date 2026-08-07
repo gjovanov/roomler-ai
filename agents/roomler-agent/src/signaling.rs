@@ -1141,11 +1141,25 @@ async fn handle_server_msg(
         } => {
             // Multi-org — WHICH organization is asking. The server's display
             // name when it sent one; otherwise this loop's own org label,
-            // which at least distinguishes secondaries. A single-org device
-            // on an older server shows nothing extra, exactly as before.
-            let asking_org: Option<String> = tenant_name
-                .clone()
-                .or_else(|| (!ctx.is_primary).then(|| ctx.label.clone()));
+            // which at least distinguishes secondaries.
+            //
+            // Shown ONLY on a daemon that actually serves more than one
+            // enrollment. The line exists to disambiguate, and on a
+            // single-org device there is nothing to disambiguate — every
+            // request necessarily comes from the one org, so an "On behalf
+            // of …" row would be pure chrome on the majority of installs.
+            // A secondary loop is multi-org by definition; the primary
+            // checks whether any `[[orgs]]` entry rides alongside it (its
+            // config keeps them — only the SYNTHESIZED per-org config has
+            // `orgs` cleared).
+            let multi_org = !ctx.is_primary || !agent_cfg.orgs.is_empty();
+            let asking_org: Option<String> = multi_org
+                .then(|| {
+                    tenant_name
+                        .clone()
+                        .or_else(|| (!ctx.is_primary).then(|| ctx.label.clone()))
+                })
+                .flatten();
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
             // Stashed per session_id so the rc:sdp.offer handler can
