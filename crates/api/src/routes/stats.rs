@@ -187,6 +187,72 @@ fn machine_series_pipeline(tenant: ObjectId, floor: DateTime, tier: Tier) -> Vec
     ]
 }
 
+/// Wave 3 — overlay + tunnel BYTES moved per bucket.
+///
+/// Its own pipeline rather than more columns on `machine_series_pipeline`,
+/// because volume needs a different shape: the agent reports cumulative
+/// counters, so the per-bucket delta is `max - min` **per agent** before
+/// anything is summed across the fleet. Folding that into the existing
+/// single-stage group would have changed how the shipped cpu/rss averages
+/// are weighted, which is not a change worth making by accident.
+///
+/// A carrier rebuild (or an agent restart) resets its counters mid-bucket,
+/// so that bucket under-reports rather than going negative — the same
+/// trade the host-total `net_*_bytes` columns already make.
+fn machine_volume_pipeline(tenant: Option<ObjectId>, floor: DateTime, tier: Tier) -> Vec<Document> {
+    let mut match_doc = doc! { "ts": { "$gte": floor } };
+    if let Some(t) = tenant {
+        match_doc.insert("tenant_id", t);
+    }
+    let delta = |max: &str, min: &str| {
+        doc! { "$max": [ 0, { "$subtract": [
+            { "$ifNull": [ format!("${max}"), 0 ] },
+            { "$ifNull": [ format!("${min}"), 0 ] },
+        ]}]}
+    };
+    // Raw samples hold the counter itself; rollup rows already hold the
+    // per-agent min/max for their bucket.
+    let per_agent = if tier == Tier::Raw {
+        doc! { "$group": {
+            "_id": { "a": "$agent_id", "b": bucket_expr(tier) },
+            "orx_max": { "$max": "$sys.overlay_rx_bytes" },
+            "orx_min": { "$min": "$sys.overlay_rx_bytes" },
+            "otx_max": { "$max": "$sys.overlay_tx_bytes" },
+            "otx_min": { "$min": "$sys.overlay_tx_bytes" },
+            "trx_max": { "$max": "$sys.tunnel_rx_bytes" },
+            "trx_min": { "$min": "$sys.tunnel_rx_bytes" },
+            "ttx_max": { "$max": "$sys.tunnel_tx_bytes" },
+            "ttx_min": { "$min": "$sys.tunnel_tx_bytes" },
+        }}
+    } else {
+        doc! { "$group": {
+            "_id": { "a": "$agent_id", "b": "$ts" },
+            "orx_max": { "$max": "$overlay_rx_bytes_max" },
+            "orx_min": { "$min": "$overlay_rx_bytes_min" },
+            "otx_max": { "$max": "$overlay_tx_bytes_max" },
+            "otx_min": { "$min": "$overlay_tx_bytes_min" },
+            "trx_max": { "$max": "$tunnel_rx_bytes_max" },
+            "trx_min": { "$min": "$tunnel_rx_bytes_min" },
+            "ttx_max": { "$max": "$tunnel_tx_bytes_max" },
+            "ttx_min": { "$min": "$tunnel_tx_bytes_min" },
+        }}
+    };
+    vec![
+        doc! { "$match": match_doc },
+        per_agent,
+        doc! { "$group": {
+            "_id": "$_id.b",
+            "overlay_rx": { "$sum": delta("orx_max", "orx_min") },
+            "overlay_tx": { "$sum": delta("otx_max", "otx_min") },
+            "tunnel_rx": { "$sum": delta("trx_max", "trx_min") },
+            "tunnel_tx": { "$sum": delta("ttx_max", "ttx_min") },
+        }},
+        doc! { "$set": { "t": t_secs() } },
+        doc! { "$unset": "_id" },
+        doc! { "$sort": { "t": 1 } },
+    ]
+}
+
 fn call_series_pipeline(tenant: Option<ObjectId>, floor: DateTime, tier: Tier) -> Vec<Document> {
     let mut match_doc = doc! { "ts": { "$gte": floor } };
     if let Some(t) = tenant {
@@ -448,12 +514,22 @@ async fn machines_payload(
     )
     .await?;
     let uptime = uptime_intervals(state, tid, floor).await?;
+    let volume = agg(
+        state,
+        &tier_coll("stats_machine", tier),
+        machine_volume_pipeline(Some(tid), floor, tier),
+    )
+    .await?;
     Ok(Json(serde_json::json!({
         "enabled": true,
         "range": range.unwrap_or("24h"),
         "series": series,
         "agents": per_agent,
         "uptime": uptime,
+        // Wave 3 — mesh + tunnel bytes moved. Empty until the fleet ships
+        // the reporting agent; an empty series reads as "no data", which is
+        // the truth, where a zero line would read as "no traffic".
+        "volume": volume,
     })))
 }
 

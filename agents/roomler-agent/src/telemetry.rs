@@ -56,7 +56,10 @@ impl SysSampler {
         }
     }
 
-    pub fn sample(&mut self, view: &OverlayView) -> AgentSysStats {
+    /// `tunnel_bytes` is `(rx, tx)` summed across this daemon's live tunnel
+    /// forwards — passed in rather than read here so telemetry stays free of
+    /// a dependency on the tunnel client hub.
+    pub fn sample(&mut self, view: &OverlayView, tunnel_bytes: (u64, u64)) -> AgentSysStats {
         let (rss_mb, cpu_pct) = match self.pid {
             Some(pid) => {
                 self.sys
@@ -87,13 +90,24 @@ impl SysSampler {
         // their own carrier kinds) — a mesh drawing needs to show the
         // peer we cannot reach, which is exactly the interesting case.
         let mut links: Vec<PeerLink> = Vec::with_capacity(view.peers.len());
+        // Wave 3: per-edge IP-data volume, summed into the agent total. The
+        // counters live on the installed carrier, so a peer with none
+        // (offline/blocked) contributes zero rather than being skipped —
+        // the edge still belongs on the graph.
+        let mut overlay_rx_bytes = 0u64;
+        let mut overlay_tx_bytes = 0u64;
         for p in &view.peers {
             let carrier = carrier_label(p);
+            let (tx, rx) = p.debug.as_ref().map(|d| (d.tx, d.rx)).unwrap_or((0, 0));
+            overlay_tx_bytes = overlay_tx_bytes.saturating_add(tx);
+            overlay_rx_bytes = overlay_rx_bytes.saturating_add(rx);
             links.push(PeerLink {
                 node: p.node_id.clone(),
                 carrier: carrier.to_string(),
                 rtt_ms: p.rtt_ms,
                 stalled: p.stalled,
+                tx,
+                rx,
             });
             if !p.online {
                 continue;
@@ -120,6 +134,10 @@ impl SysSampler {
             relay,
             derp,
             peer_rtt_ms,
+            overlay_rx_bytes,
+            overlay_tx_bytes,
+            tunnel_rx_bytes: tunnel_bytes.0,
+            tunnel_tx_bytes: tunnel_bytes.1,
             links,
         }
     }
@@ -129,6 +147,22 @@ impl SysSampler {
 mod tests {
     use super::*;
     use tunnel_core::localapi::{PeerCarrierDebug, PeerInfo};
+
+    fn peer_with_bytes(
+        online: bool,
+        conn: ConnectionType,
+        rtt: Option<u32>,
+        kind: Option<&str>,
+        tx: u64,
+        rx: u64,
+    ) -> PeerInfo {
+        let mut p = peer(online, conn, rtt, kind);
+        if let Some(d) = p.debug.as_mut() {
+            d.tx = tx;
+            d.rx = rx;
+        }
+        p
+    }
 
     fn peer(online: bool, conn: ConnectionType, rtt: Option<u32>, kind: Option<&str>) -> PeerInfo {
         PeerInfo {
@@ -177,7 +211,7 @@ mod tests {
             dns: None,
             srflx: None,
         };
-        let out = s.sample(&view);
+        let out = s.sample(&view, (0, 0));
         assert_eq!(out.direct, 1);
         assert_eq!(out.relay, 2);
         assert_eq!(out.derp, 1);
@@ -211,11 +245,46 @@ mod tests {
             dns: None,
             srflx: None,
         };
-        let out = s.sample(&view);
+        let out = s.sample(&view, (0, 0));
         assert_eq!(out.links.len(), 3);
         assert_eq!(out.links[1].carrier, "offline");
         assert_eq!(out.links[2].carrier, "blocked");
         assert_eq!(out.direct, 1);
         assert_eq!(out.relay + out.derp, 0);
+    }
+
+    /// Wave 3 — per-edge volume rides each link, and the agent total is
+    /// exactly their sum. A peer with no installed carrier contributes
+    /// zero rather than being dropped, so the edge count is unaffected.
+    #[test]
+    fn overlay_volume_sums_across_edges() {
+        let mut s = SysSampler::new();
+        let view = OverlayView {
+            self_ip: Some("100.64.0.7".into()),
+            self_ip6: None,
+            peers: vec![
+                peer_with_bytes(
+                    true,
+                    ConnectionType::Relay,
+                    Some(10),
+                    Some("turn"),
+                    100,
+                    200,
+                ),
+                peer_with_bytes(true, ConnectionType::Relay, Some(20), Some("derp"), 30, 7),
+                // No debug block at all → no carrier → contributes nothing.
+                peer(false, ConnectionType::Offline, None, None),
+            ],
+            exit_node: None,
+            dns: None,
+            srflx: None,
+        };
+        let out = s.sample(&view, (0, 0));
+        assert_eq!(out.links.len(), 3);
+        assert_eq!(out.links[0].tx, 100);
+        assert_eq!(out.links[0].rx, 200);
+        assert_eq!(out.links[2].tx, 0, "carrier-less peer reports zero volume");
+        assert_eq!(out.overlay_tx_bytes, 130);
+        assert_eq!(out.overlay_rx_bytes, 207);
     }
 }
