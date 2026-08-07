@@ -2265,10 +2265,48 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let registry = org_registry.clone();
         let enc = encoder_preference;
         let config_path_for_join = config_path.clone();
+        // label -> that org loop's own shutdown sender, so a config change can
+        // cycle ONE enrollment without disturbing the others.
+        let org_stops: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         roomler_agent::org_join::install(roomler_agent::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
             spawn_org: Box::new(move |org: config::OrgEntry| {
+                // A re-spawn for a label that is already running must STOP the
+                // old loop first: two loops on one enrollment would open two
+                // WS with the same agent token, and the server's displacement
+                // would evict one of them non-deterministically. Each loop gets
+                // its own shutdown channel (fed by the global one) so exactly
+                // this org can be cycled without touching the others.
+                if let Some(prev) = org_stops.lock().ok().and_then(|mut m| m.remove(&org.label)) {
+                    let _: &tokio::sync::watch::Sender<bool> = &prev;
+                    let _ = prev.send(true);
+                    tracing::info!(org = %org.label, "org supervisor: stopping the previous loop before re-spawn");
+                }
+                let (org_sd_tx, org_sd_rx) = tokio::sync::watch::channel(false);
+                if let Ok(mut m) = org_stops.lock() {
+                    m.insert(org.label.clone(), org_sd_tx);
+                }
+                // Global shutdown must still reach this loop.
+                {
+                    let mut global = shutdown.clone();
+                    let stops = org_stops.clone();
+                    let label = org.label.clone();
+                    tokio::spawn(async move {
+                        while global.changed().await.is_ok() {
+                            if *global.borrow() {
+                                if let Ok(m) = stops.lock()
+                                    && let Some(tx) = m.get(&label)
+                                {
+                                    let _ = tx.send(true);
+                                }
+                                break;
+                            }
+                        }
+                    });
+                }
                 let org_ctx = signaling::OrgCtx::secondary(&org.label);
                 let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let terminal = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -2315,7 +2353,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
                     env!("CARGO_PKG_VERSION").to_string(),
                 );
-                let rx = shutdown.clone();
+                // The PER-ORG shutdown, not the global one — that is what
+                // makes a single org cyclable.
+                let rx = org_sd_rx;
                 let broker = broker.clone();
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
