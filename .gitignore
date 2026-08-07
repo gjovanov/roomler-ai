@@ -22,3 +22,5 @@ ui/playwright-report/
 ui/e2e/video/output/
 .claude/
 dist/
+# Operator-supplied GeoLite2 databases — licensed data, never committed.
+files/geoip/*.mmdb
