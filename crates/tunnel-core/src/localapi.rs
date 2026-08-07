@@ -438,6 +438,15 @@ pub struct ConsentRequest {
     pub permissions: String,
     #[serde(default)]
     pub timeout_secs: u64,
+    /// Multi-org — the organization the request comes from, so the modal can
+    /// say WHO is asking. On a device enrolled in two orgs, "Alice wants to
+    /// control this machine" is not enough to decide on: Alice may be a
+    /// colleague in one org and an outside contractor in the other.
+    ///
+    /// Empty for a single-org device, and for a daemon older than the field
+    /// (`#[serde(default)]` — the desktop app simply shows no org line).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub org: String,
 }
 
 /// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
@@ -1726,6 +1735,7 @@ mod tests {
                 controller_name: "alice".into(),
                 permissions: "view|control".into(),
                 timeout_secs: 30,
+                org: "Acme".into(),
             }]
         }
         fn consent_decide(&self, session_id: &str, allow: bool) -> bool {
@@ -2391,5 +2401,42 @@ mod tests {
         );
         let back: NodeStatus = serde_json::from_str(&json).unwrap();
         assert!(!back.srflx.unwrap().is_healthy());
+    }
+
+    /// Multi-org — the consent modal's `org` line is ADDITIVE: a daemon that
+    /// predates it (no `org` key) must still deserialize, and a single-org
+    /// device must not ship an empty string that renders a blank "On behalf
+    /// of" row.
+    #[test]
+    fn consent_request_org_is_additive_and_omitted_when_empty() {
+        // An older daemon's payload — no `org` key at all.
+        let legacy: ConsentRequest = serde_json::from_str(
+            r#"{"session_id":"abc","controller_name":"Alice","permissions":"VIEW_SCREEN","timeout_secs":30}"#,
+        )
+        .expect("a pre-org payload must still parse");
+        assert_eq!(legacy.org, "");
+
+        // A single-org device omits the key entirely rather than sending "".
+        let single = ConsentRequest {
+            session_id: "abc".into(),
+            controller_name: "Alice".into(),
+            permissions: "VIEW_SCREEN".into(),
+            timeout_secs: 30,
+            org: String::new(),
+        };
+        let json = serde_json::to_string(&single).unwrap();
+        assert!(
+            !json.contains("\"org\""),
+            "empty org must not be serialized: {json}"
+        );
+
+        // A multi-org device names the asking organization.
+        let multi = ConsentRequest {
+            org: "Acme GmbH".into(),
+            ..single
+        };
+        let round: ConsentRequest =
+            serde_json::from_str(&serde_json::to_string(&multi).unwrap()).unwrap();
+        assert_eq!(round.org, "Acme GmbH");
     }
 }
