@@ -21,6 +21,13 @@ pub const STATS_RELAY: &str = "stats_relay";
 pub const STATS_MACHINE: &str = "stats_machine";
 pub const STATS_EVENTS: &str = "stats_events";
 pub const STATS_CALL: &str = "stats_call";
+/// Per-PARTICIPANT call throughput (wave 3). `stats_call` answers "how
+/// busy was this room"; this answers "how much did this user move", which
+/// is what per-user usage accounting needs and the room-level bucket can
+/// never be disaggregated back into.
+pub const STATS_CALL_USER: &str = "stats_call_user";
+pub const STATS_CALL_USER_1H: &str = "stats_call_user_1h";
+pub const STATS_CALL_USER_1D: &str = "stats_call_user_1d";
 pub const STATS_MESH: &str = "stats_mesh";
 pub const CALL_SESSIONS: &str = "call_sessions";
 pub const STATS_META: &str = "stats_meta";
@@ -159,6 +166,44 @@ impl StatsDao {
             set.insert("sys", sys);
         }
         self.upsert(STATS_MACHINE, doc! { "_id": &id }, doc! { "$set": set })
+            .await
+    }
+
+    /// Wave 3 — ONE participant's throughput inside a live call.
+    ///
+    /// Rates, not cumulative byte counters: a participant's transports are
+    /// recreated on rejoin (and on an ICE restart), so a running total
+    /// would step backwards and any `$max` would freeze at the pre-churn
+    /// peak. The read side integrates instead — `Σ bps × bucket / 8` — which
+    /// is churn-proof and matches how the room-level series is already read.
+    ///
+    /// Directions are named from the USER's point of view, not the SFU's:
+    /// `up` is what they sent, `down` what they received.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_call_user_sample(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        call_id: Option<ObjectId>,
+        user_id: ObjectId,
+        unix: i64,
+        up_bps: f64,
+        down_bps: f64,
+    ) -> DaoResult<()> {
+        let bucket = bucket_start(unix, CALL_BUCKET_SECS);
+        let id = format!("{}:{}:{}", room_id.to_hex(), user_id.to_hex(), bucket);
+        let mut set = doc! {
+            "tenant_id": tenant_id,
+            "room_id": room_id,
+            "user_id": user_id,
+            "ts": DateTime::from_millis(bucket * 1000),
+            "up_bps": up_bps,
+            "down_bps": down_bps,
+        };
+        if let Some(cid) = call_id {
+            set.insert("call_id", cid);
+        }
+        self.upsert(STATS_CALL_USER, doc! { "_id": &id }, doc! { "$set": set })
             .await
     }
 
