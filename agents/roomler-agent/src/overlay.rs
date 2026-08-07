@@ -120,7 +120,7 @@ pub async fn maybe_start(
     // it changed. Take the sender clone OUTSIDE the lock before awaiting.
     let fingerprint = RuntimeFingerprint {
         wg_public_key: keypair.public_base64(),
-        netstack_port: netstack_socks_port(),
+        netstack_port: netstack_socks_port(cfg),
         advertised_routes: cfg.effective_overlay_advertised_routes(),
         exit_node: cfg.overlay_exit_node.clone(),
         tenant_id: cfg.tenant_id.clone(),
@@ -173,7 +173,7 @@ pub async fn maybe_start(
     // handle channel are process-global singletons; N netstack orgs would
     // fight over them).
     let tun_factory: TunFactory = if cfg.overlay_multi_org {
-        if netstack_socks_port().is_some() {
+        if netstack_socks_port(cfg).is_some() {
             warn!(
                 "overlay: OVERLAY_NETSTACK_SOCKS is set but overlay_multi_org is on — \
                  netstack mode is single-org; using the shared OS TUN instead"
@@ -181,7 +181,7 @@ pub async fn maybe_start(
         }
         mux_systun_factory(cfg.tenant_id.clone())?
     } else {
-        match netstack_socks_port() {
+        match netstack_socks_port(cfg) {
             // Give the netstack SOCKS front a live mesh view so it can resolve
             // DOMAIN targets (peer name / MagicDNS FQDN → overlay IP). Same channel
             // the runtime publishes to below, so it's stable across reconnects.
@@ -338,12 +338,24 @@ async fn resolve_server_ips(server_url: &str) -> Vec<std::net::IpAddr> {
     }
 }
 
-/// The loopback SOCKS5 port for **netstack mode**, from
-/// `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`. `None` (the default) selects OS-TUN
-/// mode; a zero / unparseable value is treated as unset.
-fn netstack_socks_port() -> Option<u16> {
-    node_env("OVERLAY_NETSTACK_SOCKS")
-        .and_then(|v| v.trim().parse::<u16>().ok())
+/// This org's loopback SOCKS5 port for **netstack mode**. `None` (the
+/// default) selects OS-TUN mode; a zero value is treated as unset.
+///
+/// The PRIMARY reads `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`, exactly as
+/// before. A SECONDARY gets whatever its `[[orgs]]` entry declares and
+/// deliberately does NOT fall back to the env key: the port is one TCP
+/// listener, so inheriting it would put two orgs on one front — the very
+/// thing the per-org split exists to prevent.
+fn netstack_socks_port(cfg: &AgentConfig) -> Option<u16> {
+    cfg.netstack_socks_port
+        .or_else(|| {
+            // Only a primary config reaches the env: `for_org` always sets
+            // the field explicitly (to the org's value, or None).
+            (!cfg.derived_org)
+                .then(|| node_env("OVERLAY_NETSTACK_SOCKS"))
+                .flatten()
+                .and_then(|v| v.trim().parse::<u16>().ok())
+        })
         .filter(|p| *p != 0)
 }
 
@@ -447,14 +459,23 @@ fn release_shared_tun(org_key: &str) {
 #[cfg(not(feature = "overlay-l3"))]
 fn release_shared_tun(_org_key: &str) {}
 
-/// Hand the netstack surface back when its owner leaves, so a remaining org
-/// can take it on its next reconnect instead of withholding forever.
+/// Hand this org's loopback SOCKS port back when its loop ends, so an org
+/// configured onto the same port can take it on its next reconnect instead
+/// of withholding forever.
 #[cfg(feature = "overlay-netstack")]
 fn release_netstack(org_key: &str) {
-    let mut owner = NETSTACK_OWNER.lock().unwrap_or_else(|e| e.into_inner());
-    if owner.as_deref() == Some(org_key) {
-        *owner = None;
-        info!(org = %org_key, "overlay netstack: released the host's netstack surface");
+    let mut ports = SOCKS_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ports) = ports.as_mut() {
+        let freed: Vec<u16> = ports
+            .iter()
+            .filter(|(_, o)| o.as_str() == org_key)
+            .map(|(p, _)| *p)
+            .collect();
+        for p in freed {
+            ports.remove(&p);
+            info!(org = %org_key, port = p,
+                "overlay netstack: released the org's loopback SOCKS port");
+        }
     }
 }
 #[cfg(not(feature = "overlay-netstack"))]
@@ -535,60 +556,72 @@ fn mux_systun_factory(_org_key: String) -> Option<TunFactory> {
     None
 }
 
-/// Process-wide netstack handle channel — the live [`NetstackHandle`], (re)
-/// published on each overlay connect. A `OnceLock` so the SOCKS front (below)
-/// and the [`netstack_pinger`] `ping` backend share ONE channel regardless of
-/// which touches it first.
+/// Multi-org — one netstack handle channel PER ORG.
+///
+/// This used to be a single `OnceLock` channel, and that was the bug: the
+/// SOCKS front and the `roomler ping` backend both read it, so a second org
+/// publishing its stack did not join the mesh twice — it REPLACED the first
+/// org's stack underneath a front that kept answering on the same port, and
+/// a caller dialing for org A was silently routed by org B.
+///
+/// Keyed by org (the tenant id), so each org's front and pinger read their
+/// OWN stack. Created on first use per org and reused across that org's
+/// reconnects, which is what keeps the front alive between sessions.
 #[cfg(feature = "overlay-netstack")]
-fn ns_handle_tx() -> &'static watch::Sender<Option<tunnel_core::overlay::netstack::NetstackHandle>>
-{
-    static NS_HANDLE: std::sync::OnceLock<
-        watch::Sender<Option<tunnel_core::overlay::netstack::NetstackHandle>>,
-    > = std::sync::OnceLock::new();
-    NS_HANDLE.get_or_init(|| watch::channel(None).0)
+#[allow(clippy::type_complexity)]
+static NS_HANDLES: std::sync::Mutex<
+    Option<
+        std::collections::BTreeMap<
+            String,
+            watch::Sender<Option<tunnel_core::overlay::netstack::NetstackHandle>>,
+        >,
+    >,
+> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "overlay-netstack")]
+fn ns_handle_tx(
+    org_key: &str,
+) -> watch::Sender<Option<tunnel_core::overlay::netstack::NetstackHandle>> {
+    let mut map = NS_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .entry(org_key.to_string())
+        .or_insert_with(|| watch::channel(None).0)
+        .clone()
 }
 
-/// Multi-org — which org owns the process-wide netstack surface.
+/// Which org holds each loopback SOCKS port.
 ///
-/// The netstack surface is a set of singletons: ONE handle channel, ONE
-/// loopback SOCKS port, ONE `roomler ping` backend. Nothing about them is
-/// org-scoped, so a second org publishing to [`ns_handle_tx`] does not join
-/// the mesh twice — it REPLACES the first org's stack underneath the SOCKS
-/// front and the pinger, which keep serving the same port. A user dialing
-/// through SOCKS believing they reach org A would silently be routed by org
-/// B's stack.
-///
-/// So the surface is CLAIMED. First org in owns it; a second org withholds
-/// its overlay (loud warning, retried on its next reconnect) exactly like a
-/// refused shared-TUN registration — the org that cannot have the surface
-/// goes without a mesh rather than taking someone else's. Re-claiming by the
-/// owner is a no-op, which is what every reconnect does.
-///
-/// Untangling the statics into per-org instances is the real fix and is
-/// deliberately not done here (docs/multi-org.md §12): it is significant work
-/// for a case nobody has hit, whereas silent cross-org misrouting is a bug
-/// whatever the demand.
+/// The per-org split removes the shared-stack hazard but not this one: a
+/// port is a single TCP listener, so two orgs configured onto the same one
+/// still genuinely conflict. First org in binds it; a second withholds its
+/// overlay with an actionable message rather than taking a front that
+/// answers for someone else. Released when its owner's loop ends.
 #[cfg(feature = "overlay-netstack")]
-static NETSTACK_OWNER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static SOCKS_PORTS: std::sync::Mutex<Option<std::collections::BTreeMap<u16, String>>> =
+    std::sync::Mutex::new(None);
 
-/// Claim the netstack surface for `org_key`. `false` ⇒ another org holds it.
+/// Claim `port` for `org_key`. `false` ⇒ another org already holds it.
+/// Re-claiming by the owner is a no-op, which is what every reconnect does.
 #[cfg(feature = "overlay-netstack")]
-fn claim_netstack(org_key: &str) -> bool {
-    let mut owner = NETSTACK_OWNER.lock().unwrap_or_else(|e| e.into_inner());
-    match owner.as_deref() {
+fn claim_socks_port(org_key: &str, port: u16) -> bool {
+    let mut map = SOCKS_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Default::default);
+    match map.get(&port) {
         Some(cur) => cur == org_key,
         None => {
-            *owner = Some(org_key.to_string());
+            map.insert(port, org_key.to_string());
             true
         }
     }
 }
 
 /// Netstack factory (`overlay-netstack`): each (re)connect builds a fresh
-/// userspace stack and publishes its handle to the process-wide loopback SOCKS
-/// front (bound once), so the front outlives reconnects without rebinding.
+/// userspace stack for THIS org and publishes its handle to that org's
+/// channel, so its loopback SOCKS front (bound once per port) outlives
+/// reconnects without rebinding.
 ///
-/// `None` when another org already owns the surface — see [`NETSTACK_OWNER`].
+/// `None` when another org already holds `socks_port` — see
+/// [`claim_socks_port`].
 #[cfg(feature = "overlay-netstack")]
 fn netstack_tun_factory(
     socks_port: u16,
@@ -599,58 +632,79 @@ fn netstack_tun_factory(
     use tunnel_core::overlay::netstack::Netstack;
     use tunnel_core::overlay::netstack_socks::serve_socks5;
 
-    if !claim_netstack(org_key) {
+    if !claim_socks_port(org_key, socks_port) {
         warn!(
-            org = %org_key,
-            "overlay netstack: another organization already owns this host's netstack \
-             surface (one userspace stack, one SOCKS port, one ping backend). This org \
-             joins no mesh — enable `overlay_multi_org` to put both orgs on the shared \
-             OS TUN instead."
+            org = %org_key, port = socks_port,
+            "overlay netstack: another organization already serves this loopback SOCKS \
+             port. This org joins no mesh until it gets its own — set \
+             `netstack_socks_port` on its [[orgs]] entry, or put both orgs on the \
+             shared OS TUN with `overlay_multi_org`."
         );
         return None;
     }
 
-    // Bind the loopback SOCKS front exactly once, subscribing to the shared
-    // handle channel so it always serves whatever stack is currently live.
-    static SOCKS_BOUND: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    SOCKS_BOUND.get_or_init(move || {
-        let handle_rx = ns_handle_tx().subscribe();
+    let handle_tx = ns_handle_tx(org_key);
+
+    // Bind this org's front exactly once — a repeat call for the same port
+    // is a reconnect, and the running front is already subscribed to the
+    // org's channel.
+    let bind_needed = {
+        let mut bound = SOCKS_BOUND.lock().unwrap_or_else(|e| e.into_inner());
+        bound
+            .get_or_insert_with(Default::default)
+            .insert(socks_port)
+    };
+    if bind_needed {
+        let handle_rx = handle_tx.subscribe();
+        let org = org_key.to_string();
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, socks_port)).await {
                 Ok(l) => {
                     info!(
-                        port = socks_port,
+                        port = socks_port, %org,
                         "overlay netstack: SOCKS5 front on 127.0.0.1"
                     );
                     serve_socks5(handle_rx, view_rx, l).await;
                 }
                 Err(e) => {
-                    warn!(port = socks_port, error = %e, "overlay netstack: SOCKS bind failed")
+                    warn!(port = socks_port, %org, error = %e,
+                        "overlay netstack: SOCKS bind failed")
                 }
             }
         });
-    });
+    }
 
+    let org = org_key.to_string();
     Some(Box::new(move |ip, nm, mtu| {
         let ns = Netstack::start(ip, netmask_to_prefix(nm), mtu);
-        let _ = ns_handle_tx().send(Some(ns.handle.clone()));
-        info!(%ip, socks_port, "overlay netstack: userspace stack up (OS-free)");
+        let _ = handle_tx.send(Some(ns.handle.clone()));
+        info!(%ip, socks_port, %org, "overlay netstack: userspace stack up (OS-free)");
         Ok(ns.tun as Arc<dyn TunIo>)
     }))
 }
+
+/// Ports whose SOCKS front task is already running.
+#[cfg(feature = "overlay-netstack")]
+static SOCKS_BOUND: std::sync::Mutex<Option<std::collections::BTreeSet<u16>>> =
+    std::sync::Mutex::new(None);
 
 /// The netstack ICMP backend for the `roomler ping` LocalAPI verb, watching the
 /// shared handle channel. `None` unless this node is in netstack mode
 /// (`ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS` set) — an OS-TUN node has no OS-free
 /// ICMP path (the OS `ping` works there).
 #[cfg(feature = "overlay-netstack")]
-pub fn netstack_pinger() -> Option<Arc<dyn crate::localapi_state::NetstackPinger>> {
+pub fn netstack_pinger(
+    cfg: &AgentConfig,
+) -> Option<Arc<dyn crate::localapi_state::NetstackPinger>> {
     use std::net::IpAddr;
     use std::time::Duration;
     use tunnel_core::overlay::netstack::NetstackHandle;
 
-    // Only meaningful in netstack mode; `?` short-circuits to `None` otherwise.
-    netstack_socks_port()?;
+    // Only meaningful in netstack mode; `?` short-circuits to `None`
+    // otherwise. Scoped to THIS config's org: `roomler ping` is a
+    // process-wide verb, so it answers for the primary — a secondary's
+    // stack is reachable through that org's own SOCKS front.
+    netstack_socks_port(cfg)?;
 
     struct NsPinger {
         handle: watch::Receiver<Option<NetstackHandle>>,
@@ -668,7 +722,7 @@ pub fn netstack_pinger() -> Option<Arc<dyn crate::localapi_state::NetstackPinger
     }
 
     Some(Arc::new(NsPinger {
-        handle: ns_handle_tx().subscribe(),
+        handle: ns_handle_tx(&cfg.tenant_id).subscribe(),
     }))
 }
 #[cfg(not(feature = "overlay-netstack"))]
@@ -737,34 +791,61 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
 
 #[cfg(all(test, feature = "overlay-netstack"))]
 mod netstack_claim_tests {
-    use super::{claim_netstack, release_netstack};
+    use super::{claim_socks_port, ns_handle_tx, release_netstack};
 
-    /// The netstack surface is one stack, one SOCKS port, one ping backend.
-    /// Whoever holds it holds it exclusively — a second org must be refused
-    /// rather than silently replacing the first org's stack under a SOCKS
-    /// front that keeps answering on the same port.
+    /// Each org gets its OWN netstack handle channel.
+    ///
+    /// This was one shared channel, and that was the bug: a second org
+    /// publishing its stack did not join twice, it REPLACED the first org's
+    /// under a SOCKS front that kept answering on the same port, so a caller
+    /// dialing for org A was routed by org B.
     #[test]
-    fn the_netstack_surface_has_exactly_one_owner() {
-        // Deliberately serialized in ONE test: the claim is process-global,
-        // so separate #[test] fns would race each other.
-        assert!(claim_netstack("org-a"), "first org in takes the surface");
+    fn every_org_reads_its_own_stack() {
+        let a = ns_handle_tx("org-a");
+        let b = ns_handle_tx("org-b");
         assert!(
-            claim_netstack("org-a"),
+            !a.same_channel(&b),
+            "two orgs must never share a stack handle"
+        );
+        assert!(
+            a.same_channel(&ns_handle_tx("org-a")),
+            "an org's channel survives its reconnects — the front stays subscribed"
+        );
+    }
+
+    /// A loopback SOCKS port is one TCP listener, so it still has exactly
+    /// one owner even though the stacks are now separate.
+    #[test]
+    fn a_socks_port_still_has_exactly_one_owner() {
+        // Serialized in ONE test on purpose: the claim map is process-global,
+        // so separate #[test] fns would race each other. Ports are unique to
+        // this test for the same reason.
+        assert!(claim_socks_port("org-a", 41080), "first org in binds it");
+        assert!(
+            claim_socks_port("org-a", 41080),
             "re-claim by the owner is a no-op — every reconnect does this"
         );
         assert!(
-            !claim_netstack("org-b"),
-            "a second org is refused, not served"
+            !claim_socks_port("org-b", 41080),
+            "a second org on the same port is refused, not served"
         );
 
-        // A non-owner leaving must not hand away someone else's surface.
-        release_netstack("org-b");
-        assert!(!claim_netstack("org-b"), "still org-a's");
+        // Different ports are the whole point: both orgs get a mesh.
+        assert!(
+            claim_socks_port("org-b", 41081),
+            "its own port is always available"
+        );
 
-        // The owner leaving frees it for the org that was withholding.
-        release_netstack("org-a");
-        assert!(claim_netstack("org-b"), "the waiting org can take over");
+        // Releasing frees only the leaver's ports.
         release_netstack("org-b");
+        assert!(
+            !claim_socks_port("org-c", 41080),
+            "org-a still holds its own"
+        );
+        assert!(claim_socks_port("org-c", 41081), "org-b's is free again");
+
+        release_netstack("org-a");
+        release_netstack("org-c");
     }
 }
 
