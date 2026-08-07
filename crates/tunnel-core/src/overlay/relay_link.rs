@@ -81,6 +81,17 @@ const REGRADE_OVERRULE_WINDOW: Duration = Duration::from_secs(600);
 /// A pair that truly cannot carry TURN converges on one cheap retry a day —
 /// still self-correcting if its network changes — while a pair that can is
 /// unaffected, because a regrade that is NOT overruled never books a strike.
+/// How long a previously-overruled peer stays gated on NEW EVIDENCE before the
+/// backoff timer alone is allowed to release it again.
+///
+/// This is the difference between repeats trending to zero and merely being
+/// rarer. Without it the ladder still fires a doomed retry on schedule; with it
+/// a pair whose situation has not changed simply never retries, because
+/// "40 minutes elapsed" is not a reason to believe TURN will work this time.
+/// The ceiling exists only to cover changes we cannot observe from here
+/// (the far side's firewall, a coturn fix) — one cheap probe a day.
+const REGRADE_EVIDENCE_CEILING: Duration = Duration::from_secs(86_400);
+
 const REGRADE_BACKOFF: [Duration; 4] = [
     Duration::from_secs(2_400),  // 40 min — clears the 30-min pin with margin
     Duration::from_secs(7_200),  // 2 h
@@ -295,6 +306,37 @@ pub struct RelayCoordinator {
     /// Consecutive regrades for a peer that the server overruled with a pin.
     /// Indexes [`REGRADE_BACKOFF`]; cleared once a regrade survives.
     derp_regrade_strikes: HashMap<ObjectId, usize>,
+    /// [`strategy_fingerprint`] of the inputs at the peer's last regrade — the
+    /// evidence gate. A peer the server already overruled does not get to try
+    /// again just because a timer elapsed; something about the pair has to have
+    /// actually CHANGED first.
+    derp_regrade_inputs: HashMap<ObjectId, u64>,
+    /// When the peer's last regrade fired. Unlike `derp_regrade_last` this is
+    /// never consumed, so it can enforce the absolute minimum spacing even when
+    /// fresh evidence waives the backoff.
+    derp_regrade_fired_at: HashMap<ObjectId, Instant>,
+}
+
+/// Hash of everything `relay_strategy` reads about a pair, other than the
+/// server's force-DERP pin (which it checks first and which expires on its own).
+///
+/// Comparing this across attempts is what turns the retry from "a timer elapsed"
+/// into "something changed". Only meaningful within one process lifetime —
+/// `DefaultHasher` is not stable across runs — which is all the coordinator's
+/// in-memory maps live for anyway.
+fn strategy_fingerprint(my_udp_relay_ok: bool, peer: &PeerConfig) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    my_udp_relay_ok.hash(&mut h);
+    peer.supports_relay_single.hash(&mut h);
+    peer.supports_derp.hash(&mut h);
+    // Order-independent: the netmap does not promise a stable ordering, and a
+    // reshuffle of the same set is NOT new evidence.
+    let mut eps: Vec<&String> = peer.srflx_endpoints.iter().collect();
+    eps.sort();
+    eps.hash(&mut h);
+    h.finish()
 }
 
 impl RelayCoordinator {
@@ -335,6 +377,8 @@ impl RelayCoordinator {
             derp_regrade_at: HashMap::new(),
             derp_regrade_last: HashMap::new(),
             derp_regrade_strikes: HashMap::new(),
+            derp_regrade_inputs: HashMap::new(),
+            derp_regrade_fired_at: HashMap::new(),
         }
     }
 
@@ -567,7 +611,35 @@ impl RelayCoordinator {
         if matches!(self.relay_strategy(node_id, peer), RelayStrategy::Derp) {
             return false;
         }
-        if self.derp_regrade_at.get(node_id).is_some_and(|&t| now < t) {
+        // Evidence gate. `relay_strategy` already says a better tier exists —
+        // but it said that last time too, and the server overruled us. Retrying
+        // on a timer alone is a guess: if nothing about the pair has changed,
+        // the attempt can only fail again and cost the carrier a second
+        // disturbance. So a peer with strikes must show NEW EVIDENCE.
+        let fp = strategy_fingerprint(self.my_udp_relay_ok, peer);
+        let evidence_changed = self
+            .derp_regrade_inputs
+            .get(node_id)
+            .is_some_and(|&prev| prev != fp);
+        let since_fired = self
+            .derp_regrade_fired_at
+            .get(node_id)
+            .map(|&t| now.saturating_duration_since(t));
+        // Absolute floor — fresh evidence must never let a flapping srflx
+        // churn the carrier faster than the base cooldown.
+        if since_fired.is_some_and(|d| d < DERP_REGRADE_COOLDOWN) {
+            return false;
+        }
+        if self.derp_regrade_strikes.contains_key(node_id)
+            && !evidence_changed
+            && since_fired.is_some_and(|d| d < REGRADE_EVIDENCE_CEILING)
+        {
+            return false;
+        }
+        // The backoff timer still governs, but NEW EVIDENCE supersedes it: a
+        // pair whose srflx just appeared should not sit out yesterday's 24 h
+        // penalty for a failure that no longer describes it.
+        if !evidence_changed && self.derp_regrade_at.get(node_id).is_some_and(|&t| now < t) {
             return false;
         }
         // `derp_regrade_last` means "a regrade is awaiting judgement": an
@@ -593,6 +665,8 @@ impl RelayCoordinator {
         };
         self.derp_regrade_at.insert(*node_id, now + wait);
         self.derp_regrade_last.insert(*node_id, now);
+        self.derp_regrade_inputs.insert(*node_id, fp);
+        self.derp_regrade_fired_at.insert(*node_id, now);
         true
     }
 
@@ -1646,15 +1720,26 @@ mod tests {
             !c.derp_regrade_due(&nid, &udp_ok, t0 + Duration::from_secs(1_815)),
             "must NOT re-fire the moment the 30-min pin lapses"
         );
-        // First backoff (40 min from the pin) has to clear it.
-        assert!(c.derp_regrade_due(&nid, &udp_ok, t0 + Duration::from_secs(180 + 2_400)));
+        // Past the first backoff (40 min from the pin) the TIMER is satisfied —
+        // but the evidence gate holds an overruled peer until something about
+        // the pair actually changes, so this test threads fresh evidence to
+        // exercise the ladder. `overruled_peer_does_not_retry_on_the_timer_alone`
+        // covers the unchanged case.
+        let moved = PeerConfig {
+            srflx_endpoints: vec!["198.51.100.1:41000".into()],
+            ..udp_ok.clone()
+        };
+        assert!(c.derp_regrade_due(&nid, &moved, t0 + Duration::from_secs(180 + 2_400)));
 
-        // A second overrule escalates further, past the previous backoff.
+        // A second overrule escalates the ladder to its 2 h step: the 40 min
+        // that sufficed last time no longer does. Same `moved` config as the
+        // last fire, so the evidence gate is neutral and the BACKOFF is what
+        // is under test.
         let t2 = t0 + Duration::from_secs(180 + 2_400);
         c.note_regrade_overruled(&nid, t2 + Duration::from_secs(180));
         assert_eq!(c.derp_regrade_strikes.get(&nid), Some(&2));
         c.roles.insert(nid, RelayStrategy::Derp);
-        assert!(!c.derp_regrade_due(&nid, &udp_ok, t2 + Duration::from_secs(2_400)));
+        assert!(!c.derp_regrade_due(&nid, &moved, t2 + Duration::from_secs(2_400)));
     }
 
     /// A regrade the server never overruled counts as having HELD: the peer's
@@ -1678,27 +1763,141 @@ mod tests {
         c.roles.insert(nid, RelayStrategy::Derp);
         let t0 = Instant::now();
 
+        // Each attempt carries fresh evidence (a new srflx mapping) so the
+        // evidence gate lets the ladder run; this test is about STRIKES.
+        let ep = |p: u16| PeerConfig {
+            srflx_endpoints: vec![format!("198.51.100.1:{p}")],
+            ..udp_ok.clone()
+        };
+
         // Two overruled regrades put the peer deep into the backoff.
-        assert!(c.derp_regrade_due(&nid, &udp_ok, t0));
+        assert!(c.derp_regrade_due(&nid, &ep(1), t0));
         c.note_regrade_overruled(&nid, t0 + Duration::from_secs(120));
         c.roles.insert(nid, RelayStrategy::Derp);
         let t1 = t0 + Duration::from_secs(3_000);
-        assert!(c.derp_regrade_due(&nid, &udp_ok, t1));
+        assert!(c.derp_regrade_due(&nid, &ep(2), t1));
         c.note_regrade_overruled(&nid, t1 + Duration::from_secs(120));
         assert_eq!(c.derp_regrade_strikes.get(&nid), Some(&2));
 
         // The next regrade is NOT overruled — it survives the window.
         c.roles.insert(nid, RelayStrategy::Derp);
         let t2 = t1 + Duration::from_secs(7_500);
-        assert!(c.derp_regrade_due(&nid, &udp_ok, t2));
+        assert!(c.derp_regrade_due(&nid, &ep(3), t2));
         // Asking again well after the window judges that regrade as held.
         c.roles.insert(nid, RelayStrategy::Derp);
         let t3 = t2 + Duration::from_secs(30_000);
-        assert!(c.derp_regrade_due(&nid, &udp_ok, t3));
+        assert!(c.derp_regrade_due(&nid, &ep(4), t3));
         assert!(
             !c.derp_regrade_strikes.contains_key(&nid),
             "a regrade that held must clear the backoff"
         );
+    }
+
+    /// The evidence gate — what takes repeats from "rarer" to zero. Once the
+    /// server has overruled a peer, the backoff timer expiring is NOT on its
+    /// own a reason to try again: if nothing about the pair changed, the retry
+    /// can only fail and churn the carrier a second time.
+    #[test]
+    fn overruled_peer_does_not_retry_on_the_timer_alone() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t0 = Instant::now();
+
+        assert!(c.derp_regrade_due(&nid, &peer, t0));
+        c.note_regrade_overruled(&nid, t0 + Duration::from_secs(120));
+
+        // Backoff elapsed, inputs IDENTICAL ⇒ still refused. Pre-fix this
+        // fired and produced the repeat.
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(!c.derp_regrade_due(&nid, &peer, t0 + Duration::from_secs(3_000)));
+        // …and stays refused for the whole day, not just one window.
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(!c.derp_regrade_due(&nid, &peer, t0 + Duration::from_secs(80_000)));
+    }
+
+    /// …but the gate must not WEDGE a pair: real new evidence (the peer's srflx
+    /// changed) supersedes the backoff instead of waiting it out.
+    #[test]
+    fn new_evidence_supersedes_the_backoff() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t0 = Instant::now();
+        assert!(c.derp_regrade_due(&nid, &peer, t0));
+        c.note_regrade_overruled(&nid, t0 + Duration::from_secs(120));
+
+        // The peer re-NATs to a different mapping — that IS new information.
+        let moved = PeerConfig {
+            srflx_endpoints: vec!["198.51.100.7:51000".into()],
+            ..peer.clone()
+        };
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(
+            c.derp_regrade_due(&nid, &moved, t0 + Duration::from_secs(900)),
+            "changed inputs must not sit out a backoff earned by a stale failure"
+        );
+
+        // A mere REORDER of the same endpoints is not evidence.
+        let reordered = PeerConfig {
+            srflx_endpoints: vec!["198.51.100.7:51000".into()],
+            ..moved.clone()
+        };
+        c.note_regrade_overruled(&nid, t0 + Duration::from_secs(1_000));
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(!c.derp_regrade_due(&nid, &reordered, t0 + Duration::from_secs(4_000)));
+    }
+
+    /// Fresh evidence still cannot beat the absolute floor — a flapping srflx
+    /// must not be able to churn the carrier every netmap tick.
+    #[test]
+    fn evidence_cannot_beat_the_minimum_spacing() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let a = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let b = PeerConfig {
+            srflx_endpoints: vec!["203.0.113.9:40001".into()],
+            ..a.clone()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t0 = Instant::now();
+        assert!(c.derp_regrade_due(&nid, &a, t0));
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(!c.derp_regrade_due(&nid, &b, t0 + Duration::from_secs(30)));
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(c.derp_regrade_due(&nid, &b, t0 + DERP_REGRADE_COOLDOWN));
     }
 
     /// A pin for a peer we did NOT just regrade is somebody else's escalation —
