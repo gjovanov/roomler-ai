@@ -51,6 +51,15 @@ impl OverlayNetworkDao {
         self.block_prefix
     }
 
+    /// The tenant's network if it HAS one, without creating it.
+    ///
+    /// [`Self::get_or_create`] is right for anything joining the mesh;
+    /// teardown paths (archiving an org) must not conjure a network row for
+    /// a tenant that never had one just to ask whether it did.
+    pub async fn find_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<Option<OverlayNetwork>> {
+        self.base.find_one(doc! { "tenant_id": tenant_id }).await
+    }
+
     /// Fetch the tenant's overlay network, creating it with the default
     /// CIDR/MTU on first use. Race-safe via the `(tenant_id)` unique
     /// index: a losing concurrent insert re-reads the winner's row.
