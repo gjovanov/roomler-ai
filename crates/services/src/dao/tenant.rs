@@ -40,6 +40,33 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// Archive (or restore) an organization.
+    ///
+    /// `is_archived` has existed on the model since the beginning and was
+    /// never read by anything, so "retire an organization" had no meaning
+    /// and a throwaway org was permanent (docs/multi-org.md §12). It means
+    /// this now: **an archived org stops acting and keeps everything it
+    /// knows.** No enrollment, no new remote-control session, no devices in
+    /// its mesh, hidden from the switcher — and every room, message, file,
+    /// member and audit row still there, so restoring it is one call.
+    ///
+    /// Deliberately NOT a delete. An org's data is entangled with people who
+    /// belong to other orgs, and there is no undo for erasure; if true
+    /// erasure is ever needed it belongs in a separate, explicitly
+    /// destructive job layered on top of this.
+    pub async fn set_archived(&self, tenant_id: ObjectId, archived: bool) -> DaoResult<Tenant> {
+        self.base
+            .update_by_id(
+                tenant_id,
+                doc! { "$set": {
+                    "is_archived": archived,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     /// Fleet RPC gate 1 — the org-wide kill-switch. Off by default on every
     /// row; turning it on still leaves each device closed until its own
     /// `ExecPolicy` is enabled.
