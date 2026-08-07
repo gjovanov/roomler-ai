@@ -540,6 +540,38 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Wave 3 — the same sampler's PER-PARTICIPANT rows, backing per-user
+    // usage accounting. `user_id` leads its own index because the platform
+    // view queries one user ACROSS orgs, where a tenant-first index can't
+    // help.
+    create_indexes(
+        db,
+        "stats_call_user",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "ts": 1 }),
+            index(bson::doc! { "tenant_id": 1, "user_id": 1, "ts": 1 }),
+            index(bson::doc! { "user_id": 1, "ts": 1 }),
+            index_ttl(bson::doc! { "ts": 1 }, 7 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
+    // Wave 3 — per-user usage reads scan these two by (user, time); both
+    // already have tenant-leading indexes for the org dashboards, neither
+    // could serve a cross-org "what did this user do" query.
+    create_indexes(
+        db,
+        "remote_sessions",
+        vec![index(bson::doc! { "tenant_id": 1, "created_at": -1 })],
+    )
+    .await?;
+    create_indexes(
+        db,
+        "tunnel_audit",
+        vec![index(bson::doc! { "user_id": 1, "at": -1 })],
+    )
+    .await?;
+
     // One document per call instance (PR-2 lifecycle). `ended_at: null`
     // scan backs the orphan sweep; TTL on started_at bounds the ledger.
     create_indexes(
@@ -560,15 +592,22 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
         ("stats_relay_1h", 90u64),
         ("stats_machine_1h", 90),
         ("stats_call_1h", 90),
+        ("stats_call_user_1h", 90),
         ("stats_relay_1d", 730),
         ("stats_machine_1d", 730),
         ("stats_call_1d", 730),
+        ("stats_call_user_1d", 730),
     ] {
         let mut idx = vec![index_ttl(bson::doc! { "ts": 1 }, ttl_days * 24 * 60 * 60)];
         if coll.starts_with("stats_relay") {
             idx.push(index(bson::doc! { "region": 1, "ts": 1 }));
         } else {
             idx.push(index(bson::doc! { "tenant_id": 1, "ts": 1 }));
+        }
+        // The rolled-up usage tiers are read per USER as well as per org
+        // (the platform view asks "this user, across every org").
+        if coll.starts_with("stats_call_user") {
+            idx.push(index(bson::doc! { "user_id": 1, "ts": 1 }));
         }
         create_indexes(db, coll, idx).await?;
     }
