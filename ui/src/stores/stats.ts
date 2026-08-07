@@ -58,6 +58,8 @@ export interface OrgsPayload {
   enabled: boolean
   tenants?: Array<{ id: string; name: string; slug?: string }>
   machines?: Array<{ tenant_id: string; total: number; online: number }>
+  /** membership counts — the third activity signal for hiding test orgs */
+  members?: Array<{ tenant_id: string; members: number }>
   calls?: Array<{ tenant_id: string; calls_30d: number; minutes_30d: number }>
 }
 

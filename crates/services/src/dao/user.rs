@@ -77,6 +77,15 @@ impl UserDao {
             .await
     }
 
+    /// Resolve an OAuth sign-in to a user: by provider identity first,
+    /// then — only when the provider PROVED the address
+    /// (`email_verified`) — by email, else create a fresh account.
+    ///
+    /// The gate is the nOAuth fix: Microsoft's multi-tenant endpoint
+    /// returns a `mail` attribute any tenant admin can set to an
+    /// arbitrary address, so treating it as an account key let a hostile
+    /// tenant claim someone else's account. An unverified identity still
+    /// signs in — it just gets its own account instead of inheriting one.
     pub async fn find_or_create_by_oauth(
         &self,
         provider: &str,
@@ -84,6 +93,7 @@ impl UserDao {
         email: &str,
         display_name: &str,
         avatar_url: Option<&str>,
+        email_verified: bool,
     ) -> DaoResult<User> {
         // 1. Try to find user by OAuth provider + provider_id
         if let Some(user) = self
@@ -98,8 +108,9 @@ impl UserDao {
             return Ok(user);
         }
 
-        // 2. Try to find user by email and link the OAuth provider
-        if let Ok(mut user) = self.find_by_email(email).await {
+        // 2. Try to find user by email and link the OAuth provider —
+        //    ONLY for a provider-verified address (see the doc comment).
+        if email_verified && let Ok(mut user) = self.find_by_email(email).await {
             let already_linked = user
                 .oauth_providers
                 .iter()
