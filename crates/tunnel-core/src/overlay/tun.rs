@@ -990,6 +990,14 @@ mod system {
                 // `netsh … add address` refuses an address that already
                 // exists; probing by delete-first would flap the connected
                 // route under live traffic, so tolerate that error instead.
+                //
+                // Tolerate it by ASKING THE INTERFACE, not by reading the
+                // message. netsh's text is LOCALIZED — field 2026-08-07,
+                // CORPLAP-1 (German Windows) answered "Das Objekt ist bereits
+                // vorhanden.", which matched no English substring, so a
+                // no-op turned into a hard error and the org's whole
+                // overlay runtime aborted on every reconnect. An address
+                // literal reads the same in every language.
                 let mask = Ipv4Addr::from(if prefix == 0 {
                     0
                 } else {
@@ -1006,15 +1014,32 @@ mod system {
                 ];
                 match run("netsh", &args) {
                     Ok(_) => Ok(()),
-                    Err(e)
-                        if e.to_string()
-                            .to_ascii_lowercase()
-                            .contains("already exists")
-                            || e.to_string().contains("0x80071392") =>
-                    {
-                        Ok(())
+                    // The HRESULT is language-independent when netsh prints
+                    // it at all; keep it as the cheap first test.
+                    Err(e) if e.to_string().contains("0x80071392") => Ok(()),
+                    Err(e) => {
+                        let listed = run(
+                            "netsh",
+                            &[
+                                "interface".into(),
+                                "ipv4".into(),
+                                "show".into(),
+                                "addresses".into(),
+                                format!("name={IF_NAME}"),
+                            ],
+                        )
+                        .unwrap_or_default();
+                        if interface_lists_address(&listed, ip) {
+                            tracing::debug!(
+                                %ip, prefix,
+                                "overlay: address already on the adapter (netsh refused in a \
+                                 localized message; confirmed by reading the interface)"
+                            );
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
                     }
-                    Err(e) => Err(e),
                 }
             }
             #[cfg(target_os = "linux")]
@@ -1728,6 +1753,24 @@ mod system {
     /// (`"0.0.0.0/1"`) — so this cheap check picks the right OS route family for
     /// [`TunIo::add_cidr_route`] / [`TunIo::del_cidr_route`] without pulling in a
     /// parser. Pure, so it unit-tests directly.
+    /// Does `netsh interface ipv4 show addresses` output list `ip` on the
+    /// interface?
+    ///
+    /// Everything netsh SAYS is localized — labels, errors, even the word
+    /// for "Address" — but an IPv4 literal is not, so the address itself is
+    /// the only token worth reading. Split on everything that cannot appear
+    /// inside a dotted quad and compare whole tokens: a substring test would
+    /// let `100.64.0.2` match a listed `100.64.0.28`.
+    /// Compiled everywhere (so every platform's test run covers it) though
+    /// only Windows calls it.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn interface_lists_address(listed: &str, ip: Ipv4Addr) -> bool {
+        let want = ip.to_string();
+        listed
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .any(|tok| tok == want)
+    }
+
     fn is_v6_cidr(cidr: &str) -> bool {
         cidr.contains(':')
     }
@@ -2269,6 +2312,47 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// A localized Windows must not be able to turn an idempotent
+        /// address-add into a fatal error.
+        ///
+        /// Field 2026-08-07, CORPLAP-1 (German): `netsh add address` answered
+        /// "Das Objekt ist bereits vorhanden." — no English substring
+        /// matched, so the org's overlay runtime aborted on every reconnect
+        /// and the host sat with `roomler peers` empty. The recovery reads
+        /// the interface instead, where the only thing that matters is an
+        /// address literal.
+        #[test]
+        fn address_presence_is_read_from_literals_not_localized_labels() {
+            use super::interface_lists_address;
+            use std::net::Ipv4Addr;
+
+            // Real `netsh interface ipv4 show addresses` shape, German —
+            // every label differs from English, the address does not.
+            let de = "\
+Konfiguration für Schnittstelle \"roomler\"
+    DHCP aktiviert:                       Nein
+    IP-Adresse:                           100.64.0.28
+    Subnetzpräfix:                        100.64.0.0/10 (Maske 255.192.0.0)
+    IP-Adresse:                           100.65.0.5
+    Subnetzpräfix:                        100.65.0.0/22 (Maske 255.255.252.0)
+";
+            assert!(interface_lists_address(de, Ipv4Addr::new(100, 64, 0, 28)));
+            assert!(interface_lists_address(de, Ipv4Addr::new(100, 65, 0, 5)));
+
+            // Absent means absent — the error must stay an error.
+            assert!(!interface_lists_address(de, Ipv4Addr::new(100, 66, 0, 7)));
+            assert!(!interface_lists_address("", Ipv4Addr::new(100, 64, 0, 28)));
+
+            // Whole tokens only: `100.64.0.2` is NOT on an interface that
+            // merely holds `100.64.0.28`.
+            assert!(!interface_lists_address(de, Ipv4Addr::new(100, 64, 0, 2)));
+
+            // English output keeps working (this is not a German special
+            // case, it is a locale-independent one).
+            let en = "    IP Address:                           100.64.0.28\n";
+            assert!(interface_lists_address(en, Ipv4Addr::new(100, 64, 0, 28)));
+        }
 
         /// Multi-org P2a — the boot-reconciler keep-set accepts ANY on-link
         /// block inside 100.64.0.0/10 (tenant-block forward-compat), keeps
