@@ -346,6 +346,7 @@ pub async fn get_block(
             state: match b.state {
                 roomler_ai_remote_control::models::OverlayBlockState::Assigned => "assigned",
                 roomler_ai_remote_control::models::OverlayBlockState::Quarantined => "quarantined",
+                roomler_ai_remote_control::models::OverlayBlockState::Reclaimed => "reclaimed",
             }
             .to_string(),
             released_reason: b.released_reason,
@@ -813,5 +814,199 @@ mod tests {
         assert!(!version_meets_floor("0.3", floor));
         // …but a broken FLOOR must not block every migration.
         assert!(version_meets_floor("0.1.0", "not-a-version"));
+    }
+}
+
+// ── Reclaim (platform operator) ─────────────────────────────────────────
+
+/// Default quarantine age before a range may be re-issued.
+///
+/// The risk quarantine protects against is a device that missed a renumber
+/// and still believes it holds an address in the old range. Every agent
+/// reconnects on a cadence of minutes and re-reads its netmap; a month is
+/// several orders of magnitude past that, and covers a laptop that spent a
+/// holiday in a drawer.
+const DEFAULT_RECLAIM_MIN_AGE_DAYS: i64 = 30;
+
+#[derive(Debug, Deserialize)]
+pub struct ReclaimRequest {
+    /// Plan only (the default). Nothing is reclaimed unless this is `false`.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// Override the quarantine age requirement, in days.
+    #[serde(default)]
+    pub min_age_days: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReclaimCandidate {
+    pub cidr: String,
+    pub slot: u32,
+    pub slots: u32,
+    pub tenant_id: String,
+    pub quarantined_days: i64,
+    /// Absent when the block is reclaimable; otherwise why it was skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReclaimResponse {
+    pub dry_run: bool,
+    pub min_age_days: i64,
+    /// Blocks reclaimed (or that would be, on a dry run).
+    pub reclaimed: Vec<ReclaimCandidate>,
+    /// Quarantined blocks that are NOT eligible, each with its reason.
+    pub skipped: Vec<ReclaimCandidate>,
+    pub headroom: roomler_ai_services::dao::overlay_block::BlockHeadroom,
+}
+
+/// POST /api/admin/overlay-block/reclaim — return quarantined ranges to the
+/// allocator. Platform operator only; dry-run by default.
+///
+/// Quarantine is permanent on purpose: a device that missed a renumber may
+/// still believe it holds an address in the old range, and handing that
+/// range to a different tenant is how two tenants end up sharing addresses.
+/// With 4032 slots the cost of never re-issuing is nothing, so this exists
+/// for the deployment that churns tenants hard enough to matter — and it is
+/// deliberately unable to cause harm in the meantime, because a reclaimed
+/// range is the allocator's EXHAUSTION FALLBACK, not its default. Normal
+/// allocation stays strictly monotonic-upward.
+///
+/// Two conditions, both required:
+/// * the block has been quarantined for at least `min_age_days`;
+/// * no live overlay node anywhere holds an address inside it.
+pub async fn reclaim(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<ReclaimRequest>,
+) -> Result<Json<ReclaimResponse>, ApiError> {
+    if !state.platform_admins.contains(&auth.user_id) {
+        return Err(ApiError::NotFound("Not found".to_string()));
+    }
+    let min_age_days = body.min_age_days.unwrap_or(DEFAULT_RECLAIM_MIN_AGE_DAYS);
+
+    // Every live address in the fleet, once. The registry is global, so the
+    // occupancy question is too.
+    let live_ips = state.overlay_nodes.all_live_overlay_ips().await?;
+
+    let now = bson::DateTime::now().timestamp_millis();
+    let mut reclaimed = Vec::new();
+    let mut skipped = Vec::new();
+
+    for b in state
+        .overlay_networks
+        .blocks()
+        .list_quarantined()
+        .await
+        .unwrap_or_default()
+    {
+        let released = b.released_at.map(|d| d.timestamp_millis());
+        let days = released.map(|r| (now - r) / 86_400_000).unwrap_or(0);
+        let mut row = ReclaimCandidate {
+            cidr: b.cidr.clone(),
+            slot: b.slot,
+            slots: b.slots,
+            tenant_id: b.tenant_id.to_hex(),
+            quarantined_days: days,
+            blocked_by: None,
+        };
+
+        // No `released_at` means an older row that predates the stamp; treat
+        // it as too young rather than guessing it is ancient.
+        if released.is_none() {
+            row.blocked_by = Some("no released_at stamp; age unknown".into());
+            skipped.push(row);
+            continue;
+        }
+        if days < min_age_days {
+            row.blocked_by = Some(format!("quarantined {days}d, needs {min_age_days}d"));
+            skipped.push(row);
+            continue;
+        }
+        if let Some(ip) = live_ips.iter().find(|ip| cidr_contains(&b.cidr, ip)) {
+            row.blocked_by = Some(format!("a live node still holds {ip}"));
+            skipped.push(row);
+            continue;
+        }
+
+        if !body.dry_run
+            && let Some(id) = b.id
+        {
+            let ok = state
+                .overlay_networks
+                .blocks()
+                .reclaim(id, "operator reclaim")
+                .await
+                .unwrap_or(false);
+            if !ok {
+                row.blocked_by = Some("state changed under us; not reclaimed".into());
+                skipped.push(row);
+                continue;
+            }
+        }
+        reclaimed.push(row);
+    }
+
+    if !body.dry_run && !reclaimed.is_empty() {
+        tracing::warn!(
+            admin = %auth.user_id, count = reclaimed.len(), min_age_days,
+            "overlay blocks: operator reclaimed quarantined ranges"
+        );
+    }
+
+    Ok(Json(ReclaimResponse {
+        dry_run: body.dry_run,
+        min_age_days,
+        reclaimed,
+        skipped,
+        headroom: state.overlay_networks.blocks().headroom().await?,
+    }))
+}
+
+/// Is `ip` inside `cidr`? IPv4 only — overlay v6 is derived from the v4
+/// address, so v4 containment already answers for both.
+fn cidr_contains(cidr: &str, ip: &str) -> bool {
+    let Some((base, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    let (Ok(base), Ok(ip)) = (
+        base.parse::<std::net::Ipv4Addr>(),
+        ip.parse::<std::net::Ipv4Addr>(),
+    ) else {
+        return false;
+    };
+    if prefix == 0 {
+        return true;
+    }
+    if prefix > 32 {
+        return false;
+    }
+    let mask = !0u32 << (32 - u32::from(prefix));
+    (u32::from(base) & mask) == (u32::from(ip) & mask)
+}
+
+#[cfg(test)]
+mod reclaim_tests {
+    use super::cidr_contains;
+
+    #[test]
+    fn containment_decides_whether_a_range_is_still_occupied() {
+        assert!(cidr_contains("100.65.0.0/22", "100.65.0.5"));
+        assert!(cidr_contains("100.65.0.0/22", "100.65.3.255"));
+        // Just outside the /22 — the next block's first address.
+        assert!(!cidr_contains("100.65.0.0/22", "100.65.4.0"));
+        assert!(!cidr_contains("100.65.0.0/22", "100.64.0.28"));
+        // The legacy range contains every carved block, which is why a
+        // legacy tenant's nodes block reclaiming anything nested in it.
+        assert!(cidr_contains("100.64.0.0/10", "100.65.0.5"));
+        // Junk must never read as "contained" — that would let a reclaim
+        // proceed against a range something still occupies.
+        assert!(!cidr_contains("not-a-cidr", "100.65.0.5"));
+        assert!(!cidr_contains("100.65.0.0/22", "::1"));
+        assert!(!cidr_contains("100.65.0.0/99", "100.65.0.5"));
     }
 }
