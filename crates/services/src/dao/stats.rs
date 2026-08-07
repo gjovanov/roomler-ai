@@ -21,6 +21,7 @@ pub const STATS_RELAY: &str = "stats_relay";
 pub const STATS_MACHINE: &str = "stats_machine";
 pub const STATS_EVENTS: &str = "stats_events";
 pub const STATS_CALL: &str = "stats_call";
+pub const STATS_MESH: &str = "stats_mesh";
 pub const CALL_SESSIONS: &str = "call_sessions";
 pub const STATS_META: &str = "stats_meta";
 
@@ -159,6 +160,30 @@ impl StatsDao {
         }
         self.upsert(STATS_MACHINE, doc! { "_id": &id }, doc! { "$set": set })
             .await
+    }
+
+    /// Wave 2 — this agent's view of the overlay mesh, replaced whole on
+    /// every heartbeat (`_id` = the agent hex, so there is exactly one
+    /// row per agent and no growth). The graph reader merges the two
+    /// ends' opinions of each edge; keeping them SEPARATE here is what
+    /// makes that possible — and a disagreement is itself diagnostic.
+    pub async fn upsert_mesh_snapshot(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        links: &[Document],
+    ) -> DaoResult<()> {
+        self.upsert(
+            STATS_MESH,
+            doc! { "_id": agent_id.to_hex() },
+            doc! { "$set": {
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "ts": DateTime::now(),
+                "links": links,
+            }},
+        )
+        .await
     }
 
     /// Presence transition ledger entry. The caller (`note_transition`)

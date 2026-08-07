@@ -229,6 +229,22 @@ pub struct AgentPeer {
     /// leaks under session churn until `video_sender.read_rtcp()` errors
     /// on its own, which isn't guaranteed to happen promptly.
     rtcp_reader: Option<JoinHandle<()>>,
+    /// Wave 2 — the viewer's own decoded-fps report (`rc:decodestat`),
+    /// packed as `(fps & 0xFFFF) | (struggling << bit)`. Held so session
+    /// telemetry can report the fps the USER actually saw rather than
+    /// what we hoped to send.
+    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// One `rc:session.stats` sample: what this session actually did.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionTelemetry {
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
+    pub rtt_ms: f32,
+    pub fps: f32,
+    pub keyframe_requests: u32,
+    pub input_events: u64,
 }
 
 impl AgentPeer {
@@ -1079,7 +1095,7 @@ impl AgentPeer {
             pc.clone(),
             capture_native_dims,
             encoded_dims,
-            viewer_report,
+            viewer_report.clone(),
             priority,
         ));
 
@@ -1090,7 +1106,47 @@ impl AgentPeer {
             #[cfg(feature = "audio")]
             audio_pump: audio_pump_handle,
             rtcp_reader: Some(rtcp_reader),
+            viewer_report: viewer_report.clone(),
         })
+    }
+
+    /// Wave 2 — a telemetry sample for `rc:session.stats`.
+    ///
+    /// Transport numbers come from the peer connection's own ICE
+    /// candidate-pair stats (the selected pair carries the session's real
+    /// byte counters and RTT), so nothing has to be threaded through the
+    /// media pump. `fps` is the VIEWER's measured decoded rate — the
+    /// number that describes what the operator experienced — and the two
+    /// counters come from the shared per-session registry.
+    pub async fn telemetry(&self) -> SessionTelemetry {
+        use crate::session_telemetry;
+        use std::sync::atomic::Ordering;
+        use webrtc::stats::StatsReportType;
+
+        let mut out = SessionTelemetry::default();
+        let report = self.pc.get_stats().await;
+        // Sum the candidate pairs: only the nominated one carries
+        // traffic, and summing avoids depending on which entry that is.
+        for v in report.reports.values() {
+            if let StatsReportType::CandidatePair(p) = v {
+                out.bytes_sent = out.bytes_sent.saturating_add(p.bytes_sent);
+                out.bytes_recv = out.bytes_recv.saturating_add(p.bytes_received);
+                if p.current_round_trip_time > 0.0 {
+                    out.rtt_ms = (p.current_round_trip_time * 1000.0) as f32;
+                }
+            }
+        }
+        // Low 16 bits = decoded fps; 0 = the viewer reported nothing in
+        // the last window (a paused tab), which is not a measured zero.
+        out.fps = f32::from((self.viewer_report.load(Ordering::Relaxed) & 0xFFFF) as u16);
+        let c = session_telemetry::counters(self.session_id);
+        out.keyframe_requests = c.keyframe_requests.load(Ordering::Relaxed);
+        out.input_events = c.input_events.load(Ordering::Relaxed);
+        out
+    }
+
+    pub fn session_id(&self) -> bson::oid::ObjectId {
+        self.session_id
     }
 
     pub async fn handle_offer(&self, offer_sdp: String) -> Result<String> {
@@ -1213,6 +1269,9 @@ impl Drop for AgentPeer {
     fn drop(&mut self) {
         let session_id = self.session_id;
         crate::input::arbiter::global().session_closed(session_id);
+        // Wave 2 — release this session's telemetry counters; a
+        // long-lived agent must not accumulate one entry per session.
+        crate::session_telemetry::forget(session_id);
         // `restore_for` touches the OS display API; keep it off this
         // (possibly async-context) thread. Ownership-gated + idempotent.
         std::thread::spawn(move || {
@@ -2064,6 +2123,7 @@ async fn media_pump(
         let frame = if *lock_state_rx.borrow() == lock_state::LockState::Locked {
             if !was_locked_last_iter {
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::session_telemetry::counters(session_id).note_keyframe();
                 was_locked_last_iter = true;
             }
             if sys_ctx_worker {
@@ -2077,6 +2137,7 @@ async fn media_pump(
                 // the resumed real desktop snaps into view at full
                 // quality immediately.
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::session_telemetry::counters(session_id).note_keyframe();
                 was_locked_last_iter = false;
             }
             frame
@@ -2270,6 +2331,7 @@ async fn media_pump(
                     encoder = None;
                     encoder_dims = None;
                     keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::session_telemetry::counters(session_id).note_keyframe();
                     tracing::info!(
                         %session_id,
                         "auto-downscale fired on first encoder build — dropping native-dim encoder so the track's first frame is at the downscaled dims (avoids browser videoWidth resize race)"
@@ -3103,6 +3165,7 @@ async fn media_pump_vp9_444_dc(
                             settle_kf.should_fire_on_settle(std::time::Instant::now())
                         {
                             keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                            crate::session_telemetry::counters(session_id).note_keyframe();
                             tracing::info!(
                                 %session_id,
                                 burst,
@@ -3194,6 +3257,7 @@ async fn media_pump_vp9_444_dc(
         let frame = if *lock_state_rx.borrow() == lock_state::LockState::Locked {
             if !was_locked_last_iter {
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::session_telemetry::counters(session_id).note_keyframe();
                 was_locked_last_iter = true;
             }
             if sys_ctx_worker {
@@ -3204,6 +3268,7 @@ async fn media_pump_vp9_444_dc(
         } else {
             if was_locked_last_iter {
                 keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::session_telemetry::counters(session_id).note_keyframe();
                 was_locked_last_iter = false;
             }
             frame
@@ -3485,6 +3550,7 @@ async fn media_pump_vp9_444_dc(
             } else {
                 if scene_kf_enabled {
                     keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::session_telemetry::counters(session_id).note_keyframe();
                     scene_change_keyframes += 1;
                 }
                 last_scene_change_kf_at = Some(now);
@@ -3551,11 +3617,13 @@ async fn media_pump_vp9_444_dc(
             // never advanced past the configured-but-unfed state.
             dc_unopen_drops += packets.len() as u64;
             keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::session_telemetry::counters(session_id).note_keyframe();
             continue;
         };
         if dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
             dc_unopen_drops += packets.len() as u64;
             keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::session_telemetry::counters(session_id).note_keyframe();
             continue;
         }
 
@@ -3586,6 +3654,7 @@ async fn media_pump_vp9_444_dc(
             // resume so the decoder doesn't choke on a delta-after-gap.
             frames_skipped_backpressure += packets.len() as u64;
             keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::session_telemetry::counters(session_id).note_keyframe();
             continue;
         }
 
@@ -3621,6 +3690,7 @@ async fn media_pump_vp9_444_dc(
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     frames_skipped_backpressure += 1;
                     keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::session_telemetry::counters(session_id).note_keyframe();
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
@@ -4966,6 +5036,7 @@ fn attach_input_handler(
             }
             // P6 — hand the event to the arbiter (serialized injection,
             // cross-session modifier fencing, floor control, ghosting).
+            crate::session_telemetry::counters(session_id).note_input();
             crate::input::arbiter::global().event(session_id, parsed);
         })
     }));
@@ -5397,6 +5468,7 @@ fn attach_control_handler(
                         *guard = Some(now);
                         drop(guard);
                         keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                        crate::session_telemetry::counters(session_id).note_keyframe();
                         debug!(%session_id, "control: rc:keyframe — forcing IDR (browser decode-backlog resync)");
                     }
                 }
