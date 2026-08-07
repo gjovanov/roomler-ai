@@ -15,8 +15,12 @@ pub struct BlockHeadroom {
     pub total: u32,
     /// Slots below the allocation cursor. Monotonic: never goes down.
     pub used: u32,
-    /// Slots inside quarantined blocks — spent and never re-issued.
+    /// Slots inside quarantined blocks — spent and, unless an operator
+    /// reclaims them, never re-issued.
     pub burned: u32,
+    /// Slots an operator HAS reclaimed. Available again, but only as the
+    /// allocator's exhaustion fallback.
+    pub reclaimed: u32,
 }
 
 /// Multi-org P2b — the GLOBAL registry of overlay address blocks.
@@ -87,12 +91,27 @@ impl OverlayBlockDao {
         for attempt in 1..=ATTEMPTS {
             let after = self.highest_end_slot().await?.max(OVERLAY_BLOCK_FIRST_SLOT);
             let slot = block_align_slot(after, slots);
-            let cidr = block_cidr_for_slot(slot, slots).ok_or_else(|| {
-                DaoError::Validation(format!(
-                    "overlay block space exhausted: no aligned /{prefix} left below \
-                     slot {OVERLAY_BLOCK_SLOT_COUNT} (highest allocated end {after})"
-                ))
-            })?;
+            let cidr = match block_cidr_for_slot(slot, slots) {
+                Some(c) => c,
+                // Monotonic space is gone. THIS is the only situation that
+                // justifies re-issuing a range an operator has reclaimed —
+                // the alternative is handing the tenant no address at all.
+                None => {
+                    if let Some(b) = self.take_reclaimed(tenant_id, network_id, slots).await? {
+                        tracing::warn!(
+                            %tenant_id, cidr = %b.cidr, slot = b.slot,
+                            "overlay blocks: monotonic space exhausted; re-issued a \
+                             RECLAIMED range"
+                        );
+                        return Ok(b);
+                    }
+                    return Err(DaoError::Validation(format!(
+                        "overlay block space exhausted: no aligned /{prefix} left below \
+                         slot {OVERLAY_BLOCK_SLOT_COUNT} (highest allocated end {after}), \
+                         and no reclaimed range of that size is available"
+                    )));
+                }
+            };
             let now = DateTime::now();
             let block = OverlayBlock {
                 id: None,
@@ -155,6 +174,96 @@ impl OverlayBlockDao {
         })
     }
 
+    /// Exhaustion fallback — take over a RECLAIMED row of exactly `slots`.
+    ///
+    /// Reuses the row rather than inserting a new one: the `slot` index is
+    /// unique, so a reclaimed row occupying that slot would collide with any
+    /// fresh insert there. The CAS on `state` is what makes two racing
+    /// allocators safe — the loser sees zero modified and asks for another.
+    ///
+    /// Exact-size only, deliberately. Splitting a reclaimed run or merging
+    /// adjacent ones is real allocator work, and the payoff is nil for a
+    /// registry that has to be 4032 blocks deep before it gets here at all.
+    async fn take_reclaimed(
+        &self,
+        tenant_id: ObjectId,
+        network_id: ObjectId,
+        slots: u32,
+    ) -> DaoResult<Option<OverlayBlock>> {
+        let now = DateTime::now();
+        let candidates = self
+            .base
+            .find_many(
+                doc! {
+                    "state": bson::to_bson(&OverlayBlockState::Reclaimed)
+                        .unwrap_or(bson::Bson::Null),
+                    "slots": slots,
+                },
+                Some(doc! { "slot": 1 }),
+            )
+            .await?;
+        for c in candidates {
+            let Some(id) = c.id else { continue };
+            let claimed = self
+                .base
+                .update_one(
+                    doc! {
+                        "_id": id,
+                        "state": bson::to_bson(&OverlayBlockState::Reclaimed)
+                            .unwrap_or(bson::Bson::Null),
+                    },
+                    doc! { "$set": {
+                        "state": bson::to_bson(&OverlayBlockState::Assigned)
+                            .unwrap_or(bson::Bson::Null),
+                        "tenant_id": tenant_id,
+                        "network_id": network_id,
+                        "released_reason": bson::Bson::Null,
+                        "released_at": bson::Bson::Null,
+                        "updated_at": now,
+                    }},
+                )
+                .await?;
+            if claimed {
+                return self.base.find_by_id(id).await.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Mark a QUARANTINED block reclaimable — see
+    /// [`OverlayBlockState::Reclaimed`]. Refuses anything not currently
+    /// quarantined, so an assigned block can never be reclaimed by mistake.
+    pub async fn reclaim(&self, block_id: ObjectId, reason: &str) -> DaoResult<bool> {
+        let now = DateTime::now();
+        self.base
+            .update_one(
+                doc! {
+                    "_id": block_id,
+                    "state": bson::to_bson(&OverlayBlockState::Quarantined)
+                        .unwrap_or(bson::Bson::Null),
+                },
+                doc! { "$set": {
+                    "state": bson::to_bson(&OverlayBlockState::Reclaimed)
+                        .unwrap_or(bson::Bson::Null),
+                    "released_reason": reason,
+                    "updated_at": now,
+                }},
+            )
+            .await
+    }
+
+    /// Every quarantined row, oldest release first — the reclaim candidate
+    /// list, which the route then filters by age and live occupancy.
+    pub async fn list_quarantined(&self) -> DaoResult<Vec<OverlayBlock>> {
+        self.base
+            .find_many(
+                doc! { "state": bson::to_bson(&OverlayBlockState::Quarantined)
+                .unwrap_or(bson::Bson::Null) },
+                Some(doc! { "released_at": 1 }),
+            )
+            .await
+    }
+
     /// Retire a block: it stops backing its network and its slots are never
     /// handed out again. `reason` lands in the row for the audit trail.
     pub async fn quarantine(&self, block_id: ObjectId, reason: &str) -> DaoResult<bool> {
@@ -196,10 +305,19 @@ impl OverlayBlockDao {
                 None,
             )
             .await?;
+        let reclaimed = self
+            .base
+            .find_many(
+                doc! { "state": bson::to_bson(&OverlayBlockState::Reclaimed)
+                .unwrap_or(bson::Bson::Null) },
+                None,
+            )
+            .await?;
         Ok(BlockHeadroom {
             total: OVERLAY_BLOCK_SLOT_COUNT - OVERLAY_BLOCK_FIRST_SLOT,
             used: cursor - OVERLAY_BLOCK_FIRST_SLOT,
             burned: quarantined.iter().map(|b| b.slots).sum(),
+            reclaimed: reclaimed.iter().map(|b| b.slots).sum(),
         })
     }
 
