@@ -147,7 +147,11 @@ pub fn build_router(state: AppState) -> Router {
     let tenant_routes = Router::new()
         .route("/", get(routes::tenant::list))
         .route("/", post(routes::tenant::create))
-        .route("/{tenant_id}", get(routes::tenant::get));
+        .route("/{tenant_id}", get(routes::tenant::get))
+        // Owner-only. Archiving revokes every device's enrollment and
+        // releases the org's mesh — see `routes::tenant::archive`.
+        .route("/{tenant_id}/archive", post(routes::tenant::archive))
+        .route("/{tenant_id}/unarchive", post(routes::tenant::unarchive));
 
     // Member routes (under tenant)
     let member_routes = Router::new()

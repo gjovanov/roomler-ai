@@ -1275,13 +1275,17 @@ pub async fn resolve_session_authz(
     // One extra read, and only on a real session request (the early-outs above
     // never reach here). A failed lookup degrades the prompt to the agent's own
     // org label rather than failing the session.
-    let tenant_name = state
-        .tenants
-        .base
-        .find_by_id(agent.tenant_id)
-        .await
-        .ok()
-        .map(|t| t.name);
+    // The SAME read answers "is this org archived?", which must refuse the
+    // session: an archived org stops acting (`routes::tenant::archive`).
+    // A failed lookup degrades the prompt to the agent's own org label
+    // rather than failing the session — it must not, however, be read as
+    // "not archived" on a row we could not see, so only a successful read
+    // can refuse.
+    let tenant = state.tenants.base.find_by_id(agent.tenant_id).await.ok();
+    if tenant.as_ref().is_some_and(|t| t.is_archived) {
+        return Err("this organization is archived; new sessions are blocked".to_string());
+    }
+    let tenant_name = tenant.map(|t| t.name);
 
     // Controlling your OWN device is always allowed AND auto-consents.
     if agent.owner_user_id == controller_user_id {
