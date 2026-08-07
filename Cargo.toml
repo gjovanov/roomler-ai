@@ -84,7 +84,7 @@ webrtc = { path = "crates/vendored/webrtc" }
 wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 
 [workspace.package]
-version = "0.3.0-rc.319"
+version = "0.3.0-rc.320"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 license = "MIT"
@@ -141,6 +141,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Concurrency
 dashmap = "6"
+# Optional GeoIP country lookup for platform user analytics (wave 2).
+# Pure Rust, no C deps; the DATABASE is operator-supplied (never vendored).
+maxminddb = "0.24"
 parking_lot = "0.12"
 bitflags = "2"
 
