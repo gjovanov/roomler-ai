@@ -7172,6 +7172,7 @@ dependencies = [
  "clap",
  "clipboard-win",
  "cpal",
+ "dashmap",
  "dcv-color-primitives",
  "directories",
  "enigo",
