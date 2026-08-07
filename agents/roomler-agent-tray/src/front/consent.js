@@ -25,6 +25,11 @@
       '<div class="consent-card" role="dialog" aria-modal="true" aria-labelledby="consent-title">',
       '  <h2 id="consent-title">Remote control request</h2>',
       '  <p class="consent-lead"><strong id="consent-who"></strong> is requesting to control this device.</p>',
+      // Multi-org: on a device enrolled in more than one organization, WHO is
+      // asking is only half the question — the same person can be a colleague
+      // in one org and an outside contractor in another. Hidden entirely when
+      // the daemon sends no org (single-org device, or an older daemon).
+      '  <p class="consent-org" id="consent-org-row" hidden>On behalf of <strong id="consent-org"></strong></p>',
       '  <p class="consent-perms">Permissions: <span id="consent-perms" class="mono"></span></p>',
       '  <div class="consent-actions">',
       '    <button type="button" id="consent-deny" class="consent-btn consent-deny">Deny</button>',
@@ -58,6 +63,12 @@
     const el = ensureModal()
     activeSession = pc.session_id
     document.getElementById('consent-who').textContent = pc.controller_name || 'A remote operator'
+    const orgRow = document.getElementById('consent-org-row')
+    if (orgRow) {
+      const org = (pc.org || '').trim()
+      document.getElementById('consent-org').textContent = org
+      orgRow.hidden = org === ''
+    }
     document.getElementById('consent-perms').textContent = pc.permissions || '—'
     document.getElementById('consent-hint').textContent = ''
     el.hidden = false
