@@ -320,6 +320,42 @@ pub async fn handle_agent_socket(
                             // this agent's overlay node. Unanswerable (no
                             // signer / no overlay node) = silently unanswered;
                             // the agent keeps using the central /derp.
+                            // Wave 2 — live session telemetry. Consumed
+                            // HERE (needs Mongo, which the Hub doesn't
+                            // hold) and scoped to THIS agent, so one
+                            // agent can never write another's session.
+                            if let ClientMsg::SessionStats {
+                                session_id,
+                                bytes_sent,
+                                bytes_recv,
+                                fps,
+                                rtt_ms,
+                                keyframe_requests,
+                                input_events,
+                            } = &parsed
+                            {
+                                if state.settings.stats.enabled
+                                    && let Ok(sid) = ObjectId::parse_str(session_id)
+                                {
+                                    let stats =
+                                        roomler_ai_remote_control::models::SessionStats {
+                                            bytes_sent: *bytes_sent,
+                                            bytes_recv: *bytes_recv,
+                                            peak_fps: *fps,
+                                            avg_rtt_ms: *rtt_ms,
+                                            keyframe_requests: *keyframe_requests,
+                                            input_events: *input_events,
+                                        };
+                                    if let Err(e) = state
+                                        .remote_sessions
+                                        .merge_live_stats(sid, agent_id, &stats)
+                                        .await
+                                    {
+                                        debug!(%agent_id, %e, "session stats merge failed");
+                                    }
+                                }
+                                continue;
+                            }
                             if matches!(parsed, ClientMsg::DerpTicketRequest {}) {
                                 handle_derp_ticket_request(&state, agent_id, &registered_tx).await;
                                 continue;
@@ -418,6 +454,25 @@ pub async fn handle_agent_socket(
                                         .unwrap_or_default()
                                         .as_secs()
                                         as i64;
+                                    // Wave 2 — the per-peer edges ride the
+                                    // same block; pulled out before `sys`
+                                    // is consumed below.
+                                    let mesh_links: Vec<bson::Document> = sys
+                                        .as_ref()
+                                        .map(|s| {
+                                            s.links
+                                                .iter()
+                                                .map(|l| {
+                                                    bson::doc! {
+                                                        "node": &l.node,
+                                                        "carrier": &l.carrier,
+                                                        "rtt_ms": l.rtt_ms.map(i64::from),
+                                                        "stalled": l.stalled,
+                                                    }
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
                                     // Stats PR-5: the v2 telemetry block —
                                     // nested `transports` matches the rollup
                                     // pipelines' `$sys.transports.*` paths.
@@ -460,6 +515,20 @@ pub async fn handle_agent_socket(
                                         .await
                                     {
                                         debug!(%agent_id, %e, "machine sample persist failed");
+                                    }
+                                    // Wave 2 — this agent's view of the
+                                    // mesh, replaced whole (one row per
+                                    // agent). Kept OUT of the minute
+                                    // buckets: it's current-state, not a
+                                    // time series, and the graph reads
+                                    // the newest snapshot per agent.
+                                    if !mesh_links.is_empty()
+                                        && let Err(e) = state
+                                            .stats
+                                            .upsert_mesh_snapshot(tenant_id, agent_id, &mesh_links)
+                                            .await
+                                    {
+                                        debug!(%agent_id, %e, "mesh snapshot persist failed");
                                     }
                                 }
                                 // Phase A-1 — refresh the presence claim, gated

@@ -626,6 +626,159 @@ async fn uptime_intervals(
     Ok(out)
 }
 
+/// Carrier ranking for the pessimistic edge merge: when the two ends
+/// disagree about how they reach each other, the WORSE opinion wins.
+/// One end believing it has a direct carrier while the other is still
+/// relaying means the pair is, in practice, relaying.
+fn carrier_rank(c: &str) -> u8 {
+    match c {
+        "direct" => 0,
+        "relay" => 1,
+        "derp" => 2,
+        "tunnel" => 3,
+        "blocked" => 4,
+        _ => 5, // offline / unknown
+    }
+}
+
+/// GET /api/tenant/{tid}/stats/mesh — the org's overlay topology as a
+/// graph: the control plane at the centre, one node per device, and
+/// edges for both the control-plane WS and the peer-to-peer carriers.
+///
+/// Member-visible (read-only, no addresses or secrets — carrier kind and
+/// latency only), because the dashboard panel it feeds is.
+pub async fn tenant_mesh(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tid = parse_tid(&tenant_id)?;
+    require_tenant_stats(&state, tid, auth.user_id, false).await?;
+    if !state.settings.stats.enabled {
+        return Ok(disabled_payload());
+    }
+
+    // Nodes: every live device, with the overlay identity the mesh
+    // edges are keyed by.
+    let nodes = agg(
+        &state,
+        "overlay_nodes",
+        vec![
+            doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
+            doc! { "$set": {
+                "id": { "$toString": "$_id" },
+                "agent_id_hex": { "$toString": "$agent_id" },
+            }},
+            doc! { "$project": {
+                "_id": 0, "id": 1, "agent_id_hex": 1, "name": 1,
+                "overlay_ip": 1, "relay_home": 1, "status": 1, "last_seen_at": 1,
+            }},
+            doc! { "$limit": 500 },
+        ],
+    )
+    .await?;
+
+    // Agents carry presence + version; joined client-side by hex id so
+    // the graph can grey out a device that is enrolled but offline.
+    let agents = agg(
+        &state,
+        "agents",
+        vec![
+            doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
+            doc! { "$set": { "id": { "$toString": "$_id" } } },
+            doc! { "$project": {
+                "_id": 0, "id": 1, "name": 1, "last_presence": 1,
+                "agent_version": 1, "relay_home": 1, "os": 1,
+            }},
+            doc! { "$limit": 500 },
+        ],
+    )
+    .await?;
+
+    // Edges: merge the two ends' snapshots. Both report the same pair,
+    // and they can legitimately disagree — take the worse carrier and
+    // the lower RTT, and remember whether both ends actually agreed.
+    let snapshots = agg(
+        &state,
+        roomler_ai_services::dao::stats::STATS_MESH,
+        vec![
+            doc! { "$match": { "tenant_id": tid } },
+            doc! { "$set": { "from": { "$toString": "$agent_id" } } },
+            doc! { "$project": { "_id": 0, "from": 1, "links": 1 } },
+        ],
+    )
+    .await?;
+
+    #[derive(Default)]
+    struct Edge {
+        carrier: String,
+        rtt_ms: Option<i64>,
+        stalled: bool,
+        reports: u8,
+    }
+    let mut edges: HashMap<(String, String), Edge> = HashMap::new();
+    for snap in &snapshots {
+        let Some(from) = snap.get("from").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(links) = snap.get("links").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for l in links {
+            let (Some(node), Some(carrier)) = (
+                l.get("node").and_then(|v| v.as_str()),
+                l.get("carrier").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            // Undirected: key on the sorted pair so both ends land on
+            // the same entry.
+            let key = if from <= node {
+                (from.to_string(), node.to_string())
+            } else {
+                (node.to_string(), from.to_string())
+            };
+            let rtt = l.get("rtt_ms").and_then(|v| v.as_i64());
+            let stalled = l.get("stalled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let e = edges.entry(key).or_default();
+            e.reports += 1;
+            e.stalled |= stalled;
+            if e.carrier.is_empty() || carrier_rank(carrier) > carrier_rank(&e.carrier) {
+                e.carrier = carrier.to_string();
+            }
+            e.rtt_ms = match (e.rtt_ms, rtt) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+    let peer_edges: Vec<serde_json::Value> = edges
+        .into_iter()
+        .map(|((a, b), e)| {
+            serde_json::json!({
+                "kind": "peer",
+                "from": a,
+                "to": b,
+                "carrier": e.carrier,
+                "rtt_ms": e.rtt_ms,
+                "stalled": e.stalled,
+                // 1 = only one end reported this pair (the other is
+                // offline, or pre-mesh). Worth surfacing: a one-sided
+                // edge is a weaker claim than a corroborated one.
+                "reports": e.reports,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "center": { "id": "control-plane", "name": "roomler.ai" },
+        "nodes": nodes,
+        "agents": agents,
+        "edges": peer_edges,
+    })))
+}
+
 /// GET /api/tenant/{tid}/stats/calls?range= — MANAGE_AGENTS.
 pub async fn tenant_calls(
     State(state): State<AppState>,

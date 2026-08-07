@@ -259,6 +259,21 @@ pub enum ClientMsg {
     #[serde(rename = "rc:relay.probe_report")]
     RelayProbeReport { results: Vec<RelayRegionRtt> },
 
+    /// Live remote-control session telemetry (wave 2). Sent by the agent
+    /// every ~15 s while a session is active; the server folds it into
+    /// `remote_sessions.stats`, which was declared-but-never-written
+    /// since Phase 4 (every session recorded zeros).
+    #[serde(rename = "rc:session.stats")]
+    SessionStats {
+        session_id: String,
+        bytes_sent: u64,
+        bytes_recv: u64,
+        fps: f32,
+        rtt_ms: f32,
+        keyframe_requests: u32,
+        input_events: u64,
+    },
+
     /// Multi-region DERP: request an EdDSA admission ticket for the regional
     /// relays (`derp_url`s in [`ServerMsg::RelayRegions`]). The server answers
     /// with [`ServerMsg::DerpTicket`]. Sent only by agents that saw a region
@@ -1435,6 +1450,34 @@ pub struct AgentSysStats {
     /// Median prober RTT across live overlay peers, ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_rtt_ms: Option<u32>,
+    /// Per-peer mesh edges as this node currently reaches them (wave 2).
+    /// The aggregate counters above answer "how many carriers of each
+    /// kind"; this answers "which peer, over what, how fast" — the graph
+    /// the org dashboard draws. Absent on pre-wave-2 agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<PeerLink>,
+}
+
+/// One overlay edge from the reporting node's point of view.
+///
+/// BOTH ends report the same pair, so the read side dedupes on the
+/// sorted node pair and merges — the two ends can legitimately disagree
+/// (one has a direct carrier installed while the other still relays),
+/// and the pessimistic merge keeps the graph honest.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PeerLink {
+    /// The peer's overlay node id (hex).
+    pub node: String,
+    /// How this node reaches it: `direct` | `relay` | `derp` | `tunnel` |
+    /// `blocked` | `offline`.
+    pub carrier: String,
+    /// Prober round-trip in ms, when measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
+    /// The health sweep's silently-one-way verdict — an edge that looks
+    /// installed but carries nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stalled: bool,
 }
 
 /// One region's probe outcome in [`ClientMsg::RelayProbeReport`].
@@ -1929,6 +1972,12 @@ mod tests {
                 relay: 1,
                 derp: 1,
                 peer_rtt_ms: Some(42),
+                links: vec![PeerLink {
+                    node: "6a1f00000000000000000001".into(),
+                    carrier: "direct".into(),
+                    rtt_ms: Some(12),
+                    stalled: false,
+                }],
             }),
             // The value that matters operationally: a measured ZERO must be
             // distinguishable on the wire from an agent that doesn't report.
@@ -1942,6 +1991,13 @@ mod tests {
         assert!(s.contains(r#""net_rx_bytes":123456789"#));
         assert!(s.contains(r#""direct":3"#));
         assert!(s.contains(r#""peer_rtt_ms":42"#));
+        // Wave 2: mesh edges ride the same block; an empty list is
+        // skipped so a pre-mesh agent's payload stays byte-identical.
+        assert!(s.contains(r#""carrier":"direct""#));
+        assert!(
+            !s.contains(r#""stalled""#),
+            "false stalled must be skipped: {s}"
+        );
         let back: ClientMsg = serde_json::from_str(&s).unwrap();
         match back {
             ClientMsg::AgentHeartbeat { sys: Some(sys), .. } => {

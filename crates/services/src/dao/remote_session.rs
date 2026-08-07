@@ -91,6 +91,41 @@ impl RemoteSessionDao {
             .await
     }
 
+    /// Wave 2 — fold a live `rc:session.stats` sample into the session
+    /// row, scoped to the reporting agent so one agent can never write
+    /// another's session.
+    ///
+    /// Counters are MONOTONIC on the agent side (bytes and event totals
+    /// only grow within a session), so last-sample-wins is correct and a
+    /// dropped sample costs nothing; `peak_fps` takes the max because a
+    /// peak is the interesting value, while `avg_rtt_ms` carries the
+    /// latest measurement rather than a true average — the field name
+    /// predates this and the value is what the session is doing NOW.
+    /// Ended sessions are excluded: a late sample must not resurrect the
+    /// numbers `mark_ended` froze.
+    pub async fn merge_live_stats(
+        &self,
+        session_id: ObjectId,
+        agent_id: ObjectId,
+        stats: &SessionStats,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": session_id, "agent_id": agent_id, "ended_at": bson::Bson::Null },
+                doc! {
+                    "$set": {
+                        "stats.bytes_sent": stats.bytes_sent as i64,
+                        "stats.bytes_recv": stats.bytes_recv as i64,
+                        "stats.avg_rtt_ms": f64::from(stats.avg_rtt_ms),
+                        "stats.keyframe_requests": stats.keyframe_requests as i64,
+                        "stats.input_events": stats.input_events as i64,
+                    },
+                    "$max": { "stats.peak_fps": f64::from(stats.peak_fps) },
+                },
+            )
+            .await
+    }
+
     pub async fn mark_ended(
         &self,
         session_id: ObjectId,

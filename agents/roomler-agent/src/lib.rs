@@ -61,6 +61,7 @@ pub mod preflight;
 pub mod rc_local_turn;
 pub mod relay_probe;
 pub mod service;
+pub mod session_telemetry;
 pub mod signaling;
 pub mod subnet_detect;
 #[cfg(feature = "system-context")]
