@@ -773,7 +773,7 @@ mod netstack_claim_tests {
 /// kernel. It needs CAP_NET_ADMIN, so it is opt-in via
 /// `ROOMLER_TUN_KERNEL_TEST=1` (set in the CI job that runs as root) and
 /// skips silently otherwise — including on every developer machine.
-#[cfg(all(test, feature = "overlay-l3", target_os = "linux"))]
+#[cfg(all(test, feature = "overlay-l3"))]
 mod tun_kernel_tests {
     use super::{mux_systun_factory, release_org};
     use std::net::Ipv4Addr;
@@ -791,6 +791,15 @@ mod tun_kernel_tests {
 
     #[tokio::test]
     async fn refused_registration_leaves_no_address_on_the_adapter() {
+        // Compiled everywhere on purpose — gating the MODULE on
+        // `target_os = "linux"` meant no developer machine ever type-checked
+        // it, and the first compile error surfaced in CI. The body is
+        // Linux-shaped (`ip`, `roomler0`), so the platform check is a runtime
+        // skip instead.
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: Linux-only (uses `ip` against the roomler0 device)");
+            return;
+        }
         if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
             eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs CAP_NET_ADMIN)");
             return;
@@ -810,8 +819,11 @@ mod tun_kernel_tests {
         // to be clean: an address left behind here is one nothing answers
         // on, which is exactly what makes a later diagnosis lie.
         let b = mux_systun_factory("kernel-org-b".into()).expect("factory");
-        let err = b(Ipv4Addr::new(100, 65, 1, 9), MASK_22, 1280)
-            .expect_err("an overlapping block must be refused");
+        // `expect_err` is out: the Ok side is `Arc<dyn TunIo>`, which has no
+        // `Debug`.
+        let Err(err) = b(Ipv4Addr::new(100, 65, 1, 9), MASK_22, 1280) else {
+            panic!("an overlapping block must be refused");
+        };
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
         let after = addrs();
         assert!(
