@@ -1450,6 +1450,36 @@ pub struct AgentSysStats {
     /// Median prober RTT across live overlay peers, ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_rtt_ms: Option<u32>,
+    /// Cumulative overlay IP-data volume, summed across this node's peer
+    /// carriers (wave 3). Host-total `net_*_bytes` above counts ALL traffic
+    /// on every interface; these two isolate the mesh's own share, which is
+    /// what "how much did the overlay move" actually means.
+    ///
+    /// Cumulative-since-carrier-install, NOT since boot: a carrier rebuild
+    /// resets its counters, so the sum can step DOWN. The server stores it
+    /// with the same min/max-per-bucket treatment as `net_*_bytes` and
+    /// differences read-side, which under-reports across a rebuild rather
+    /// than going negative. Absent on pre-wave-3 agents.
+    #[serde(default)]
+    pub overlay_rx_bytes: u64,
+    #[serde(default)]
+    pub overlay_tx_bytes: u64,
+    /// Cumulative tunnel-forward volume across this node's live flows
+    /// (wave 3), from the endpoint's own counters.
+    ///
+    /// The server cannot measure this itself: tunnel payload rides the
+    /// peer-to-peer data channel, which is why `tunnel_audit.bytes_in`/
+    /// `bytes_out` have held a literal 0 on every row ever written. These
+    /// two are DEVICE-attributed — a daemon-supervised forward belongs to
+    /// the host, not to a person. A dedicated `roomler-tunnel` client's
+    /// flows are user-owned and still report nothing; that needs the same
+    /// counters wired into the CLI's own heartbeat.
+    ///
+    /// `in` = the local app received, `out` = the local app sent.
+    #[serde(default)]
+    pub tunnel_rx_bytes: u64,
+    #[serde(default)]
+    pub tunnel_tx_bytes: u64,
     /// Per-peer mesh edges as this node currently reaches them (wave 2).
     /// The aggregate counters above answer "how many carriers of each
     /// kind"; this answers "which peer, over what, how fast" — the graph
@@ -1478,6 +1508,14 @@ pub struct PeerLink {
     /// installed but carries nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stalled: bool,
+    /// IP-data bytes carried over this edge since its carrier was installed
+    /// (wave 3). Handshakes and keepalives touch neither, so `tx > 0` with
+    /// `rx == 0` is exactly the one-way signal `stalled` reports — the two
+    /// corroborate each other. Zero on pre-wave-3 agents.
+    #[serde(default)]
+    pub tx: u64,
+    #[serde(default)]
+    pub rx: u64,
 }
 
 /// One region's probe outcome in [`ClientMsg::RelayProbeReport`].
@@ -1972,11 +2010,17 @@ mod tests {
                 relay: 1,
                 derp: 1,
                 peer_rtt_ms: Some(42),
+                overlay_rx_bytes: 4_096,
+                overlay_tx_bytes: 8_192,
+                tunnel_rx_bytes: 65_536,
+                tunnel_tx_bytes: 1_024,
                 links: vec![PeerLink {
                     node: "6a1f00000000000000000001".into(),
                     carrier: "direct".into(),
                     rtt_ms: Some(12),
                     stalled: false,
+                    tx: 512,
+                    rx: 256,
                 }],
             }),
             // The value that matters operationally: a measured ZERO must be
@@ -1998,6 +2042,15 @@ mod tests {
             !s.contains(r#""stalled""#),
             "false stalled must be skipped: {s}"
         );
+        // Wave 3: per-edge and per-agent overlay volume. Unlike `stalled`
+        // these are NOT skipped when zero — a mesh that genuinely moved no
+        // bytes has to stay distinguishable from an agent too old to count.
+        assert!(s.contains(r#""tx":512"#));
+        assert!(s.contains(r#""rx":256"#));
+        assert!(s.contains(r#""overlay_rx_bytes":4096"#));
+        assert!(s.contains(r#""overlay_tx_bytes":8192"#));
+        assert!(s.contains(r#""tunnel_rx_bytes":65536"#));
+        assert!(s.contains(r#""tunnel_tx_bytes":1024"#));
         let back: ClientMsg = serde_json::from_str(&s).unwrap();
         match back {
             ClientMsg::AgentHeartbeat { sys: Some(sys), .. } => {
