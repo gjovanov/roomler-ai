@@ -484,7 +484,12 @@ const allOrgRows = computed<OrgRow[]>(() => {
         calls,
         minutes: c.get(t.id)?.minutes_30d ?? 0,
         members,
-        active: total > 0 || calls > 0 || members > 1,
+        // Devices or calls = real usage. Membership alone is a weak
+        // signal: the integration seeder creates an admin + a member, so
+        // "> 1" left every test org looking active (field-checked: 59 of
+        // them, all with exactly 2). A third human is the cheapest line
+        // that separates a workspace someone actually uses.
+        active: total > 0 || calls > 0 || members > 2,
       }
     })
     .sort(
