@@ -1197,6 +1197,18 @@ pub async fn resolve_session_authz(
     // P6 — the device's input arbitration mode rides every allowed outcome.
     let input_mode = agent.access_policy.input_mode;
 
+    // Multi-org — the organization name the host's consent prompt will show.
+    // One extra read, and only on a real session request (the early-outs above
+    // never reach here). A failed lookup degrades the prompt to the agent's own
+    // org label rather than failing the session.
+    let tenant_name = state
+        .tenants
+        .base
+        .find_by_id(agent.tenant_id)
+        .await
+        .ok()
+        .map(|t| t.name);
+
     // Controlling your OWN device is always allowed AND auto-consents.
     if agent.owner_user_id == controller_user_id {
         return Ok(SessionAuthz::allow_with_input(
