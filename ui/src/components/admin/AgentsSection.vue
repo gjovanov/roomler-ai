@@ -899,6 +899,16 @@
           hide-details
         />
         <v-alert
+          v-if="joinOrgOverlayMode === 'tun' && joinOrgLoaded && !joinOrgMeshReady"
+          type="info"
+          variant="tonal"
+          density="compact"
+          class="mt-3"
+          text="This device's agent started with a single organization, so it holds its
+                network adapter exclusively. The join is applied right away, but mesh
+                access begins after the agent restarts — the next auto-update does that."
+        />
+        <v-alert
           v-if="joinOrgError"
           type="error"
           variant="tonal"
@@ -1473,6 +1483,9 @@ const joinOrgLoading = ref(false)
 const joinOrgLoaded = ref(false)
 const joinOrgSupported = ref(true)
 const joinOrgOnline = ref(true)
+// Whether picking "Join the mesh" gets a mesh now or after a restart. Only
+// consulted when `tun` is selected — an `off` join never touches the TUN.
+const joinOrgMeshReady = ref(true)
 const joinOrgError = ref('')
 const joinOrgItems = ref<
   Array<{ tenant_id: string; name: string; slug: string; already_enrolled: boolean }>
@@ -1498,6 +1511,9 @@ async function openJoinOrg(a: Agent) {
     joinOrgItems.value = res.items
     joinOrgSupported.value = res.supported
     joinOrgOnline.value = res.online
+    // Older servers omit the field; assume ready so we never invent a
+    // restart warning for a device that doesn't need one.
+    joinOrgMeshReady.value = res.mesh_ready !== false
   } catch (e) {
     joinOrgError.value = (e as Error).message
   } finally {
@@ -1519,9 +1535,13 @@ async function confirmJoinOrg() {
     joinOrgDialogOpen.value = false
     // The device enrolls itself a beat later; say what actually happened
     // rather than implying the row is already there.
-    updateNotice.value = res.already_enrolled
+    const base = res.already_enrolled
       ? `${joinOrgTarget.value.name} was already in that organization — its enrollment was refreshed.`
       : `${joinOrgTarget.value.name} is joining as "${res.label}". It appears in that organization's device list shortly.`
+    // Say the quiet part: the enrollment landed, the MESH did not.
+    updateNotice.value = res.restart_required
+      ? `${base} Mesh access is configured but starts after the device's agent restarts — the next auto-update delivers that.`
+      : base
   } catch (e) {
     joinOrgError.value = (e as Error).message
   } finally {

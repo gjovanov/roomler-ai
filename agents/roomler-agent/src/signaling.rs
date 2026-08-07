@@ -701,7 +701,7 @@ async fn connect_once(
         os: detect_os(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         displays: stub_displays(),
-        caps: Box::new(stub_caps()),
+        caps: Box::new(stub_caps(cfg.overlay_multi_org)),
         // Tunnel mesh subnet-router: advertise the CIDRs this host offers to
         // route — explicit `advertise_routes` config unioned with auto-detected
         // local subnets. Admin-gated server-side (untrusted until an admin
@@ -2228,12 +2228,26 @@ fn stub_displays() -> Vec<DisplayInfo> {
     crate::displays::enumerate()
 }
 
-fn stub_caps() -> AgentCaps {
+fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     // Real probe via encode::caps; replaces the empty-vec stub. The
     // resulting AgentCaps populates the rc:agent.hello payload, which
     // the server persists into the agents collection and surfaces in
     // the admin UI (2A.2).
-    crate::encode::caps::detect()
+    let mut caps = crate::encode::caps::detect();
+    // `detect()` is memoized and config-blind, so the one capability that
+    // depends on the host's config gets appended here: `tun` says "this
+    // daemon's TUN is already muxed — a second org can join the mesh
+    // live". The flag is read from the config the PROCESS started with
+    // (the reconnect loop lives inside `run`, which owns `cfg`), which is
+    // precisely the honest answer: flipping `overlay_multi_org` at runtime
+    // does not mux a TUN the primary loop already opened un-muxed, so the
+    // server keeps being told "no" until a real daemon restart. That's
+    // what lets `join-org` answer `restart_required` instead of promising
+    // a mesh that would fail its bring-up (field 2026-08-07, PC50045).
+    if multi_org_tun {
+        caps.multi_org.push("tun".into());
+    }
+    caps
 }
 
 pub(crate) fn urlencode(s: &str) -> String {
