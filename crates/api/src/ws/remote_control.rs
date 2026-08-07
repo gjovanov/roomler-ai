@@ -214,6 +214,7 @@ pub async fn handle_agent_socket(
         consent_mode: ConsentMode::Prompt,
         override_reason: None,
         input_mode: None,
+        tenant_name: None,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's
@@ -915,8 +916,10 @@ pub async fn dispatch_controller_rc(
         // PR-2: the relay needs its own copy after ctx takes this one.
         override_reason: override_reason.clone(),
         input_mode,
-        tenant_name,
+        tenant_name: tenant_name.clone(),
     };
+    // …and so does the cross-pod relay, for the same reason.
+    let relay_tenant_name = tenant_name;
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
         // C-2 rehome: a SessionRequest that missed the LOCAL hub while a
@@ -959,6 +962,7 @@ pub async fn dispatch_controller_rc(
                     consent_mode,
                     &override_reason,
                     input_mode,
+                    &relay_tenant_name,
                     &frame_val,
                 )
                 .await
@@ -1073,6 +1077,7 @@ pub async fn dispatch_controller_rc(
                         consent_mode,
                         &override_reason,
                         input_mode,
+                        &relay_tenant_name,
                         &frame_val,
                     )
                     .await
