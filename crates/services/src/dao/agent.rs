@@ -122,6 +122,16 @@ impl AgentDao {
             .await
     }
 
+    /// Every non-tombstoned device in the tenant, unpaginated.
+    ///
+    /// For whole-org operations (archiving revokes them all) rather than UI
+    /// lists — those want [`Self::list_for_tenant`] and its pagination.
+    pub async fn list_all_active_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<Vec<Agent>> {
+        self.base
+            .find_many(doc! { "tenant_id": tenant_id, "deleted_at": null }, None)
+            .await
+    }
+
     /// S5 — active (non-tombstoned) devices in the tenant, for the plan
     /// device-cap check at enrollment.
     pub async fn count_active_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {

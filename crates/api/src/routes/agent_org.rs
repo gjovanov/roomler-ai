@@ -172,6 +172,22 @@ pub async fn join_org(
         )));
     }
 
+    // The enroll route would refuse an archived target anyway, but there
+    // the failure lands in a daemon log nobody is watching; here it is the
+    // click's answer — and no token gets minted for a join that cannot work.
+    if state
+        .tenants
+        .base
+        .find_by_id(target)
+        .await
+        .map(|t| t.is_archived)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::BadRequest(
+            "The target organization is archived and accepts no device enrollments".to_string(),
+        ));
+    }
+
     // Already enrolled? Not an error — the agent refreshes that org's entry
     // in place — but the response says so, and the UI can be honest.
     let already = state
@@ -305,6 +321,11 @@ pub async fn join_targets(
     for membership in state.tenants.find_user_tenants(auth.user_id).await? {
         let Some(other) = membership.id else { continue };
         if other == tid {
+            continue;
+        }
+        // An archived org takes no devices (`routes::tenant::archive`), so
+        // it never appears in the picker.
+        if membership.is_archived {
             continue;
         }
         // Silently skip orgs where this caller can't manage devices — the
