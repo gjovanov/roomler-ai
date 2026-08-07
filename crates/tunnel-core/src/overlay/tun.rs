@@ -959,6 +959,37 @@ mod system {
             }
         }
 
+        /// Is `ip` currently assigned to the overlay interface?
+        ///
+        /// The locale-proof half of the idempotent-add above. `netsh … show
+        /// addresses` labels its columns in the host's language, but the
+        /// address literal is invariant, so a substring match on the IP is
+        /// stable everywhere. Word-boundary-checked so `100.64.0.2` cannot
+        /// match a line that only contains `100.64.0.28`.
+        ///
+        /// Any failure to ASK is reported as "not present": the caller then
+        /// surfaces the original netsh error, which is the honest outcome —
+        /// far better than claiming success because the probe itself broke.
+        #[cfg(target_os = "windows")]
+        fn address_present_v4(
+            run: &impl Fn(&str, &[String]) -> std::io::Result<String>,
+            ip: Ipv4Addr,
+        ) -> bool {
+            let args: Vec<String> = vec![
+                "interface".into(),
+                "ipv4".into(),
+                "show".into(),
+                "addresses".into(),
+                format!("name={IF_NAME}"),
+            ];
+            let Ok(out) = run("netsh", &args) else {
+                return false;
+            };
+            let needle = ip.to_string();
+            out.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .any(|tok| tok == needle)
+        }
+
         /// Multi-org P2c — assign an ADDITIONAL local address (a secondary
         /// org's self-IP with its block's prefix) to the live device.
         ///
@@ -1006,15 +1037,29 @@ mod system {
                 ];
                 match run("netsh", &args) {
                     Ok(_) => Ok(()),
-                    Err(e)
-                        if e.to_string()
-                            .to_ascii_lowercase()
-                            .contains("already exists")
-                            || e.to_string().contains("0x80071392") =>
-                    {
-                        Ok(())
+                    // Don't parse the MESSAGE — netsh is localized, and the
+                    // English-string check this replaces silently failed on a
+                    // German host. pc50045 (2026-08-07) answered
+                    // "Das Objekt ist bereits vorhanden." to an address it
+                    // already held; the tolerance missed it, `up` treated the
+                    // error as fatal, and the whole overlay runtime aborted —
+                    // `roomler peers` went empty on a box that was otherwise
+                    // healthy, with its ONE useful log line in German.
+                    //
+                    // Ask what we actually care about instead: is the address
+                    // on the interface now? An IP literal is the same in every
+                    // locale, so matching it in `show addresses` is stable
+                    // where the error text is not. Retains the original
+                    // reason for tolerating this at all: probing by
+                    // delete-first would flap the connected route under live
+                    // traffic.
+                    Err(e) => {
+                        if Self::address_present_v4(&run, ip) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
                     }
-                    Err(e) => Err(e),
                 }
             }
             #[cfg(target_os = "linux")]
@@ -2269,6 +2314,54 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// The pc50045 outage (2026-08-07): a GERMAN-locale Windows host
+        /// answered `netsh … add address` with "Das Objekt ist bereits
+        /// vorhanden." for an address it already held. The old tolerance
+        /// matched the ENGLISH string, so the error escaped, `up` treated it
+        /// as fatal, and the entire overlay runtime aborted — `roomler peers`
+        /// went empty on an otherwise healthy box.
+        ///
+        /// Locale-proof now: the IP literal is invariant, so we ask whether
+        /// the address is present rather than reading the complaint.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn address_presence_is_locale_proof() {
+            use super::super::SystemTun;
+            use std::net::Ipv4Addr;
+
+            // Real shapes: German column labels, English column labels.
+            let de = "\nSchnittstelle \"roomler\"\n    DHCP aktiviert:  Nein\n    IP-Adresse:      100.64.0.28\n    Subnetzpräfix:   100.64.0.0/10\n";
+            let en = "\nConfiguration for interface \"roomler\"\n    DHCP enabled:    No\n    IP Address:      100.64.0.28\n    Subnet Prefix:   100.64.0.0/10\n";
+            for out in [de, en] {
+                let run = |_: &str, _: &[String]| Ok(out.to_string());
+                assert!(
+                    SystemTun::address_present_v4(&run, Ipv4Addr::new(100, 64, 0, 28)),
+                    "must see the address regardless of the host's language"
+                );
+                // A DIFFERENT address must not match — including the prefix
+                // trap: `100.64.0.2` is a substring of `100.64.0.28`, and a
+                // naive `contains` would report it present and swallow a real
+                // failure.
+                assert!(!SystemTun::address_present_v4(
+                    &run,
+                    Ipv4Addr::new(100, 64, 0, 2)
+                ));
+                assert!(!SystemTun::address_present_v4(
+                    &run,
+                    Ipv4Addr::new(100, 65, 0, 5)
+                ));
+            }
+
+            // If the PROBE itself fails we must report "absent", so the
+            // caller surfaces the original netsh error instead of claiming a
+            // success we never verified.
+            let broken = |_: &str, _: &[String]| Err(std::io::Error::other("netsh gone"));
+            assert!(!SystemTun::address_present_v4(
+                &broken,
+                Ipv4Addr::new(100, 64, 0, 28)
+            ));
+        }
 
         /// Multi-org P2a — the boot-reconciler keep-set accepts ANY on-link
         /// block inside 100.64.0.0/10 (tenant-block forward-compat), keeps
