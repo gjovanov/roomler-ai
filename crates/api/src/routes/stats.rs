@@ -890,6 +890,200 @@ pub async fn tenant_tunnels(
     })))
 }
 
+// ── Page-view beacon ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct PageViewBody {
+    /// Client route paths, batched. NORMALISED server-side — ids never
+    /// reach an analytics row (see `user_analytics::normalize_path`).
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+/// POST /api/stats/pageview — the SPA's route-change beacon.
+///
+/// Authenticated (so a view is attributable to a user without any
+/// cookie of our own) and deliberately dumb: it records the normalised
+/// route and the timestamp, nothing else. Batches are capped so a
+/// misbehaving client can't turn this into a write amplifier.
+pub async fn page_view(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<PageViewBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !state.settings.stats.enabled {
+        return Ok(Json(serde_json::json!({ "enabled": false })));
+    }
+    const MAX_BATCH: usize = 50;
+    let tenant = body.tenant_id.as_deref().and_then(|t| parse_tid(t).ok());
+    let now = DateTime::now();
+    let docs: Vec<Document> = body
+        .paths
+        .iter()
+        .take(MAX_BATCH)
+        .map(|p| {
+            doc! {
+                "user_id": auth.user_id,
+                "tenant_id": tenant,
+                "path": crate::user_analytics::normalize_path(p),
+                "ts": now,
+            }
+        })
+        .collect();
+    if docs.is_empty() {
+        return Ok(Json(serde_json::json!({ "recorded": 0 })));
+    }
+    let n = docs.len();
+    if let Err(e) = state
+        .db
+        .collection::<Document>(crate::user_analytics::PAGE_VIEWS)
+        .insert_many(docs)
+        .await
+    {
+        // Analytics must never fail a user's navigation.
+        tracing::debug!(%e, "page view persist failed");
+        return Ok(Json(serde_json::json!({ "recorded": 0 })));
+    }
+    Ok(Json(serde_json::json!({ "recorded": n })))
+}
+
+/// GET /api/admin/stats/users?range= — platform user analytics: WS
+/// sessions over time, durations, browsers, platforms, countries, pages,
+/// and the per-org split.
+pub async fn admin_users(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(q): Query<RangeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_platform_admin(&state, &auth)?;
+    if !state.settings.stats.enabled {
+        return Ok(disabled_payload());
+    }
+    let (window, tier) = range_spec(q.range.as_deref())?;
+    let floor = floor_dt(window);
+    let unit = match tier {
+        Tier::Raw => doc! { "$dateTrunc": { "date": "$started_at", "unit": "hour" } },
+        Tier::Hour => doc! { "$dateTrunc": { "date": "$started_at", "unit": "hour" } },
+        Tier::Day => doc! { "$dateTrunc": { "date": "$started_at", "unit": "day" } },
+    };
+    let ws = crate::user_analytics::WS_SESSIONS;
+
+    // Sessions + distinct users per bucket. A still-open session counts
+    // toward "now" via $$NOW so a live connection isn't invisible.
+    let series = agg(
+        &state,
+        ws,
+        vec![
+            doc! { "$match": { "started_at": { "$gte": floor } } },
+            doc! { "$set": { "end_eff": { "$ifNull": [ "$ended_at", "$$NOW" ] } } },
+            doc! { "$group": {
+                "_id": unit,
+                "sessions": { "$sum": 1 },
+                "users": { "$addToSet": "$user_id" },
+                "avg_duration_s": { "$avg": { "$divide": [
+                    { "$subtract": [ "$end_eff", "$started_at" ] }, 1000,
+                ] } },
+            }},
+            doc! { "$set": { "t": t_secs(), "users": { "$size": "$users" } } },
+            doc! { "$unset": "_id" },
+            doc! { "$sort": { "t": 1 } },
+        ],
+    )
+    .await?;
+
+    // One breakdown shape, three fields.
+    let breakdown = |field: &str| {
+        vec![
+            doc! { "$match": { "started_at": { "$gte": floor } } },
+            doc! { "$group": { "_id": format!("${field}"), "sessions": { "$sum": 1 } } },
+            doc! { "$set": { "key": { "$ifNull": [ "$_id", "unknown" ] } } },
+            doc! { "$unset": "_id" },
+            doc! { "$sort": { "sessions": -1 } },
+            doc! { "$limit": 25 },
+        ]
+    };
+    let browsers = agg(&state, ws, breakdown("browser")).await?;
+    let platforms = agg(&state, ws, breakdown("platform")).await?;
+    let countries = agg(&state, ws, breakdown("country")).await?;
+
+    // Per-org: sessions, distinct users, total connected time.
+    let orgs = agg(
+        &state,
+        ws,
+        vec![
+            doc! { "$match": { "started_at": { "$gte": floor }, "tenant_id": { "$ne": Bson::Null } } },
+            doc! { "$set": { "end_eff": { "$ifNull": [ "$ended_at", "$$NOW" ] } } },
+            doc! { "$group": {
+                "_id": "$tenant_id",
+                "sessions": { "$sum": 1 },
+                "users": { "$addToSet": "$user_id" },
+                "connected_minutes": { "$sum": { "$divide": [
+                    { "$subtract": [ "$end_eff", "$started_at" ] }, 60_000,
+                ] } },
+            }},
+            doc! { "$set": { "tenant_id": { "$toString": "$_id" }, "users": { "$size": "$users" } } },
+            doc! { "$unset": "_id" },
+            doc! { "$sort": { "connected_minutes": -1 } },
+            doc! { "$limit": 100 },
+        ],
+    )
+    .await?;
+
+    let pages = agg(
+        &state,
+        crate::user_analytics::PAGE_VIEWS,
+        vec![
+            doc! { "$match": { "ts": { "$gte": floor } } },
+            doc! { "$group": {
+                "_id": "$path",
+                "views": { "$sum": 1 },
+                "users": { "$addToSet": "$user_id" },
+            }},
+            doc! { "$set": { "path": "$_id", "users": { "$size": "$users" } } },
+            doc! { "$unset": "_id" },
+            doc! { "$sort": { "views": -1 } },
+            doc! { "$limit": 25 },
+        ],
+    )
+    .await?;
+
+    // Duration histogram — the shape of a session, not just its mean.
+    let durations = agg(
+        &state,
+        ws,
+        vec![
+            doc! { "$match": { "started_at": { "$gte": floor } } },
+            doc! { "$set": { "end_eff": { "$ifNull": [ "$ended_at", "$$NOW" ] } } },
+            doc! { "$set": { "secs": { "$divide": [
+                { "$subtract": [ "$end_eff", "$started_at" ] }, 1000,
+            ] } } },
+            doc! { "$bucket": {
+                "groupBy": "$secs",
+                "boundaries": [0, 60, 300, 900, 3600, 14400, 86_400],
+                "default": "86400+",
+                "output": { "sessions": { "$sum": 1 } },
+            }},
+            doc! { "$set": { "bucket": { "$toString": "$_id" } } },
+            doc! { "$unset": "_id" },
+        ],
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "enabled": true,
+        "range": q.range.as_deref().unwrap_or("24h"),
+        "geoip": state.geoip.enabled(),
+        "series": series,
+        "browsers": browsers,
+        "platforms": platforms,
+        "countries": countries,
+        "orgs": orgs,
+        "pages": pages,
+        "durations": durations,
+    })))
+}
+
 // ── Admin endpoints ─────────────────────────────────────────────────────
 
 /// GET /api/admin/stats/relay/current — realtime cluster view: newest

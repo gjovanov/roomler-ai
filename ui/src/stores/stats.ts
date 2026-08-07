@@ -95,6 +95,25 @@ export interface MeshPayload {
   }>
 }
 
+export interface UsersPayload {
+  enabled: boolean
+  range?: string
+  /** false = no GeoIP database configured ⇒ countries read "unknown" */
+  geoip?: boolean
+  series?: SeriesPoint[]
+  browsers?: Array<{ key: string; sessions: number }>
+  platforms?: Array<{ key: string; sessions: number }>
+  countries?: Array<{ key: string; sessions: number }>
+  orgs?: Array<{
+    tenant_id: string
+    sessions: number
+    users: number
+    connected_minutes: number
+  }>
+  pages?: Array<{ path: string; views: number; users: number }>
+  durations?: Array<{ bucket: string; sessions: number }>
+}
+
 export const useStatsStore = defineStore('stats', () => {
   // Cached snapshots the dashboard panels poll into. Query-tab payloads
   // are returned to the caller (view-local state) — they're range-keyed
@@ -159,6 +178,9 @@ export const useStatsStore = defineStore('stats', () => {
   async function fetchOrgs(): Promise<OrgsPayload> {
     return api.get<OrgsPayload>('/admin/stats/orgs')
   }
+  async function fetchUsers(range: string): Promise<UsersPayload> {
+    return api.get<UsersPayload>(`/admin/stats/users?range=${range}`)
+  }
   async function fetchAdminMachines(tenantId: string, range: string): Promise<SeriesPayload> {
     return api.get<SeriesPayload>(`/admin/stats/machines?tenant_id=${tenantId}&range=${range}`)
   }
@@ -180,6 +202,7 @@ export const useStatsStore = defineStore('stats', () => {
     fetchRelayCurrent,
     fetchRelayHistory,
     fetchOrgs,
+    fetchUsers,
     fetchAdminMachines,
     fetchAdminCalls,
   }

@@ -735,3 +735,95 @@ async fn uptime_intervals_reconstruct_presence_and_admit_ignorance() {
         "the unknown stretch must end where the ledger starts, got {boundary}"
     );
 }
+
+// ── Wave 2 — platform user analytics ────────────────────────────────────
+
+#[tokio::test]
+async fn page_view_beacon_normalizes_paths_and_admin_reads_them_back() {
+    let admin_id = ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(admin_id.to_hex());
+    })
+    .await;
+    let user = app
+        .register_user(
+            "beacon@test.io",
+            "beacon",
+            "Beacon User",
+            "Password123!",
+            None,
+            None,
+        )
+        .await;
+
+    // A real SPA path carrying two ObjectIds plus a query string.
+    let r = app
+        .auth_post("/api/stats/pageview", &user.access_token)
+        .json(&serde_json::json!({
+            "paths": [
+                "/tenant/69a1dbbad2000f26adc875ce/room/69a1dbc8d2000f26adc875d5?tab=all",
+                "/observability",
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
+    // Stored paths must carry NO identifiers.
+    let stored: Vec<String> = {
+        let mut out = Vec::new();
+        let mut cur = app
+            .state
+            .db
+            .collection::<Document>("page_views")
+            .find(doc! {})
+            .await
+            .unwrap();
+        while let Ok(Some(d)) = futures::TryStreamExt::try_next(&mut cur).await {
+            out.push(d.get_str("path").unwrap_or_default().to_string());
+        }
+        out.sort();
+        out
+    };
+    assert_eq!(
+        stored,
+        vec![
+            "/observability".to_string(),
+            "/tenant/:id/room/:id".to_string()
+        ],
+        "ids and query strings must never reach an analytics row"
+    );
+
+    // The platform view reads them back, and is platform-admin gated.
+    let tokens = app
+        .state
+        .auth
+        .generate_tokens(admin_id, "padmin@test.io", "padmin")
+        .unwrap();
+    let r = app
+        .auth_get("/api/admin/stats/users?range=24h", &tokens.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["enabled"], serde_json::json!(true));
+    // No GeoIP database in tests ⇒ the flag says so rather than the
+    // payload pretending it resolved countries.
+    assert_eq!(body["geoip"], serde_json::json!(false));
+    let pages = body["pages"].as_array().unwrap();
+    assert!(
+        pages.iter().any(|p| p["path"] == "/tenant/:id/room/:id"),
+        "normalised page should be reported: {pages:?}"
+    );
+
+    // A non-admin must not see the platform analytics (404, never 403 —
+    // the web client force-logs-out on 403).
+    let r = app
+        .auth_get("/api/admin/stats/users?range=24h", &user.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+}

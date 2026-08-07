@@ -369,6 +369,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
+import { usePageViews } from '@/composables/usePageViews'
 import { useTenantStore } from '@/stores/tenant'
 import { canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
 import { useRoomStore } from '@/stores/rooms'
@@ -387,6 +388,10 @@ const { mobile } = useDisplay()
 const { showError: showCreateOrgError } = useSnackbar()
 const { rules } = useValidation()
 const { auth, logout: handleLogout } = useAuth()
+// Wave 2 — route-change beacon for the platform analytics. Installed
+// once here, in the authenticated shell, so it never runs for logged-out
+// visitors (landing / auth pages live outside this layout).
+usePageViews()
 const tenantStore = useTenantStore()
 const roomStore = useRoomStore()
 const notificationStore = useNotificationStore()
