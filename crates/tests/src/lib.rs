@@ -64,4 +64,6 @@ mod role_tests;
 #[cfg(test)]
 mod stats_tests;
 #[cfg(test)]
+mod tenant_archive_tests;
+#[cfg(test)]
 mod tunnel_tests;
