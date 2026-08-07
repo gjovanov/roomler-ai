@@ -2356,6 +2356,19 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 // The PER-ORG shutdown, not the global one — that is what
                 // makes a single org cyclable.
                 let rx = org_sd_rx;
+                // Cleanup handles: release this org's shared-TUN claim when
+                // its loop ends, unless a re-spawn replaced us (see below).
+                let cleanup_stops = org_stops.clone();
+                let cleanup_label = org.label.clone();
+                let cleanup_tenant = org.tenant_id.clone();
+                let my_stop = match org_stops.lock() {
+                    Ok(m) => m.get(&org.label).cloned(),
+                    Err(_) => None,
+                };
+                let Some(my_stop) = my_stop else {
+                    tracing::error!(org = %org.label, "org supervisor: lost our own stop handle; not spawning");
+                    return;
+                };
                 let broker = broker.clone();
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
@@ -2381,6 +2394,35 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                                     *t = Some(chain);
                                 }
                             }
+                        }
+                        // This org is done — hand its shared-TUN address back
+                        // (docs/multi-org.md §12: it used to linger until the
+                        // daemon restarted).
+                        //
+                        // ONLY when no replacement took our slot: a RE-spawn
+                        // stops this loop and immediately registers a fresh
+                        // port under the same key, and releasing then would
+                        // strip the address the NEW loop just claimed —
+                        // leaving that org live with nothing to receive on.
+                        // Channel identity is the test; a replacement always
+                        // installs its own.
+                        let mine = match cleanup_stops.lock() {
+                            Ok(m) => m
+                                .get(&cleanup_label)
+                                .is_some_and(|cur| cur.same_channel(&my_stop)),
+                            Err(_) => false,
+                        };
+                        if mine {
+                            if let Ok(mut m) = cleanup_stops.lock() {
+                                m.remove(&cleanup_label);
+                            }
+                            // The overlay module only exists in a build with
+                            // an overlay surface; without one there is no
+                            // shared TUN to release.
+                            #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+                            roomler_agent::overlay::release_org(&cleanup_tenant);
+                            #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+                            let _ = &cleanup_tenant;
                         }
                     },
                     span,
