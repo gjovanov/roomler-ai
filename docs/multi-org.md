@@ -404,22 +404,32 @@ no blank row can render).
 
 ## 12. Open items
 
-- **P2c field validation** — the shared-TUN mux (§4.4) is field-proven for
-  the two-org case (five hosts, full cross-org reachability, 2026-08-05) and
-  for the clean-join path. What is NOT field-tested is the REFUSAL path
-  leaving no address behind: it needs a third org still on the legacy `/10`,
-  and there is no tenant-delete endpoint, so creating one would leave a
-  permanent tenant behind. Unit-locked only (`tun_mux` tests). macOS is
-  excluded (`add_address_sync` refuses — utun aliasing is future work).
+- **The refusal path is unit-locked, not field-run.** The two-org case and
+  the clean-join path are field-proven (five hosts, 2026-08-05); what has
+  never run on real hardware is a REFUSED registration leaving no address
+  behind. It needs a third org still on the legacy `/10`, and **the blocker
+  is a product decision, not engineering**: `Tenant.is_archived` exists but
+  nothing reads it, so there is no way to retire a throwaway org afterwards.
+  Deciding what "archive an organization" means (hidden from the switcher?
+  blocks enrollment? blocks new sessions? what happens to its devices and
+  rooms?) is a prerequisite; the endpoint itself is small once it is
+  decided.
+- **macOS is excluded from multi-org meshing, and the gap is wider than it
+  looks.** `add_address_sync` refuses there, but so do `add_peer_route` and
+  `add_cidr_route` — both are no-ops outside Linux/Windows. macOS therefore
+  has no per-peer `/32`s and no subnet routes at all today; the overlay
+  leans entirely on the device's own connected route. Adding utun aliasing
+  alone would produce a second address with no routing behind it. Doing this
+  properly is its own project (utun name accessor + `ifconfig` alias +
+  `route -interface` handling) and needs a Mac to verify — there is none in
+  the fleet, and unverified OS-level networking is worse than the current
+  loud refusal.
 - **Netstack per-org statics** (`NS_HANDLE`'s single watch channel,
   `SOCKS_BOUND` once-ever) keep netstack single-org; `overlay_multi_org`
   overrides netstack mode to the OS TUN, and a foreign-server org still has
-  no overlay path at all.
-- **A removed org's adapter addresses linger** until the daemon restarts. A
-  REFUSED registration now rolls its address back (`TunMux::deregister` +
-  `SystemTun::del_address_sync`), but an org that is disabled or removed at
-  runtime still leaves its address up. Harmless — the address answers nothing
-  once its runtime is gone — but untidy on a long-lived host.
+  no overlay path at all. Worth doing only if a locked-down host genuinely
+  needs netstack in two orgs — untangling process-global statics is real
+  work for a case nobody has hit yet.
 - **Block reclaim** — quarantined blocks are never automatically re-issued.
   With 4032 slots this is deliberate; a reclaim path can be added if a
   deployment ever churns tenants hard enough to matter.
