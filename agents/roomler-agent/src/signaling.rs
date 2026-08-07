@@ -971,6 +971,30 @@ async fn connect_once(
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Err(ConnectError::Transient(e.context("heartbeat send")));
                 }
+                // Wave 2 — one `rc:session.stats` per LIVE session, on the
+                // heartbeat's own 30 s tick (no extra timer, and it stops
+                // by construction when the session map empties). The
+                // server folds these into `remote_sessions.stats`, which
+                // recorded zeros for every session before this.
+                for (session_id, peer) in peers.iter() {
+                    let t = peer.telemetry().await;
+                    let msg = ClientMsg::SessionStats {
+                        session_id: session_id.to_hex(),
+                        bytes_sent: t.bytes_sent,
+                        bytes_recv: t.bytes_recv,
+                        fps: t.fps,
+                        rtt_ms: t.rtt_ms,
+                        keyframe_requests: t.keyframe_requests,
+                        input_events: t.input_events,
+                    };
+                    // Best-effort: telemetry must never tear down a
+                    // working session, so a failed send is only logged —
+                    // the heartbeat above is what proves liveness.
+                    if let Err(e) = send_msg(&mut ws, &msg).await {
+                        debug!(%session_id, %e, "session stats send failed");
+                        break;
+                    }
+                }
                 watchdog::tick(ctx.pump);
             }
             Some(outbound_msg) = outbound_rx.recv() => {

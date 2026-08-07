@@ -469,6 +469,19 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Wave 2 — per-agent overlay mesh snapshots (one row per agent,
+    // replaced each heartbeat). TTL reaps the rows of agents that stop
+    // reporting, so a decommissioned device leaves the graph on its own.
+    create_indexes(
+        db,
+        "stats_mesh",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "ts": -1 }),
+            index_ttl(bson::doc! { "ts": 1 }, 7 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Presence transition ledger (online|stale|offline), appended after the
     // `agents.last_presence` CAS — exactly-once across pods by construction.
     // Long TTL: transitions are rare and the 1-year uptime strips need them.
