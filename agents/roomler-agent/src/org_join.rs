@@ -90,7 +90,15 @@ pub enum JoinOutcome {
     /// re-sending to change the org's mesh participation. `restarted` = the
     /// org's supervisor was rebuilt because something it was spawned with
     /// changed (a running loop holds its own config).
-    Refreshed { label: String, restarted: bool },
+    Refreshed {
+        label: String,
+        restarted: bool,
+        /// The push turned ON `overlay_multi_org`. The config is written, but
+        /// the mesh cannot come up until the DAEMON restarts: the primary
+        /// loop still owns the TUN un-muxed, and Wintun refuses a second
+        /// session on one adapter.
+        restart_required: bool,
+    },
     /// The enrollment resolved to the PRIMARY identity. Refused: a remote
     /// push must never be able to rewrite the machine's primary enrollment
     /// (that is what `enroll --replace` at the keyboard is for).
@@ -159,6 +167,9 @@ pub async fn join_org(
     // Overlay participation for this org — applied on BOTH the append and the
     // refresh path (see above).
     let mut mode_changed = false;
+    // Set when this push turned ON the host-level `overlay_multi_org`: that
+    // needs a DAEMON restart, not a per-org one (see below).
+    let mut flag_flipped = false;
     if let Some(mode) = overlay_mode {
         let want = match mode {
             "tun" => OrgOverlayMode::Tun,
@@ -177,11 +188,28 @@ pub async fn join_org(
         // changes how the host's ONE TUN adapter is shared.
         if want == OrgOverlayMode::Tun && !merged.overlay_multi_org {
             merged.overlay_multi_org = true;
-            mode_changed = true;
+            // NOT `mode_changed` — deliberately no live restart here.
+            //
+            // The flag changes who owns the host's TUN: without it the
+            // PRIMARY holds a plain `SystemTun`; with it every org rides the
+            // shared mux. Restarting only the secondary would send it to
+            // `SystemTun::up` on an adapter whose Wintun session the primary
+            // still holds, and Wintun refuses a second session on one
+            // adapter — field 2026-08-07 on PC50045:
+            // `WintunStartSession failed "Failed to register rings"`, the
+            // secondary's overlay aborting on every reconnect while the
+            // primary stayed happily single-org.
+            //
+            // The primary's loop cannot be rebuilt from here (it owns the
+            // process's main enrollment), so the honest answer is: the
+            // config is written and the mesh comes up at the next daemon
+            // start, which the next auto-update delivers anyway.
+            flag_flipped = true;
             info!(
                 org = %joined_label,
-                "join_org: enabling overlay_multi_org — an admin asked this device to \
-                 join a second organization's mesh, which is the opt-in that flag means"
+                "join_org: enabled overlay_multi_org — RESTART REQUIRED before this \
+                 device can carry a second org on the shared TUN (the primary loop \
+                 still owns the adapter un-muxed)"
             );
         }
     }
@@ -201,7 +229,10 @@ pub async fn join_org(
     // loop holds the config it was given, so a mode written to disk is inert
     // until its loop is rebuilt. Re-starting on every refresh would churn a
     // healthy mesh for nothing.
-    let restart = was_new || mode_changed;
+    // A flag flip means the whole daemon has to come back before the mesh
+    // can work; restarting the org loop alone would just fail its TUN
+    // bring-up in a retry cycle.
+    let restart = (was_new || mode_changed) && !flag_flipped;
     let supervised = match (JOIN_RUNTIME.get(), restart) {
         (Some(rt), true) => {
             (rt.spawn_org)(entry);
@@ -226,11 +257,13 @@ pub async fn join_org(
     } else {
         info!(
             org = %joined_label, restarted = supervised, mode_changed,
+            restart_required = flag_flipped,
             "rc:agent.join_org — refreshed an existing org"
         );
         Ok(JoinOutcome::Refreshed {
             label: joined_label,
             restarted: supervised,
+            restart_required: flag_flipped,
         })
     }
 }
@@ -378,5 +411,34 @@ mod tests {
         let mut no_flag = cfg.clone();
         no_flag.overlay_multi_org = false;
         assert!(!no_flag.for_org(&org).overlay_enabled, "flag is required");
+    }
+
+    /// Field 2026-08-07 (PC50045): turning `overlay_multi_org` ON must NOT
+    /// live-restart the org loop. The flag decides who owns the host's TUN —
+    /// without it the PRIMARY holds a plain `SystemTun`, and a secondary
+    /// restarted into the mux calls `SystemTun::up` on an adapter whose
+    /// Wintun session the primary still holds. Wintun refuses:
+    /// "Failed to register rings", and the org's overlay aborts on every
+    /// reconnect. The config is written; the mesh waits for a daemon start.
+    #[test]
+    fn turning_the_multi_org_flag_on_defers_to_a_daemon_restart() {
+        // Mirrors join_org's decision inputs.
+        for (was_new, mode_changed, flag_flipped, expect_restart) in [
+            // A brand-new org on a host ALREADY in multi-org mode: live spawn.
+            (true, false, false, true),
+            // Mode changed on an existing org, flag already on: cycle it.
+            (false, true, false, true),
+            // The flag had to be flipped ⇒ defer, whatever else changed.
+            (true, true, true, false),
+            (false, true, true, false),
+            // Nothing changed: never churn a healthy mesh.
+            (false, false, false, false),
+        ] {
+            let restart = (was_new || mode_changed) && !flag_flipped;
+            assert_eq!(
+                restart, expect_restart,
+                "was_new={was_new} mode_changed={mode_changed} flag_flipped={flag_flipped}"
+            );
+        }
     }
 }
