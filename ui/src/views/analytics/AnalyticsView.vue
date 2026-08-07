@@ -90,6 +90,30 @@
                 </v-card-text>
               </v-card>
             </v-col>
+            <v-col cols="12" md="6">
+              <v-card>
+                <v-card-title class="text-subtitle-1">
+                  Mesh &amp; tunnel traffic
+                  <span class="text-caption text-medium-emphasis ml-2">
+                    bytes moved per bucket
+                  </span>
+                </v-card-title>
+                <v-card-text>
+                  <time-series-chart
+                    :points="machines?.volume ?? []"
+                    :series="[
+                      { key: 'overlay_rx', label: 'Overlay in' },
+                      { key: 'overlay_tx', label: 'Overlay out' },
+                      { key: 'tunnel_rx', label: 'Tunnel in' },
+                      { key: 'tunnel_tx', label: 'Tunnel out' },
+                    ]"
+                    :y-format="fmtBytes"
+                    stacked
+                    empty-text="No traffic telemetry yet — arrives with agent telemetry v3"
+                  />
+                </v-card-text>
+              </v-card>
+            </v-col>
             <v-col cols="12">
               <v-card>
                 <v-card-title class="text-subtitle-1">
