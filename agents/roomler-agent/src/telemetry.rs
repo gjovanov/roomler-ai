@@ -10,8 +10,30 @@
 //! Sampling is cheap and synchronous; the 30 s heartbeat cadence satisfies
 //! sysinfo's minimum CPU-measurement interval (the first tick reports 0%).
 
-use roomler_ai_remote_control::signaling::AgentSysStats;
-use tunnel_core::localapi::{ConnectionType, OverlayView};
+use roomler_ai_remote_control::signaling::{AgentSysStats, PeerLink};
+use tunnel_core::localapi::{ConnectionType, OverlayView, PeerInfo};
+
+/// How this node currently reaches a peer, as ONE label.
+///
+/// `ConnectionType` has no `Derp` variant — DERP is a relay flavour only
+/// the carrier forensics block distinguishes — so the split lives here,
+/// used by both the aggregate counters and the per-edge report.
+fn carrier_label(p: &PeerInfo) -> &'static str {
+    match p.connection {
+        ConnectionType::Direct => "direct",
+        ConnectionType::Relay => {
+            let is_derp = p
+                .debug
+                .as_ref()
+                .map(|d| d.relay_kind.as_deref() == Some("derp"))
+                .unwrap_or(false);
+            if is_derp { "derp" } else { "relay" }
+        }
+        ConnectionType::Tunnel => "tunnel",
+        ConnectionType::Blocked => "blocked",
+        ConnectionType::Offline => "offline",
+    }
+}
 
 pub struct SysSampler {
     sys: sysinfo::System,
@@ -60,27 +82,27 @@ impl SysSampler {
 
         let (mut direct, mut relay, mut derp) = (0u32, 0u32, 0u32);
         let mut rtts: Vec<u32> = Vec::new();
+        // Wave 2: the same walk also emits the per-peer EDGES the org
+        // dashboard graphs. Offline/blocked peers are reported too (as
+        // their own carrier kinds) — a mesh drawing needs to show the
+        // peer we cannot reach, which is exactly the interesting case.
+        let mut links: Vec<PeerLink> = Vec::with_capacity(view.peers.len());
         for p in &view.peers {
+            let carrier = carrier_label(p);
+            links.push(PeerLink {
+                node: p.node_id.clone(),
+                carrier: carrier.to_string(),
+                rtt_ms: p.rtt_ms,
+                stalled: p.stalled,
+            });
             if !p.online {
                 continue;
             }
-            match p.connection {
-                ConnectionType::Direct => direct += 1,
-                ConnectionType::Relay => {
-                    // DERP is a relay flavor — only the carrier forensics
-                    // block knows which; absent debug counts as TURN relay.
-                    let is_derp = p
-                        .debug
-                        .as_ref()
-                        .map(|d| d.relay_kind.as_deref() == Some("derp"))
-                        .unwrap_or(false);
-                    if is_derp {
-                        derp += 1;
-                    } else {
-                        relay += 1;
-                    }
-                }
-                ConnectionType::Tunnel | ConnectionType::Blocked | ConnectionType::Offline => {}
+            match carrier {
+                "direct" => direct += 1,
+                "derp" => derp += 1,
+                "relay" => relay += 1,
+                _ => {}
             }
             if let Some(r) = p.rtt_ms {
                 rtts.push(r);
@@ -98,6 +120,7 @@ impl SysSampler {
             relay,
             derp,
             peer_rtt_ms,
+            links,
         }
     }
 }
@@ -159,5 +182,40 @@ mod tests {
         assert_eq!(out.relay, 2);
         assert_eq!(out.derp, 1);
         assert_eq!(out.peer_rtt_ms, Some(50)); // median of [10, 50, 90]
+        // Wave 2: the same walk emits one EDGE per peer — including the
+        // offline one, which a mesh drawing must show rather than omit.
+        assert_eq!(out.links.len(), 5);
+        let carriers: Vec<&str> = out.links.iter().map(|l| l.carrier.as_str()).collect();
+        assert_eq!(
+            carriers,
+            vec!["direct", "relay", "derp", "relay", "direct"],
+            "carrier labels split DERP out of the Relay variant"
+        );
+        assert_eq!(out.links[0].rtt_ms, Some(10));
+    }
+
+    /// A peer we cannot reach is still an edge — with its own carrier
+    /// label — but never counts as a live carrier.
+    #[test]
+    fn unreachable_peers_are_edges_not_carriers() {
+        let mut s = SysSampler::new();
+        let view = OverlayView {
+            self_ip: Some("100.64.0.7".into()),
+            self_ip6: None,
+            peers: vec![
+                peer(true, ConnectionType::Direct, Some(10), None),
+                peer(false, ConnectionType::Offline, None, None),
+                peer(false, ConnectionType::Blocked, None, None),
+            ],
+            exit_node: None,
+            dns: None,
+            srflx: None,
+        };
+        let out = s.sample(&view);
+        assert_eq!(out.links.len(), 3);
+        assert_eq!(out.links[1].carrier, "offline");
+        assert_eq!(out.links[2].carrier, "blocked");
+        assert_eq!(out.direct, 1);
+        assert_eq!(out.relay + out.derp, 0);
     }
 }

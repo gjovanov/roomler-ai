@@ -583,6 +583,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/calls", get(routes::stats::admin_calls));
     let tenant_stats_routes = Router::new()
         .route("/overview", get(routes::stats::tenant_overview))
+        .route("/mesh", get(routes::stats::tenant_mesh))
         .route("/machines", get(routes::stats::tenant_machines))
         .route("/calls", get(routes::stats::tenant_calls))
         .route("/tunnels", get(routes::stats::tenant_tunnels));
