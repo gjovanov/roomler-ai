@@ -859,9 +859,22 @@ pub async fn admin_orgs(
         "tenants",
         vec![
             doc! { "$match": { "deleted_at": Bson::Null } },
-            doc! { "$set": { "id": { "$toString": "$_id" } } },
-            doc! { "$project": { "_id": 0, "id": 1, "name": 1, "slug": 1 } },
+            doc! { "$set": { "id": { "$toString": "$_id" }, "created": "$created_at" } },
+            doc! { "$project": { "_id": 0, "id": 1, "name": 1, "slug": 1, "created": 1 } },
             doc! { "$limit": 500 },
+        ],
+    )
+    .await?;
+    // Members per org — the third activity signal (an org with one
+    // member, no devices and no calls is almost always a test artifact;
+    // this deployment carries ~60 of them from integration runs).
+    let members = agg(
+        &state,
+        "tenant_members",
+        vec![
+            doc! { "$group": { "_id": "$tenant_id", "members": { "$sum": 1 } } },
+            doc! { "$set": { "tenant_id": { "$toString": "$_id" } } },
+            doc! { "$unset": "_id" },
         ],
     )
     .await?;
@@ -903,6 +916,7 @@ pub async fn admin_orgs(
         "enabled": true,
         "tenants": tenants,
         "machines": machines,
+        "members": members,
         "calls": calls,
     })))
 }
