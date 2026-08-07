@@ -64,6 +64,11 @@ pub struct BlockStatusResponse {
     pub version_floor: String,
     /// Devices below the floor right now — a renumber refuses while non-empty.
     pub below_floor: Vec<DeviceVersion>,
+    /// Fleet-wide slot accounting for the whole block space. Quarantined
+    /// blocks are never re-issued, so `burned` only grows; reporting it is
+    /// what turns "4032 slots is plenty" from a belief into something an
+    /// operator can check (docs/multi-org.md §12).
+    pub headroom: roomler_ai_services::dao::overlay_block::BlockHeadroom,
 }
 
 #[derive(Debug, Serialize)]
@@ -357,6 +362,7 @@ pub async fn get_block(
         carving_enabled: state.overlay_networks.block_prefix().is_some(),
         version_floor: floor,
         below_floor,
+        headroom: state.overlay_networks.blocks().headroom().await?,
     }))
 }
 
