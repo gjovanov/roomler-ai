@@ -105,6 +105,10 @@ pub struct AppState {
     /// emails: OAuth links accounts by bare email, so an email allowlist
     /// would turn a provider-asserted address into platform-root).
     pub platform_admins: Arc<std::collections::HashSet<ObjectId>>,
+    /// Wave 2 — optional country resolver for the user analytics. The
+    /// client IP is resolved at connect time and DROPPED; no address is
+    /// ever stored. Absent database ⇒ every session reads `unknown`.
+    pub geoip: Arc<crate::user_analytics::GeoIp>,
     /// Phase 4 — owner-side consent requests (email/push approve-link tokens).
     pub consent_requests: Arc<ConsentRequestDao>,
     pub rc_hub: Arc<Hub>,
@@ -377,6 +381,9 @@ impl AppState {
             tracing::info!(count = platform_admins.len(), "platform admins configured");
         }
         let platform_admins = Arc::new(platform_admins);
+        let geoip = Arc::new(crate::user_analytics::GeoIp::open(
+            settings.stats.geoip_mmdb.as_deref(),
+        ));
 
         let turn_map = Arc::new(build_turn_map(&settings));
         // P6b — live per-region load (written by the /stats poller, consulted
@@ -813,6 +820,7 @@ impl AppState {
             agent_logs,
             stats,
             platform_admins,
+            geoip,
             consent_requests,
             rc_hub,
             turn_map,
