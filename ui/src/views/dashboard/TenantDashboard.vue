@@ -94,6 +94,23 @@
       </v-row>
     </template>
 
+    <!-- Overlay mesh (wave 2): how this org's devices actually reach the
+         control plane and each other. Member-visible — carrier kind and
+         latency only, no addresses. -->
+    <template v-if="meshNodes.length">
+      <h2 class="text-h6 mt-4 mb-2">Network</h2>
+      <v-card>
+        <v-card-text>
+          <mesh-graph
+            :nodes="meshNodes"
+            :edges="meshEdges"
+            :center-name="centerName"
+            @select="onMeshSelect"
+          />
+        </v-card-text>
+      </v-card>
+    </template>
+
     <!-- Quick actions -->
     <h2 class="text-h6 mt-4 mb-2">Quick Actions</h2>
     <v-row>
@@ -192,6 +209,7 @@ import { useStatsStore } from '@/stores/stats'
 import { usePolling } from '@/composables/usePolling'
 import { canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
+import MeshGraph, { type MeshNode } from '@/components/stats/MeshGraph.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -217,8 +235,40 @@ const showAnalytics = computed(() =>
 // while hidden). The store swallows 404s so a member of a stats-disabled
 // deployment just sees no panel.
 usePolling(async () => {
-  if (tenantId.value) await statsStore.fetchOverview(tenantId.value)
+  if (!tenantId.value) return
+  await statsStore.fetchOverview(tenantId.value)
+  await statsStore.fetchMesh(tenantId.value)
 }, 60_000)
+
+// The mesh payload keys edges by OVERLAY node id while presence and
+// version live on the agent row — join them here so the graph gets one
+// flat node list. A device with no overlay node simply isn't in the mesh.
+const meshNodes = computed<MeshNode[]>(() => {
+  const m = statsStore.mesh
+  if (!m?.nodes) return []
+  const agentById = new Map((m.agents ?? []).map((a) => [a.id, a]))
+  return m.nodes.map((n) => {
+    const agent = n.agent_id_hex ? agentById.get(n.agent_id_hex) : undefined
+    return {
+      id: n.id,
+      name: agent?.name || n.name || n.overlay_ip || n.id.slice(-6),
+      online: agent?.last_presence === 'online',
+      relay_home: agent?.relay_home ?? n.relay_home ?? null,
+      version: agent?.agent_version ?? null,
+    }
+  })
+})
+const meshEdges = computed(() => statsStore.mesh?.edges ?? [])
+const centerName = computed(() => statsStore.mesh?.center?.name ?? 'roomler.ai')
+
+function onMeshSelect(nodeId: string) {
+  // Clicking a device jumps to the fleet page it belongs to — the graph
+  // answers "who is reachable how", Devices answers "what do I do about it".
+  const agentHex = statsStore.mesh?.nodes?.find((n) => n.id === nodeId)?.agent_id_hex
+  if (agentHex && showFleet.value) {
+    router.push(`/tenant/${tenantId.value}/devices`)
+  }
+}
 watch(tenantId, (tid) => {
   if (tid) void statsStore.fetchOverview(tid)
 })
