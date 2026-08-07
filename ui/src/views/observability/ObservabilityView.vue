@@ -111,12 +111,26 @@
       </v-row>
 
       <!-- ── Orgs ────────────────────────────────────────────────────── -->
-      <h2 class="text-h6 mt-6 mb-2">Organizations</h2>
+      <div class="d-flex align-center mt-6 mb-2" style="gap: 12px">
+        <h2 class="text-h6">Organizations</h2>
+        <span class="text-caption text-medium-emphasis">
+          {{ orgRows.length }} of {{ allOrgRows.length }}
+        </span>
+        <v-spacer />
+        <v-switch
+          v-model="showInactiveOrgs"
+          density="compact"
+          hide-details
+          color="primary"
+          :label="`Show inactive (${inactiveCount})`"
+        />
+      </div>
       <v-card>
         <v-table density="compact">
           <thead>
             <tr>
               <th>Org</th>
+              <th class="text-right">Members</th>
               <th class="text-right">Machines online</th>
               <th class="text-right">Calls (30d)</th>
               <th class="text-right">Minutes (30d)</th>
@@ -124,8 +138,12 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="o in orgRows" :key="o.id">
-              <td>{{ o.name }}</td>
+            <tr v-for="o in orgRows" :key="o.id" :class="{ 'text-medium-emphasis': !o.active }">
+              <td>
+                {{ o.name }}
+                <v-chip v-if="!o.active" size="x-small" variant="tonal" class="ml-2">idle</v-chip>
+              </td>
+              <td class="text-right">{{ o.members }}</td>
               <td class="text-right">{{ o.online }} / {{ o.total }}</td>
               <td class="text-right">{{ o.calls }}</td>
               <td class="text-right">{{ Math.round(o.minutes) }}</td>
@@ -138,7 +156,13 @@
               </td>
             </tr>
             <tr v-if="orgRows.length === 0">
-              <td colspan="5" class="text-medium-emphasis">No organizations yet</td>
+              <td colspan="6" class="text-medium-emphasis">
+                {{
+                  allOrgRows.length
+                    ? 'No active organizations — toggle "Show inactive" to see the rest'
+                    : 'No organizations yet'
+                }}
+              </td>
             </tr>
           </tbody>
         </v-table>
@@ -319,21 +343,52 @@ interface OrgRow {
   total: number
   calls: number
   minutes: number
+  members: number
+  active: boolean
 }
-const orgRows = computed<OrgRow[]>(() => {
+
+// A deployment accumulates test tenants (integration runs leave dozens
+// of one-member orgs behind), and they drown the real ones. "Active" =
+// it has devices, calls, or more than a lone creator. Presentation only
+// — the rows are still one toggle away, because deleting tenant DATA is
+// the operator's call, not this view's.
+const showInactiveOrgs = ref(false)
+
+const allOrgRows = computed<OrgRow[]>(() => {
   const o = orgs.value
   if (!o?.tenants) return []
   const m = new Map((o.machines ?? []).map((x) => [x.tenant_id, x]))
   const c = new Map((o.calls ?? []).map((x) => [x.tenant_id, x]))
-  return o.tenants.map((t) => ({
-    id: t.id,
-    name: t.name,
-    online: m.get(t.id)?.online ?? 0,
-    total: m.get(t.id)?.total ?? 0,
-    calls: c.get(t.id)?.calls_30d ?? 0,
-    minutes: c.get(t.id)?.minutes_30d ?? 0,
-  }))
+  const mem = new Map((o.members ?? []).map((x) => [x.tenant_id, x]))
+  return o.tenants
+    .map((t) => {
+      const total = m.get(t.id)?.total ?? 0
+      const calls = c.get(t.id)?.calls_30d ?? 0
+      const members = mem.get(t.id)?.members ?? 0
+      return {
+        id: t.id,
+        name: t.name,
+        online: m.get(t.id)?.online ?? 0,
+        total,
+        calls,
+        minutes: c.get(t.id)?.minutes_30d ?? 0,
+        members,
+        active: total > 0 || calls > 0 || members > 1,
+      }
+    })
+    .sort(
+      (a, b) =>
+        Number(b.active) - Number(a.active) ||
+        b.online - a.online ||
+        b.total - a.total ||
+        b.minutes - a.minutes ||
+        a.name.localeCompare(b.name),
+    )
 })
+const inactiveCount = computed(() => allOrgRows.value.filter((o) => !o.active).length)
+const orgRows = computed(() =>
+  showInactiveOrgs.value ? allOrgRows.value : allOrgRows.value.filter((o) => o.active),
+)
 function orgName(id: string): string {
   return orgRows.value.find((o) => o.id === id)?.name ?? id
 }
