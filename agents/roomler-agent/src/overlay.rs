@@ -418,6 +418,29 @@ static SHARED_MUX: std::sync::Mutex<
     Option<(Arc<SystemTun>, Arc<tunnel_core::overlay::tun_mux::TunMux>)>,
 > = std::sync::Mutex::new(None);
 
+/// Multi-org — release an org's claim on the shared TUN: drop its mux port
+/// and take its address back off the adapter.
+///
+/// Called when an org's supervised loop ENDS for good (disabled, removed,
+/// terminal error) — until now the address stayed up until the daemon
+/// restarted (docs/multi-org.md §12). Harmless but untidy, and on a
+/// long-lived multi-org host the litter accumulates.
+///
+/// No-op without the shared mux (single-org daemons never register).
+#[cfg(feature = "overlay-l3")]
+pub fn release_org(org_key: &str) {
+    let shared = SHARED_MUX.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((dev, mux)) = shared.as_ref() else {
+        return;
+    };
+    if let Some((addr, prefix)) = mux.deregister(org_key) {
+        dev.del_address_sync(addr, prefix);
+        info!(org = %org_key, %addr, "overlay: released the org's shared-TUN claim");
+    }
+}
+#[cfg(not(feature = "overlay-l3"))]
+pub fn release_org(_org_key: &str) {}
+
 /// Multi-org P2c — per-org TUN factory over the ONE shared device.
 ///
 /// Differences from [`systun_tun_factory`], all deliberate:
