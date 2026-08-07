@@ -63,12 +63,45 @@ export interface OrgsPayload {
   calls?: Array<{ tenant_id: string; calls_30d: number; minutes_30d: number }>
 }
 
+export interface MeshPayload {
+  enabled: boolean
+  center?: { id: string; name: string }
+  /** overlay nodes — edges are keyed by these ids */
+  nodes?: Array<{
+    id: string
+    agent_id_hex?: string
+    name?: string
+    overlay_ip?: string
+    relay_home?: string | null
+    status?: string
+  }>
+  /** agent rows carry presence + version, joined by hex id */
+  agents?: Array<{
+    id: string
+    name?: string
+    last_presence?: string
+    agent_version?: string
+    relay_home?: string | null
+    os?: string
+  }>
+  edges?: Array<{
+    kind: string
+    from: string
+    to: string
+    carrier: string
+    rtt_ms?: number | null
+    stalled?: boolean
+    reports?: number
+  }>
+}
+
 export const useStatsStore = defineStore('stats', () => {
   // Cached snapshots the dashboard panels poll into. Query-tab payloads
   // are returned to the caller (view-local state) — they're range-keyed
   // and short-lived, caching them here would just go stale.
   const overview = ref<TenantOverview | null>(null)
   const relayCurrent = ref<RelayCurrent | null>(null)
+  const mesh = ref<MeshPayload | null>(null)
   const error = ref<string | null>(null)
 
   async function fetchOverview(tenantId: string): Promise<TenantOverview | null> {
@@ -92,6 +125,19 @@ export const useStatsStore = defineStore('stats', () => {
   }
   async function fetchTunnels(tenantId: string, range: string): Promise<SeriesPayload> {
     return api.get<SeriesPayload>(`/tenant/${tenantId}/stats/tunnels?range=${range}`)
+  }
+
+  /** Overlay topology for the dashboard mesh graph (member-visible). */
+  async function fetchMesh(tenantId: string): Promise<MeshPayload | null> {
+    try {
+      mesh.value = await api.get<MeshPayload>(`/tenant/${tenantId}/stats/mesh`)
+      error.value = null
+    } catch (e) {
+      // 404 = not a member / stats off — the panel just doesn't render.
+      error.value = e instanceof Error ? e.message : 'mesh failed'
+      mesh.value = null
+    }
+    return mesh.value
   }
 
   // ── platform admin ────────────────────────────────────────────────────
@@ -124,11 +170,13 @@ export const useStatsStore = defineStore('stats', () => {
   return {
     overview,
     relayCurrent,
+    mesh,
     error,
     fetchOverview,
     fetchMachines,
     fetchCalls,
     fetchTunnels,
+    fetchMesh,
     fetchRelayCurrent,
     fetchRelayHistory,
     fetchOrgs,
