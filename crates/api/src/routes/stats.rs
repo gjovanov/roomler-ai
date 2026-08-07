@@ -667,7 +667,17 @@ pub async fn tenant_mesh(
             doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
             doc! { "$set": {
                 "id": { "$toString": "$_id" },
-                "agent_id_hex": { "$toString": "$agent_id" },
+                // An overlay node points at its owner through
+                // `node_ref: {kind, id}` — there is NO flat `agent_id`.
+                // Reading the wrong field yielded nulls, which silently
+                // emptied the agent→node map and drew a graph with no
+                // edges at all. Tunnel-client nodes have no agent, so
+                // they resolve to null here by design.
+                "agent_id_hex": { "$cond": [
+                    { "$eq": [ "$node_ref.kind", "agent" ] },
+                    { "$toString": "$node_ref.id" },
+                    Bson::Null,
+                ]},
             }},
             doc! { "$project": {
                 "_id": 0, "id": 1, "agent_id_hex": 1, "name": 1,
