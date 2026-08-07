@@ -576,6 +576,7 @@ async fn handle_client_message(
             authz.mode,
             authz.override_reason,
             authz.input_mode,
+            authz.tenant_name,
             dialed_tid,
             conn_established_ms,
             connection_id,

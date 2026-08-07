@@ -1137,7 +1137,15 @@ async fn handle_server_msg(
             audio_enabled,
             consent_mode,
             input_mode,
+            tenant_name,
         } => {
+            // Multi-org — WHICH organization is asking. The server's display
+            // name when it sent one; otherwise this loop's own org label,
+            // which at least distinguishes secondaries. A single-org device
+            // on an older server shows nothing extra, exactly as before.
+            let asking_org: Option<String> = tenant_name
+                .clone()
+                .or_else(|| (!ctx.is_primary).then(|| ctx.label.clone()));
             // Pick the best codec for this session from the
             // intersection of (browser-advertised, agent-supported).
             // Stashed per session_id so the rc:sdp.offer handler can
@@ -1199,6 +1207,7 @@ async fn handle_server_msg(
                 audio_requested = audio_enabled,
                 audio_negotiated,
                 consent_mode = ?consent_broker.mode(),
+                org = ?asking_org,
                 "incoming session request — running consent broker"
             );
             // Show the "someone is watching" overlay on the controlled
@@ -1255,6 +1264,12 @@ async fn handle_server_msg(
                     "controller_name": controller_name,
                     "permissions": permissions,
                     "timeout_secs": consent_timeout_secs,
+                    // Multi-org — the tray/desktop modal renders this so the
+                    // operator can tell WHICH organization is asking. On a
+                    // device enrolled in two orgs, "Alice wants to control
+                    // this machine" is not enough to decide on. Absent for a
+                    // single-org device (nothing useful to add).
+                    "org": asking_org,
                 })
                 .to_string();
                 if let Err(e) = consent_broker.write_pending(&session_hex, &body) {

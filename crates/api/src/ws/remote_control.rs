@@ -214,6 +214,7 @@ pub async fn handle_agent_socket(
         consent_mode: ConsentMode::Prompt,
         override_reason: None,
         input_mode: None,
+        tenant_name: None,
     };
 
     // Phase A-1 — server-side receive-liveness, symmetric to the agent's
@@ -889,6 +890,9 @@ pub async fn dispatch_controller_rc(
     // P6 — the device's `AccessPolicy.input_mode` (resolved by the authz
     // gate alongside `consent_mode`); forwarded to the agent's arbiter.
     input_mode: Option<roomler_ai_remote_control::models::InputMode>,
+    // Multi-org — the org name the host's consent prompt should name
+    // (resolved by the same gate).
+    tenant_name: Option<String>,
     // PR-1 rehome direction inputs: the affinity key this conn DIALED
     // with (None = key-less legacy/racy dial) and when it established.
     dialed_tid: Option<&str>,
@@ -912,7 +916,10 @@ pub async fn dispatch_controller_rc(
         // PR-2: the relay needs its own copy after ctx takes this one.
         override_reason: override_reason.clone(),
         input_mode,
+        tenant_name: tenant_name.clone(),
     };
+    // …and so does the cross-pod relay, for the same reason.
+    let relay_tenant_name = tenant_name;
     if let Err(e) = hub.dispatch(&ctx, parsed) {
         warn!(%user_id, %e, "rc:* dispatch failed (controller)");
         // C-2 rehome: a SessionRequest that missed the LOCAL hub while a
@@ -955,6 +962,7 @@ pub async fn dispatch_controller_rc(
                     consent_mode,
                     &override_reason,
                     input_mode,
+                    &relay_tenant_name,
                     &frame_val,
                 )
                 .await
@@ -1069,6 +1077,7 @@ pub async fn dispatch_controller_rc(
                         consent_mode,
                         &override_reason,
                         input_mode,
+                        &relay_tenant_name,
                         &frame_val,
                     )
                     .await
@@ -1117,6 +1126,11 @@ pub struct SessionAuthz {
     pub override_reason: Option<String>,
     /// P6 — the device's `AccessPolicy.input_mode` (None = free default).
     pub input_mode: Option<roomler_ai_remote_control::models::InputMode>,
+    /// Multi-org — display name of the organization this session happens in,
+    /// so the host's consent prompt can say WHICH org is asking. Resolved
+    /// from the agent row the gate already loads. `None` on the early-out
+    /// paths (non-session-request, unknown agent) where no prompt follows.
+    pub tenant_name: Option<String>,
 }
 
 impl SessionAuthz {
@@ -1125,16 +1139,19 @@ impl SessionAuthz {
             mode,
             override_reason: None,
             input_mode: None,
+            tenant_name: None,
         }
     }
     fn allow_with_input(
         mode: ConsentMode,
         input_mode: Option<roomler_ai_remote_control::models::InputMode>,
+        tenant_name: Option<String>,
     ) -> Self {
         Self {
             mode,
             override_reason: None,
             input_mode,
+            tenant_name,
         }
     }
 }
@@ -1185,11 +1202,24 @@ pub async fn resolve_session_authz(
     // P6 — the device's input arbitration mode rides every allowed outcome.
     let input_mode = agent.access_policy.input_mode;
 
+    // Multi-org — the organization name the host's consent prompt will show.
+    // One extra read, and only on a real session request (the early-outs above
+    // never reach here). A failed lookup degrades the prompt to the agent's own
+    // org label rather than failing the session.
+    let tenant_name = state
+        .tenants
+        .base
+        .find_by_id(agent.tenant_id)
+        .await
+        .ok()
+        .map(|t| t.name);
+
     // Controlling your OWN device is always allowed AND auto-consents.
     if agent.owner_user_id == controller_user_id {
         return Ok(SessionAuthz::allow_with_input(
             ConsentMode::Auto,
             input_mode,
+            tenant_name,
         ));
     }
 
@@ -1210,9 +1240,14 @@ pub async fn resolve_session_authz(
                 mode: ConsentMode::Auto,
                 override_reason: Some(reason),
                 input_mode,
+                tenant_name,
             });
         }
-        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+        ));
     }
     if !permissions::has(perms, permissions::REMOTE_CONTROL) {
         return Err("you don't have permission to control others' devices".to_string());
@@ -1222,10 +1257,18 @@ pub async fn resolve_session_authz(
     // request; consent is the real gate). Non-empty ⇒ user or a role must match.
     let policy = &agent.access_policy;
     if policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty() {
-        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+        ));
     }
     if policy.allowed_user_ids.contains(&controller_user_id) {
-        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+        ));
     }
     let role_ids = state
         .tenants
@@ -1233,7 +1276,11 @@ pub async fn resolve_session_authz(
         .await
         .unwrap_or_default();
     if policy.allowed_role_ids.iter().any(|r| role_ids.contains(r)) {
-        return Ok(SessionAuthz::allow_with_input(mode, input_mode));
+        return Ok(SessionAuthz::allow_with_input(
+            mode,
+            input_mode,
+            tenant_name.clone(),
+        ));
     }
     Err("you're not on this device's control allowlist".to_string())
 }

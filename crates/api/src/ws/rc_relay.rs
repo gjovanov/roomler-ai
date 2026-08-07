@@ -118,6 +118,14 @@ pub fn wire_rc_relay(state: &AppState) {
                     .get("input_mode")
                     .cloned()
                     .and_then(|v| serde_json::from_value(v).ok());
+                // Multi-org — the asking org's name rides the relayed frame so
+                // a CROSS-POD session request still names it in the host's
+                // consent prompt. Resolved on the ORIGIN pod (it ran the authz
+                // gate); the owner pod only forwards what it was told.
+                let tenant_name = body
+                    .get("tenant_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let frame: ClientMsg = serde_json::from_value(
                     body.get("frame")
                         .cloned()
@@ -173,6 +181,7 @@ pub fn wire_rc_relay(state: &AppState) {
                     consent_mode,
                     override_reason,
                     input_mode,
+                    tenant_name,
                 };
                 match state.rc_hub.dispatch(&ctx, frame) {
                     Ok(()) => Ok(serde_json::json!({ "dispatched": true })),
@@ -303,6 +312,7 @@ pub async fn relay_rc_frame(
     consent_mode: ConsentMode,
     override_reason: &Option<String>,
     input_mode: Option<InputMode>,
+    tenant_name: &Option<String>,
     raw_frame: &serde_json::Value,
 ) -> Result<Option<(String, String)>, ()> {
     let Some(bus) = state.cluster_bus.clone() else {
@@ -319,6 +329,7 @@ pub async fn relay_rc_frame(
         "consent_mode": consent_mode,
         "override_reason": override_reason,
         "input_mode": input_mode,
+        "tenant_name": tenant_name,
         "frame": raw_frame,
     });
     match bus.request(owner_pod, "rc.cmd", body).await {
