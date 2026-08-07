@@ -404,32 +404,51 @@ no blank row can render).
 
 ## 12. Open items
 
-- **The refusal path is unit-locked, not field-run.** The two-org case and
-  the clean-join path are field-proven (five hosts, 2026-08-05); what has
-  never run on real hardware is a REFUSED registration leaving no address
-  behind. It needs a third org still on the legacy `/10`, and **the blocker
-  is a product decision, not engineering**: `Tenant.is_archived` exists but
-  nothing reads it, so there is no way to retire a throwaway org afterwards.
-  Deciding what "archive an organization" means (hidden from the switcher?
-  blocks enrollment? blocks new sessions? what happens to its devices and
-  rooms?) is a prerequisite; the endpoint itself is small once it is
-  decided.
+- **The refusal path now runs against a real kernel; the third-org field run
+  still needs a product decision.** `TunMux`'s bookkeeping was always
+  unit-tested against a fake device, but the half that touches the OS — a
+  REFUSED registration leaving no address behind, a disjoint block really
+  getting one, a released org really losing it — had never met a kernel,
+  because reproducing it in the field needs a third organization on the
+  legacy `/10` and **there is no way to retire a throwaway org afterwards**.
+  A `tun` device is free, so that half now runs on every CI push
+  (`tun_kernel_tests`, root + `ROOMLER_TUN_KERNEL_TEST=1`, skipped
+  everywhere else). What is still untested is the same path with two real
+  control planes behind it. Unblocking it means deciding what "archive an
+  organization" means — hidden from the switcher? blocks enrollment? blocks
+  new sessions? what happens to its devices and rooms? — since
+  `Tenant.is_archived` exists and nothing reads it. The endpoint is small
+  once that is decided.
 - **macOS is excluded from multi-org meshing, and the gap is wider than it
-  looks.** `add_address_sync` refuses there, but so do `add_peer_route` and
-  `add_cidr_route` — both are no-ops outside Linux/Windows. macOS therefore
-  has no per-peer `/32`s and no subnet routes at all today; the overlay
-  leans entirely on the device's own connected route. Adding utun aliasing
-  alone would produce a second address with no routing behind it. Doing this
-  properly is its own project (utun name accessor + `ifconfig` alias +
-  `route -interface` handling) and needs a Mac to verify — there is none in
-  the fleet, and unverified OS-level networking is worse than the current
-  loud refusal.
-- **Netstack per-org statics** (`NS_HANDLE`'s single watch channel,
-  `SOCKS_BOUND` once-ever) keep netstack single-org; `overlay_multi_org`
-  overrides netstack mode to the OS TUN, and a foreign-server org still has
-  no overlay path at all. Worth doing only if a locked-down host genuinely
-  needs netstack in two orgs — untangling process-global statics is real
-  work for a case nobody has hit yet.
-- **Block reclaim** — quarantined blocks are never automatically re-issued.
-  With 4032 slots this is deliberate; a reclaim path can be added if a
-  deployment ever churns tenants hard enough to matter.
+  looks.** `add_address_sync` refuses there, but so do `add_peer_route`,
+  `add_cidr_route`, `enumerate_if_routes`, `purge_one` and the derived-v6
+  assign — all no-ops outside Linux/Windows. macOS therefore has no per-peer
+  `/32`s and no subnet routes at all today; the overlay leans entirely on the
+  device's own connected route. Adding utun aliasing alone would produce a
+  second address with no routing behind it, which is why the refusal is loud
+  rather than partial.
+  The blocker used to be stated as "needs a Mac, and there is none in the
+  fleet". That is no longer true: **a `macos-latest` CI runner has sudo and
+  utun**, and `ci.yml` already runs a macOS job. So this is now scoped work
+  rather than blocked work — utun name accessor, `ifconfig <utun> alias`,
+  `route -n add -interface`, and the same kernel-level test shape as
+  `tun_kernel_tests` — just a project of its own, and still worth nothing
+  until someone actually runs a Mac in a mesh.
+- **The netstack surface is now OWNED, not silently shared.** It is a set of
+  process-global singletons — one stack handle channel, one loopback SOCKS
+  port, one `roomler ping` backend — and none of them is org-scoped. A
+  second org publishing its stack did not join the mesh twice; it REPLACED
+  the first org's stack underneath a SOCKS front that kept answering on the
+  same port, so a user dialing through SOCKS believing they reached org A
+  was silently routed by org B. First org in now claims the surface and a
+  second one withholds its overlay with a loud warning, exactly like a
+  refused shared-TUN registration; the claim is released when its owner's
+  loop ends. Untangling the statics into genuinely per-org instances is
+  still deferred: it is real work for a case nobody has hit, whereas silent
+  cross-org misrouting was a bug regardless of demand.
+- **Block reclaim** — quarantined blocks are never automatically re-issued,
+  because a re-issued range could collide with an agent still holding stale
+  peers from the previous tenant. With 4032 slots that is comfortable, and
+  `GET …/overlay-block` now reports `headroom { total, used, burned }` so
+  the comfort is a number rather than a belief. A reclaim path earns its
+  risk on the day `burned` becomes a meaningful fraction of `total`.
