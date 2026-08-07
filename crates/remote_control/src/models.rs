@@ -1602,6 +1602,18 @@ pub enum OverlayBlockState {
     /// tenant would hand that stale node a live neighbour's address. The row
     /// is kept as the forensic record of who held the range.
     Quarantined,
+    /// An operator has judged a quarantined range safe to hand out again:
+    /// old enough that any device would have reconnected and been
+    /// renumbered many times over, and with no live node still holding an
+    /// address inside it.
+    ///
+    /// Reclaimed rows are the allocator's **fallback, not its default**.
+    /// Normal allocation stays strictly monotonic-upward — that is what
+    /// makes non-overlap structural rather than locked — and only reaches
+    /// for a reclaimed range when the monotonic path has genuinely run out
+    /// of space above. So the risk this state carries is paid exactly when
+    /// the alternative is "no address at all", and never before.
+    Reclaimed,
 }
 
 /// One entry in the GLOBAL overlay block registry (multi-org P2b).
