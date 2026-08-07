@@ -180,6 +180,24 @@ enum Command {
         #[command(flatten)]
         fmt: OutputFmt,
     },
+    /// Tail a daemon log, resolved BY the daemon — the path differs per process
+    /// and per platform, and two of the candidates on a Windows host are decoys.
+    /// Pairs with Fleet RPC: `roomler exec <host> -- roomler logs --grep ICE`.
+    Logs {
+        /// Which log: `daemon` (this process's rolling log — the one with the
+        /// overlay/media events), `service` (the SCM host log), or `panic`
+        /// (the newest panic dump).
+        #[arg(long, default_value = "daemon")]
+        source: String,
+        /// Tail size in bytes; the daemon clamps it (≤64 KiB).
+        #[arg(long)]
+        max_bytes: Option<u64>,
+        /// Case-insensitive substring filter applied to the returned tail.
+        #[arg(long)]
+        grep: Option<String>,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
     /// List the peers the local daemon currently sees, with each peer's live
     /// connection type (direct / relay / tunnel / blocked / offline).
     Peers {
@@ -465,6 +483,12 @@ async fn main() -> Result<()> {
         // Read-only LocalAPI verbs: no config/token — talk straight to the
         // local daemon over its ACL-gated pipe/socket.
         Command::Status { fmt } => localclient::status(fmt.json).await,
+        Command::Logs {
+            source,
+            max_bytes,
+            grep,
+            fmt,
+        } => localclient::logs(source, max_bytes, grep, fmt.json).await,
         Command::Peers { fmt } => localclient::peers(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
         Command::Rename { name } => localclient::rename(&name).await,
