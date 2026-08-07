@@ -63,6 +63,41 @@ export const RC_RECONNECT_LADDER_MS = [250, 500, 1000, 2000, 4000, 8000] as cons
 export const RC_RECONNECT_STEADY_MS = 8000
 
 /**
+ * Extra delay for consecutive **dead-air** cycles — sessions that reached
+ * `connected` but never delivered a single frame before the media watchdog
+ * tore them down.
+ *
+ * `RC_RECONNECT_LADDER_MS` alone cannot slow this down, because reaching
+ * `connected` used to reset the attempt counter: the peer connects, the
+ * watchdog kills it 10 s later (`RC_WATCHDOG_TICK_MS` × `RC_STALL_FAIL_TICKS`)
+ * having seen no media, and the next retry starts back at 250 ms. The ladder
+ * counts CONNECTION failures, and this failure happens after a successful
+ * connection — so the backoff never grew and the retry ran at fixed rate
+ * forever.
+ *
+ * Field 2026-08-07: a controller left pointed at CORPLAP-1, whose Check Point
+ * profile leaves it with no usable ICE candidate, produced **388 sessions in
+ * 24 h** — each connecting, running ~10.9 s of dead air, and dying. The other
+ * hosts in the same office logged 3 and 4.
+ *
+ * The first two cycles stay fast: a lock-screen/SYSTEM-context handoff or a
+ * codec renegotiation genuinely can produce one frameless session. From the
+ * third, the pair almost certainly has no media path at all, and retrying
+ * every ~19 s buys nothing — so back off to minutes and tell the operator.
+ */
+export const RC_DEAD_AIR_LADDER_MS = [0, 0, 0, 30_000, 60_000, 120_000, 300_000] as const
+
+/**
+ * Consecutive dead-air cycles → minimum delay before the next attempt.
+ * `streak` is the number of frameless sessions seen in a row (1 = the first).
+ * Exported for unit testing.
+ */
+export function deadAirDelayMs(streak: number): number {
+  if (streak <= 0) return 0
+  return RC_DEAD_AIR_LADDER_MS[Math.min(streak, RC_DEAD_AIR_LADDER_MS.length - 1)]
+}
+
+/**
  * S3 viewer resilience Ã¢ÂÂ detection constants. All exported so the
  * decision tables below are unit-lockable.
  *
@@ -2543,6 +2578,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    */
   let lastConnectArgs: { agentId: string; permissions: string; orgId?: string } | null = null
   const reconnectAttempt = ref(0)
+  /** Consecutive sessions that connected but never delivered a frame —
+   *  drives `deadAirDelayMs`. Cleared the moment media actually moves. */
+  const deadAirStreak = ref(0)
+  /** Has media EVER advanced on the current session? The media watchdog
+   *  owns this; it is what "the connection is genuinely working" means,
+   *  as opposed to merely having reached `connected`. */
+  let mediaEverFlowed = false
   // PR-1 rehome: consecutive `agent_on_other_pod` streak. Each one
   // re-keys + redials the WS (bounded by RC_REHOME_MAX_REDIALS, then
   // the infinite ladder carries on without socket cycling). Reset by
@@ -2637,6 +2679,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       lastMediaProgress = cur
       if (advanced) {
         stallTicks = 0
+        // Media actually moving is the ONLY proof this pair has a working
+        // path — reaching `connected` is not. Reset the ladders here rather
+        // than on the connection state, so a session that connects and then
+        // sits in dead air keeps climbing instead of restarting at 250 ms.
+        if (!mediaEverFlowed) {
+          mediaEverFlowed = true
+          deadAirStreak.value = 0
+          reconnectAttempt.value = 0
+        }
       } else {
         stallTicks++
       }
@@ -5414,12 +5465,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    * transition (so a stable session that later fails starts the
    * ladder from 250 ms again, not from where it left off).
    */
-  function cancelReconnect() {
+  function cancelReconnect(opts?: { keepAttempts?: boolean }) {
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
     }
+    if (opts?.keepAttempts) return
     reconnectAttempt.value = 0
+    deadAirStreak.value = 0
     rehomeStreak = 0
     notice.value = null
   }
@@ -5469,7 +5522,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // the "budget exhausted" terminal that frustrated operators on
     // corporate AV-protected hosts where the agent gets killed and
     // restarted repeatedly during large uploads.
-    const delay = nextReconnectDelayMs(attemptIdx)
+    // A cycle that reached `connected` and never saw a frame is DEAD AIR:
+    // count it, and let the dead-air ladder raise the floor on the delay.
+    // `Math.max` so a genuinely flapping-but-working session keeps the fast
+    // ladder — only the frameless case is slowed.
+    if (!mediaEverFlowed && phase.value === 'connected') {
+      deadAirStreak.value += 1
+    }
+    const deadAir = deadAirDelayMs(deadAirStreak.value)
+    const delay = Math.max(nextReconnectDelayMs(attemptIdx), deadAir)
+    if (deadAir > 0) {
+      console.warn(
+        '[rc] no media on the last',
+        deadAirStreak.value,
+        'attempts — backing off',
+        delay,
+        'ms. The device likely has no usable network path to this browser.',
+      )
+      notice.value = `No video from this device after ${deadAirStreak.value} attempts — retrying every ${Math.round(delay / 1000)}s. Its network may be blocking the connection.`
+    }
     reconnectAttempt.value = attemptIdx + 1
     phase.value = 'reconnecting'
     teardown()
@@ -5632,6 +5703,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     error.value = null
     sessionId.value = null
+    // Per-ATTEMPT, not per-user-connect: each retry has to earn "media
+    // flowed" again, otherwise one good session would excuse every frameless
+    // one that followed it.
+    mediaEverFlowed = false
     inputGranted.value = true // until rc:session.created reports otherwise
     // P6 — fresh session, fresh multi-user state.
     controlState.value = null
@@ -5864,12 +5939,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (!state) return
       if (state === 'connected') {
         phase.value = 'connected'
-        // A successful connection (whether the initial one or a
-        // mid-ladder retry) resets the attempt counter. Without this
-        // a long-lived session that drops once at hour 5 would jump
-        // straight to attempt 4 and use a 4 s first delay instead of
-        // 250 ms.
-        cancelReconnect()
+        // Stand down the pending retry timer, but KEEP the attempt counters:
+        // reaching `connected` is not proof the session works. A pair with no
+        // usable ICE candidate connects every time and then sits in dead air
+        // until the media watchdog kills it, so resetting here made the ladder
+        // restart at 250 ms forever (CORPLAP-1: 388 sessions/24 h). The media
+        // watchdog clears both counters the moment a frame actually arrives,
+        // which still gives a long-lived session that drops at hour 5 its
+        // 250 ms first retry — that session had media.
+        cancelReconnect({ keepAttempts: true })
         // A recovered ICE flap lands back here Ã¢ÂÂ stand down the
         // sustained-'disconnected' fuse and the negotiation timeout,
         // and start watching media progress.

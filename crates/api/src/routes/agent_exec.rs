@@ -751,16 +751,55 @@ pub async fn set_org_settings(
     }))
 }
 
+/// ⚠️ The pagination fields are declared INLINE, deliberately not
+/// `#[serde(flatten)] page: PaginationParams`.
+///
+/// `Query` deserializes with `serde_urlencoded`, which hands every value to
+/// serde as a **string**. `flatten` forces the fields behind it through
+/// `deserialize_any`, and `u64` then rejects `"1"` with "invalid type: string,
+/// expected u64" — so the extractor rejected EVERY request with 400 and the
+/// admin Command-audit panel showed "API error 400" permanently. It read as
+/// "no commands attempted yet", which is why it survived review: the empty
+/// state and the broken state look identical.
+///
+/// Every other paginated route takes `Query<PaginationParams>` directly, with
+/// no flatten, which is why this was the only one affected. The other
+/// `serde(flatten)` uses in this file are on JSON bodies/responses, where it
+/// works fine — it is specifically flatten + urlencoded that breaks.
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
-    #[serde(flatten)]
-    pub page: PaginationParams,
+    #[serde(default = "default_audit_page")]
+    pub page: u64,
+    #[serde(default = "default_audit_per_page")]
+    pub per_page: u64,
+    /// ISO 8601 — return only entries created before this instant.
+    #[serde(default)]
+    pub before: Option<String>,
     /// Narrow to one device.
     #[serde(default)]
     pub agent_id: Option<String>,
     /// Narrow to one person — where an incident review starts.
     #[serde(default)]
     pub user_id: Option<String>,
+}
+
+fn default_audit_page() -> u64 {
+    1
+}
+
+fn default_audit_per_page() -> u64 {
+    25
+}
+
+impl AuditQuery {
+    /// The DAO's pagination view of this query.
+    fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            page: self.page,
+            per_page: self.per_page,
+            before: self.before.clone(),
+        }
+    }
 }
 
 /// `GET /api/tenant/{tenant_id}/exec-audit`
@@ -780,18 +819,19 @@ pub async fn audit(
     )
     .await?;
 
+    let pg = q.pagination();
     let page = match (&q.agent_id, &q.user_id) {
         (Some(a), _) => {
             let aid = ObjectId::parse_str(a)
                 .map_err(|_| ApiError::BadRequest("Invalid agent_id".into()))?;
-            state.exec_audit.list_for_agent(tid, aid, &q.page).await?
+            state.exec_audit.list_for_agent(tid, aid, &pg).await?
         }
         (None, Some(u)) => {
             let uid = ObjectId::parse_str(u)
                 .map_err(|_| ApiError::BadRequest("Invalid user_id".into()))?;
-            state.exec_audit.list_for_user(tid, uid, &q.page).await?
+            state.exec_audit.list_for_user(tid, uid, &pg).await?
         }
-        (None, None) => state.exec_audit.list_for_tenant(tid, &q.page).await?,
+        (None, None) => state.exec_audit.list_for_tenant(tid, &pg).await?,
     };
     Ok(Json(ExecAuditResponse {
         items: page.items.into_iter().map(Into::into).collect(),
@@ -804,6 +844,45 @@ pub async fn audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The admin panel's exact request. Went through axum's real `Query`
+    /// extractor, because the bug was in the EXTRACTOR — `serde_urlencoded`
+    /// hands values over as strings and `#[serde(flatten)]` made the `u64`
+    /// pagination fields reject them, 400-ing every call. A test that
+    /// deserialized the struct some other way would have passed throughout.
+    #[test]
+    fn audit_query_parses_the_admin_panels_request() {
+        use axum::extract::Query;
+        let uri: axum::http::Uri =
+            "/api/tenant/69a1dbbad2000f26adc875ce/exec-audit?page=1&per_page=50"
+                .parse()
+                .unwrap();
+        let q: Query<AuditQuery> = Query::try_from_uri(&uri).expect("admin panel query must parse");
+        assert_eq!(q.page, 1);
+        assert_eq!(q.per_page, 50);
+        assert!(q.agent_id.is_none());
+        assert!(q.user_id.is_none());
+        assert_eq!(q.pagination().per_page, 50);
+    }
+
+    /// The filters the console history and incident review use, plus the
+    /// no-params case (defaults must apply, not 400).
+    #[test]
+    fn audit_query_parses_filters_and_bare_request() {
+        use axum::extract::Query;
+        let uri: axum::http::Uri =
+            "/x?page=2&per_page=10&agent_id=6a6bd082f326868c85708cea&user_id=69a1dbbad2000f26adc875ce"
+                .parse()
+                .unwrap();
+        let q: Query<AuditQuery> = Query::try_from_uri(&uri).unwrap();
+        assert_eq!((q.page, q.per_page), (2, 10));
+        assert_eq!(q.agent_id.as_deref(), Some("6a6bd082f326868c85708cea"));
+        assert_eq!(q.user_id.as_deref(), Some("69a1dbbad2000f26adc875ce"));
+
+        let bare: axum::http::Uri = "/x".parse().unwrap();
+        let q: Query<AuditQuery> = Query::try_from_uri(&bare).expect("no params must default");
+        assert_eq!((q.page, q.per_page), (1, 25));
+    }
 
     #[test]
     fn sample_truncation_never_splits_a_char() {
