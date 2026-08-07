@@ -199,6 +199,92 @@
         </v-col>
       </v-row>
 
+      <!-- ── Users / sessions ────────────────────────────────────────── -->
+      <h2 class="text-h6 mt-6 mb-2">Users &amp; sessions</h2>
+      <v-row>
+        <v-col cols="12" md="8">
+          <v-card>
+            <v-card-title class="text-subtitle-1">Connections</v-card-title>
+            <v-card-text>
+              <time-series-chart
+                :points="users?.series ?? []"
+                :series="[
+                  { key: 'sessions', label: 'Sessions' },
+                  { key: 'users', label: 'Distinct users' },
+                ]"
+                area
+                empty-text="No sessions recorded in this range"
+              />
+            </v-card-text>
+          </v-card>
+        </v-col>
+        <v-col cols="12" md="4">
+          <v-card>
+            <v-card-title class="text-subtitle-1">Session length</v-card-title>
+            <v-card-text>
+              <v-table density="compact">
+                <tbody>
+                  <tr v-for="d in durationRows" :key="d.label">
+                    <td>{{ d.label }}</td>
+                    <td class="text-right">{{ d.sessions }}</td>
+                  </tr>
+                  <tr v-if="!durationRows.length">
+                    <td class="text-medium-emphasis">No sessions yet</td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </v-card-text>
+          </v-card>
+        </v-col>
+      </v-row>
+
+      <v-row dense>
+        <v-col v-for="b in breakdowns" :key="b.title" cols="12" sm="6" md="3">
+          <v-card>
+            <v-card-title class="text-subtitle-1">
+              {{ b.title }}
+              <span
+                v-if="b.title === 'Countries' && users && users.geoip === false"
+                class="text-caption text-medium-emphasis ml-2"
+              >no GeoIP database</span>
+            </v-card-title>
+            <v-card-text class="pt-0">
+              <v-table density="compact">
+                <tbody>
+                  <tr v-for="row in b.rows" :key="row.key">
+                    <td>{{ row.key }}</td>
+                    <td class="text-right">{{ row.sessions }}</td>
+                  </tr>
+                  <tr v-if="!b.rows.length">
+                    <td class="text-medium-emphasis">—</td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </v-card-text>
+          </v-card>
+        </v-col>
+        <v-col cols="12" sm="6" md="3">
+          <v-card>
+            <v-card-title class="text-subtitle-1">Top pages</v-card-title>
+            <v-card-text class="pt-0">
+              <v-table density="compact">
+                <tbody>
+                  <tr v-for="p in users?.pages ?? []" :key="p.path">
+                    <td class="text-truncate" style="max-width: 160px" :title="p.path">
+                      {{ p.path }}
+                    </td>
+                    <td class="text-right">{{ p.views }}</td>
+                  </tr>
+                  <tr v-if="!(users?.pages ?? []).length">
+                    <td class="text-medium-emphasis">—</td>
+                  </tr>
+                </tbody>
+              </v-table>
+            </v-card-text>
+          </v-card>
+        </v-col>
+      </v-row>
+
       <!-- ── Calls (platform-wide) ───────────────────────────────────── -->
       <h2 class="text-h6 mt-6 mb-2">Calls — platform wide</h2>
       <v-row>
@@ -244,6 +330,7 @@ import {
   type OrgsPayload,
   type SeriesPayload,
   type SeriesPoint,
+  type UsersPayload,
 } from '@/stores/stats'
 import { usePolling } from '@/composables/usePolling'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
@@ -262,6 +349,29 @@ const orgs = ref<OrgsPayload | null>(null)
 const orgMachines = ref<SeriesPayload | null>(null)
 const orgCalls = ref<SeriesPayload | null>(null)
 const globalCalls = ref<SeriesPayload | null>(null)
+const users = ref<UsersPayload | null>(null)
+
+// Mongo's $bucket labels boundaries by their lower bound; name them.
+const DURATION_LABELS: Record<string, string> = {
+  '0': '< 1 min',
+  '60': '1–5 min',
+  '300': '5–15 min',
+  '900': '15–60 min',
+  '3600': '1–4 h',
+  '14400': '4–24 h',
+  '86400+': '> 24 h',
+}
+const durationRows = computed(() =>
+  (users.value?.durations ?? []).map((d) => ({
+    label: DURATION_LABELS[d.bucket] ?? d.bucket,
+    sessions: d.sessions,
+  })),
+)
+const breakdowns = computed(() => [
+  { title: 'Browsers', rows: users.value?.browsers ?? [] },
+  { title: 'Platforms', rows: users.value?.platforms ?? [] },
+  { title: 'Countries', rows: users.value?.countries ?? [] },
+])
 
 // Realtime: 15 s poll of the current snapshot (reads the newest persisted
 // buckets — cheap), paused while the tab is hidden.
@@ -331,6 +441,7 @@ watch(
     if (!isPlatformAdmin.value) return
     orgs.value = await statsStore.fetchOrgs().catch(() => null)
     globalCalls.value = await statsStore.fetchAdminCalls(range.value).catch(() => null)
+    users.value = await statsStore.fetchUsers(range.value).catch(() => null)
     if (selectedOrg.value) await selectOrg(selectedOrg.value)
   },
   { immediate: true },
