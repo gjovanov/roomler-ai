@@ -369,6 +369,34 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_multi_org: bool,
 
+    /// Loopback SOCKS5 port for THIS org's userspace netstack.
+    ///
+    /// Netstack mode used to be a process-wide singleton keyed off
+    /// `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`: one stack, one port, one
+    /// `roomler ping` backend, none of it org-scoped. A second org did not
+    /// join twice — it replaced the first org's stack under a SOCKS front
+    /// still answering on the same port, so a caller dialing for org A was
+    /// silently routed by org B.
+    ///
+    /// Each org now gets its OWN stack and front. The primary keeps reading
+    /// the env key (unchanged for every existing host); a secondary sets
+    /// `netstack_socks_port` on its `[[orgs]]` entry. Two orgs asking for
+    /// the same port is a genuine conflict — one TCP listener — so the
+    /// second withholds loudly rather than stealing it.
+    #[serde(default)]
+    pub netstack_socks_port: Option<u16>,
+
+    /// True on a config produced by [`AgentConfig::for_org`] — a SECONDARY
+    /// org's view, not the process's own enrollment.
+    ///
+    /// `#[serde(skip)]`, so it is never written to or read from disk and a
+    /// loaded config is always a primary, which is the truth. It exists
+    /// because process-wide env keys belong to the primary alone: a
+    /// secondary that inherited them would silently contend for the same
+    /// single-instance resource (one SOCKS port, one ping backend).
+    #[serde(skip)]
+    pub derived_org: bool,
+
     /// Phase 3b: this node's persisted WireGuard Curve25519 secret key
     /// (base64). Generated on the first overlay-enabled startup in `main`;
     /// the public key is what the netmap distributes. `None` until then.
@@ -509,6 +537,14 @@ pub struct OrgEntry {
     /// advertisements are per-tenant admin-approved).
     #[serde(default)]
     pub advertise_routes: Vec<String>,
+    /// This org's OWN loopback SOCKS5 port for `overlay_mode = "netstack"`.
+    ///
+    /// Required for a secondary in netstack mode: the port is a real TCP
+    /// listener, so orgs cannot share one. Unset (or equal to another org's)
+    /// means this org withholds its overlay rather than taking a front that
+    /// answers for someone else — see [`AgentConfig::netstack_socks_port`].
+    #[serde(default)]
+    pub netstack_socks_port: Option<u16>,
 }
 
 impl OrgEntry {
@@ -595,6 +631,11 @@ impl AgentConfig {
         c.overlay_exit_node_enabled = false;
         c.overlay_exit_node = None;
         c.advertise_routes = org.advertise_routes.clone();
+        // Explicitly the ORG's port, never inherited: the primary's value
+        // comes from the process-wide env key, and silently reusing it would
+        // put two orgs on one listener.
+        c.netstack_socks_port = org.netstack_socks_port;
+        c.derived_org = true;
         c.tunnel_routes = Vec::new();
         c.orgs = Vec::new();
         c
@@ -687,6 +728,7 @@ pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> 
         overlay_advertised_routes: cfg.overlay_advertised_routes.clone(),
         overlay_exit_node_enabled: cfg.overlay_exit_node_enabled,
         advertise_routes: cfg.advertise_routes.clone(),
+        netstack_socks_port: entry.netstack_socks_port,
     };
     cfg.server_url = entry.server_url;
     cfg.ws_url = entry.ws_url;
@@ -1216,6 +1258,8 @@ mod tests {
             virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig::default(),
             overlay_enabled: false,
             overlay_multi_org: false,
+            netstack_socks_port: None,
+            derived_org: false,
             overlay_wg_secret_key: None,
             overlay_advertised_routes: Vec::new(),
             overlay_exit_node_enabled: false,
@@ -1242,6 +1286,7 @@ mod tests {
             overlay_advertised_routes: Vec::new(),
             overlay_exit_node_enabled: false,
             advertise_routes: Vec::new(),
+            netstack_socks_port: None,
         }
     }
 
