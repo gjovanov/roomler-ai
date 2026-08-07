@@ -114,6 +114,90 @@ export interface UsersPayload {
   durations?: Array<{ bucket: string; sessions: number }>
 }
 
+// ── Wave 3 — per-user usage. Mirrors crates/api/src/routes/usage.rs. ──
+
+/** One activity class's totals. `bytes_known: false` means the bytes were
+ *  never measured — render an em dash, NOT a zero. */
+export interface UsageClass {
+  minutes: number
+  bytes: number
+  sessions: number
+  devices: number
+  bytes_known: boolean
+}
+
+export interface UsageUserRow {
+  user_id: string
+  name: string
+  rc: UsageClass
+  call: UsageClass
+  tunnel: UsageClass
+  total_minutes: number
+  /** Platform scope only — which orgs this user was active in. */
+  orgs?: Array<{ tenant_id: string; name: string }>
+}
+
+export interface UsagePayload {
+  enabled: boolean
+  range?: string
+  /** False when the range outruns the 90-day remote_audit TTL, so the UI
+   *  can say watcher history is incomplete rather than implying none. */
+  watchers_complete?: boolean
+  users?: UsageUserRow[]
+}
+
+export interface UsageViewingWindow {
+  session_id: string
+  agent_id: string
+  agent_name?: string
+  tenant_id: string
+  tenant_name?: string
+  started_at: number
+  ended_at?: number | null
+  seconds: number
+  role: 'controller' | 'watcher'
+  bytes?: number
+  bytes_known?: boolean
+}
+
+export interface UsageDetailPayload {
+  enabled: boolean
+  range?: string
+  watchers_complete?: boolean
+  user?: { user_id: string; name: string }
+  totals?: {
+    rc_minutes: number
+    rc_bytes: number
+    call_minutes: number
+    call_bytes: number
+    tunnel_minutes: number
+  }
+  /** The headline: every window this user spent looking at a screen. */
+  viewing?: UsageViewingWindow[]
+  calls?: Array<{
+    room_id: string
+    room_name?: string
+    tenant_id: string
+    tenant_name?: string
+    started_at: number
+    ended_at?: number | null
+    seconds: number
+  }>
+  tunnels?: Array<{
+    session_id?: string
+    agent_id?: string
+    agent_name?: string
+    tenant_id?: string
+    tenant_name?: string
+    started_at: number
+    ended_at: number
+    seconds: number
+    events: number
+    bytes_known: boolean
+  }>
+  truncated?: boolean
+}
+
 export const useStatsStore = defineStore('stats', () => {
   // Cached snapshots the dashboard panels poll into. Query-tab payloads
   // are returned to the caller (view-local state) — they're range-keyed
@@ -189,6 +273,32 @@ export const useStatsStore = defineStore('stats', () => {
     return api.get<SeriesPayload>(`/admin/stats/calls?${t}range=${range}`)
   }
 
+  // ── Wave 3 — per-user usage ──────────────────────────────────────────
+  async function fetchTenantUsage(tenantId: string, range: string): Promise<UsagePayload> {
+    return api.get<UsagePayload>(`/tenant/${tenantId}/stats/usage?range=${range}`)
+  }
+  async function fetchTenantUsageDetail(
+    tenantId: string,
+    userId: string,
+    range: string,
+  ): Promise<UsageDetailPayload> {
+    return api.get<UsageDetailPayload>(
+      `/tenant/${tenantId}/stats/usage/${userId}?range=${range}`,
+    )
+  }
+  async function fetchAdminUsage(range: string, tenantId?: string): Promise<UsagePayload> {
+    const t = tenantId ? `tenant_id=${tenantId}&` : ''
+    return api.get<UsagePayload>(`/admin/stats/usage?${t}range=${range}`)
+  }
+  async function fetchAdminUsageDetail(
+    userId: string,
+    range: string,
+    tenantId?: string,
+  ): Promise<UsageDetailPayload> {
+    const t = tenantId ? `tenant_id=${tenantId}&` : ''
+    return api.get<UsageDetailPayload>(`/admin/stats/usage/${userId}?${t}range=${range}`)
+  }
+
   return {
     overview,
     relayCurrent,
@@ -205,5 +315,9 @@ export const useStatsStore = defineStore('stats', () => {
     fetchUsers,
     fetchAdminMachines,
     fetchAdminCalls,
+    fetchTenantUsage,
+    fetchTenantUsageDetail,
+    fetchAdminUsage,
+    fetchAdminUsageDetail,
   }
 })
