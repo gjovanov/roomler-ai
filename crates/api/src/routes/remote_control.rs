@@ -118,6 +118,23 @@ pub async fn enroll_agent(
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
+    // An archived org accepts no devices — including back into an existing
+    // row, which is what makes archiving a throwaway org actually final
+    // (`routes::tenant::archive`). Checked before the single-use claim so a
+    // refused enrollment does not also burn the token.
+    if state
+        .tenants
+        .base
+        .find_by_id(tid)
+        .await
+        .map(|t| t.is_archived)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::Forbidden(
+            "This organization is archived and accepts no device enrollments".to_string(),
+        ));
+    }
+
     // If a row already exists for (tenant_id, machine_id), rehydrate it —
     // refresh name / os / agent_version, clear `deleted_at` if soft-deleted,
     // and re-issue a token against the same _id. The unique index on
