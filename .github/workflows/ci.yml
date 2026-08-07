@@ -163,6 +163,10 @@ jobs:
         # takes ownership of the shared cargo cache.
         run: |
           sudo modprobe tun || true
+          # Build FIRST with human diagnostics. The json pass below would
+          # otherwise swallow a compile error into records jq drops, leaving
+          # only an empty $BIN and "sudo: : command not found".
+          cargo test -p roomler-agent --features overlay-l3 --lib --no-run
           BIN=$(cargo test -p roomler-agent --features overlay-l3 --lib \
                   --no-run --message-format=json \
                 | jq -r 'select(.profile.test == true) | .executable' | head -1)
