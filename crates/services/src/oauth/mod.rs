@@ -23,6 +23,20 @@ pub struct OAuthUserInfo {
     pub email: String,
     pub name: String,
     pub avatar_url: Option<String>,
+    /// Did the PROVIDER prove this address belongs to this identity?
+    ///
+    /// Only a true here may link the sign-in to an existing account by
+    /// email ([`crate::dao::user::UserDao::find_or_create_by_oauth`]).
+    /// `false` is not a rejection — the identity still signs in, it just
+    /// gets its own account instead of inheriting one that happens to
+    /// share an address.
+    ///
+    /// Microsoft is the reason this exists: the multi-tenant `common`
+    /// endpoint hands back a `mail` attribute that ANY Entra tenant admin
+    /// can set to an arbitrary string, including someone else's Gmail
+    /// address (the "nOAuth" class of account takeover). Its `id` is
+    /// still a real assertion, so provider-id matching stays trusted.
+    pub email_verified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +95,8 @@ struct GitHubEmail {
 struct LinkedInUser {
     sub: Option<String>,
     email: Option<String>,
+    /// OIDC standard claim — LinkedIn sends it; absent ⇒ untrusted.
+    email_verified: Option<bool>,
     name: Option<String>,
     given_name: Option<String>,
     family_name: Option<String>,
@@ -321,24 +337,22 @@ impl OAuthService {
                     .trim()
                     .to_string()
                 });
-                // Stats PR-3 hardening: an UNVERIFIED Google email must not
-                // reach the email-linking step in find_or_create_oauth —
-                // blank it so the account matches by provider_id only.
-                let email = if user.verified_email == Some(false) {
+                // Google states the claim explicitly; absent ⇒ treat as
+                // unverified rather than assuming in our own favour.
+                let email_verified = user.verified_email == Some(true);
+                if !email_verified {
                     tracing::warn!(
                         provider_id = %user.id,
-                        "google oauth: unverified email — skipping email-based account linking"
+                        "google oauth: unverified email — no email-based account linking"
                     );
-                    String::new()
-                } else {
-                    user.email.unwrap_or_default()
-                };
+                }
                 Ok(OAuthUserInfo {
                     provider: "google".to_string(),
                     provider_id: user.id,
-                    email,
+                    email: user.email.unwrap_or_default(),
                     name,
                     avatar_url: user.picture,
+                    email_verified,
                 })
             }
             "facebook" => {
@@ -355,12 +369,17 @@ impl OAuthService {
                     .await
                     .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?;
                 let avatar = user.picture.and_then(|p| p.data).and_then(|d| d.url);
+                // Facebook only returns `email` once the address is
+                // confirmed on the account, so its presence IS the proof.
+                let email = user.email.unwrap_or_default();
+                let email_verified = !email.is_empty();
                 Ok(OAuthUserInfo {
                     provider: "facebook".to_string(),
                     provider_id: user.id,
-                    email: user.email.unwrap_or_default(),
+                    email,
                     name: user.name.unwrap_or_default(),
                     avatar_url: avatar,
+                    email_verified,
                 })
             }
             "github" => {
@@ -376,33 +395,40 @@ impl OAuthService {
                     .await
                     .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?;
 
-                let email = if let Some(email) = user.email {
-                    email
-                } else {
-                    // Fallback: fetch emails endpoint
-                    let emails: Vec<GitHubEmail> = self
-                        .client
-                        .get("https://api.github.com/user/emails")
-                        .header("User-Agent", "roomler-ai")
-                        .bearer_auth(access_token)
-                        .send()
-                        .await
-                        .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?
-                        .json()
-                        .await
-                        .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?;
-                    emails
-                        .into_iter()
-                        .find(|e| e.primary && e.verified)
-                        .map(|e| e.email)
-                        .unwrap_or_default()
-                };
+                // The profile's public `email` is user-chosen and carries
+                // no verification claim, so it is NOT a linking basis.
+                // `/user/emails` is: take the primary+verified one, which
+                // is also what an account-recovery flow would use.
+                let emails: Vec<GitHubEmail> = self
+                    .client
+                    .get("https://api.github.com/user/emails")
+                    .header("User-Agent", "roomler-ai")
+                    .bearer_auth(access_token)
+                    .send()
+                    .await
+                    .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?
+                    .json()
+                    .await
+                    .unwrap_or_default();
+                let verified = emails
+                    .into_iter()
+                    .find(|e| e.primary && e.verified)
+                    .map(|e| e.email);
+                let email_verified = verified.is_some();
+                let email = verified.or(user.email).unwrap_or_default();
+                if !email_verified {
+                    tracing::warn!(
+                        provider_id = %user.id,
+                        "github oauth: no primary+verified email — no email-based account linking"
+                    );
+                }
 
                 Ok(OAuthUserInfo {
                     provider: "github".to_string(),
                     provider_id: user.id.to_string(),
                     email,
                     name: user.login,
+                    email_verified,
                     avatar_url: user.avatar_url,
                 })
             }
@@ -426,12 +452,14 @@ impl OAuthService {
                     .trim()
                     .to_string()
                 });
+                let email_verified = user.email_verified == Some(true);
                 Ok(OAuthUserInfo {
                     provider: "linkedin".to_string(),
                     provider_id: user.sub.unwrap_or_default(),
                     email: user.email.unwrap_or_default(),
                     name,
                     avatar_url: user.picture,
+                    email_verified,
                 })
             }
             "microsoft" => {
@@ -447,12 +475,18 @@ impl OAuthService {
                     .map_err(|e| OAuthError::UserInfoFailed(e.to_string()))?;
                 let name = user.display_name.or(user.given_name).unwrap_or_default();
                 let email = user.mail.or(user.user_principal_name).unwrap_or_default();
+                // nOAuth: `mail` (and a UPN in a tenant the signer
+                // controls) is self-asserted, so it must never link into
+                // an existing account. The `id` (object id) is what
+                // Microsoft actually proves — provider-id matching keeps
+                // working, and returning users are unaffected.
                 Ok(OAuthUserInfo {
                     provider: "microsoft".to_string(),
                     provider_id: user.id,
                     email,
                     name,
                     avatar_url: None,
+                    email_verified: false,
                 })
             }
             _ => Err(OAuthError::UnknownProvider(provider.to_string())),

@@ -65,6 +65,7 @@ pub async fn oauth_callback(
             &user_info.email,
             &user_info.name,
             user_info.avatar_url.as_deref(),
+            user_info.email_verified,
         )
         .await?;
 
