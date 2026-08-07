@@ -628,6 +628,9 @@ impl Hub {
         override_reason: Option<String>,
         local_relay: Option<LocalRelayDescriptor>,
         input_mode: Option<crate::models::InputMode>,
+        // Multi-org — display name of the requesting org, for the host's
+        // consent prompt. See `ServerMsg::Request::tenant_name`.
+        tenant_name: Option<String>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
         // that connects then drops before teardown completes can leave an
@@ -792,6 +795,8 @@ impl Hub {
             // P6 — the device policy's arbitration mode for the agent's
             // InputArbiter (first session seeds; toggles win afterwards).
             input_mode,
+            // Multi-org — so the host prompt names the asking organization.
+            tenant_name,
         };
         // Keep the Request while consent is pending so `register_agent` can
         // re-push it if the agent's control WS flaps before `rc:consent`
@@ -1338,6 +1343,12 @@ pub struct DispatchCtx {
     /// layer alongside `consent_mode`; forwarded to the agent's InputArbiter
     /// in `ServerMsg::Request`. `None` = agent default (free).
     pub input_mode: Option<crate::models::InputMode>,
+    /// Multi-org — the display name of the organization the request is made
+    /// in, resolved by the API WS layer (the Hub has no DB access) and
+    /// forwarded in `ServerMsg::Request` so the host's consent prompt can
+    /// say WHICH org is asking. `None` = older caller / lookup failed; the
+    /// agent then falls back to its org label.
+    pub tenant_name: Option<String>,
 }
 
 impl Hub {
@@ -1421,6 +1432,7 @@ impl Hub {
                     ctx.override_reason.clone(),
                     local_relay,
                     ctx.input_mode,
+                    ctx.tenant_name.clone(),
                 )?;
                 Ok(())
             }
@@ -1522,6 +1534,7 @@ mod tests {
             None, // override_reason
             None, // local_relay
             None, // input_mode
+            None, // tenant_name
         );
         assert!(matches!(res, Err(Error::AgentOffline(_))));
     }
@@ -1555,6 +1568,7 @@ mod tests {
                 None, // override_reason
                 None, // local_relay
                 None, // input_mode
+                None, // tenant_name
             )
             .unwrap();
 
@@ -1598,6 +1612,7 @@ mod tests {
                 None,
                 false,
                 ConsentMode::Prompt,
+                None,
                 None,
                 None,
                 None,
@@ -1662,6 +1677,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         let _created = ctl_rx.recv().await.unwrap();
@@ -1707,6 +1723,7 @@ mod tests {
                 None,
                 false,
                 ConsentMode::Prompt,
+                None,
                 None,
                 None,
                 None,
@@ -1761,6 +1778,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1773,6 +1791,7 @@ mod tests {
             consent_mode: ConsentMode::Prompt,
             override_reason: None,
             input_mode: None,
+            tenant_name: None,
         };
         let stranger = ctx_for(Role::Controller, Some(ObjectId::new()), None);
         let owner_ctx = ctx_for(Role::Controller, Some(owner), None);
@@ -1898,6 +1917,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
         };
         let effective = |rx: &mut mpsc::Receiver<ServerMsg>| match rx.try_recv().unwrap() {
@@ -1971,6 +1991,7 @@ mod tests {
                 None,
                 None,
                 Some(crate::models::InputMode::Exclusive),
+                None, // tenant_name
             )
         };
         let effective = |rx: &mut mpsc::Receiver<ServerMsg>| match rx.try_recv().unwrap() {
@@ -2035,6 +2056,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         let sid_b = hub
@@ -2049,6 +2071,7 @@ mod tests {
                 None,
                 false,
                 ConsentMode::Prompt,
+                None,
                 None,
                 None,
                 None,
@@ -2107,6 +2130,7 @@ mod tests {
                 None,
                 None, // local_relay
                 None, // input_mode
+                None, // tenant_name
             )
             .unwrap();
         drop(ctl_rx_a); // controller gone → the session's controller_tx.is_closed()
@@ -2128,6 +2152,7 @@ mod tests {
             None,
             None, // local_relay
             None, // input_mode
+            None, // tenant_name
         );
         assert!(
             res_b.is_ok(),
@@ -2169,6 +2194,7 @@ mod tests {
             None,
             None, // local_relay
             None, // input_mode
+            None, // tenant_name
         );
         assert!(
             matches!(res_c, Err(Error::AgentBusy)),
@@ -2215,6 +2241,7 @@ mod tests {
                     credential: "abcd1234".into(),
                 }),
                 None,
+                None, // tenant_name
             )
             .unwrap();
 
@@ -2275,6 +2302,7 @@ mod tests {
                     credential: "c".into(),
                 }),
                 None,
+                None, // tenant_name
             )
             .unwrap();
 
