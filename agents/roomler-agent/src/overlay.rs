@@ -185,7 +185,7 @@ pub async fn maybe_start(
             // Give the netstack SOCKS front a live mesh view so it can resolve
             // DOMAIN targets (peer name / MagicDNS FQDN → overlay IP). Same channel
             // the runtime publishes to below, so it's stable across reconnects.
-            Some(port) => netstack_tun_factory(port, peer_view.subscribe())?,
+            Some(port) => netstack_tun_factory(port, peer_view.subscribe(), &cfg.tenant_id)?,
             None => systun_tun_factory()?,
         }
     };
@@ -418,17 +418,23 @@ static SHARED_MUX: std::sync::Mutex<
     Option<(Arc<SystemTun>, Arc<tunnel_core::overlay::tun_mux::TunMux>)>,
 > = std::sync::Mutex::new(None);
 
-/// Multi-org — release an org's claim on the shared TUN: drop its mux port
-/// and take its address back off the adapter.
+/// Multi-org — release everything process-wide an org held: its shared-TUN
+/// port + address, and the netstack surface if it owned that.
 ///
 /// Called when an org's supervised loop ENDS for good (disabled, removed,
 /// terminal error) — until now the address stayed up until the daemon
 /// restarted (docs/multi-org.md §12). Harmless but untidy, and on a
 /// long-lived multi-org host the litter accumulates.
 ///
-/// No-op without the shared mux (single-org daemons never register).
-#[cfg(feature = "overlay-l3")]
+/// No-op for anything the org never claimed (single-org daemons never
+/// register), so it is safe to call unconditionally on teardown.
 pub fn release_org(org_key: &str) {
+    release_shared_tun(org_key);
+    release_netstack(org_key);
+}
+
+#[cfg(feature = "overlay-l3")]
+fn release_shared_tun(org_key: &str) {
     let shared = SHARED_MUX.lock().unwrap_or_else(|e| e.into_inner());
     let Some((dev, mux)) = shared.as_ref() else {
         return;
@@ -439,7 +445,20 @@ pub fn release_org(org_key: &str) {
     }
 }
 #[cfg(not(feature = "overlay-l3"))]
-pub fn release_org(_org_key: &str) {}
+fn release_shared_tun(_org_key: &str) {}
+
+/// Hand the netstack surface back when its owner leaves, so a remaining org
+/// can take it on its next reconnect instead of withholding forever.
+#[cfg(feature = "overlay-netstack")]
+fn release_netstack(org_key: &str) {
+    let mut owner = NETSTACK_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+    if owner.as_deref() == Some(org_key) {
+        *owner = None;
+        info!(org = %org_key, "overlay netstack: released the host's netstack surface");
+    }
+}
+#[cfg(not(feature = "overlay-netstack"))]
+fn release_netstack(_org_key: &str) {}
 
 /// Multi-org P2c — per-org TUN factory over the ONE shared device.
 ///
@@ -518,17 +537,67 @@ fn ns_handle_tx() -> &'static watch::Sender<Option<tunnel_core::overlay::netstac
     NS_HANDLE.get_or_init(|| watch::channel(None).0)
 }
 
+/// Multi-org — which org owns the process-wide netstack surface.
+///
+/// The netstack surface is a set of singletons: ONE handle channel, ONE
+/// loopback SOCKS port, ONE `roomler ping` backend. Nothing about them is
+/// org-scoped, so a second org publishing to [`ns_handle_tx`] does not join
+/// the mesh twice — it REPLACES the first org's stack underneath the SOCKS
+/// front and the pinger, which keep serving the same port. A user dialing
+/// through SOCKS believing they reach org A would silently be routed by org
+/// B's stack.
+///
+/// So the surface is CLAIMED. First org in owns it; a second org withholds
+/// its overlay (loud warning, retried on its next reconnect) exactly like a
+/// refused shared-TUN registration — the org that cannot have the surface
+/// goes without a mesh rather than taking someone else's. Re-claiming by the
+/// owner is a no-op, which is what every reconnect does.
+///
+/// Untangling the statics into per-org instances is the real fix and is
+/// deliberately not done here (docs/multi-org.md §12): it is significant work
+/// for a case nobody has hit, whereas silent cross-org misrouting is a bug
+/// whatever the demand.
+#[cfg(feature = "overlay-netstack")]
+static NETSTACK_OWNER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Claim the netstack surface for `org_key`. `false` ⇒ another org holds it.
+#[cfg(feature = "overlay-netstack")]
+fn claim_netstack(org_key: &str) -> bool {
+    let mut owner = NETSTACK_OWNER.lock().unwrap_or_else(|e| e.into_inner());
+    match owner.as_deref() {
+        Some(cur) => cur == org_key,
+        None => {
+            *owner = Some(org_key.to_string());
+            true
+        }
+    }
+}
+
 /// Netstack factory (`overlay-netstack`): each (re)connect builds a fresh
 /// userspace stack and publishes its handle to the process-wide loopback SOCKS
 /// front (bound once), so the front outlives reconnects without rebinding.
+///
+/// `None` when another org already owns the surface — see [`NETSTACK_OWNER`].
 #[cfg(feature = "overlay-netstack")]
 fn netstack_tun_factory(
     socks_port: u16,
     view_rx: watch::Receiver<OverlayView>,
+    org_key: &str,
 ) -> Option<TunFactory> {
     use std::net::Ipv4Addr;
     use tunnel_core::overlay::netstack::Netstack;
     use tunnel_core::overlay::netstack_socks::serve_socks5;
+
+    if !claim_netstack(org_key) {
+        warn!(
+            org = %org_key,
+            "overlay netstack: another organization already owns this host's netstack \
+             surface (one userspace stack, one SOCKS port, one ping backend). This org \
+             joins no mesh — enable `overlay_multi_org` to put both orgs on the shared \
+             OS TUN instead."
+        );
+        return None;
+    }
 
     // Bind the loopback SOCKS front exactly once, subscribing to the shared
     // handle channel so it always serves whatever stack is currently live.
@@ -595,6 +664,7 @@ pub fn netstack_pinger() -> Option<Arc<dyn crate::localapi_state::NetstackPinger
 fn netstack_tun_factory(
     _socks_port: u16,
     _view_rx: watch::Receiver<OverlayView>,
+    _org_key: &str,
 ) -> Option<TunFactory> {
     warn!(
         "overlay: netstack mode requested (ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS set) \
@@ -652,4 +722,128 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
         warn!("overlay: event channel full/closed; dropping a netmap update");
     }
     None
+}
+
+#[cfg(all(test, feature = "overlay-netstack"))]
+mod netstack_claim_tests {
+    use super::{claim_netstack, release_netstack};
+
+    /// The netstack surface is one stack, one SOCKS port, one ping backend.
+    /// Whoever holds it holds it exclusively — a second org must be refused
+    /// rather than silently replacing the first org's stack under a SOCKS
+    /// front that keeps answering on the same port.
+    #[test]
+    fn the_netstack_surface_has_exactly_one_owner() {
+        // Deliberately serialized in ONE test: the claim is process-global,
+        // so separate #[test] fns would race each other.
+        assert!(claim_netstack("org-a"), "first org in takes the surface");
+        assert!(
+            claim_netstack("org-a"),
+            "re-claim by the owner is a no-op — every reconnect does this"
+        );
+        assert!(
+            !claim_netstack("org-b"),
+            "a second org is refused, not served"
+        );
+
+        // A non-owner leaving must not hand away someone else's surface.
+        release_netstack("org-b");
+        assert!(!claim_netstack("org-b"), "still org-a's");
+
+        // The owner leaving frees it for the org that was withholding.
+        release_netstack("org-a");
+        assert!(claim_netstack("org-b"), "the waiting org can take over");
+        release_netstack("org-b");
+    }
+}
+
+/// Multi-org P2c — the shared-TUN factory against REAL kernel networking.
+///
+/// [`tunnel_core::overlay::tun_mux`]'s own tests cover the bookkeeping with a
+/// fake device. What they cannot cover is the half that touches the OS: that
+/// a REFUSED registration leaves no address behind on the adapter, that a
+/// disjoint block really does get its address, and that releasing an org
+/// really does take it off again. That half was unit-locked but never run
+/// against a kernel (docs/multi-org.md §12) because reproducing it in the
+/// field needs a third organization — and there is no way to retire a
+/// throwaway org afterwards.
+///
+/// A real `tun` device costs nothing to create, so the OS half runs here
+/// instead: same factory, same `SystemTun`, same `ip addr` calls, real
+/// kernel. It needs CAP_NET_ADMIN, so it is opt-in via
+/// `ROOMLER_TUN_KERNEL_TEST=1` (set in the CI job that runs as root) and
+/// skips silently otherwise — including on every developer machine.
+#[cfg(all(test, feature = "overlay-l3", target_os = "linux"))]
+mod tun_kernel_tests {
+    use super::{mux_systun_factory, release_org};
+    use std::net::Ipv4Addr;
+
+    const MASK_22: Ipv4Addr = Ipv4Addr::new(255, 255, 252, 0);
+
+    /// Addresses the kernel currently has on the overlay device.
+    fn addrs() -> String {
+        let out = std::process::Command::new("ip")
+            .args(["-4", "addr", "show", "dev", "roomler0"])
+            .output()
+            .expect("ip addr show");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[tokio::test]
+    async fn refused_registration_leaves_no_address_on_the_adapter() {
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs CAP_NET_ADMIN)");
+            return;
+        }
+
+        // Org A creates the device and takes 100.65.0.0/22.
+        let a = mux_systun_factory("kernel-org-a".into()).expect("factory");
+        let _port_a = a(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("org A joins");
+        assert!(
+            addrs().contains("100.65.0.5"),
+            "org A's address must be on the device:\n{}",
+            addrs()
+        );
+
+        // Org B asks for an address inside THE SAME block — the
+        // two-un-migrated-tenants case. The mux refuses, and the refusal has
+        // to be clean: an address left behind here is one nothing answers
+        // on, which is exactly what makes a later diagnosis lie.
+        let b = mux_systun_factory("kernel-org-b".into()).expect("factory");
+        let err = b(Ipv4Addr::new(100, 65, 1, 9), MASK_22, 1280)
+            .expect_err("an overlapping block must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        let after = addrs();
+        assert!(
+            !after.contains("100.65.1.9"),
+            "a refused org must leave NO address behind:\n{after}"
+        );
+        assert!(
+            after.contains("100.65.0.5"),
+            "org A keeps its mesh:\n{after}"
+        );
+
+        // A disjoint block is accepted and really does land on the adapter.
+        let c = mux_systun_factory("kernel-org-c".into()).expect("factory");
+        let _port_c = c(Ipv4Addr::new(100, 66, 0, 7), MASK_22, 1280).expect("org C joins");
+        assert!(
+            addrs().contains("100.66.0.7"),
+            "org C's address must be on the device:\n{}",
+            addrs()
+        );
+
+        // …and releasing that org takes it back off (the litter fix).
+        release_org("kernel-org-c");
+        let after = addrs();
+        assert!(
+            !after.contains("100.66.0.7"),
+            "a released org's address must be gone:\n{after}"
+        );
+        assert!(
+            after.contains("100.65.0.5"),
+            "and only that org's — A is untouched:\n{after}"
+        );
+
+        release_org("kernel-org-a");
+    }
 }
