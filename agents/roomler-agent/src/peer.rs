@@ -286,9 +286,33 @@ impl AgentPeer {
             webrtc::api::interceptor_registry::register_default_interceptors(registry, &mut engine)
                 .context("register default interceptors")?;
 
+        // Keep the OVERLAY interface out of ICE. The controller is a
+        // BROWSER, which is never a node on the overlay mesh, so a candidate
+        // bound to the `roomler` TUN can never pair — but it is not merely
+        // dead weight: the STUN query that rides that interface comes back
+        // reflected as the node's own overlay address, and webrtc-rs offers
+        // it as a perfectly ordinary `typ=srflx` candidate.
+        //
+        // Field 2026-08-07 (CORPLAP-1, Check Point profile blocking STUN on the
+        // physical NIC): the ONLY srflx it gathered was
+        // `typ=srflx address=100.64.0.28` — its own overlay IP. That masked
+        // the fact it had no public reflexive candidate at all, so every
+        // session negotiated, "started", and then died at a constant ~10.9 s
+        // when media never flowed (388 sessions in 24 h). CORPLAP-2, same LAN
+        // and same Check Point build, offered a real `37.63.112.129` and
+        // worked. The filter does not FIX a host that cannot reach STUN — it
+        // stops that failure from disguising itself as a usable candidate.
+        //
+        // Filter by interface NAME, deliberately not by CIDR: the overlay
+        // lives in 100.64.0.0/10, which is real CGNAT space that some ISPs
+        // hand out to customers, so a CIDR rule would strip a legitimate host
+        // candidate from anyone behind carrier-grade NAT.
+        let mut setting = webrtc::api::setting_engine::SettingEngine::default();
+        setting.set_interface_filter(Box::new(|name: &str| !is_overlay_iface(name)));
         let api = APIBuilder::new()
             .with_media_engine(engine)
             .with_interceptor_registry(registry)
+            .with_setting_engine(setting)
             .build();
 
         // rc.162: hostile-NAT hosts (WSL2 + wsl-vpnkit, other userspace-VPN
@@ -7624,6 +7648,24 @@ async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutg
     }
 }
 
+/// Is this the overlay's own TUN interface?
+///
+/// The names come from `tunnel_core::overlay::tun`: `roomler` on Windows,
+/// `roomler0` on Linux, and a kernel-assigned `utunN` on macOS — which we
+/// cannot match by name, so macOS keeps offering the overlay candidate. That
+/// is acceptable: the candidate is inert (no browser is on the mesh) and the
+/// masking-srflx failure this guards against needs a host whose STUN is
+/// blocked on the physical NIC, which is the corp-Windows case.
+///
+/// Prefix-matched rather than compared exactly so a suffixed variant (a
+/// second adapter, a `:N` alias) is caught too. Anything else — including a
+/// user interface merely CONTAINING "roomler" further in the name — is left
+/// alone; a false positive here silently removes a real candidate.
+fn is_overlay_iface(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    n == "roomler" || n.starts_with("roomler0") || n.starts_with("roomler.")
+}
+
 fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
     servers
         .iter()
@@ -7675,6 +7717,38 @@ fn map_ice_servers_relay_tcp(servers: &[IceServer]) -> Vec<RTCIceServer> {
             "ICE relay-over-TCP: media pinned to TURNS/TCP relay (hostile-NAT mode)"
         );
         filtered
+    }
+}
+
+#[cfg(test)]
+mod overlay_iface_filter_tests {
+    use super::is_overlay_iface;
+
+    #[test]
+    fn matches_the_overlay_tun_on_every_platform_we_name_it() {
+        // tunnel_core::overlay::tun — `roomler` (Windows), `roomler0` (Linux).
+        assert!(is_overlay_iface("roomler"));
+        assert!(is_overlay_iface("roomler0"));
+        assert!(is_overlay_iface("ROOMLER")); // Windows aliases are case-y
+        assert!(is_overlay_iface(" roomler ")); // and can carry whitespace
+        assert!(is_overlay_iface("roomler0:1")); // suffixed alias
+    }
+
+    /// A false positive silently deletes a real ICE candidate, so the match
+    /// must not be a loose "contains".
+    #[test]
+    fn leaves_every_other_interface_alone() {
+        for n in [
+            "Wi-Fi",
+            "eth0",
+            "utun3",
+            "vEthernet (Default Switch)",
+            "my-roomler-vpn", // contains it, is NOT ours
+            "roomlerx",       // near-miss
+            "",
+        ] {
+            assert!(!is_overlay_iface(n), "must not filter {n:?}");
+        }
     }
 }
 
