@@ -611,6 +611,12 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
+        // The block registry is GLOBAL, so reclaiming from it is a platform
+        // operation, not a tenant one. Dry-run by default.
+        .route(
+            "/admin/overlay-block/reclaim",
+            post(routes::overlay_block::reclaim),
+        )
         // Wave 2 — the SPA's route-change beacon (authenticated, paths
         // normalised server-side). User-scoped, not tenant-scoped: a
         // user navigates across orgs within one session.
