@@ -469,6 +469,37 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Wave 2 — platform user analytics. Neither collection stores an IP
+    // or a raw User-Agent: the address is resolved to a country at
+    // connect time and dropped, and page paths are normalised before
+    // insert. 90-day retention, which is plenty for usage trends and
+    // short enough that stale behavioural data doesn't accumulate.
+    create_indexes(
+        db,
+        "ws_sessions",
+        vec![
+            index(bson::doc! { "started_at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "started_at": -1 }),
+            index(bson::doc! { "user_id": 1, "started_at": -1 }),
+            // The close path updates by _id + open-ness; this keeps the
+            // "still open" scan (and the orphan sweep) cheap.
+            index(bson::doc! { "ended_at": 1 }),
+            index_ttl(bson::doc! { "started_at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+    create_indexes(
+        db,
+        "page_views",
+        vec![
+            index(bson::doc! { "ts": -1 }),
+            index(bson::doc! { "tenant_id": 1, "ts": -1 }),
+            index(bson::doc! { "path": 1, "ts": -1 }),
+            index_ttl(bson::doc! { "ts": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Wave 2 — per-agent overlay mesh snapshots (one row per agent,
     // replaced each heartbeat). TTL reaps the rows of agents that stop
     // reporting, so a decommissioned device leaves the graph on its own.
