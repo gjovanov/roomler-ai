@@ -32,6 +32,7 @@ pub mod stripe;
 pub mod tenant;
 pub mod tunnel;
 pub mod tunnel_release;
+pub mod usage;
 
 pub mod search;
 pub mod user;

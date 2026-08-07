@@ -27,7 +27,7 @@ use bson::{Bson, DateTime, Document, doc};
 use tracing::{debug, info};
 
 use crate::state::AppState;
-use roomler_ai_services::dao::stats::{STATS_CALL, STATS_MACHINE, STATS_RELAY};
+use roomler_ai_services::dao::stats::{STATS_CALL, STATS_CALL_USER, STATS_MACHINE, STATS_RELAY};
 
 const ROLLUP_INTERVAL_SECS: u64 = 900; // 15 min
 const HOUR: i64 = 3600;
@@ -227,6 +227,53 @@ fn call_pipeline(floor: DateTime, unit: &str, src_is_rollup: bool, into: &str) -
     }
 }
 
+/// Wave 3 — per-(tenant, user) call usage.
+///
+/// Rates in, **bytes out**: a 30 s gauge multiplied by its own bucket width
+/// is an exact byte count, and unlike the averaged gauges elsewhere in this
+/// file both columns are pure sums, so they stay exact through raw → 1h → 1d.
+/// That matters here in a way it doesn't for a dashboard line: these numbers
+/// are the usage ledger, and an average-of-averages would quietly misreport
+/// a user who was only in a call for part of the bucket.
+fn call_user_pipeline(
+    floor: DateTime,
+    unit: &str,
+    src_is_rollup: bool,
+    into: &str,
+) -> Vec<Document> {
+    let key = doc! { "$concat": [
+        { "$toString": "$tenant_id" }, ":", { "$toString": "$user_id" },
+    ]};
+    let group = if !src_is_rollup {
+        doc! {
+            "_id": { "k": key.clone(), "b": { "$dateTrunc": { "date": "$ts", "unit": unit } } },
+            "tenant_id": { "$first": "$tenant_id" },
+            "user_id": { "$first": "$user_id" },
+            "seconds": { "$sum": 30 },
+            "up_bytes": { "$sum": { "$divide": [ { "$multiply": [ "$up_bps", 30 ] }, 8 ] } },
+            "down_bytes": { "$sum": { "$divide": [ { "$multiply": [ "$down_bps", 30 ] }, 8 ] } },
+        }
+    } else {
+        doc! {
+            "_id": { "k": key.clone(), "b": { "$dateTrunc": { "date": "$ts", "unit": unit } } },
+            "tenant_id": { "$first": "$tenant_id" },
+            "user_id": { "$first": "$user_id" },
+            "seconds": { "$sum": "$seconds" },
+            "up_bytes": { "$sum": "$up_bytes" },
+            "down_bytes": { "$sum": "$down_bytes" },
+        }
+    };
+    vec![
+        doc! { "$match": { "ts": { "$gte": floor } } },
+        doc! { "$group": group },
+        doc! { "$set": {
+            "ts": "$_id.b",
+            "_id": { "$concat": [ "$_id.k", ":", bucket_secs_str() ] },
+        }},
+        merge_into(into),
+    ]
+}
+
 /// One (src → dst) compaction pass with its watermark dance. Returns true
 /// when the `$merge` ran (and the watermark advanced).
 async fn roll_family(
@@ -346,6 +393,26 @@ pub async fn run_stats_rollup_once(state: &AppState) -> usize {
         "call:1d",
         "stats_call_1h",
         call_pipeline(f, "day", true, "stats_call_1d"),
+        DAY,
+    )
+    .await as usize;
+
+    // call-user (usage ledger): raw → 1h → 1d
+    let f = family_floor(state, "call_user:1h").await;
+    done += roll_family(
+        state,
+        "call_user:1h",
+        STATS_CALL_USER,
+        call_user_pipeline(f, "hour", false, "stats_call_user_1h"),
+        HOUR,
+    )
+    .await as usize;
+    let f = family_floor(state, "call_user:1d").await;
+    done += roll_family(
+        state,
+        "call_user:1d",
+        "stats_call_user_1h",
+        call_user_pipeline(f, "day", true, "stats_call_user_1d"),
         DAY,
     )
     .await as usize;
