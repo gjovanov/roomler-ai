@@ -151,6 +151,15 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Route-guard blind-tick seconds while the route-event subscription is live (2-300; 2 = pre-demotion war cadence). Built-in default: 30. Always 2 s without a live subscription.",
     ),
     (
+        "netstack_socks_port",
+        "number",
+        "Multi-org: the loopback SOCKS5 port serving THIS org's userspace netstack \
+         (overlay_mode=\"netstack\"). One TCP listener per org — two orgs configured onto \
+         one port means the second joins no mesh. The primary reads \
+         ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS instead; set this on an [[orgs]] entry. \
+         Built-in default: unset (OS-TUN mode).",
+    ),
+    (
         "rc_max_sessions",
         "number",
         "Concurrent remote-control sessions this agent accepts (1-8). Same-profile DC viewers share one capture+encoder (see shared_encoder); distinct profiles run their own — weak-GPU hosts may prefer 1. Built-in default: 2.",
@@ -339,6 +348,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_rpf" => cfg.overlay_rpf.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
+        "netstack_socks_port" => cfg.netstack_socks_port.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
         "overlay_direct_port" => cfg.overlay_direct_port.map(|v| v.to_string()),
         "shared_encoder" => cfg.shared_encoder.map(fmt_bool),
@@ -475,6 +485,22 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         return Err("overlay_route_tick_secs must be between 2 and 300".into());
                     }
                     Some(s)
+                }
+            }
+        }
+        "netstack_socks_port" => {
+            cfg.netstack_socks_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let n: u16 = v.parse().map_err(|_| {
+                        format!("netstack_socks_port must be a port number (got {v:?})")
+                    })?;
+                    if n < 1024 {
+                        return Err("netstack_socks_port must be >= 1024 \
+                                    (it binds a loopback listener)"
+                            .into());
+                    }
+                    Some(n)
                 }
             }
         }
@@ -1162,5 +1188,41 @@ mod tests {
         assert!(apply(&mut cfg, "update_check_interval_h", Some("nope")).is_err());
         apply(&mut cfg, "update_check_interval_h", None).unwrap();
         assert_eq!(cfg.update_check_interval_h, None);
+    }
+}
+
+#[cfg(test)]
+mod netstack_port_surface_tests {
+    use super::{apply, current_value};
+
+    /// Multi-org netstack: the per-org port is a real config key, so it has
+    /// to round-trip through the surface like every other one.
+    #[test]
+    fn netstack_socks_port_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(current_value(&cfg, "netstack_socks_port"), None);
+
+        apply(&mut cfg, "netstack_socks_port", Some("41080")).unwrap();
+        assert_eq!(cfg.netstack_socks_port, Some(41080));
+        assert_eq!(
+            current_value(&cfg, "netstack_socks_port").as_deref(),
+            Some("41080")
+        );
+
+        // Privileged ports would need the daemon to bind below 1024 for a
+        // loopback convenience listener — refuse rather than fail at bind.
+        assert!(apply(&mut cfg, "netstack_socks_port", Some("80")).is_err());
+        assert!(apply(&mut cfg, "netstack_socks_port", Some("nope")).is_err());
+        assert_eq!(
+            cfg.netstack_socks_port,
+            Some(41080),
+            "a rejected set is a no-op"
+        );
+
+        apply(&mut cfg, "netstack_socks_port", None).unwrap();
+        assert_eq!(
+            cfg.netstack_socks_port, None,
+            "clearing returns to OS-TUN mode"
+        );
     }
 }
