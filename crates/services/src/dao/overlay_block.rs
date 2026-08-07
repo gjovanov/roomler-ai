@@ -7,6 +7,18 @@ use roomler_ai_remote_control::models::{
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
+/// Fleet-wide slot accounting — see [`OverlayBlockDao::headroom`].
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct BlockHeadroom {
+    /// Slots the allocator may ever hand out (the `/10` minus the legacy
+    /// `/16` reservation).
+    pub total: u32,
+    /// Slots below the allocation cursor. Monotonic: never goes down.
+    pub used: u32,
+    /// Slots inside quarantined blocks — spent and never re-issued.
+    pub burned: u32,
+}
+
 /// Multi-org P2b — the GLOBAL registry of overlay address blocks.
 ///
 /// One row per carved range. Unlike every other DAO here this collection is
@@ -159,6 +171,36 @@ impl OverlayBlockDao {
                 }},
             )
             .await
+    }
+
+    /// Fleet-wide slot accounting for the block space.
+    ///
+    /// Quarantined blocks are never re-issued: retiring one BURNS its slots
+    /// for the life of the deployment. That is deliberate — a re-issued
+    /// range could collide with an agent still holding stale peers from the
+    /// previous tenant — and with 4032 slots it is nowhere near mattering.
+    /// "Nowhere near" should be a number an operator can read, though, not a
+    /// belief, so it is reported: the day `burned` becomes a meaningful
+    /// fraction of `total` is the day a reclaim path earns its risk
+    /// (docs/multi-org.md §12).
+    ///
+    /// `used` is the allocation cursor, not a live count — allocation only
+    /// ever moves upward, so it already includes everything burned below it.
+    pub async fn headroom(&self) -> DaoResult<BlockHeadroom> {
+        let cursor = self.highest_end_slot().await?.max(OVERLAY_BLOCK_FIRST_SLOT);
+        let quarantined = self
+            .base
+            .find_many(
+                doc! { "state": bson::to_bson(&OverlayBlockState::Quarantined)
+                .unwrap_or(bson::Bson::Null) },
+                None,
+            )
+            .await?;
+        Ok(BlockHeadroom {
+            total: OVERLAY_BLOCK_SLOT_COUNT - OVERLAY_BLOCK_FIRST_SLOT,
+            used: cursor - OVERLAY_BLOCK_FIRST_SLOT,
+            burned: quarantined.iter().map(|b| b.slots).sum(),
+        })
     }
 
     /// Highest `slot + slots` in the registry, or 0 when it is empty. One
