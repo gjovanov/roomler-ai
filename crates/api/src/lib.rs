@@ -8,6 +8,7 @@ pub mod routes;
 pub mod state;
 pub mod stats_rollup;
 pub mod storage;
+pub mod user_analytics;
 pub mod ws;
 
 use axum::{
@@ -579,6 +580,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/relay/current", get(routes::stats::admin_relay_current))
         .route("/relay/history", get(routes::stats::admin_relay_history))
         .route("/orgs", get(routes::stats::admin_orgs))
+        .route("/users", get(routes::stats::admin_users))
         .route("/machines", get(routes::stats::admin_machines))
         .route("/calls", get(routes::stats::admin_calls));
     let tenant_stats_routes = Router::new()
@@ -609,6 +611,10 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/turn", turn_routes)
         .nest("/relay", relay_routes)
         .nest("/admin/stats", admin_stats_routes)
+        // Wave 2 — the SPA's route-change beacon (authenticated, paths
+        // normalised server-side). User-scoped, not tenant-scoped: a
+        // user navigates across orgs within one session.
+        .route("/stats/pageview", post(routes::stats::page_view))
         .nest("/log", log_routes)
         .nest("/tenant", tenant_routes)
         .nest("/tenant/{tenant_id}/member", member_routes)
