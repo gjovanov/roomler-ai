@@ -209,8 +209,19 @@ mod windows {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Task not found → idempotent uninstall, treat as success.
-            // schtasks prints "ERROR: The system cannot find the file specified."
-            if stderr.contains("cannot find") || stderr.contains("does not exist") {
+            //
+            // Decide that by asking whether the task is STILL THERE, not by
+            // reading schtasks' complaint: its messages are localized, and the
+            // English-only equivalent of this check is exactly what took
+            // pc50045's overlay down on a German host (#373 — netsh answered
+            // "Das Objekt ist bereits vorhanden." to an idempotent add and the
+            // runtime aborted). Here the same miss would fail an uninstall that
+            // had nothing left to do. The English match is kept as a fast path
+            // so the common case costs no extra process spawn.
+            if stderr.contains("cannot find")
+                || stderr.contains("does not exist")
+                || !task_exists(name)
+            {
                 return Ok(());
             }
             bail!(
@@ -220,6 +231,49 @@ mod windows {
             );
         }
         Ok(())
+    }
+
+    /// Does this scheduled task exist? Locale-proof.
+    ///
+    /// `schtasks /Query /TN <name>` prints the task's own NAME on success, and
+    /// a name we chose is the same in every locale — unlike the error text.
+    /// A query that fails to RUN reports `true` ("assume still there"), so a
+    /// caller treating absence as success can never be fooled by a broken
+    /// probe into skipping real work.
+    fn task_exists(name: &str) -> bool {
+        let Ok(out) = Command::new("schtasks")
+            .args(["/Query", "/TN", name])
+            .output()
+        else {
+            return true;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&out.stdout).contains(name)
+    }
+
+    /// Is `name` provably ABSENT from the full task list?
+    ///
+    /// The independent, locale-proof half of [`query_task`]'s error path: a
+    /// listing that succeeds and does not mention our name is real evidence of
+    /// absence, in any language. `/FO CSV /NH` keeps the output machine-shaped
+    /// rather than the localized table.
+    ///
+    /// Returns `false` — "not proven absent" — whenever the listing itself
+    /// fails, so an unavailable or access-denied schtasks yields `Unknown`
+    /// rather than a confident `NotInstalled`.
+    fn task_absent_from_listing(name: &str) -> bool {
+        let Ok(out) = Command::new("schtasks")
+            .args(["/Query", "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        !String::from_utf8_lossy(&out.stdout).contains(name)
     }
 
     pub fn status() -> Result<AutostartStatus> {
@@ -237,10 +291,29 @@ mod windows {
             .output()
             .context("running schtasks /Query")?;
         if output.status.success() {
-            Ok(AutostartStatus::Installed)
+            // Confirm it really named OUR task: a success whose output doesn't
+            // mention it is not evidence of installation.
+            if String::from_utf8_lossy(&output.stdout).contains(name) {
+                Ok(AutostartStatus::Installed)
+            } else {
+                Ok(AutostartStatus::Unknown)
+            }
         } else {
+            // Localized stderr again (see `task_exists`). English strings stay
+            // as a no-extra-spawn fast path; otherwise get an INDEPENDENT
+            // locale-proof answer by listing the tasks and looking for our own
+            // name — re-running the query that just failed would prove nothing.
+            //
+            // `Unknown` must stay distinct from `NotInstalled`: a caller that
+            // reinstalls on `NotInstalled` would thrash the task every time
+            // schtasks itself is unavailable or access-denied. So only a
+            // successful listing that lacks our name downgrades to
+            // `NotInstalled`.
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("cannot find") || stderr.contains("does not exist") {
+            if stderr.contains("cannot find")
+                || stderr.contains("does not exist")
+                || task_absent_from_listing(name)
+            {
                 Ok(AutostartStatus::NotInstalled)
             } else {
                 Ok(AutostartStatus::Unknown)
