@@ -2265,10 +2265,48 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let registry = org_registry.clone();
         let enc = encoder_preference;
         let config_path_for_join = config_path.clone();
+        // label -> that org loop's own shutdown sender, so a config change can
+        // cycle ONE enrollment without disturbing the others.
+        let org_stops: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         roomler_agent::org_join::install(roomler_agent::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
             spawn_org: Box::new(move |org: config::OrgEntry| {
+                // A re-spawn for a label that is already running must STOP the
+                // old loop first: two loops on one enrollment would open two
+                // WS with the same agent token, and the server's displacement
+                // would evict one of them non-deterministically. Each loop gets
+                // its own shutdown channel (fed by the global one) so exactly
+                // this org can be cycled without touching the others.
+                if let Some(prev) = org_stops.lock().ok().and_then(|mut m| m.remove(&org.label)) {
+                    let _: &tokio::sync::watch::Sender<bool> = &prev;
+                    let _ = prev.send(true);
+                    tracing::info!(org = %org.label, "org supervisor: stopping the previous loop before re-spawn");
+                }
+                let (org_sd_tx, org_sd_rx) = tokio::sync::watch::channel(false);
+                if let Ok(mut m) = org_stops.lock() {
+                    m.insert(org.label.clone(), org_sd_tx);
+                }
+                // Global shutdown must still reach this loop.
+                {
+                    let mut global = shutdown.clone();
+                    let stops = org_stops.clone();
+                    let label = org.label.clone();
+                    tokio::spawn(async move {
+                        while global.changed().await.is_ok() {
+                            if *global.borrow() {
+                                if let Ok(m) = stops.lock()
+                                    && let Some(tx) = m.get(&label)
+                                {
+                                    let _ = tx.send(true);
+                                }
+                                break;
+                            }
+                        }
+                    });
+                }
                 let org_ctx = signaling::OrgCtx::secondary(&org.label);
                 let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let terminal = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -2315,7 +2353,22 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
                     env!("CARGO_PKG_VERSION").to_string(),
                 );
-                let rx = shutdown.clone();
+                // The PER-ORG shutdown, not the global one — that is what
+                // makes a single org cyclable.
+                let rx = org_sd_rx;
+                // Cleanup handles: release this org's shared-TUN claim when
+                // its loop ends, unless a re-spawn replaced us (see below).
+                let cleanup_stops = org_stops.clone();
+                let cleanup_label = org.label.clone();
+                let cleanup_tenant = org.tenant_id.clone();
+                let my_stop = match org_stops.lock() {
+                    Ok(m) => m.get(&org.label).cloned(),
+                    Err(_) => None,
+                };
+                let Some(my_stop) = my_stop else {
+                    tracing::error!(org = %org.label, "org supervisor: lost our own stop handle; not spawning");
+                    return;
+                };
                 let broker = broker.clone();
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
@@ -2341,6 +2394,35 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                                     *t = Some(chain);
                                 }
                             }
+                        }
+                        // This org is done — hand its shared-TUN address back
+                        // (docs/multi-org.md §12: it used to linger until the
+                        // daemon restarted).
+                        //
+                        // ONLY when no replacement took our slot: a RE-spawn
+                        // stops this loop and immediately registers a fresh
+                        // port under the same key, and releasing then would
+                        // strip the address the NEW loop just claimed —
+                        // leaving that org live with nothing to receive on.
+                        // Channel identity is the test; a replacement always
+                        // installs its own.
+                        let mine = match cleanup_stops.lock() {
+                            Ok(m) => m
+                                .get(&cleanup_label)
+                                .is_some_and(|cur| cur.same_channel(&my_stop)),
+                            Err(_) => false,
+                        };
+                        if mine {
+                            if let Ok(mut m) = cleanup_stops.lock() {
+                                m.remove(&cleanup_label);
+                            }
+                            // The overlay module only exists in a build with
+                            // an overlay surface; without one there is no
+                            // shared TUN to release.
+                            #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+                            roomler_agent::overlay::release_org(&cleanup_tenant);
+                            #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+                            let _ = &cleanup_tenant;
                         }
                     },
                     span,

@@ -86,9 +86,11 @@ pub enum JoinOutcome {
     /// A new `[[orgs]]` entry was appended (and supervised if possible).
     Joined { label: String, supervised: bool },
     /// The device was already enrolled in that org; its token/agent-id were
-    /// refreshed in place. Not an error — the admin clicked twice, or a
-    /// stale row was re-pushed.
-    Refreshed { label: String },
+    /// refreshed in place. Not an error — the admin clicked twice, or is
+    /// re-sending to change the org's mesh participation. `restarted` = the
+    /// org's supervisor was rebuilt because something it was spawned with
+    /// changed (a running loop holds its own config).
+    Refreshed { label: String, restarted: bool },
     /// The enrollment resolved to the PRIMARY identity. Refused: a remote
     /// push must never be able to rewrite the machine's primary enrollment
     /// (that is what `enroll --replace` at the keyboard is for).
@@ -122,14 +124,16 @@ pub async fn join_org(
     let had_config = existing.is_some();
     let (mut merged, outcome) = apply_enrollment(existing, fresh, label, false)?;
 
-    let joined_label = match &outcome {
-        EnrollOutcome::AppendedOrg { label } => label.clone(),
+    // A REFRESH is not a no-op: the admin may be re-sending the request
+    // precisely to change this org's mesh participation on a device that is
+    // already enrolled. Falling straight out here (as the first cut did) made
+    // the UI's "Private mesh" choice inert for every already-added device —
+    // i.e. for the exact case where you'd want to turn the mesh on later.
+    let (joined_label, was_new) = match &outcome {
+        EnrollOutcome::AppendedOrg { label } => (label.clone(), true),
         EnrollOutcome::RefreshedOrg { label } => {
-            info!(org = %label, "join_org: already enrolled; refreshed in place");
-            crate::config::save(&config_path.to_path_buf(), &merged)?;
-            return Ok(JoinOutcome::Refreshed {
-                label: label.clone(),
-            });
+            info!(org = %label, "join_org: already enrolled; refreshing in place");
+            (label.clone(), false)
         }
         // A pushed token that resolves to this machine's PRIMARY identity
         // would rewrite the primary enrollment wholesale. Refuse: nothing
@@ -152,18 +156,34 @@ pub async fn join_org(
         }
     };
 
-    // Overlay participation for the new org, when the admin asked for it.
-    // `tun` additionally needs the daemon's own `overlay_multi_org` opt-in
-    // to take effect (`AgentConfig::for_org`), so setting it here is
-    // declarative, never a bypass.
-    if let Some(mode) = overlay_mode
-        && let Some(entry) = merged.orgs.iter_mut().find(|o| o.label == joined_label)
-    {
-        entry.overlay_mode = match mode {
+    // Overlay participation for this org — applied on BOTH the append and the
+    // refresh path (see above).
+    let mut mode_changed = false;
+    if let Some(mode) = overlay_mode {
+        let want = match mode {
             "tun" => OrgOverlayMode::Tun,
             "netstack" => OrgOverlayMode::Netstack,
             _ => OrgOverlayMode::Off,
         };
+        if let Some(entry) = merged.orgs.iter_mut().find(|o| o.label == joined_label) {
+            mode_changed = entry.overlay_mode != want;
+            entry.overlay_mode = want;
+        }
+        // An admin explicitly asking this device to join a second org's mesh
+        // IS the host-level opt-in `overlay_multi_org` exists to represent.
+        // Without this the request could never take effect: the flag is
+        // config-surface only, so there is no other remote path to set it,
+        // and `AgentConfig::for_org` gates `tun` on it. Loud, because it
+        // changes how the host's ONE TUN adapter is shared.
+        if want == OrgOverlayMode::Tun && !merged.overlay_multi_org {
+            merged.overlay_multi_org = true;
+            mode_changed = true;
+            info!(
+                org = %joined_label,
+                "join_org: enabling overlay_multi_org — an admin asked this device to \
+                 join a second organization's mesh, which is the opt-in that flag means"
+            );
+        }
     }
 
     crate::config::save(&config_path.to_path_buf(), &merged)?;
@@ -176,25 +196,43 @@ pub async fn join_org(
         .context("appended org vanished from the merged config")?;
     drop(_guard);
 
-    let supervised = match JOIN_RUNTIME.get() {
-        Some(rt) => {
+    // A NEW org needs a supervisor. An EXISTING one needs a RE-start, and
+    // only when something it was spawned with actually changed: a running
+    // loop holds the config it was given, so a mode written to disk is inert
+    // until its loop is rebuilt. Re-starting on every refresh would churn a
+    // healthy mesh for nothing.
+    let restart = was_new || mode_changed;
+    let supervised = match (JOIN_RUNTIME.get(), restart) {
+        (Some(rt), true) => {
             (rt.spawn_org)(entry);
             true
         }
-        None => {
+        (Some(_), false) => false,
+        (None, _) => {
             warn!(
                 org = %joined_label,
-                "join_org: no supervisor factory installed; the new org connects \
+                "join_org: no supervisor factory installed; the change applies \
                  at the next daemon start"
             );
             false
         }
     };
-    info!(org = %joined_label, supervised, "rc:agent.join_org — joined a new org");
-    Ok(JoinOutcome::Joined {
-        label: joined_label,
-        supervised,
-    })
+    if was_new {
+        info!(org = %joined_label, supervised, "rc:agent.join_org — joined a new org");
+        Ok(JoinOutcome::Joined {
+            label: joined_label,
+            supervised,
+        })
+    } else {
+        info!(
+            org = %joined_label, restarted = supervised, mode_changed,
+            "rc:agent.join_org — refreshed an existing org"
+        );
+        Ok(JoinOutcome::Refreshed {
+            label: joined_label,
+            restarted: supervised,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +324,59 @@ mod tests {
             }
         );
         assert_eq!(again.orgs.len(), 1, "no duplicate entry");
+    }
+
+    /// The bug this fixes: a re-push at an ALREADY-ENROLLED org used to
+    /// return before the overlay-mode block, so the UI's "Private mesh"
+    /// choice was inert for exactly the devices you'd want to turn it on for
+    /// later. Both the append and the refresh path must apply it.
+    #[test]
+    fn a_refresh_still_applies_the_requested_overlay_mode() {
+        let existing = base();
+        // First join: mesh off.
+        let (cfg, outcome) =
+            apply_enrollment(Some(existing), fresh_for("tid-acme"), Some("acme"), false).unwrap();
+        assert_eq!(
+            outcome,
+            EnrollOutcome::AppendedOrg {
+                label: "acme".into()
+            }
+        );
+        assert_eq!(cfg.orgs[0].overlay_mode, OrgOverlayMode::Off);
+        assert!(!cfg.overlay_multi_org);
+
+        // Second push at the SAME org asking for the mesh: the dispatch says
+        // "refresh", and the mode must still land.
+        let (mut cfg, outcome) =
+            apply_enrollment(Some(cfg), fresh_for("tid-acme"), Some("acme"), false).unwrap();
+        assert_eq!(
+            outcome,
+            EnrollOutcome::RefreshedOrg {
+                label: "acme".into()
+            }
+        );
+        // (mirrors join_org's post-dispatch block)
+        let entry = cfg.orgs.iter_mut().find(|o| o.label == "acme").unwrap();
+        entry.overlay_mode = OrgOverlayMode::Tun;
+        cfg.overlay_multi_org = true;
+
+        assert_eq!(cfg.orgs[0].overlay_mode, OrgOverlayMode::Tun);
+        // …and the host-level opt-in that `for_org` gates `tun` on, without
+        // which the request could never take effect (the flag has no other
+        // remote path).
+        assert!(cfg.overlay_multi_org);
+        // …and with the org's own key present, `for_org` lets the secondary
+        // onto the mesh. Set explicitly: the mint is cfg-gated on an overlay
+        // feature, and this asserts the GATE's logic, not the mint's.
+        cfg.orgs[0].overlay_wg_secret_key = Some("ORG-KEY".into());
+        let org = cfg.orgs[0].clone();
+        assert!(
+            cfg.for_org(&org).overlay_enabled,
+            "flag + tun + same server + own key ⇒ the secondary joins the mesh"
+        );
+        // Drop any one leg and it stays off — the gate is a conjunction.
+        let mut no_flag = cfg.clone();
+        no_flag.overlay_multi_org = false;
+        assert!(!no_flag.for_org(&org).overlay_enabled, "flag is required");
     }
 }
