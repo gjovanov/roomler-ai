@@ -2045,7 +2045,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // The netstack ICMP backend for `roomler ping` — Some only on a node running
     // the userspace stack (netstack mode); None otherwise (OS-TUN / non-overlay).
     #[cfg(feature = "overlay-netstack")]
-    let netstack_pinger = roomler_agent::overlay::netstack_pinger();
+    let netstack_pinger = roomler_agent::overlay::netstack_pinger(&cfg);
     #[cfg(not(feature = "overlay-netstack"))]
     let netstack_pinger: Option<std::sync::Arc<dyn localapi_state::NetstackPinger>> = None;
     // S1b — ONE pinger for BOTH the interactive `Ping` verb and the RTT
