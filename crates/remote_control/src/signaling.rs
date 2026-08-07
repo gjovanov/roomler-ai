@@ -850,6 +850,21 @@ pub enum ServerMsg {
         /// serde-default so old agents/servers interop.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_mode: Option<crate::models::InputMode>,
+        /// Multi-org — the DISPLAY NAME of the organization this request
+        /// comes from, so the consent prompt can say who is asking.
+        ///
+        /// A device enrolled in N orgs runs N signalling loops into the same
+        /// host. Without this the operator sees "Alice wants to control this
+        /// machine" and cannot tell whether Alice is asking as a colleague or
+        /// as a contractor from another company — which is precisely the
+        /// decision consent exists to make. The agent knows only its
+        /// `tenant_id` (an opaque hex), so the NAME has to come from here.
+        ///
+        /// `None` on an older server → the prompt falls back to the org's
+        /// config label, and to nothing at all for the primary enrollment
+        /// (the pre-multi-org behaviour).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant_name: Option<String>,
     },
 
     /// Server forwards SDP offer from controller → agent.

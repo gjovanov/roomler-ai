@@ -1076,6 +1076,7 @@ mod tests {
                 controller_name: "x".into(),
                 permissions: "VIEW_SCREEN".into(),
                 timeout_secs: 30,
+                org: String::new(),
             };
             std::fs::write(
                 dir.join(format!("{i:024x}.pending")),
