@@ -137,6 +137,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_enabled: false,
         // Multi-org P2c: secondary-org TUN sharing, off until opted in.
         overlay_multi_org: false,
+        netstack_socks_port: None,
+        derived_org: false,
         overlay_wg_secret_key: None,
         // Phase 1: no advertised subnet routes until the operator configures them.
         overlay_advertised_routes: Vec::new(),
@@ -241,6 +243,7 @@ pub fn apply_enrollment(
         overlay_advertised_routes: Vec::new(),
         overlay_exit_node_enabled: false,
         advertise_routes: Vec::new(),
+        netstack_socks_port: None,
     };
     // Mint this org's OWN WireGuard identity now (builds without an overlay
     // surface leave it None; P2's first overlay-enabled start mints then,
@@ -534,6 +537,7 @@ mod tests {
             overlay_advertised_routes: Vec::new(),
             overlay_exit_node_enabled: false,
             advertise_routes: Vec::new(),
+            netstack_socks_port: None,
         }
     }
 
