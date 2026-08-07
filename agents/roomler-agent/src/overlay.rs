@@ -497,20 +497,31 @@ fn mux_systun_factory(org_key: String) -> Option<TunFactory> {
         // nothing answered on, which is exactly the litter that makes a
         // later diagnosis lie.
         let port = mux.register(&org_key, ip, nm)?;
-        // Then the org's own address: its block's connected route rides the
-        // assignment. The creator's address came up with the device;
-        // add_address_sync is idempotent, so skipping the create params only
-        // avoids a pointless netsh round-trip.
-        if !fresh {
-            let prefix = u32::from(nm).count_ones() as u8;
-            if let Err(e) = dev.add_address_sync(ip, prefix) {
-                // Roll the claim back — a block held by an org with no
-                // address to receive on would refuse every later joiner.
-                if let Some((addr, plen)) = mux.deregister(&org_key) {
-                    dev.del_address_sync(addr, plen);
-                }
-                return Err(e);
+        // Then the org's own address — for EVERY org, the device's creator
+        // included.
+        //
+        // The creator used to be skipped on the theory that `SystemTun::up`
+        // had already assigned its address. That holds only when `up`
+        // actually creates the adapter. Field 2026-08-07, CORPLAP-1: the
+        // adapter survives a process restart (stable Wintun GUID, by
+        // design), so `up` REUSED it and left the previous incarnation's
+        // address in place — the creating org logged "TUN up self_v4=
+        // 100.65.0.5" while the interface still held only 100.64.0.28, and
+        // nothing ever answered on 100.65.0.5. Which org got skipped was
+        // decided by registration order, i.e. by a race.
+        //
+        // `add_address_sync` is idempotent, so doing it unconditionally
+        // costs one netsh/ip round-trip per org per connect and makes the
+        // result independent of who arrived first.
+        let _ = fresh;
+        let prefix = u32::from(nm).count_ones() as u8;
+        if let Err(e) = dev.add_address_sync(ip, prefix) {
+            // Roll the claim back — a block held by an org with no
+            // address to receive on would refuse every later joiner.
+            if let Some((addr, plen)) = mux.deregister(&org_key) {
+                dev.del_address_sync(addr, plen);
             }
+            return Err(e);
         }
         Ok(port as Arc<dyn TunIo>)
     }))
