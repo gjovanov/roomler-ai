@@ -1480,9 +1480,12 @@ impl Hub {
                 ClientMsg::AgentHello { .. }
                 | ClientMsg::AgentHeartbeat { .. }
                 | ClientMsg::RelayProbeReport { .. }
+                | ClientMsg::SessionStats { .. }
                 | ClientMsg::DerpTicketRequest {},
             ) => {
-                // Hello is handled at registration time; heartbeat is logged by WS layer.
+                // Hello is handled at registration time; heartbeat and
+                // session stats are consumed by the WS layer (they need
+                // AppState/Mongo, which the Hub deliberately doesn't hold).
                 Ok(())
             }
             (role, msg) => {
