@@ -317,25 +317,41 @@ impl OverlayRuntime {
             let Some(handshake_done) = wg.peer_handshake_done(&e.pubkey) else {
                 continue;
             };
+            // Stage 2 — settle any pending active-revalidation poke: answered
+            // iff an INITIATOR-role handshake completed at-or-after the poke
+            // instant (the only signal that proves OUR outbound works — see
+            // `PeerStats::hs_response_at`). An answered poke clears, re-arming
+            // the triggers; an unanswered one rides into the tick, which
+            // kills it once the tier's handshake-deadline window closes.
+            let poke = e.last_poke_at.map(|at| PokeState {
+                since_poke: now.saturating_duration_since(at),
+                answered: wg.peer_initiator_hs_answered(&e.pubkey, at),
+            });
+            if poke.as_ref().is_some_and(|p| p.answered) {
+                e.last_poke_at = None;
+            }
             // P2 — every rule that can kill this carrier lives in ONE pure
             // transition (`lifecycle::carrier_tick`): the per-tier handshake
             // deadline (Phase C / rc.204 / rc.223), the rc.206 rx-staleness
             // backstop, the rc.137 one-way counter, the rc.181 hard-dead fast
-            // path, the warm-up grace, and the relay refresh holdoff. This
-            // loop only gathers inputs and applies the verdict.
+            // path, the Stage 2 poke verdict, the warm-up grace, and the relay
+            // refresh holdoff. This loop only gathers inputs and applies the
+            // verdict.
+            let since_last_rx = now.saturating_duration_since(e.last_rx_at);
             let v = carrier_tick(&HealthInputs {
                 tier: e.tier,
                 is_direct: e.is_direct,
                 hard_dead: wg.peer_carrier_dead(&e.pubkey).unwrap_or(false),
                 handshake_done,
                 since_install: e.since.elapsed(),
-                since_last_rx: now.saturating_duration_since(e.last_rx_at),
+                since_last_rx,
                 traffic: (tx, rx),
                 last_traffic: (last_tx, last_rx),
                 bad_sweeps: e.bad_sweeps,
                 relay_refresh_held: relay_refresh_cooldown
                     .get(nid)
                     .is_some_and(|&until| until > now),
+                poke,
             });
             // P3 PR-A — feed the sweep's evidence to the shadow monitor:
             // heard-this-sweep (Q credit), a stored one-way strike (Q debit),
@@ -371,6 +387,27 @@ impl OverlayRuntime {
             // lives in the monitor now (`on_healthy_rx`, fed just above).
             if let Some(reason) = v.death {
                 dead.push((*nid, e.tier, reason));
+            } else if e.last_poke_at.is_none() {
+                // Stage 2 — arm an active revalidation for a SURVIVOR when the
+                // passive signals can't prove it either way: silent past
+                // `POKE_SILENCE_AFTER`, or no initiator-role handshake within
+                // `POKE_PROOF_AFTER` (`since_proof` counts from install for a
+                // carrier we never initiated on). One in-flight poke per
+                // carrier; boringtun retries the initiation every ~5 s on its
+                // own.
+                let since_proof = wg
+                    .peer_initiator_hs_age(&e.pubkey)
+                    .map_or(e.since.elapsed(), |age| age.min(e.since.elapsed()));
+                if should_poke(handshake_done, false, since_last_rx, since_proof)
+                    && wg.poke_handshake(&e.pubkey)
+                {
+                    e.last_poke_at = Some(now);
+                    debug!(
+                        peer = %nid, tier = ?e.tier,
+                        silent_s = since_last_rx.as_secs(), proof_age_s = since_proof.as_secs(),
+                        "overlay: revalidating carrier (forced rekey poke)"
+                    );
+                }
             }
         }
         for (nid, tier, reason) in dead {
@@ -386,7 +423,11 @@ impl OverlayRuntime {
             // itself re-selects).
             self.shadow(|s| {
                 s.mon.on_death(&nid, tier, reason, mbb, now);
-                if tier.is_direct() {
+                // Stage 2 — a RekeyUnanswered death deliberately books NO
+                // penalty (see `PathMonitor::on_death`), so the tier is
+                // legitimately still eligible and the tripwire would
+                // false-fire its MODEL-BUG warning on every poke death.
+                if tier.is_direct() && reason != DeathReason::RekeyUnanswered {
                     s.assert_ineligible(&nid, tier, now);
                 }
             });
@@ -416,6 +457,15 @@ impl OverlayRuntime {
                         peer = %nid, tier = tier_name, fails,
                         "overlay: direct carrier failed repeatedly — pinning this peer to relay for the session"
                     );
+                } else if reason == DeathReason::RekeyUnanswered {
+                    // Stage 2 — active proof: 2–3 forced-rekey initiations
+                    // went unanswered. No strike booked (the rebuild supplies
+                    // fresh evidence itself), so a re-upgrade may re-attempt
+                    // direct immediately — its failure is what books.
+                    warn!(
+                        peer = %nid, tier = tier_name,
+                        "overlay: established direct carrier failed active revalidation (forced rekey unanswered — path filtered / VPN / NAT rebind?) — rebuilding via relay"
+                    );
                 } else if reason == DeathReason::RxStale {
                     // rc.206 — an ESTABLISHED direct carrier that went silent
                     // (peer roamed / NAT rebind / path died mid-session), not a
@@ -442,6 +492,18 @@ impl OverlayRuntime {
                     warn!(
                         peer = %nid,
                         "overlay: relay carrier send hard-errored (TURNS/TCP reset / QUIC-over-TURN lost) — re-allocating"
+                    );
+                } else if reason == DeathReason::RekeyUnanswered {
+                    // Stage 2 — the relay accepted our sends (no hard error)
+                    // but repeated forced-rekey initiations never completed:
+                    // the classic silently-dead allocation, now caught by
+                    // active proof instead of the 90 s rx-stale wait — and
+                    // caught EVEN when the peer's own inbound traffic keeps
+                    // rx moving (the one-way class no passive rule can see;
+                    // field 2026-08-08, pc50045→neo16 via a raw-dialed srflx).
+                    warn!(
+                        peer = %nid,
+                        "overlay: relay carrier failed active revalidation (forced rekey unanswered — one-way or dead allocation) — re-allocating"
                     );
                 } else if reason == DeathReason::RxStale {
                     // rc.206 — a relay carrier that stopped delivering with no

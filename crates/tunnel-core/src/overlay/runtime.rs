@@ -294,6 +294,12 @@ struct Installed {
     /// Consecutive sweeps where we sent but received nothing (tx grew, rx
     /// flat). A few in a row ⇒ the direct carrier is one-way / dead.
     bad_sweeps: u32,
+    /// Stage 2 — when the sweep last armed an active-revalidation poke (a
+    /// forced WG rekey) for this carrier; `None` = none pending. Cleared when
+    /// the poke is answered (an initiator-role handshake completed at-or-after
+    /// it — `WgDevice::peer_initiator_hs_answered`); an unanswered poke past
+    /// the tier's handshake deadline is a `DeathReason::RekeyUnanswered`.
+    last_poke_at: Option<Instant>,
     /// rc.275 honesty — the health sweep's verdict that this carrier is
     /// SILENTLY ONE-WAY: installed past the warm-up grace with either no
     /// completed WG handshake ever (the pre-handshake zombie whose tx/rx
@@ -396,6 +402,7 @@ impl Installed {
             since: now,
             last_traffic: (0, 0),
             bad_sweeps: 0,
+            last_poke_at: None,
             stalled: false,
             initiated: false,
             hs_done: false,
@@ -3117,6 +3124,141 @@ mod tests {
             s.mon.eligible(&nid, DirectTier::Public, now)
                 && s.mon.strikes(&nid, DirectTier::Public) == 0,
             "CC1: the public-direct tier is NOT poisoned"
+        );
+    }
+
+    /// Stage 2 — the sweep's poke wiring end-to-end: a silent ESTABLISHED
+    /// carrier gets a revalidation poke armed (and survives the arming
+    /// sweep); unanswered past the tier's handshake-deadline window it dies
+    /// `RekeyUnanswered` with NO strike and the tier still ELIGIBLE (the
+    /// no-penalty contract `PathMonitor::on_death` promises); an answered
+    /// poke (the initiator-handshake stamp advancing) clears instead and the
+    /// carrier lives on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_poke_arms_reaps_unanswered_and_clears_answered() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 4);
+        let pk = peer_kp.public.to_bytes();
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dead, true)
+            .await;
+        // ESTABLISHED phase (the poke is Established-only).
+        wg.test_latch_handshake_done(&pk);
+
+        let nid = ObjectId::from_bytes([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                // Old enough for the grace; silent past POKE_SILENCE_AFTER
+                // but inside the 60 s rx-stale deadline.
+                since: Instant::now()
+                    .checked_sub(Duration::from_secs(120))
+                    .unwrap(),
+                last_rx_at: Instant::now()
+                    .checked_sub(POKE_SILENCE_AFTER + Duration::from_secs(2))
+                    .unwrap(),
+                ..Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now())
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        // Sweep 1 — arms the poke, kills nothing.
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+        )
+        .await;
+        assert!(
+            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_some()),
+            "silent carrier survives the arming sweep with a poke pending"
+        );
+
+        // Back-date the poke past the LAN window (12 s): the next sweep must
+        // reap it — RekeyUnanswered, and the no-penalty contract holds.
+        by_node.get_mut(&nid).unwrap().last_poke_at = Some(
+            Instant::now()
+                .checked_sub(LAN_HANDSHAKE_DEADLINE + Duration::from_secs(1))
+                .unwrap(),
+        );
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+        )
+        .await;
+        assert!(
+            !by_node.contains_key(&nid),
+            "the unanswered carrier is torn down"
+        );
+        {
+            let now = Instant::now();
+            let s = rt.path_shadow.lock().unwrap();
+            assert_eq!(
+                s.mon.strikes(&nid, DirectTier::Lan),
+                0,
+                "RekeyUnanswered books NO strike"
+            );
+            assert!(
+                s.mon.eligible(&nid, DirectTier::Lan, now),
+                "the LAN tier stays immediately eligible"
+            );
+        }
+
+        // Answered variant: reinstall the carrier, arm a poke older than the
+        // window, then stamp an initiator-handshake AFTER it — the sweep must
+        // clear the poke and keep the carrier.
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dead, true)
+            .await;
+        wg.test_latch_handshake_done(&pk);
+        by_node.insert(
+            nid,
+            Installed {
+                since: Instant::now().checked_sub(Duration::from_secs(60)).unwrap(),
+                last_poke_at: Some(
+                    Instant::now()
+                        .checked_sub(LAN_HANDSHAKE_DEADLINE + Duration::from_secs(1))
+                        .unwrap(),
+                ),
+                ..Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now())
+            },
+        );
+        wg.test_stamp_initiator_hs(&pk);
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+        )
+        .await;
+        assert!(
+            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_none()),
+            "an answered poke clears and the carrier survives"
         );
     }
 
