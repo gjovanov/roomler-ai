@@ -994,9 +994,7 @@ mod system {
             let Ok(out) = run("netsh", &args) else {
                 return false;
             };
-            let needle = ip.to_string();
-            out.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-                .any(|tok| tok == needle)
+            listing_mentions_address(&out, ip)
         }
 
         /// The interface name the OS gave this device — [`IF_NAME`] on
@@ -1118,7 +1116,7 @@ mod system {
                     // and that text is not a contract). Ask the interface.
                     Err(e) => {
                         let listed = run("ifconfig", &[self.if_name.clone()]).unwrap_or_default();
-                        if interface_lists_address(&listed, ip) {
+                        if listing_mentions_address(&listed, ip) {
                             Ok(())
                         } else {
                             Err(e)
@@ -1937,6 +1935,32 @@ mod system {
     const IF_NAME: &str = "roomler";
     #[cfg(target_os = "linux")]
     const IF_NAME: &str = "roomler0";
+    /// Does an interface listing mention `ip`?
+    ///
+    /// The one shared piece of "ask the interface instead of reading the
+    /// error", used by both `netsh interface ipv4 show addresses` (Windows)
+    /// and `ifconfig <utun>` (macOS). Everything those tools SAY is
+    /// localized — labels and errors alike — but an IPv4 literal is not, so
+    /// the address is the only token worth reading. Split on everything
+    /// that cannot appear inside a dotted quad and compare whole tokens: a
+    /// substring test would let `100.64.0.2` match a listed `100.64.0.28`.
+    ///
+    /// Compiled everywhere so every platform's test run covers it.
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+    fn listing_mentions_address(listed: &str, ip: Ipv4Addr) -> bool {
+        let want = ip.to_string();
+        listed
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .any(|tok| tok == want)
+    }
+
+    /// macOS ignores a requested name — utun numbers are kernel-assigned —
+    /// so this is only the REQUESTED name and a logging fallback. The real
+    /// one comes from `SystemTun::if_name()`. That macOS had no `IF_NAME`
+    /// at all is the reason its whole routing surface was a set of no-ops:
+    /// there was nothing to address, so nothing addressed anything.
+    #[cfg(target_os = "macos")]
+    const IF_NAME: &str = "utun";
 
     /// Is `cidr` an IPv6 CIDR? A colon only ever appears in the v6 textual form
     /// (`"::/1"`, `"8000::/1"`, `"fd72:6f6f:6d6c::/96"`), never in a v4 one
@@ -2540,6 +2564,38 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// The shared half of "ask the interface, don't read the error".
+        ///
+        /// `address_presence_is_locale_proof` below covers the Windows
+        /// wrapper but is `cfg(windows)`, so CI never runs it. This one
+        /// compiles everywhere and covers both listing shapes — including
+        /// macOS `ifconfig`, whose output is the other caller.
+        #[test]
+        fn listings_are_read_by_address_literal_not_by_label() {
+            use super::listing_mentions_address as m;
+            use std::net::Ipv4Addr;
+
+            // German Windows `netsh` — every label differs, the address does not.
+            let de = "    IP-Adresse:  100.64.0.28\n    Subnetzpräfix: 100.64.0.0/10\n";
+            // macOS `ifconfig utun4` — a point-to-point inet line.
+            let mac = "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+                       \tinet 100.64.0.28 --> 100.64.0.28 netmask 0xffc00000\n\
+                       \tinet 100.65.0.5 --> 100.65.0.5 netmask 0xfffffc00\n";
+
+            for out in [de, mac] {
+                assert!(m(out, Ipv4Addr::new(100, 64, 0, 28)));
+                // The substring trap: `100.64.0.2` must NOT match a listed
+                // `100.64.0.28`, or a real failure gets swallowed.
+                assert!(!m(out, Ipv4Addr::new(100, 64, 0, 2)));
+                assert!(!m(out, Ipv4Addr::new(10, 0, 0, 1)));
+            }
+            // macOS carries the second org's address too — that is the
+            // whole point of the multi-address path there.
+            assert!(m(mac, Ipv4Addr::new(100, 65, 0, 5)));
+            assert!(!m(de, Ipv4Addr::new(100, 65, 0, 5)));
+            assert!(!m("", Ipv4Addr::new(100, 64, 0, 28)));
+        }
 
         /// The pc50045 outage (2026-08-07): a GERMAN-locale Windows host
         /// answered `netsh … add address` with "Das Objekt ist bereits
