@@ -204,6 +204,17 @@ fn machine_volume_pipeline(tenant: Option<ObjectId>, floor: DateTime, tier: Tier
     if let Some(t) = tenant {
         match_doc.insert("tenant_id", t);
     }
+    // Only rows that actually CARRY the counter. Without this, a fleet with
+    // no reporting agent yields a full set of buckets whose `$ifNull` deltas
+    // are all zero — and a flat zero line reads as "no traffic" when the
+    // truth is "nobody is measuring yet". No rows ⇒ empty series ⇒ the chart
+    // says so. Once agents report, a genuinely idle bucket still shows 0.
+    let counter_field = if tier == Tier::Raw {
+        "sys.overlay_rx_bytes"
+    } else {
+        "overlay_rx_bytes_max"
+    };
+    match_doc.insert(counter_field, doc! { "$exists": true });
     let delta = |max: &str, min: &str| {
         doc! { "$max": [ 0, { "$subtract": [
             { "$ifNull": [ format!("${max}"), 0 ] },
