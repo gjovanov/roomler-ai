@@ -417,21 +417,31 @@ no blank row can render).
   retire it afterwards; **archiving now exists** (§13), so the remaining
   work is scheduling it on a disposable host — deliberately not a prod
   cluster node, since the test is an intentional address collision.
-- **macOS is excluded from multi-org meshing, and the gap is wider than it
-  looks.** `add_address_sync` refuses there, but so do `add_peer_route`,
-  `add_cidr_route`, `enumerate_if_routes`, `purge_one` and the derived-v6
-  assign — all no-ops outside Linux/Windows. macOS therefore has no
-  per-peer `/32`s and no subnet routes at all today; the overlay leans
-  entirely on the device's own connected route. Adding utun aliasing alone
-  would produce a second address with no routing behind it, which is why
-  the refusal is loud rather than partial.
-  The blocker is no longer hardware: a `macos-latest` CI runner has sudo
-  and utun and `ci.yml` already runs a macOS job, and a rented Apple-silicon
-  Mac mini costs about €0.11–0.22/h (24 h minimum lease — Apple licensing,
-  which AWS EC2 Mac carries too) if a persistent mesh member is ever wanted.
-  So this is scoped work — utun name accessor, `ifconfig <utun> alias`,
-  `route -n add -interface`, then the `tun_kernel_tests` shape again on a
-  macOS runner — rather than blocked work.
+- **macOS meshes, including multi-org — CLOSED.** `add_peer_route`,
+  `add_cidr_route`, `del_*`, `purge_one` and the derived-v6 assign were
+  `#[cfg(not(any(linux, windows)))]` no-ops and `add_address_sync` refused
+  outright, so macOS had no per-peer `/32`s, no subnet routes and no second
+  address — the overlay leaned entirely on the device's connected route.
+  The mechanical cause was the interface name: `IF_NAME` was defined only
+  for Windows and Linux, and utun numbers are kernel-assigned anyway
+  (`utun3`, `utun7`, …), so any `ifconfig`/`route` call there would have
+  addressed an interface that does not exist. `SystemTun` now captures what
+  the OS actually named the device and every macOS arm uses it, with BSD
+  forms throughout (`ifconfig <utun> inet A A netmask M alias` for the
+  point-to-point interface; delete-then-add for routes, since BSD `route
+  add` has no idempotent form).
+  `enumerate_if_routes` stays empty on macOS, for the right reason: the
+  boot reconciler exists for a PERSISTED device, and a utun dies with the
+  fd that created it, taking its routes along — there are no orphans to
+  clean.
+  This stayed undone because writing OS networking you cannot run is worse
+  than a loud refusal. It is run now: a `macos-latest` CI step creates a
+  real utun and asserts against `ifconfig` / `netstat -rn` that a second
+  address lands, a peer `/32` lands, a subnet route lands, and each comes
+  back off — plus that the utun name really is kernel-assigned, so the
+  hardcoded name cannot quietly return. (If a persistent macOS mesh member
+  is ever wanted, a rented Apple-silicon Mac mini is ~€0.11–0.22/h with a
+  24 h minimum lease — Apple licensing, which AWS EC2 Mac carries too.)
 - **Netstack is per-org.** ~~One handle channel, one SOCKS port, one ping
   backend, none org-scoped~~ — each org now has its own stack and its own
   front, so two orgs in netstack mode both get a mesh. What genuinely
