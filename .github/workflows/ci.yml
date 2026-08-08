@@ -199,6 +199,24 @@ jobs:
       - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
         run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
 
+      - name: macOS overlay against a real utun
+        # The macOS arms of add_address_sync / add_peer_route /
+        # add_cidr_route / assign_derived_v6 were no-ops until now, so none
+        # of them had ever run anywhere. Compiling them is not evidence —
+        # a hardcoded interface name compiles fine and addresses an
+        # interface that does not exist, which is precisely what was wrong.
+        #
+        # This runner has sudo and utun, so the code gets exercised instead
+        # of trusted. Built as the normal user and only RUN under sudo, so
+        # root never takes ownership of the cargo cache.
+        run: |
+          BIN=$(cargo test -p roomler-ai-tunnel-core --features overlay-l3 --lib \
+                  --no-run --message-format=json \
+                | jq -r 'select(.profile.test == true) | .executable' | head -1)
+          echo "test binary: $BIN"
+          sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" macos_kernel_tests \
+            --test-threads=1 --nocapture
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest
