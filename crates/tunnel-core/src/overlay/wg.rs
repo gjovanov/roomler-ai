@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use bytes::Bytes;
@@ -95,6 +96,11 @@ pub enum Carrier {
     Direct {
         sock: Arc<UdpSocket>,
         dst: SocketAddr,
+        /// Latched when `send` reports that the LOCAL end is gone — the bound
+        /// source address vanished, or its interface lost its route. See the
+        /// errno filter in [`Carrier::send`]: an ordinary dropped datagram
+        /// must never set this.
+        dead: AtomicBool,
     },
     /// Tier 2/3: through a coturn TURN allocation (`RelayConn`), dialing
     /// the peer's relayed address. The DERP-equivalent carrier.
@@ -127,7 +133,11 @@ pub enum Carrier {
 
 impl Carrier {
     pub fn direct(sock: Arc<UdpSocket>, dst: SocketAddr) -> Arc<Self> {
-        Arc::new(Carrier::Direct { sock, dst })
+        Arc::new(Carrier::Direct {
+            sock,
+            dst,
+            dead: AtomicBool::new(false),
+        })
     }
 
     pub fn relay(conn: Arc<dyn RelayConn>, dst: SocketAddr) -> Arc<Self> {
@@ -195,24 +205,66 @@ impl Carrier {
         matches!(self, Carrier::Direct { .. })
     }
 
-    /// rc.181 — a relay carrier whose `send` hard-errored (a TURNS/TCP reset,
-    /// or a lost QUIC-over-TURN connection). The runtime's health sweep treats
-    /// this as an immediate carrier death and re-allocates on the next tick,
-    /// without waiting out the multi-sweep rx-flat heuristic. Always `false`
-    /// for a direct carrier (its `send` failing is a dropped UDP datagram, not
-    /// a dead session).
+    /// rc.181 — a carrier whose `send` hard-errored (a TURNS/TCP reset, a lost
+    /// QUIC-over-TURN connection, or — since the uplink work — a direct socket
+    /// whose interface went away). The runtime's health sweep treats this as an
+    /// immediate carrier death and rebuilds on the next tick, without waiting
+    /// out the rx-staleness bound.
     pub fn is_dead(&self) -> bool {
         match self {
-            Carrier::Direct { .. } => false,
-            Carrier::Relay { dead, .. } | Carrier::QuicRelay { dead, .. } => {
-                dead.load(Ordering::Relaxed)
-            }
+            Carrier::Direct { dead, .. }
+            | Carrier::Relay { dead, .. }
+            | Carrier::QuicRelay { dead, .. } => dead.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Latch dead from OUTSIDE the send path.
+    ///
+    /// For evidence that the session is over which does not arrive as a send
+    /// error — specifically boringtun's `ConnectionExpired`, which the timer
+    /// task sees when a rekey attempt finally gives up. That verdict is
+    /// conclusive and was previously discarded, leaving the carrier to be
+    /// rediscovered by the rx-staleness bound.
+    pub fn mark_dead(&self) {
+        match self {
+            Carrier::Direct { dead, .. }
+            | Carrier::Relay { dead, .. }
+            | Carrier::QuicRelay { dead, .. } => dead.store(true, Ordering::Relaxed),
         }
     }
 
     async fn send(&self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            Carrier::Direct { sock, dst } => sock.send_to(buf, *dst).await,
+            // A direct send failing is USUALLY just a dropped datagram (ICMP
+            // port-unreachable surfacing as WSAECONNRESET, an MTU refusal) and
+            // says nothing about the session — which is why this arm latched
+            // nothing for years. But two errno classes are not about the
+            // datagram at all, they are the LOCAL end reporting it no longer
+            // exists:
+            //
+            //   AddrNotAvailable — the source address we bound is gone (the
+            //     adapter was removed or renumbered);
+            //   NetworkUnreachable — the pinned interface has no route.
+            //
+            // Both mean every subsequent send on this socket fails too, so
+            // waiting out the rx-staleness bound is pure dead time. Latching
+            // here turns "my dock/Wi-Fi/VPN adapter changed" into a sub-second
+            // carrier death instead of a 60 s one. Deliberately NOT a catch-all
+            // `is_err()`: that would kill a healthy carrier on the first
+            // ICMP-induced error, which is exactly the trap the old
+            // always-false behaviour was avoiding.
+            Carrier::Direct { sock, dst, dead } => {
+                let r = sock.send_to(buf, *dst).await;
+                if let Err(e) = &r
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::AddrNotAvailable | io::ErrorKind::NetworkUnreachable
+                    )
+                {
+                    dead.store(true, Ordering::Relaxed);
+                }
+                r
+            }
             // A TURNS/TCP write error (`tcp-turn write: connection reset`) or a
             // dead UDP relay means the allocation is gone — latch `dead` so the
             // health sweep re-allocates promptly (next ≤5 s tick) instead of
@@ -979,6 +1031,15 @@ impl WgDevice {
                     let mut t = timer_tunn.lock().await;
                     match t.update_timers(&mut buf) {
                         TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                        // boringtun gives up re-handshaking once a rekey
+                        // attempt expires and reports the session over. That
+                        // verdict is conclusive, and dropping it (as this arm
+                        // did) left the carrier to be rediscovered the slow
+                        // way, by the rx-staleness bound.
+                        TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                            timer_carrier.mark_dead();
+                            None
+                        }
                         _ => None,
                     }
                 };
@@ -1077,7 +1138,11 @@ impl WgDevice {
         let Some((tunn, ingress)) = entry else {
             return;
         };
-        let reply = Arc::new(Carrier::Direct { sock, dst: src });
+        let reply = Arc::new(Carrier::Direct {
+            sock,
+            dst: src,
+            dead: AtomicBool::new(false),
+        });
         let mut buf = packet.to_vec();
         let n = buf.len();
         let mut t = tunn.lock().await;
@@ -1171,6 +1236,15 @@ impl WgDevice {
                     let mut t = timer_tunn.lock().await;
                     match t.update_timers(&mut buf) {
                         TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                        // boringtun gives up re-handshaking once a rekey
+                        // attempt expires and reports the session over. That
+                        // verdict is conclusive, and dropping it (as this arm
+                        // did) left the carrier to be rediscovered the slow
+                        // way, by the rx-staleness bound.
+                        TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                            timer_carrier.mark_dead();
+                            None
+                        }
                         _ => None,
                     }
                 };
@@ -1757,6 +1831,7 @@ async fn run_direct_demux(
         let reply = Arc::new(Carrier::Direct {
             sock: sock.clone(),
             dst: src,
+            dead: AtomicBool::new(false),
         });
         let mut t = tunn.lock().await;
         process_inbound(&mut t, n, &mut buf, &reply, &tun_tx, &ingress).await;
@@ -3195,15 +3270,49 @@ mod tests {
         );
     }
 
+    /// A direct carrier dies ONLY when the local end reports it is gone.
+    ///
+    /// The old contract was "never dead", on the reasoning that a failed
+    /// datagram is a drop and not a session death. That is still true for the
+    /// ordinary failures — and this test's first half keeps pinning it, because
+    /// a catch-all `is_err()` here would kill healthy carriers on the first
+    /// ICMP-induced `ConnectionReset`. What changed is that
+    /// `AddrNotAvailable` / `NetworkUnreachable` are not statements about the
+    /// datagram at all: the bound source address is gone, so every later send
+    /// fails too, and waiting out the rx-staleness bound is dead time.
     #[tokio::test]
-    async fn direct_carrier_is_never_dead() {
+    async fn direct_carrier_dies_only_on_local_end_gone() {
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let carrier = Carrier::direct(sock, dst);
-        // A direct (UDP) carrier is never "dead": a failed datagram is dropped,
-        // not a session death — so the sweep keeps using the rx-flat heuristic.
+        // An ordinary send (or an ordinary failure) leaves it alive.
         let _ = carrier.send(b"x").await;
-        assert!(!carrier.is_dead());
+        assert!(
+            !carrier.is_dead(),
+            "a dropped datagram must not kill a direct carrier"
+        );
+
+        // The latch itself: only the two local-end errno classes set it.
+        let Carrier::Direct { dead, .. } = &*carrier else {
+            unreachable!("constructed as Direct")
+        };
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(
+                !matches!(
+                    kind,
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::NetworkUnreachable
+                ),
+                "{kind:?} must not be treated as a dead local end"
+            );
+        }
+        dead.store(true, Ordering::Relaxed);
+        assert!(
+            carrier.is_dead(),
+            "a latched local-end failure must surface to the health sweep"
+        );
     }
 
     /// Phase A — `authenticate_init` extracts + AUTHENTICATES an inbound
