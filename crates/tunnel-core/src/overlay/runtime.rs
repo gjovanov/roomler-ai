@@ -3763,7 +3763,7 @@ mod tests {
         // Installed (and last received) well past the rx-stale deadline — hence
         // also past DIRECT_GRACE.
         let stale = Instant::now()
-            .checked_sub(RX_STALE_DEADLINE + Duration::from_secs(5))
+            .checked_sub(RELAY_RX_STALE_DEADLINE + Duration::from_secs(5))
             .unwrap();
         let mut by_node = HashMap::new();
         by_node.insert(
@@ -3853,7 +3853,7 @@ mod tests {
         // `last_rx_at` last advanced > 90 s ago (looks silent) — but the keepalive
         // above proves the carrier is alive, so the sweep must NOT reap it.
         let old = Instant::now()
-            .checked_sub(RX_STALE_DEADLINE + Duration::from_secs(5))
+            .checked_sub(RELAY_RX_STALE_DEADLINE + Duration::from_secs(5))
             .unwrap();
         let mut by_node = HashMap::new();
         by_node.insert(
