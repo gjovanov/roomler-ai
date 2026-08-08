@@ -69,11 +69,24 @@ pub(super) enum Defend {
     /// risks a forwarding loop; Windows' on-link route serves local delivery
     /// the moment the competitor is gone (field-proven on pc50045).
     EvictSelf(Ipv4Addr),
+    /// Change B — the block-floor maintenance step
+    /// ([`TunIo::defend_block_floor`]): assert the four `plen+2` sub-prefixes
+    /// of the connected overlay block (a corp VPN's `/11` out-specifics both
+    /// the connected `/10` and the rc.288 metric-0 defense, so absent-`/32`
+    /// traffic leaked to the CORP GATEWAY — field 2026-08-08, pc50045), or
+    /// actively retract them when the host's own uplink sits inside the block
+    /// (the ISP-CGNAT self-wedge gate — decided per wave, inside the detached
+    /// task, off the select loop).
+    BlockFloor,
 }
 
 /// Compose the defended set from the live peer table + our own address.
-/// Peers first, self LAST — the shape the arms have used since rc.278,
-/// locked by `route_reassert_covers_self_and_peers`.
+/// Peers first, self next, the block floor LAST — the peer/self shape the
+/// arms have used since rc.278, locked by
+/// `route_reassert_covers_self_and_peers`. The floor entry is unconditional
+/// here: its per-wave assert-vs-retract decision (the ISP-CGNAT gate) lives
+/// in [`TunIo::defend_block_floor`] so it runs inside the DETACHED wave, not
+/// on the select loop.
 pub(super) fn defended_routes(
     by_node: &HashMap<ObjectId, Installed>,
     self_v4: Ipv4Addr,
@@ -81,7 +94,7 @@ pub(super) fn defended_routes(
     by_node
         .values()
         .map(|e| Defend::AssertPeer(e.overlay_ip))
-        .chain(std::iter::once(Defend::EvictSelf(self_v4)))
+        .chain([Defend::EvictSelf(self_v4), Defend::BlockFloor])
         .collect()
 }
 
@@ -97,6 +110,7 @@ pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
                 tun.add_peer_route(ip).await.ok();
             }
             Defend::EvictSelf(ip) => tun.defend_self_route(ip).await,
+            Defend::BlockFloor => tun.defend_block_floor().await,
         }
     }
 }
