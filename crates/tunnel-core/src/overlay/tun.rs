@@ -991,10 +991,39 @@ mod system {
                 "addresses".into(),
                 format!("name={IF_NAME}"),
             ];
-            let Ok(out) = run("netsh", &args) else {
-                return false;
-            };
-            listing_mentions_address(&out, ip)
+            // Poll briefly rather than answering from one sample.
+            //
+            // `netsh … add address` and `netsh … show addresses` do not see the
+            // interface at the same instant. When the device was just created,
+            // `up()` has already assigned this org's address through the tun
+            // crate, so the (deliberately unconditional, #375) re-add reports
+            // "already exists" while the listing has not caught up — and a
+            // single-sample check then answers ABSENT for an address that is
+            // very much there. The caller treats that as fatal, its rollback
+            // DELETES the address `up()` legitimately created, and the whole
+            // org's runtime aborts.
+            //
+            // Field 2026-08-08, pc50045: reproduced on every restart —
+            // `roomler status` showed `overlay ip —` with a healthy control WS,
+            // and the address was gone by the time anyone looked because the
+            // rollback had removed it. Running the identical netsh by hand
+            // always succeeded, which is the signature of a race rather than a
+            // rejected argument.
+            //
+            // A few hundred milliseconds is enough for the listing to settle;
+            // the cost when the address is genuinely absent is bounded and paid
+            // only on a path that is already failing.
+            for attempt in 0..ADDRESS_PRESENCE_ATTEMPTS {
+                if let Ok(out) = run("netsh", &args)
+                    && listing_mentions_address(&out, ip)
+                {
+                    return true;
+                }
+                if attempt + 1 < ADDRESS_PRESENCE_ATTEMPTS {
+                    std::thread::sleep(ADDRESS_PRESENCE_BACKOFF);
+                }
+            }
+            false
         }
 
         /// The interface name the OS gave this device — [`IF_NAME`] on
@@ -1932,6 +1961,16 @@ mod system {
     /// The overlay NIC name we set in [`SystemTun::up`] — used to target
     /// per-peer `/32` routes without a LUID/index lookup.
     #[cfg(target_os = "windows")]
+    /// How many times `address_present_v4` samples the interface listing
+    /// before concluding an address really is absent, and how long it waits
+    /// between samples. Sized to cover the gap between `netsh … add address`
+    /// seeing an address and `netsh … show addresses` listing it — see the
+    /// comment in that function for the outage this exists to stop.
+    #[cfg(target_os = "windows")]
+    const ADDRESS_PRESENCE_ATTEMPTS: usize = 4;
+    #[cfg(target_os = "windows")]
+    const ADDRESS_PRESENCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+
     const IF_NAME: &str = "roomler";
     #[cfg(target_os = "linux")]
     const IF_NAME: &str = "roomler0";
@@ -2606,6 +2645,48 @@ mod system {
         ///
         /// Locale-proof now: the IP literal is invariant, so we ask whether
         /// the address is present rather than reading the complaint.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn address_presence_polls_until_the_listing_catches_up() {
+            use super::super::SystemTun;
+            use std::cell::Cell;
+            use std::net::Ipv4Addr;
+
+            let present = "\nSchnittstelle \"roomler\"\n    IP-Adresse:      100.64.0.28\n";
+            let empty = "\nSchnittstelle \"roomler\"\n    IP-Adresse:      100.65.0.5\n";
+
+            // `netsh add` and `netsh show` do not see the interface at the
+            // same instant: the address is already assigned (so the add says
+            // "already exists") while the listing still omits it. A
+            // single-sample check answered ABSENT here, the caller treated
+            // that as fatal, its rollback deleted the address, and the org's
+            // runtime aborted — pc50045, every restart, 2026-08-08.
+            let calls = Cell::new(0usize);
+            let late = |_: &str, _: &[String]| {
+                let n = calls.get();
+                calls.set(n + 1);
+                Ok(if n == 0 { empty } else { present }.to_string())
+            };
+            assert!(
+                SystemTun::address_present_v4(&late, Ipv4Addr::new(100, 64, 0, 28)),
+                "must poll past a listing that has not caught up yet"
+            );
+            assert!(calls.get() >= 2, "should have re-sampled");
+
+            // A genuinely absent address still answers false — bounded, and
+            // only after actually re-checking.
+            let calls = Cell::new(0usize);
+            let never = |_: &str, _: &[String]| {
+                calls.set(calls.get() + 1);
+                Ok(empty.to_string())
+            };
+            assert!(!SystemTun::address_present_v4(
+                &never,
+                Ipv4Addr::new(100, 64, 0, 28)
+            ));
+            assert!(calls.get() > 1, "absence must be confirmed, not assumed");
+        }
+
         #[cfg(target_os = "windows")]
         #[test]
         fn address_presence_is_locale_proof() {
