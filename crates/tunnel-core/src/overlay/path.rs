@@ -495,16 +495,35 @@ impl PathMonitor {
 
     /// P2 seam — a carrier on `tier` died with `reason`. Direct tiers book
     /// the strike+penalty (≡ the legacy sweep's cooldown bookkeeping); every
-    /// tier's Q is slammed. Tolerates either landing order with the lifecycle
-    /// work: the reason is evidence detail, not control flow.
+    /// tier's Q is slammed.
+    ///
+    /// Stage 2 exception — [`DeathReason::RekeyUnanswered`] books NO strike,
+    /// NO penalty and NO Q-slam, only the switch-pacing record. The poke death
+    /// is proof the OLD carrier stopped working, not evidence about what a
+    /// FRESH attempt on that tier would do (its trigger class — VPN filters,
+    /// NAT rebinds, roams — is transient as often as not), and the rebuild it
+    /// causes supplies real evidence on its own: a re-attempt that fails books
+    /// `HandshakeDeadline` through this same seam ~12 s later, while a
+    /// transient recovers with zero penalty. Booking here instead would let a
+    /// blip start the suppression ladder and feed the server's forced-DERP
+    /// churn escalation — the exact false-positive cost the staged plan was
+    /// rebuilt around.
     pub(crate) fn on_death(
         &mut self,
         peer: &ObjectId,
         tier: DirectTier,
-        _reason: DeathReason,
+        reason: DeathReason,
         mbb: bool,
         now: Instant,
     ) {
+        if reason == DeathReason::RekeyUnanswered {
+            self.peers
+                .entry(*peer)
+                .or_default()
+                .hysteresis
+                .record_switch(now);
+            return;
+        }
         if tier.is_direct() {
             self.book_failure(peer, tier, mbb, now);
         }
@@ -1188,6 +1207,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Stage 2 — a [`DeathReason::RekeyUnanswered`] death books NOTHING: no
+    /// strike, no suppression penalty, no Q movement, on direct AND relay
+    /// tiers. The tier must stay immediately eligible (the rebuild's own
+    /// failure is what books evidence), and the Q plane must be untouched so
+    /// a transient poke death can't nudge tier selection or feed the
+    /// forced-DERP churn ladder.
+    #[test]
+    fn rekey_unanswered_death_books_nothing() {
+        for tier in DIRECT_TIERS {
+            let mut m = PathMonitor::default();
+            let a = oid(1);
+            let t0 = Instant::now();
+            m.on_death(&a, tier, DeathReason::RekeyUnanswered, true, t0);
+            assert!(
+                m.eligible(&a, tier, t0 + Duration::from_secs(1)),
+                "{tier:?} must stay immediately eligible after a poke death"
+            );
+            assert_eq!(m.strikes(&a, tier), 0, "{tier:?} must book no strike");
+            let p = m.peers.get(&a).expect("switch pacing recorded the peer");
+            let idx = tier_idx(tier).unwrap();
+            assert_eq!(
+                p.tiers[idx].q.get(),
+                0.0,
+                "{tier:?} Q must be untouched (no death slam)"
+            );
+            assert!(p.tiers[idx].penalty.is_none(), "{tier:?} no penalty");
+        }
+        // Relay flavour: relay_q untouched too.
+        let mut m = PathMonitor::default();
+        let a = oid(2);
+        m.on_death(
+            &a,
+            DirectTier::Relay,
+            DeathReason::RekeyUnanswered,
+            true,
+            Instant::now(),
+        );
+        assert_eq!(m.peers.get(&a).unwrap().relay_q.get(), 0.0);
+        // Contrast lock: the SAME death with any other reason still books.
+        let mut m = PathMonitor::default();
+        let t0 = Instant::now();
+        m.on_death(&a, DirectTier::Lan, DeathReason::RxStale, true, t0);
+        assert_eq!(m.strikes(&a, DirectTier::Lan), 1);
+        assert!(!m.eligible(&a, DirectTier::Lan, t0 + Duration::from_secs(1)));
     }
 
     /// The escalated window (2 strikes LAN/public, 3 srflx) reproduces the
