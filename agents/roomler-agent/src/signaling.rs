@@ -946,8 +946,18 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             _ = heartbeat.tick() => {
+                // Wave 3 — tunnel volume the server cannot see for itself
+                // (the payload rides the P2P data channel). Cumulative for
+                // each forward's life, so the server treats it like the
+                // other byte counters: store per bucket, difference on read.
+                let tunnel_bytes = tunnel_hub.flows_snapshot().iter().fold(
+                    (0u64, 0u64),
+                    |(rx, tx), f| {
+                        (rx.saturating_add(f.bytes_in), tx.saturating_add(f.bytes_out))
+                    },
+                );
                 // The borrow guards are dropped before the send await.
-                let sys = sys_sampler.sample(&overlay_view_tx.borrow());
+                let sys = sys_sampler.sample(&overlay_view_tx.borrow(), tunnel_bytes);
                 // NAT-traversal health. `None` only while the overlay runtime
                 // hasn't published a gather yet — once it has, a measured 0 is
                 // reported as 0, which is the value the server actually needs
