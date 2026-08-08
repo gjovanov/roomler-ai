@@ -1,0 +1,160 @@
+name: macOS mesh test
+
+# Does a macOS host actually JOIN the overlay and move bytes?
+#
+# `ci.yml`'s `macos-overlay-check` proves the OS calls work — a second
+# address lands, a peer /32 lands, routes come back off. That is not the
+# same as meshing: it never opens a WireGuard session, never talks to a
+# peer, and never carries a packet. This does.
+#
+# MANUAL ONLY, and deliberately so. It enrolls a REAL device into a REAL
+# organization, which is not something a push should do. The enrollment
+# token is a run-time INPUT rather than a repository secret: enrollment
+# tokens are single-use with a 10-minute TTL, so there is nothing worth
+# storing, and no long-lived fleet credential is ever handed to GitHub.
+#
+# Mint one immediately before running:
+#   POST /api/tenant/{tenant_id}/agent/enroll-token   (admin JWT)
+#
+# NOTE the device row it creates is NOT removed by this job — deleting a
+# device needs an admin credential, which is exactly what this workflow
+# avoids holding. Delete it afterwards from the admin UI or:
+#   DELETE /api/tenant/{tenant_id}/agent/{agent_id}
+# The job prints the agent id it enrolled as.
+
+on:
+  workflow_dispatch:
+    inputs:
+      enrollment_token:
+        description: "Single-use enrollment JWT (10 min TTL) — mint it right before running"
+        required: true
+      peer_ip:
+        description: "Overlay IP of a live fleet peer to ping (default: mars in Grox)"
+        required: false
+        default: "100.64.0.14"
+      server:
+        description: "Roomler API base URL"
+        required: false
+        default: "https://roomler.ai"
+
+jobs:
+  mesh:
+    name: macOS joins the overlay and pings a peer
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-mesh-test
+
+      - name: Build the daemon
+        # overlay-l3 only: this test is about the mesh, not media, and the
+        # full release feature set drags in FFmpeg/VP9 for no benefit here.
+        run: cargo build -p roomler-agent --release --features overlay-l3
+
+      - name: Enroll
+        id: enroll
+        env:
+          TOKEN: ${{ inputs.enrollment_token }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/roomler-ci
+          # Enrolled AND run as root: creating a utun and installing routes
+          # both require it. The shipped .pkg installs a per-user LaunchAgent
+          # instead, which is why the overlay has never come up on a real
+          # macOS install — see docs/multi-org.md.
+          sudo ./target/release/roomlerd --config /etc/roomler-ci/config.toml \
+            enroll --server "${{ inputs.server }}" --token "$TOKEN" \
+            --name "ci-macos-${GITHUB_RUN_ID}"
+          AGENT_ID=$(sudo grep -E '^agent_id' /etc/roomler-ci/config.toml | head -1 | cut -d'"' -f2)
+          echo "agent_id=$AGENT_ID" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Enrolled::agent_id=$AGENT_ID — delete this device row when you are done"
+
+      - name: Enable the overlay
+        # Default-OFF by design: the feature being compiled in is not consent
+        # to join a mesh.
+        run: |
+          set -euo pipefail
+          sudo sed -i '' 's/^overlay_enabled = false/overlay_enabled = true/' /etc/roomler-ci/config.toml
+          # Verify rather than trust the sed — a serialisation change would
+          # otherwise leave the overlay off and this test would "pass" by
+          # never having tried.
+          if ! sudo grep -qE '^overlay_enabled = true' /etc/roomler-ci/config.toml; then
+            echo "overlay_enabled = true" | sudo tee -a /etc/roomler-ci/config.toml >/dev/null
+          fi
+          sudo grep -E '^overlay_enabled' /etc/roomler-ci/config.toml
+
+      - name: Run the daemon
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /var/log/roomler-ci
+          sudo bash -c 'RUST_LOG=info,tunnel_core::overlay=debug \
+            ./target/release/roomlerd --config /etc/roomler-ci/config.toml run \
+            > /var/log/roomler-ci/agent.log 2>&1 &'
+          sleep 5
+          pgrep -f roomlerd >/dev/null && echo "daemon up" || (sudo cat /var/log/roomler-ci/agent.log; exit 1)
+
+      - name: Wait for the utun to carry an overlay address
+        id: tun
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            IF=$(ifconfig -l | tr ' ' '\n' | grep '^utun' | while read -r u; do
+                   if ifconfig "$u" 2>/dev/null | grep -qE 'inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'; then echo "$u"; fi
+                 done | head -1)
+            if [ -n "${IF:-}" ]; then
+              IP=$(ifconfig "$IF" | awk '/inet 100\./ {print $2; exit}')
+              echo "utun=$IF" >> "$GITHUB_OUTPUT"
+              echo "overlay_ip=$IP" >> "$GITHUB_OUTPUT"
+              echo "::notice title=Overlay up::$IF has $IP after ${i}s"
+              ifconfig "$IF"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error title=No overlay address::the daemon never brought up a utun with a CGNAT address"
+          sudo tail -100 /var/log/roomler-ci/agent.log
+          exit 1
+
+      - name: Peer routes installed?
+        run: |
+          set -euo pipefail
+          netstat -rn -f inet | grep "${{ steps.tun.outputs.utun }}" || true
+          COUNT=$(netstat -rn -f inet | grep -c "${{ steps.tun.outputs.utun }}" || true)
+          echo "routes on ${{ steps.tun.outputs.utun }}: $COUNT"
+          [ "$COUNT" -gt 0 ] || { echo "::error::no routes point at the overlay interface"; exit 1; }
+
+      - name: Ping a fleet peer over the overlay
+        # THE assertion. Everything above can pass on a host that carries no
+        # traffic; this is the one that needs a WireGuard session, a correct
+        # route, and a working data plane.
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 24); do
+            if ping -c 3 -t 5 "${{ inputs.peer_ip }}" > /tmp/ping.txt 2>&1; then
+              cat /tmp/ping.txt
+              echo "::notice title=Meshed::reached ${{ inputs.peer_ip }} from ${{ steps.tun.outputs.overlay_ip }} after ~$((i*10))s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error title=No data plane::the overlay came up but ${{ inputs.peer_ip }} never answered"
+          cat /tmp/ping.txt || true
+          sudo grep -iE "carrier|handshake|peer installed|relay|derp" /var/log/roomler-ci/agent.log | tail -40
+          exit 1
+
+      - name: Evidence
+        if: always()
+        run: |
+          echo "=== interfaces ==="; ifconfig | grep -A4 '^utun' || true
+          echo "=== routes ==="; netstat -rn -f inet | head -40
+          echo "=== agent log (tail) ==="; sudo tail -200 /var/log/roomler-ci/agent.log || true
+
+      - name: Stop the daemon
+        if: always()
+        run: sudo pkill -f roomlerd || true
