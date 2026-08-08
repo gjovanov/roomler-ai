@@ -346,6 +346,18 @@ pub struct PeerStats {
     /// 5 s tick, and that quantization would be worse than no number at all
     /// (why PR-A passed `None`).
     handshake_at: AtomicU64,
+    /// Stage 2 — mono-ms (against [`wg_epoch`]) when we last processed a valid
+    /// handshake RESPONSE from this peer, i.e. when a handshake WE INITIATED
+    /// last completed; 0 = never (stamps are `max(1)`-floored). Unlike the
+    /// set-once [`handshake`](Self::handshake) latch this ADVANCES on every
+    /// initiator-role completion — it is the active-revalidation poke's
+    /// answer signal. Initiator-role only, deliberately: a responder-role
+    /// session (we answered THEIR init) proves the peer can reach us but says
+    /// nothing about our own outbound — and in the exact failure this exists
+    /// to catch (our tx dead, field 2026-08-08 pc50045→neo16), the peer
+    /// hammers initiations at us every ~5 s, so an either-role stamp would
+    /// read permanently alive.
+    hs_response_at: AtomicU64,
     /// P4 — inbound IP packets from this peer whose SOURCE address it does not
     /// own ([`Router::rpf_check`]). Counted in `warn` AND `enforce` (only
     /// `enforce` also drops), so a fleet read of this counter is exactly the
@@ -1623,6 +1635,76 @@ impl WgDevice {
         )
     }
 
+    /// Stage 2 — did an INITIATOR-role handshake to `peer_public` complete
+    /// at-or-after `since`? Lock-free (reads the recv-path
+    /// [`PeerStats::hs_response_at`] stamp). This is the poke's answer check:
+    /// only a response WE processed proves our own outbound works — see the
+    /// field note on the stats field for why responder-role handshakes must
+    /// not count. `false` for an unknown peer or if never stamped.
+    pub fn peer_initiator_hs_answered(&self, peer_public: &[u8; 32], since: Instant) -> bool {
+        let Some(p) = self.peers.get(peer_public) else {
+            return false;
+        };
+        let at = p.stats.hs_response_at.load(Ordering::Relaxed);
+        at != 0 && at >= since.saturating_duration_since(wg_epoch()).as_millis() as u64
+    }
+
+    /// Stage 2 — how long since the last INITIATOR-role handshake completion
+    /// for `peer_public` (`None` = never, or unknown peer). Drives the
+    /// stale-proof poke trigger (`lifecycle::should_poke`).
+    pub fn peer_initiator_hs_age(&self, peer_public: &[u8; 32]) -> Option<Duration> {
+        let at = self
+            .peers
+            .get(peer_public)?
+            .stats
+            .hs_response_at
+            .load(Ordering::Relaxed);
+        (at != 0).then(|| Duration::from_millis(mono_ms_now().saturating_sub(at)))
+    }
+
+    /// Stage 2 — force a WG rekey toward `peer_public` NOW
+    /// (`format_handshake_initiation(force_resend: true)`), off this call path.
+    /// The active-revalidation poke: a healthy peer MUST answer a valid
+    /// initiation, so the (lock-free) [`Self::peer_initiator_hs_answered`]
+    /// stamp advancing is proof the round trip works, and its silence past the
+    /// tier's handshake deadline is proof it doesn't — boringtun auto-retries
+    /// the in-flight initiation every ~5 s either way. `false` if the peer is
+    /// unknown. Same lock-then-send split as the timer tasks (rc.211): the
+    /// `Tunn` lock is never held across a carrier send, and never touched by
+    /// the sweep itself (rc.137).
+    pub fn poke_handshake(&self, peer_public: &[u8; 32]) -> bool {
+        let Some(p) = self.peers.get(peer_public) else {
+            return false;
+        };
+        let (tunn, carrier) = (p.tunn.clone(), p.carrier.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; WG_BUF];
+            let out = {
+                let mut t = tunn.lock().await;
+                match t.format_handshake_initiation(&mut buf, true) {
+                    TunnResult::WriteToNetwork(b) => Some(b.to_vec()),
+                    _ => None,
+                }
+            };
+            if let Some(b) = out {
+                let _ = carrier.send(&b).await;
+            }
+        });
+        true
+    }
+
+    /// Test-only: stamp `peer_public`'s initiator-handshake instant to NOW, as
+    /// if a poke had just been answered (mirrors the recv-path stamp without a
+    /// live two-device session).
+    #[cfg(test)]
+    pub fn test_stamp_initiator_hs(&self, peer_public: &[u8; 32]) {
+        if let Some(p) = self.peers.get(peer_public) {
+            p.stats
+                .hs_response_at
+                .store(mono_ms_now().max(1), Ordering::Relaxed);
+        }
+    }
+
     /// Test-only: latch `peer_public`'s handshake-done flag true without a live
     /// two-device session. The health-sweep tests that exercise the
     /// ESTABLISHED-carrier paths (rc.206 rx-staleness) need `peer_handshake_done`
@@ -1677,6 +1759,18 @@ async fn process_inbound(
     // packet, so it must not count as liveness. `Err` (replay / garbage) isn't.
     if n > 0 && !matches!(res, TunnResult::Err(_)) {
         stats.rx_any.fetch_add(1, Ordering::Relaxed);
+        // Stage 2 — a HANDSHAKE RESPONSE (type 2) that decapsulated without
+        // error means a handshake WE initiated just completed: boringtun only
+        // accepts a response against our own outstanding initiator state, so
+        // this proves our init reached the peer AND its reply reached us —
+        // the round-trip evidence the active-revalidation poke waits for.
+        // (boringtun rejects any size ≠ 92 or crypto/state mismatch as `Err`,
+        // so the byte-shape check alone can't be spoofed into a stamp.)
+        if n >= 4 && buf[0] == 2 && buf[1..4] == [0, 0, 0] {
+            stats
+                .hs_response_at
+                .store(mono_ms_now().max(1), Ordering::Relaxed);
+        }
     }
     match res {
         TunnResult::WriteToNetwork(b) => {
