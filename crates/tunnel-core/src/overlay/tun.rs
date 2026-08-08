@@ -1961,6 +1961,8 @@ mod system {
     /// The overlay NIC name we set in [`SystemTun::up`] — used to target
     /// per-peer `/32` routes without a LUID/index lookup.
     #[cfg(target_os = "windows")]
+    const IF_NAME: &str = "roomler";
+
     /// How many times `address_present_v4` samples the interface listing
     /// before concluding an address really is absent, and how long it waits
     /// between samples. Sized to cover the gap between `netsh … add address`
@@ -1971,7 +1973,6 @@ mod system {
     #[cfg(target_os = "windows")]
     const ADDRESS_PRESENCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
 
-    const IF_NAME: &str = "roomler";
     #[cfg(target_os = "linux")]
     const IF_NAME: &str = "roomler0";
     /// Does an interface listing mention `ip`?
