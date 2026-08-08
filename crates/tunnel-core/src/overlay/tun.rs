@@ -649,6 +649,15 @@ mod system {
     /// + write loops.
     pub struct SystemTun {
         dev: Arc<tun::AsyncDevice>,
+        /// The interface name the OS actually gave this device.
+        ///
+        /// On Windows and Linux it is [`IF_NAME`], because the device is
+        /// created BY that name. On macOS it cannot be: utun numbers are
+        /// kernel-assigned (`utun3`, `utun7`, …), so a hardcoded name meant
+        /// every `ifconfig`/`route` call there addressed an interface that
+        /// does not exist — which is exactly why the whole macOS routing
+        /// surface used to be a set of no-ops. Captured once at bring-up.
+        if_name: String,
         /// rc.288 — the CONNECTED overlay prefix (`100.64.0.0/10`), derived at
         /// bring-up from the assigned address + netmask. Defended at metric 0
         /// alongside the peer `/32`s: when a `/32` is momentarily missing,
@@ -985,9 +994,13 @@ mod system {
             let Ok(out) = run("netsh", &args) else {
                 return false;
             };
-            let needle = ip.to_string();
-            out.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-                .any(|tok| tok == needle)
+            listing_mentions_address(&out, ip)
+        }
+
+        /// The interface name the OS gave this device — [`IF_NAME`] on
+        /// Windows/Linux, the kernel-assigned `utunN` on macOS.
+        pub fn if_name(&self) -> &str {
+            &self.if_name
         }
 
         /// Multi-org P2c — assign an ADDITIONAL local address (a secondary
@@ -1074,13 +1087,46 @@ mod system {
                 ];
                 run("ip", &args).map(|_| ())
             }
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            #[cfg(target_os = "macos")]
+            {
+                // A utun is a POINT-TO-POINT interface: `ifconfig utunN inet
+                // A B netmask M alias` needs BOTH a local and a peer address.
+                // Using the address as its own peer is what makes the block's
+                // prefix land on this interface, which is what the connected
+                // route needs — the same shape `up` uses for the first
+                // address.
+                let mask = Ipv4Addr::from(if prefix == 0 {
+                    0
+                } else {
+                    !0u32 << (32 - u32::from(prefix.min(32)))
+                });
+                let args: Vec<String> = vec![
+                    self.if_name.clone(),
+                    "inet".into(),
+                    ip.to_string(),
+                    ip.to_string(),
+                    "netmask".into(),
+                    mask.to_string(),
+                    "alias".into(),
+                ];
+                match run("ifconfig", &args) {
+                    Ok(_) => Ok(()),
+                    // Same lesson as the Windows path: never parse the
+                    // message (`ifconfig` says "File exists" for a duplicate,
+                    // and that text is not a contract). Ask the interface.
+                    Err(e) => {
+                        let listed = run("ifconfig", &[self.if_name.clone()]).unwrap_or_default();
+                        if listing_mentions_address(&listed, ip) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             {
                 let _ = (ip, prefix, run);
-                // macOS utun aliasing is possible via ifconfig, but multi-org
-                // TUN is not offered there yet — the agent's config gate keeps
-                // secondaries off, so reaching here is a bug: refuse loudly
-                // rather than silently half-work.
                 Err(std::io::Error::other(
                     "multi-address TUN is not supported on this platform",
                 ))
@@ -1121,7 +1167,20 @@ mod system {
                     IF_NAME.into(),
                 ],
             );
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            #[cfg(target_os = "macos")]
+            {
+                let _ = prefix;
+                run(
+                    "ifconfig",
+                    &[
+                        self.if_name.clone(),
+                        "inet".into(),
+                        ip.to_string(),
+                        "-alias".into(),
+                    ],
+                );
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             {
                 let _ = (ip, prefix, run);
             }
@@ -1207,6 +1266,25 @@ mod system {
             )?;
             let dev = Arc::new(dev);
 
+            // Ask the OS what it named this device. Windows/Linux answer with
+            // the name we asked for; macOS answers `utunN`, which is the only
+            // way to address the interface in `ifconfig`/`route`.
+            let if_name = {
+                use tun::AbstractDevice;
+                match dev.tun_name() {
+                    Ok(n) if !n.is_empty() => n,
+                    other => {
+                        if let Err(e) = &other {
+                            tracing::debug!(%e, "overlay: TUN name query failed; assuming {IF_NAME}");
+                        }
+                        IF_NAME.to_string()
+                    }
+                }
+            };
+            if if_name != IF_NAME {
+                tracing::info!(%if_name, "overlay: OS-assigned TUN interface name");
+            }
+
             // Pin the overlay NIC to the lowest interface metric so its routes
             // (the connected `/10` + the per-peer `/32`s) are preferred over a
             // full-tunnel VPN's captured routes for the overlay's 100.64.0.0/10
@@ -1226,7 +1304,7 @@ mod system {
             // `tun` crate's Configuration is v4-only, so this is an OS call —
             // sync + best-effort like the metric pin; a failure leaves the
             // node v4-only, which keeps working unchanged).
-            assign_derived_v6(self_ip);
+            assign_derived_v6(self_ip, &if_name);
 
             // Program WFP so the overlay's inbound survives a GPO-locked
             // Defender Firewall (Tailscale's approach). Best-effort: a
@@ -1318,6 +1396,7 @@ mod system {
 
             Ok(Self {
                 dev,
+                if_name,
                 #[cfg(windows)]
                 connected_v4: prefix_len_of_mask(netmask).map(|plen| {
                     let net =
@@ -1405,7 +1484,36 @@ mod system {
                 )
                 .await
             }
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            #[cfg(target_os = "macos")]
+            {
+                // BSD `route` has no idempotent form: `add` fails once the
+                // entry exists. Delete-then-add is the portable equivalent
+                // of `ip route replace`, and the delete is expected to fail
+                // on the first call — its result is deliberately ignored.
+                let _ = run_cmd(
+                    "route",
+                    vec![
+                        "-n".into(),
+                        "delete".into(),
+                        "-inet".into(),
+                        peer.to_string(),
+                    ],
+                )
+                .await;
+                run_cmd(
+                    "route",
+                    vec![
+                        "-n".into(),
+                        "add".into(),
+                        "-inet".into(),
+                        peer.to_string(),
+                        "-interface".into(),
+                        self.if_name.clone(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             {
                 let _ = peer;
                 Ok(())
@@ -1479,7 +1587,18 @@ mod system {
                 ],
             )
             .await;
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            #[cfg(target_os = "macos")]
+            let _ = run_cmd(
+                "route",
+                vec![
+                    "-n".into(),
+                    "delete".into(),
+                    "-inet".into(),
+                    peer.to_string(),
+                ],
+            )
+            .await;
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             let _ = peer;
         }
 
@@ -1523,7 +1642,39 @@ mod system {
                 ]);
                 run_cmd("ip", args).await
             }
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            #[cfg(target_os = "macos")]
+            {
+                // BSD `route` wants `-net <prefix> -prefixlen <n>`; the
+                // family flag picks v4 vs v6. Delete-then-add for the same
+                // reason as the peer `/32`s: `add` is not idempotent.
+                let (net, plen) = cidr.split_once('/').unwrap_or((cidr, ""));
+                let family = if v6 { "-inet6" } else { "-inet" };
+                let mut del: Vec<String> = vec![
+                    "-n".into(),
+                    "delete".into(),
+                    family.into(),
+                    "-net".into(),
+                    net.into(),
+                ];
+                let mut add: Vec<String> = vec![
+                    "-n".into(),
+                    "add".into(),
+                    family.into(),
+                    "-net".into(),
+                    net.into(),
+                ];
+                if !plen.is_empty() {
+                    for v in [&mut del, &mut add] {
+                        v.push("-prefixlen".into());
+                        v.push(plen.into());
+                    }
+                }
+                add.push("-interface".into());
+                add.push(self.if_name.clone());
+                let _ = run_cmd("route", del).await;
+                run_cmd("route", add).await
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             {
                 let _ = (cidr, v6);
                 Ok(())
@@ -1555,7 +1706,24 @@ mod system {
                 ]);
                 let _ = run_cmd("ip", args).await;
             }
-            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            #[cfg(target_os = "macos")]
+            {
+                let (net, plen) = cidr.split_once('/').unwrap_or((cidr, ""));
+                let family = if v6 { "-inet6" } else { "-inet" };
+                let mut args: Vec<String> = vec![
+                    "-n".into(),
+                    "delete".into(),
+                    family.into(),
+                    "-net".into(),
+                    net.into(),
+                ];
+                if !plen.is_empty() {
+                    args.push("-prefixlen".into());
+                    args.push(plen.into());
+                }
+                let _ = run_cmd("route", args).await;
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
             let _ = (cidr, v6);
         }
 
@@ -1767,6 +1935,32 @@ mod system {
     const IF_NAME: &str = "roomler";
     #[cfg(target_os = "linux")]
     const IF_NAME: &str = "roomler0";
+    /// Does an interface listing mention `ip`?
+    ///
+    /// The one shared piece of "ask the interface instead of reading the
+    /// error", used by both `netsh interface ipv4 show addresses` (Windows)
+    /// and `ifconfig <utun>` (macOS). Everything those tools SAY is
+    /// localized — labels and errors alike — but an IPv4 literal is not, so
+    /// the address is the only token worth reading. Split on everything
+    /// that cannot appear inside a dotted quad and compare whole tokens: a
+    /// substring test would let `100.64.0.2` match a listed `100.64.0.28`.
+    ///
+    /// Compiled everywhere so every platform's test run covers it.
+    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+    fn listing_mentions_address(listed: &str, ip: Ipv4Addr) -> bool {
+        let want = ip.to_string();
+        listed
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .any(|tok| tok == want)
+    }
+
+    /// macOS ignores a requested name — utun numbers are kernel-assigned —
+    /// so this is only the REQUESTED name and a logging fallback. The real
+    /// one comes from `SystemTun::if_name()`. That macOS had no `IF_NAME`
+    /// at all is the reason its whole routing surface was a set of no-ops:
+    /// there was nothing to address, so nothing addressed anything.
+    #[cfg(target_os = "macos")]
+    const IF_NAME: &str = "utun";
 
     /// Is `cidr` an IPv6 CIDR? A colon only ever appears in the v6 textual form
     /// (`"::/1"`, `"8000::/1"`, `"fd72:6f6f:6d6c::/96"`), never in a v4 one
@@ -1896,17 +2090,20 @@ mod system {
         in_cgnat && len < 32
     }
 
-    /// Other platforms (macOS): no enumeration, so the reconciler is INERT
-    /// rather than absent — mirroring the `purge_one` fallback below, which
-    /// #295 added while this one was missed (the agent's macOS build is the
-    /// only lane that compiles this arm, and it runs only at release time).
+    /// macOS: empty, and correctly so — there is nothing to reconcile.
     ///
-    /// Deliberately empty rather than a `netstat -rn` parse: macOS ABBREVIATES
-    /// destinations (`10.66/16`, `100.64/10`), which cannot be turned back into
-    /// a CIDR reliably — and `purge_one` DELETES whatever this returns. A
-    /// mis-parse would remove the wrong route, which is strictly worse than the
-    /// documented best-effort contract of "a failure leaves the pre-existing
-    /// state, never a worse one".
+    /// This reconciler exists for a PERSISTED device: Wintun adapters (and a
+    /// cached Linux tun) outlive the process, so a previous generation's
+    /// routes can still be installed at the next boot with no crypto-router
+    /// entries behind them. A utun is bound to the file descriptor that
+    /// created it — when the process dies the interface goes, and the kernel
+    /// takes its routes with it. So the orphan-route class this cleans up
+    /// cannot occur on macOS.
+    ///
+    /// (The previous reason given here was that `netstat -rn` abbreviates
+    /// destinations — `10.66/16` — and mis-parsing them would make
+    /// `purge_one` delete the wrong route. True, and a good reason not to
+    /// guess; but the real answer is that there is nothing to enumerate.)
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     fn enumerate_if_routes() -> Vec<String> {
         Vec::new()
@@ -1972,7 +2169,27 @@ mod system {
             .output();
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(target_os = "macos")]
+    fn purge_one(cidr: &str) {
+        let (net, plen) = cidr.split_once('/').unwrap_or((cidr, ""));
+        let family = if is_v6_cidr(cidr) { "-inet6" } else { "-inet" };
+        // Interface-less delete: BSD `route delete` keys on the destination,
+        // and the caller has already decided this prefix should not exist.
+        let mut args: Vec<String> = vec![
+            "-n".into(),
+            "delete".into(),
+            family.into(),
+            "-net".into(),
+            net.into(),
+        ];
+        if !plen.is_empty() {
+            args.push("-prefixlen".into());
+            args.push(plen.into());
+        }
+        let _ = std::process::Command::new("route").args(&args).output();
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     fn purge_one(_cidr: &str) {}
 
     /// Assign this node's derived overlay IPv6 (`fd72:6f6f:6d6c::<v4>`, `/96`
@@ -1982,7 +2199,7 @@ mod system {
     /// `netsh` pattern the route helpers already use (the Wintun adapter
     /// persists across reconnects, so the address may already be present).
     /// macOS utun stays v4-only for now, matching the per-peer-route stance.
-    fn assign_derived_v6(self_ip: Ipv4Addr) {
+    fn assign_derived_v6(self_ip: Ipv4Addr, #[allow(unused_variables)] if_name: &str) {
         let v6 = crate::overlay::router::derive_overlay_v6(self_ip);
         #[cfg(target_os = "linux")]
         {
@@ -2051,17 +2268,50 @@ mod system {
                 ),
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        #[cfg(target_os = "macos")]
         {
-            // macOS utun: v4-only for now (see the doc comment).
-            let _ = v6;
+            let plen = crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX.to_string();
+            // `-alias` first so a re-bring-up replaces rather than stacks;
+            // it fails harmlessly when the address isn't there yet.
+            let _ = std::process::Command::new("ifconfig")
+                .args([if_name, "inet6", &v6.to_string(), "-alias"])
+                .output();
+            match std::process::Command::new("ifconfig")
+                .args([
+                    if_name,
+                    "inet6",
+                    &v6.to_string(),
+                    "prefixlen",
+                    &plen,
+                    "alias",
+                ])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(addr = %v6, %plen, "overlay: derived IPv6 assigned to the TUN");
+                }
+                Ok(out) => tracing::warn!(
+                    addr = %v6,
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "overlay: derived-IPv6 assign failed; node stays v4-only"
+                ),
+                Err(e) => tracing::warn!(
+                    addr = %v6,
+                    error = %e,
+                    "overlay: derived-IPv6 assign failed; node stays v4-only"
+                ),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        {
+            let _ = (v6, if_name);
         }
     }
 
     /// Run an OS route command off the async reactor (`std::process` in a
     /// blocking task — avoids pulling in tokio's `process` feature). Non-zero
     /// exit → `Err` with the captured stderr.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     async fn run_cmd(prog: &'static str, args: Vec<String>) -> std::io::Result<()> {
         tokio::task::spawn_blocking(move || {
             let out = std::process::Command::new(prog).args(&args).output()?;
@@ -2314,6 +2564,38 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// The shared half of "ask the interface, don't read the error".
+        ///
+        /// `address_presence_is_locale_proof` below covers the Windows
+        /// wrapper but is `cfg(windows)`, so CI never runs it. This one
+        /// compiles everywhere and covers both listing shapes — including
+        /// macOS `ifconfig`, whose output is the other caller.
+        #[test]
+        fn listings_are_read_by_address_literal_not_by_label() {
+            use super::listing_mentions_address as m;
+            use std::net::Ipv4Addr;
+
+            // German Windows `netsh` — every label differs, the address does not.
+            let de = "    IP-Adresse:  100.64.0.28\n    Subnetzpräfix: 100.64.0.0/10\n";
+            // macOS `ifconfig utun4` — a point-to-point inet line.
+            let mac = "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
+                       \tinet 100.64.0.28 --> 100.64.0.28 netmask 0xffc00000\n\
+                       \tinet 100.65.0.5 --> 100.65.0.5 netmask 0xfffffc00\n";
+
+            for out in [de, mac] {
+                assert!(m(out, Ipv4Addr::new(100, 64, 0, 28)));
+                // The substring trap: `100.64.0.2` must NOT match a listed
+                // `100.64.0.28`, or a real failure gets swallowed.
+                assert!(!m(out, Ipv4Addr::new(100, 64, 0, 2)));
+                assert!(!m(out, Ipv4Addr::new(10, 0, 0, 1)));
+            }
+            // macOS carries the second org's address too — that is the
+            // whole point of the multi-address path there.
+            assert!(m(mac, Ipv4Addr::new(100, 65, 0, 5)));
+            assert!(!m(de, Ipv4Addr::new(100, 65, 0, 5)));
+            assert!(!m("", Ipv4Addr::new(100, 64, 0, 28)));
+        }
 
         /// The pc50045 outage (2026-08-07): a GERMAN-locale Windows host
         /// answered `netsh … add address` with "Das Objekt ist bereits
@@ -2601,5 +2883,121 @@ No       Manual    256  fe80::/64                    1  Loopback Pseudo-Interfac
             assert_eq!(r.interface, "12");
             assert!(parse_windows_default_route_v6("").is_none());
         }
+    }
+}
+/// macOS overlay networking against a REAL utun.
+///
+/// Everything in the macOS arms — address aliasing, peer `/32`s, subnet
+/// routes, the derived v6 — was a no-op until now, so none of it has ever
+/// run. Writing it unverified would have been worse than the loud refusal
+/// it replaces, and the recorded blocker was "needs a Mac, and the fleet
+/// has none". That stopped being true: a `macos-latest` runner has sudo and
+/// utun, so the code is exercised on every push instead of being trusted.
+///
+/// Needs root, hence the `ROOMLER_TUN_KERNEL_TEST=1` opt-in; skips silently
+/// everywhere else, including on non-macOS hosts.
+#[cfg(all(test, feature = "overlay-l3"))]
+mod macos_kernel_tests {
+    use super::SystemTun;
+    use crate::overlay::tun::TunIo;
+    use std::net::Ipv4Addr;
+
+    const MASK_22: Ipv4Addr = Ipv4Addr::new(255, 255, 252, 0);
+
+    fn sh(prog: &str, args: &[&str]) -> String {
+        let out = std::process::Command::new(prog)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("{prog} {args:?}: {e}"));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Whole-token match so `100.65.0.5` never matches `100.65.0.50`.
+    fn mentions(haystack: &str, needle: &str) -> bool {
+        haystack
+            .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == ':'))
+            .any(|t| t == needle)
+    }
+
+    #[tokio::test]
+    async fn utun_carries_addresses_peer_routes_and_subnet_routes() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipping: macOS-only (utun + BSD route/ifconfig)");
+            return;
+        }
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("utun bring-up");
+        let iface = tun.if_name().to_string();
+        assert!(
+            iface.starts_with("utun"),
+            "the kernel names utuns; a hardcoded name is why this all used to \
+             address a nonexistent interface (got {iface:?})"
+        );
+
+        let cfg = sh("ifconfig", &[&iface]);
+        assert!(
+            mentions(&cfg, "100.65.0.5"),
+            "the device's own address must be up:\n{cfg}"
+        );
+
+        // A SECOND address — the multi-org case, and the one `add_address_sync`
+        // used to refuse outright on this platform.
+        tun.add_address_sync(Ipv4Addr::new(100, 66, 0, 7), 22)
+            .expect("second address");
+        let cfg = sh("ifconfig", &[&iface]);
+        assert!(
+            mentions(&cfg, "100.66.0.7"),
+            "a second org's address must land on the same utun:\n{cfg}"
+        );
+        // Idempotent: the reconnect path re-adds every session.
+        tun.add_address_sync(Ipv4Addr::new(100, 66, 0, 7), 22)
+            .expect("re-adding an existing address is a no-op, not an error");
+
+        // A peer /32. Without this macOS had NO per-peer routes at all and
+        // leaned entirely on the connected route.
+        tun.add_peer_route(Ipv4Addr::new(100, 65, 0, 9))
+            .await
+            .expect("peer route");
+        let routes = sh("netstat", &["-rn", "-f", "inet"]);
+        assert!(
+            routes.contains(&iface) && mentions(&routes, "100.65.0.9"),
+            "the peer /32 must be in the table on {iface}:\n{routes}"
+        );
+
+        // A subnet route (what a subnet-router peer advertises).
+        tun.add_cidr_route("10.66.0.0/16")
+            .await
+            .expect("cidr route");
+        let routes = sh("netstat", &["-rn", "-f", "inet"]);
+        assert!(
+            // macOS abbreviates: 10.66.0.0/16 prints as `10.66`.
+            routes.contains("10.66") && routes.contains(&iface),
+            "the subnet route must be in the table on {iface}:\n{routes}"
+        );
+
+        // …and every one of them comes back off.
+        tun.del_cidr_route("10.66.0.0/16").await;
+        tun.del_peer_route(Ipv4Addr::new(100, 65, 0, 9)).await;
+        tun.del_address_sync(Ipv4Addr::new(100, 66, 0, 7), 22);
+
+        let cfg = sh("ifconfig", &[&iface]);
+        assert!(
+            !mentions(&cfg, "100.66.0.7"),
+            "a released address must be gone:\n{cfg}"
+        );
+        assert!(
+            mentions(&cfg, "100.65.0.5"),
+            "and only that one — the device's own address stays:\n{cfg}"
+        );
+        let routes = sh("netstat", &["-rn", "-f", "inet"]);
+        assert!(
+            !mentions(&routes, "100.65.0.9"),
+            "a deleted peer route must be gone:\n{routes}"
+        );
     }
 }
