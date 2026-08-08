@@ -93,9 +93,39 @@ fn clamped_secs(start: DateTime, end: Option<DateTime>, floor: DateTime, now: Da
 
 // ── Per-class accumulators ──────────────────────────────────────────────
 
+/// Total wall-clock covered by `spans`, merging overlaps.
+///
+/// Summing raw durations would double-count concurrency, and for these
+/// classes concurrency is the norm, not the exception: a person with five
+/// declared tunnel routes open all day has spent 24 h tunnelling, not 120 h.
+/// The first prod render of this table reported **1103 h of tunnel use in a
+/// 24 h window** for exactly that reason. "Minutes" has to mean time spent,
+/// so overlapping windows merge; `sessions` still counts them individually.
+fn merged_secs(mut spans: Vec<(i64, i64)>) -> f64 {
+    if spans.is_empty() {
+        return 0.0;
+    }
+    spans.sort_unstable();
+    let mut total = 0i64;
+    let (mut cur_s, mut cur_e) = spans[0];
+    for (s, e) in spans.into_iter().skip(1) {
+        if s > cur_e {
+            total += cur_e - cur_s;
+            cur_s = s;
+            cur_e = e;
+        } else if e > cur_e {
+            cur_e = e;
+        }
+    }
+    total += cur_e - cur_s;
+    total.max(0) as f64
+}
+
 #[derive(Default, Clone)]
 struct ClassTotals {
-    seconds: f64,
+    /// Half-open `[start, end)` unix-second windows, already clamped to the
+    /// query range. Merged (not summed) into minutes — see [`merged_secs`].
+    spans: Vec<(i64, i64)>,
     bytes: f64,
     sessions: u32,
     /// How many of those sessions actually reported bytes. Zero with
@@ -106,9 +136,25 @@ struct ClassTotals {
 }
 
 impl ClassTotals {
+    fn add(&mut self, start: DateTime, end: Option<DateTime>, floor: DateTime, now: DateTime) {
+        let s = if start < floor { floor } else { start };
+        let e = match end {
+            Some(e) if e < now => e,
+            _ => now,
+        };
+        if e > s {
+            self.spans.push((unix_secs(s), unix_secs(e)));
+        }
+        self.sessions += 1;
+    }
+
+    fn seconds(&self) -> f64 {
+        merged_secs(self.spans.clone())
+    }
+
     fn json(&self, bytes_measurable: bool) -> serde_json::Value {
         serde_json::json!({
-            "minutes": (self.seconds / 60.0 * 10.0).round() / 10.0,
+            "minutes": (self.seconds() / 60.0 * 10.0).round() / 10.0,
             "bytes": self.bytes.round(),
             "sessions": self.sessions,
             "devices": self.devices.len(),
@@ -570,8 +616,7 @@ async fn usage_table(
 
     for w in view_windows(state, tenant, None, floor, now).await? {
         let e = totals.entry(w.user_id).or_default();
-        e.rc.seconds += clamped_secs(w.start, w.end, floor, now);
-        e.rc.sessions += 1;
+        e.rc.add(w.start, w.end, floor, now);
         e.rc.devices.insert(w.agent_id);
         e.tenants.insert(w.tenant_id);
         if w.bytes > 0.0 {
@@ -582,8 +627,7 @@ async fn usage_table(
 
     for (uid, tid, rid, joined, left) in call_minutes(state, tenant, None, floor, now).await? {
         let e = totals.entry(uid).or_default();
-        e.call.seconds += clamped_secs(joined, left, floor, now);
-        e.call.sessions += 1;
+        e.call.add(joined, left, floor, now);
         e.call.devices.insert(rid);
         e.tenants.insert(tid);
     }
@@ -604,8 +648,7 @@ async fn usage_table(
             continue;
         };
         let e = totals.entry(uid).or_default();
-        e.tunnel.seconds += clamped_secs(*first, Some(*last), floor, now);
-        e.tunnel.sessions += 1;
+        e.tunnel.add(*first, Some(*last), floor, now);
         if let Ok(a) = d.get_object_id("agent_id") {
             e.tunnel.devices.insert(a);
         }
@@ -649,8 +692,17 @@ async fn usage_table(
                 "call": t.call.json(true),
                 // Tunnel bytes are not measurable server-side today.
                 "tunnel": t.tunnel.json(false),
-                "total_minutes": ((t.rc.seconds + t.call.seconds + t.tunnel.seconds) / 60.0 * 10.0)
-                    .round() / 10.0,
+                // Merged across classes too: someone on a call while a
+                // tunnel is up spent that hour once, not twice. This is
+                // "time active on the platform", which is what a reader
+                // sorting by Total is actually after.
+                "total_minutes": (merged_secs(
+                    t.rc.spans.iter()
+                        .chain(t.call.spans.iter())
+                        .chain(t.tunnel.spans.iter())
+                        .copied()
+                        .collect(),
+                ) / 60.0 * 10.0).round() / 10.0,
                 "orgs": orgs,
             })
         })
@@ -773,6 +825,38 @@ async fn usage_detail(
         .sum();
     let rc_bytes: f64 = mine.iter().map(|w| w.bytes).sum();
 
+    // Clamp each window to the range, then MERGE — a person controlling two
+    // machines at once spent that hour once.
+    let span_of = |s: DateTime, e: Option<DateTime>| -> Option<(i64, i64)> {
+        let s = if s < floor { floor } else { s };
+        let e = match e {
+            Some(e) if e < now => e,
+            _ => now,
+        };
+        (e > s).then(|| (unix_secs(s), unix_secs(e)))
+    };
+    let rc_total_secs = merged_secs(
+        mine.iter()
+            .filter_map(|w| span_of(w.start, w.end))
+            .collect(),
+    );
+    let call_total_secs = merged_secs(
+        calls
+            .iter()
+            .filter_map(|(_, _, _, j, l)| span_of(*j, *l))
+            .collect(),
+    );
+    let tunnel_total_secs = merged_secs(
+        tunnels
+            .iter()
+            .filter_map(|d| {
+                let f = d.get_datetime("first").ok()?;
+                let l = d.get_datetime("last").ok()?;
+                span_of(*f, Some(*l))
+            })
+            .collect(),
+    );
+
     Ok(serde_json::json!({
         "enabled": true,
         "range": range.unwrap_or("24h"),
@@ -782,15 +866,14 @@ async fn usage_detail(
             "name": unames.get(&user).cloned().unwrap_or_default(),
         },
         "totals": {
-            "rc_minutes": (mine.iter().map(|w| clamped_secs(w.start, w.end, floor, now)).sum::<f64>()
-                / 60.0 * 10.0).round() / 10.0,
+            // Merged, not summed — concurrent windows are one stretch of
+            // time, and these headline numbers have to agree with the
+            // table's (see `merged_secs`).
+            "rc_minutes": (rc_total_secs / 60.0 * 10.0).round() / 10.0,
             "rc_bytes": rc_bytes,
-            "call_minutes": (calls.iter()
-                .map(|(_, _, _, j, l)| clamped_secs(*j, *l, floor, now)).sum::<f64>()
-                / 60.0 * 10.0).round() / 10.0,
+            "call_minutes": (call_total_secs / 60.0 * 10.0).round() / 10.0,
             "call_bytes": call_byte_total,
-            "tunnel_minutes": (tunnel_rows.iter()
-                .map(|r| r["seconds"].as_f64().unwrap_or(0.0)).sum::<f64>() / 60.0 * 10.0).round() / 10.0,
+            "tunnel_minutes": (tunnel_total_secs / 60.0 * 10.0).round() / 10.0,
         },
         "viewing": viewing,
         "calls": call_rows,
@@ -914,17 +997,50 @@ mod tests {
         assert_eq!(clamped_secs(dt(0), Some(dt(500)), floor, now), 0.0);
     }
 
+    /// The bug the first prod render exposed: five tunnels open all day
+    /// summed to 120 h of "usage" in a 24 h window. Concurrent windows are
+    /// ONE stretch of wall-clock.
+    #[test]
+    fn concurrent_windows_merge_instead_of_summing() {
+        let day = 86_400;
+        let five_all_day: Vec<(i64, i64)> = (0..5).map(|_| (0, day)).collect();
+        assert_eq!(merged_secs(five_all_day), day as f64);
+    }
+
+    #[test]
+    fn disjoint_windows_still_add_up() {
+        assert_eq!(merged_secs(vec![(0, 100), (200, 350)]), 250.0);
+        // Touching at a boundary is one continuous stretch, not two.
+        assert_eq!(merged_secs(vec![(0, 100), (100, 250)]), 250.0);
+        // Order must not matter, and a window fully inside another adds none.
+        assert_eq!(merged_secs(vec![(200, 350), (0, 400), (10, 20)]), 400.0);
+        assert_eq!(merged_secs(vec![]), 0.0);
+    }
+
+    #[test]
+    fn class_totals_merge_across_added_windows() {
+        let floor = dt(1_000);
+        let now = dt(2_000);
+        let mut c = ClassTotals::default();
+        // Two overlapping sessions: 1000..1600 and 1400..1800 = 800 s.
+        c.add(dt(1_000), Some(dt(1_600)), floor, now);
+        c.add(dt(1_400), Some(dt(1_800)), floor, now);
+        assert_eq!(c.seconds(), 800.0);
+        // Both still count as sessions — merging is about TIME, not tally.
+        assert_eq!(c.sessions, 2);
+    }
+
     #[test]
     fn bytes_known_false_when_nothing_measured() {
         // Sessions happened but none reported bytes — must not read as 0 B.
         let t = ClassTotals {
-            seconds: 600.0,
+            spans: vec![(0, 600)],
             sessions: 3,
             ..Default::default()
         };
         assert_eq!(t.json(true)["bytes_known"], serde_json::json!(false));
         let t2 = ClassTotals {
-            seconds: 600.0,
+            spans: vec![(0, 600)],
             sessions: 3,
             bytes: 1024.0,
             with_bytes: 1,

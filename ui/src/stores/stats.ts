@@ -37,6 +37,10 @@ export interface SeriesPayload {
     name?: string
     intervals: Array<{ from: number; to: number; presence: string }>
   }>
+  /** machines endpoint: overlay + tunnel BYTES moved per bucket (wave 3).
+   *  Empty until the fleet ships the reporting agent — an empty series is
+   *  "no data", which a zero line would misrepresent as "no traffic". */
+  volume?: SeriesPoint[]
 }
 
 export interface RelayCurrent {
