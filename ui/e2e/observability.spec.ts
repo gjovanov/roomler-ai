@@ -72,6 +72,33 @@ test.describe('Org analytics', () => {
     await page.getByRole('tab', { name: /calls/i }).click()
     await expect(page.getByText(/participant-minutes/i).first()).toBeVisible({ timeout: 10000 })
   })
+
+  test('People tab lists per-user usage and says so when empty', async ({ page }) => {
+    const { tenant } = await newOrgOwner(page)
+    await page.goto(`/tenant/${tenant.id}/analytics`)
+    await expect(page.getByRole('heading', { name: 'Analytics' })).toBeVisible({ timeout: 15000 })
+
+    await page.getByRole('tab', { name: /people/i }).click()
+    await expect(page.getByText(/usage by person/i)).toBeVisible({ timeout: 10000 })
+
+    // A brand-new org has nobody with recorded activity. That must read as
+    // "nothing happened", not as a table of zeroes.
+    await expect(page.getByText(/no recorded activity in this range/i)).toBeVisible({
+      timeout: 10000,
+    })
+  })
+
+  test('unmeasured traffic renders its empty state, never a confident zero', async ({ page }) => {
+    const { tenant } = await newOrgOwner(page)
+    await page.goto(`/tenant/${tenant.id}/analytics`)
+    await expect(page.getByRole('heading', { name: 'Analytics' })).toBeVisible({ timeout: 15000 })
+
+    // The mesh/tunnel traffic chart must show its empty state rather than a
+    // flat line at 0 B: with no reporting agent the honest answer is "not
+    // measured yet", and a zero line claims the opposite.
+    await expect(page.getByText(/mesh & tunnel traffic/i)).toBeVisible({ timeout: 10000 })
+    await expect(page.getByText(/no traffic telemetry yet/i)).toBeVisible({ timeout: 10000 })
+  })
 })
 
 test.describe('Platform observability', () => {
@@ -97,5 +124,26 @@ test.describe('Platform observability', () => {
     await page.goto(`/tenant/${tenant.id}`)
     await expect(page.getByText('Insights')).toBeVisible({ timeout: 15000 })
     await expect(page.getByRole('link', { name: /observability/i })).toHaveCount(0)
+  })
+
+  test('per-user usage endpoints answer 404, never 403, for a non-admin', async ({ page }) => {
+    // 403 is the dangerous answer: ui/src/api/client.ts wipes tokens and
+    // force-logs-out on ANY 403, so a mis-typed gate on a usage endpoint
+    // would eject a legitimate member from the whole app. Asserted at the
+    // HTTP layer because the UI gates client-side and would never issue it.
+    const { tenant, token } = await newOrgOwner(page)
+    const base = process.env.E2E_API_URL || 'http://localhost:5001'
+    const headers = { Authorization: `Bearer ${token}` }
+
+    const platform = await page.request.get(`${base}/api/admin/stats/usage?range=24h`, { headers })
+    expect(platform.status()).toBe(404)
+
+    // The org's OWN usage is reachable to its owner — the gate is about
+    // authority, not about hiding the surface from everyone.
+    const own = await page.request.get(`${base}/api/tenant/${tenant.id}/stats/usage?range=24h`, {
+      headers,
+    })
+    expect(own.status()).not.toBe(403)
+    expect([200, 404]).toContain(own.status())
   })
 })
