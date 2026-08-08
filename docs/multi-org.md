@@ -404,51 +404,82 @@ no blank row can render).
 
 ## 12. Open items
 
-- **The refusal path now runs against a real kernel; the third-org field run
-  still needs a product decision.** `TunMux`'s bookkeeping was always
-  unit-tested against a fake device, but the half that touches the OS — a
-  REFUSED registration leaving no address behind, a disjoint block really
-  getting one, a released org really losing it — had never met a kernel,
-  because reproducing it in the field needs a third organization on the
-  legacy `/10` and **there is no way to retire a throwaway org afterwards**.
-  A `tun` device is free, so that half now runs on every CI push
+- **The refusal path runs against a real kernel; the two-control-plane
+  field run is now unblocked but not yet done.** `TunMux`'s bookkeeping was
+  always unit-tested against a fake device; the half that touches the OS —
+  a REFUSED registration leaving no address behind, a disjoint block really
+  getting one, a released org really losing it — now runs on every CI push
   (`tun_kernel_tests`, root + `ROOMLER_TUN_KERNEL_TEST=1`, skipped
-  everywhere else). What is still untested is the same path with two real
-  control planes behind it. Unblocking it means deciding what "archive an
-  organization" means — hidden from the switcher? blocks enrollment? blocks
-  new sessions? what happens to its devices and rooms? — since
-  `Tenant.is_archived` exists and nothing reads it. The endpoint is small
-  once that is decided.
+  everywhere else). It earned its keep on its first run by catching
+  `deregister` handing back the block BASE instead of the org's address.
+  What is still untested is the same path driven by two real control
+  planes. That needed a third organization on the legacy `/10` and a way to
+  retire it afterwards; **archiving now exists** (§13), so the remaining
+  work is scheduling it on a disposable host — deliberately not a prod
+  cluster node, since the test is an intentional address collision.
 - **macOS is excluded from multi-org meshing, and the gap is wider than it
   looks.** `add_address_sync` refuses there, but so do `add_peer_route`,
   `add_cidr_route`, `enumerate_if_routes`, `purge_one` and the derived-v6
-  assign — all no-ops outside Linux/Windows. macOS therefore has no per-peer
-  `/32`s and no subnet routes at all today; the overlay leans entirely on the
-  device's own connected route. Adding utun aliasing alone would produce a
-  second address with no routing behind it, which is why the refusal is loud
-  rather than partial.
-  The blocker used to be stated as "needs a Mac, and there is none in the
-  fleet". That is no longer true: **a `macos-latest` CI runner has sudo and
-  utun**, and `ci.yml` already runs a macOS job. So this is now scoped work
-  rather than blocked work — utun name accessor, `ifconfig <utun> alias`,
-  `route -n add -interface`, and the same kernel-level test shape as
-  `tun_kernel_tests` — just a project of its own, and still worth nothing
-  until someone actually runs a Mac in a mesh.
-- **The netstack surface is now OWNED, not silently shared.** It is a set of
-  process-global singletons — one stack handle channel, one loopback SOCKS
-  port, one `roomler ping` backend — and none of them is org-scoped. A
-  second org publishing its stack did not join the mesh twice; it REPLACED
-  the first org's stack underneath a SOCKS front that kept answering on the
-  same port, so a user dialing through SOCKS believing they reached org A
-  was silently routed by org B. First org in now claims the surface and a
-  second one withholds its overlay with a loud warning, exactly like a
-  refused shared-TUN registration; the claim is released when its owner's
-  loop ends. Untangling the statics into genuinely per-org instances is
-  still deferred: it is real work for a case nobody has hit, whereas silent
-  cross-org misrouting was a bug regardless of demand.
-- **Block reclaim** — quarantined blocks are never automatically re-issued,
-  because a re-issued range could collide with an agent still holding stale
-  peers from the previous tenant. With 4032 slots that is comfortable, and
-  `GET …/overlay-block` now reports `headroom { total, used, burned }` so
-  the comfort is a number rather than a belief. A reclaim path earns its
-  risk on the day `burned` becomes a meaningful fraction of `total`.
+  assign — all no-ops outside Linux/Windows. macOS therefore has no
+  per-peer `/32`s and no subnet routes at all today; the overlay leans
+  entirely on the device's own connected route. Adding utun aliasing alone
+  would produce a second address with no routing behind it, which is why
+  the refusal is loud rather than partial.
+  The blocker is no longer hardware: a `macos-latest` CI runner has sudo
+  and utun and `ci.yml` already runs a macOS job, and a rented Apple-silicon
+  Mac mini costs about €0.11–0.22/h (24 h minimum lease — Apple licensing,
+  which AWS EC2 Mac carries too) if a persistent mesh member is ever wanted.
+  So this is scoped work — utun name accessor, `ifconfig <utun> alias`,
+  `route -n add -interface`, then the `tun_kernel_tests` shape again on a
+  macOS runner — rather than blocked work.
+- **Netstack is per-org.** ~~One handle channel, one SOCKS port, one ping
+  backend, none org-scoped~~ — each org now has its own stack and its own
+  front, so two orgs in netstack mode both get a mesh. What genuinely
+  cannot be shared is the PORT (one TCP listener): it keeps an owner, and a
+  second org configured onto the same one withholds with an actionable
+  message. The primary reads `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`; a
+  secondary sets `netstack_socks_port` on its `[[orgs]]` entry and
+  deliberately does not inherit the env key.
+- **Block reclaim** — `POST /api/admin/overlay-block/reclaim`, platform
+  operator, dry-run by default. Quarantine stays permanent by default for
+  the original reason (a device that missed a renumber may still believe it
+  holds an address in the old range), and reclaiming requires both a
+  minimum quarantine age and no live node anywhere inside the range. The
+  shape that makes this safe: **a reclaimed range is the allocator's
+  exhaustion fallback, not its default** — normal allocation stays strictly
+  monotonic-upward, so the risk is paid only when the alternative is no
+  address at all. `GET …/overlay-block` reports
+  `headroom { total, used, burned, reclaimed }`.
+
+## 13. Archiving an organization
+
+`Tenant.is_archived` existed from the first migration and nothing read it,
+so "retire an org" had no meaning and there is no tenant-delete route at
+all. It means this now: **an archived organization stops acting and keeps
+everything it knows.**
+
+`POST /api/tenant/{id}/archive` — **owner only**. Five effects:
+
+1. hidden from the org switcher (`GET /api/tenant`; `?include_archived=true`
+   still lists it — this is not erasure);
+2. no new device enrollments;
+3. no new remote-control sessions;
+4. its devices leave its mesh — every enrollment revoked, every overlay
+   node released back to the address pool, its block quarantined;
+5. everything else — rooms, messages, files, members, roles, audit —
+   retained untouched.
+
+`POST /api/tenant/{id}/unarchive` restores 1–3. It deliberately does NOT
+resurrect the revoked enrollments or the quarantined block: a device that
+never saw the archive may still believe it holds an address in that range,
+and re-issuing it is how two tenants end up sharing addresses. Devices
+re-enroll; the org carves a fresh block.
+
+Owner-only because effect 4 revokes every device's enrollment — not a
+MANAGE_TENANT delegate's surprise. Archiving twice is a 400 rather than a
+silent no-op that would report `devices_revoked: 0` and read like success.
+
+Not a delete, and the reason matters: an org's data is entangled with
+people who belong to other orgs, and erasure has no undo. If true erasure
+is ever needed it belongs in a separate, explicitly destructive job layered
+on top of this one — archive first, purge later.
