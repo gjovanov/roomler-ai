@@ -23,7 +23,8 @@
 //!   send hard-errored.
 //! * [`CarrierPhase::Established`] — handshake latched (set-once). The deaths
 //!   are [`DeathReason::RxStale`] (nothing heard — keepalives included — for
-//!   90 s) and [`DeathReason::OneWay`] (tx advancing, rx flat, 3 sweeps).
+//!   the tier's [`DirectTier::rx_stale_deadline`]: direct 60 s, relay 90 s) and
+//!   [`DeathReason::OneWay`] (tx advancing, rx flat, 3 sweeps).
 //!
 //! `Installing × RxStale` and `Established × HandshakeDeadline` are
 //! structurally unreachable — the phase split makes the old comment-level
@@ -121,6 +122,34 @@ impl DirectTier {
             DirectTier::Relay => RELAY_HANDSHAKE_DEADLINE,
         }
     }
+
+    /// rc.206's absolute rx-staleness backstop, per tier.
+    ///
+    /// Split out of the former single global because the two cases are sized
+    /// against different things. Both must clear the ~25 s persistent
+    /// keepalive (`wg::KEEPALIVE_SECS`) with room for losses, but:
+    ///
+    /// * a **direct** carrier dies the instant its path is filtered — a
+    ///   full-tunnel VPN connecting drops every off-tunnel datagram at once
+    ///   (field 2026-08-08, pc50045/Check Point: `ping` went from a steady
+    ///   75 ms to total loss, and the mesh stayed dark for MINUTES waiting out
+    ///   this deadline). 60 s still tolerates two consecutive lost keepalives,
+    ///   and a false trip only forces a rebuild that re-establishes if the
+    ///   path really recovered;
+    /// * a **relay** carrier's liveness depends on a third party (coturn /
+    ///   the DERP WS) whose own reconnects can legitimately straddle a
+    ///   keepalive or two, so it keeps the original, more forgiving 90 s.
+    ///
+    /// This is the cheap half of the recovery work — it needs no new state, no
+    /// probe, and no platform code. The active liveness poke that takes this
+    /// below ~30 s is a separate change.
+    pub(crate) fn rx_stale_deadline(self) -> Duration {
+        if self.is_direct() {
+            DIRECT_RX_STALE_DEADLINE
+        } else {
+            RELAY_RX_STALE_DEADLINE
+        }
+    }
 }
 
 /// Grace after install before the fallback can fire — lets the bilateral
@@ -139,11 +168,20 @@ pub(crate) const BAD_SWEEPS_TO_FALLBACK: u32 = 3;
 /// heuristic reads that as "just idle — no judgment" and never tears the
 /// carrier down — observed in the field as an 8-hour "direct" carrier stuck at
 /// 100 % loss with a frozen last-seen. This absolute rx-staleness deadline
-/// catches it regardless of tx. 90 s = ~3–4 missed keepalives: comfortably
-/// past a transient blip, well short of the multi-hour zombie. A false trip
-/// only forces a (cheap) rebuild, which re-establishes if the path actually
-/// recovered.
-pub(crate) const RX_STALE_DEADLINE: Duration = Duration::from_secs(90);
+/// catches it regardless of tx. A false trip only forces a (cheap) rebuild,
+/// which re-establishes if the path actually recovered.
+///
+/// Sized per tier by [`DirectTier::rx_stale_deadline`] — read that for why the
+/// two differ.
+///
+/// 60 s ≈ 2 missed keepalives. Chosen over the original 90 s because a direct
+/// carrier's path can be revoked instantly (a full-tunnel VPN connecting), and
+/// the old value was the whole reason the mesh stayed dark for minutes after
+/// one.
+pub(crate) const DIRECT_RX_STALE_DEADLINE: Duration = Duration::from_secs(60);
+/// 90 s ≈ 3–4 missed keepalives — the original value, kept for the relay tier
+/// (see [`DirectTier::rx_stale_deadline`]).
+pub(crate) const RELAY_RX_STALE_DEADLINE: Duration = Duration::from_secs(90);
 /// Phase C — the WG-handshake completion deadline for a srflx punch carrier:
 /// past it with no session, the punch failed → tear down to relay. Tight —
 /// bilateral INIT retransmit is ~5 s, so ~2 cycles + jitter + RTT covers a
@@ -190,7 +228,7 @@ pub(crate) enum DeathReason {
     /// grace.
     HardDead,
     /// rc.206 — established, then nothing heard (keepalives included) within
-    /// [`RX_STALE_DEADLINE`].
+    /// [`DirectTier::rx_stale_deadline`].
     RxStale,
     /// Phase C / rc.204 / rc.223 — never handshaked within the tier's
     /// [`DirectTier::handshake_deadline`].
@@ -283,7 +321,7 @@ pub(crate) fn carrier_tick(i: &HealthInputs) -> HealthVerdict {
         CarrierPhase::Installing { deadline } => (i.since_install > deadline, false),
         CarrierPhase::Established => (
             false,
-            i.since_install >= DIRECT_GRACE && i.since_last_rx > RX_STALE_DEADLINE,
+            i.since_install >= DIRECT_GRACE && i.since_last_rx > i.tier.rx_stale_deadline(),
         ),
     };
 
@@ -503,17 +541,43 @@ mod tests {
 
     #[test]
     fn rx_stale_requires_handshake_grace_and_deadline() {
-        // 89 s silent: survives. 91 s: dies RxStale.
-        let i = HealthInputs {
-            since_last_rx: Duration::from_secs(89),
-            ..established()
-        };
-        assert!(carrier_tick(&i).death.is_none());
-        let i = HealthInputs {
-            since_last_rx: Duration::from_secs(91),
-            ..established()
-        };
-        assert_eq!(carrier_tick(&i).death, Some(DeathReason::RxStale));
+        // Just under the tier's deadline: survives. Just over: dies RxStale.
+        // Expressed RELATIVE to the deadline so the boundary can't silently
+        // re-hardcode when a tier's value is retuned.
+        for (tier, is_direct) in [
+            (DirectTier::Lan, true),
+            (DirectTier::Srflx, true),
+            (DirectTier::Relay, false),
+        ] {
+            let d = tier.rx_stale_deadline();
+            let at = |since_last_rx: Duration| HealthInputs {
+                tier,
+                is_direct,
+                since_last_rx,
+                ..established()
+            };
+            assert!(
+                carrier_tick(&at(d - Duration::from_secs(1)))
+                    .death
+                    .is_none(),
+                "{tier:?} must survive just inside its deadline"
+            );
+            assert_eq!(
+                carrier_tick(&at(d + Duration::from_secs(1))).death,
+                Some(DeathReason::RxStale),
+                "{tier:?} must die just past it"
+            );
+            // And the tiers really are on different deadlines: a direct
+            // carrier is already dead where the relay one is still alive.
+            if is_direct {
+                assert!(
+                    carrier_tick(&at(RELAY_RX_STALE_DEADLINE - Duration::from_secs(1)))
+                        .death
+                        .is_some(),
+                    "{tier:?} must NOT be waiting out the relay deadline"
+                );
+            }
+        }
         // Heard this sweep: survives regardless of anything else.
         let i = HealthInputs {
             since_last_rx: Duration::ZERO,
@@ -710,5 +774,60 @@ mod tests {
         assert!(PUBLIC_HANDSHAKE_DEADLINE < RELAY_HANDSHAKE_DEADLINE);
         assert!(LAN_HANDSHAKE_DEADLINE > DIRECT_GRACE);
         assert!(RELAY_HANDSHAKE_DEADLINE > DIRECT_GRACE);
+
+        // Per-tier rx-staleness: direct is tighter (its path can be revoked
+        // instantly by a VPN), relay keeps the forgiving bound because its
+        // liveness depends on a third party that may reconnect.
+        assert!(DIRECT_RX_STALE_DEADLINE < RELAY_RX_STALE_DEADLINE);
+        for t in [DirectTier::Lan, DirectTier::Public, DirectTier::Srflx] {
+            assert_eq!(t.rx_stale_deadline(), DIRECT_RX_STALE_DEADLINE);
+        }
+        assert_eq!(
+            DirectTier::Relay.rx_stale_deadline(),
+            RELAY_RX_STALE_DEADLINE
+        );
+    }
+
+    /// The floor under BOTH rx-stale deadlines: a healthy but idle carrier is
+    /// legitimately silent for a full persistent-keepalive period
+    /// (`wg::KEEPALIVE_SECS` = 25 s), and the two ends are unsynchronised. Any
+    /// deadline at or below ~2 keepalives would reap working carriers — the
+    /// exact trap that makes a naive "no rx in 10 s ⇒ dead" rule unusable.
+    #[test]
+    fn rx_stale_deadlines_clear_two_keepalive_periods() {
+        const KEEPALIVE: Duration = Duration::from_secs(25); // wg::KEEPALIVE_SECS
+        for d in [DIRECT_RX_STALE_DEADLINE, RELAY_RX_STALE_DEADLINE] {
+            assert!(
+                d > KEEPALIVE * 2,
+                "{d:?} must survive two consecutive lost keepalives"
+            );
+        }
+    }
+
+    /// An idle-but-healthy DIRECT carrier must survive right up to the new,
+    /// tighter deadline — the regression lock for shortening it.
+    #[test]
+    fn idle_direct_carrier_survives_until_its_deadline() {
+        let quiet = |since_last_rx: Duration| HealthInputs {
+            since_last_rx,
+            ..established()
+        };
+        // One missed keepalive: alive.
+        assert!(
+            carrier_tick(&quiet(Duration::from_secs(30)))
+                .death
+                .is_none()
+        );
+        // Just inside the deadline: still alive.
+        assert!(
+            carrier_tick(&quiet(DIRECT_RX_STALE_DEADLINE - Duration::from_secs(1)))
+                .death
+                .is_none()
+        );
+        // Past it: dead, and for the rx-stale reason specifically.
+        assert_eq!(
+            carrier_tick(&quiet(DIRECT_RX_STALE_DEADLINE + Duration::from_secs(1))).death,
+            Some(DeathReason::RxStale)
+        );
     }
 }
