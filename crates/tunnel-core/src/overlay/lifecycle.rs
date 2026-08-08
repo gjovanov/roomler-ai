@@ -212,6 +212,24 @@ pub(crate) const RELAY_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(45);
 /// `HANDSHAKE(REKEY_TIMEOUT)` while boringtun gave up after ~90 s). As tight
 /// as srflx: it either establishes near-instantly or never will.
 pub(crate) const LAN_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
+/// Stage 2 (active revalidation) — poke an ESTABLISHED carrier with a forced
+/// WG rekey once it has been silent this long. Must clear the ~25 s persistent
+/// keepalive (`wg::KEEPALIVE_SECS`) or every idle keepalive gap would poke;
+/// 30 s = one keepalive interval + loss/jitter margin. The poke converts
+/// "suspiciously quiet" into proof either way ~`handshake_deadline` later —
+/// vs. waiting out the full `rx_stale_deadline` (60/90 s) doing nothing.
+pub(crate) const POKE_SILENCE_AFTER: Duration = Duration::from_secs(30);
+/// Stage 2 — ALSO poke when no INITIATOR-role handshake has completed within
+/// this window (counting from install). This is the detector for the carrier
+/// class the rx-anchored rules are structurally blind to (field 2026-08-08,
+/// CORPLAP-1→neo16): our tx dead while the peer's own traffic keeps arriving —
+/// `rx_any` advances (so rx-staleness never fires) and `rx` trickles (so the
+/// one-way counter resets), yet 100 % of our sends are lost. Only a completed
+/// handshake WE initiated proves the round trip. ≈ WireGuard's own
+/// REKEY_AFTER_TIME (120 s), so an active carrier usually refreshes the proof
+/// organically and the poke only fires for idle or responder-role carriers —
+/// one 2-packet handshake per peer per ~2 min at worst.
+pub(crate) const POKE_PROOF_AFTER: Duration = Duration::from_secs(120);
 
 /// Why a carrier died. Precedence when several signals co-trip (mirrors the
 /// pre-P2 log selection, which keyed off `(hard_dead, rx_stale)` in this
@@ -236,6 +254,15 @@ pub(crate) enum DeathReason {
     /// rc.137 — tx advancing while rx stayed flat for
     /// [`BAD_SWEEPS_TO_FALLBACK`] consecutive sweeps.
     OneWay,
+    /// Stage 2 — an active-revalidation poke (forced WG rekey,
+    /// `format_handshake_initiation(force_resend: true)`) went unanswered for
+    /// the tier's [`DirectTier::handshake_deadline`]. boringtun auto-retries an
+    /// in-flight initiation every ~5 s, so even the tightest window (12 s) is
+    /// 2–3 attempts — this is proof-grade, not a single lost packet. Books NO
+    /// PathMonitor strike/penalty/Q-slam (see `PathMonitor::on_death`): the
+    /// rebuild it triggers supplies fresh evidence itself, so a transient blip
+    /// recovers with zero penalty and can't feed the forced-DERP escalation.
+    RekeyUnanswered,
 }
 
 /// The lifecycle phase, DERIVED from the monotonic handshake latch — never
@@ -261,6 +288,21 @@ impl CarrierPhase {
             }
         }
     }
+}
+
+/// Stage 2 — the sweep's view of a pending active-revalidation poke, built
+/// from `Installed.last_poke_at` + the lock-free initiator-handshake stamp
+/// (`WgDevice::peer_initiator_hs_answered`). `answered` means an
+/// INITIATOR-role handshake completed at-or-after the poke — the only signal
+/// that proves OUR outbound works. (Responder-role handshakes prove nothing
+/// here: a peer whose tx works while ours is dead hammers initiations at us
+/// and each one we answer re-establishes a session — an rx- or
+/// either-role-anchored predicate would read permanently alive. Field
+/// 2026-08-08.)
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PokeState {
+    pub(crate) since_poke: Duration,
+    pub(crate) answered: bool,
 }
 
 /// Everything [`carrier_tick`] needs about one installed carrier, gathered by
@@ -291,6 +333,8 @@ pub(crate) struct HealthInputs {
     /// A relay refresh happened within `RELAY_REFRESH_COOLDOWN` — the
     /// anti-ping-pong holdoff. The tick applies it only to relay carriers.
     pub(crate) relay_refresh_held: bool,
+    /// Stage 2 — the pending active-revalidation poke, if one is armed.
+    pub(crate) poke: Option<PokeState>,
 }
 
 /// [`carrier_tick`]'s result: the updated one-way counter (store back into
@@ -315,13 +359,24 @@ pub(crate) struct HealthVerdict {
 /// * the strike-clear fires only for a direct carrier whose rx genuinely
 ///   advanced (not merely idle).
 pub(crate) fn carrier_tick(i: &HealthInputs) -> HealthVerdict {
-    // Phase-split detection: HandshakeDeadline is Installing-only, RxStale is
-    // Established-only — structurally disjoint (see the module doc).
-    let (punch_dead, rx_stale) = match CarrierPhase::of(i.handshake_done, i.tier) {
-        CarrierPhase::Installing { deadline } => (i.since_install > deadline, false),
+    // Phase-split detection: HandshakeDeadline is Installing-only; RxStale and
+    // RekeyUnanswered are Established-only — structurally disjoint (see the
+    // module doc). A poke can only be armed on an established carrier (the
+    // sweep gates on the handshake latch), but the phase gate here keeps the
+    // pure transition robust to a caller that armed one anyway.
+    let (punch_dead, rx_stale, rekey_unanswered) = match CarrierPhase::of(i.handshake_done, i.tier)
+    {
+        CarrierPhase::Installing { deadline } => (i.since_install > deadline, false, false),
         CarrierPhase::Established => (
             false,
             i.since_install >= DIRECT_GRACE && i.since_last_rx > i.tier.rx_stale_deadline(),
+            // Stage 2 — the poke's window is the tier's handshake deadline:
+            // it is literally the same physical question ("can a handshake
+            // complete over this path?"), so the deadline table stays the
+            // single source of truth.
+            i.poke
+                .as_ref()
+                .is_some_and(|p| !p.answered && p.since_poke > i.tier.handshake_deadline()),
         ),
     };
 
@@ -348,7 +403,11 @@ pub(crate) fn carrier_tick(i: &HealthInputs) -> HealthVerdict {
         (0, i.is_direct && rx > last_rx)
     };
 
-    let tripped = bad_sweeps >= BAD_SWEEPS_TO_FALLBACK || i.hard_dead || punch_dead || rx_stale;
+    let tripped = bad_sweeps >= BAD_SWEEPS_TO_FALLBACK
+        || i.hard_dead
+        || punch_dead
+        || rx_stale
+        || rekey_unanswered;
     let death = if !tripped {
         None
     } else if !i.is_direct && i.relay_refresh_held {
@@ -357,6 +416,12 @@ pub(crate) fn carrier_tick(i: &HealthInputs) -> HealthVerdict {
         None
     } else if i.hard_dead {
         Some(DeathReason::HardDead)
+    } else if rekey_unanswered {
+        // Above RxStale: an unanswered poke is ACTIVE proof (2–3 initiation
+        // attempts lost), stronger evidence than passive silence — and it
+        // normally fires first anyway (poke windows close before the
+        // rx-stale deadlines).
+        Some(DeathReason::RekeyUnanswered)
     } else if rx_stale {
         Some(DeathReason::RxStale)
     } else if punch_dead {
@@ -369,6 +434,32 @@ pub(crate) fn carrier_tick(i: &HealthInputs) -> HealthVerdict {
         clear_tier_strikes,
         death,
     }
+}
+
+/// Stage 2 — should the sweep arm an active-revalidation poke for this
+/// carrier right now? Pure and clock-free, like [`carrier_tick`]. Established
+/// carriers only (`handshake_done`), one poke at a time (`poke_pending`), on
+/// either trigger:
+///
+/// * **silence** — nothing heard for [`POKE_SILENCE_AFTER`] (> the ~25 s
+///   keepalive cadence, so a healthy idle gap never pokes). Converts the
+///   VPN-filter / path-died class into a verdict ~`handshake_deadline` later
+///   instead of waiting out the full rx-stale deadline;
+/// * **stale proof** — no INITIATOR-role handshake within
+///   [`POKE_PROOF_AFTER`] (`since_proof` = min(time since install, time since
+///   the last initiator handshake)). The only detector for a carrier whose tx
+///   is dead while the peer's own traffic keeps our rx counters moving.
+///
+/// The sweep arms the poke only for carriers the same tick left alive.
+pub(crate) fn should_poke(
+    handshake_done: bool,
+    poke_pending: bool,
+    since_last_rx: Duration,
+    since_proof: Duration,
+) -> bool {
+    handshake_done
+        && !poke_pending
+        && (since_last_rx > POKE_SILENCE_AFTER || since_proof > POKE_PROOF_AFTER)
 }
 
 /// A make-before-break shadow probe's verdict (pre-P2: the two branch
@@ -466,6 +557,7 @@ mod tests {
             last_traffic: (10, 10),
             bad_sweeps: 0,
             relay_refresh_held: false,
+            poke: None,
         }
     }
 
@@ -829,5 +921,155 @@ mod tests {
             carrier_tick(&quiet(DIRECT_RX_STALE_DEADLINE + Duration::from_secs(1))).death,
             Some(DeathReason::RxStale)
         );
+    }
+
+    /// Stage 2 REGRESSION LOCK (write-first, per the plan): an idle
+    /// established carrier with NO poke armed must never die early, and the
+    /// arming rule must not fire inside a healthy keepalive gap. Persistent
+    /// keepalives arrive every ~25 s on an unsynchronised cadence, so
+    /// `since_last_rx` on a healthy idle carrier is roughly uniform over
+    /// [0, 25 s) — a poke threshold at or below that cadence would poke (and
+    /// with any poke-path bug, kill) most idle carriers on every sweep.
+    #[test]
+    fn healthy_idle_carrier_neither_dies_nor_pokes() {
+        let fresh_proof = Duration::from_secs(5);
+        let idle = Duration::from_secs(24);
+        assert!(
+            carrier_tick(&HealthInputs {
+                since_last_rx: idle,
+                ..established()
+            })
+            .death
+            .is_none()
+        );
+        assert!(!should_poke(true, false, idle, fresh_proof));
+        // At exactly the keepalive cadence: still no poke.
+        assert!(!should_poke(
+            true,
+            false,
+            Duration::from_secs(25),
+            fresh_proof
+        ));
+    }
+
+    /// Stage 2 — the arming matrix: silence and stale-proof each trigger;
+    /// a pending poke, a missing handshake, or fresh evidence suppress.
+    #[test]
+    fn should_poke_matrix() {
+        let s = Duration::from_secs;
+        // Silence trigger: strictly past POKE_SILENCE_AFTER.
+        assert!(!should_poke(true, false, POKE_SILENCE_AFTER, s(5)));
+        assert!(should_poke(true, false, POKE_SILENCE_AFTER + s(1), s(5)));
+        // Stale-proof trigger: strictly past POKE_PROOF_AFTER.
+        assert!(!should_poke(true, false, s(1), POKE_PROOF_AFTER));
+        assert!(should_poke(true, false, s(1), POKE_PROOF_AFTER + s(1)));
+        // One poke at a time; Installing carriers never poke.
+        assert!(!should_poke(true, true, s(999), s(999)));
+        assert!(!should_poke(false, false, s(999), s(999)));
+    }
+
+    /// Stage 2 — the verdict: an unanswered poke kills at the tier's
+    /// handshake-deadline window; an answered one never does; the window
+    /// respects the phase gate and the relay refresh holdoff.
+    #[test]
+    fn rekey_unanswered_verdict_per_tier() {
+        for (tier, is_direct) in [
+            (DirectTier::Lan, true),
+            (DirectTier::Srflx, true),
+            (DirectTier::Public, true),
+            (DirectTier::Relay, false),
+        ] {
+            let w = tier.handshake_deadline();
+            let poked = |since_poke: Duration, answered: bool| HealthInputs {
+                tier,
+                is_direct,
+                poke: Some(PokeState {
+                    since_poke,
+                    answered,
+                }),
+                ..established()
+            };
+            // Window still open: wait.
+            assert!(
+                carrier_tick(&poked(w - Duration::from_secs(1), false))
+                    .death
+                    .is_none(),
+                "{tier:?} must survive inside its poke window"
+            );
+            // Window closed, unanswered: dead, for the poke reason.
+            assert_eq!(
+                carrier_tick(&poked(w + Duration::from_secs(1), false)).death,
+                Some(DeathReason::RekeyUnanswered),
+                "{tier:?} must die once the poke window closes unanswered"
+            );
+            // Answered: alive no matter how old the poke is.
+            assert!(
+                carrier_tick(&poked(w * 3, true)).death.is_none(),
+                "{tier:?} answered poke must never kill"
+            );
+        }
+        // Phase gate: a poke on a never-handshaked carrier yields the
+        // Installing-phase verdict (HandshakeDeadline), not RekeyUnanswered.
+        let i = HealthInputs {
+            handshake_done: false,
+            since_install: Duration::from_secs(60),
+            poke: Some(PokeState {
+                since_poke: Duration::from_secs(60),
+                answered: false,
+            }),
+            ..established()
+        };
+        assert_eq!(carrier_tick(&i).death, Some(DeathReason::HandshakeDeadline));
+        // Relay refresh holdoff defers the poke verdict like every other.
+        let i = HealthInputs {
+            tier: DirectTier::Relay,
+            is_direct: false,
+            relay_refresh_held: true,
+            poke: Some(PokeState {
+                since_poke: Duration::from_secs(60),
+                answered: false,
+            }),
+            ..established()
+        };
+        assert!(carrier_tick(&i).death.is_none());
+    }
+
+    /// Stage 2 — precedence: HardDead outranks the poke verdict; the poke
+    /// verdict outranks RxStale (active proof beats passive silence).
+    #[test]
+    fn rekey_unanswered_precedence() {
+        let base = HealthInputs {
+            tier: DirectTier::Relay,
+            is_direct: false,
+            // 61 s silence: past DIRECT deadlines but inside the relay's 90 s,
+            // and past the relay's own 45 s poke window.
+            since_last_rx: Duration::from_secs(61),
+            poke: Some(PokeState {
+                since_poke: Duration::from_secs(46),
+                answered: false,
+            }),
+            ..established()
+        };
+        assert_eq!(
+            carrier_tick(&HealthInputs {
+                hard_dead: true,
+                ..base
+            })
+            .death,
+            Some(DeathReason::HardDead)
+        );
+        // Both rx-stale and poke-expired co-trip (direct tier, 61 s > 60 s
+        // rx-stale, poke window long closed): the poke reason wins.
+        let i = HealthInputs {
+            tier: DirectTier::Lan,
+            is_direct: true,
+            since_last_rx: Duration::from_secs(61),
+            poke: Some(PokeState {
+                since_poke: Duration::from_secs(31),
+                answered: false,
+            }),
+            ..established()
+        };
+        assert_eq!(carrier_tick(&i).death, Some(DeathReason::RekeyUnanswered));
     }
 }

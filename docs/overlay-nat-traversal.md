@@ -189,6 +189,20 @@ cascade's guarantees while replacing its reactive counters:
   bilateral 60 s LAN punch cadence is pinned in the probe scheduler
   independent of any score (the hibernate-recovery cadence survives mixed
   fleets by construction).
+- **Active revalidation (Stage 2).** The health sweep pokes an established
+  carrier with a forced WG rekey when it has been silent > 30 s, or when no
+  *initiator-role* handshake has completed in 120 s (initiator-role only —
+  a responder session proves the peer can reach us, not that we can reach
+  them; the rx-anchored rules are structurally blind to a carrier whose tx
+  is dead while the peer's own traffic keeps arriving, field 2026-08-08).
+  A poke unanswered past the tier's handshake deadline dies
+  `RekeyUnanswered` — detection in ~42 s for the VPN-filter class and
+  bounded ~2.5 min for the one-way class, vs. the 60/90 s rx-stale backstop
+  that never fires at all on the one-way shape. `RekeyUnanswered` books
+  **no strike, no penalty, no Q movement**: the rebuild's own outcome is
+  the evidence (a failed re-attempt books `HandshakeDeadline` ~12 s later;
+  a transient recovers with zero penalty and cannot feed the forced-DERP
+  churn escalation).
 - **Resets.** An endpoint change (roam) clears penalties, strikes, and `Q` —
   new endpoints make old evidence stale. Forced-DERP remains a **server
   override**: the monitor annotates the pinned window and never selects
