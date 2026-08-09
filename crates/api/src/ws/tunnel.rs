@@ -310,8 +310,12 @@ pub async fn handle_tunnel_client_socket(
                 session_id,
                 flow_id,
                 reason,
+                bytes_in,
+                bytes_out,
             } => {
-                // Relay flow-close to agent + append audit row.
+                // Relay flow-close to agent + append audit row. The byte
+                // counts come from the endpoint because the payload never
+                // passes through here.
                 relay_tcp_closed_to_agent(
                     &state,
                     &orig,
@@ -319,6 +323,7 @@ pub async fn handle_tunnel_client_socket(
                     session_id,
                     flow_id,
                     reason,
+                    (bytes_in, bytes_out),
                 )
                 .await;
             }
@@ -1271,6 +1276,8 @@ async fn relay_tcp_closed_to_agent(
     request_session_id: ObjectId,
     flow_id: u32,
     reason: CloseReason,
+    // `(bytes_in, bytes_out)` as the reporting endpoint counted them.
+    bytes: (u64, u64),
 ) {
     let Some(s) = session else {
         return;
@@ -1288,7 +1295,7 @@ async fn relay_tcp_closed_to_agent(
     ) {
         debug!(origin = %orig.log_id(), %flow_id, %e, "tcp-closed relay to agent failed");
     }
-    audit_tcp_close(state, s, orig, flow_id, reason).await;
+    audit_tcp_close(state, s, orig, flow_id, reason, bytes).await;
 }
 
 /// UDP analogue of [`relay_tcp_closed_to_agent`]: relay a UDP-flow close
@@ -1318,7 +1325,11 @@ async fn relay_udp_closed_to_agent(
     ) {
         debug!(origin = %orig.log_id(), %flow_id, %e, "udp-closed relay to agent failed");
     }
-    audit_tcp_close(state, s, orig, flow_id, reason).await;
+    // UDP flows carry no byte counts: SOCKS5 UDP-ASSOCIATE datagrams run
+    // on per-flow `FlowStats` with no session aggregate, and `UdpClosed`
+    // has no counters to forward. Zero here means "not counted", same as
+    // a pre-wave-3 client — not "no traffic".
+    audit_tcp_close(state, s, orig, flow_id, reason, (0, 0)).await;
 }
 
 /// Relay a tunnel-client SDP offer to the agent. Cheap session_id
@@ -1406,12 +1417,21 @@ async fn relay_quic_candidate_to_agent(
     }
 }
 
+/// Append the flow-close audit row.
+///
+/// `bytes` = `(in, out)` **as the reporting endpoint counted them**. The
+/// server cannot measure this itself — tunnel payload rides the peer-to-peer
+/// data channel — which is why these two columns held a literal 0 on every
+/// row written before wave 3, and why the tunnel byte series was flat.
+/// `(0, 0)` from a pre-wave-3 client is therefore still the honest answer:
+/// nobody counted.
 async fn audit_tcp_close(
     state: &AppState,
     session: &TunnelSession,
     orig: &Originator,
     flow_id: u32,
     reason: CloseReason,
+    bytes: (u64, u64),
 ) {
     let _ = state
         .tunnel_audit
@@ -1428,8 +1448,8 @@ async fn audit_tcp_close(
             flow_id: Some(flow_id),
             dst_host: None,
             dst_port: None,
-            bytes_in: 0,
-            bytes_out: 0,
+            bytes_in: bytes.0,
+            bytes_out: bytes.1,
             message_count: 0,
             duration_ms: None,
             relay: RelayMode::Direct,
@@ -1660,6 +1680,8 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
             session_id,
             flow_id,
             reason,
+            bytes_in,
+            bytes_out,
         } => {
             if sessions.contains_key(&session_id) {
                 relay_tcp_closed_to_agent(
@@ -1669,6 +1691,7 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
                     session_id,
                     flow_id,
                     reason,
+                    (bytes_in, bytes_out),
                 )
                 .await;
                 None
@@ -1677,6 +1700,8 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
                     session_id,
                     flow_id,
                     reason,
+                    bytes_in,
+                    bytes_out,
                 })
             }
         }
