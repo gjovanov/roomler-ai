@@ -11,11 +11,12 @@
 //! - **calls** — minutes from `room_members.sessions[]` (the existing source
 //!   of truth for participation), bytes from the wave-3 `stats_call_user`
 //!   buckets.
-//! - **tunnel** — session windows from `tunnel_audit`. Bytes are NOT
-//!   available: the columns exist but every writer passes 0, and the server
-//!   is signalling-only for tunnels (payload is P2P over the data channel),
-//!   so it cannot observe them. Reported as `bytes_known: false` rather than
-//!   as a zero — see PR-3.
+//! - **tunnel** — session windows from `tunnel_audit`, plus the per-flow
+//!   byte totals the ORIGINATING endpoint reports on close. The server
+//!   cannot measure those itself (payload is P2P over the data channel),
+//!   which is why those columns held a literal 0 on every row written
+//!   before wave 3. A window whose flows all predate that reports
+//!   `bytes_known: false` rather than a zero.
 //!
 //! **Windows are clamped to the query range.** A session that began before
 //! the window contributes only its overlap, so the numbers sum to something
@@ -534,6 +535,21 @@ async fn tunnel_windows(
                 "first": { "$min": "$at" },
                 "last": { "$max": "$at" },
                 "events": { "$sum": 1 },
+                // Per-flow totals, summed over the session's close rows.
+                // Only the endpoint can count these, so a session whose
+                // flows all predate wave 3 sums to 0 — `measured` is what
+                // separates that from "moved nothing".
+                "bytes": { "$sum": { "$add": [
+                    { "$ifNull": [ "$bytes_in", 0 ] },
+                    { "$ifNull": [ "$bytes_out", 0 ] },
+                ]}},
+                "measured": { "$sum": { "$cond": [
+                    { "$gt": [ { "$add": [
+                        { "$ifNull": [ "$bytes_in", 0 ] },
+                        { "$ifNull": [ "$bytes_out", 0 ] },
+                    ]}, 0 ] },
+                    1, 0,
+                ]}},
             }},
             doc! { "$sort": { "last": -1 } },
             doc! { "$limit": MAX_TIMELINE as i64 },
@@ -649,6 +665,16 @@ async fn usage_table(
         };
         let e = totals.entry(uid).or_default();
         e.tunnel.add(*first, Some(*last), floor, now);
+        // Wave 3: tunnel bytes are real once the endpoint reports them.
+        let b = d
+            .get_f64("bytes")
+            .ok()
+            .or_else(|| d.get_i64("bytes").ok().map(|v| v as f64))
+            .unwrap_or(0.0);
+        if b > 0.0 {
+            e.tunnel.bytes += b;
+            e.tunnel.with_bytes += 1;
+        }
         if let Ok(a) = d.get_object_id("agent_id") {
             e.tunnel.devices.insert(a);
         }
@@ -691,7 +717,10 @@ async fn usage_table(
                 "rc": t.rc.json(true),
                 "call": t.call.json(true),
                 // Tunnel bytes are not measurable server-side today.
-                "tunnel": t.tunnel.json(false),
+                // Measurable since wave 3 (the endpoint reports its flow
+                // totals on close); `bytes_known` still falls back to false
+                // for a window whose flows all predate that.
+                "tunnel": t.tunnel.json(true),
                 // Merged across classes too: someone on a call while a
                 // tunnel is up spent that hour once, not twice. This is
                 // "time active on the platform", which is what a reader
@@ -804,6 +833,11 @@ async fn usage_detail(
             let last = d.get_datetime("last").ok()?;
             let aid = d.get_object_id("agent_id").ok();
             let tid = d.get_object_id("tenant_id").ok();
+            let bytes = d
+                .get_f64("bytes")
+                .ok()
+                .or_else(|| d.get_i64("bytes").ok().map(|v| v as f64))
+                .unwrap_or(0.0);
             Some(serde_json::json!({
                 "session_id": d.get_object_id("_id").ok().map(|i| i.to_hex()),
                 "agent_id": aid.map(|a| a.to_hex()),
@@ -814,7 +848,11 @@ async fn usage_detail(
                 "ended_at": unix_secs(*last),
                 "seconds": clamped_secs(*first, Some(*last), floor, now).round(),
                 "events": d.get_i32("events").unwrap_or(0),
-                "bytes_known": false,
+                "bytes": bytes,
+                // Per SESSION, not global: a long-lived route whose flows
+                // closed before wave 3 genuinely has no count, even while
+                // a newer session next to it does.
+                "bytes_known": bytes > 0.0,
             }))
         })
         .collect();
@@ -874,6 +912,8 @@ async fn usage_detail(
             "call_minutes": (call_total_secs / 60.0 * 10.0).round() / 10.0,
             "call_bytes": call_byte_total,
             "tunnel_minutes": (tunnel_total_secs / 60.0 * 10.0).round() / 10.0,
+            "tunnel_bytes": tunnel_rows.iter()
+                .map(|r| r["bytes"].as_f64().unwrap_or(0.0)).sum::<f64>(),
         },
         "viewing": viewing,
         "calls": call_rows,

@@ -179,15 +179,24 @@ pub async fn handle_forward_request(
     }
 
     let half_close = tunnel_peer.half_close_sink(outbound.clone());
+    // Wave 3 — report this end's totals too. The server audits only the
+    // ORIGINATOR's close (booking both would double every flow), but an
+    // end that CAN count must not put a false zero on the wire.
+    let stats_for_audit = Arc::clone(&stats);
     let close_reason =
         tunnel_core::forward::run_flow(stream, dc, flow_id, from_dc, half_close, stats).await;
     demux.unregister(flow_id).await;
     info!(%session_id, %flow_id, ?close_reason, "agent flow ended");
+    let (tcp_read, _dc_send, _dc_recv, tcp_write, _depth) = stats_for_audit.snapshot();
     let _ = outbound
         .send(ClientMsg::TcpClosed {
             session_id,
             flow_id,
             reason: close_reason,
+            // Local side here is the DESTINATION service, so `in` is what
+            // arrived from the tunnel client and went to the dst.
+            bytes_in: tcp_write,
+            bytes_out: tcp_read,
         })
         .await;
 }
@@ -251,6 +260,10 @@ pub async fn handle_forward_request_quic(
                     session_id,
                     flow_id,
                     reason: CloseReason::IoError,
+                    // No flow ever ran, so zero is the measured truth here
+                    // rather than a stand-in for "unknown".
+                    bytes_in: 0,
+                    bytes_out: 0,
                 })
                 .await;
             return;
@@ -258,14 +271,18 @@ pub async fn handle_forward_request_quic(
     };
 
     let stats = Arc::new(tunnel_core::forward::FlowStats::default());
+    let stats_for_audit = Arc::clone(&stats);
     let close_reason =
         tunnel_core::forward::run_flow_quic(stream, send, recv, flow_id, stats).await;
     info!(%session_id, %flow_id, ?close_reason, "agent QUIC flow ended");
+    let (tcp_read, _dc_send, _dc_recv, tcp_write, _depth) = stats_for_audit.snapshot();
     let _ = outbound
         .send(ClientMsg::TcpClosed {
             session_id,
             flow_id,
             reason: close_reason,
+            bytes_in: tcp_write,
+            bytes_out: tcp_read,
         })
         .await;
 }
@@ -702,7 +719,20 @@ mod tests {
 
         // Flow ended cleanly → acceptor emits TcpClosed for audit.
         match rx.recv().await.expect("expected TcpClosed after flow end") {
-            ClientMsg::TcpClosed { flow_id: f, .. } => assert_eq!(f, flow_id),
+            ClientMsg::TcpClosed {
+                flow_id: f,
+                bytes_in,
+                bytes_out,
+                ..
+            } => {
+                assert_eq!(f, flow_id);
+                // Wave 3 — this end counts too. Local side here is the
+                // DESTINATION, so `in` is what arrived from the client and
+                // `out` is what the dst echoed back.
+                let n = b"ping over quic acceptor".len() as u64;
+                assert_eq!(bytes_in, n, "bytes_in = what reached the dst");
+                assert_eq!(bytes_out, n, "bytes_out = what the dst returned");
+            }
             other => panic!("expected TcpClosed, got {other:?}"),
         }
 
