@@ -735,6 +735,18 @@ pub enum ClientMsg {
         /// when BOTH ends advertise this. Absent from a pre-P7 node ⇒ `false`.
         #[serde(default)]
         supports_forced_derp: bool,
+        /// U2 — the node accepts a SERVER-COMPUTED relay-tier verdict
+        /// ([`NetmapPeer::relay_strategy`]) and uses it in place of its own
+        /// local `relay_strategy()` derivation. The server populates the
+        /// per-edge verdict ONLY when BOTH ends advertise this (an unflagged
+        /// end computes locally from its own — possibly frozen — UDP-capability
+        /// view the server can't reproduce, so a one-sided verdict would
+        /// manufacture anchor/dialer role disagreements). Absent from a
+        /// pre-U2 node ⇒ `false` ⇒ every pair keeps the client-authoritative
+        /// path. Advertised only when the node's own
+        /// `OVERLAY_SERVER_RELAY_STRATEGY` env/config is on.
+        #[serde(default)]
+        supports_server_relay_strategy: bool,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -1583,6 +1595,31 @@ pub struct LocalRelayDescriptor {
 // Overlay network supporting types (rc:overlay.*)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// U2 — the server's per-edge relay-tier verdict (the recipient's view of
+/// THIS peer), mirroring the client's own `RelayStrategy` so the client can
+/// use it verbatim in place of its local derivation. Serialised as a
+/// lowercase-kebab string tag; an unknown/absent value ⇒ the client falls
+/// back to its local computation, so adding a variant later is
+/// forward-compatible.
+///
+/// Anchor/dialer symmetry is the whole reason this is server-computed: the
+/// server holds BOTH ends' pubkeys, so it stamps exactly one end
+/// `SingleRelayAnchor` and the other `SingleRelayDialer` — the client's own
+/// derivation depends on its (possibly frozen) `my_udp_relay_ok`, which the
+/// server can't reproduce and which is what let the two ends disagree.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelayStrategyWire {
+    /// v1 single-relay ANCHOR (allocate the one relay, advertise `R`).
+    SingleRelayAnchor,
+    /// v1 single-relay DIALER (no allocation; raw-dial the anchor's `R`).
+    SingleRelayDialer,
+    /// DERP `/derp` WS relay (both ends UDP-blocked).
+    Derp,
+    /// Two coturn allocations (the fall-through).
+    BothAllocate,
+}
+
 /// One peer in a netmap. `node_id` is the peer's `overlay_nodes._id`
 /// (the stable handle the control plane uses for fan-out + ACL). The
 /// node installs this peer as a WireGuard `Tunn` keyed by
@@ -1659,6 +1696,20 @@ pub struct NetmapPeer {
     /// arm) AND the local `OVERLAY_DERP` flag is on. Pre-DERP peer ⇒ `false`.
     #[serde(default)]
     pub supports_derp: bool,
+    /// U2 — this peer advertised `supports_forced_derp`. Echoed per-peer (it
+    /// was NOT before U2) so the client can tell whether a peer will honor a
+    /// pin, and so the server-computed [`relay_strategy`](Self::relay_strategy)
+    /// is only applied by a client whose peer also participates. Pre-U2
+    /// server/peer ⇒ `false`.
+    #[serde(default)]
+    pub supports_forced_derp: bool,
+    /// U2 — the server's relay-tier verdict for THIS edge (the recipient →
+    /// this peer). Populated ONLY when both ends advertised
+    /// `supports_server_relay_strategy`; `None` otherwise (and for every
+    /// pre-U2 server), in which case the client computes the tier locally as
+    /// before. Skipped-when-None so a pre-U2 node's wire shape is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_strategy: Option<RelayStrategyWire>,
     /// Phase 1 — subnet routes this peer is an **approved** router for (CIDR
     /// strings like `"192.168.1.0/24"`). A receiving node installs each CIDR
     /// into its router (allowed_ips) + OS route table pointing at this peer, so
@@ -2828,6 +2879,7 @@ mod tests {
             supports_relay_single: true,
             supports_derp: true,
             supports_forced_derp: true,
+            supports_server_relay_strategy: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -2841,6 +2893,7 @@ mod tests {
                 supports_relay_single,
                 supports_derp,
                 supports_forced_derp,
+                supports_server_relay_strategy,
                 advertised_routes,
                 ..
             } => {
@@ -2856,6 +2909,10 @@ mod tests {
                 assert!(
                     supports_forced_derp,
                     "supports_forced_derp must round-trip (P7)"
+                );
+                assert!(
+                    supports_server_relay_strategy,
+                    "supports_server_relay_strategy must round-trip (U2)"
                 );
                 assert_eq!(advertised_routes, vec!["192.168.1.0/24".to_string()]);
             }
@@ -3308,6 +3365,8 @@ mod tests {
                 supports_quic: true,
                 supports_relay_single: true,
                 supports_derp: true,
+                supports_forced_derp: true,
+                relay_strategy: Some(RelayStrategyWire::SingleRelayDialer),
                 routes: vec!["10.0.0.0/24".into()],
                 agent_id: Some(agent_id),
                 ingress_rules: None,
@@ -3372,8 +3431,51 @@ mod tests {
                 assert_eq!(peers.len(), 1);
                 assert_eq!(peers[0].node_id, node_id);
                 assert_eq!(peers[0].agent_id, Some(agent_id));
+                // U2 — the server verdict + echoed forced-DERP support
+                // round-trip.
+                assert_eq!(
+                    peers[0].relay_strategy,
+                    Some(RelayStrategyWire::SingleRelayDialer)
+                );
+                assert!(peers[0].supports_forced_derp);
             }
             other => panic!("expected OverlayNetmap, got {other:?}"),
+        }
+        // U2 — the verdict serialises as a kebab string tag.
+        assert!(s.contains(r#""relay_strategy":"single-relay-dialer""#));
+    }
+
+    /// U2 — wire compat both directions: a pre-U2 peer omits both
+    /// `relay_strategy` and `supports_forced_derp` (⇒ `None`/`false`, the
+    /// client-authoritative path), and every verdict variant round-trips
+    /// through its kebab tag.
+    #[test]
+    fn relay_strategy_wire_defaults_and_roundtrips() {
+        let legacy = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(legacy).unwrap();
+        assert_eq!(p.relay_strategy, None);
+        assert!(!p.supports_forced_derp);
+        // An absent verdict must stay OFF the wire (pre-U2 shape unchanged).
+        assert!(
+            !serde_json::to_string(&p)
+                .unwrap()
+                .contains("relay_strategy")
+        );
+
+        for (v, tag) in [
+            (RelayStrategyWire::SingleRelayAnchor, "single-relay-anchor"),
+            (RelayStrategyWire::SingleRelayDialer, "single-relay-dialer"),
+            (RelayStrategyWire::Derp, "derp"),
+            (RelayStrategyWire::BothAllocate, "both-allocate"),
+        ] {
+            let j = serde_json::to_string(&v).unwrap();
+            assert_eq!(j, format!("\"{tag}\""), "{v:?} tag");
+            assert_eq!(serde_json::from_str::<RelayStrategyWire>(&j).unwrap(), v);
         }
     }
 
