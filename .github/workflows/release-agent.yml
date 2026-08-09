@@ -1184,6 +1184,11 @@ jobs:
           # bundled dylibs are wrong, dyld fails and this step (set -e) fails.
           "$APP/Contents/MacOS/roomler-agent" --version
           cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
+          # The privileged half's plist rides along in Resources; the
+          # postinstall only installs it into /Library/LaunchDaemons when the
+          # operator has opted in. Staged unconditionally so enabling the
+          # daemon never requires a different package.
+          cp agents/roomler-agent/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
