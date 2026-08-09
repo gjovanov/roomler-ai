@@ -1373,6 +1373,12 @@ pub struct OverlayNode {
     /// never split tiers. Absent on a pre-P7 row ⇒ `false`.
     #[serde(default)]
     pub supports_forced_derp: bool,
+    /// U2 — the node advertised (on JOIN) that it accepts a server-computed
+    /// relay-tier verdict. The broker stamps a per-edge `relay_strategy` in
+    /// the netmap only when BOTH ends carry this. Absent on a pre-U2 row ⇒
+    /// `false` ⇒ the pair keeps the client-authoritative path.
+    #[serde(default)]
+    pub supports_server_relay_strategy: bool,
     /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
     /// `--advertise-routes` config, refreshed on each join). Untrusted until an
     /// admin approves; see `approved_routes`.

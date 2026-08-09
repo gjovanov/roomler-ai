@@ -58,6 +58,19 @@ pub struct PeerConfig {
     /// ends advertise this AND both are UDP-blocked AND our `OVERLAY_DERP` flag
     /// is on; else the `(false,false)` pair stays on both-allocate.
     pub supports_derp: bool,
+    /// U2 — the peer advertised `supports_forced_derp` (echoed per-peer only
+    /// from U2 onward). Part of the both-ends gate for applying a
+    /// server-computed `relay_strategy`.
+    pub supports_forced_derp: bool,
+    /// U2 — the server's relay-tier verdict for this edge, or `None` when the
+    /// server didn't stamp one (pre-U2 server, or either end unflagged). When
+    /// present AND our own `server_relay_strategy_enabled()` is on, the
+    /// coordinator uses it verbatim in place of its local derivation.
+    pub relay_strategy: Option<roomler_ai_remote_control::signaling::RelayStrategyWire>,
+    /// U2 — the peer's coturn region hint (server `relay_home`), previously
+    /// DROPPED by this conversion. Carried so the client's region/worker
+    /// selection matches the server's when it computes the strategy.
+    pub relay_home: Option<String>,
 }
 
 /// Decode a netmap peer. `None` if the pubkey isn't valid base64/length
@@ -82,6 +95,9 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         supports_quic: peer.supports_quic,
         supports_relay_single: peer.supports_relay_single,
         supports_derp: peer.supports_derp,
+        supports_forced_derp: peer.supports_forced_derp,
+        relay_strategy: peer.relay_strategy,
+        relay_home: peer.relay_home.clone(),
     })
 }
 
@@ -106,6 +122,8 @@ mod tests {
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
+            supports_forced_derp: false,
+            relay_strategy: None,
             routes: vec![],
             agent_id: None,
             ingress_rules: None,
