@@ -52,12 +52,15 @@
       <template #item.tunnel_minutes="{ item }">
         {{ fmtMinutes(item.tunnel.minutes) }}
       </template>
-      <!-- Tunnel payload is peer-to-peer over the data channel, so the
-           server has no byte count to report. An em dash with a tooltip is
-           honest; a 0 would not be. -->
-      <template #item.tunnel_bytes>
-        <span class="text-medium-emphasis" title="Tunnel traffic is peer-to-peer — not measured">
-          —
+      <!-- Reported by the flow's own endpoint since wave 3. Sessions that
+           closed before then carry no count, so the em dash stays for
+           those — "not measured" is not "no traffic". -->
+      <template #item.tunnel_bytes="{ item }">
+        <span
+          :class="{ 'text-medium-emphasis': !item.tunnel.bytes_known }"
+          :title="item.tunnel.bytes_known ? '' : 'Flows that closed before traffic accounting shipped'"
+        >
+          {{ item.tunnel.bytes_known ? fmtBytes(item.tunnel.bytes) : '—' }}
         </span>
       </template>
 
@@ -112,7 +115,7 @@ const headers = computed(() => {
     { title: 'Calls', key: 'call_minutes', value: (i: UsageUserRow) => i.call.minutes },
     { title: '', key: 'call_bytes', value: (i: UsageUserRow) => i.call.bytes, sortable: true },
     { title: 'Tunnel', key: 'tunnel_minutes', value: (i: UsageUserRow) => i.tunnel.minutes },
-    { title: '', key: 'tunnel_bytes', sortable: false },
+    { title: '', key: 'tunnel_bytes', value: (i: UsageUserRow) => i.tunnel.bytes, sortable: true },
     { title: 'Total', key: 'total_minutes' },
   ]
   if (props.showOrg) base.push({ title: 'Orgs', key: 'orgs', sortable: false })

@@ -547,12 +547,27 @@ pub enum ClientMsg {
 
     /// Either side closes a flow (clean EOF or error). Server relays
     /// to the peer and appends to `tunnel_audit`.
+    ///
+    /// The byte counts are the flow's final totals, reported by the
+    /// endpoint because the server never sees them: tunnel payload
+    /// rides the peer-to-peer data channel, which is why the
+    /// `tunnel_audit.bytes_in`/`bytes_out` columns held a literal 0 on
+    /// every row written before this. TCP-side application payload (not
+    /// framed DC bytes), so the number is comparable across the WebRTC
+    /// and QUIC transports. `#[serde(default)]` ⇒ a pre-wave-3 client
+    /// still parses and simply books zero.
     #[serde(rename = "rc:tunnel.tcp.closed")]
     TcpClosed {
         #[serde(with = "oid_hex")]
         session_id: ObjectId,
         flow_id: u32,
         reason: CloseReason,
+        /// Peer → local app (what the operator's tool received).
+        #[serde(default)]
+        bytes_in: u64,
+        /// Local app → peer (what the operator's tool sent).
+        #[serde(default)]
+        bytes_out: u64,
     },
 
     /// Client → server (→ agent): open one UDP forward (SOCKS5 UDP
@@ -2499,13 +2514,43 @@ mod tests {
                 session_id: ObjectId::new(),
                 flow_id: 1,
                 reason: r,
+                bytes_in: 4_096,
+                bytes_out: 512,
             };
             let s = serde_json::to_string(&m).unwrap();
             let back: ClientMsg = serde_json::from_str(&s).unwrap();
             match back {
-                ClientMsg::TcpClosed { reason, .. } => assert_eq!(reason, r),
+                ClientMsg::TcpClosed {
+                    reason,
+                    bytes_in,
+                    bytes_out,
+                    ..
+                } => {
+                    assert_eq!(reason, r);
+                    assert_eq!((bytes_in, bytes_out), (4_096, 512));
+                }
                 _ => panic!("wrong variant"),
             }
+        }
+    }
+
+    /// Wave 3 — a pre-wave-3 client omits the byte counts entirely; the
+    /// server must still parse the close and simply book zero, because a
+    /// flow that fails to close would leak its audit row.
+    #[test]
+    fn tcp_closed_without_byte_counts_still_parses() {
+        let legacy = r#"{"t":"rc:tunnel.tcp.closed","session_id":"6a1f00000000000000000001","flow_id":7,"reason":"eof"}"#;
+        match serde_json::from_str::<ClientMsg>(legacy).unwrap() {
+            ClientMsg::TcpClosed {
+                flow_id,
+                bytes_in,
+                bytes_out,
+                ..
+            } => {
+                assert_eq!(flow_id, 7);
+                assert_eq!((bytes_in, bytes_out), (0, 0));
+            }
+            _ => panic!("wrong variant"),
         }
     }
 
