@@ -1276,7 +1276,7 @@ async fn relay_tcp_closed_to_agent(
     request_session_id: ObjectId,
     flow_id: u32,
     reason: CloseReason,
-    /// `(bytes_in, bytes_out)` as the reporting endpoint counted them.
+    // `(bytes_in, bytes_out)` as the reporting endpoint counted them.
     bytes: (u64, u64),
 ) {
     let Some(s) = session else {
