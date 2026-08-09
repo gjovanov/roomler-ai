@@ -44,7 +44,7 @@ use roomler_ai_remote_control::models::OverlayRule;
 /// 1280; a WG datagram adds ~32 B of overhead, so 2048 is comfortable
 /// headroom and equals the relay's `MAX_DATAGRAM` cap (no fragmentation
 /// at this size).
-const WG_BUF: usize = 2048;
+pub(crate) const WG_BUF: usize = 2048;
 
 /// WireGuard persistent-keepalive interval. Keeps a relayed/NAT mapping
 /// warm so a mostly-idle overlay link stays reachable.
@@ -425,7 +425,7 @@ enum IngressDeny {
 }
 
 #[derive(Clone)]
-struct Ingress {
+pub(crate) struct Ingress {
     peer: [u8; 32],
     /// Read-only here: the routing table doubles as the allowed-IPs table.
     send: WgSender,
@@ -561,8 +561,8 @@ pub struct DirectInbound {
 /// the SAME source, and the cap on tracked sources. WG retransmits an
 /// unanswered init every ~5 s, so 2 s forwards every genuine attempt while a
 /// junk flood collapses to ≤1 event per source per 2 s (and ≤64 sources).
-const UNKNOWN_INIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
-const UNKNOWN_INIT_MAX_SOURCES: usize = 64;
+pub(crate) const UNKNOWN_INIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const UNKNOWN_INIT_MAX_SOURCES: usize = 64;
 
 /// One installed peer: its `Tunn`, its carrier, and the background tasks
 /// that pump it. Dropping aborts the tasks.
@@ -578,6 +578,11 @@ struct Peer {
     /// un-register it from the demux routing table. `None` for relay /
     /// dedicated-socket carriers (those own a per-peer recv task).
     direct_src: Option<SocketAddr>,
+    /// Multi-org v2 — the plane-registered session index, when this peer's
+    /// route lives on the shared [`CarrierPlane`](super::carrier_plane)
+    /// instead of the device demux. Removal/replacement unregisters by THIS
+    /// key (indices never alias; source addresses can).
+    plane_idx: Option<u32>,
 }
 
 impl Drop for Peer {
@@ -785,6 +790,12 @@ pub struct WgDevice {
     /// data-plane gate that could change under a live session would make a
     /// field report ("which packets did this node drop?") unanswerable.
     rpf: RpfMode,
+    /// Multi-org v2 — when attached to the process-wide
+    /// [`CarrierPlane`](super::carrier_plane::CarrierPlane): session indices
+    /// come from the plane (unique across every attached engine — they key
+    /// its receiver-index demux) and direct-session routes register THERE;
+    /// the plane's recv loops replace this device's own source-keyed demux.
+    plane: Option<super::carrier_plane::PlaneHandle>,
 }
 
 impl Drop for WgDevice {
@@ -828,9 +839,66 @@ impl WgDevice {
                 stun_events_tx,
                 stun_events_rx: Some(stun_events_rx),
                 rpf,
+                plane: None,
             },
             tun_rx,
         )
+    }
+
+    /// Multi-org v2 — attach this device to the shared carrier plane. Must be
+    /// called BEFORE any peer is installed; direct sessions then register on
+    /// the plane and demux by receiver index on its shared sockets.
+    pub fn set_plane(&mut self, handle: super::carrier_plane::PlaneHandle) {
+        self.plane = Some(handle);
+    }
+
+    /// Multi-org v2 — the hook bundle the embedder hands to
+    /// [`CarrierPlane::attach`](super::carrier_plane::CarrierPlane::attach)
+    /// for this device (unknown-source inits and decrypted inbound flow
+    /// through the same channels the device's own demux used).
+    pub fn plane_hooks(&self) -> super::carrier_plane::EngineHooks {
+        super::carrier_plane::EngineHooks {
+            secret: self.secret.clone(),
+            public: self.public,
+            direct_events: self.direct_events_tx.clone(),
+            tun_tx: self.tun_tx.clone(),
+        }
+    }
+
+    /// Session index for a new `Tunn` — plane-allocated when attached (the
+    /// index keys the plane's cross-engine receiver-index demux), else the
+    /// device-local counter (sessions are per-socket; no cross-device demux).
+    fn alloc_index(&mut self) -> u32 {
+        match &self.plane {
+            Some(h) => h.alloc_index(),
+            None => {
+                let i = self.next_index;
+                self.next_index = self.next_index.wrapping_add(1);
+                i
+            }
+        }
+    }
+
+    /// Sync half of demux cleanup: drop a replaced/removed peer's PLANE route
+    /// (index-keyed, so a replacement never aliases it). The source-keyed
+    /// legacy entry is NOT touched here — a same-`dst` replacement already
+    /// overwrote it in place, and removing by source would kill the new
+    /// peer's route.
+    fn unregister_plane_route(&self, p: &Peer) {
+        if let (Some(idx), Some(h)) = (p.plane_idx, &self.plane) {
+            h.unregister_route(idx);
+        }
+    }
+
+    /// Full demux cleanup for a peer leaving entirely (no replacement):
+    /// plane route by index, or the device-local source-keyed entry.
+    async fn unregister_direct(&self, p: &Peer) {
+        self.unregister_plane_route(p);
+        if p.plane_idx.is_none()
+            && let (Some(src), Some(demux)) = (p.direct_src, &self.direct)
+        {
+            demux.routes.lock().await.remove(&src);
+        }
     }
 
     /// P4 — the [`Ingress`] context for one peer's inbound path: its identity,
@@ -910,27 +978,7 @@ impl WgDevice {
     /// the same init and emits the response that reaches the peer (each Tunn has
     /// independent anti-replay state, so the re-run isn't rejected).
     pub fn authenticate_init(&self, init: &[u8]) -> Option<[u8; 32]> {
-        let claimed = {
-            let Ok(Packet::HandshakeInit(hi)) = Tunn::parse_incoming_packet(init) else {
-                return None;
-            };
-            boringtun::noise::handshake::parse_handshake_anon(&self.secret, &self.public, &hi)
-                .ok()?
-                .peer_static_public
-        };
-        let mut probe = Tunn::new(
-            self.secret.clone(),
-            PublicKey::from(claimed),
-            None,
-            None,
-            0,
-            None,
-        );
-        let mut out = vec![0u8; WG_BUF];
-        match probe.decapsulate(None, init, &mut out) {
-            TunnResult::WriteToNetwork(_) => Some(claimed),
-            _ => None,
-        }
+        authenticate_init_with(&self.secret, &self.public, init)
     }
 
     /// This node's public key.
@@ -1028,8 +1076,7 @@ impl WgDevice {
         carrier: Arc<Carrier>,
         initiate: bool,
     ) {
-        let index = self.next_index;
-        self.next_index = self.next_index.wrapping_add(1);
+        let index = self.alloc_index();
 
         let tunn = Tunn::new(
             self.secret.clone(),
@@ -1100,7 +1147,7 @@ impl WgDevice {
             }
         });
 
-        self.peers.insert(
+        if let Some(old) = self.peers.insert(
             peer_public,
             Peer {
                 tunn: tunn.clone(),
@@ -1109,8 +1156,11 @@ impl WgDevice {
                 tasks: vec![recv_task, timer_task],
                 stats: stats.clone(),
                 direct_src: None,
+                plane_idx: None,
             },
-        );
+        ) {
+            self.unregister_plane_route(&old);
+        }
         self.send_install(
             peer_public,
             overlay_ip,
@@ -1143,6 +1193,12 @@ impl WgDevice {
     /// socket forever and routes each datagram to the peer matching its source
     /// address (replacing the per-peer recv loop for direct carriers).
     pub fn ensure_direct_demux(&mut self, sock: Arc<UdpSocket>) {
+        if self.plane.is_some() {
+            // Multi-org v2 — the plane owns the recv loops on its shared
+            // sockets; a per-device source-keyed loop double-reading them
+            // would steal datagrams from every other attached engine.
+            return;
+        }
         let local = match sock.local_addr() {
             Ok(a) => a,
             Err(e) => {
@@ -1209,6 +1265,10 @@ impl WgDevice {
     /// is answered immediately instead of waiting ~5 s for the initiator's
     /// retransmit). No-op if `src` has no route (nothing was installed).
     pub async fn feed_direct(&self, src: SocketAddr, sock: Arc<UdpSocket>, packet: &[u8]) {
+        if let Some(h) = &self.plane {
+            h.feed(src, sock, packet).await;
+            return;
+        }
         let Some(demux) = &self.direct else {
             return;
         };
@@ -1247,7 +1307,9 @@ impl WgDevice {
         {
             let (tunn, carrier, stats) =
                 (peer.tunn.clone(), peer.carrier.clone(), peer.stats.clone());
-            self.peers.insert(peer_public, peer);
+            if let Some(old) = self.peers.insert(peer_public, peer) {
+                self.unregister_plane_route(&old);
+            }
             self.send_install(peer_public, overlay_ip, tunn, carrier, stats);
             self.debug_assert_send_synced();
         }
@@ -1266,16 +1328,15 @@ impl WgDevice {
         dst: SocketAddr,
         initiate: bool,
     ) -> Option<Peer> {
-        let Some(demux) = &self.direct else {
+        if self.plane.is_none() && self.direct.is_none() {
             warn!("wg: make_direct_peer before ensure_direct_demux; ignoring");
             return None;
-        };
+        }
         // Send from the interface-bound socket that shares the peer's subnet
         // (rc.143) — forces egress out the right NIC past a full-tunnel VPN.
         let carrier = Carrier::direct(sock, dst);
 
-        let index = self.next_index;
-        self.next_index = self.next_index.wrapping_add(1);
+        let index = self.alloc_index();
         let tunn = Arc::new(Mutex::new(Tunn::new(
             self.secret.clone(),
             PublicKey::from(peer_public),
@@ -1287,12 +1348,25 @@ impl WgDevice {
 
         let stats = Arc::new(PeerStats::default());
         let ingress = self.ingress_for(peer_public, stats.clone());
-        // Register for demux BEFORE the handshake so inbound is routed.
-        demux
-            .routes
-            .lock()
-            .await
-            .insert(dst, (tunn.clone(), ingress));
+        // Register for demux BEFORE the handshake so inbound is routed —
+        // on the plane by session index (unique across every attached
+        // engine), else in the device's source-keyed table.
+        let plane_idx = match &self.plane {
+            Some(h) => {
+                h.register_route(index, tunn.clone(), ingress, dst);
+                Some(index)
+            }
+            None => {
+                self.direct
+                    .as_ref()
+                    .expect("checked above")
+                    .routes
+                    .lock()
+                    .await
+                    .insert(dst, (tunn.clone(), ingress));
+                None
+            }
+        };
 
         // Timer task only — no recv task; the shared demux loop delivers
         // this peer's inbound.
@@ -1358,6 +1432,7 @@ impl WgDevice {
             tasks: vec![timer_task],
             stats,
             direct_src: Some(dst),
+            plane_idx,
         })
     }
 
@@ -1450,7 +1525,9 @@ impl WgDevice {
                 probe.stats.clone(),
             );
             // Insert replaces + drops the old (relay) peer; Drop aborts its task.
-            self.peers.insert(*peer_public, probe);
+            if let Some(old) = self.peers.insert(*peer_public, probe) {
+                self.unregister_plane_route(&old);
+            }
             // P1 (S6) — swap the pump's view atomically: the whole triple
             // replaces the old one under a single write lock.
             self.send_install(*peer_public, overlay_ip, tunn, carrier, stats);
@@ -1466,10 +1543,8 @@ impl WgDevice {
     /// Un-registers its demux entry and aborts its timer task; the ACTIVE carrier
     /// is untouched, so there is no stall. No-op if there is no probe.
     pub async fn drop_direct_probe(&mut self, peer_public: &[u8; 32]) {
-        if let Some(probe) = self.probes.remove(peer_public)
-            && let (Some(src), Some(demux)) = (probe.direct_src, &self.direct)
-        {
-            demux.routes.lock().await.remove(&src);
+        if let Some(probe) = self.probes.remove(peer_public) {
+            self.unregister_direct(&probe).await;
         }
     }
 
@@ -1507,9 +1582,7 @@ impl WgDevice {
         if let Some(p) = self.peers.remove(peer_public) {
             self.send_uninstall(peer_public);
             self.debug_assert_send_synced();
-            if let (Some(src), Some(demux)) = (p.direct_src, &self.direct) {
-                demux.routes.lock().await.remove(&src);
-            }
+            self.unregister_direct(&p).await;
         }
     }
 
@@ -1814,7 +1887,7 @@ impl WgDevice {
 /// Handle one inbound carrier datagram: decapsulate, echo any
 /// handshake/cookie/queued bytes back over the carrier, and deliver a
 /// decrypted IP packet to the TUN channel.
-async fn process_inbound(
+pub(crate) async fn process_inbound(
     t: &mut Tunn,
     n: usize,
     buf: &mut [u8],
@@ -1920,8 +1993,42 @@ async fn process_inbound(
 /// big-endian 16-bit type puts `0x01` in byte 1), so the two classes are
 /// disjoint. Intentionally does NOT validate length/contents — it's only the
 /// exclusion half of the STUN discriminator.
-fn is_wg_shaped(pkt: &[u8]) -> bool {
+pub(crate) fn is_wg_shaped(pkt: &[u8]) -> bool {
     pkt.len() >= 4 && matches!(pkt[0], 1..=4) && pkt[1] == 0 && pkt[2] == 0 && pkt[3] == 0
+}
+
+/// Phase A / carrier plane — the keypair-parameterized core of
+/// [`WgDevice::authenticate_init`], so the shared carrier plane can trial a
+/// handshake initiation against EACH attached engine's static (an init is
+/// sealed to exactly one) without borrowing a device. See the method's doc
+/// for why BOTH steps (anon parse, then a throwaway-`Tunn` decapsulate) are
+/// required — the parsed key alone is a claim, not proof.
+pub(crate) fn authenticate_init_with(
+    secret: &StaticSecret,
+    public: &PublicKey,
+    init: &[u8],
+) -> Option<[u8; 32]> {
+    let claimed = {
+        let Ok(Packet::HandshakeInit(hi)) = Tunn::parse_incoming_packet(init) else {
+            return None;
+        };
+        boringtun::noise::handshake::parse_handshake_anon(secret, public, &hi)
+            .ok()?
+            .peer_static_public
+    };
+    let mut probe = Tunn::new(
+        secret.clone(),
+        PublicKey::from(claimed),
+        None,
+        None,
+        0,
+        None,
+    );
+    let mut out = vec![0u8; WG_BUF];
+    match probe.decapsulate(None, init, &mut out) {
+        TunnResult::WriteToNetwork(_) => Some(claimed),
+        _ => None,
+    }
 }
 
 /// rc.134 — the shared direct-socket recv loop. Reads every datagram and

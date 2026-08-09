@@ -117,64 +117,12 @@ pub(super) fn resolve_direct_candidates(
     DirectCandidates { lan, public, srflx }
 }
 
-/// Bind one direct socket on a STABLE port so a rebuilt carrier reproduces
-/// the UDP 5-tuple a stateful corp firewall already grandfathered (rc.307).
-///
-/// Three tiers, in order:
-/// 1. **The base port, retried briefly.** During a runtime hand-over (MSI
-///    upgrade, service restart) the exiting worker may still hold it for a
-///    moment; retrying beats walking, because walking would silently change
-///    the port and forfeit the very 5-tuple we are protecting.
-/// 2. **The rest of the band** (`direct_port_candidates`). Hyper-V / WSL2 /
-///    HNS reserve large port pools that are invisible to `netstat` AND
-///    `netsh excludedportrange`, and they MOVE between boots — a base can be
-///    swallowed whole (field-measured on a WSL-mirrored host, 2026-08-05).
-///    A band walk keeps a stable port instead of losing the feature.
-/// 3. **Ephemeral**, the pre-rc.307 behaviour, so the interface always works.
-///
-/// `base == 0` skips straight to ephemeral (explicit opt-out). `None` only
-/// when even the ephemeral bind fails.
-pub(super) async fn bind_direct_socket(
-    ip: Ipv4Addr,
-    base: u16,
-    what: &'static str,
-) -> Option<UdpSocket> {
-    let mut candidates = direct::direct_port_candidates(base);
-    if let Some(first) = candidates.next() {
-        for attempt in 0u8..3 {
-            match UdpSocket::bind((ip, first)).await {
-                Ok(s) => return Some(s),
-                Err(_) if attempt < 2 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
-                Err(_) => {}
-            }
-        }
-        // The base is held by something that isn't just a slow hand-over.
-        for port in candidates {
-            if let Ok(s) = UdpSocket::bind((ip, port)).await {
-                warn!(
-                    %ip, base, port, what,
-                    "overlay: stable direct-port base unavailable (Hyper-V/WSL reservation?) — \
-                     using the next port in the band"
-                );
-                return Some(s);
-            }
-        }
-        warn!(
-            %ip, base, band = direct::DIRECT_PORT_BAND, what,
-            "overlay: the whole stable direct-port band is unavailable; falling back to an \
-             ephemeral port (carriers will not survive a corp-firewall session table)"
-        );
-    }
-    match UdpSocket::bind((ip, 0)).await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            warn!(%ip, %e, what, "overlay: direct socket bind failed; skipping");
-            None
-        }
-    }
-}
+// The stable-port binder MOVED to `direct::bind_direct_socket` (multi-org v2:
+// the shared carrier plane binds the same way, and `direct` is the module both
+// can reach). Re-exported so the call sites here and the band-walk lock test
+// in `runtime::tests` keep their `bind_direct_socket` /
+// `establish::bind_direct_socket` paths.
+pub(super) use crate::overlay::direct::bind_direct_socket;
 
 /// bind-to-interface-by-route (Phase 1, `OVERLAY_BIND_BY_ROUTE`) — pick the
 /// egress socket for a LAN direct carrier/probe to `dst`. Tailscale's
