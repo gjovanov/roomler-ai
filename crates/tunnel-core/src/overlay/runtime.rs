@@ -318,6 +318,10 @@ struct Installed {
     /// measuring volume — and volume is exactly what decides whether `enforce`
     /// is safe to flip.
     rx_denied: u64,
+    /// The `Rpf(NoRoute)` subset of [`Self::rx_denied`] — sources NO installed
+    /// peer owns, whose replies this node cannot route back (the multi-org
+    /// wrong-source signature). Snapshotted beside it.
+    rx_denied_noroute: u64,
     /// Stats PR-5 — the prober's last RTT measurement for this peer (the
     /// B1 `RttSample` events previously fed only the path-monitor Q).
     /// Published through [`build_overlay_view`] so `roomler peers` and the
@@ -415,6 +419,7 @@ impl Installed {
             relay_dst: None,
             public_direct_dst: None,
             rx_denied: 0,
+            rx_denied_noroute: 0,
             tier,
         }
     }
@@ -1008,6 +1013,7 @@ fn build_overlay_view(
                     last_rx_age_s: now.saturating_duration_since(i.last_rx_at).as_secs(),
                     relay_kind: i.relay_kind.map(|k| k.as_str().to_string()),
                     rx_denied: i.rx_denied,
+                    rx_denied_noroute: i.rx_denied_noroute,
                 }),
             }
         })
