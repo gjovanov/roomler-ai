@@ -49,11 +49,15 @@
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
+
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::router::Router;
+use super::mux_nat::{self, FlowMap};
+use super::router::{Router, embedded_v4_of_overlay_v6};
 use super::tun::TunIo;
 
 /// Per-port inbound queue depth. Matches the runtime's own outbound queue
@@ -93,6 +97,11 @@ struct PortEntry {
 
 struct MuxState {
     ports: Vec<PortEntry>,
+    /// Normalized cross-org egress flows (the mux NAT) — see [`mux_nat`].
+    flows: FlowMap,
+    /// `OVERLAY_MUX_NAT` gate, resolved once at construction (the same
+    /// process-lifetime stance as `OVERLAY_RPF` in [`super::wg`]).
+    nat_enabled: bool,
 }
 
 /// The shared-device multiplexer. One per process (the agent holds it in a
@@ -114,9 +123,20 @@ impl TunMux {
     /// return `Err` — each org's runtime then tears down its session exactly
     /// as it would for its own dead TUN.
     pub fn new(real: Arc<dyn TunIo>) -> Arc<Self> {
+        let nat_enabled = crate::env::flag("OVERLAY_MUX_NAT", true);
+        if !nat_enabled {
+            info!(
+                "tun-mux: cross-org egress source normalization DISABLED \
+                 (OVERLAY_MUX_NAT / config overlay_mux_nat)"
+            );
+        }
         let mux = Arc::new(Self {
             real: real.clone(),
-            state: Arc::new(Mutex::new(MuxState { ports: Vec::new() })),
+            state: Arc::new(Mutex::new(MuxState {
+                ports: Vec::new(),
+                flows: FlowMap::default(),
+                nat_enabled,
+            })),
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let state = mux.state.clone();
@@ -128,12 +148,11 @@ impl TunMux {
                     Err(e) => {
                         debug!(%e, "tun-mux: device read ended; reader exiting");
                         dead.store(true, std::sync::atomic::Ordering::SeqCst);
-                        // Dropping the senders EOFs every port.
-                        state
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .ports
-                            .clear();
+                        // Dropping the senders EOFs every port; the flow map
+                        // dies with the device it described.
+                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.ports.clear();
+                        st.flows.clear();
                         break;
                     }
                 }
@@ -211,10 +230,21 @@ impl TunMux {
 
         Ok(Arc::new(MuxPort {
             org: org.to_string(),
+            self_ip,
             real: self.real.clone(),
             state: self.state.clone(),
             rx: tokio::sync::Mutex::new(rx),
         }))
+    }
+
+    /// Test seam: flip the mux-NAT gate without touching process env (the
+    /// production value is resolved once in [`TunMux::new`]).
+    #[cfg(test)]
+    fn set_nat_enabled(&self, on: bool) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .nat_enabled = on;
     }
 
     /// Is the underlying device still alive as far as the mux knows? False
@@ -236,6 +266,10 @@ impl TunMux {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let idx = st.ports.iter().position(|p| p.org == org)?;
         let port = st.ports.remove(idx);
+        // The org's OS address is going away with it: flows restoring TO it
+        // or recorded FROM it are pointless (and would misfire if the block
+        // is ever re-assigned).
+        st.flows.purge_addr(port.self_ip);
         // The org's own ADDRESS, not its block base — the caller hands this
         // straight to `del_address_sync`, and deleting the base is a silent
         // no-op that leaves the real address on the adapter forever.
@@ -246,15 +280,21 @@ impl TunMux {
 /// Longest-prefix demux of one inbound packet, then a non-blocking handoff to
 /// the winning org. Free function (not a method) so the reader task doesn't
 /// hold an `Arc<TunMux>` cycle.
-fn route_inbound(state: &Mutex<MuxState>, pkt: Vec<u8>) {
-    let st = state.lock().unwrap_or_else(|e| e.into_inner());
-    if st.ports.is_empty() {
+fn route_inbound(state: &Mutex<MuxState>, mut pkt: Vec<u8>) {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    let MuxState {
+        ports,
+        flows,
+        nat_enabled,
+    } = &mut *guard;
+    let ports: &[PortEntry] = ports;
+    if ports.is_empty() {
         return;
     }
 
     let winner: Option<&PortEntry> = match Router::dst_of_ip_packet(&pkt) {
         // v4, or derived-ULA v6 unmapped to its embedded v4.
-        Some(dst) => best_v4(&st.ports, u32::from(dst)),
+        Some(dst) => best_v4(ports, u32::from(dst)),
         // Non-ULA v6 (an exit client's global-unicast egress) — match the
         // orgs' installed v6 routes. Anything else v6 (link-local chatter,
         // multicast) or unparseable: fall through to None.
@@ -263,7 +303,7 @@ fn route_inbound(state: &Mutex<MuxState>, pkt: Vec<u8>) {
             .filter(|b| (**b >> 4) == 6)
             .and_then(|_| pkt.get(24..40))
             .and_then(|dst| <[u8; 16]>::try_from(dst).ok())
-            .and_then(|dst| best_v6(&st.ports, u128::from_be_bytes(dst))),
+            .and_then(|dst| best_v6(ports, u128::from_be_bytes(dst))),
     };
 
     // No org claims the destination. The OS only routes packets here along
@@ -272,6 +312,9 @@ fn route_inbound(state: &Mutex<MuxState>, pkt: Vec<u8>) {
     let Some(port) = winner else {
         return;
     };
+    if *nat_enabled {
+        normalize_egress_src(ports, port.self_ip, flows, &mut pkt);
+    }
     match port.tx.try_send(pkt) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -283,6 +326,126 @@ fn route_inbound(state: &Mutex<MuxState>, pkt: Vec<u8>) {
             // reader attached. The dead port is reaped on next register.
         }
     }
+}
+
+/// Millisecond clock for the NAT warn throttle (process-relative).
+fn nat_mono_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// One log line per minute per slot; CAS so concurrent callers emit one line.
+/// The FIRST event always logs (`last == 0`).
+fn nat_throttled(slot: &AtomicU64) -> bool {
+    let now = nat_mono_ms().max(1);
+    let last = slot.load(Ordering::Relaxed);
+    (last == 0 || now.saturating_sub(last) >= 60_000)
+        && slot
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+static NAT_PASSTHROUGH_WARNED_AT: AtomicU64 = AtomicU64::new(0);
+static NAT_FIRST_REWRITE: AtomicBool = AtomicBool::new(false);
+static NAT_V6_TRIPWIRE: AtomicBool = AtomicBool::new(false);
+
+/// Hook A of the mux NAT (host-egress). A locally-originated v4 packet whose
+/// source is ANOTHER org's own address is rewritten to the winning org's
+/// address so single-org receivers can route their replies, and the reverse
+/// mapping is recorded for [`MuxPort::restore_inbound_dst`]. The OS picks
+/// such a wrong source freely on a multi-org host — nested org blocks defeat
+/// its source selection (field 2026-08-09, CORPLAP-1; `docs/multi-org.md`).
+/// Forwarded traffic (subnet-router, exit returns) can never trigger this:
+/// its sources are never our own addresses.
+fn normalize_egress_src(
+    ports: &[PortEntry],
+    winner_self: Ipv4Addr,
+    flows: &mut FlowMap,
+    pkt: &mut [u8],
+) {
+    let Some(v) = mux_nat::v4_view(pkt) else {
+        // v6 tripwire: exactly one overlay v6 exists per host today, so a
+        // derived-ULA SOURCE embedding another org's v4 is impossible. If
+        // multi-org v6 ever lands without extending the NAT, say so once
+        // instead of failing silently like v4 did.
+        if pkt.first().map(|b| *b >> 4) == Some(6)
+            && let Some(src) = pkt.get(8..24)
+            && let Ok(src) = <[u8; 16]>::try_from(src)
+            && let Some(src4) = embedded_v4_of_overlay_v6(src.into())
+            && src4 != winner_self
+            && ports.iter().any(|p| p.self_ip == src4)
+            && !NAT_V6_TRIPWIRE.swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                src = %src4,
+                "tun-mux: a derived-ULA v6 packet carries ANOTHER org's \
+                 source — the mux NAT only normalizes v4, so this flow's \
+                 replies will be unroutable at single-org receivers"
+            );
+        }
+        return;
+    };
+    if v.src == winner_self || !ports.iter().any(|p| p.self_ip == v.src) {
+        return;
+    }
+    let now = Instant::now();
+    let tracked = match v.proto {
+        // ICMPv4's checksum has no pseudo-header and the OS matches echo
+        // replies by identifier — safe to rewrite even untracked (errors,
+        // non-echo types). Echo requests also record the reverse mapping.
+        mux_nat::PROTO_ICMP => {
+            if v.first_fragment
+                && let Some(key) = mux_nat::egress_key(pkt, &v)
+            {
+                let _ = flows.note_egress(key, v.src, winner_self, now);
+            }
+            true
+        }
+        mux_nat::PROTO_TCP | mux_nat::PROTO_UDP => {
+            if v.first_fragment {
+                // Rewrite ONLY when the reverse mapping is recorded: a
+                // rewritten-but-unmapped flow fails with zero diagnostics
+                // (returns go to an address no socket is anchored to), while
+                // an unrewritten one keeps today's behavior plus the
+                // receiver-side RPF warn as the breadcrumb.
+                matches!(mux_nat::egress_key(pkt, &v),
+                    Some(key) if flows.note_egress(key, v.src, winner_self, now))
+            } else {
+                // Non-first fragment: no L4 header here — the offset-0
+                // fragment recorded the flow, and the rewrite decision is
+                // IP-header-only, so every fragment of the datagram gets the
+                // same source.
+                true
+            }
+        }
+        // Anything else on the overlay is unexpected; do not guess.
+        _ => return,
+    };
+    if !tracked {
+        if nat_throttled(&NAT_PASSTHROUGH_WARNED_AT) {
+            warn!(
+                src = %v.src, dst = %v.dst, proto = v.proto,
+                "tun-mux: cross-org flow could not be tracked (flow table \
+                 full or unparseable L4) — passing through with the \
+                 OS-chosen source; the flow will likely fail at a single-org \
+                 receiver"
+            );
+        }
+        return;
+    }
+    mux_nat::rewrite_src(pkt, &v, winner_self);
+    if !NAT_FIRST_REWRITE.swap(true, Ordering::Relaxed) {
+        info!(
+            orig = %v.src, wire = %winner_self,
+            "tun-mux: normalizing cross-org egress source — the OS picked a \
+             foreign org's overlay address for this destination org \
+             (docs/multi-org.md)"
+        );
+    }
+    debug!(
+        orig = %v.src, wire = %winner_self, dst = %v.dst, proto = v.proto,
+        "tun-mux: egress source normalized"
+    );
 }
 
 /// The port with the LONGEST matching v4 entry (own block + installed
@@ -327,6 +490,9 @@ fn best_v6(ports: &[PortEntry], dst: u128) -> Option<&PortEntry> {
 /// runtime cannot tell it from a private TUN.
 pub struct MuxPort {
     org: String,
+    /// This org's own address on the shared device — the mux NAT's ingress
+    /// gate ([`Self::restore_inbound_dst`]).
+    self_ip: Ipv4Addr,
     real: Arc<dyn TunIo>,
     state: Arc<Mutex<MuxState>>,
     /// The inbound queue's receiving half. A `tokio::sync::Mutex` because
@@ -373,6 +539,35 @@ impl MuxPort {
         }
     }
 
+    /// Hook B of the mux NAT (host-ingress): `Some(rewritten)` iff this
+    /// decrypted inbound v4 packet is addressed to this org's own address AND
+    /// matches a flow [`normalize_egress_src`] recorded — the destination is
+    /// then restored to the address the OS originally chose, so the anchored
+    /// socket receives it. Fragments are never rewritten: only the offset-0
+    /// fragment carries the ports, and a half-rewritten train fails
+    /// reassembly — strictly worse than untouched.
+    fn restore_inbound_dst(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        let v = mux_nat::v4_view(packet)?;
+        if v.dst != self.self_ip || v.fragment {
+            return None;
+        }
+        let key = mux_nat::ingress_key(packet, &v)?;
+        let orig = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.nat_enabled {
+                return None;
+            }
+            st.flows.restore_dst(&key, self.self_ip, Instant::now())?
+        };
+        let mut pkt = packet.to_vec();
+        mux_nat::rewrite_dst(&mut pkt, &v, orig);
+        debug!(
+            wire = %v.dst, orig = %orig, src = %v.src,
+            "tun-mux: ingress destination restored"
+        );
+        Some(pkt)
+    }
+
     /// Record whichever family `cidr` parses as. Unparseable strings are
     /// ignored here — the real device rejects them and its error is what the
     /// caller sees.
@@ -411,16 +606,24 @@ impl TunIo for MuxPort {
 
     async fn write_packet(&self, packet: &[u8]) -> std::io::Result<()> {
         // Writes need no arbitration: the device serialises internally and
-        // the packets carry their own addressing.
+        // the packets carry their own addressing. The one exception is the
+        // mux NAT's reverse leg — a reply to a flow whose egress source was
+        // normalized must get its destination restored, or the OS delivers
+        // it to an address no local socket is anchored to.
+        if let Some(rewritten) = self.restore_inbound_dst(packet) {
+            return self.real.write_packet(&rewritten).await;
+        }
         self.real.write_packet(packet).await
     }
 
     async fn add_peer_route(&self, peer: Ipv4Addr) -> std::io::Result<()> {
         // Record BEFORE the (best-effort, fallible) OS install: the demux
         // must know the peer even when the OS route already exists or the
-        // install is racing a VPN's competing entry.
+        // install is racing a VPN's competing entry. The `_from` twin pins
+        // this org's address as the route's source hint (Linux), so kernel
+        // source selection can never pick a sibling org's address here.
         self.note_v4(u32::from(peer), 32);
-        self.real.add_peer_route(peer).await
+        self.real.add_peer_route_from(peer, self.self_ip).await
     }
 
     async fn del_peer_route(&self, peer: Ipv4Addr) {
@@ -436,7 +639,9 @@ impl TunIo for MuxPort {
 
     async fn add_cidr_route(&self, cidr: &str) -> std::io::Result<()> {
         self.note_cidr(cidr, true);
-        self.real.add_cidr_route(cidr).await
+        // Source-hinted like the peer `/32`s — a subnet behind this org's
+        // router must never be reached with a sibling org's source either.
+        self.real.add_cidr_route_from(cidr, self.self_ip).await
     }
 
     async fn del_cidr_route(&self, cidr: &str) {
@@ -839,5 +1044,260 @@ mod tests {
             .unwrap();
         assert!(a.read_packet().await.is_err());
         assert!(b.read_packet().await.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Mux NAT (cross-org egress source normalization + reverse restore)
+    // -----------------------------------------------------------------------
+
+    use crate::overlay::mux_nat::{self, FLOW_CAP, FlowKey, reference as refpkt};
+
+    fn addr(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    /// Legacy `/10` org A (self 100.64.0.7) + carved `/22` org B (self
+    /// 100.65.0.3), with an A-side peer `/32` at 100.64.9.9 — the exact
+    /// nested-block shape the field bug lived in. NAT forced ON so tests are
+    /// independent of ambient env.
+    async fn nat_fixture() -> (
+        mpsc::Sender<std::io::Result<Vec<u8>>>,
+        Arc<MockTun>,
+        Arc<TunMux>,
+        Arc<MuxPort>,
+        Arc<MuxPort>,
+    ) {
+        let (feed, dev) = mock();
+        let mux = TunMux::new(dev.clone());
+        mux.set_nat_enabled(true);
+        let a = mux
+            .register("orgA", addr("100.64.0.7"), addr("255.192.0.0"))
+            .unwrap();
+        let b = mux
+            .register("orgB", addr("100.65.0.3"), addr("255.255.252.0"))
+            .unwrap();
+        a.add_peer_route(addr("100.64.9.9")).await.unwrap();
+        (feed, dev, mux, a, b)
+    }
+
+    fn last_write(dev: &MockTun) -> Vec<u8> {
+        dev.writes.lock().unwrap().last().cloned().expect("a write")
+    }
+
+    /// The field bug, reproduced end-to-end: a packet the OS sourced from the
+    /// WRONG org's address (100.65.0.3, org B) toward an org-A destination is
+    /// delivered to org A with its source normalized to A's own address and
+    /// checksums intact.
+    #[tokio::test]
+    async fn cross_org_egress_source_is_normalized() {
+        let (feed, _dev, _mux, a, _b) = nat_fixture().await;
+        let pkt = refpkt::mk_udp(addr("100.65.0.3"), addr("100.64.9.9"), 40000, 53);
+        feed.send(Ok(pkt)).await.unwrap();
+        let got = recv_on(&a).await;
+        let v = mux_nat::v4_view(&got).unwrap();
+        assert_eq!(v.src, addr("100.64.0.7"));
+        assert_eq!(v.dst, addr("100.64.9.9"));
+        refpkt::assert_checksums_valid(&got);
+    }
+
+    /// The trigger is exact-match on OUR self addresses: forwarded traffic
+    /// (subnet-router LAN sources, exit-node internet returns) passes
+    /// byte-identical.
+    #[tokio::test]
+    async fn foreign_sources_are_never_rewritten() {
+        let (feed, _dev, _mux, a, _b) = nat_fixture().await;
+        for src in ["10.66.51.147", "1.1.1.1"] {
+            let pkt = refpkt::mk_udp(addr(src), addr("100.64.9.9"), 4433, 53);
+            feed.send(Ok(pkt.clone())).await.unwrap();
+            assert_eq!(recv_on(&a).await, pkt, "src {src} must pass untouched");
+        }
+    }
+
+    /// The reverse leg: the peer's reply (addressed to the WIRE source) has
+    /// its destination restored to the address the local socket is anchored
+    /// to; an unrelated reply passes byte-identical.
+    #[tokio::test]
+    async fn reply_dst_is_restored_on_ingress() {
+        let (feed, dev, _mux, a, _b) = nat_fixture().await;
+        let out = refpkt::mk_udp(addr("100.65.0.3"), addr("100.64.9.9"), 40000, 53);
+        feed.send(Ok(out)).await.unwrap();
+        let _ = recv_on(&a).await;
+
+        let reply = refpkt::mk_udp(addr("100.64.9.9"), addr("100.64.0.7"), 53, 40000);
+        a.write_packet(&reply).await.unwrap();
+        let got = last_write(&dev);
+        let v = mux_nat::v4_view(&got).unwrap();
+        assert_eq!(v.dst, addr("100.65.0.3"), "restored to the anchored addr");
+        refpkt::assert_checksums_valid(&got);
+
+        let unrelated = refpkt::mk_udp(addr("100.64.9.9"), addr("100.64.0.7"), 53, 41000);
+        a.write_packet(&unrelated).await.unwrap();
+        assert_eq!(last_write(&dev), unrelated, "no flow ⇒ untouched");
+    }
+
+    /// ICMP echo round-trips by identifier — and an INBOUND echo request from
+    /// the peer never matches the entry our own outbound request created.
+    #[tokio::test]
+    async fn icmp_echo_round_trips_by_id() {
+        let (feed, dev, _mux, a, _b) = nat_fixture().await;
+        let req = refpkt::mk_icmp(addr("100.65.0.3"), addr("100.64.9.9"), 8, 77);
+        feed.send(Ok(req)).await.unwrap();
+        let got = recv_on(&a).await;
+        assert_eq!(mux_nat::v4_view(&got).unwrap().src, addr("100.64.0.7"));
+        refpkt::assert_checksums_valid(&got);
+
+        let reply = refpkt::mk_icmp(addr("100.64.9.9"), addr("100.64.0.7"), 0, 77);
+        a.write_packet(&reply).await.unwrap();
+        let got = last_write(&dev);
+        assert_eq!(mux_nat::v4_view(&got).unwrap().dst, addr("100.65.0.3"));
+        refpkt::assert_checksums_valid(&got);
+
+        // The peer pinging OUR wire address with the same id is not a reply
+        // and must pass untouched (type-8 never keys ingress).
+        let inbound_req = refpkt::mk_icmp(addr("100.64.9.9"), addr("100.64.0.7"), 8, 77);
+        a.write_packet(&inbound_req).await.unwrap();
+        assert_eq!(last_write(&dev), inbound_req);
+    }
+
+    /// Fragment policy: egress non-first fragments get the SAME source
+    /// rewrite (IP-header-only decision, L4 bytes untouched); ingress
+    /// fragments are NEVER rewritten, even when a flow matches.
+    #[tokio::test]
+    async fn fragments_follow_the_policy() {
+        let (feed, dev, _mux, a, _b) = nat_fixture().await;
+        // Record the flow with the offset-0 packet first.
+        let out = refpkt::mk_udp(addr("100.65.0.3"), addr("100.64.9.9"), 40000, 53);
+        feed.send(Ok(out)).await.unwrap();
+        let _ = recv_on(&a).await;
+
+        // A non-first fragment of the same datagram (offset 5, no L4 header).
+        let mut frag = refpkt::mk_udp(addr("100.65.0.3"), addr("100.64.9.9"), 40000, 53);
+        frag[6] = 0x00;
+        frag[7] = 0x05;
+        let ck = refpkt::ipv4_header_cksum(&frag);
+        frag[10..12].copy_from_slice(&ck.to_be_bytes());
+        let l4_before = frag[20..].to_vec();
+        feed.send(Ok(frag)).await.unwrap();
+        let got = recv_on(&a).await;
+        let v = mux_nat::v4_view(&got).unwrap();
+        assert_eq!(v.src, addr("100.64.0.7"), "fragment source rewritten");
+        assert_eq!(
+            u16::from_be_bytes([got[10], got[11]]),
+            refpkt::ipv4_header_cksum(&got),
+            "ip cksum patched"
+        );
+        assert_eq!(got[20..].to_vec(), l4_before, "L4 bytes untouched");
+
+        // An MF-flagged reply matching the recorded flow: untouched.
+        let mut mf_reply = refpkt::mk_udp(addr("100.64.9.9"), addr("100.64.0.7"), 53, 40000);
+        mf_reply[6] = 0x20;
+        let ck = refpkt::ipv4_header_cksum(&mf_reply);
+        mf_reply[10..12].copy_from_slice(&ck.to_be_bytes());
+        a.write_packet(&mf_reply).await.unwrap();
+        assert_eq!(
+            last_write(&dev),
+            mf_reply,
+            "ingress fragments never rewritten"
+        );
+    }
+
+    /// The v6 twin does not exist today (one overlay v6 per host) — a
+    /// derived-ULA packet with a cross-org embedded SOURCE trips the log-once
+    /// warn but passes byte-identical.
+    #[tokio::test]
+    async fn ula_v6_with_cross_org_embedded_src_is_untouched() {
+        let (feed, _dev, _mux, a, _b) = nat_fixture().await;
+        let mut pkt = ula_pkt([100, 64, 9, 9]);
+        // Source = derived ULA embedding org B's 100.65.0.3.
+        pkt[8] = 0xfd;
+        pkt[9] = 0x72;
+        pkt[10] = 0x6f;
+        pkt[11] = 0x6f;
+        pkt[12] = 0x6d;
+        pkt[13] = 0x6c;
+        pkt[20..24].copy_from_slice(&[100, 65, 0, 3]);
+        feed.send(Ok(pkt.clone())).await.unwrap();
+        assert_eq!(recv_on(&a).await, pkt, "v6 is observed, never rewritten");
+    }
+
+    /// A full flow table degrades NEW TCP/UDP flows to today's unrewritten
+    /// behavior (with a breadcrumb) — but stateless-safe ICMP still rewrites.
+    #[tokio::test]
+    async fn full_map_passes_tcp_through_and_still_rewrites_icmp() {
+        let (feed, _dev, mux, a, _b) = nat_fixture().await;
+        {
+            let mut st = mux.state.lock().unwrap();
+            let now = Instant::now();
+            for i in 0..FLOW_CAP as u32 {
+                let key = FlowKey {
+                    proto: mux_nat::PROTO_UDP,
+                    remote: Ipv4Addr::from(0x0A000001 + (i >> 16)),
+                    remote_port: 9,
+                    local_port: (i & 0xFFFF) as u16,
+                };
+                assert!(
+                    st.flows
+                        .note_egress(key, addr("100.65.0.3"), addr("100.64.0.7"), now)
+                );
+            }
+        }
+        let tcp = refpkt::mk_tcp(addr("100.65.0.3"), addr("100.64.9.9"), 50000, 22);
+        feed.send(Ok(tcp.clone())).await.unwrap();
+        assert_eq!(recv_on(&a).await, tcp, "untracked TCP passes unrewritten");
+
+        let icmp = refpkt::mk_icmp(addr("100.65.0.3"), addr("100.64.9.9"), 8, 5);
+        feed.send(Ok(icmp)).await.unwrap();
+        let got = recv_on(&a).await;
+        assert_eq!(mux_nat::v4_view(&got).unwrap().src, addr("100.64.0.7"));
+    }
+
+    /// Deregistering an org purges its flows; re-registering an org (same
+    /// address) keeps restoring — entries are keyed by addresses, never by
+    /// port identity.
+    #[tokio::test]
+    async fn deregister_purges_and_reregistration_keeps_restoring() {
+        let (feed, dev, mux, a, _b) = nat_fixture().await;
+        let out = refpkt::mk_udp(addr("100.65.0.3"), addr("100.64.9.9"), 40000, 53);
+        feed.send(Ok(out.clone())).await.unwrap();
+        let _ = recv_on(&a).await;
+
+        // Org B (the ORIG side of the mapping) leaves: the reply is no
+        // longer restored.
+        mux.deregister("orgB").expect("orgB registered");
+        let reply = refpkt::mk_udp(addr("100.64.9.9"), addr("100.64.0.7"), 53, 40000);
+        a.write_packet(&reply).await.unwrap();
+        assert_eq!(last_write(&dev), reply, "purged with its org");
+
+        // Fresh mapping, then org A (the WIRE side) re-registers: the entry
+        // still matches through the NEW port.
+        let _b2 = mux
+            .register("orgB", addr("100.65.0.3"), addr("255.255.252.0"))
+            .unwrap();
+        feed.send(Ok(out)).await.unwrap();
+        let _ = recv_on(&a).await;
+        let a2 = mux
+            .register("orgA", addr("100.64.0.7"), addr("255.192.0.0"))
+            .unwrap();
+        a2.write_packet(&reply).await.unwrap();
+        let got = last_write(&dev);
+        assert_eq!(mux_nat::v4_view(&got).unwrap().dst, addr("100.65.0.3"));
+    }
+
+    /// The kill switch restores byte-identical pre-fix behavior on both hooks.
+    #[tokio::test]
+    async fn kill_switch_disables_both_hooks() {
+        let (feed, dev, mux, a, _b) = nat_fixture().await;
+        // Record a flow while ON, then flip OFF: neither hook may act.
+        let out = refpkt::mk_udp(addr("100.65.0.3"), addr("100.64.9.9"), 40000, 53);
+        feed.send(Ok(out.clone())).await.unwrap();
+        let _ = recv_on(&a).await;
+        mux.set_nat_enabled(false);
+
+        feed.send(Ok(out.clone())).await.unwrap();
+        assert_eq!(recv_on(&a).await, out, "egress hook off");
+
+        let reply = refpkt::mk_udp(addr("100.64.9.9"), addr("100.64.0.7"), 53, 40000);
+        a.write_packet(&reply).await.unwrap();
+        assert_eq!(last_write(&dev), reply, "ingress hook off");
     }
 }
