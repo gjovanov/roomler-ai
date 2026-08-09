@@ -396,6 +396,33 @@ impl RelayCoordinator {
         }
     }
 
+    /// R2 — replace the LAN endpoints after a direct-plane rebuild. These
+    /// were constructor-only (relay grant handling advertises
+    /// `all_endpoints()` = these + the allocation), so every trickle after a
+    /// roam re-advertised the DEAD plane's addresses.
+    pub fn set_lan_endpoints(&mut self, endpoints: Vec<String>) {
+        self.lan_endpoints = endpoints;
+    }
+
+    /// R2 — update our own UDP-relay capability after a srflx re-gather.
+    /// Constructor-only until now, which FROZE half of
+    /// [`strategy_fingerprint`] for the runtime's life — the #355 latent
+    /// limitation: the exact incident the DERP regrade was built for (a
+    /// fleet-wide srflx outage recovering) was undetectable from our own
+    /// side; only the peer's srflx reappearing or a process restart could
+    /// unfreeze a pinned pair. A live value makes our half of the evidence
+    /// real.
+    pub fn set_udp_relay_ok(&mut self, ok: bool) {
+        if self.my_udp_relay_ok != ok {
+            info!(
+                was = self.my_udp_relay_ok,
+                now = ok,
+                "overlay relay: own UDP-relay capability changed (srflx re-gather)"
+            );
+        }
+        self.my_udp_relay_ok = ok;
+    }
+
     /// U1 — stamp the one-shot evidence for `node_id`'s NEXT relay request:
     /// the dead carrier's flavour + the `DeathReason` short string. Called by
     /// the health sweep's teardown right before its re-request.
