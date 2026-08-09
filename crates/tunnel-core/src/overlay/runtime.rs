@@ -636,6 +636,13 @@ pub enum OverlayEvent {
     /// PathMonitor's Q for the peer's incumbent tier; never affects
     /// eligibility. Gated by `OVERLAY_RTT_Q` (default on).
     RttSample { node_id: ObjectId, rtt_ms: u32 },
+    /// R3/R4 — the embedder observed a LAN-address-set change on a
+    /// control-WS reconnect (the `RuntimeFingerprint` lan_ips mismatch that
+    /// used to spawn a WHOLE NEW runtime beside this one — which was never
+    /// told, so both held direct sockets and the new one walked the
+    /// stable-port band). The runtime now rebuilds its direct plane in
+    /// place instead. Also useful for tests and future embedder triggers.
+    RebuildDirect,
 }
 
 /// Builds the WG carrier for a peer. Production wires a direct UDP socket
@@ -792,6 +799,60 @@ async fn run_srflx_keepalive(
         }
     }
 }
+
+/// R3 — spawn (or re-spawn, after a direct-plane rebuild) the srflx
+/// keepalive task. Extracted from `run()`'s startup so the rebuild executor
+/// can rebuild it against the NEW plane: the task captures its punch socket,
+/// advert and NAT class by value, so a plane swap must replace the whole
+/// task, not mutate it. `None` when any precondition is missing (no punch
+/// socket / no STUN server / keepalive disabled / nothing advertised) —
+/// exactly the startup semantics.
+#[allow(clippy::too_many_arguments)]
+fn spawn_srflx_keepalive(
+    direct_ctx: &Option<DirectCtx>,
+    stun_server: Option<SocketAddr>,
+    stun_rx: Option<mpsc::Receiver<crate::transport::stun::StunInbound>>,
+    stun_urls: &[String],
+    advertised: &[String],
+    my_nat: &Option<String>,
+    outbound: ControlTx,
+    reattach_rx: tokio::sync::watch::Receiver<u64>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let secs = direct::srflx_keepalive_secs();
+    match (
+        direct_ctx.as_ref().and_then(|c| c.punch.clone()),
+        stun_server,
+        stun_rx,
+    ) {
+        (Some((_, punch_sock)), Some(stun_server), Some(stun_rx))
+            if direct::srflx_enabled() && secs > 0 && !advertised.is_empty() =>
+        {
+            Some(tokio::spawn(run_srflx_keepalive(
+                punch_sock,
+                stun_rx,
+                stun_server,
+                stun_urls.to_vec(),
+                direct_ctx
+                    .as_ref()
+                    .map(|c| c.socks.iter().map(|(ip, _)| *ip).collect())
+                    .unwrap_or_default(),
+                advertised.to_vec(),
+                my_nat.clone(),
+                outbound,
+                Duration::from_secs(secs),
+                reattach_rx,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// R3 — minimum spacing between direct-plane rebuilds (the net-change
+/// trigger respects it; resume and the embedder's fingerprint push bypass
+/// it — those are authoritative). A rebuild is cheap but not free (~900 ms
+/// worst-case port re-bind + a full re-establish wave), and interface
+/// events arrive in storms.
+const REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// How the runtime obtains a carrier for each peer.
 enum CarrierMode {
@@ -1233,6 +1294,10 @@ impl OverlayRuntime {
         // `mut` — the srflx gather (below, after the first netmap) records the
         // punch socket into it (Phase C).
         let mut direct_ctx = self.setup_direct().await;
+        // R3 — the non-plane half of the advertised set (agent-config
+        // extras), kept so a rebuild can recompose `advertised` from the NEW
+        // plane instead of replaying the startup snapshot.
+        let base_endpoints = endpoints.clone();
         let mut advertised = endpoints;
         if let Some(ctx) = &direct_ctx {
             advertised.extend(ctx.endpoints.iter().cloned());
@@ -1281,6 +1346,7 @@ impl OverlayRuntime {
                 Some(OverlayEvent::RelayGrant { .. }) => continue,  // pre-netmap; ignore
                 Some(OverlayEvent::ForceDerp { .. }) => continue,   // pre-netmap; ignore
                 Some(OverlayEvent::RttSample { .. }) => continue,   // pre-netmap; ignore
+                Some(OverlayEvent::RebuildDirect) => continue,      // pre-netmap; no plane yet
                 None => return,
             }
         };
@@ -1359,9 +1425,9 @@ impl OverlayRuntime {
         let gathered = self
             .gather_and_advertise_srflx(&mut direct_ctx, &network.stun_urls)
             .await;
-        let srflx_stun_server: Option<SocketAddr> = gathered.stun_server;
-        let srflx_advertised: Vec<String> = gathered.advertised;
-        let srflx_my_nat: Option<String> = gathered.my_nat;
+        let mut srflx_stun_server: Option<SocketAddr> = gathered.stun_server;
+        let mut srflx_advertised: Vec<String> = gathered.advertised;
+        let mut srflx_my_nat: Option<String> = gathered.my_nat;
 
         // Phase A/B — receiver for AUTHENTICATED inbound direct handshakes (a
         // NAT'd client dialing our public endpoint, or a known peer that roamed
@@ -1397,35 +1463,26 @@ impl OverlayRuntime {
         // restores it on the fresh session. Dropped when run() returns,
         // which ends the task.
         let (srflx_reattach_tx, srflx_reattach_rx) = tokio::sync::watch::channel(0u64);
-        let srflx_keepalive = {
-            let secs = direct::srflx_keepalive_secs();
-            match (
-                direct_ctx.as_ref().and_then(|c| c.punch.clone()),
-                srflx_stun_server,
-                wg.take_stun_events(),
-            ) {
-                (Some((_, punch_sock)), Some(stun_server), Some(stun_rx))
-                    if direct::srflx_enabled() && secs > 0 && !srflx_advertised.is_empty() =>
-                {
-                    Some(tokio::spawn(run_srflx_keepalive(
-                        punch_sock,
-                        stun_rx,
-                        stun_server,
-                        network.stun_urls.clone(),
-                        direct_ctx
-                            .as_ref()
-                            .map(|c| c.socks.iter().map(|(ip, _)| *ip).collect())
-                            .unwrap_or_default(),
-                        srflx_advertised.clone(),
-                        srflx_my_nat.clone(),
-                        self.outbound.clone(),
-                        Duration::from_secs(secs),
-                        srflx_reattach_rx,
-                    )))
-                }
-                _ => None,
-            }
-        };
+        let mut srflx_keepalive = spawn_srflx_keepalive(
+            &direct_ctx,
+            srflx_stun_server,
+            wg.take_stun_events(),
+            &network.stun_urls,
+            &srflx_advertised,
+            &srflx_my_nat,
+            self.outbound.clone(),
+            srflx_reattach_rx,
+        );
+        // R3 — direct-plane rebuild scheduling: triggers (an addr/iface
+        // event whose LAN-IP set actually changed, a resume-from-suspend, or
+        // the embedder's fingerprint push) set the flag; ONE executor at the
+        // top of the fallback tick runs the ordered sequence. `last_rebuild`
+        // paces the net-change trigger; resume + embedder pushes clear it
+        // (authoritative). `last_netcheck` debounces the gather behind
+        // interface-event storms.
+        let mut pending_rebuild: Option<&'static str> = None;
+        let mut last_rebuild: Option<Instant> = None;
+        let mut last_netcheck: Option<Instant> = None;
 
         // Latest netmap view (node_id → peer), so the fallback sweep can drive
         // the relay path for a downgraded peer without waiting for a netmap.
@@ -1849,14 +1906,93 @@ impl OverlayRuntime {
                         // P3 PR-A — same clean slate in the monitor (probe
                         // bookkeeping survives, like `upgrade_probes` does).
                         self.shadow(|s| s.mon.on_resume());
-                        let peers_now: Vec<NetmapPeer> = current_peers.values().cloned().collect();
-                        self.install_peers(
-                            &mut wg, &mut by_node, &mut relay, &tun, &peers_now,
-                            direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq,
-                            "resume",
-                        ).await;
-                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        // R3 — a laptop resumes on a DIFFERENT network more
+                        // often than the same one, and the old sockets are
+                        // pinned (IP_UNICAST_IF) to pre-sleep interfaces —
+                        // rebuild the whole direct plane rather than reusing
+                        // the sockets verbatim (the pre-R3 behavior). The
+                        // executor below rebinds + re-joins + re-gathers +
+                        // installs; authoritative, so the cooldown clears.
+                        pending_rebuild = Some("resume");
+                        last_rebuild = None;
+                    }
+                    // R3 — the ONE direct-plane rebuild executor: triggers
+                    // only set `pending_rebuild`; this runs the ordered
+                    // sequence (teardown → retire → rebind → demux → join →
+                    // gather → coordinator swap → keepalive respawn →
+                    // re-establish). Ordering is load-bearing throughout —
+                    // see `rebuild_direct_plane_sockets` and the join/gather
+                    // contract on `gather_and_advertise_srflx`.
+                    if let Some(reason) = pending_rebuild {
+                        let rebuild_due =
+                            last_rebuild.is_none_or(|t| t.elapsed() >= REBUILD_COOLDOWN);
+                        if rebuild_due {
+                            pending_rebuild = None;
+                            last_rebuild = Some(Instant::now());
+                            let t0 = Instant::now();
+                            warn!(reason, "overlay: rebuilding the direct plane");
+                            // The keepalive owns a punch-socket Arc by value —
+                            // down first so the old ports can actually free.
+                            if let Some(h) = srflx_keepalive.take() {
+                                h.abort();
+                            }
+                            let stun_rx = self
+                                .rebuild_direct_plane_sockets(
+                                    &mut wg, &mut by_node, &mut upgrade_probes, &mut relay,
+                                    &mut relay_bq, &mut alloc_q, &tun, &mut direct_ctx,
+                                )
+                                .await;
+                            // Fresh join FROM THE NEW PLANE (the server's
+                            // re-join updates lan_endpoints AND clears srflx
+                            // — which is why the gather comes after).
+                            advertised = base_endpoints.clone();
+                            if let Some(ctx) = direct_ctx.as_ref() {
+                                advertised.extend(ctx.endpoints.iter().cloned());
+                            }
+                            if self
+                                .outbound
+                                .send(self.make_join(advertised.clone()))
+                                .await
+                                .is_err()
+                            {
+                                warn!("overlay: rebuild join failed (detached); reattach will re-join");
+                            }
+                            let gathered = self
+                                .gather_and_advertise_srflx(&mut direct_ctx, &network.stun_urls)
+                                .await;
+                            srflx_stun_server = gathered.stun_server;
+                            srflx_advertised = gathered.advertised;
+                            srflx_my_nat = gathered.my_nat;
+                            if let Some(r) = relay.as_mut() {
+                                r.set_lan_endpoints(
+                                    direct_ctx
+                                        .as_ref()
+                                        .map(|c| c.endpoints.clone())
+                                        .unwrap_or_default(),
+                                );
+                                r.set_udp_relay_ok(!srflx_advertised.is_empty());
+                            }
+                            srflx_keepalive = spawn_srflx_keepalive(
+                                &direct_ctx,
+                                srflx_stun_server,
+                                stun_rx,
+                                &network.stun_urls,
+                                &srflx_advertised,
+                                &srflx_my_nat,
+                                self.outbound.clone(),
+                                srflx_reattach_tx.subscribe(),
+                            );
+                            let peers_now: Vec<NetmapPeer> =
+                                current_peers.values().cloned().collect();
+                            self.install_peers(
+                                &mut wg, &mut by_node, &mut relay, &tun, &peers_now,
+                                direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq,
+                                "rebuild",
+                            ).await;
+                            self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                            warn_if_slow("rebuild_direct_plane", t0);
+                        }
                     }
                     let t0 = Instant::now();
                     self.sweep_carrier_health(
@@ -1983,6 +2119,38 @@ impl OverlayRuntime {
                     match maybe_route_evt {
                         Some(first) => {
                             let burst = route_watch.as_mut().map(|w| w.drain()).unwrap_or(0);
+                            // R3 — an ADDRESS/INTERFACE-tagged event (N4) is
+                            // the roam signal. Debounced behind the same wave
+                            // interval, then gated on the ONLY thing that
+                            // justifies a plane rebuild: the sorted LAN IP
+                            // SET actually changed (the fingerprint's own
+                            // rule — IPs, never ifindexes, which Windows
+                            // renumbers without addresses changing). Routes
+                            // alone never trigger: a filter-only VPN changes
+                            // no addresses, and Stage 2's poke owns that
+                            // class.
+                            if first.starts_with("addr") || first.starts_with("iface") {
+                                let check_due = last_netcheck.is_none_or(|t| {
+                                    t.elapsed() >= super::route_events::ROUTE_WAVE_MIN_INTERVAL
+                                });
+                                if check_due && pending_rebuild.is_none() {
+                                    last_netcheck = Some(Instant::now());
+                                    let mut now_ips = direct::gather_lan_ips();
+                                    now_ips.sort_unstable();
+                                    let mut plane_ips: Vec<Ipv4Addr> = direct_ctx
+                                        .as_ref()
+                                        .map(|c| c.my_ips.clone())
+                                        .unwrap_or_default();
+                                    plane_ips.sort_unstable();
+                                    if now_ips != plane_ips {
+                                        info!(
+                                            ?now_ips, ?plane_ips,
+                                            "overlay: LAN address set changed — scheduling a direct-plane rebuild"
+                                        );
+                                        pending_rebuild = Some("net-change");
+                                    }
+                                }
+                            }
                             let due = last_route_wave
                                 .is_none_or(|t| t.elapsed() >= super::route_events::ROUTE_WAVE_MIN_INTERVAL);
                             if due {
@@ -2383,6 +2551,14 @@ impl OverlayRuntime {
                                 s.mon.on_rtt_sample(&node_id, tier, rtt_ms);
                             });
                         }
+                    }
+                    Some(OverlayEvent::RebuildDirect) => {
+                        // R4 — the embedder saw the LAN-IP fingerprint change
+                        // on a WS reconnect. Authoritative: bypass the
+                        // cooldown; the tick executor runs the sequence.
+                        info!("overlay: embedder requested a direct-plane rebuild (fingerprint change)");
+                        pending_rebuild = Some("ws-fingerprint");
+                        last_rebuild = None;
                     }
                     None => break,
                 },
