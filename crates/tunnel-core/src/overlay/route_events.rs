@@ -117,7 +117,9 @@ mod imp {
     use tokio::sync::mpsc::UnboundedSender;
     use windows_sys::Win32::Foundation::{HANDLE, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        CancelMibChangeNotify2, MIB_IPFORWARD_ROW2, MIB_NOTIFICATION_TYPE, NotifyRouteChange2,
+        CancelMibChangeNotify2, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+        MIB_UNICASTIPADDRESS_ROW, NotifyIpInterfaceChange, NotifyRouteChange2,
+        NotifyUnicastIpAddressChange,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
 
@@ -127,6 +129,14 @@ mod imp {
 
     pub(super) struct WatchGuard {
         handle: HANDLE,
+        /// N4 — the address- and interface-change registrations (null when
+        /// their registration failed; best-effort, unlike the load-bearing
+        /// route watch). An address appearing/vanishing is the direct-plane
+        /// rebuild's trigger (R3): until N4 there was NO address-change
+        /// subscription anywhere — `lan_ips` was only re-sampled when a
+        /// control-WS session restarted.
+        addr_handle: HANDLE,
+        iface_handle: HANDLE,
         ctx: *mut Ctx,
     }
     // The raw pointers are only touched in Drop (after CancelMibChangeNotify2
@@ -167,6 +177,58 @@ mod imp {
         let _ = ctx.tx.send(desc);
     }
 
+    /// N4 — SYSTEM-worker callback for unicast-ADDRESS changes: the signal a
+    /// laptop roam produces (an interface address appearing or vanishing).
+    /// Same contract as the route callback: format-and-send only.
+    unsafe extern "system" fn on_addr_change(
+        caller_context: *const c_void,
+        row: *const MIB_UNICASTIPADDRESS_ROW,
+        notification_type: MIB_NOTIFICATION_TYPE,
+    ) {
+        if caller_context.is_null() {
+            return;
+        }
+        let ctx = unsafe { &*(caller_context as *const Ctx) };
+        let desc = if row.is_null() {
+            format!("addr type={notification_type}")
+        } else {
+            let row = unsafe { &*row };
+            let family = unsafe { row.Address.si_family };
+            if family == AF_INET {
+                let o = unsafe { row.Address.Ipv4.sin_addr.S_un.S_addr }.to_ne_bytes();
+                format!(
+                    "addr type={notification_type} ip={}.{}.{}.{}",
+                    o[0], o[1], o[2], o[3]
+                )
+            } else if family == AF_INET6 {
+                format!("addr type={notification_type} ip=v6")
+            } else {
+                format!("addr type={notification_type} family={family}")
+            }
+        };
+        let _ = ctx.tx.send(desc);
+    }
+
+    /// N4 — SYSTEM-worker callback for INTERFACE parameter changes
+    /// (up/down, metric, forwarding). Format-and-send only.
+    unsafe extern "system" fn on_iface_change(
+        caller_context: *const c_void,
+        row: *const MIB_IPINTERFACE_ROW,
+        notification_type: MIB_NOTIFICATION_TYPE,
+    ) {
+        if caller_context.is_null() {
+            return;
+        }
+        let ctx = unsafe { &*(caller_context as *const Ctx) };
+        let desc = if row.is_null() {
+            format!("iface type={notification_type}")
+        } else {
+            let idx = unsafe { (*row).InterfaceIndex };
+            format!("iface type={notification_type} ifindex={idx}")
+        };
+        let _ = ctx.tx.send(desc);
+    }
+
     pub(super) fn spawn(tx: UnboundedSender<String>) -> Option<WatchGuard> {
         let ctx = Box::into_raw(Box::new(Ctx { tx }));
         let mut handle: HANDLE = core::ptr::null_mut();
@@ -186,15 +248,61 @@ mod imp {
             drop(unsafe { Box::from_raw(ctx) });
             return None;
         }
-        Some(WatchGuard { handle, ctx })
+        // N4 — the address + interface watches share the context. Best-effort:
+        // the route watch above is the load-bearing one (its failure keeps the
+        // 2 s tick); these two only ACCELERATE reactions to a roam, so a
+        // registration failure is a warn, not a None.
+        let mut addr_handle: HANDLE = core::ptr::null_mut();
+        let rc = unsafe {
+            NotifyUnicastIpAddressChange(
+                AF_UNSPEC,
+                Some(on_addr_change),
+                ctx as *const c_void,
+                false,
+                &mut addr_handle,
+            )
+        };
+        if rc != NO_ERROR {
+            tracing::warn!(
+                rc,
+                "overlay: NotifyUnicastIpAddressChange registration failed"
+            );
+            addr_handle = core::ptr::null_mut();
+        }
+        let mut iface_handle: HANDLE = core::ptr::null_mut();
+        let rc = unsafe {
+            NotifyIpInterfaceChange(
+                AF_UNSPEC,
+                Some(on_iface_change),
+                ctx as *const c_void,
+                false,
+                &mut iface_handle,
+            )
+        };
+        if rc != NO_ERROR {
+            tracing::warn!(rc, "overlay: NotifyIpInterfaceChange registration failed");
+            iface_handle = core::ptr::null_mut();
+        }
+        Some(WatchGuard {
+            handle,
+            addr_handle,
+            iface_handle,
+            ctx,
+        })
     }
 
     impl Drop for WatchGuard {
         fn drop(&mut self) {
             unsafe {
-                // Blocks until in-flight callbacks complete — after this the
-                // context box is provably unreferenced.
+                // Blocks until in-flight callbacks complete — after all three
+                // cancels the context box is provably unreferenced.
                 CancelMibChangeNotify2(self.handle);
+                if !self.addr_handle.is_null() {
+                    CancelMibChangeNotify2(self.addr_handle);
+                }
+                if !self.iface_handle.is_null() {
+                    CancelMibChangeNotify2(self.iface_handle);
+                }
                 drop(Box::from_raw(self.ctx));
             }
         }
