@@ -3298,6 +3298,14 @@ mod tests {
         async fn defend_self_route(&self, ip: Ipv4Addr) {
             self.routes.lock().unwrap().push(("defend", ip));
         }
+        async fn defend_block_floor(&self) {
+            // Change B — recorded with the unspecified address (the step has
+            // no single IP; its CIDR math is unit-tested in `tun.rs`).
+            self.routes
+                .lock()
+                .unwrap()
+                .push(("floor", Ipv4Addr::UNSPECIFIED));
+        }
     }
 
     /// rc.278 — the route-guard re-assert must cover our OWN overlay `/32`, not
@@ -3323,11 +3331,16 @@ mod tests {
         run_defense_wave(t, defended_routes(&by_node, self_v4)).await;
 
         let got = tun.calls();
-        assert_eq!(got.len(), peers.len() + 1);
+        assert_eq!(got.len(), peers.len() + 2);
         assert_eq!(
             got.last(),
+            Some(&("floor", Ipv4Addr::UNSPECIFIED)),
+            "the block-floor maintenance runs LAST (Change B)"
+        );
+        assert_eq!(
+            got.get(got.len() - 2),
             Some(&("defend", self_v4)),
-            "our own address defended LAST, after every peer re-assert"
+            "our own address defended after every peer re-assert"
         );
         let added: HashSet<Ipv4Addr> = got
             .iter()
@@ -3348,9 +3361,10 @@ mod tests {
     }
 
     /// rc.285 — the defended-set composition is declarative: every installed
-    /// peer exactly once, self exactly once and LAST, and nothing else. (The
-    /// P5 exit `/1`s are deliberately ABSENT — their re-assert is inline-only
-    /// for the teardown mutual-exclusion; see [`Defend`].)
+    /// peer exactly once, then self, then (Change B) the block-floor step
+    /// LAST, and nothing else. (The P5 exit `/1`s are deliberately ABSENT —
+    /// their re-assert is inline-only for the teardown mutual-exclusion; see
+    /// [`Defend`].)
     #[test]
     fn defended_set_lists_every_peer_once_and_self_last() {
         let self_v4 = Ipv4Addr::new(100, 64, 0, 28);
@@ -3365,21 +3379,26 @@ mod tests {
         }
 
         let set = defended_routes(&by_node, self_v4);
-        assert_eq!(set.len(), ips.len() + 1);
-        assert_eq!(set.last(), Some(&Defend::EvictSelf(self_v4)));
+        assert_eq!(set.len(), ips.len() + 2);
+        assert_eq!(set.last(), Some(&Defend::BlockFloor));
+        assert_eq!(
+            set.get(set.len() - 2),
+            Some(&Defend::EvictSelf(self_v4)),
+            "self defended after every peer, before the floor step"
+        );
         let asserted: HashSet<Ipv4Addr> = set
             .iter()
             .filter_map(|d| match d {
                 Defend::AssertPeer(ip) => Some(*ip),
-                Defend::EvictSelf(_) => None,
+                Defend::EvictSelf(_) | Defend::BlockFloor => None,
             })
             .collect();
         assert_eq!(asserted, ips.iter().copied().collect::<HashSet<_>>());
 
-        // An empty mesh still defends our own address.
+        // An empty mesh still defends our own address + the floor.
         assert_eq!(
             defended_routes(&HashMap::new(), self_v4),
-            vec![Defend::EvictSelf(self_v4)]
+            vec![Defend::EvictSelf(self_v4), Defend::BlockFloor]
         );
     }
 

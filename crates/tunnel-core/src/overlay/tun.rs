@@ -95,6 +95,26 @@ pub trait TunIo: Send + Sync {
     /// Remove a CIDR route installed by [`add_cidr_route`]. Best-effort.
     async fn del_cidr_route(&self, _cidr: &str) {}
 
+    /// Change B (corp-gateway leak) — maintain the BLOCK-FLOOR routes: the
+    /// four `plen+2` sub-prefixes of the connected overlay block, installed
+    /// via this device. A full-tunnel VPN that claims a LONGER prefix than the
+    /// block (Check Point installs `100.64.0.0/11` at metric 1) out-specifics
+    /// both the connected `/10` and the rc.288 metric-0 defense — longest
+    /// prefix wins BEFORE metric — so whenever a peer's `/32` is momentarily
+    /// absent (netmap churn, carrier rebuild), packets for it leak to the
+    /// CORP GATEWAY (field 2026-08-08, pc50045: `Antwort von 10.16.6.34:
+    /// Zielhost nicht erreichbar`). The `/12` floors out-specific the `/11`,
+    /// so absent-`/32` traffic drops locally at the TUN instead.
+    ///
+    /// ⚠️ WITHHELD (and actively retracted) when the host's own uplink lives
+    /// inside the block: some ISPs assign CGNAT (`100.64.0.0/10`) WAN
+    /// addresses, and claiming the block there can blackhole the host's own
+    /// internet — the self-wedge the per-peer-`/32` design exists to avoid.
+    /// The gate fails toward WITHHOLD (an unreadable interface table installs
+    /// nothing). Default no-op (mock, netstack, platforms without the
+    /// route-war doctrine).
+    async fn defend_block_floor(&self) {}
+
     /// P5 exit-node — install a `/32` (host) **exemption** route for `ip` via the
     /// host's ORIGINAL default gateway (captured at TUN bring-up), NOT via this
     /// overlay device. When an exit-node client installs the split-default
@@ -110,6 +130,113 @@ pub trait TunIo: Send + Sync {
 
     /// Remove a `/32` exemption installed by [`add_host_exemption`]. Best-effort.
     async fn del_host_exemption(&self, _ip: std::net::IpAddr) {}
+}
+
+/// Change B — the four block-floor CIDRs for a connected block `net/plen`:
+/// its `plen+2` sub-prefixes (a `/10` → four `/12`s). Two bits longer beats
+/// any VPN claim of `plen+1` (the observed Check Point `/11`) by longest
+/// prefix while staying a fixed, tiny set. `None` when the block can't be
+/// floored (`plen` 0 or > 30). Pure — unit-tested against the real overlay
+/// block.
+#[cfg(any(windows, test))]
+pub(crate) fn floor_cidrs(net: std::net::Ipv4Addr, plen: u8) -> Option<[String; 4]> {
+    if plen == 0 || plen > 30 {
+        return None;
+    }
+    let base = u32::from(net) & (u32::MAX << (32 - plen));
+    let step = 1u32 << (32 - plen - 2);
+    Some(std::array::from_fn(|i| {
+        format!(
+            "{}/{}",
+            std::net::Ipv4Addr::from(base + i as u32 * step),
+            plen + 2
+        )
+    }))
+}
+
+/// Change B — may the block floor be installed? `false` (WITHHOLD) when any
+/// non-overlay interface address OR the original default gateway sits inside
+/// the block — the ISP-CGNAT-uplink case where claiming the block would
+/// blackhole the host's own internet. Pure; the caller supplies the gathered
+/// addresses and fails toward withhold when it cannot gather.
+#[cfg(any(windows, test))]
+pub(crate) fn floor_safe(
+    non_overlay_v4: &[std::net::Ipv4Addr],
+    orig_gateway_v4: Option<std::net::Ipv4Addr>,
+    block: (std::net::Ipv4Addr, u8),
+) -> bool {
+    let (net, plen) = block;
+    if plen == 0 {
+        return false;
+    }
+    let mask = u32::MAX << (32 - plen);
+    let net = u32::from(net) & mask;
+    let inside = |ip: std::net::Ipv4Addr| (u32::from(ip) & mask) == net;
+    !non_overlay_v4.iter().copied().any(inside) && !orig_gateway_v4.is_some_and(inside)
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use std::net::Ipv4Addr;
+
+    use super::{floor_cidrs, floor_safe};
+
+    const BLOCK: (Ipv4Addr, u8) = (Ipv4Addr::new(100, 64, 0, 0), 10);
+
+    /// The real overlay block floors to exactly the four /12s that
+    /// out-specific a corp `/11`, covering the /10 with no gap.
+    #[test]
+    fn floors_of_the_overlay_block() {
+        let got = floor_cidrs(BLOCK.0, BLOCK.1).unwrap();
+        assert_eq!(
+            got,
+            [
+                "100.64.0.0/12".to_string(),
+                "100.80.0.0/12".to_string(),
+                "100.96.0.0/12".to_string(),
+                "100.112.0.0/12".to_string(),
+            ]
+        );
+        // Unfloorable blocks: /0 (nonsense) and /31 (can't add two bits).
+        assert!(floor_cidrs(Ipv4Addr::UNSPECIFIED, 0).is_none());
+        assert!(floor_cidrs(Ipv4Addr::new(10, 0, 0, 0), 31).is_none());
+        // A host-bit-dirty net is normalized, not shifted.
+        assert_eq!(
+            floor_cidrs(Ipv4Addr::new(100, 64, 0, 28), 10).unwrap()[0],
+            "100.64.0.0/12"
+        );
+    }
+
+    /// The withhold gate: an ordinary uplink installs; a CGNAT WAN address or
+    /// a CGNAT default gateway withholds; boundary addresses are classified
+    /// exactly.
+    #[test]
+    fn floor_gate_withholds_on_cgnat_uplink() {
+        let lan = [Ipv4Addr::new(192, 168, 68, 5), Ipv4Addr::new(172, 30, 1, 2)];
+        let gw = Some(Ipv4Addr::new(192, 168, 68, 1));
+        assert!(floor_safe(&lan, gw, BLOCK));
+        // An ISP CGNAT WAN address inside the block ⇒ withhold.
+        let cgnat = [lan[0], Ipv4Addr::new(100, 91, 3, 7)];
+        assert!(!floor_safe(&cgnat, gw, BLOCK));
+        // A CGNAT default gateway alone ⇒ withhold.
+        assert!(!floor_safe(
+            &lan,
+            Some(Ipv4Addr::new(100, 127, 255, 254)),
+            BLOCK
+        ));
+        // Block boundaries: 100.63.255.255 is outside, 100.64.0.0 inside,
+        // 100.127.255.255 inside, 100.128.0.0 outside.
+        assert!(floor_safe(&[Ipv4Addr::new(100, 63, 255, 255)], None, BLOCK));
+        assert!(!floor_safe(&[Ipv4Addr::new(100, 64, 0, 0)], None, BLOCK));
+        assert!(!floor_safe(
+            &[Ipv4Addr::new(100, 127, 255, 255)],
+            None,
+            BLOCK
+        ));
+        assert!(floor_safe(&[Ipv4Addr::new(100, 128, 0, 0)], None, BLOCK));
+        // No gateway captured is NOT itself a reason to withhold.
+        assert!(floor_safe(&lan, None, BLOCK));
+    }
 }
 
 /// The real OS TUN device. Behind `overlay-l3` so the WG core + the
@@ -687,6 +814,11 @@ mod system {
         /// (best-effort — the overlay still works on non-locked hosts).
         #[cfg(windows)]
         _wfp: Option<crate::overlay::wfp::WfpGuard>,
+        /// Change B — the last block-floor decision (0 = unknown, 1 = safe /
+        /// asserted, 2 = withheld), so the defense wave logs the DECISION
+        /// only when it flips instead of once per 2–30 s wave.
+        #[cfg(windows)]
+        floor_state: std::sync::atomic::AtomicU8,
     }
 
     /// rc.209 — bounded retry-with-backoff around a fallible create. Returns the
@@ -1438,8 +1570,35 @@ mod system {
                 orig_default_v6,
                 #[cfg(windows)]
                 _wfp,
+                #[cfg(windows)]
+                floor_state: std::sync::atomic::AtomicU8::new(0),
             })
         }
+    }
+
+    /// Change B — every IPv4 address on every interface EXCEPT the overlay
+    /// adapter itself (matched by interface NAME, so a sibling org's address
+    /// on the shared adapter is excluded too) and loopback. Deliberately
+    /// UNFILTERED otherwise — unlike `direct::gather_lan_ips`, which *skips*
+    /// CGNAT addresses, because an ISP-CGNAT WAN address is exactly what the
+    /// floor gate must detect. `None` when enumeration fails OR the overlay
+    /// adapter can't be identified — the caller treats both as WITHHOLD.
+    #[cfg(windows)]
+    fn non_overlay_v4_addrs(overlay_if: &str) -> Option<Vec<Ipv4Addr>> {
+        let addrs = if_addrs::get_if_addrs().ok()?;
+        if !addrs.iter().any(|a| a.name == overlay_if) {
+            return None;
+        }
+        Some(
+            addrs
+                .into_iter()
+                .filter(|a| a.name != overlay_if)
+                .filter_map(|a| match a.ip() {
+                    std::net::IpAddr::V4(v) if !v.is_loopback() => Some(v),
+                    _ => None,
+                })
+                .collect(),
+        )
     }
 
     #[async_trait]
@@ -1707,6 +1866,55 @@ mod system {
             {
                 let _ = (cidr, v6);
                 Ok(())
+            }
+        }
+
+        async fn defend_block_floor(&self) {
+            #[cfg(windows)]
+            {
+                use std::sync::atomic::Ordering;
+                let Some((net, plen)) = self.connected_v4 else {
+                    return;
+                };
+                let Some(floors) = super::floor_cidrs(net, plen) else {
+                    return;
+                };
+                // The gate FAILS TOWARD WITHHOLD: an unreadable interface
+                // table (or an adapter whose own address isn't visible yet —
+                // the #388 listing race) installs nothing this wave and
+                // retries on the next.
+                let safe = non_overlay_v4_addrs(&self.if_name).is_some_and(|addrs| {
+                    super::floor_safe(
+                        &addrs,
+                        self.orig_default.as_ref().map(|r| r.gateway),
+                        (net, plen),
+                    )
+                });
+                // Log the DECISION only on a flip — the wave re-runs this
+                // every 2–30 s.
+                let state = if safe { 1 } else { 2 };
+                if self.floor_state.swap(state, Ordering::Relaxed) != state {
+                    if safe {
+                        tracing::info!(
+                            block = %format!("{net}/{plen}"),
+                            "overlay: installing block-floor routes (corp-VPN /11 leak guard)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            block = %format!("{net}/{plen}"),
+                            "overlay: WITHHOLDING block-floor routes — the uplink or default \
+                             gateway sits inside the overlay block (ISP CGNAT?); absent-peer \
+                             traffic may reach the physical gateway instead of dropping locally"
+                        );
+                    }
+                }
+                for c in &floors {
+                    if safe {
+                        let _ = self.add_cidr_route(c).await;
+                    } else {
+                        self.del_cidr_route(c).await;
+                    }
+                }
             }
         }
 
