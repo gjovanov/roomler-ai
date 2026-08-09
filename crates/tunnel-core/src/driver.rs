@@ -764,15 +764,24 @@ async fn handle_local_connection(
 
     let dc = demux.dc();
     debug!(flow_id, dc_index, %peer_addr, "running flow");
+    // Keep a handle so the close can report the flow's totals: only the
+    // endpoints ever see tunnel payload (it rides the data channel), so
+    // if we don't send them the audit row records zero forever.
+    let stats_for_audit = Arc::clone(&stats);
     let close_reason = run_flow(tcp, dc, flow_id, from_dc, on_local_eof, stats).await;
     info!(flow_id, ?close_reason, "flow ended");
 
-    // Audit close.
+    // Audit close. TCP-side counters, not `dc_send`/`dc_recv`: those carry
+    // the 4-byte frame prefix, so they wouldn't be comparable with QUIC.
+    let (tcp_read, _dc_send, _dc_recv, tcp_write, _depth) = stats_for_audit.snapshot();
     let _ = sink
         .send(ClientMsg::TcpClosed {
             session_id,
             flow_id,
             reason: close_reason,
+            // Named from the local app's side: `in` is what it received.
+            bytes_in: tcp_write,
+            bytes_out: tcp_read,
         })
         .await;
 
@@ -1668,13 +1677,19 @@ async fn handle_local_connection_quic(
         ..Default::default()
     });
     debug!(flow_id, %peer_addr, "running quic flow");
+    let stats_for_audit = Arc::clone(&stats);
     let close_reason = run_flow_quic(tcp, send, recv, flow_id, stats).await;
     info!(flow_id, ?close_reason, "quic flow ended");
+    // Same TCP-side counters as the WebRTC path, which is the point of
+    // measuring there: the two transports stay directly comparable.
+    let (tcp_read, _dc_send, _dc_recv, tcp_write, _depth) = stats_for_audit.snapshot();
     let _ = sink
         .send(ClientMsg::TcpClosed {
             session_id,
             flow_id,
             reason: close_reason,
+            bytes_in: tcp_write,
+            bytes_out: tcp_read,
         })
         .await;
     active_flows.lock().await.remove(&flow_id);
@@ -1907,7 +1922,28 @@ mod tests {
             .await
             .expect("expected TcpClosed after flow end")
         {
-            ClientMsg::TcpClosed { flow_id: f, .. } => assert_eq!(f, flow_id),
+            ClientMsg::TcpClosed {
+                flow_id: f,
+                bytes_in,
+                bytes_out,
+                ..
+            } => {
+                assert_eq!(f, flow_id);
+                // Wave 3 — the close carries the flow's REAL totals. Only
+                // the endpoints ever see tunnel payload, so if these were
+                // plumbed but never populated the audit row would keep
+                // recording zero and nobody would notice. The echo loop
+                // moved the same payload each way.
+                let n = b"ping over client quic".len() as u64;
+                assert_eq!(
+                    bytes_out, n,
+                    "bytes_out must be what the local app SENT (tcp_read)"
+                );
+                assert_eq!(
+                    bytes_in, n,
+                    "bytes_in must be what the local app RECEIVED (tcp_write)"
+                );
+            }
             other => panic!("expected TcpClosed, got {other:?}"),
         }
     }

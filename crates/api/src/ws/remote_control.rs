@@ -1695,10 +1695,15 @@ async fn relay_tunnel_msg_from_agent(state: &AppState, parsed: ClientMsg) -> Opt
             .await;
             None
         }
+        // The AGENT end of a flow closing. Byte counts are deliberately
+        // ignored here: the audit row is written once, from the
+        // ORIGINATOR's close (see `ws::tunnel::audit_tcp_close`), and
+        // booking both ends would double every flow's volume.
         ClientMsg::TcpClosed {
             session_id,
             flow_id,
             reason,
+            ..
         } => {
             relay_to_client(
                 state,
