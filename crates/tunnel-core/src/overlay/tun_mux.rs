@@ -231,6 +231,7 @@ impl TunMux {
         Ok(Arc::new(MuxPort {
             org: org.to_string(),
             self_ip,
+            block: (Ipv4Addr::from(block.0), block.1),
             real: self.real.clone(),
             state: self.state.clone(),
             rx: tokio::sync::Mutex::new(rx),
@@ -493,6 +494,10 @@ pub struct MuxPort {
     /// This org's own address on the shared device — the mux NAT's ingress
     /// gate ([`Self::restore_inbound_dst`]).
     self_ip: Ipv4Addr,
+    /// This org's block `(net, plen)` — what THIS port's
+    /// [`TunIo::defend_block_floor`] floors. The shared device's own
+    /// connected block is the creator org's only.
+    block: (Ipv4Addr, u8),
     real: Arc<dyn TunIo>,
     state: Arc<Mutex<MuxState>>,
     /// The inbound queue's receiving half. A `tokio::sync::Mutex` because
@@ -649,6 +654,17 @@ impl TunIo for MuxPort {
         self.real.del_cidr_route(cidr).await
     }
 
+    async fn defend_block_floor(&self) {
+        // Forward THIS org's block through the device's `_of` twin. The
+        // device's plain method floors its own connected block — the CREATOR
+        // org's — and the trait default is a no-op, so without this arm the
+        // #391 corp-VPN leak guard is silently dead for every org on a
+        // shared device. Floors bypass `note_cidr`: they are drop-guards,
+        // and the org's block registration already covers them in the demux.
+        let (net, plen) = self.block;
+        self.real.defend_block_floor_of(net, plen).await
+    }
+
     async fn add_host_exemption(&self, ip: std::net::IpAddr) -> std::io::Result<()> {
         // Exemptions route AWAY from the TUN (via the original uplink), so
         // they never appear in the demux table.
@@ -705,6 +721,7 @@ mod tests {
         inbound: tokio::sync::Mutex<mpsc::Receiver<std::io::Result<Vec<u8>>>>,
         writes: Mutex<Vec<Vec<u8>>>,
         peer_routes: AtomicUsize,
+        floors: Mutex<Vec<(Ipv4Addr, u8)>>,
     }
 
     fn mock() -> (mpsc::Sender<std::io::Result<Vec<u8>>>, Arc<MockTun>) {
@@ -715,6 +732,7 @@ mod tests {
                 inbound: tokio::sync::Mutex::new(rx),
                 writes: Mutex::new(Vec::new()),
                 peer_routes: AtomicUsize::new(0),
+                floors: Mutex::new(Vec::new()),
             }),
         )
     }
@@ -736,6 +754,9 @@ mod tests {
         async fn add_peer_route(&self, _peer: Ipv4Addr) -> std::io::Result<()> {
             self.peer_routes.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+        async fn defend_block_floor_of(&self, net: Ipv4Addr, plen: u8) {
+            self.floors.lock().unwrap().push((net, plen));
         }
     }
 
@@ -807,6 +828,43 @@ mod tests {
         // Derived-ULA v6 unmaps to its embedded v4 and follows it.
         feed.send(Ok(ula_pkt([100, 65, 1, 4]))).await.unwrap();
         assert_eq!(recv_on(&carved).await[0] >> 4, 6);
+    }
+
+    /// #391's corp-VPN leak guard must survive the mux: each org's port
+    /// forwards its OWN block to the device's `_of` twin. The device's plain
+    /// `defend_block_floor` only knows the creator's connected block and the
+    /// trait default is a no-op — the exact combination that left the guard
+    /// silently dead on every multi-org host.
+    #[tokio::test]
+    async fn block_floor_forwards_each_orgs_own_block() {
+        let (_feed, dev) = mock();
+        let mux = TunMux::new(dev.clone());
+        let legacy = mux
+            .register(
+                "orgA",
+                "100.64.0.7".parse().unwrap(),
+                "255.192.0.0".parse().unwrap(),
+            )
+            .unwrap();
+        let carved = mux
+            .register(
+                "orgB",
+                "100.65.4.3".parse().unwrap(),
+                "255.255.252.0".parse().unwrap(),
+            )
+            .unwrap();
+
+        legacy.defend_block_floor().await;
+        carved.defend_block_floor().await;
+
+        let floors = dev.floors.lock().unwrap().clone();
+        assert_eq!(
+            floors,
+            vec![
+                ("100.64.0.0".parse::<Ipv4Addr>().unwrap(), 10),
+                ("100.65.4.0".parse::<Ipv4Addr>().unwrap(), 22),
+            ]
+        );
     }
 
     /// A peer `/32` recorded via the facade OUTRANKS another org's block:
