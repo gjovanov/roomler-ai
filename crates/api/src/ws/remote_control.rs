@@ -12,7 +12,7 @@ use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     hub::DispatchCtx,
     models::ConsentMode,
-    signaling::{ClientMsg, RelayRegionRtt, Role, ServerMsg},
+    signaling::{AgentSysStats, ClientMsg, RelayRegionRtt, Role, ServerMsg},
     turn_creds::relay_regions_wire,
 };
 use std::sync::Arc;
@@ -468,41 +468,15 @@ pub async fn handle_agent_socket(
                                                         "carrier": &l.carrier,
                                                         "rtt_ms": l.rtt_ms.map(i64::from),
                                                         "stalled": l.stalled,
+                                                        // Wave 3 per-edge volume.
+                                                        "tx": l.tx as i64,
+                                                        "rx": l.rx as i64,
                                                     }
                                                 })
                                                 .collect()
                                         })
                                         .unwrap_or_default();
-                                    // Stats PR-5: the v2 telemetry block —
-                                    // nested `transports` matches the rollup
-                                    // pipelines' `$sys.transports.*` paths.
-                                    let sys_doc = sys.map(|s| {
-                                        bson::doc! {
-                                            "rss_mb": s.rss_mb as i32,
-                                            "cpu_pct": f64::from(s.cpu_pct),
-                                            "net_rx_bytes": s.net_rx_bytes as i64,
-                                            "net_tx_bytes": s.net_tx_bytes as i64,
-                                            "transports": {
-                                                "direct": s.direct as i32,
-                                                "relay": s.relay as i32,
-                                                "derp": s.derp as i32,
-                                            },
-                                            "peer_rtt_ms": s.peer_rtt_ms.map(i64::from),
-                                            // NAT-traversal coverage. A node
-                                            // reporting 0 cannot hole-punch and
-                                            // reads as UDP-blocked to every
-                                            // peer, so all its pairs degrade to
-                                            // relay/DERP. Counting these across
-                                            // the fleet is the one number that
-                                            // would have surfaced the 2026-08-06
-                                            // coturn TTL=1 outage on day one
-                                            // instead of after the whole mesh
-                                            // had silently fallen to DERP.
-                                            // `null` = a pre-feature agent, which
-                                            // must stay distinct from a real 0.
-                                            "srflx_count": srflx_count.map(i64::from),
-                                        }
-                                    });
+                                    let sys_doc = sys.map(|s| machine_sys_doc(&s, srflx_count));
                                     if let Err(e) = state
                                         .stats
                                         .upsert_machine_sample(
@@ -1884,5 +1858,98 @@ async fn relay_to_client(state: &AppState, session_id: bson::oid::ObjectId, msg:
     };
     if let Err(e) = tx.send(msg).await {
         debug!(%session_id, %e, "agent → client relay: channel closed");
+    }
+}
+
+/// The persisted `sys` sub-document of a machine sample.
+///
+/// Hand-built rather than `bson::to_document(&s)` because the shape is NOT
+/// the wire shape: the carrier tallies nest under `transports` to match the
+/// rollup pipelines' `$sys.transports.*` paths, and `srflx_count` comes from
+/// outside the struct.
+///
+/// The cost of that choice is real and was paid once: a new `AgentSysStats`
+/// field is parsed off the wire and then **silently dropped** unless it is
+/// also listed here. Wave 3's four volume counters shipped in rc.324, every
+/// agent reported them, and every value went in the bin — the traffic chart
+/// read "no telemetry" fleet-wide for days, which is indistinguishable from
+/// a fleet that simply hasn't updated. `sys_doc_carries_every_counter` below
+/// is the guard; extend it when you extend the struct.
+fn machine_sys_doc(s: &AgentSysStats, srflx_count: Option<u8>) -> bson::Document {
+    bson::doc! {
+        "rss_mb": s.rss_mb as i32,
+        "cpu_pct": f64::from(s.cpu_pct),
+        "net_rx_bytes": s.net_rx_bytes as i64,
+        "net_tx_bytes": s.net_tx_bytes as i64,
+        "transports": {
+            "direct": s.direct as i32,
+            "relay": s.relay as i32,
+            "derp": s.derp as i32,
+        },
+        "peer_rtt_ms": s.peer_rtt_ms.map(i64::from),
+        // Wave 3 — mesh + tunnel volume.
+        "overlay_rx_bytes": s.overlay_rx_bytes as i64,
+        "overlay_tx_bytes": s.overlay_tx_bytes as i64,
+        "tunnel_rx_bytes": s.tunnel_rx_bytes as i64,
+        "tunnel_tx_bytes": s.tunnel_tx_bytes as i64,
+        // NAT-traversal coverage. A node reporting 0 cannot hole-punch and
+        // reads as UDP-blocked to every peer, so all its pairs degrade to
+        // relay/DERP. Counting these across the fleet is the one number that
+        // would have surfaced the 2026-08-06 coturn TTL=1 outage on day one
+        // instead of after the whole mesh had silently fallen to DERP.
+        // `null` = a pre-feature agent, which must stay distinct from a real 0.
+        "srflx_count": srflx_count.map(i64::from),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every numeric counter the agent reports must survive into the
+    /// persisted document. This test exists because they did not: the
+    /// hand-built doc dropped four wave-3 fields for several releases while
+    /// the agents dutifully sent them, and nothing anywhere failed — the
+    /// dashboards just showed an empty series, which reads exactly like a
+    /// fleet that hasn't upgraded yet.
+    #[test]
+    fn sys_doc_carries_every_counter() {
+        let s = AgentSysStats {
+            rss_mb: 87,
+            cpu_pct: 1.5,
+            net_rx_bytes: 1_000,
+            net_tx_bytes: 2_000,
+            direct: 3,
+            relay: 1,
+            derp: 1,
+            peer_rtt_ms: Some(42),
+            overlay_rx_bytes: 4_096,
+            overlay_tx_bytes: 8_192,
+            tunnel_rx_bytes: 65_536,
+            tunnel_tx_bytes: 1_024,
+            links: Vec::new(),
+        };
+        let d = machine_sys_doc(&s, Some(0));
+
+        // The four that were silently dropped.
+        assert_eq!(d.get_i64("overlay_rx_bytes").unwrap(), 4_096);
+        assert_eq!(d.get_i64("overlay_tx_bytes").unwrap(), 8_192);
+        assert_eq!(d.get_i64("tunnel_rx_bytes").unwrap(), 65_536);
+        assert_eq!(d.get_i64("tunnel_tx_bytes").unwrap(), 1_024);
+
+        // …and the ones that already worked, so a refactor can't trade one
+        // for another.
+        assert_eq!(d.get_i64("net_rx_bytes").unwrap(), 1_000);
+        assert_eq!(d.get_i32("rss_mb").unwrap(), 87);
+        assert_eq!(
+            d.get_document("transports")
+                .unwrap()
+                .get_i32("direct")
+                .unwrap(),
+            3
+        );
+        // A measured zero must persist as 0, never as absent — "can't
+        // hole-punch" and "didn't report" are different facts.
+        assert_eq!(d.get_i64("srflx_count").unwrap(), 0);
     }
 }
