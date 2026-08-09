@@ -777,10 +777,34 @@ pub enum ClientMsg {
     /// leg to a specific peer (used when direct hole-punch to that peer
     /// fails). The server replies with `rc:overlay.relay_grant` carrying
     /// creds keyed by the symmetric `pair_key`.
+    ///
+    /// U1 — the request now carries the requester's EVIDENCE, so the P7
+    /// churn escalation can act on what actually happened instead of
+    /// inferring everything from arrival timing. All three fields are
+    /// additive with serde defaults: an old client omits them, an old
+    /// server ignores them.
     #[serde(rename = "rc:overlay.relay_request")]
     OverlayRelayRequest {
         #[serde(with = "oid_hex")]
         peer_node_id: ObjectId,
+        /// Which relay flavour this request is REPLACING (`"turn"` /
+        /// `"derp"`); absent = a fresh establishment, which the churn
+        /// counter should never mistake for a died-carrier cycle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_kind: Option<String>,
+        /// Why the prior carrier died (the `DeathReason` short string) —
+        /// diagnostic evidence for the server's escalation logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// STICKY failure evidence: this client recently ATTEMPTED to open a
+        /// `/derp` mux and failed (the `force_derp` veto condition). While
+        /// set, the server must not choose or hold forced-DERP for this
+        /// pair — a client that vetoes the pin while the server refuses TURN
+        /// grants for the pin's TTL is a hard dark window (the silent-veto
+        /// bug). Deliberately NOT "is a mux open": the mux opens lazily on
+        /// first use, so a healthy client that never needed DERP has none.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        derp_mux_failed: bool,
     },
 }
 
@@ -3194,12 +3218,63 @@ mod tests {
     #[test]
     fn overlay_relay_request_uses_raw_hex_peer_id() {
         let peer = ObjectId::parse_str("507f1f77bcf86cd799439014").unwrap();
-        let m = ClientMsg::OverlayRelayRequest { peer_node_id: peer };
+        let m = ClientMsg::OverlayRelayRequest {
+            peer_node_id: peer,
+            current_kind: None,
+            reason: None,
+            derp_mux_failed: false,
+        };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.relay_request""#));
         assert!(!s.contains("$oid"));
+        // U1 — absent evidence stays OFF the wire entirely, so an old server
+        // sees byte-identical requests from a new fresh-establishment client.
+        assert!(!s.contains("current_kind"));
+        assert!(!s.contains("reason"));
+        assert!(!s.contains("derp_mux_failed"));
         match serde_json::from_str::<ClientMsg>(&s).unwrap() {
-            ClientMsg::OverlayRelayRequest { peer_node_id } => assert_eq!(peer_node_id, peer),
+            ClientMsg::OverlayRelayRequest { peer_node_id, .. } => assert_eq!(peer_node_id, peer),
+            other => panic!("expected OverlayRelayRequest, got {other:?}"),
+        }
+    }
+
+    /// U1 — wire-compat both directions: a LEGACY request (no evidence
+    /// fields) decodes with inert defaults, and a populated one round-trips.
+    #[test]
+    fn overlay_relay_request_evidence_fields_roundtrip_and_default() {
+        let legacy =
+            r#"{"t":"rc:overlay.relay_request","peer_node_id":"507f1f77bcf86cd799439014"}"#;
+        match serde_json::from_str::<ClientMsg>(legacy).unwrap() {
+            ClientMsg::OverlayRelayRequest {
+                current_kind,
+                reason,
+                derp_mux_failed,
+                ..
+            } => {
+                assert_eq!(current_kind, None);
+                assert_eq!(reason, None);
+                assert!(!derp_mux_failed);
+            }
+            other => panic!("expected OverlayRelayRequest, got {other:?}"),
+        }
+        let m = ClientMsg::OverlayRelayRequest {
+            peer_node_id: ObjectId::parse_str("507f1f77bcf86cd799439014").unwrap(),
+            current_kind: Some("turn".into()),
+            reason: Some("rekey-unanswered".into()),
+            derp_mux_failed: true,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::OverlayRelayRequest {
+                current_kind,
+                reason,
+                derp_mux_failed,
+                ..
+            } => {
+                assert_eq!(current_kind.as_deref(), Some("turn"));
+                assert_eq!(reason.as_deref(), Some("rekey-unanswered"));
+                assert!(derp_mux_failed);
+            }
             other => panic!("expected OverlayRelayRequest, got {other:?}"),
         }
     }
