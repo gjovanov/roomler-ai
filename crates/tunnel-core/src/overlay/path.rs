@@ -658,6 +658,29 @@ impl PathMonitor {
         }
     }
 
+    /// R2 — OUR direct plane was rebuilt (roam / interface change): every
+    /// direct-tier measurement was made through sockets that no longer
+    /// exist, so clear direct penalties, strikes AND Q for every peer —
+    /// [`on_endpoint_change`](Self::on_endpoint_change) semantics, applied
+    /// locally. Deliberately NOT [`on_resume`](Self::on_resume): `relay_q`
+    /// is KEPT (relay carriers ride the coordinator/WS and survive a plane
+    /// rebuild — that evidence is still good) and `last_lan_attempt` is
+    /// KEPT (so `LAN_PROBE_SPACING` still paces the post-rebuild re-probe
+    /// herd instead of amplifying it).
+    // The production caller is R3's rebuild arm (next change, same track) —
+    // remove the allow when it lands; see the defensive-catch-all rule in
+    // CLAUDE.md for why staged-landing dead code is annotated, not deleted.
+    #[allow(dead_code)]
+    pub(crate) fn on_local_rebuild(&mut self) {
+        for p in self.peers.values_mut() {
+            for t in &mut p.tiers {
+                t.penalty = None;
+                t.fails = 0;
+                t.q = Ewma::default();
+            }
+        }
+    }
+
     /// P8 ≡ the resume-from-suspend `cooldowns = default()`: every score and
     /// suppression is stale evidence after a sleep. Probe bookkeeping is KEPT
     /// — the legacy resume path leaves `upgrade_probes` in flight too (they
@@ -1253,6 +1276,49 @@ mod tests {
         m.on_death(&a, DirectTier::Lan, DeathReason::RxStale, true, t0);
         assert_eq!(m.strikes(&a, DirectTier::Lan), 1);
         assert!(!m.eligible(&a, DirectTier::Lan, t0 + Duration::from_secs(1)));
+    }
+
+    /// R2 — `on_local_rebuild` clears every peer's DIRECT-tier evidence
+    /// (penalties, strikes, Q) but KEEPS `relay_q` (relay carriers survive a
+    /// plane rebuild) and KEEPS `last_lan_attempt` (LAN_PROBE_SPACING must
+    /// still pace the post-rebuild herd) — the two properties that
+    /// disqualify `on_resume` here.
+    #[test]
+    fn local_rebuild_clears_direct_evidence_keeps_relay_and_lan_pacing() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let t0 = Instant::now();
+        // Book direct evidence + relay evidence + a LAN attempt marker.
+        m.on_death(
+            &a,
+            DirectTier::Lan,
+            DeathReason::HandshakeDeadline,
+            true,
+            t0,
+        );
+        m.on_heard(&a, DirectTier::Relay);
+        m.on_installed(&a, DirectTier::Lan, t0);
+        let relay_q_before = m.peers.get(&a).unwrap().relay_q.get();
+        assert!(relay_q_before > 0.0, "precondition: relay q credited");
+        assert!(!m.eligible(&a, DirectTier::Lan, t0 + Duration::from_secs(1)));
+
+        m.on_local_rebuild();
+
+        let p = m.peers.get(&a).unwrap();
+        assert!(
+            m.eligible(&a, DirectTier::Lan, t0 + Duration::from_secs(1)),
+            "direct suppression cleared"
+        );
+        assert_eq!(m.strikes(&a, DirectTier::Lan), 0, "direct strikes cleared");
+        assert_eq!(
+            p.relay_q.get(),
+            relay_q_before,
+            "relay evidence survives the rebuild"
+        );
+        assert!(
+            p.last_lan_attempt.is_some(),
+            "LAN probe pacing survives the rebuild"
+        );
     }
 
     /// The escalated window (2 strikes LAN/public, 3 srflx) reproduces the
