@@ -263,6 +263,46 @@ the OS TUN is used regardless of `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`).
 
 ---
 
+## 4b. Cross-org egress source normalization — the mux NAT (rc.328)
+
+With two org addresses on the ONE shared adapter (§2), the **OS** picks the
+source address for locally-originated traffic — and with nested blocks (a
+legacy `/10` beside a carved `/22`) it can pick the WRONG org's address.
+Field 2026-08-09 (pc50045): Windows deterministically sourced grox-bound
+packets from the jovanov address; Linux fleet nodes did the equivalent
+(`inet_select_addr` is address-order-dependent). The packet rides the correct
+pair (demux is dst-based), but a **single-org receiver** RPF-flags the foreign
+source (`rx_denied_noroute` in `peers --json`), replies to an address it
+cannot route, and the reply blackholes into its own on-link block route —
+100 % loss on everything the multi-org host initiates toward single-org
+peers, while dual-org receivers work by reply-hairpin accident and IPv6 is
+immune (one overlay v6 per host).
+
+Two-layer fix:
+
+- **Prevention (Linux):** every route the mux installs carries
+  `src <org-self>` (RTA_PREFSRC), so the kernel can't mis-pick
+  (`TunIo::add_peer_route_from` / `add_cidr_route_from`).
+- **Normalization (all platforms, the load-bearer on Windows, which has no
+  per-route source hint):** the mux rewrites a host-originated v4 packet
+  whose source is ANOTHER org's own address to the destination org's address
+  (checksums fixed incrementally), records the flow, and restores the
+  destination on matching replies so the OS delivers them to the socket
+  still anchored to the original address (`overlay/mux_nat.rs` +
+  `tun_mux.rs` hooks). Kill switch: `overlay_mux_nat`
+  (`ROOMLER_NODE_OVERLAY_MUX_NAT`), default **on**.
+
+Accepted limitations (all narrow): no port translation — sockets on BOTH org
+addresses colliding on an identical (proto, local port, remote, remote port)
+4-tuple are indistinguishable on the wire; inbound ICMP errors quoting a
+normalized flow are not un-NATed (moot at the uniform 1280 MTU); a
+FRAGMENTED reply to a normalized flow is delivered to the wire address and
+misses the anchored socket (ingress never rewrites fragments — a
+half-rewritten train fails reassembly). TCP/UDP flows that cannot be
+recorded (flow table full) pass through UNrewritten with a throttled WARN —
+that keeps the pre-fix behavior plus the receiver-side breadcrumb, instead
+of a silently-broken rewritten flow.
+
 ## 5. P3 — remote-control concurrency (shipped, #320 + #323)
 
 Security first (#320): `Hub::dispatch` gained **session-party checks**.
@@ -374,6 +414,7 @@ no blank row can render).
 | An agent below the version floor is force-migrated | Its boot reconciler purges its own on-link route ⇒ that host's mesh blackholes until it updates | P2b |
 | Two viewers, one host, mixed versions | An agent without `AgentCaps.input` keeps the P3 single-INPUT strip; only arbiter-capable agents go free-for-all | P6 |
 | Encoder spill oscillation | Hysteresis on the deviation gate, hard cap of 2 pipelines | P5 |
+| OS picks the wrong org's source address on the shared adapter | Mux NAT normalizes egress + restores replies (§4b); receivers count the foreign source as `rx_denied_noroute` | §4b |
 
 ## 10. Scale notes
 

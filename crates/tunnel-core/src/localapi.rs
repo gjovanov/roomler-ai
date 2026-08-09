@@ -313,6 +313,14 @@ pub struct PeerCarrierDebug {
     /// `peers --json` stays unchanged.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub rx_denied: u64,
+    /// The `Rpf(NoRoute)` subset of [`Self::rx_denied`]: packets from a source
+    /// NO installed peer owns. Worse than a plain denial even under `warn` —
+    /// the packet is delivered but replies to that source are unroutable from
+    /// this node, so the flow fails silently. The signature of a multi-org
+    /// sender whose OS picked the wrong org's overlay address as source.
+    /// Omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub rx_denied_noroute: u64,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -1943,6 +1951,7 @@ mod tests {
             last_rx_age_s: 7,
             relay_kind: Some("turn".into()),
             rx_denied: 0,
+            rx_denied_noroute: 0,
         });
         let s = serde_json::to_string(&p2).unwrap();
         assert!(s.contains(r#""tier":"relay""#) && s.contains(r#""tx":42"#));
@@ -1952,15 +1961,20 @@ mod tests {
         let back: PeerInfo = serde_json::from_str(&s).unwrap();
         assert_eq!(back.debug, p2.debug);
 
-        // …and a peer the ingress ACL refused surfaces the count.
+        // …and a peer the ingress ACL refused surfaces the count, with the
+        // NoRoute subset beside it (omitted when 0, absent-tolerant on read).
         let mut p3 = p2.clone();
         if let Some(d) = p3.debug.as_mut() {
             d.rx_denied = 17;
+            d.rx_denied_noroute = 5;
         }
         let s3 = serde_json::to_string(&p3).unwrap();
         assert!(s3.contains(r#""rx_denied":17"#));
+        assert!(s3.contains(r#""rx_denied_noroute":5"#));
         let back3: PeerInfo = serde_json::from_str(&s3).unwrap();
-        assert_eq!(back3.debug.unwrap().rx_denied, 17);
+        let d3 = back3.debug.unwrap();
+        assert_eq!(d3.rx_denied, 17);
+        assert_eq!(d3.rx_denied_noroute, 5);
     }
 
     /// rc.275 — `PeerInfo.stalled` is wire-compatible in both directions: a
