@@ -36,7 +36,9 @@ use bson::{DateTime, oid::ObjectId};
 use roomler_ai_remote_control::models::{OverlayAclMode, OverlayPolicy};
 use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode, overlay_ip},
-    signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo, ServerMsg},
+    signaling::{
+        ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo, RelayStrategyWire, ServerMsg,
+    },
     turn_creds,
     worker_pick::pick_worker_fnv1a,
 };
@@ -86,6 +88,7 @@ pub async fn relay_overlay_msg_from_node(
             supports_relay_single,
             supports_derp,
             supports_forced_derp,
+            supports_server_relay_strategy,
             advertised_routes,
             ..
         } => {
@@ -99,6 +102,7 @@ pub async fn relay_overlay_msg_from_node(
                 supports_relay_single,
                 supports_derp,
                 supports_forced_derp,
+                supports_server_relay_strategy,
                 advertised_routes,
             )
             .await;
@@ -152,6 +156,7 @@ async fn handle_overlay_join(
     supports_relay_single: bool,
     supports_derp: bool,
     supports_forced_derp: bool,
+    supports_server_relay_strategy: bool,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
@@ -209,6 +214,7 @@ async fn handle_overlay_join(
                     supports_relay_single,
                     supports_derp,
                     supports_forced_derp,
+                    supports_server_relay_strategy,
                     &advertised_routes,
                 )
                 .await
@@ -266,6 +272,7 @@ async fn handle_overlay_join(
                         supports_relay_single,
                         supports_derp,
                         supports_forced_derp,
+                        supports_server_relay_strategy,
                         advertised_routes.clone(),
                     )
                     .await
@@ -327,13 +334,15 @@ async fn handle_overlay_join(
         } else {
             None
         };
-        if let Some(p) = shape_peer(
+        if let Some(mut p) = shape_peer(
             &acl,
             &joiner_src,
             n,
             peer_src.as_ref(),
             is_reachable(&reach, n),
         ) {
+            // U2 — the joiner's full-netmap edge is `self_node → n`.
+            p.relay_strategy = server_relay_verdict(state, &self_node, n);
             peers.push(p);
         }
     }
@@ -395,9 +404,14 @@ async fn handle_overlay_join(
         let peer_src = overlay_source_of(state, peer).await;
         // The shaped peer here is the JOINER, whose identity we already have.
         let joiner_ingress = acl.enforcing().then_some(&joiner_src);
+        // U2 — this recipient's edge is `peer → self_node` (the joiner).
+        let verdict = server_relay_verdict(state, peer, &self_node);
         let (upserts, removes) = match shape_peer(&acl, &peer_src, &self_node, joiner_ingress, true)
         {
-            Some(u) => (vec![u], vec![]),
+            Some(mut u) => {
+                u.relay_strategy = verdict;
+                (vec![u], vec![])
+            }
             None => (vec![], vec![self_node.id.unwrap_or_default()]),
         };
         send_to_node(
@@ -1107,8 +1121,14 @@ async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, rea
     };
     for peer in peers.iter().filter(|p| p.id != node.id) {
         let src = overlay_source_of(state, peer).await;
+        // U2 — the edge is `recipient=peer → this fanned node`; both full
+        // rows are in hand, so stamp the server verdict onto the shaped peer.
+        let verdict = server_relay_verdict(state, peer, node);
         let (upserts, removes) = match shape_peer(&acl, &src, node, node_src.as_ref(), reachable) {
-            Some(u) => (vec![u], vec![]),
+            Some(mut u) => {
+                u.relay_strategy = verdict;
+                (vec![u], vec![])
+            }
             None => (vec![], vec![node.id.unwrap_or_default()]),
         };
         send_to_node(
@@ -1461,6 +1481,108 @@ pub(crate) async fn overlay_source_of(state: &AppState, node: &OverlayNode) -> O
 /// reads as "the ACL compiled nothing, fall back to the coarse local scope".
 /// Callers pass `None` unless the tenant is ENFORCING, so `warn` can never cause
 /// a node to drop: warn's whole contract is that it observes and never denies.
+/// U2 — the server's relay-tier verdict for the edge `recipient → peer`, or
+/// `None` when the server must NOT stamp one (either end hasn't opted into
+/// `supports_server_relay_strategy` — then that end computes locally from its
+/// own view, and a one-sided verdict would manufacture anchor/dialer
+/// disagreements). A pure port of the client's `relay_strategy()`: the server
+/// holds a strict superset of the inputs at netmap-build time (both ends'
+/// srflx presence, capabilities, pubkeys, and its OWN forced-DERP pin), and
+/// is the only party that can flip both ends of a pair atomically.
+///
+/// Symmetric by construction: for the reverse edge the server swaps `my`/
+/// `peer`, so exactly one end is stamped `SingleRelayAnchor` and the other
+/// `SingleRelayDialer` (UDP-capability first, smaller-pubkey tie-break — the
+/// same rule and the same raw-byte comparison the client uses).
+fn server_relay_verdict(
+    state: &AppState,
+    recipient: &OverlayNode,
+    peer: &OverlayNode,
+) -> Option<RelayStrategyWire> {
+    // Force-DERP pin wins first (the server owns it), gated on both ends'
+    // DERP support exactly as the client's pin check is.
+    let pinned = recipient.supports_derp
+        && peer.supports_derp
+        && matches!((recipient.id, peer.id), (Some(a), Some(b))
+            if state
+                .relay_pair_churn
+                .get(&pair_key(a, b))
+                .is_some_and(|pc| forced_active(&pc, Instant::now())));
+    verdict_from_nodes(recipient, peer, pinned)
+}
+
+/// U2 — the node-level verdict (the pin resolved to a bool by the caller so
+/// this stays `AppState`-free and unit-testable). Applies the both-ends
+/// capability gate, decodes the pubkeys for the tie-break, and delegates the
+/// rule set to [`relay_verdict_core`].
+fn verdict_from_nodes(
+    recipient: &OverlayNode,
+    peer: &OverlayNode,
+    pinned: bool,
+) -> Option<RelayStrategyWire> {
+    if !(recipient.supports_server_relay_strategy && peer.supports_server_relay_strategy) {
+        return None;
+    }
+    // The tie-break compares RAW pubkey bytes (base64 string order ≠ byte
+    // order), so decode both. On a decode failure, withhold — never guess a
+    // role, which could put both ends on the same anchor/dialer side.
+    let (Ok(my_pk), Ok(peer_pk)) = (
+        BASE64.decode(&recipient.wg_public_key),
+        BASE64.decode(&peer.wg_public_key),
+    ) else {
+        return None;
+    };
+    Some(relay_verdict_core(
+        pinned,
+        recipient.supports_derp && peer.supports_derp,
+        recipient.supports_relay_single && peer.supports_relay_single,
+        !recipient.srflx_endpoints.is_empty(),
+        !peer.srflx_endpoints.is_empty(),
+        &my_pk,
+        &peer_pk,
+    ))
+}
+
+/// U2 — the PURE relay-tier decision (the pin + capability lookups resolved
+/// to booleans by [`server_relay_verdict`]). A verbatim transcription of the
+/// client's `relay_strategy()` in `tunnel_core::overlay::relay_link`: the
+/// pin first, then single-relay by UDP-capability with a smaller-raw-pubkey
+/// tie-break, then DERP for a both-blocked pair, then both-allocate. The two
+/// MUST stay in lockstep — the `server_verdict_matches_client_rules` matrix
+/// is the lock, and U3 only deletes the client copy once this parity holds.
+#[allow(clippy::too_many_arguments)]
+fn relay_verdict_core(
+    pinned: bool,
+    both_derp: bool,
+    both_single: bool,
+    my_udp_ok: bool,
+    peer_udp_ok: bool,
+    my_pk: &[u8],
+    peer_pk: &[u8],
+) -> RelayStrategyWire {
+    if pinned {
+        return RelayStrategyWire::Derp;
+    }
+    if both_single {
+        match (my_udp_ok, peer_udp_ok) {
+            (true, false) => return RelayStrategyWire::SingleRelayDialer,
+            (false, true) => return RelayStrategyWire::SingleRelayAnchor,
+            (true, true) => {
+                return if my_pk < peer_pk {
+                    RelayStrategyWire::SingleRelayAnchor
+                } else {
+                    RelayStrategyWire::SingleRelayDialer
+                };
+            }
+            (false, false) => {} // neither can raw-dial → DERP below
+        }
+    }
+    if both_derp && !my_udp_ok && !peer_udp_ok {
+        return RelayStrategyWire::Derp;
+    }
+    RelayStrategyWire::BothAllocate
+}
+
 fn shape_peer(
     acl: &AclCtx,
     src: &OverlaySource,
@@ -1554,6 +1676,13 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // Phase D (DERP) — surface the node's DERP capability so a both-UDP-blocked
         // pair only picks DERP when both ends advertise it.
         supports_derp: node.supports_derp,
+        // U2 — echo forced-DERP support (not surfaced pre-U2) + the
+        // per-edge relay verdict. `relay_strategy` is the PERMISSIVE default
+        // (`None` = client computes locally); the call sites that hold BOTH
+        // the recipient and this peer's full node stamp it via
+        // `server_relay_verdict`.
+        supports_forced_derp: node.supports_forced_derp,
+        relay_strategy: None,
         // Only the admin-APPROVED routes reach peers — and, once the tenant's
         // overlay ACL is enforcing, only the subset THIS recipient may install
         // (see `shape_peer`). `to_netmap_peer` keeps the permissive default so
@@ -1867,6 +1996,7 @@ mod tests {
             supports_relay_single: true,
             supports_derp: true,
             supports_forced_derp: true,
+            supports_server_relay_strategy: false,
             advertised_routes: vec![],
             approved_routes: vec![],
             is_exit_node: false,
@@ -1914,6 +2044,84 @@ mod tests {
         let b = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
         assert_eq!(pair_key(a, b), pair_key(b, a));
         assert!(pair_key(a, b).contains(&a.to_hex()));
+    }
+
+    /// U2 — the PARITY LOCK: the server's pure verdict core must reproduce the
+    /// client's `relay_strategy()` rules exactly (the client's own doc-comment
+    /// truth table, transcribed). U3 deletes the client copy only while this
+    /// holds; any divergence between the two implementations breaks here.
+    #[test]
+    fn server_verdict_matches_client_rules() {
+        use RelayStrategyWire::*;
+        let lo = [1u8; 32]; // smaller raw pubkey
+        let hi = [9u8; 32];
+        let core = relay_verdict_core;
+        // Pin wins over everything.
+        assert_eq!(core(true, false, true, true, true, &lo, &hi), Derp);
+        assert_eq!(core(true, false, false, false, false, &lo, &hi), Derp);
+        // single-relay by UDP capability (both advertise single):
+        //   we-ok / peer-blocked → WE dial (peer anchors)
+        assert_eq!(
+            core(false, false, true, true, false, &lo, &hi),
+            SingleRelayDialer
+        );
+        //   we-blocked / peer-ok → WE anchor
+        assert_eq!(
+            core(false, false, true, false, true, &lo, &hi),
+            SingleRelayAnchor
+        );
+        //   both-ok → smaller raw pubkey anchors (and its mirror dials)
+        assert_eq!(
+            core(false, false, true, true, true, &lo, &hi),
+            SingleRelayAnchor
+        );
+        assert_eq!(
+            core(false, false, true, true, true, &hi, &lo),
+            SingleRelayDialer
+        );
+        // both-blocked + both support DERP → DERP (the only both-blocked tier)
+        assert_eq!(core(false, true, true, false, false, &lo, &hi), Derp);
+        // both-blocked but NO shared DERP → both-allocate
+        assert_eq!(
+            core(false, false, true, false, false, &lo, &hi),
+            BothAllocate
+        );
+        // single-relay NOT mutually advertised → both-allocate even if UDP-ok
+        assert_eq!(
+            core(false, false, false, true, false, &lo, &hi),
+            BothAllocate
+        );
+    }
+
+    /// U2 — the both-ends capability gate + the anchor/dialer SYMMETRY (the
+    /// whole reason it's server-computed): the reverse edge swaps my/peer, so
+    /// exactly one end is stamped anchor and the other dialer.
+    #[test]
+    fn server_verdict_gated_and_symmetric() {
+        let mut a = node("a", "100.64.0.2");
+        let mut b = node("b", "100.64.0.4");
+        a.wg_public_key = BASE64.encode([1u8; 32]);
+        b.wg_public_key = BASE64.encode([9u8; 32]);
+        a.supports_server_relay_strategy = true;
+        b.supports_server_relay_strategy = true;
+        // Both UDP-capable, both advertise single-relay → smaller pubkey (a)
+        // anchors; the reverse edge sees a dialer. `node()` sets both
+        // supports_relay_single = true. No pin (pinned = false).
+        a.srflx_endpoints = vec!["1.2.3.4:5".into()];
+        b.srflx_endpoints = vec!["6.7.8.9:0".into()];
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor)
+        );
+        assert_eq!(
+            verdict_from_nodes(&b, &a, false),
+            Some(RelayStrategyWire::SingleRelayDialer)
+        );
+        // One end unflagged → the server withholds the verdict entirely (both
+        // ends then compute locally, staying symmetric on their own).
+        b.supports_server_relay_strategy = false;
+        assert_eq!(verdict_from_nodes(&a, &b, false), None);
+        assert_eq!(verdict_from_nodes(&b, &a, false), None);
     }
 
     #[test]

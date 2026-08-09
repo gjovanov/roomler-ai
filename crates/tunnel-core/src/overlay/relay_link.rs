@@ -45,7 +45,7 @@ use super::netmap::PeerConfig;
 use super::wg::Carrier;
 use crate::transport::derp::DerpMux;
 use crate::transport::relay::RelayConn;
-use roomler_ai_remote_control::signaling::{ClientMsg, IceServer};
+use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, RelayStrategyWire};
 use roomler_ai_remote_control::worker_pick::pick_worker_fnv1a;
 
 /// Minimum spacing between break-before-make regrades OFF an established DERP
@@ -327,6 +327,12 @@ pub struct RelayCoordinator {
     /// (client ignores the pin, server refuses TURN grants for the pin's
     /// TTL). Cleared the moment any mux registers successfully.
     derp_mux_failed: bool,
+    /// U2 — our own `OVERLAY_SERVER_RELAY_STRATEGY` opt-in, read once at
+    /// construction (like `derp`/`single_relay`). When on, and the server
+    /// stamped a per-edge verdict (`PeerConfig::relay_strategy`, which it
+    /// only does when the PEER is also flagged), `relay_strategy()` returns
+    /// that verdict verbatim instead of deriving locally.
+    server_strategy: bool,
 }
 
 /// Hash of everything `relay_strategy` reads about a pair, other than the
@@ -393,6 +399,7 @@ impl RelayCoordinator {
             derp_regrade_fired_at: HashMap::new(),
             refresh_ctx: HashMap::new(),
             derp_mux_failed: false,
+            server_strategy: super::direct::server_relay_strategy_enabled(),
         }
     }
 
@@ -611,6 +618,24 @@ impl RelayCoordinator {
         if self.forced_derp_active(node_id) && self.mux_for(node_id).is_some() && peer.supports_derp
         {
             return RelayStrategy::Derp;
+        }
+        // U2 — a server-computed verdict is authoritative, taken verbatim.
+        // Checked AFTER the local force-DERP pin (a live `OverlayForceDerp`
+        // push the server may still send during a mixed transition wins over
+        // a possibly-stale netmap verdict; once the pin is set the server's
+        // own verdict is `Derp` anyway, so they agree outside the skew
+        // window). Gated on BOTH our own opt-in AND the presence of a stamp —
+        // and the server only stamps when the PEER is also flagged, so the
+        // both-ends requirement holds without us re-checking the peer's cap.
+        if self.server_strategy
+            && let Some(w) = peer.relay_strategy
+        {
+            return match w {
+                RelayStrategyWire::SingleRelayAnchor => RelayStrategy::SingleRelay(true),
+                RelayStrategyWire::SingleRelayDialer => RelayStrategy::SingleRelay(false),
+                RelayStrategyWire::Derp => RelayStrategy::Derp,
+                RelayStrategyWire::BothAllocate => RelayStrategy::BothAllocate,
+            };
         }
         let peer_udp_ok = !peer.srflx_endpoints.is_empty();
         if self.single_relay && peer.supports_relay_single {
@@ -1314,6 +1339,9 @@ mod tests {
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
+            supports_forced_derp: false,
+            relay_strategy: None,
+            relay_home: None,
         }
     }
 
