@@ -175,6 +175,7 @@ export interface UsageDetailPayload {
     call_minutes: number
     call_bytes: number
     tunnel_minutes: number
+    tunnel_bytes: number
   }
   /** The headline: every window this user spent looking at a screen. */
   viewing?: UsageViewingWindow[]
@@ -197,6 +198,8 @@ export interface UsageDetailPayload {
     ended_at: number
     seconds: number
     events: number
+    bytes?: number
+    /** Per SESSION: flows that closed before wave 3 carry no count. */
     bytes_known: boolean
   }>
   truncated?: boolean

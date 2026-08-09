@@ -57,7 +57,9 @@
             <v-col cols="6" md="3">
               <div class="text-caption text-medium-emphasis">Tunnel</div>
               <div class="text-h6">{{ fmtMinutes(detail.totals?.tunnel_minutes) }}</div>
-              <div class="text-caption text-medium-emphasis">not measured</div>
+              <div class="text-caption text-medium-emphasis">
+                {{ detail.totals?.tunnel_bytes ? fmtBytes(detail.totals.tunnel_bytes) : '—' }}
+              </div>
             </v-col>
             <v-col cols="6" md="3">
               <div class="text-caption text-medium-emphasis">Devices viewed</div>
@@ -115,6 +117,7 @@
                   <th>From</th>
                   <th>Until</th>
                   <th class="text-right">Duration</th>
+                  <th class="text-right">Traffic</th>
                 </tr>
               </thead>
               <tbody>
@@ -124,6 +127,9 @@
                   <td>{{ fmtTime(t.started_at) }}</td>
                   <td>{{ fmtTime(t.ended_at) }}</td>
                   <td class="text-right">{{ fmtDuration(t.seconds) }}</td>
+                  <td class="text-right" :class="{ 'text-medium-emphasis': !t.bytes_known }">
+                    {{ t.bytes_known ? fmtBytes(t.bytes ?? 0) : '—' }}
+                  </td>
                 </tr>
               </tbody>
             </v-table>
