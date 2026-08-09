@@ -33,4 +33,62 @@ echo "roomler-agent installed for user $CONSOLE_USER (uid=$CONSOLE_UID)"
 echo "Grant Screen Recording + Accessibility permissions in System Settings, then:"
 echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
 
+# ---------------------------------------------------------------------------
+# The privileged half — OPT-IN.
+#
+# The LaunchAgent above is unprivileged by necessity: capture and input need
+# the GUI session. But creating a utun and installing routes need root, which
+# is why the overlay has never come up on a real macOS install. A root
+# LaunchDaemon closes that, and it is deliberately NOT installed by default:
+# putting a root daemon on someone's Mac is a posture decision, not a side
+# effect of installing a remote-control agent.
+#
+# Enable with either:
+#   sudo mkdir -p /etc/roomler-agent && sudo touch /etc/roomler-agent/enable-daemon
+#   (then re-run the installer), or
+#   ROOMLER_MACOS_DAEMON=1 installer -pkg … -target /
+#
+# The daemon gets its OWN config at /etc/roomler-agent/config.toml. It must
+# not share the user's: two processes on one enrollment identity would fight
+# over the control WS (the hub keys on agent_id — the second connection
+# displaces the first), so they are separate enrollments by construction.
+# ---------------------------------------------------------------------------
+DAEMON_PLIST_SOURCE="/Applications/roomler-agent.app/Contents/Resources/com.roomler.daemon.plist"
+DAEMON_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.daemon.plist"
+
+if [ -f /etc/roomler-agent/enable-daemon ] || [ "${ROOMLER_MACOS_DAEMON:-0}" = "1" ]; then
+  if [ ! -f "$DAEMON_PLIST_SOURCE" ]; then
+    echo "WARNING: daemon requested but $DAEMON_PLIST_SOURCE is missing; skipping"
+  else
+    mkdir -p /etc/roomler-agent /var/log/roomler-agent
+    cp "$DAEMON_PLIST_SOURCE" "$DAEMON_PLIST_TARGET"
+    chown root:wheel "$DAEMON_PLIST_TARGET"
+    chmod 644 "$DAEMON_PLIST_TARGET"
+
+    # bootout first so an upgrade replaces a running job rather than failing
+    # the (non-idempotent) bootstrap.
+    launchctl bootout system/com.roomler.daemon 2>/dev/null || true
+    launchctl bootstrap system "$DAEMON_PLIST_TARGET"
+
+    echo "roomler system daemon installed (overlay/tunnel run as root)."
+    if [ ! -f /etc/roomler-agent/config.toml ]; then
+      echo "  NOT ENROLLED YET — the daemon needs its own enrollment:"
+      echo "    sudo /Applications/roomler-agent.app/Contents/MacOS/roomler-agent \\"
+      echo "      --config /etc/roomler-agent/config.toml \\"
+      echo "      enroll --server <url> --token <enrollment-jwt> --name <label>"
+      echo "    sudo launchctl kickstart -k system/com.roomler.daemon"
+    fi
+    echo "  Its LocalAPI lives at /var/run/roomler/roomler.sock — reach it with"
+    echo "  'sudo roomler …' (an unprivileged 'roomler' finds the user agent)."
+  fi
+else
+  # A previously-enabled daemon must go away when the marker does, or an
+  # upgrade would silently keep a root job the operator has opted out of.
+  if [ -f "$DAEMON_PLIST_TARGET" ]; then
+    launchctl bootout system/com.roomler.daemon 2>/dev/null || true
+    rm -f "$DAEMON_PLIST_TARGET"
+    echo "roomler system daemon disabled (no /etc/roomler-agent/enable-daemon)."
+  fi
+fi
+
 exit 0
