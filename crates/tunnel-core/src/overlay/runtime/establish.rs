@@ -530,6 +530,11 @@ impl OverlayRuntime {
                 if !tier.is_direct() {
                     coord.forget(&nid);
                 }
+                // U1 — ship the death as evidence with the re-request: the
+                // dead carrier's relay flavour (None for a direct→relay fall)
+                // + the typed reason, so the server's churn escalation can
+                // log/act on WHAT died instead of inferring from timing.
+                coord.note_refresh_context(nid, e.relay_kind, reason.as_str());
                 coord.request(nid, cfg).await;
             }
         }
@@ -2035,4 +2040,155 @@ impl OverlayRuntime {
             .await;
         info!(peer = %link.node_id, overlay_ip = %link.overlay_ip, initiate, "overlay: peer installed");
     }
+
+    /// R1 — one srflx gather + advertise pass, extracted VERBATIM from
+    /// `run()`'s startup inline block so the direct-plane rebuild (R3) can
+    /// re-run it mid-session; [`setup_direct`](Self::setup_direct) is the
+    /// bind half of the same split. Behaviour is identical to the inline
+    /// original: gate on `srflx_gather_active`, resolve a STUN server
+    /// excluding our own IPs, gather within [`SRFLX_GATHER_BUDGET`], pick the
+    /// FIRST pair as the punch socket, probe our NAT type on it, stamp
+    /// `ctx.punch`/`ctx.my_nat`, publish `srflx_status`, and advertise via
+    /// `ClientMsg::OverlaySrflx`.
+    ///
+    /// Ordering contracts (both load-bearing):
+    /// * call AFTER the join for this plane — the server's (re-)join handler
+    ///   CLEARS `srflx_endpoints`, so a gather advertised before the join is
+    ///   erased by it;
+    /// * call BEFORE the demux loops start reading these sockets — the STUN
+    ///   replies ride the very sockets the overlay will use (the mapping has
+    ///   to match), and a recv loop would steal them.
+    pub(super) async fn gather_and_advertise_srflx(
+        &mut self,
+        direct_ctx: &mut Option<DirectCtx>,
+        stun_urls: &[String],
+    ) -> SrflxGather {
+        let mut out = SrflxGather {
+            stun_server: None,
+            advertised: Vec::new(),
+            my_nat: None,
+        };
+        if !direct::srflx_gather_active() {
+            return out;
+        }
+        let socks = direct_ctx
+            .as_ref()
+            .map(|c| c.socks.clone())
+            .unwrap_or_default();
+        // Our own interface IPs — excluded as STUN targets so a fleet host
+        // co-located with a coturn worker doesn't STUN itself (→ hairpin →
+        // false UDP-blocked). See `direct::resolve_stun_server`.
+        let own_ips: Vec<Ipv4Addr> = socks.iter().map(|(ip, _)| *ip).collect();
+        if socks.is_empty() || stun_urls.is_empty() {
+            return out;
+        }
+        match direct::resolve_stun_server(stun_urls, &own_ips).await {
+            Some(stun_server) => {
+                out.stun_server = Some(stun_server);
+                let pairs = tokio::time::timeout(
+                    SRFLX_GATHER_BUDGET,
+                    direct::gather_srflx(&socks, stun_server, SRFLX_ATTEMPT_TIMEOUT),
+                )
+                .await
+                .unwrap_or_default();
+                if pairs.is_empty() {
+                    // WARN, not debug. This exact line was `debug!` when the
+                    // srflx tier died fleet-wide on 2026-08-06 (coturn
+                    // replying with TTL=1, so every forwarded reply was
+                    // dropped before FORWARD) — and nothing above DEBUG said
+                    // a word while every pair in the mesh silently degraded
+                    // to the DERP carrier. Once per gather pass, so it can't
+                    // become log spam.
+                    warn!(
+                        %stun_server,
+                        sockets = socks.len(),
+                        "overlay: srflx gather yielded NO public candidate — this node \
+                         cannot hole-punch and every peer will read it as UDP-blocked \
+                         (pairs fall back to the relay/DERP tier). Check that the STUN \
+                         server answers UDP from the internet."
+                    );
+                    self.srflx_status = Some(crate::localapi::SrflxStatus {
+                        candidates: Vec::new(),
+                        stun_server: Some(stun_server.to_string()),
+                        nat: None,
+                        error: Some(format!(
+                            "STUN yielded no public candidate from {stun_server} \
+                             ({} socket(s) probed)",
+                            socks.len()
+                        )),
+                    });
+                } else {
+                    // The FIRST pair is the punch socket: its candidate is
+                    // advertised at index 0, which the peer's dial-side
+                    // (`pick_public_endpoint`) picks first — so both ends
+                    // agree on the mapping to punch.
+                    let punch = pairs.first().cloned();
+                    // Phase C — probe OUR NAT type on the punch socket (two
+                    // distinct STUN targets), BEFORE its demux loop starts
+                    // (same socket-read race as the gather). A peer skips the
+                    // punch only when BOTH ends are symmetric; `None`
+                    // (unknown) stays optimistic.
+                    let my_nat = if let Some((_, ps)) = &punch {
+                        let targets = direct::resolve_stun_targets(stun_urls, &own_ips).await;
+                        direct::probe_nat_type(ps, &targets, SRFLX_ATTEMPT_TIMEOUT)
+                            .await
+                            .map(str::to_string)
+                    } else {
+                        None
+                    };
+                    out.my_nat = my_nat.clone();
+                    if let (Some(ctx), Some(first)) = (direct_ctx.as_mut(), punch) {
+                        ctx.punch = Some(first);
+                        ctx.my_nat = my_nat.clone();
+                    }
+                    let candidates: Vec<String> = pairs.into_iter().map(|(c, _)| c).collect();
+                    out.advertised = candidates.clone();
+                    self.srflx_status = Some(crate::localapi::SrflxStatus {
+                        candidates: candidates.clone(),
+                        stun_server: Some(stun_server.to_string()),
+                        nat: my_nat.clone(),
+                        error: None,
+                    });
+                    info!(?candidates, ?my_nat, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B/C)");
+                    let _ = self
+                        .outbound
+                        .send(ClientMsg::OverlaySrflx {
+                            candidates,
+                            nat: my_nat,
+                        })
+                        .await;
+                }
+            }
+            None => {
+                // Also promoted from debug! — same reasoning as the
+                // no-candidate arm: with no STUN server the entire srflx tier
+                // is off for this pass, which is a fleet-level fact, not a
+                // detail.
+                warn!(
+                    urls = ?stun_urls,
+                    "overlay: no resolvable STUN server — srflx tier OFF this run; \
+                     this node will read as UDP-blocked to every peer"
+                );
+                self.srflx_status = Some(crate::localapi::SrflxStatus {
+                    candidates: Vec::new(),
+                    stun_server: None,
+                    nat: None,
+                    error: Some(format!("no resolvable STUN server among {stun_urls:?}")),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// R1 — outcome of one [`gather_and_advertise_srflx`] pass: the pinned STUN
+/// server, the advertised candidates, and the probed NAT class — exactly the
+/// three loop locals `run()` used to fill inline. The keepalive task and the
+/// reattach restore read these.
+///
+/// [`gather_and_advertise_srflx`]: OverlayRuntime::gather_and_advertise_srflx
+pub(super) struct SrflxGather {
+    pub(super) stun_server: Option<SocketAddr>,
+    pub(super) advertised: Vec<String>,
+    pub(super) my_nat: Option<String>,
 }
