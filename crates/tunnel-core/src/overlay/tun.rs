@@ -1089,9 +1089,15 @@ mod system {
                     if row.InterfaceLuid.Value != luid {
                         continue;
                     }
-                    let a = Ipv4Addr::from(u32::from_ne_bytes(
-                        row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
-                    ));
+                    // `S_addr`'s in-memory bytes ARE the network-order octets;
+                    // read them as `[u8; 4]`. Round-tripping through
+                    // `Ipv4Addr::from(u32)` instead byte-flips on
+                    // little-endian (field 2026-08-09: `list_v4` returned
+                    // 2.0.64.100 for 100.64.0.2, so the SkipAsSource
+                    // reconcile compared garbage geometry and silently
+                    // no-opped on the very host it exists for). Locked by
+                    // `sockaddr_v4_roundtrip`.
+                    let a = Ipv4Addr::from(row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes());
                     out.push((a, row.OnLinkPrefixLength, row.SkipAsSource));
                 }
                 FreeMibTable(table as _);
@@ -3074,6 +3080,46 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// Live field probe against the local `roomler` adapter — run
+        /// manually with `--ignored --nocapture`. This is the probe that
+        /// caught the `list_v4` byte-flip (2.0.64.100 for 100.64.0.2) that
+        /// unit tests structurally can't: the FFI read only lies against a
+        /// REAL table.
+        #[cfg(windows)]
+        #[test]
+        #[ignore]
+        fn manual_list_v4_probe() {
+            let luid = super::winroute::luid_for_alias("roomler").expect("no roomler adapter");
+            println!("luid={luid}");
+            let addrs = super::winaddr::list_v4(luid);
+            println!("list_v4 -> {addrs:?}");
+        }
+
+        /// The endianness lock for every SOCKADDR_INET v4 read/write pair:
+        /// what `winroute::sockaddr` stores, a memory-order byte read gets
+        /// back EXACTLY — on any endianness. (`Ipv4Addr::from(u32)` is the
+        /// trap: it interprets big-endian, so an ne-identity round-trip
+        /// byte-flips on little-endian hosts.)
+        #[cfg(windows)]
+        #[test]
+        fn sockaddr_v4_roundtrip() {
+            use std::net::{IpAddr, Ipv4Addr};
+            for ip in [
+                Ipv4Addr::new(100, 64, 0, 2),
+                Ipv4Addr::new(100, 65, 0, 5),
+                Ipv4Addr::new(1, 2, 3, 4),
+            ] {
+                let sa = super::winroute::sockaddr(IpAddr::V4(ip));
+                // SAFETY: reading the arm sockaddr() just wrote.
+                let raw = unsafe { sa.Ipv4.sin_addr.S_un.S_addr };
+                assert_eq!(
+                    Ipv4Addr::from(raw.to_ne_bytes()),
+                    ip,
+                    "memory-order byte read must round-trip"
+                );
+            }
+        }
 
         /// "Ask the interface, don't read the error" — now macOS-only (N1
         /// moved Windows address ops to typed IP Helper, deleting the netsh
