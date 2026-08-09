@@ -338,7 +338,8 @@ mod system {
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
 
         /// A zeroed `SOCKADDR_INET` carrying `ip`'s family + address only.
-        fn sockaddr(ip: IpAddr) -> SOCKADDR_INET {
+        /// `pub(super)`: [`winaddr`](super::winaddr) keys its rows the same way.
+        pub(super) fn sockaddr(ip: IpAddr) -> SOCKADDR_INET {
             // SAFETY: SOCKADDR_INET is a POD union; zero it, then write the
             // active v4/v6 arm's family + address (the documented init pattern).
             unsafe {
@@ -690,6 +691,199 @@ mod system {
             }
         }
 
+        /// The address inside a `SOCKADDR_INET`, per its own family tag.
+        /// `None` for an unset/foreign family (a zeroed union reads AF 0).
+        fn ip_of(sa: &SOCKADDR_INET) -> Option<IpAddr> {
+            // SAFETY: reading the union arm selected by its family tag; the
+            // in-memory byte order IS network order, so the raw bytes are the
+            // address octets.
+            unsafe {
+                match sa.si_family {
+                    AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+                        sa.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+                    ))),
+                    AF_INET6 => Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                        sa.Ipv6.sin6_addr.u.Byte,
+                    ))),
+                    _ => None,
+                }
+            }
+        }
+
+        /// N3 — the LUID for an interface ALIAS (`"roomler"`), for callers
+        /// with NO live device handle: the boot reconciler and the last-gasp
+        /// crash-path purge, which previously targeted the alias through
+        /// `netsh`/PowerShell spawns — from a process that was, by
+        /// definition, already wedged. `None` when no such adapter exists
+        /// (nothing to purge — the honest answer).
+        pub fn luid_for_alias(alias: &str) -> Option<u64> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
+            let wide: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut luid = NET_LUID_LH { Value: 0 };
+            // SAFETY: `wide` is NUL-terminated; the API writes the out-param
+            // only on success, and `Value` covers the whole union.
+            unsafe {
+                (ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) == NO_ERROR)
+                    .then_some(luid.Value)
+            }
+        }
+
+        /// N3 — every route prefix currently on `luid`, both families, as
+        /// `"addr/plen"` strings (the shape `purge_one` consumes). The typed
+        /// twin of the retired `Get-NetRoute` PowerShell spawn: an in-memory
+        /// FIB snapshot instead of a 0.5–2 s process launch on bring-up and
+        /// on every crash-path exit.
+        pub fn list_cidrs(luid: u64) -> Vec<String> {
+            let mut out = Vec::new();
+            // SAFETY: GetIpForwardTable2 allocates a snapshot we iterate then
+            // free — the same idiom as `evict_competing_v4`.
+            unsafe {
+                for family in [AF_INET, AF_INET6] {
+                    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                    if GetIpForwardTable2(family, &mut table) != NO_ERROR || table.is_null() {
+                        continue;
+                    }
+                    let n = (*table).NumEntries as usize;
+                    let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                    for r in rows {
+                        if r.InterfaceLuid.Value != luid {
+                            continue;
+                        }
+                        if let Some(ip) = ip_of(&r.DestinationPrefix.Prefix) {
+                            out.push(format!("{ip}/{}", r.DestinationPrefix.PrefixLength));
+                        }
+                    }
+                    FreeMibTable(table as *const core::ffi::c_void);
+                }
+            }
+            out
+        }
+
+        /// N2 — the host's best route toward `dst` as `(ifIndex, gateway)`,
+        /// straight from the FIB (`GetBestRoute2`) — the typed replacement
+        /// for parsing `netsh interface ipv{4,6} show route`'s LOCALIZED,
+        /// position-keyed table (the most fragile parse the tree had).
+        /// `None` on error or when the best route is on-link (unspecified
+        /// next-hop): no usable gateway, same verdict the parser reached by
+        /// skipping non-address gateway columns.
+        pub fn best_route(dst: IpAddr) -> Option<(u32, IpAddr)> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::GetBestRoute2;
+            // SAFETY: out-params are written on success; the destination is a
+            // fully-initialised SOCKADDR_INET.
+            unsafe {
+                let dest = sockaddr(dst);
+                let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+                let mut src: SOCKADDR_INET = std::mem::zeroed();
+                if GetBestRoute2(
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    &dest,
+                    0,
+                    &mut row,
+                    &mut src,
+                ) != NO_ERROR
+                {
+                    return None;
+                }
+                let gw = ip_of(&row.NextHop)?;
+                let unspecified = match gw {
+                    IpAddr::V4(v) => v.is_unspecified(),
+                    IpAddr::V6(v) => v.is_unspecified(),
+                };
+                if unspecified {
+                    return None;
+                }
+                Some((row.InterfaceIndex, gw))
+            }
+        }
+
+        /// N3 — a gateway-routed row keyed by interface INDEX (what
+        /// `OrigDefaultRoute` carries): the host-exemption shape. Unlike
+        /// [`make_row`] the next-hop is a REAL gateway, and the interface is
+        /// the ORIGINAL uplink's, never ours.
+        fn make_gw_row(
+            ifindex: u32,
+            dest: IpAddr,
+            plen: u8,
+            gateway: IpAddr,
+            metric: u32,
+        ) -> MIB_IPFORWARD_ROW2 {
+            // SAFETY: InitializeIpForwardEntry fills valid defaults; we
+            // override index / prefix / next-hop / metric.
+            unsafe {
+                let mut r: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+                InitializeIpForwardEntry(&mut r);
+                r.InterfaceIndex = ifindex;
+                r.DestinationPrefix.Prefix = sockaddr(dest);
+                r.DestinationPrefix.PrefixLength = plen;
+                r.NextHop = sockaddr(gateway);
+                r.Metric = metric;
+                r
+            }
+        }
+
+        /// N3 — add (idempotent) `dest/plen` via `gateway` on interface
+        /// index `ifindex` — the typed host-exemption install.
+        pub fn add_gateway_route(
+            ifindex: u32,
+            dest: IpAddr,
+            plen: u8,
+            gateway: IpAddr,
+            metric: u32,
+        ) -> std::io::Result<()> {
+            let r = make_gw_row(ifindex, dest, plen, gateway, metric);
+            // SAFETY: fully-initialised row; the API copies it.
+            let rc = unsafe { CreateIpForwardEntry2(&r) };
+            if rc == NO_ERROR || rc == ERROR_OBJECT_ALREADY_EXISTS {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(rc as i32))
+            }
+        }
+
+        /// N3 — remove a host-exemption row (best-effort; absent is fine).
+        pub fn del_gateway_route(ifindex: u32, dest: IpAddr, plen: u8, gateway: IpAddr) {
+            let r = make_gw_row(ifindex, dest, plen, gateway, 0);
+            // SAFETY: the row carries the (interface, prefix, next-hop) key
+            // the API matches on.
+            unsafe { DeleteIpForwardEntry2(&r) };
+        }
+
+        /// N5 — pin the adapter's IPv4 interface METRIC (the route-war
+        /// priority: our connected `/10` + peer `/32`s must outrank a
+        /// full-tunnel VPN's captured routes). Typed replacement for the
+        /// blocking `netsh set interface metric=` in `up()`. The
+        /// `SitePrefixLength = 0` reset before `Set` is a documented API
+        /// quirk (`Get` returns a value `Set` rejects) — same handling as
+        /// the in-tree wintun-bindings `set_adapter_mtu`.
+        pub fn set_iface_metric_v4(luid: u64, metric: u32) -> std::io::Result<()> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::{
+                GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+                SetIpInterfaceEntry,
+            };
+            // SAFETY: Initialize fills valid defaults; Get fills the row for
+            // (family, luid); Set writes the mutated copy back.
+            unsafe {
+                let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+                InitializeIpInterfaceEntry(&mut row);
+                row.Family = AF_INET;
+                row.InterfaceLuid = NET_LUID_LH { Value: luid };
+                let rc = GetIpInterfaceEntry(&mut row);
+                if rc != NO_ERROR {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+                row.SitePrefixLength = 0;
+                row.Metric = metric;
+                row.UseAutomaticMetric = false;
+                let rc = SetIpInterfaceEntry(&mut row);
+                if rc != NO_ERROR {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+            }
+            Ok(())
+        }
+
         /// rc.279 — the OS-observed identity for our adapter LUID:
         /// `(ifIndex, "{GUID}")`. Diagnostics only (the bring-up identity
         /// log); `0` / `"?"` on conversion failure.
@@ -782,6 +976,197 @@ mod system {
                 assert_eq!(t.note(k2, t0 + Duration::from_secs(61)), Some(0));
             }
         }
+    }
+
+    /// Track N1 — typed unicast-ADDRESS management on the overlay adapter,
+    /// the sibling of [`winroute`] (routes). IP Helper end to end: no
+    /// `netsh`, no subprocess, no output parsing — which retires the two
+    /// production incident classes the netsh path accumulated:
+    ///
+    /// * **#373 (locale)** — "is this error 'already exists'?" was answered
+    ///   by matching English prose; a German host's "Das Objekt ist bereits
+    ///   vorhanden." escaped and aborted the whole org runtime. Here the
+    ///   answer is the numeric `ERROR_OBJECT_ALREADY_EXISTS`, invariant by
+    ///   construction.
+    /// * **#388 (read-after-write race)** — `netsh add` and `netsh show`
+    ///   don't see the interface at the same instant, so a single-sample
+    ///   presence probe declared a just-created address ABSENT and the
+    ///   caller's rollback deleted it (pc50045, every restart). `Create…` and
+    ///   `Get…UnicastIpAddressEntry` operate on the SAME in-memory MIB table,
+    ///   so the skew — and the 4×150 ms polling loop that tolerated it —
+    ///   cannot exist here.
+    ///
+    /// The multi-org `SkipAsSource` reconcile also lives here: on one shared
+    /// adapter, Windows source-selection prefers the MOST-SPECIFIC address
+    /// regardless of destination, so a carved block nested inside another
+    /// org's block (pc50045: jovanov `100.65.0.5/22` inside grox's
+    /// `100.64.0.28/10`) gets picked as the source for the OUTER org's
+    /// destinations — and single-org receivers then reply into their own
+    /// on-link blackhole (field 2026-08-09, 100 % initiated-only loss). The
+    /// hand-applied mitigation (`SkipAsSource=$true` on the nested address)
+    /// was reverted by every restart; [`reconcile_skip_as_source`] re-derives
+    /// it from the address-table geometry after every add/remove, making it
+    /// durable. (The full fix — egress source normalization in `tun_mux` —
+    /// is separate; this keeps the field mitigation standing until then.)
+    #[cfg(windows)]
+    mod winaddr {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use windows_sys::Win32::Foundation::{
+            ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
+        };
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            CreateUnicastIpAddressEntry, DeleteUnicastIpAddressEntry, FreeMibTable,
+            GetUnicastIpAddressEntry, GetUnicastIpAddressTable, InitializeUnicastIpAddressEntry,
+            MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE, SetUnicastIpAddressEntry,
+        };
+        use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+        /// A minimal row identifying `ip` on `luid` — the (luid, address) pair
+        /// is the key every Get/Delete matches on.
+        fn row_for(luid: u64, ip: IpAddr) -> MIB_UNICASTIPADDRESS_ROW {
+            // SAFETY: POD row; Initialize fills valid defaults, then the key
+            // fields are written (same init pattern as `winroute::make_row`).
+            unsafe {
+                let mut r: MIB_UNICASTIPADDRESS_ROW = std::mem::zeroed();
+                InitializeUnicastIpAddressEntry(&mut r);
+                r.InterfaceLuid = NET_LUID_LH { Value: luid };
+                r.Address = super::winroute::sockaddr(ip);
+                r
+            }
+        }
+
+        /// Add `ip/plen` to `luid` (idempotent — an already-present address is
+        /// success, decided by the NUMERIC error, never the message). Returns
+        /// `true` when the address was newly created.
+        pub fn ensure(luid: u64, ip: IpAddr, plen: u8) -> std::io::Result<bool> {
+            let mut r = row_for(luid, ip);
+            r.OnLinkPrefixLength = plen;
+            // Mirror the `tun` crate's field-proven primary-address settings:
+            // manual origins, infinite lifetimes, DAD pre-passed (wintun does
+            // no ARP/NS, so waiting on DAD would only delay bring-up).
+            r.PrefixOrigin = 1; // IpPrefixOriginManual
+            r.SuffixOrigin = 1; // IpSuffixOriginManual
+            r.ValidLifetime = u32::MAX;
+            r.PreferredLifetime = u32::MAX;
+            r.DadState = 4; // IpDadStatePreferred
+            // SAFETY: fully-initialised row; the API copies it.
+            let rc = unsafe { CreateUnicastIpAddressEntry(&r) };
+            match rc {
+                NO_ERROR => Ok(true),
+                ERROR_OBJECT_ALREADY_EXISTS => Ok(false),
+                _ => Err(std::io::Error::from_raw_os_error(rc as i32)),
+            }
+        }
+
+        /// Take `ip` off `luid`. Best-effort: absent is fine, and a failure
+        /// only leaves an idle address behind (the caller's contract).
+        pub fn remove(luid: u64, ip: IpAddr) {
+            let r = row_for(luid, ip);
+            // SAFETY: `r` carries the (luid, address) key the API matches on.
+            let rc = unsafe { DeleteUnicastIpAddressEntry(&r) };
+            if rc != NO_ERROR && rc != ERROR_NOT_FOUND {
+                tracing::debug!(%ip, code = rc, "overlay: address delete reported an error");
+            }
+        }
+
+        /// Every IPv4 `(address, prefix_len, skip_as_source)` currently on
+        /// `luid` — the geometry input for the SkipAsSource reconcile.
+        pub fn list_v4(luid: u64) -> std::io::Result<Vec<(Ipv4Addr, u8, bool)>> {
+            let mut out = Vec::new();
+            // SAFETY: GetUnicastIpAddressTable allocates a snapshot we iterate
+            // then free — same idiom as `winroute::evict_competing_v4`.
+            unsafe {
+                let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
+                let rc = GetUnicastIpAddressTable(AF_INET, &mut table);
+                if rc != NO_ERROR || table.is_null() {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for row in rows {
+                    if row.InterfaceLuid.Value != luid {
+                        continue;
+                    }
+                    let a = Ipv4Addr::from(u32::from_ne_bytes(
+                        row.Address.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+                    ));
+                    out.push((a, row.OnLinkPrefixLength, row.SkipAsSource));
+                }
+                FreeMibTable(table as _);
+            }
+            Ok(out)
+        }
+
+        /// Flip one address's `SkipAsSource` in place (Get → mutate → Set; no
+        /// delete/re-add, so the connected route never flaps).
+        fn set_skip_as_source(luid: u64, ip: Ipv4Addr, skip: bool) -> std::io::Result<()> {
+            let mut r = row_for(luid, IpAddr::V4(ip));
+            // SAFETY: Get fills the row matched by (luid, address); Set writes
+            // the mutated copy back.
+            unsafe {
+                let rc = GetUnicastIpAddressEntry(&mut r);
+                if rc != NO_ERROR {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+                if r.SkipAsSource == skip {
+                    return Ok(());
+                }
+                r.SkipAsSource = skip;
+                let rc = SetUnicastIpAddressEntry(&r);
+                if rc != NO_ERROR {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+            }
+            tracing::info!(
+                %ip, skip,
+                "overlay: SkipAsSource reconciled (nested multi-org block source-selection guard)"
+            );
+            Ok(())
+        }
+
+        /// Multi-org source-selection guard — re-derive every overlay
+        /// address's `SkipAsSource` from the adapter's current geometry: an
+        /// address whose prefix nests STRICTLY inside another address's
+        /// prefix on the same adapter gets `skip = true` (Windows would
+        /// otherwise prefer it as the source for the outer block's
+        /// destinations); everything else gets `skip = false`. Deterministic
+        /// regardless of add order, so a restart, a re-claim, or an adapter
+        /// recreate always converges to the same flags — the property the
+        /// hand-applied pc50045 mitigation lacked. Best-effort: geometry we
+        /// cannot read leaves the flags as they are.
+        pub fn reconcile_skip_as_source(luid: u64) {
+            let Ok(addrs) = list_v4(luid) else { return };
+            for (ip, plen, cur) in &addrs {
+                let desired = addrs.iter().any(|(oip, oplen, _)| {
+                    (oip, oplen) != (ip, plen)
+                        && super::nests_strictly_within((*ip, *plen), (*oip, *oplen))
+                });
+                if *cur != desired
+                    && let Err(e) = set_skip_as_source(luid, *ip, desired)
+                {
+                    tracing::warn!(%ip, desired, %e, "overlay: SkipAsSource reconcile failed");
+                }
+            }
+        }
+    }
+
+    /// Track N1 (pure) — does prefix `a` nest STRICTLY inside prefix `b`?
+    /// True when `a`'s prefix is longer than `b`'s and `a`'s network falls
+    /// inside `b`. This is the exact geometry where Windows source-selection
+    /// picks the wrong org's address on a shared adapter (the more-specific
+    /// address wins for ANY destination), so it is the trigger for the
+    /// `SkipAsSource` guard.
+    #[cfg(any(windows, test))]
+    pub(crate) fn nests_strictly_within(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
+        let (aip, aplen) = a;
+        let (bip, bplen) = b;
+        if aplen <= bplen || bplen == 0 || bplen > 32 {
+            return false;
+        }
+        let mask = !0u32 << (32 - u32::from(bplen));
+        (u32::from(aip) & mask) == (u32::from(bip) & mask)
     }
 
     /// rc.288 — prefix length of an IPv4 netmask, e.g. `255.192.0.0` yields
@@ -1129,64 +1514,6 @@ mod system {
             }
         }
 
-        /// Is `ip` currently assigned to the overlay interface?
-        ///
-        /// The locale-proof half of the idempotent-add above. `netsh … show
-        /// addresses` labels its columns in the host's language, but the
-        /// address literal is invariant, so a substring match on the IP is
-        /// stable everywhere. Word-boundary-checked so `100.64.0.2` cannot
-        /// match a line that only contains `100.64.0.28`.
-        ///
-        /// Any failure to ASK is reported as "not present": the caller then
-        /// surfaces the original netsh error, which is the honest outcome —
-        /// far better than claiming success because the probe itself broke.
-        #[cfg(target_os = "windows")]
-        fn address_present_v4(
-            run: &impl Fn(&str, &[String]) -> std::io::Result<String>,
-            ip: Ipv4Addr,
-        ) -> bool {
-            let args: Vec<String> = vec![
-                "interface".into(),
-                "ipv4".into(),
-                "show".into(),
-                "addresses".into(),
-                format!("name={IF_NAME}"),
-            ];
-            // Poll briefly rather than answering from one sample.
-            //
-            // `netsh … add address` and `netsh … show addresses` do not see the
-            // interface at the same instant. When the device was just created,
-            // `up()` has already assigned this org's address through the tun
-            // crate, so the (deliberately unconditional, #375) re-add reports
-            // "already exists" while the listing has not caught up — and a
-            // single-sample check then answers ABSENT for an address that is
-            // very much there. The caller treats that as fatal, its rollback
-            // DELETES the address `up()` legitimately created, and the whole
-            // org's runtime aborts.
-            //
-            // Field 2026-08-08, pc50045: reproduced on every restart —
-            // `roomler status` showed `overlay ip —` with a healthy control WS,
-            // and the address was gone by the time anyone looked because the
-            // rollback had removed it. Running the identical netsh by hand
-            // always succeeded, which is the signature of a race rather than a
-            // rejected argument.
-            //
-            // A few hundred milliseconds is enough for the listing to settle;
-            // the cost when the address is genuinely absent is bounded and paid
-            // only on a path that is already failing.
-            for attempt in 0..ADDRESS_PRESENCE_ATTEMPTS {
-                if let Ok(out) = run("netsh", &args)
-                    && listing_mentions_address(&out, ip)
-                {
-                    return true;
-                }
-                if attempt + 1 < ADDRESS_PRESENCE_ATTEMPTS {
-                    std::thread::sleep(ADDRESS_PRESENCE_BACKOFF);
-                }
-            }
-            false
-        }
-
         /// The interface name the OS gave this device — [`IF_NAME`] on
         /// Windows/Linux, the kernel-assigned `utunN` on macOS.
         pub fn if_name(&self) -> &str {
@@ -1221,49 +1548,21 @@ mod system {
             };
             #[cfg(target_os = "windows")]
             {
-                // `netsh … add address` refuses an address that already
-                // exists; probing by delete-first would flap the connected
-                // route under live traffic, so tolerate that error instead.
-                let mask = Ipv4Addr::from(if prefix == 0 {
-                    0
-                } else {
-                    !0u32 << (32 - u32::from(prefix.min(32)))
-                });
-                let args: Vec<String> = vec![
-                    "interface".into(),
-                    "ipv4".into(),
-                    "add".into(),
-                    "address".into(),
-                    format!("name={IF_NAME}"),
-                    format!("addr={ip}"),
-                    format!("mask={mask}"),
-                ];
-                match run("netsh", &args) {
-                    Ok(_) => Ok(()),
-                    // Don't parse the MESSAGE — netsh is localized, and the
-                    // English-string check this replaces silently failed on a
-                    // German host. pc50045 (2026-08-07) answered
-                    // "Das Objekt ist bereits vorhanden." to an address it
-                    // already held; the tolerance missed it, `up` treated the
-                    // error as fatal, and the whole overlay runtime aborted —
-                    // `roomler peers` went empty on a box that was otherwise
-                    // healthy, with its ONE useful log line in German.
-                    //
-                    // Ask what we actually care about instead: is the address
-                    // on the interface now? An IP literal is the same in every
-                    // locale, so matching it in `show addresses` is stable
-                    // where the error text is not. Retains the original
-                    // reason for tolerating this at all: probing by
-                    // delete-first would flap the connected route under live
-                    // traffic.
-                    Err(e) => {
-                        if Self::address_present_v4(&run, ip) {
-                            Ok(())
-                        } else {
-                            Err(e)
-                        }
-                    }
-                }
+                let _ = run; // Linux/macOS shell out; Windows is typed (N1).
+                // Track N1 — typed IP Helper, replacing `netsh add address` +
+                // the locale-string tolerance (#373) + the listing-race
+                // presence poll (#388). Idempotence is decided by the NUMERIC
+                // `ERROR_OBJECT_ALREADY_EXISTS` inside `ensure`, and there is
+                // no delete-first, so the connected route never flaps under
+                // live traffic (the original reason the netsh path tolerated
+                // "already exists" at all).
+                let luid = self.dev.tun_luid();
+                winaddr::ensure(luid, std::net::IpAddr::V4(ip), prefix)?;
+                // Multi-org source-selection guard: a carved block nested in
+                // another org's block must not be picked as the source for
+                // the outer block's destinations (field 2026-08-09, pc50045).
+                winaddr::reconcile_skip_as_source(luid);
+                Ok(())
             }
             #[cfg(target_os = "linux")]
             {
@@ -1333,18 +1632,11 @@ mod system {
             };
             #[cfg(target_os = "windows")]
             {
-                let _ = prefix;
-                run(
-                    "netsh",
-                    &[
-                        "interface".into(),
-                        "ipv4".into(),
-                        "delete".into(),
-                        "address".into(),
-                        format!("name={IF_NAME}"),
-                        format!("addr={ip}"),
-                    ],
-                );
+                let _ = (prefix, &run); // Linux/macOS shell out; Windows is typed (N1).
+                let luid = self.dev.tun_luid();
+                winaddr::remove(luid, std::net::IpAddr::V4(ip));
+                // Removing a block can un-nest a survivor — heal the flags.
+                winaddr::reconcile_skip_as_source(luid);
             }
             #[cfg(target_os = "linux")]
             run(
@@ -1481,20 +1773,26 @@ mod system {
             // range. Check Point Endpoint installs competing `/32`s via its NIC
             // at metric 1, which otherwise swallow overlay traffic (the packet
             // is bounced to the VPN gateway → "destination host unreachable").
-            // Best-effort + sync (`up` isn't async) — a blocking `netsh` at
-            // bring-up is fine; a failure just leaves the default metric.
+            // N5 — typed (`Get/SetIpInterfaceEntry`, in-memory µs) instead of
+            // the old blocking `netsh` spawn. Still best-effort: a failure
+            // just leaves the default metric.
             #[cfg(target_os = "windows")]
             {
-                let _ = std::process::Command::new("netsh")
-                    .args(["interface", "ipv4", "set", "interface", IF_NAME, "metric=1"])
-                    .output();
+                use tun::AbstractDeviceExt as _;
+                if let Err(e) = winroute::set_iface_metric_v4(dev.tun_luid(), 1) {
+                    tracing::warn!(%e, "overlay: interface metric pin failed; keeping the default");
+                }
             }
 
             // Dual-stack: assign the derived overlay v6 on the ULA /96 (the
             // `tun` crate's Configuration is v4-only, so this is an OS call —
             // sync + best-effort like the metric pin; a failure leaves the
             // node v4-only, which keeps working unchanged).
-            assign_derived_v6(self_ip, &if_name);
+            #[cfg(target_os = "windows")]
+            let tun_luid = dev.tun_luid();
+            #[cfg(not(target_os = "windows"))]
+            let tun_luid = 0u64;
+            assign_derived_v6(self_ip, &if_name, tun_luid);
 
             // Program WFP so the overlay's inbound survives a GPO-locked
             // Defender Firewall (Tailscale's approach). Best-effort: a
@@ -2088,34 +2386,19 @@ mod system {
                     }
                     #[cfg(target_os = "windows")]
                     {
-                        // delete-then-add (idempotent), like the other helpers.
-                        let _ = run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv4".into(),
-                                "delete".into(),
-                                "route".into(),
-                                format!("prefix={v4}/32"),
-                                format!("interface={}", gw.interface),
-                            ],
+                        // N3 — typed IP Helper (idempotent by numeric
+                        // AlreadyExists); `gw.interface` is the ORIGINAL
+                        // uplink's ifIndex, captured at bring-up.
+                        let ifindex: u32 = gw.interface.parse().map_err(|_| {
+                            std::io::Error::other("orig default route ifindex not numeric")
+                        })?;
+                        winroute::add_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V4(v4),
+                            32,
+                            std::net::IpAddr::V4(gw.gateway),
+                            1,
                         )
-                        .await;
-                        run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv4".into(),
-                                "add".into(),
-                                "route".into(),
-                                format!("prefix={v4}/32"),
-                                format!("interface={}", gw.interface),
-                                format!("nexthop={}", gw.gateway),
-                                "metric=1".into(),
-                                "store=active".into(),
-                            ],
-                        )
-                        .await
                     }
                 }
                 // P5/S3b — the IPv6 `/128` counterpart, via the original v6 gateway.
@@ -2144,33 +2427,17 @@ mod system {
                     }
                     #[cfg(target_os = "windows")]
                     {
-                        let _ = run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv6".into(),
-                                "delete".into(),
-                                "route".into(),
-                                format!("prefix={v6}/128"),
-                                format!("interface={}", gw.interface),
-                            ],
+                        // N3 — typed v6 twin of the v4 exemption above.
+                        let ifindex: u32 = gw.interface.parse().map_err(|_| {
+                            std::io::Error::other("orig v6 default route ifindex not numeric")
+                        })?;
+                        winroute::add_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V6(v6),
+                            128,
+                            std::net::IpAddr::V6(gw.gateway),
+                            1,
                         )
-                        .await;
-                        run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv6".into(),
-                                "add".into(),
-                                "route".into(),
-                                format!("prefix={v6}/128"),
-                                format!("interface={}", gw.interface),
-                                format!("nexthop={}", gw.gateway),
-                                "metric=1".into(),
-                                "store=active".into(),
-                            ],
-                        )
-                        .await
                     }
                 }
             }
@@ -2202,18 +2469,14 @@ mod system {
                         let _ = run_cmd("ip", args).await;
                     }
                     #[cfg(target_os = "windows")]
-                    let _ = run_cmd(
-                        "netsh",
-                        vec![
-                            "interface".into(),
-                            "ipv4".into(),
-                            "delete".into(),
-                            "route".into(),
-                            format!("prefix={v4}/32"),
-                            format!("interface={}", gw.interface),
-                        ],
-                    )
-                    .await;
+                    if let Ok(ifindex) = gw.interface.parse::<u32>() {
+                        winroute::del_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V4(v4),
+                            32,
+                            std::net::IpAddr::V4(gw.gateway),
+                        );
+                    }
                 }
                 std::net::IpAddr::V6(v6) => {
                     let Some(gw) = self.orig_default_v6.as_ref() else {
@@ -2237,18 +2500,14 @@ mod system {
                         let _ = run_cmd("ip", args).await;
                     }
                     #[cfg(target_os = "windows")]
-                    let _ = run_cmd(
-                        "netsh",
-                        vec![
-                            "interface".into(),
-                            "ipv6".into(),
-                            "delete".into(),
-                            "route".into(),
-                            format!("prefix={v6}/128"),
-                            format!("interface={}", gw.interface),
-                        ],
-                    )
-                    .await;
+                    if let Ok(ifindex) = gw.interface.parse::<u32>() {
+                        winroute::del_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V6(v6),
+                            128,
+                            std::net::IpAddr::V6(gw.gateway),
+                        );
+                    }
                 }
             }
         }
@@ -2259,30 +2518,21 @@ mod system {
     #[cfg(target_os = "windows")]
     const IF_NAME: &str = "roomler";
 
-    /// How many times `address_present_v4` samples the interface listing
-    /// before concluding an address really is absent, and how long it waits
-    /// between samples. Sized to cover the gap between `netsh … add address`
-    /// seeing an address and `netsh … show addresses` listing it — see the
-    /// comment in that function for the outage this exists to stop.
-    #[cfg(target_os = "windows")]
-    const ADDRESS_PRESENCE_ATTEMPTS: usize = 4;
-    #[cfg(target_os = "windows")]
-    const ADDRESS_PRESENCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
-
     #[cfg(target_os = "linux")]
     const IF_NAME: &str = "roomler0";
     /// Does an interface listing mention `ip`?
     ///
-    /// The one shared piece of "ask the interface instead of reading the
-    /// error", used by both `netsh interface ipv4 show addresses` (Windows)
-    /// and `ifconfig <utun>` (macOS). Everything those tools SAY is
-    /// localized — labels and errors alike — but an IPv4 literal is not, so
-    /// the address is the only token worth reading. Split on everything
-    /// that cannot appear inside a dotted quad and compare whole tokens: a
-    /// substring test would let `100.64.0.2` match a listed `100.64.0.28`.
+    /// "Ask the interface instead of reading the error", for the ONE platform
+    /// still on subprocess address ops: `ifconfig <utun>` on macOS. (Windows
+    /// moved to typed IP Helper in N1 — `winaddr` — so its netsh listing
+    /// probe is gone.) Everything `ifconfig` SAYS is localized — labels and
+    /// errors alike — but an IPv4 literal is not, so the address is the only
+    /// token worth reading. Split on everything that cannot appear inside a
+    /// dotted quad and compare whole tokens: a substring test would let
+    /// `100.64.0.2` match a listed `100.64.0.28`.
     ///
     /// Compiled everywhere so every platform's test run covers it.
-    #[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn listing_mentions_address(listed: &str, ip: Ipv4Addr) -> bool {
         let want = ip.to_string();
         listed
@@ -2461,23 +2711,13 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn enumerate_if_routes() -> Vec<String> {
-        let out = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Get-NetRoute -InterfaceAlias {IF_NAME} -ErrorAction SilentlyContinue | \
-                     Select-Object -ExpandProperty DestinationPrefix"
-                ),
-            ])
-            .output();
-        let Ok(out) = out else { return Vec::new() };
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|p| p.contains('/'))
-            .map(str::to_string)
-            .collect()
+        // N3 — typed FIB walk. The old `Get-NetRoute` PowerShell spawn cost
+        // 0.5–2 s at bring-up AND inside `purge_exit_routes()` on every
+        // `process::exit` path — launched from a process that was, by
+        // definition, already wedged.
+        winroute::luid_for_alias(IF_NAME)
+            .map(winroute::list_cidrs)
+            .unwrap_or_default()
     }
 
     #[cfg(target_os = "linux")]
@@ -2492,17 +2732,14 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn purge_one(cidr: &str) {
-        let family = if is_v6_cidr(cidr) { "ipv6" } else { "ipv4" };
-        let _ = std::process::Command::new("netsh")
-            .args([
-                "interface",
-                family,
-                "delete",
-                "route",
-                &format!("prefix={cidr}"),
-                &format!("interface={IF_NAME}"),
-            ])
-            .output();
+        // N3 — typed delete (was the last Windows route MUTATION on netsh,
+        // kept only because this path has no live SystemTun/LUID in hand).
+        let Some((ip, plen)) = parse_cidr(cidr) else {
+            return;
+        };
+        if let Some(luid) = winroute::luid_for_alias(IF_NAME) {
+            winroute::del(luid, ip, plen);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -2531,11 +2768,17 @@ mod system {
     /// Assign this node's derived overlay IPv6 (`fd72:6f6f:6d6c::<v4>`, `/96`
     /// on-link) to the overlay NIC. Sync + best-effort (`up` isn't async): the
     /// `tun` crate's `Configuration` carries no v6 surface, so Linux uses
-    /// `ip -6 addr replace` (idempotent) and Windows the delete-then-add
-    /// `netsh` pattern the route helpers already use (the Wintun adapter
-    /// persists across reconnects, so the address may already be present).
-    /// macOS utun stays v4-only for now, matching the per-peer-route stance.
-    fn assign_derived_v6(self_ip: Ipv4Addr, #[allow(unused_variables)] if_name: &str) {
+    /// `ip -6 addr replace` (idempotent) and Windows the typed
+    /// [`winaddr::ensure`] (N1 — idempotent by numeric error, which also
+    /// retires the old delete-then-add's per-bring-up flap of the v6
+    /// connected route; the Wintun adapter persists across reconnects, so
+    /// the address is usually already present). macOS utun stays v4-only for
+    /// now, matching the per-peer-route stance.
+    fn assign_derived_v6(
+        self_ip: Ipv4Addr,
+        #[allow(unused_variables)] if_name: &str,
+        #[allow(unused_variables)] luid: u64,
+    ) {
         let v6 = crate::overlay::router::derive_overlay_v6(self_ip);
         #[cfg(target_os = "linux")]
         {
@@ -2561,44 +2804,16 @@ mod system {
         }
         #[cfg(target_os = "windows")]
         {
-            // Delete (ignored when absent — first bring-up), then add.
-            let iface = format!("interface={IF_NAME}");
-            let _ = std::process::Command::new("netsh")
-                .args([
-                    "interface",
-                    "ipv6",
-                    "delete",
-                    "address",
-                    &iface,
-                    &format!("address={v6}"),
-                ])
-                .output();
-            let addr = format!(
-                "address={v6}/{}",
-                crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX
-            );
-            match std::process::Command::new("netsh")
-                .args([
-                    "interface",
-                    "ipv6",
-                    "add",
-                    "address",
-                    &iface,
-                    &addr,
-                    "store=active",
-                ])
-                .output()
-            {
-                Ok(out) if out.status.success() => {
-                    tracing::info!(%addr, "overlay: derived IPv6 assigned to the TUN");
+            let plen = crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX;
+            match winaddr::ensure(luid, std::net::IpAddr::V6(v6), plen) {
+                Ok(created) => {
+                    tracing::info!(
+                        addr = %format!("{v6}/{plen}"), created,
+                        "overlay: derived IPv6 assigned to the TUN"
+                    );
                 }
-                Ok(out) => tracing::warn!(
-                    %addr,
-                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                    "overlay: derived-IPv6 assign failed; node stays v4-only"
-                ),
                 Err(e) => tracing::warn!(
-                    %addr,
+                    addr = %format!("{v6}/{plen}"),
                     error = %e,
                     "overlay: derived-IPv6 assign failed; node stays v4-only"
                 ),
@@ -2646,8 +2861,10 @@ mod system {
 
     /// Run an OS route command off the async reactor (`std::process` in a
     /// blocking task — avoids pulling in tokio's `process` feature). Non-zero
-    /// exit → `Err` with the captured stderr.
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    /// exit → `Err` with the captured stderr. Linux/macOS only since N2/N3:
+    /// every Windows route/address operation goes through the typed
+    /// `winroute`/`winaddr` IP Helper layers now.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn run_cmd(prog: &'static str, args: Vec<String>) -> std::io::Result<()> {
         tokio::task::spawn_blocking(move || {
             let out = std::process::Command::new(prog).args(&args).output()?;
@@ -2699,14 +2916,22 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn discover_default_route() -> Option<OrigDefaultRoute> {
-        let out = std::process::Command::new("netsh")
-            .args(["interface", "ipv4", "show", "route"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
+        // N2 — `GetBestRoute2` toward the unspecified address answers "which
+        // route would carry a default-bound packet right now" as a STRUCT,
+        // replacing the fixed-position parse of `netsh show route`'s
+        // LOCALIZED table (the most fragile parse the tree had). On-link
+        // defaults (unspecified next-hop) yield `None`, same as the parser's
+        // skip. Ordering contract unchanged: this runs in `up()` BEFORE the
+        // adapter exists, so the best route cannot be our own.
+        let (ifindex, gw) =
+            winroute::best_route(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?;
+        let std::net::IpAddr::V4(gateway) = gw else {
             return None;
-        }
-        parse_windows_default_route(&String::from_utf8_lossy(&out.stdout))
+        };
+        Some(OrigDefaultRoute {
+            gateway,
+            interface: ifindex.to_string(),
+        })
     }
 
     /// Parse `ip -4 route show default` → the lowest-metric default route. Pure
@@ -2755,33 +2980,6 @@ mod system {
         best.map(|(_, r)| r)
     }
 
-    /// Parse `netsh interface ipv4 show route` → the lowest-metric `0.0.0.0/0`
-    /// route (gateway + interface index). Pure so it unit-tests against captured
-    /// output. Rows whose gateway column is an interface NAME (on-link, no
-    /// gateway) are skipped — a real default route always carries a gateway.
-    #[cfg(target_os = "windows")]
-    fn parse_windows_default_route(output: &str) -> Option<OrigDefaultRoute> {
-        let mut best: Option<(u32, OrigDefaultRoute)> = None;
-        for line in output.lines() {
-            // Columns: Publish  Type  Met  Prefix  Idx  Gateway/Interface Name
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            if toks.len() < 6 || toks[3] != "0.0.0.0/0" {
-                continue;
-            }
-            let Ok(metric) = toks[2].parse::<u32>() else {
-                continue; // header row ("Met")
-            };
-            let Ok(gateway) = toks[5].parse::<Ipv4Addr>() else {
-                continue; // on-link (interface name, not a gateway)
-            };
-            let interface = toks[4].to_string();
-            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
-                best = Some((metric, OrigDefaultRoute { gateway, interface }));
-            }
-        }
-        best.map(|(_, r)| r)
-    }
-
     /// P5/S3b — the host's original IPv6 default route: the v6 gateway + interface
     /// that carried its v6 traffic before the overlay. Pins v6 `/128` exit
     /// exemptions. `gateway` is frequently a link-local (`fe80::`) next-hop, which
@@ -2814,14 +3012,18 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn discover_default_route_v6() -> Option<OrigDefaultRoute6> {
-        let out = std::process::Command::new("netsh")
-            .args(["interface", "ipv6", "show", "route"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
+        // N2 — v6 twin of the typed discovery above. A link-local (`fe80::`)
+        // next-hop comes back as an ADDRESS from the FIB — no `%zone` string
+        // to strip; the ifIndex disambiguates it, as before.
+        let (ifindex, gw) =
+            winroute::best_route(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))?;
+        let std::net::IpAddr::V6(gateway) = gw else {
             return None;
-        }
-        parse_windows_default_route_v6(&String::from_utf8_lossy(&out.stdout))
+        };
+        Some(OrigDefaultRoute6 {
+            gateway,
+            interface: ifindex.to_string(),
+        })
     }
 
     /// Parse `ip -6 route show default` → the lowest-metric v6 default (gateway +
@@ -2868,158 +3070,72 @@ mod system {
         best.map(|(_, r)| r)
     }
 
-    /// Parse `netsh interface ipv6 show route` → the lowest-metric `::/0` route
-    /// (gateway + interface index). Pure. Rows whose gateway column isn't a v6
-    /// address (on-link — an interface name) are skipped; a `%zone` suffix on a
-    /// link-local gateway is stripped before parsing.
-    #[cfg(target_os = "windows")]
-    fn parse_windows_default_route_v6(output: &str) -> Option<OrigDefaultRoute6> {
-        let mut best: Option<(u32, OrigDefaultRoute6)> = None;
-        for line in output.lines() {
-            // Columns: Publish  Type  Met  Prefix  Idx  Gateway/Interface Name
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            if toks.len() < 6 || toks[3] != "::/0" {
-                continue;
-            }
-            let Ok(metric) = toks[2].parse::<u32>() else {
-                continue; // header row ("Met")
-            };
-            let gw_str = toks[5].split('%').next().unwrap_or(toks[5]);
-            let Ok(gateway) = gw_str.parse::<Ipv6Addr>() else {
-                continue; // on-link (interface name, not a gateway)
-            };
-            let interface = toks[4].to_string();
-            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
-                best = Some((metric, OrigDefaultRoute6 { gateway, interface }));
-            }
-        }
-        best.map(|(_, r)| r)
-    }
-
     #[cfg(test)]
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
 
-        /// The shared half of "ask the interface, don't read the error".
-        ///
-        /// `address_presence_is_locale_proof` below covers the Windows
-        /// wrapper but is `cfg(windows)`, so CI never runs it. This one
-        /// compiles everywhere and covers both listing shapes — including
-        /// macOS `ifconfig`, whose output is the other caller.
+        /// "Ask the interface, don't read the error" — now macOS-only (N1
+        /// moved Windows address ops to typed IP Helper, deleting the netsh
+        /// listing probe, its German/English captures, and the #388 polling
+        /// loop; the race those tolerated cannot exist against the MIB table
+        /// the create itself writes).
         #[test]
         fn listings_are_read_by_address_literal_not_by_label() {
             use super::listing_mentions_address as m;
             use std::net::Ipv4Addr;
 
-            // German Windows `netsh` — every label differs, the address does not.
-            let de = "    IP-Adresse:  100.64.0.28\n    Subnetzpräfix: 100.64.0.0/10\n";
-            // macOS `ifconfig utun4` — a point-to-point inet line.
+            // macOS `ifconfig utun4` — point-to-point inet lines, one per org.
             let mac = "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\
                        \tinet 100.64.0.28 --> 100.64.0.28 netmask 0xffc00000\n\
                        \tinet 100.65.0.5 --> 100.65.0.5 netmask 0xfffffc00\n";
 
-            for out in [de, mac] {
-                assert!(m(out, Ipv4Addr::new(100, 64, 0, 28)));
-                // The substring trap: `100.64.0.2` must NOT match a listed
-                // `100.64.0.28`, or a real failure gets swallowed.
-                assert!(!m(out, Ipv4Addr::new(100, 64, 0, 2)));
-                assert!(!m(out, Ipv4Addr::new(10, 0, 0, 1)));
-            }
-            // macOS carries the second org's address too — that is the
-            // whole point of the multi-address path there.
+            assert!(m(mac, Ipv4Addr::new(100, 64, 0, 28)));
+            // The substring trap: `100.64.0.2` must NOT match a listed
+            // `100.64.0.28`, or a real failure gets swallowed.
+            assert!(!m(mac, Ipv4Addr::new(100, 64, 0, 2)));
+            assert!(!m(mac, Ipv4Addr::new(10, 0, 0, 1)));
+            // The second org's address is listed too — the whole point of
+            // the multi-address path.
             assert!(m(mac, Ipv4Addr::new(100, 65, 0, 5)));
-            assert!(!m(de, Ipv4Addr::new(100, 65, 0, 5)));
             assert!(!m("", Ipv4Addr::new(100, 64, 0, 28)));
         }
 
-        /// The pc50045 outage (2026-08-07): a GERMAN-locale Windows host
-        /// answered `netsh … add address` with "Das Objekt ist bereits
-        /// vorhanden." for an address it already held. The old tolerance
-        /// matched the ENGLISH string, so the error escaped, `up` treated it
-        /// as fatal, and the entire overlay runtime aborted — `roomler peers`
-        /// went empty on an otherwise healthy box.
-        ///
-        /// Locale-proof now: the IP literal is invariant, so we ask whether
-        /// the address is present rather than reading the complaint.
-        #[cfg(target_os = "windows")]
+        /// Track N1 — the multi-org source-selection geometry: an address
+        /// nests STRICTLY inside another when its prefix is longer and its
+        /// network falls inside the other's. This is what decides
+        /// `SkipAsSource` (Windows prefers the most-specific address as a
+        /// source for ANY destination — pc50045's jovanov /22 inside grox's
+        /// /10 sourced grox-bound packets and single-org receivers replied
+        /// into their own on-link blackhole, field 2026-08-09).
         #[test]
-        fn address_presence_polls_until_the_listing_catches_up() {
-            use super::super::SystemTun;
-            use std::cell::Cell;
+        fn nesting_rule_matches_the_field_geometry() {
+            use super::nests_strictly_within as nests;
             use std::net::Ipv4Addr;
-
-            let present = "\nSchnittstelle \"roomler\"\n    IP-Adresse:      100.64.0.28\n";
-            let empty = "\nSchnittstelle \"roomler\"\n    IP-Adresse:      100.65.0.5\n";
-
-            // `netsh add` and `netsh show` do not see the interface at the
-            // same instant: the address is already assigned (so the add says
-            // "already exists") while the listing still omits it. A
-            // single-sample check answered ABSENT here, the caller treated
-            // that as fatal, its rollback deleted the address, and the org's
-            // runtime aborted — pc50045, every restart, 2026-08-08.
-            let calls = Cell::new(0usize);
-            let late = |_: &str, _: &[String]| {
-                let n = calls.get();
-                calls.set(n + 1);
-                Ok(if n == 0 { empty } else { present }.to_string())
-            };
-            assert!(
-                SystemTun::address_present_v4(&late, Ipv4Addr::new(100, 64, 0, 28)),
-                "must poll past a listing that has not caught up yet"
-            );
-            assert!(calls.get() >= 2, "should have re-sampled");
-
-            // A genuinely absent address still answers false — bounded, and
-            // only after actually re-checking.
-            let calls = Cell::new(0usize);
-            let never = |_: &str, _: &[String]| {
-                calls.set(calls.get() + 1);
-                Ok(empty.to_string())
-            };
-            assert!(!SystemTun::address_present_v4(
-                &never,
-                Ipv4Addr::new(100, 64, 0, 28)
+            let grox = (Ipv4Addr::new(100, 64, 0, 28), 10u8);
+            let jovanov = (Ipv4Addr::new(100, 65, 0, 5), 22u8);
+            // The pc50045 shape: the carved /22 nests inside the /10 — and
+            // only in that direction.
+            assert!(nests(jovanov, grox));
+            assert!(!nests(grox, jovanov));
+            // Nothing nests in itself; equal prefixes never nest.
+            assert!(!nests(grox, grox));
+            assert!(!nests(
+                (Ipv4Addr::new(100, 64, 0, 1), 22),
+                (Ipv4Addr::new(100, 64, 0, 2), 22)
             ));
-            assert!(calls.get() > 1, "absence must be confirmed, not assumed");
-        }
-
-        #[cfg(target_os = "windows")]
-        #[test]
-        fn address_presence_is_locale_proof() {
-            use super::super::SystemTun;
-            use std::net::Ipv4Addr;
-
-            // Real shapes: German column labels, English column labels.
-            let de = "\nSchnittstelle \"roomler\"\n    DHCP aktiviert:  Nein\n    IP-Adresse:      100.64.0.28\n    Subnetzpräfix:   100.64.0.0/10\n";
-            let en = "\nConfiguration for interface \"roomler\"\n    DHCP enabled:    No\n    IP Address:      100.64.0.28\n    Subnet Prefix:   100.64.0.0/10\n";
-            for out in [de, en] {
-                let run = |_: &str, _: &[String]| Ok(out.to_string());
-                assert!(
-                    SystemTun::address_present_v4(&run, Ipv4Addr::new(100, 64, 0, 28)),
-                    "must see the address regardless of the host's language"
-                );
-                // A DIFFERENT address must not match — including the prefix
-                // trap: `100.64.0.2` is a substring of `100.64.0.28`, and a
-                // naive `contains` would report it present and swallow a real
-                // failure.
-                assert!(!SystemTun::address_present_v4(
-                    &run,
-                    Ipv4Addr::new(100, 64, 0, 2)
-                ));
-                assert!(!SystemTun::address_present_v4(
-                    &run,
-                    Ipv4Addr::new(100, 65, 0, 5)
-                ));
-            }
-
-            // If the PROBE itself fails we must report "absent", so the
-            // caller surfaces the original netsh error instead of claiming a
-            // success we never verified.
-            let broken = |_: &str, _: &[String]| Err(std::io::Error::other("netsh gone"));
-            assert!(!SystemTun::address_present_v4(
-                &broken,
-                Ipv4Addr::new(100, 64, 0, 28)
+            // Disjoint blocks: no nesting, no flags.
+            assert!(!nests(
+                (Ipv4Addr::new(100, 66, 0, 1), 22),
+                (Ipv4Addr::new(100, 72, 0, 1), 22)
+            ));
+            // A /0 outer would swallow everything — deliberately never an
+            // outer (a stray default-shaped address must not flag the world).
+            assert!(!nests(jovanov, (Ipv4Addr::new(0, 0, 0, 0), 0)));
+            // Host-bit-dirty inputs are masked, not trusted.
+            assert!(nests(
+                (Ipv4Addr::new(100, 65, 3, 99), 22),
+                (Ipv4Addr::new(100, 127, 255, 255), 10)
             ));
         }
 
@@ -3195,23 +3311,10 @@ mod system {
             assert!(parse_linux_default_route("10.0.0.0/8 dev eth0\n").is_none());
         }
 
-        #[cfg(target_os = "windows")]
-        #[test]
-        fn windows_default_route_lowest_metric_skips_headers_and_onlink() {
-            use super::parse_windows_default_route;
-            use std::net::Ipv4Addr;
-            let out = "\
-Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\r\n\
--------  --------  ---  ------------------------  ---  ------------------------\r\n\
-No       Manual      0  0.0.0.0/0                   12  192.168.68.1\r\n\
-No       Manual    256  0.0.0.0/0                    5  10.0.0.1\r\n\
-No       Manual    256  255.255.255.255/32          1  Loopback Pseudo-Interface 1\r\n";
-            let r = parse_windows_default_route(out).unwrap();
-            assert_eq!(r.gateway, Ipv4Addr::new(192, 168, 68, 1));
-            assert_eq!(r.interface, "12");
-            // No default route present.
-            assert!(parse_windows_default_route("").is_none());
-        }
+        // N2 — the Windows default-route parsers (and these fixed-position
+        // captures of a LOCALIZED netsh table) are gone: discovery now reads
+        // the FIB via `GetBestRoute2` as a struct. Only the Linux `ip route`
+        // parsers remain text-based.
 
         #[cfg(target_os = "linux")]
         #[test]
@@ -3243,23 +3346,6 @@ No       Manual    256  255.255.255.255/32          1  Loopback Pseudo-Interface
             // None present.
             assert!(parse_linux_default_route_v6("").is_none());
             assert!(parse_linux_default_route_v6("2001:db8::/64 dev eth0\n").is_none());
-        }
-
-        #[cfg(target_os = "windows")]
-        #[test]
-        fn windows_default_route_v6_skips_headers_and_onlink() {
-            use super::parse_windows_default_route_v6;
-            use std::net::Ipv6Addr;
-            let out = "\
-Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\r\n\
--------  --------  ---  ------------------------  ---  ------------------------\r\n\
-No       Manual      0  ::/0                        12  fe80::1\r\n\
-No       Manual    256  ::/0                         5  2a01:4f8::1\r\n\
-No       Manual    256  fe80::/64                    1  Loopback Pseudo-Interface 1\r\n";
-            let r = parse_windows_default_route_v6(out).unwrap();
-            assert_eq!(r.gateway, "fe80::1".parse::<Ipv6Addr>().unwrap());
-            assert_eq!(r.interface, "12");
-            assert!(parse_windows_default_route_v6("").is_none());
         }
     }
 }
