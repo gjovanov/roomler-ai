@@ -55,6 +55,23 @@ pub trait TunIo: Send + Sync {
     /// mesh). Best-effort; never fails the caller.
     async fn del_peer_route(&self, _peer: std::net::Ipv4Addr) {}
 
+    /// Multi-org twin of [`add_peer_route`](Self::add_peer_route) carrying the
+    /// org's own address. On Linux the route gets a `src` hint (RTA_PREFSRC)
+    /// so the kernel's source selection can never pick ANOTHER org's address
+    /// for this peer — with nested org blocks on one shared device the
+    /// unhinted choice is address-order-dependent (field 2026-08-09: the
+    /// Linux fleet nodes sourced grox-bound traffic from their second org's
+    /// address, tripping every receiver's RPF). Default: the plain call
+    /// (single-org devices, mocks, netstack; Windows routes cannot carry a
+    /// source hint — the mux NAT in `tun_mux` covers it there).
+    async fn add_peer_route_from(
+        &self,
+        peer: std::net::Ipv4Addr,
+        _src: std::net::Ipv4Addr,
+    ) -> std::io::Result<()> {
+        self.add_peer_route(peer).await
+    }
+
     /// rc.278 — evict any FOREIGN `/32` for **our own** overlay address.
     ///
     /// [`add_peer_route`] has evicted VPN-installed competing `/32`s for every
@@ -94,6 +111,18 @@ pub trait TunIo: Send + Sync {
 
     /// Remove a CIDR route installed by [`add_cidr_route`]. Best-effort.
     async fn del_cidr_route(&self, _cidr: &str) {}
+
+    /// Multi-org twin of [`add_cidr_route`](Self::add_cidr_route) — see
+    /// [`add_peer_route_from`](Self::add_peer_route_from). The source hint
+    /// applies to v4 CIDRs only; v6 (and every non-Linux platform) delegates
+    /// unchanged.
+    async fn add_cidr_route_from(
+        &self,
+        cidr: &str,
+        _src: std::net::Ipv4Addr,
+    ) -> std::io::Result<()> {
+        self.add_cidr_route(cidr).await
+    }
 
     /// Change B (corp-gateway leak) — maintain the BLOCK-FLOOR routes: the
     /// four `plen+2` sub-prefixes of the connected overlay block, installed
@@ -2006,6 +2035,35 @@ mod system {
             }
         }
 
+        /// Linux: the peer `/32` with `src <self>` (RTA_PREFSRC), so kernel
+        /// source selection is pinned per-route — see
+        /// [`TunIo::add_peer_route_from`]. Every other platform: the plain
+        /// route (Windows has no per-route source hint; the mux NAT covers
+        /// the multi-org case there).
+        async fn add_peer_route_from(&self, peer: Ipv4Addr, src: Ipv4Addr) -> std::io::Result<()> {
+            #[cfg(target_os = "linux")]
+            {
+                run_cmd(
+                    "ip",
+                    vec![
+                        "route".into(),
+                        "replace".into(),
+                        format!("{peer}/32"),
+                        "dev".into(),
+                        IF_NAME.into(),
+                        "src".into(),
+                        src.to_string(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = src;
+                self.add_peer_route(peer).await
+            }
+        }
+
         /// rc.278 — see [`TunIo::defend_self_route`]. Windows-only: a VPN's
         /// metric-1 `/32` for OUR OWN overlay address out-ranks the metric-256
         /// on-link route Windows derives from the interface address, diverting
@@ -2164,6 +2222,36 @@ mod system {
             {
                 let _ = (cidr, v6);
                 Ok(())
+            }
+        }
+
+        /// Linux + v4: the subnet route with `src <self>` — see
+        /// [`TunIo::add_cidr_route_from`]. v6 and every other platform
+        /// delegate to the plain call.
+        async fn add_cidr_route_from(&self, cidr: &str, src: Ipv4Addr) -> std::io::Result<()> {
+            #[cfg(target_os = "linux")]
+            {
+                if is_v6_cidr(cidr) {
+                    return self.add_cidr_route(cidr).await;
+                }
+                run_cmd(
+                    "ip",
+                    vec![
+                        "route".into(),
+                        "replace".into(),
+                        cidr.to_string(),
+                        "dev".into(),
+                        IF_NAME.into(),
+                        "src".into(),
+                        src.to_string(),
+                    ],
+                )
+                .await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = src;
+                self.add_cidr_route(cidr).await
             }
         }
 

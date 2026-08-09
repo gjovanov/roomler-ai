@@ -28,6 +28,9 @@ pub mod direct;
 pub mod dns;
 pub mod ingress;
 pub(crate) mod lifecycle;
+/// Multi-org egress source normalization — the pure half of the mux NAT
+/// (flow table + v4 checksum rewrites). Hooks live in [`tun_mux`].
+pub(crate) mod mux_nat;
 pub mod nat;
 pub mod netmap;
 /// Userspace TCP/IP stack (smoltcp) presented as a [`tun::TunIo`] — the
