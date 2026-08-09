@@ -116,8 +116,23 @@ pub async fn relay_overlay_msg_from_node(
             handle_overlay_leave(state, ident).await;
             None
         }
-        ClientMsg::OverlayRelayRequest { peer_node_id } => {
-            handle_overlay_relay_request(state, ident, peer_node_id).await;
+        ClientMsg::OverlayRelayRequest {
+            peer_node_id,
+            current_kind,
+            reason,
+            derp_mux_failed,
+        } => {
+            handle_overlay_relay_request(
+                state,
+                ident,
+                peer_node_id,
+                RelayRequestEvidence {
+                    current_kind,
+                    reason,
+                    derp_mux_failed,
+                },
+            )
+            .await;
             None
         }
         other => Some(other),
@@ -490,11 +505,20 @@ pub async fn handle_overlay_leave(state: &AppState, ident: NodeIdentity) {
     fan_upsert_shaped(state, &self_node, epoch, false).await;
 }
 
+/// U1 — the requester's self-reported evidence riding a relay request. All
+/// fields default-inert for legacy clients.
+struct RelayRequestEvidence {
+    current_kind: Option<String>,
+    reason: Option<String>,
+    derp_mux_failed: bool,
+}
+
 /// Mint symmetric coturn creds for a relay leg to `peer_node_id`.
 async fn handle_overlay_relay_request(
     state: &AppState,
     ident: NodeIdentity,
     peer_node_id: ObjectId,
+    evidence: RelayRequestEvidence,
 ) {
     let Some(self_node) = current_node(state, ident).await else {
         debug!(?ident, "overlay.relay_request before join; ignoring");
@@ -553,7 +577,24 @@ async fn handle_overlay_relay_request(
     // would never see a grant field) and skip the TURN grant entirely. Gated
     // on BOTH ends advertising the capability, so a mixed-version pair can
     // never split tiers.
+    // U1 — the silent-veto healer: a requester whose `/derp` mux open FAILED
+    // cannot honor a pin, so an active pin for this pair is a hard dark
+    // window (client ignores it, server refuses TURN for the TTL). Clear the
+    // pin and fall through to a normal grant; the capability gate below also
+    // refuses NEW escalations while the flag rides.
+    if evidence.derp_mux_failed
+        && let Some(mut pc) = state.relay_pair_churn.get_mut(&pair_key)
+        && forced_active(&pc, Instant::now())
+    {
+        pc.forced_until = None;
+        pc.forced_derp_url = None;
+        warn!(
+            %pair_key, requester = %self_id,
+            "overlay relay: requester reports its /derp mux failed — clearing the forced-DERP pin (silent-veto healer)"
+        );
+    }
     let pair_supports_forced_derp = forced_derp_enabled()
+        && !evidence.derp_mux_failed
         && self_node.supports_forced_derp
         && self_node.supports_derp
         && peer.supports_forced_derp
@@ -561,9 +602,25 @@ async fn handle_overlay_relay_request(
     if pair_supports_forced_derp && note_relay_request(state, &pair_key) {
         tracing::info!(
             %pair_key, requester = %self_id, peer = %peer_node_id,
+            replacing = evidence.current_kind.as_deref().unwrap_or("-"),
+            reason = evidence.reason.as_deref().unwrap_or("-"),
             "overlay relay: TURN churn threshold — escalating pair to forced DERP"
         );
-        let ttl_ms = FORCED_DERP_TTL.as_millis() as u64;
+        // U1 — a mid-pin re-push must carry the REMAINING TTL, not restart
+        // the clock: the escalation path re-pushed the full window on every
+        // mid-pin re-request while the server's own `forced_until` stood
+        // still, so the two ends' pins ratcheted apart (the join re-push
+        // already used remaining; now both do). A FRESH escalation just set
+        // `forced_until = now + FORCED_DERP_TTL`, so the same read yields
+        // the full window there.
+        let ttl_ms = state
+            .relay_pair_churn
+            .get(&pair_key)
+            .and_then(|pc| pc.forced_until)
+            .map(|until| until.saturating_duration_since(Instant::now()))
+            .filter(|d| !d.is_zero())
+            .unwrap_or(FORCED_DERP_TTL)
+            .as_millis() as u64;
         // Multi-region DERP: pick the pair's regional relay from the same
         // sticky region the TURN grants use (symmetric — the server computes
         // once and pushes the SAME url to both ends); store it on the churn
@@ -621,6 +678,17 @@ async fn handle_overlay_relay_request(
     )
     .await;
 
+    // U1 — the evidence line for grants (the escalation path logs its own):
+    // a died-carrier refresh names what died and why; a fresh establishment
+    // carries neither.
+    if evidence.current_kind.is_some() || evidence.reason.is_some() {
+        debug!(
+            %pair_key, requester = %self_id,
+            replacing = evidence.current_kind.as_deref().unwrap_or("-"),
+            reason = evidence.reason.as_deref().unwrap_or("-"),
+            "overlay relay: re-granting after a died carrier"
+        );
+    }
     // P7 — arm the churn detector: a re-request for this pair arriving after
     // this grant (past the dedup gap) counts as one churn cycle. Armed before
     // the send so `pair_key` can move into the grant.
@@ -756,10 +824,26 @@ fn note_relay_request(state: &AppState, pair_key: &str) -> bool {
     churn_note_request(entry.value_mut(), now)
 }
 
+/// U1 — pure arming rule: stamp `last_grant_at` ONLY when unarmed.
+///
+/// The old unconditional re-stamp had a starvation hole: a sub-
+/// [`CYCLE_MIN_GAP`] re-request is not counted (correct — retry burst), but
+/// the grant it still received re-stamped `last_grant_at`, pushing the gap
+/// anchor forward — so two ends alternating requests faster than the gap
+/// could churn indefinitely without EVER counting a cycle. Anchoring on the
+/// FIRST grant of a burst bounds the dedup window to one burst: a "burst"
+/// that outlives the gap counts, as it should (a client re-requesting for
+/// longer than the dedup window is not deduplicating, it is churning).
+pub(crate) fn arm_grant(pc: &mut PairChurn, now: Instant) {
+    if pc.last_grant_at.is_none() {
+        pc.last_grant_at = Some(now);
+    }
+}
+
 /// P7 — arm the cycle detector after sending a TURN grant.
 fn note_grant_sent(state: &AppState, pair_key: &str) {
     if let Some(mut pc) = state.relay_pair_churn.get_mut(pair_key) {
-        pc.last_grant_at = Some(Instant::now());
+        arm_grant(pc.value_mut(), Instant::now());
     } else {
         state.relay_pair_churn.insert(
             pair_key.to_string(),
@@ -1971,6 +2055,38 @@ mod tests {
         let after = t0 + Duration::from_secs(110) + FORCED_DERP_TTL + Duration::from_secs(1);
         assert!(!churn_note_request(&mut pc, after));
         assert_eq!(pc.cycles, 0);
+    }
+
+    /// U1 — the burst-starvation lock: two ends alternating request→grant
+    /// FASTER than [`CYCLE_MIN_GAP`] must still escalate. The old
+    /// unconditional re-stamp in `note_grant_sent` pushed the gap anchor
+    /// forward on every uncounted grant, so such a pair churned forever
+    /// without a single counted cycle; [`arm_grant`] anchors on the FIRST
+    /// grant of a burst instead.
+    #[test]
+    fn alternating_fast_requests_cannot_starve_the_counter() {
+        let t0 = Instant::now();
+        let mut pc = PairChurn::default();
+        arm_grant(&mut pc, t0);
+        let mut now = t0;
+        let mut escalated_at = None;
+        for i in 0..40 {
+            now += Duration::from_secs(2);
+            if churn_note_request(&mut pc, now) {
+                escalated_at = Some(i);
+                break;
+            }
+            arm_grant(&mut pc, now);
+        }
+        assert!(
+            escalated_at.is_some(),
+            "sub-gap alternation must eventually count cycles and escalate"
+        );
+        // And the anchor rule itself: arming while armed is a no-op.
+        let mut pc = PairChurn::default();
+        arm_grant(&mut pc, t0);
+        arm_grant(&mut pc, t0 + Duration::from_secs(3));
+        assert_eq!(pc.last_grant_at, Some(t0), "first grant of a burst anchors");
     }
 
     /// P7 — cycles outside the sliding window don't accumulate.
