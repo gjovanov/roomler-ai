@@ -190,6 +190,7 @@ mod tests {
                 last_rx_age_s: 0,
                 relay_kind: Some(k.into()),
                 rx_denied: 0,
+                rx_denied_noroute: 0,
             }),
         }
     }

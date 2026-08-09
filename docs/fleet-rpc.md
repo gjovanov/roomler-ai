@@ -16,6 +16,14 @@ That made every hypothesis in a remote investigation cost a human round trip:
 "please run this in an elevated pwsh and paste the output." Fleet RPC removes
 that loop.
 
+**Reading a remote log: always `roomler exec <host> -- roomler logs`** (with
+`--grep <pat>` / `-n <lines>` / `--source daemon|service|panic`), never a path
+guess. The daemon resolves its OWN log file — the path depends on the service
+role, the running user, and a UTC-dated suffix, and a Windows host carries
+two decoy `roomlerd.log*` files (the SCM supervisor's and the updater's).
+Path archaeology has produced a false "the agent's logging is dead" verdict
+twice (2026-08-07 and 2026-08-09); the verb existed both times.
+
 ## Transport
 
 Commands ride the agent's **existing control WebSocket**, not the overlay.
