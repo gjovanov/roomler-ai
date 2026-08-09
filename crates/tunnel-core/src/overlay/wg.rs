@@ -863,6 +863,21 @@ impl WgDevice {
         self.stun_events_rx.take()
     }
 
+    /// R3 — mint a FRESH stun-events channel and return its receiver. The
+    /// take above is once-only, and the srflx keepalive task OWNS the taken
+    /// receiver — so after a direct-plane rebuild aborts that task, the old
+    /// receiver is gone with it and a respawned keepalive would have no
+    /// event source. Call AFTER retiring the old demux slots and BEFORE
+    /// registering the new ones: retired loops still hold the OLD sender
+    /// (their sends now go nowhere, which is exactly right for loops being
+    /// torn down), and every loop registered after this clones the NEW one.
+    pub fn replace_stun_events(&mut self) -> mpsc::Receiver<crate::transport::stun::StunInbound> {
+        let (tx, rx) = mpsc::channel(16);
+        self.stun_events_tx = tx;
+        self.stun_events_rx = None;
+        rx
+    }
+
     /// Phase A — the demux source address a SHARED-direct peer is currently
     /// registered under (`None` for relay/dedicated-socket peers or unknown
     /// pubkeys). Lets the runtime tell a duplicate event for an
