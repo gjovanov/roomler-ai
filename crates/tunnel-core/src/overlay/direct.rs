@@ -999,6 +999,67 @@ pub fn srflx_hairpin_pointless(
         .all(|e| e.parse::<SocketAddr>().ok().map(|s| s.ip()) == Some(my_ip))
 }
 
+/// Bind one direct socket on a STABLE port so a rebuilt carrier reproduces
+/// the UDP 5-tuple a stateful corp firewall already grandfathered (rc.307).
+/// Lives here (not in the runtime) since multi-org v2: the shared carrier
+/// plane binds the process-wide socket set with exactly this policy.
+///
+/// Three tiers, in order:
+/// 1. **The base port, retried briefly.** During a runtime hand-over (MSI
+///    upgrade, service restart) the exiting worker may still hold it for a
+///    moment; retrying beats walking, because walking would silently change
+///    the port and forfeit the very 5-tuple we are protecting.
+/// 2. **The rest of the band** ([`direct_port_candidates`]). Hyper-V / WSL2 /
+///    HNS reserve large port pools that are invisible to `netstat` AND
+///    `netsh excludedportrange`, and they MOVE between boots — a base can be
+///    swallowed whole (field-measured on a WSL-mirrored host, 2026-08-05).
+///    A band walk keeps a stable port instead of losing the feature.
+/// 3. **Ephemeral**, the pre-rc.307 behaviour, so the interface always works.
+///
+/// `base == 0` skips straight to ephemeral (explicit opt-out). `None` only
+/// when even the ephemeral bind fails.
+pub(crate) async fn bind_direct_socket(
+    ip: Ipv4Addr,
+    base: u16,
+    what: &'static str,
+) -> Option<UdpSocket> {
+    let mut candidates = direct_port_candidates(base);
+    if let Some(first) = candidates.next() {
+        for attempt in 0u8..3 {
+            match UdpSocket::bind((ip, first)).await {
+                Ok(s) => return Some(s),
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                Err(_) => {}
+            }
+        }
+        // The base is held by something that isn't just a slow hand-over.
+        for port in candidates {
+            if let Ok(s) = UdpSocket::bind((ip, port)).await {
+                tracing::warn!(
+                    %ip, base, port, what,
+                    "overlay: stable direct-port base unavailable (Hyper-V/WSL reservation?) — \
+                     using the next port in the band"
+                );
+                return Some(s);
+            }
+        }
+        tracing::warn!(
+            %ip, base, band = DIRECT_PORT_BAND, what,
+            "overlay: the whole stable direct-port band is unavailable; falling back to an \
+             ephemeral port (carriers will not survive a corp-firewall session table)"
+        );
+    }
+    match UdpSocket::bind((ip, 0)).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(%ip, %e, what, "overlay: direct socket bind failed; skipping");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
