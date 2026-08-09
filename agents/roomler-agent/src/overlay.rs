@@ -65,6 +65,25 @@ struct RuntimeFingerprint {
     lan_ips: Vec<String>,
 }
 
+impl RuntimeFingerprint {
+    /// R4 — do the fields that REQUIRE a runtime respawn all match?
+    /// `lan_ips` is deliberately excluded: it is the one runtime-variable
+    /// input, and a changed set is handled by an IN-PLACE direct-plane
+    /// rebuild (`OverlayEvent::RebuildDirect`) instead of the old
+    /// spawn-a-second-runtime path — which never told the first runtime,
+    /// left both holding direct sockets, and made the new one walk the
+    /// stable-port band, forfeiting the very 5-tuple stability rc.307/308
+    /// exist to provide.
+    fn same_shape(&self, other: &Self) -> bool {
+        self.wg_public_key == other.wg_public_key
+            && self.netstack_port == other.netstack_port
+            && self.advertised_routes == other.advertised_routes
+            && self.exit_node == other.exit_node
+            && self.tenant_id == other.tenant_id
+            && self.server_url == other.server_url
+    }
+}
+
 struct RuntimeSlot {
     fingerprint: RuntimeFingerprint,
     evt_tx: mpsc::Sender<OverlayEvent>,
@@ -138,10 +157,15 @@ pub async fn maybe_start(
         let slots = RUNTIME_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .get(&cfg.tenant_id)
-            .filter(|s| s.fingerprint == fingerprint)
-            .map(|s| s.evt_tx.clone())
+            .filter(|s| s.fingerprint.same_shape(&fingerprint))
+            .map(|s| {
+                (
+                    s.evt_tx.clone(),
+                    s.fingerprint.lan_ips == fingerprint.lan_ips,
+                )
+            })
     };
-    if let Some(evt_tx) = existing {
+    if let Some((evt_tx, lan_ips_same)) = existing {
         match evt_tx
             .send(OverlayEvent::Reattach {
                 outbound: outbound.clone(),
@@ -149,7 +173,27 @@ pub async fn maybe_start(
             .await
         {
             Ok(()) => {
-                info!("overlay: re-attached the persistent node runtime (carriers intact)");
+                if lan_ips_same {
+                    info!("overlay: re-attached the persistent node runtime (carriers intact)");
+                } else {
+                    // R4 — the LAN IP set moved while the runtime persisted:
+                    // reattach (control plane) + rebuild the direct plane in
+                    // place (data plane). Replaces the old fresh-spawn path,
+                    // which raced the surviving runtime for the stable ports.
+                    info!(
+                        "overlay: re-attached the persistent runtime; LAN addresses changed — requesting a direct-plane rebuild"
+                    );
+                    let _ = evt_tx.send(OverlayEvent::RebuildDirect).await;
+                    // Store the NEW set so the next reconnect compares
+                    // against what the rebuild actually bound.
+                    if let Some(s) = RUNTIME_SLOTS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&cfg.tenant_id)
+                    {
+                        s.fingerprint = fingerprint.clone();
+                    }
+                }
                 return Some(evt_tx);
             }
             Err(_) => {
@@ -787,6 +831,52 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
         warn!("overlay: event channel full/closed; dropping a netmap update");
     }
     None
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::RuntimeFingerprint;
+
+    fn base() -> RuntimeFingerprint {
+        RuntimeFingerprint {
+            wg_public_key: "pk".into(),
+            netstack_port: None,
+            advertised_routes: vec!["10.0.0.0/24".into()],
+            exit_node: None,
+            tenant_id: "t1".into(),
+            server_url: "https://roomler.ai".into(),
+            lan_ips: vec!["192.168.68.5".into()],
+        }
+    }
+
+    /// R4 — the respawn/rebuild split: a lan_ips-only difference is
+    /// same-shape (⇒ reattach + in-place plane rebuild, never a second
+    /// runtime), while any process-immutable field difference is not
+    /// (⇒ the old fresh-spawn path).
+    #[test]
+    fn lan_ips_change_is_same_shape_immutable_fields_are_not() {
+        let a = base();
+        let mut roamed = base();
+        roamed.lan_ips = vec!["10.20.30.40".into()];
+        assert!(a.same_shape(&roamed), "a roam must not respawn the runtime");
+        assert!(a != roamed, "but it is still a fingerprint difference");
+
+        for mutate in [
+            |f: &mut RuntimeFingerprint| f.wg_public_key = "other".into(),
+            |f: &mut RuntimeFingerprint| f.netstack_port = Some(1080),
+            |f: &mut RuntimeFingerprint| f.advertised_routes = vec![],
+            |f: &mut RuntimeFingerprint| f.exit_node = Some("exit".into()),
+            |f: &mut RuntimeFingerprint| f.tenant_id = "t2".into(),
+            |f: &mut RuntimeFingerprint| f.server_url = "https://other".into(),
+        ] {
+            let mut m = base();
+            mutate(&mut m);
+            assert!(
+                !a.same_shape(&m),
+                "an immutable-field change must force a respawn"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, feature = "overlay-netstack"))]
