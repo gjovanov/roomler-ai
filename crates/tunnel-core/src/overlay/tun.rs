@@ -144,6 +144,14 @@ pub trait TunIo: Send + Sync {
     /// route-war doctrine).
     async fn defend_block_floor(&self) {}
 
+    /// Multi-org twin of [`defend_block_floor`](Self::defend_block_floor) —
+    /// maintain the floors of the GIVEN block instead of the device's own
+    /// connected block. A [`tun_mux`](super::tun_mux) port forwards here with
+    /// ITS org's block: the shared device's connected block is the CREATOR
+    /// org's only, so the plain method would floor one org's block and
+    /// silently skip every sibling's. Default no-op, like the plain method.
+    async fn defend_block_floor_of(&self, _net: std::net::Ipv4Addr, _plen: u8) {}
+
     /// P5 exit-node — install a `/32` (host) **exemption** route for `ip` via the
     /// host's ORIGINAL default gateway (captured at TUN bring-up), NOT via this
     /// overlay device. When an exit-node client installs the split-default
@@ -233,6 +241,17 @@ mod floor_tests {
         assert_eq!(
             floor_cidrs(Ipv4Addr::new(100, 64, 0, 28), 10).unwrap()[0],
             "100.64.0.0/12"
+        );
+        // A carved /22 floors to its four /24s — the multi-org case, where
+        // each org's port forwards its OWN block.
+        assert_eq!(
+            floor_cidrs(Ipv4Addr::new(100, 65, 4, 0), 22).unwrap(),
+            [
+                "100.65.4.0/24".to_string(),
+                "100.65.5.0/24".to_string(),
+                "100.65.6.0/24".to_string(),
+                "100.65.7.0/24".to_string(),
+            ]
         );
     }
 
@@ -1234,11 +1253,14 @@ mod system {
         /// (best-effort — the overlay still works on non-locked hosts).
         #[cfg(windows)]
         _wfp: Option<crate::overlay::wfp::WfpGuard>,
-        /// Change B — the last block-floor decision (0 = unknown, 1 = safe /
+        /// Change B — the last block-floor decision per BLOCK (1 = safe /
         /// asserted, 2 = withheld), so the defense wave logs the DECISION
-        /// only when it flips instead of once per 2–30 s wave.
+        /// only when it flips instead of once per 2–30 s wave. Keyed by
+        /// block because a shared multi-org device floors one block per org
+        /// (each [`tun_mux`](super::tun_mux) port forwards its own), and
+        /// their decisions flip independently.
         #[cfg(windows)]
-        floor_state: std::sync::atomic::AtomicU8,
+        floor_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), u8)>>,
     }
 
     /// rc.209 — bounded retry-with-backoff around a fallible create. Returns the
@@ -1904,7 +1926,7 @@ mod system {
                 #[cfg(windows)]
                 _wfp,
                 #[cfg(windows)]
-                floor_state: std::sync::atomic::AtomicU8::new(0),
+                floor_state: std::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -2264,10 +2286,16 @@ mod system {
         async fn defend_block_floor(&self) {
             #[cfg(windows)]
             {
-                use std::sync::atomic::Ordering;
                 let Some((net, plen)) = self.connected_v4 else {
                     return;
                 };
+                self.defend_block_floor_of(net, plen).await;
+            }
+        }
+
+        async fn defend_block_floor_of(&self, net: Ipv4Addr, plen: u8) {
+            #[cfg(windows)]
+            {
                 let Some(floors) = super::floor_cidrs(net, plen) else {
                     return;
                 };
@@ -2283,9 +2311,24 @@ mod system {
                     )
                 });
                 // Log the DECISION only on a flip — the wave re-runs this
-                // every 2–30 s.
-                let state = if safe { 1 } else { 2 };
-                if self.floor_state.swap(state, Ordering::Relaxed) != state {
+                // every 2–30 s, per block (a shared multi-org device carries
+                // one independently-flipping decision per org's block).
+                let state = if safe { 1u8 } else { 2u8 };
+                let flipped = {
+                    let mut st = self.floor_state.lock().unwrap_or_else(|e| e.into_inner());
+                    match st.iter_mut().find(|(b, _)| *b == (net, plen)) {
+                        Some((_, s)) if *s == state => false,
+                        Some((_, s)) => {
+                            *s = state;
+                            true
+                        }
+                        None => {
+                            st.push(((net, plen), state));
+                            true
+                        }
+                    }
+                };
+                if flipped {
                     if safe {
                         tracing::info!(
                             block = %format!("{net}/{plen}"),
@@ -2307,6 +2350,10 @@ mod system {
                         self.del_cidr_route(c).await;
                     }
                 }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (net, plen);
             }
         }
 
