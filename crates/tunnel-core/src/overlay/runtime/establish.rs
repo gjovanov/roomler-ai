@@ -529,6 +529,11 @@ impl OverlayRuntime {
                 if !tier.is_direct() {
                     coord.forget(&nid);
                 }
+                // U1 — ship the death as evidence with the re-request: the
+                // dead carrier's relay flavour (None for a direct→relay fall)
+                // + the typed reason, so the server's churn escalation can
+                // log/act on WHAT died instead of inferring from timing.
+                coord.note_refresh_context(nid, e.relay_kind, reason.as_str());
                 coord.request(nid, cfg).await;
             }
         }

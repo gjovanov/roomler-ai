@@ -265,6 +265,21 @@ pub(crate) enum DeathReason {
     RekeyUnanswered,
 }
 
+impl DeathReason {
+    /// U1 — the wire/diagnostic short string (rides
+    /// `OverlayRelayRequest.reason` so the server's escalation logs say WHY a
+    /// relay carrier is being replaced, not just that it was).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DeathReason::HardDead => "hard-dead",
+            DeathReason::RxStale => "rx-stale",
+            DeathReason::HandshakeDeadline => "handshake-deadline",
+            DeathReason::OneWay => "one-way",
+            DeathReason::RekeyUnanswered => "rekey-unanswered",
+        }
+    }
+}
+
 /// The lifecycle phase, DERIVED from the monotonic handshake latch — never
 /// stored (see the module doc).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
