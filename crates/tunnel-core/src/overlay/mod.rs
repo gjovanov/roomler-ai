@@ -24,6 +24,10 @@
 //! the coordination server and distributed in the netmap.
 
 pub mod bridge;
+/// Multi-org v2 — the process-wide shared direct-carrier plane: one stable
+/// socket set for EVERY org engine, inbound demultiplexed by WireGuard
+/// receiver index (initiations by per-engine static-key trial).
+pub mod carrier_plane;
 pub mod direct;
 pub mod dns;
 pub mod ingress;
