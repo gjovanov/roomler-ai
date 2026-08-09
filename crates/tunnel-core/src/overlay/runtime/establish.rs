@@ -2040,6 +2040,99 @@ impl OverlayRuntime {
         info!(peer = %link.node_id, overlay_ip = %link.overlay_ip, initiate, "overlay: peer installed");
     }
 
+    /// R3 — the socket half of a direct-plane rebuild: tear down everything
+    /// referencing the old sockets, retire their demux slots (freeing the
+    /// stable-port band — the ports only close when the LAST Arc drops, and
+    /// carriers, the pump mirror, probes and the demux all hold clones),
+    /// mint a fresh stun-events channel, bind the new plane, and register
+    /// its demux loops. Returns the new keepalive event receiver.
+    ///
+    /// The caller owns the rest of the ordered sequence (join → gather →
+    /// coordinator swap → keepalive respawn → `install_peers`) because those
+    /// touch `run()`'s loop locals. The caller must ALSO abort the srflx
+    /// keepalive BEFORE calling (it owns a punch-socket Arc by value).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn rebuild_direct_plane_sockets(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        relay: &mut Option<RelayCoordinator>,
+        relay_bq: &mut RelayBuildQueue,
+        alloc_q: &mut RelayAllocQueue,
+        tun: &Arc<dyn TunIo>,
+        direct_ctx: &mut Option<DirectCtx>,
+    ) -> Option<mpsc::Receiver<crate::transport::stun::StunInbound>> {
+        // 1. Direct carriers die first — their Carrier/pump/timer-task Arcs
+        //    pin the old sockets. The shared teardown also drops each peer's
+        //    in-flight probe.
+        let direct_nids: Vec<ObjectId> = by_node
+            .iter()
+            .filter(|(_, e)| e.is_direct)
+            .map(|(n, _)| *n)
+            .collect();
+        for nid in direct_nids {
+            self.remove_peer_state(
+                nid,
+                wg,
+                by_node,
+                tun,
+                relay,
+                relay_bq,
+                Some(alloc_q),
+                upgrade_probes,
+                PeerRoute::Drop,
+            )
+            .await;
+        }
+        // 2. Probes on RELAY peers also ride the old sockets — drop them
+        //    without a verdict (the plane vanished under them; that says
+        //    nothing about the tier).
+        let probe_nids: Vec<ObjectId> = upgrade_probes.keys().copied().collect();
+        for nid in probe_nids {
+            if let Some(p) = upgrade_probes.remove(&nid) {
+                wg.drop_direct_probe(&p.pubkey).await;
+                self.shadow(|s| s.mon.on_probe_aborted(&nid));
+            }
+        }
+        // 3. Retire the old demux slots (aborts their recv loops) and drop
+        //    the plane's own Arcs — with 1+2 done, the ports actually free.
+        if let Some(old) = direct_ctx.take() {
+            for (_ip, s) in &old.socks {
+                if let Ok(a) = s.local_addr() {
+                    wg.retire_direct_socket(a);
+                }
+            }
+            if let Some(ps) = &old.public_sock
+                && let Ok(a) = ps.local_addr()
+            {
+                wg.retire_direct_socket(a);
+            }
+        }
+        // 4. Fresh stun-events channel: the old receiver died with the
+        //    keepalive task; retired loops keep the dead sender, and every
+        //    loop registered below clones the new one.
+        let stun_rx = wg.replace_stun_events();
+        // 5. Bind the new plane (the stable-port binder tolerates the old
+        //    binds' lingering close with its ~900 ms retry window) and wire
+        //    its demux loops eagerly, exactly like startup.
+        *direct_ctx = self.setup_direct().await;
+        if let Some(ctx) = direct_ctx.as_ref()
+            && (direct::public_direct_enabled() || direct::srflx_enabled())
+        {
+            for (_ip, s) in &ctx.socks {
+                wg.ensure_direct_demux(s.clone());
+            }
+            if let Some(ps) = &ctx.public_sock {
+                wg.ensure_direct_demux(ps.clone());
+            }
+        }
+        // 6. Every direct-tier measurement was made through sockets that no
+        //    longer exist — reset that evidence (relay evidence survives).
+        self.shadow(|s| s.mon.on_local_rebuild());
+        Some(stun_rx)
+    }
+
     /// R1 — one srflx gather + advertise pass, extracted VERBATIM from
     /// `run()`'s startup inline block so the direct-plane rebuild (R3) can
     /// re-run it mid-session; [`setup_direct`](Self::setup_direct) is the

@@ -667,10 +667,6 @@ impl PathMonitor {
     /// rebuild — that evidence is still good) and `last_lan_attempt` is
     /// KEPT (so `LAN_PROBE_SPACING` still paces the post-rebuild re-probe
     /// herd instead of amplifying it).
-    // The production caller is R3's rebuild arm (next change, same track) —
-    // remove the allow when it lands; see the defensive-catch-all rule in
-    // CLAUDE.md for why staged-landing dead code is annotated, not deleted.
-    #[allow(dead_code)]
     pub(crate) fn on_local_rebuild(&mut self) {
         for p in self.peers.values_mut() {
             for t in &mut p.tiers {
