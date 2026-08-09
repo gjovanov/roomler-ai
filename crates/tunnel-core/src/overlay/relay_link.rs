@@ -315,6 +315,18 @@ pub struct RelayCoordinator {
     /// never consumed, so it can enforce the absolute minimum spacing even when
     /// fresh evidence waives the backoff.
     derp_regrade_fired_at: HashMap<ObjectId, Instant>,
+    /// U1 — one-shot context for the NEXT [`request`](Self::request) per
+    /// peer: which relay flavour is being replaced + why it died. Stamped by
+    /// the health sweep's teardown just before its re-request; consumed on
+    /// send so a later fresh establishment doesn't replay stale evidence.
+    refresh_ctx: HashMap<ObjectId, (Option<RelayKind>, &'static str)>,
+    /// U1 — STICKY: a `/derp` mux open was ATTEMPTED and failed (the
+    /// [`force_derp`](Self::force_derp) veto fired with no mux to bind).
+    /// Reported on every relay request so the server stops choosing/holding
+    /// forced-DERP for this node's pairs — the silent-veto dark window
+    /// (client ignores the pin, server refuses TURN grants for the pin's
+    /// TTL). Cleared the moment any mux registers successfully.
+    derp_mux_failed: bool,
 }
 
 /// Hash of everything `relay_strategy` reads about a pair, other than the
@@ -379,7 +391,21 @@ impl RelayCoordinator {
             derp_regrade_strikes: HashMap::new(),
             derp_regrade_inputs: HashMap::new(),
             derp_regrade_fired_at: HashMap::new(),
+            refresh_ctx: HashMap::new(),
+            derp_mux_failed: false,
         }
+    }
+
+    /// U1 — stamp the one-shot evidence for `node_id`'s NEXT relay request:
+    /// the dead carrier's flavour + the `DeathReason` short string. Called by
+    /// the health sweep's teardown right before its re-request.
+    pub fn note_refresh_context(
+        &mut self,
+        node_id: ObjectId,
+        kind: Option<RelayKind>,
+        reason: &'static str,
+    ) {
+        self.refresh_ctx.insert(node_id, (kind, reason));
     }
 
     /// P7 — does this coordinator hold a live `/derp` mux? The runtime checks
@@ -396,6 +422,8 @@ impl RelayCoordinator {
         if self.derp_mux.is_none() {
             self.derp_mux = Some(mux);
         }
+        // U1 — a mux registered: the sticky open-failure evidence is stale.
+        self.derp_mux_failed = false;
     }
 
     /// Multi-region DERP — is a mux for this regional `derp_url` already open?
@@ -456,7 +484,13 @@ impl RelayCoordinator {
             }
         }
         if self.mux_for(&node_id).is_none() {
-            warn!(peer = %node_id, "overlay relay: force-derp push but no /derp mux — ignoring");
+            // U1 — latch the veto as sticky evidence: every later relay
+            // request reports `derp_mux_failed`, so the server stops
+            // choosing/holding forced-DERP for this node's pairs instead of
+            // refusing TURN grants at a client that cannot comply (the
+            // silent-veto dark window).
+            self.derp_mux_failed = true;
+            warn!(peer = %node_id, "overlay relay: force-derp push but no /derp mux — ignoring (reporting derp_mux_failed on future requests)");
             return None;
         }
         // Lazy hygiene: drop expired pins so the map tracks only live ones
@@ -757,6 +791,10 @@ impl RelayCoordinator {
         if self.is_tracking(&node_id) {
             return;
         }
+        // U1 — consume the one-shot refresh evidence UNCONDITIONALLY (the
+        // no-wire strategies below send nothing, and stale evidence must not
+        // linger to be replayed by a later, unrelated request).
+        let refresh = self.refresh_ctx.remove(&node_id);
         // Compute the strategy ONCE and remember it, so `maybe_complete` can
         // detect a later flip (the peer's srflx propagating) and re-establish —
         // see `roles`.
@@ -776,10 +814,27 @@ impl RelayCoordinator {
             }
             RelayStrategy::SingleRelay(true) | RelayStrategy::BothAllocate => {}
         }
+        // U1 — attach the refresh evidence + the sticky mux-failure flag.
+        let (current_kind, reason) = match refresh {
+            Some((kind, reason)) => (
+                kind.map(|k| {
+                    match k {
+                        RelayKind::Turn => "turn",
+                        RelayKind::Derp => "derp",
+                    }
+                    .to_string()
+                }),
+                Some(reason.to_string()),
+            ),
+            None => (None, None),
+        };
         if self
             .outbound
             .send(ClientMsg::OverlayRelayRequest {
                 peer_node_id: node_id,
+                current_kind,
+                reason,
+                derp_mux_failed: self.derp_mux_failed,
             })
             .await
             .is_err()
@@ -1316,7 +1371,7 @@ mod tests {
         assert!(coord.is_tracking(&node));
         assert!(matches!(
             rx.recv().await,
-            Some(ClientMsg::OverlayRelayRequest { peer_node_id }) if peer_node_id == node
+            Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node
         ));
         assert!(rx.try_recv().is_err()); // only one request sent
     }
