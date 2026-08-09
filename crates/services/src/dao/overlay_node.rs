@@ -64,6 +64,7 @@ impl OverlayNodeDao {
         supports_relay_single: bool,
         supports_derp: bool,
         supports_forced_derp: bool,
+        supports_server_relay_strategy: bool,
         advertised_routes: Vec<String>,
     ) -> DaoResult<OverlayNode> {
         let now = DateTime::now();
@@ -92,6 +93,7 @@ impl OverlayNodeDao {
             supports_relay_single,
             supports_derp,
             supports_forced_derp,
+            supports_server_relay_strategy,
             // Phase 1 — the node's claimed routes; nothing approved until an
             // admin acts, so a fresh node routes for no one.
             advertised_routes,
@@ -128,6 +130,7 @@ impl OverlayNodeDao {
         supports_relay_single: bool,
         supports_derp: bool,
         supports_forced_derp: bool,
+        supports_server_relay_strategy: bool,
         advertised_routes: &[String],
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
@@ -171,6 +174,9 @@ impl OverlayNodeDao {
                         "supports_derp": supports_derp,
                         // P7 — refresh the forced-DERP capability likewise.
                         "supports_forced_derp": supports_forced_derp,
+                        // U2 — refresh the server-relay-strategy opt-in likewise
+                        // (an operator may flip OVERLAY_SERVER_RELAY_STRATEGY).
+                        "supports_server_relay_strategy": supports_server_relay_strategy,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                         "updated_at": DateTime::now(),
