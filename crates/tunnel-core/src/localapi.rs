@@ -1233,12 +1233,24 @@ pub(crate) async fn serve_windows_at(
 #[cfg(unix)]
 const LOCALAPI_SOCKET_NAME: &str = "roomler.sock";
 
-/// Resolve the LocalAPI socket path: `$XDG_RUNTIME_DIR/roomler.sock` when the
-/// per-user runtime dir is set (systemd guarantees it's 0700 + user-owned — the
-/// right home for a control socket), else a `roomler/` subdir under the temp
-/// dir (locked to 0700 by the listener). The socket itself is chmod 0600.
+/// Well-known home for a SYSTEM (root) daemon's control socket.
+///
+/// A per-user path cannot serve a root daemon. On macOS `temp_dir()` is
+/// already per-user (`/var/folders/…`), so a root daemon's socket would land
+/// in ROOT's folder and a user-session `roomler peers` would look in its own
+/// and find *nothing* — not a permission error, an apparent absence. That is
+/// the trap the macOS LaunchDaemon split walks into, and this is the fix:
+/// when the process can own `/var/run/roomler`, it is the daemon and the
+/// socket goes somewhere every session can name.
 #[cfg(unix)]
-pub(crate) fn unix_socket_path() -> std::path::PathBuf {
+const LOCALAPI_SYSTEM_DIR: &str = "/var/run/roomler";
+
+/// The PER-USER socket path — `$XDG_RUNTIME_DIR/roomler.sock` when the
+/// runtime dir is set (systemd guarantees it's 0700 + user-owned — the right
+/// home for a control socket), else a `roomler/` subdir under the temp dir
+/// (locked to 0700 by the listener). The socket itself is chmod 0600.
+#[cfg(unix)]
+pub(crate) fn user_socket_path() -> std::path::PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return std::path::PathBuf::from(dir).join(LOCALAPI_SOCKET_NAME);
     }
@@ -1248,12 +1260,65 @@ pub(crate) fn unix_socket_path() -> std::path::PathBuf {
         .join(LOCALAPI_SOCKET_NAME)
 }
 
+/// The SYSTEM socket path, used by a daemon privileged enough to bind it.
+#[cfg(unix)]
+pub(crate) fn system_socket_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(LOCALAPI_SYSTEM_DIR).join(LOCALAPI_SOCKET_NAME)
+}
+
+/// Where a CLIENT looks, in order: a per-user daemon first (unchanged fast
+/// path for every existing install), then the system daemon.
+#[cfg(unix)]
+pub(crate) fn unix_socket_candidates() -> [std::path::PathBuf; 2] {
+    [user_socket_path(), system_socket_path()]
+}
+
+/// Bind the daemon's control socket, preferring the SYSTEM path.
+///
+/// Which path is right depends on whether this process is privileged, and
+/// rather than ask (`geteuid` would mean a `libc` dependency for one call —
+/// and a uid is only a PROXY for the thing we actually need) this TESTS the
+/// capability: if `/var/run/roomler` can be created and bound, we are the
+/// system daemon and belong there. An unprivileged daemon fails that and
+/// keeps exactly its current per-user path.
+///
+/// A system daemon ALSO binds the per-user path, best-effort. That is
+/// forward-compat for one release, the same shape as the P2a rollout: a
+/// `roomler` CLI that predates this change only knows the per-user path, and
+/// packaging does not guarantee the CLI and the daemon step forward in the
+/// same instant. Drop the second bind once the fleet is past it.
 #[cfg(unix)]
 async fn serve_unix(
     state: Arc<dyn LocalApiState>,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    serve_unix_at(unix_socket_path(), state, shutdown).await
+    let system = system_socket_path();
+    match prepare_unix_listener(&system) {
+        Ok(listener) => {
+            tracing::info!(
+                path = %system.display(),
+                "localapi: system-daemon socket (privileged); a user session reaches it here"
+            );
+            let legacy = user_socket_path();
+            if let Ok(l) = prepare_unix_listener(&legacy) {
+                let st = state.clone();
+                let sd = shutdown.clone();
+                tracing::info!(
+                    path = %legacy.display(),
+                    "localapi: also serving the legacy per-user path (pre-split CLIs)"
+                );
+                tokio::spawn(async move { accept_unix(l, legacy, st, sd).await });
+            }
+            accept_unix(listener, system, state, shutdown).await
+        }
+        Err(e) => {
+            tracing::debug!(
+                path = %system.display(), error = %e,
+                "localapi: not privileged for the system socket; using the per-user path"
+            );
+            serve_unix_at(user_socket_path(), state, shutdown).await
+        }
+    }
 }
 
 /// The unix-socket accept loop, parameterised on the path so tests can use a
@@ -1262,14 +1327,24 @@ async fn serve_unix(
 pub(crate) async fn serve_unix_at(
     path: std::path::PathBuf,
     state: Arc<dyn LocalApiState>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    use tokio::net::UnixListener;
-
     if *shutdown.borrow() {
         return Ok(());
     }
+    let listener = prepare_unix_listener(&path)?;
+    accept_unix(listener, path, state, shutdown).await
+}
+
+/// Create the parent dir, clear a stale socket, bind, and lock the socket to
+/// 0600. Split out from the accept loop so a caller can TEST whether a path is
+/// bindable (the privileged-vs-per-user decision) without committing to
+/// serving it forever.
+#[cfg(unix)]
+fn prepare_unix_listener(path: &std::path::Path) -> std::io::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::net::UnixListener;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         // Lock the parent to owner-only when we own it (the temp-subdir case);
@@ -1278,12 +1353,21 @@ pub(crate) async fn serve_unix_at(
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     // A stale socket from an unclean exit makes bind fail with EADDRINUSE.
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
     // Owner-only: no other local user can open the control socket.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     tracing::info!(path = %path.display(), "localapi: unix-socket listener up (0600)");
+    Ok(listener)
+}
 
+#[cfg(unix)]
+async fn accept_unix(
+    listener: tokio::net::UnixListener,
+    path: std::path::PathBuf,
+    state: Arc<dyn LocalApiState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
     loop {
         tokio::select! {
             biased;
@@ -1318,7 +1402,7 @@ pub(crate) async fn serve_unix_at(
 // The thin clients — the CLI (`roomler`) and the desktop app — connect to the
 // daemon's LocalAPI over the same platform endpoint the server binds and issue
 // read-only requests. Lives in-module so it shares the endpoint constants
-// (`LOCALAPI_PIPE_NAME` / `unix_socket_path`) and the wire types with the
+// (`LOCALAPI_PIPE_NAME` / `unix_socket_candidates`) and the wire types with the
 // server: one source of truth, no re-declared pipe name.
 // ---------------------------------------------------------------------------
 
@@ -1346,7 +1430,21 @@ pub async fn connect() -> std::io::Result<Client> {
     }
     #[cfg(not(windows))]
     {
-        connect_unix_at(unix_socket_path()).await
+        // Try a per-user daemon first (unchanged, and the common case), then
+        // the system daemon. Without the second candidate a root daemon is
+        // invisible to a user session on macOS, where the per-user path lives
+        // under ROOT's `/var/folders/…` — the CLI would report "not running"
+        // for a daemon that is running perfectly well.
+        let mut last: Option<std::io::Error> = None;
+        for path in unix_socket_candidates() {
+            match connect_unix_at(path).await {
+                Ok(client) => return Ok(client),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket")
+        }))
     }
 }
 
@@ -2331,6 +2429,34 @@ mod tests {
 
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+    }
+
+    /// The client must look for a per-user daemon FIRST and the system
+    /// daemon second.
+    ///
+    /// Order is the whole contract. Reversed, every unprivileged daemon on a
+    /// host that also has a system one would be shadowed; and without the
+    /// system candidate at all, a root daemon is invisible from a user
+    /// session on macOS — `temp_dir()` is per-user there, so the CLI would
+    /// search its own `/var/folders/…`, find nothing, and report "not
+    /// running" for a daemon that is running.
+    #[cfg(unix)]
+    #[test]
+    fn socket_candidates_prefer_the_per_user_daemon() {
+        let cands = super::unix_socket_candidates();
+        assert_eq!(cands[0], super::user_socket_path(), "per-user first");
+        assert_eq!(cands[1], super::system_socket_path(), "system second");
+        assert_ne!(cands[0], cands[1], "the two must be distinct paths");
+        assert!(
+            cands[1].starts_with("/var/run/roomler"),
+            "the system path must be well-known, not per-user: {:?}",
+            cands[1]
+        );
+        // Every candidate is the same socket FILE name — only the directory
+        // (and therefore the privilege domain) differs.
+        for c in &cands {
+            assert_eq!(c.file_name().unwrap(), super::LOCALAPI_SOCKET_NAME);
+        }
     }
 
     #[cfg(unix)]
