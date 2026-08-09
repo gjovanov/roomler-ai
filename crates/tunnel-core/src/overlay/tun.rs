@@ -662,6 +662,165 @@ mod system {
             }
         }
 
+        /// The address inside a `SOCKADDR_INET`, per its own family tag.
+        /// `None` for an unset/foreign family (a zeroed union reads AF 0).
+        fn ip_of(sa: &SOCKADDR_INET) -> Option<IpAddr> {
+            // SAFETY: reading the union arm selected by its family tag; the
+            // in-memory byte order IS network order, so the raw bytes are the
+            // address octets.
+            unsafe {
+                match sa.si_family {
+                    AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+                        sa.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+                    ))),
+                    AF_INET6 => Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                        sa.Ipv6.sin6_addr.u.Byte,
+                    ))),
+                    _ => None,
+                }
+            }
+        }
+
+        /// N3 — the LUID for an interface ALIAS (`"roomler"`), for callers
+        /// with NO live device handle: the boot reconciler and the last-gasp
+        /// crash-path purge, which previously targeted the alias through
+        /// `netsh`/PowerShell spawns — from a process that was, by
+        /// definition, already wedged. `None` when no such adapter exists
+        /// (nothing to purge — the honest answer).
+        pub fn luid_for_alias(alias: &str) -> Option<u64> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
+            let wide: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut luid = NET_LUID_LH { Value: 0 };
+            // SAFETY: `wide` is NUL-terminated; the API writes the out-param
+            // only on success, and `Value` covers the whole union.
+            unsafe {
+                (ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) == NO_ERROR)
+                    .then_some(luid.Value)
+            }
+        }
+
+        /// N3 — every route prefix currently on `luid`, both families, as
+        /// `"addr/plen"` strings (the shape `purge_one` consumes). The typed
+        /// twin of the retired `Get-NetRoute` PowerShell spawn: an in-memory
+        /// FIB snapshot instead of a 0.5–2 s process launch on bring-up and
+        /// on every crash-path exit.
+        pub fn list_cidrs(luid: u64) -> Vec<String> {
+            let mut out = Vec::new();
+            // SAFETY: GetIpForwardTable2 allocates a snapshot we iterate then
+            // free — the same idiom as `evict_competing_v4`.
+            unsafe {
+                for family in [AF_INET, AF_INET6] {
+                    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                    if GetIpForwardTable2(family, &mut table) != NO_ERROR || table.is_null() {
+                        continue;
+                    }
+                    let n = (*table).NumEntries as usize;
+                    let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                    for r in rows {
+                        if r.InterfaceLuid.Value != luid {
+                            continue;
+                        }
+                        if let Some(ip) = ip_of(&r.DestinationPrefix.Prefix) {
+                            out.push(format!("{ip}/{}", r.DestinationPrefix.PrefixLength));
+                        }
+                    }
+                    FreeMibTable(table as *const core::ffi::c_void);
+                }
+            }
+            out
+        }
+
+        /// N2 — the host's best route toward `dst` as `(ifIndex, gateway)`,
+        /// straight from the FIB (`GetBestRoute2`) — the typed replacement
+        /// for parsing `netsh interface ipv{4,6} show route`'s LOCALIZED,
+        /// position-keyed table (the most fragile parse the tree had).
+        /// `None` on error or when the best route is on-link (unspecified
+        /// next-hop): no usable gateway, same verdict the parser reached by
+        /// skipping non-address gateway columns.
+        pub fn best_route(dst: IpAddr) -> Option<(u32, IpAddr)> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::GetBestRoute2;
+            // SAFETY: out-params are written on success; the destination is a
+            // fully-initialised SOCKADDR_INET.
+            unsafe {
+                let dest = sockaddr(dst);
+                let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+                let mut src: SOCKADDR_INET = std::mem::zeroed();
+                if GetBestRoute2(
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    &dest,
+                    0,
+                    &mut row,
+                    &mut src,
+                ) != NO_ERROR
+                {
+                    return None;
+                }
+                let gw = ip_of(&row.NextHop)?;
+                let unspecified = match gw {
+                    IpAddr::V4(v) => v.is_unspecified(),
+                    IpAddr::V6(v) => v.is_unspecified(),
+                };
+                if unspecified {
+                    return None;
+                }
+                Some((row.InterfaceIndex, gw))
+            }
+        }
+
+        /// N3 — a gateway-routed row keyed by interface INDEX (what
+        /// `OrigDefaultRoute` carries): the host-exemption shape. Unlike
+        /// [`make_row`] the next-hop is a REAL gateway, and the interface is
+        /// the ORIGINAL uplink's, never ours.
+        fn make_gw_row(
+            ifindex: u32,
+            dest: IpAddr,
+            plen: u8,
+            gateway: IpAddr,
+            metric: u32,
+        ) -> MIB_IPFORWARD_ROW2 {
+            // SAFETY: InitializeIpForwardEntry fills valid defaults; we
+            // override index / prefix / next-hop / metric.
+            unsafe {
+                let mut r: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+                InitializeIpForwardEntry(&mut r);
+                r.InterfaceIndex = ifindex;
+                r.DestinationPrefix.Prefix = sockaddr(dest);
+                r.DestinationPrefix.PrefixLength = plen;
+                r.NextHop = sockaddr(gateway);
+                r.Metric = metric;
+                r
+            }
+        }
+
+        /// N3 — add (idempotent) `dest/plen` via `gateway` on interface
+        /// index `ifindex` — the typed host-exemption install.
+        pub fn add_gateway_route(
+            ifindex: u32,
+            dest: IpAddr,
+            plen: u8,
+            gateway: IpAddr,
+            metric: u32,
+        ) -> std::io::Result<()> {
+            let r = make_gw_row(ifindex, dest, plen, gateway, metric);
+            // SAFETY: fully-initialised row; the API copies it.
+            let rc = unsafe { CreateIpForwardEntry2(&r) };
+            if rc == NO_ERROR || rc == ERROR_OBJECT_ALREADY_EXISTS {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(rc as i32))
+            }
+        }
+
+        /// N3 — remove a host-exemption row (best-effort; absent is fine).
+        pub fn del_gateway_route(ifindex: u32, dest: IpAddr, plen: u8, gateway: IpAddr) {
+            let r = make_gw_row(ifindex, dest, plen, gateway, 0);
+            // SAFETY: the row carries the (interface, prefix, next-hop) key
+            // the API matches on.
+            unsafe { DeleteIpForwardEntry2(&r) };
+        }
+
         /// rc.279 — the OS-observed identity for our adapter LUID:
         /// `(ifIndex, "{GUID}")`. Diagnostics only (the bring-up identity
         /// log); `0` / `"?"` on conversion failure.
@@ -2103,34 +2262,19 @@ mod system {
                     }
                     #[cfg(target_os = "windows")]
                     {
-                        // delete-then-add (idempotent), like the other helpers.
-                        let _ = run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv4".into(),
-                                "delete".into(),
-                                "route".into(),
-                                format!("prefix={v4}/32"),
-                                format!("interface={}", gw.interface),
-                            ],
+                        // N3 — typed IP Helper (idempotent by numeric
+                        // AlreadyExists); `gw.interface` is the ORIGINAL
+                        // uplink's ifIndex, captured at bring-up.
+                        let ifindex: u32 = gw.interface.parse().map_err(|_| {
+                            std::io::Error::other("orig default route ifindex not numeric")
+                        })?;
+                        winroute::add_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V4(v4),
+                            32,
+                            std::net::IpAddr::V4(gw.gateway),
+                            1,
                         )
-                        .await;
-                        run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv4".into(),
-                                "add".into(),
-                                "route".into(),
-                                format!("prefix={v4}/32"),
-                                format!("interface={}", gw.interface),
-                                format!("nexthop={}", gw.gateway),
-                                "metric=1".into(),
-                                "store=active".into(),
-                            ],
-                        )
-                        .await
                     }
                 }
                 // P5/S3b — the IPv6 `/128` counterpart, via the original v6 gateway.
@@ -2159,33 +2303,17 @@ mod system {
                     }
                     #[cfg(target_os = "windows")]
                     {
-                        let _ = run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv6".into(),
-                                "delete".into(),
-                                "route".into(),
-                                format!("prefix={v6}/128"),
-                                format!("interface={}", gw.interface),
-                            ],
+                        // N3 — typed v6 twin of the v4 exemption above.
+                        let ifindex: u32 = gw.interface.parse().map_err(|_| {
+                            std::io::Error::other("orig v6 default route ifindex not numeric")
+                        })?;
+                        winroute::add_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V6(v6),
+                            128,
+                            std::net::IpAddr::V6(gw.gateway),
+                            1,
                         )
-                        .await;
-                        run_cmd(
-                            "netsh",
-                            vec![
-                                "interface".into(),
-                                "ipv6".into(),
-                                "add".into(),
-                                "route".into(),
-                                format!("prefix={v6}/128"),
-                                format!("interface={}", gw.interface),
-                                format!("nexthop={}", gw.gateway),
-                                "metric=1".into(),
-                                "store=active".into(),
-                            ],
-                        )
-                        .await
                     }
                 }
             }
@@ -2217,18 +2345,14 @@ mod system {
                         let _ = run_cmd("ip", args).await;
                     }
                     #[cfg(target_os = "windows")]
-                    let _ = run_cmd(
-                        "netsh",
-                        vec![
-                            "interface".into(),
-                            "ipv4".into(),
-                            "delete".into(),
-                            "route".into(),
-                            format!("prefix={v4}/32"),
-                            format!("interface={}", gw.interface),
-                        ],
-                    )
-                    .await;
+                    if let Ok(ifindex) = gw.interface.parse::<u32>() {
+                        winroute::del_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V4(v4),
+                            32,
+                            std::net::IpAddr::V4(gw.gateway),
+                        );
+                    }
                 }
                 std::net::IpAddr::V6(v6) => {
                     let Some(gw) = self.orig_default_v6.as_ref() else {
@@ -2252,18 +2376,14 @@ mod system {
                         let _ = run_cmd("ip", args).await;
                     }
                     #[cfg(target_os = "windows")]
-                    let _ = run_cmd(
-                        "netsh",
-                        vec![
-                            "interface".into(),
-                            "ipv6".into(),
-                            "delete".into(),
-                            "route".into(),
-                            format!("prefix={v6}/128"),
-                            format!("interface={}", gw.interface),
-                        ],
-                    )
-                    .await;
+                    if let Ok(ifindex) = gw.interface.parse::<u32>() {
+                        winroute::del_gateway_route(
+                            ifindex,
+                            std::net::IpAddr::V6(v6),
+                            128,
+                            std::net::IpAddr::V6(gw.gateway),
+                        );
+                    }
                 }
             }
         }
@@ -2467,23 +2587,13 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn enumerate_if_routes() -> Vec<String> {
-        let out = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Get-NetRoute -InterfaceAlias {IF_NAME} -ErrorAction SilentlyContinue | \
-                     Select-Object -ExpandProperty DestinationPrefix"
-                ),
-            ])
-            .output();
-        let Ok(out) = out else { return Vec::new() };
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|p| p.contains('/'))
-            .map(str::to_string)
-            .collect()
+        // N3 — typed FIB walk. The old `Get-NetRoute` PowerShell spawn cost
+        // 0.5–2 s at bring-up AND inside `purge_exit_routes()` on every
+        // `process::exit` path — launched from a process that was, by
+        // definition, already wedged.
+        winroute::luid_for_alias(IF_NAME)
+            .map(winroute::list_cidrs)
+            .unwrap_or_default()
     }
 
     #[cfg(target_os = "linux")]
@@ -2498,17 +2608,14 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn purge_one(cidr: &str) {
-        let family = if is_v6_cidr(cidr) { "ipv6" } else { "ipv4" };
-        let _ = std::process::Command::new("netsh")
-            .args([
-                "interface",
-                family,
-                "delete",
-                "route",
-                &format!("prefix={cidr}"),
-                &format!("interface={IF_NAME}"),
-            ])
-            .output();
+        // N3 — typed delete (was the last Windows route MUTATION on netsh,
+        // kept only because this path has no live SystemTun/LUID in hand).
+        let Some((ip, plen)) = parse_cidr(cidr) else {
+            return;
+        };
+        if let Some(luid) = winroute::luid_for_alias(IF_NAME) {
+            winroute::del(luid, ip, plen);
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -2630,8 +2737,10 @@ mod system {
 
     /// Run an OS route command off the async reactor (`std::process` in a
     /// blocking task — avoids pulling in tokio's `process` feature). Non-zero
-    /// exit → `Err` with the captured stderr.
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    /// exit → `Err` with the captured stderr. Linux/macOS only since N2/N3:
+    /// every Windows route/address operation goes through the typed
+    /// `winroute`/`winaddr` IP Helper layers now.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn run_cmd(prog: &'static str, args: Vec<String>) -> std::io::Result<()> {
         tokio::task::spawn_blocking(move || {
             let out = std::process::Command::new(prog).args(&args).output()?;
@@ -2683,14 +2792,22 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn discover_default_route() -> Option<OrigDefaultRoute> {
-        let out = std::process::Command::new("netsh")
-            .args(["interface", "ipv4", "show", "route"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
+        // N2 — `GetBestRoute2` toward the unspecified address answers "which
+        // route would carry a default-bound packet right now" as a STRUCT,
+        // replacing the fixed-position parse of `netsh show route`'s
+        // LOCALIZED table (the most fragile parse the tree had). On-link
+        // defaults (unspecified next-hop) yield `None`, same as the parser's
+        // skip. Ordering contract unchanged: this runs in `up()` BEFORE the
+        // adapter exists, so the best route cannot be our own.
+        let (ifindex, gw) =
+            winroute::best_route(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))?;
+        let std::net::IpAddr::V4(gateway) = gw else {
             return None;
-        }
-        parse_windows_default_route(&String::from_utf8_lossy(&out.stdout))
+        };
+        Some(OrigDefaultRoute {
+            gateway,
+            interface: ifindex.to_string(),
+        })
     }
 
     /// Parse `ip -4 route show default` → the lowest-metric default route. Pure
@@ -2739,33 +2856,6 @@ mod system {
         best.map(|(_, r)| r)
     }
 
-    /// Parse `netsh interface ipv4 show route` → the lowest-metric `0.0.0.0/0`
-    /// route (gateway + interface index). Pure so it unit-tests against captured
-    /// output. Rows whose gateway column is an interface NAME (on-link, no
-    /// gateway) are skipped — a real default route always carries a gateway.
-    #[cfg(target_os = "windows")]
-    fn parse_windows_default_route(output: &str) -> Option<OrigDefaultRoute> {
-        let mut best: Option<(u32, OrigDefaultRoute)> = None;
-        for line in output.lines() {
-            // Columns: Publish  Type  Met  Prefix  Idx  Gateway/Interface Name
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            if toks.len() < 6 || toks[3] != "0.0.0.0/0" {
-                continue;
-            }
-            let Ok(metric) = toks[2].parse::<u32>() else {
-                continue; // header row ("Met")
-            };
-            let Ok(gateway) = toks[5].parse::<Ipv4Addr>() else {
-                continue; // on-link (interface name, not a gateway)
-            };
-            let interface = toks[4].to_string();
-            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
-                best = Some((metric, OrigDefaultRoute { gateway, interface }));
-            }
-        }
-        best.map(|(_, r)| r)
-    }
-
     /// P5/S3b — the host's original IPv6 default route: the v6 gateway + interface
     /// that carried its v6 traffic before the overlay. Pins v6 `/128` exit
     /// exemptions. `gateway` is frequently a link-local (`fe80::`) next-hop, which
@@ -2798,14 +2888,18 @@ mod system {
 
     #[cfg(target_os = "windows")]
     fn discover_default_route_v6() -> Option<OrigDefaultRoute6> {
-        let out = std::process::Command::new("netsh")
-            .args(["interface", "ipv6", "show", "route"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
+        // N2 — v6 twin of the typed discovery above. A link-local (`fe80::`)
+        // next-hop comes back as an ADDRESS from the FIB — no `%zone` string
+        // to strip; the ifIndex disambiguates it, as before.
+        let (ifindex, gw) =
+            winroute::best_route(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))?;
+        let std::net::IpAddr::V6(gateway) = gw else {
             return None;
-        }
-        parse_windows_default_route_v6(&String::from_utf8_lossy(&out.stdout))
+        };
+        Some(OrigDefaultRoute6 {
+            gateway,
+            interface: ifindex.to_string(),
+        })
     }
 
     /// Parse `ip -6 route show default` → the lowest-metric v6 default (gateway +
@@ -2847,34 +2941,6 @@ mod system {
                         onlink,
                     },
                 ));
-            }
-        }
-        best.map(|(_, r)| r)
-    }
-
-    /// Parse `netsh interface ipv6 show route` → the lowest-metric `::/0` route
-    /// (gateway + interface index). Pure. Rows whose gateway column isn't a v6
-    /// address (on-link — an interface name) are skipped; a `%zone` suffix on a
-    /// link-local gateway is stripped before parsing.
-    #[cfg(target_os = "windows")]
-    fn parse_windows_default_route_v6(output: &str) -> Option<OrigDefaultRoute6> {
-        let mut best: Option<(u32, OrigDefaultRoute6)> = None;
-        for line in output.lines() {
-            // Columns: Publish  Type  Met  Prefix  Idx  Gateway/Interface Name
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            if toks.len() < 6 || toks[3] != "::/0" {
-                continue;
-            }
-            let Ok(metric) = toks[2].parse::<u32>() else {
-                continue; // header row ("Met")
-            };
-            let gw_str = toks[5].split('%').next().unwrap_or(toks[5]);
-            let Ok(gateway) = gw_str.parse::<Ipv6Addr>() else {
-                continue; // on-link (interface name, not a gateway)
-            };
-            let interface = toks[4].to_string();
-            if best.as_ref().is_none_or(|(m, _)| metric < *m) {
-                best = Some((metric, OrigDefaultRoute6 { gateway, interface }));
             }
         }
         best.map(|(_, r)| r)
@@ -3121,23 +3187,10 @@ mod system {
             assert!(parse_linux_default_route("10.0.0.0/8 dev eth0\n").is_none());
         }
 
-        #[cfg(target_os = "windows")]
-        #[test]
-        fn windows_default_route_lowest_metric_skips_headers_and_onlink() {
-            use super::parse_windows_default_route;
-            use std::net::Ipv4Addr;
-            let out = "\
-Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\r\n\
--------  --------  ---  ------------------------  ---  ------------------------\r\n\
-No       Manual      0  0.0.0.0/0                   12  192.168.68.1\r\n\
-No       Manual    256  0.0.0.0/0                    5  10.0.0.1\r\n\
-No       Manual    256  255.255.255.255/32          1  Loopback Pseudo-Interface 1\r\n";
-            let r = parse_windows_default_route(out).unwrap();
-            assert_eq!(r.gateway, Ipv4Addr::new(192, 168, 68, 1));
-            assert_eq!(r.interface, "12");
-            // No default route present.
-            assert!(parse_windows_default_route("").is_none());
-        }
+        // N2 — the Windows default-route parsers (and these fixed-position
+        // captures of a LOCALIZED netsh table) are gone: discovery now reads
+        // the FIB via `GetBestRoute2` as a struct. Only the Linux `ip route`
+        // parsers remain text-based.
 
         #[cfg(target_os = "linux")]
         #[test]
@@ -3169,23 +3222,6 @@ No       Manual    256  255.255.255.255/32          1  Loopback Pseudo-Interface
             // None present.
             assert!(parse_linux_default_route_v6("").is_none());
             assert!(parse_linux_default_route_v6("2001:db8::/64 dev eth0\n").is_none());
-        }
-
-        #[cfg(target_os = "windows")]
-        #[test]
-        fn windows_default_route_v6_skips_headers_and_onlink() {
-            use super::parse_windows_default_route_v6;
-            use std::net::Ipv6Addr;
-            let out = "\
-Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\r\n\
--------  --------  ---  ------------------------  ---  ------------------------\r\n\
-No       Manual      0  ::/0                        12  fe80::1\r\n\
-No       Manual    256  ::/0                         5  2a01:4f8::1\r\n\
-No       Manual    256  fe80::/64                    1  Loopback Pseudo-Interface 1\r\n";
-            let r = parse_windows_default_route_v6(out).unwrap();
-            assert_eq!(r.gateway, "fe80::1".parse::<Ipv6Addr>().unwrap());
-            assert_eq!(r.interface, "12");
-            assert!(parse_windows_default_route_v6("").is_none());
         }
     }
 }
