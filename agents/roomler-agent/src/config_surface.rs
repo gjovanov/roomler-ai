@@ -180,6 +180,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Force overlay coturn allocations onto the TURNS/TCP (TLS) tier — corp-VPN probe. Built-in default: off.",
     ),
     (
+        "overlay_mux_nat",
+        "tribool",
+        "Multi-org mux NAT: rewrite a cross-org egress source the OS picked from the wrong org on the shared adapter, and restore matching reply destinations. off = pre-fix behavior. Built-in default: on.",
+    ),
+    (
         "overlay_tun_stable_guid",
         "tribool",
         "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
@@ -353,6 +358,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_direct_port" => cfg.overlay_direct_port.map(|v| v.to_string()),
         "shared_encoder" => cfg.shared_encoder.map(fmt_bool),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
+        "overlay_mux_nat" => cfg.overlay_mux_nat.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
@@ -541,6 +547,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "shared_encoder" => cfg.shared_encoder = parse_tribool(value)?,
         "overlay_relay_tls" => cfg.overlay_relay_tls = parse_tribool(value)?,
+        "overlay_mux_nat" => cfg.overlay_mux_nat = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
@@ -730,6 +737,24 @@ mod tests {
         apply(&mut cfg, "overlay_relay_tls", None).unwrap();
         assert_eq!(cfg.overlay_relay_tls, None);
         assert!(apply(&mut cfg, "overlay_relay_tls", Some("maybe")).is_err());
+    }
+
+    /// Multi-org mux NAT kill switch set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_mux_nat_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_mux_nat", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_mux_nat, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_mux_nat").unwrap().value.as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_mux_nat", Some("1")).unwrap();
+        assert_eq!(cfg.overlay_mux_nat, Some(true));
+        apply(&mut cfg, "overlay_mux_nat", None).unwrap();
+        assert_eq!(cfg.overlay_mux_nat, None);
+        assert!(apply(&mut cfg, "overlay_mux_nat", Some("maybe")).is_err());
     }
 
     /// rc.275 — the LAN-gather virtual-interface filter key set/echo/clear

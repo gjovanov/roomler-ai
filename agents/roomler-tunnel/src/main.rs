@@ -195,6 +195,10 @@ enum Command {
         /// Case-insensitive substring filter applied to the returned tail.
         #[arg(long)]
         grep: Option<String>,
+        /// Keep only the last N lines (applied after `--grep`; the transport
+        /// stays byte-bounded, so N is capped by `--max-bytes` worth of log).
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
         #[command(flatten)]
         fmt: OutputFmt,
     },
@@ -487,8 +491,9 @@ async fn main() -> Result<()> {
             source,
             max_bytes,
             grep,
+            lines,
             fmt,
-        } => localclient::logs(source, max_bytes, grep, fmt.json).await,
+        } => localclient::logs(source, max_bytes, grep, lines, fmt.json).await,
         Command::Peers { fmt } => localclient::peers(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
         Command::Rename { name } => localclient::rename(&name).await,
