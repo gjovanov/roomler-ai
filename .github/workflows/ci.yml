@@ -199,6 +199,27 @@ jobs:
       - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
         run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
 
+      - name: Lint the macOS packaging
+        # A malformed plist or postinstall only fails at INSTALL time, on
+        # someone's Mac, with launchctl's famously unhelpful diagnostics.
+        # Both checks are free here.
+        run: |
+          set -euo pipefail
+          for p in agents/roomler-agent/packaging/macos/*.plist; do
+            plutil -lint "$p"
+          done
+          bash -n agents/roomler-agent/packaging/macos/postinstall
+          # The daemon plist must point at a path the .pkg actually creates,
+          # and must NOT reuse the LaunchAgent's Label — launchctl would
+          # refuse the second bootstrap and the failure reads as "already
+          # loaded" rather than "you shipped one label twice".
+          AGENT_LABEL=$(plutil -extract Label raw agents/roomler-agent/packaging/macos/com.roomler.agent.plist)
+          DAEMON_LABEL=$(plutil -extract Label raw agents/roomler-agent/packaging/macos/com.roomler.daemon.plist)
+          echo "agent=$AGENT_LABEL daemon=$DAEMON_LABEL"
+          [ "$AGENT_LABEL" != "$DAEMON_LABEL" ] || { echo "::error::the two launchd jobs share a Label"; exit 1; }
+          grep -q '/Applications/roomler-agent.app/Contents/MacOS/roomler-agent' \
+            agents/roomler-agent/packaging/macos/com.roomler.daemon.plist
+
       - name: macOS overlay against a real utun
         # The macOS arms of add_address_sync / add_peer_route /
         # add_cidr_route / assign_derived_v6 were no-ops until now, so none
