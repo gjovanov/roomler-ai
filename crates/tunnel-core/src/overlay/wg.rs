@@ -2249,6 +2249,8 @@ mod tests {
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
+            supports_forced_derp: false,
+            relay_strategy: None,
             routes: vec![],
             agent_id: None,
             ingress_rules: None,

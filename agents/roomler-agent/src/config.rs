@@ -105,6 +105,12 @@ pub struct AgentConfig {
     /// Built-in default: on.
     #[serde(default)]
     pub overlay_derp: Option<bool>,
+    /// U2 — accept the server's computed relay-tier verdict in place of the
+    /// local `relay_strategy()` derivation
+    /// (`ROOMLER_NODE_OVERLAY_SERVER_RELAY_STRATEGY`). Built-in default: **off**
+    /// (the U2 program soaks per-host before fleet-wide).
+    #[serde(default)]
+    pub overlay_server_relay_strategy: Option<bool>,
     /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
     /// Built-in default: on.
     #[serde(default)]
@@ -1034,12 +1040,16 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 22] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 23] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
         ("OVERLAY_DERP", cfg.overlay_derp),
+        (
+            "OVERLAY_SERVER_RELAY_STRATEGY",
+            cfg.overlay_server_relay_strategy,
+        ),
         ("OVERLAY_MBB", cfg.overlay_mbb),
         ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
         ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
@@ -1225,6 +1235,7 @@ mod tests {
             overlay_quic: None,
             overlay_direct: None,
             overlay_derp: None,
+            overlay_server_relay_strategy: None,
             overlay_mbb: None,
             overlay_lan_iface_filter: None,
             overlay_pathmon: None,
