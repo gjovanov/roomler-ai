@@ -363,6 +363,13 @@ pub struct PeerStats {
     /// `enforce` also drops), so a fleet read of this counter is exactly the
     /// blast radius of flipping the mode. Monotonic — never drained.
     rx_denied: AtomicU64,
+    /// The subset of [`Self::rx_denied`] whose reason was `Rpf(NoRoute)` — a
+    /// source NO installed peer owns. Split out because this class is worse
+    /// than a plain denial even in `warn`: the packet is delivered, but any
+    /// reply to that source is unroutable from this node, so the flow fails
+    /// silently (field 2026-08-09: a multi-org sender's OS picking the wrong
+    /// org's overlay address). Monotonic.
+    rx_denied_noroute: AtomicU64,
     /// P4 — mono-ms (against [`wg_epoch`]) of the last reverse-path log line
     /// emitted for this peer; 0 = never. Throttles the warning to ≤1 per peer
     /// per [`RPF_LOG_THROTTLE_MS`] so neither a spoofing flood nor a
@@ -408,11 +415,9 @@ fn short_key(k: &[u8; 32]) -> String {
 /// advertised).
 #[derive(Debug, Clone, Copy)]
 enum IngressDeny {
-    /// The inner reason is consumed only by the derived `Debug` in the warning
-    /// below — which dead-code analysis doesn't count as a read — but it is the
-    /// whole diagnostic value of the line (`NoRoute` = an approval/config gap,
-    /// `OtherPeer` = an actual forgery), so it stays.
-    Rpf(#[allow(dead_code)] super::router::RpfDeny),
+    /// `NoRoute` = a source nobody here owns (reply-unroutable — see
+    /// [`PeerStats::rx_denied_noroute`]); `OtherPeer` = an actual forgery.
+    Rpf(super::router::RpfDeny),
     OutOfScope,
     /// The destination is inside this node's scope, but the tenant's ACL grants
     /// this particular peer no rule covering it (or its port/protocol).
@@ -481,6 +486,13 @@ impl Ingress {
             RpfVerdict::Deny(r) => IngressDeny::Rpf(r),
             RpfVerdict::Allow => return true,
         };
+        // The precedence above makes this subset exact: OutOfScope and
+        // NotPermitted win over Rpf, so `noroute` counts ONLY packets whose
+        // final verdict was "a source nobody owns".
+        let noroute = matches!(reason, IngressDeny::Rpf(super::router::RpfDeny::NoRoute));
+        if noroute {
+            self.stats.rx_denied_noroute.fetch_add(1, Ordering::Relaxed);
+        }
         let denied = self.stats.rx_denied.fetch_add(1, Ordering::Relaxed) + 1;
         let now = mono_ms_now();
         let last = self.stats.rpf_logged_at.load(Ordering::Relaxed);
@@ -499,6 +511,18 @@ impl Ingress {
                 warn!(
                     %src, ?reason, %peer, denied,
                     "overlay: DROPPED an inbound packet the sending peer is not entitled to send"
+                );
+            } else if noroute {
+                // The delivery is a trap here: replies to a source nobody owns
+                // are unroutable from this node, so the flow fails silently
+                // whatever we do — say so instead of implying warn is harmless.
+                warn!(
+                    %src, %peer, denied,
+                    "overlay: inbound packet from a source NO installed peer owns — \
+                     delivered (overlay_rpf=warn), but replies to this source cannot be \
+                     routed back from this node, so the flow will fail silently. If the \
+                     sender is a multi-org host, its OS likely picked the wrong org's \
+                     overlay address as source"
                 );
             } else {
                 warn!(
@@ -1532,6 +1556,18 @@ impl WgDevice {
             .unwrap_or(0)
     }
 
+    /// The subset of [`Self::peer_rx_denied`] whose reason was `Rpf(NoRoute)`:
+    /// packets from a source NO installed peer owns, i.e. flows whose replies
+    /// this node cannot route back — they fail silently even in `warn`. The
+    /// signature of a multi-org sender whose OS picked the wrong org's
+    /// overlay address (field 2026-08-09). Monotonic; 0 for an unknown peer.
+    pub fn peer_rx_denied_noroute(&self, peer_public: &[u8; 32]) -> u64 {
+        self.peers
+            .get(peer_public)
+            .map(|p| p.stats.rx_denied_noroute.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// P4 — the device's reverse-path mode, for status/diagnostics.
     pub fn rpf_mode(&self) -> RpfMode {
         self.rpf
@@ -2279,6 +2315,52 @@ mod tests {
             .unwrap();
         assert_eq!(&got[20..], b"spoof");
         assert_eq!(dev_b.peer_rx_denied(&pk_a), 1);
+    }
+
+    /// The `NoRoute` subset counter splits exactly: a source NOBODY owns
+    /// counts in both `rx_denied` and `rx_denied_noroute` (its replies are
+    /// unroutable from this node — the multi-org wrong-source signature),
+    /// while forging ANOTHER installed peer's address (`OtherPeer`) counts
+    /// only in the total. Both delivered — this is `warn`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpf_warn_splits_the_noroute_counter() {
+        let (dev_a, mut dev_b, mut rx_b, pk_a) = rpf_pair(RpfMode::Warn).await;
+        let pk_b = dev_b.public().to_bytes();
+
+        let nobody = Ipv4Addr::new(10, 66, 51, 147);
+        send_until_ok(&dev_a, &pk_b, &synthetic_ipv4(nobody, IP_B, b"lost")).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("warn mode must not drop")
+            .unwrap();
+        assert_eq!(&got[20..], b"lost");
+        assert_eq!(dev_b.peer_rx_denied(&pk_a), 1);
+        assert_eq!(dev_b.peer_rx_denied_noroute(&pk_a), 1);
+
+        // A third identity B has installed: forging ITS address is OtherPeer —
+        // total climbs, the NoRoute subset does not.
+        let c = WgKeypair::generate();
+        let sock_c = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr_c = sock_c.local_addr().unwrap();
+        let ip_c = Ipv4Addr::new(100, 64, 0, 9);
+        dev_b.add_peer(
+            c.public.to_bytes(),
+            ip_c,
+            Carrier::direct(sock_c, addr_c),
+            false,
+        );
+        send_until_ok(&dev_a, &pk_b, &synthetic_ipv4(ip_c, IP_B, b"forge")).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), rx_b.recv())
+            .await
+            .expect("warn mode must not drop")
+            .unwrap();
+        assert_eq!(&got[20..], b"forge");
+        assert_eq!(dev_b.peer_rx_denied(&pk_a), 2);
+        assert_eq!(
+            dev_b.peer_rx_denied_noroute(&pk_a),
+            1,
+            "OtherPeer must not count as NoRoute"
+        );
     }
 
     /// The destination half: a peer with a perfectly legitimate SOURCE aims

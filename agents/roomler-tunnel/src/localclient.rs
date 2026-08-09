@@ -61,6 +61,7 @@ pub async fn logs(
     source: String,
     max_bytes: Option<u64>,
     grep: Option<String>,
+    lines: Option<usize>,
     json: bool,
 ) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;
@@ -80,6 +81,15 @@ pub async fn logs(
                 .join("\n")
         }
         None => content,
+    };
+    // `-n` trims AFTER the grep, so `--grep X -n 20` reads as "the last 20
+    // matching lines" — same order as a shell `grep X | tail -n 20`.
+    let body: String = match lines {
+        Some(n) => {
+            let all: Vec<&str> = body.lines().collect();
+            all[all.len().saturating_sub(n)..].join("\n")
+        }
+        None => body,
     };
     if json {
         println!(
