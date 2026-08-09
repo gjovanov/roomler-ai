@@ -1137,6 +1137,33 @@ impl WgDevice {
         demux.tasks.push(task);
     }
 
+    /// R2 — retire one direct socket's demux slot: abort its recv loop and
+    /// drop the slot's socket Arc. Without this, a direct-plane rebuild that
+    /// re-binds the SAME stable `ip:port` is silently defeated by
+    /// [`ensure_direct_demux`]'s local-addr dedupe — the rebuilt socket is
+    /// treated as already-demuxed while the DEAD socket keeps the slot (and
+    /// the port, until every Arc holder is gone). Per-peer `routes` entries
+    /// are NOT touched here: they belong to carriers, and the rebuild tears
+    /// those down via `remove_peer` (which unregisters its own route) before
+    /// retiring sockets. `true` when a slot was found.
+    pub fn retire_direct_socket(&mut self, local: SocketAddr) -> bool {
+        let Some(demux) = &mut self.direct else {
+            return false;
+        };
+        let Some(i) = demux
+            .socks
+            .iter()
+            .position(|s| s.local_addr().map(|a| a == local).unwrap_or(false))
+        else {
+            return false;
+        };
+        // `socks`/`tasks` are pushed in lockstep (above), so index `i` names
+        // both halves of the slot.
+        demux.socks.remove(i);
+        demux.tasks.remove(i).abort();
+        true
+    }
+
     /// Phase A — process ONE datagram for an already-registered direct route
     /// (the runtime calls this right after installing/re-pointing a peer from a
     /// [`DirectInbound`] event, so the very initiation that triggered the event
@@ -3606,5 +3633,45 @@ mod tests {
             stun_events.try_recv().is_err(),
             "a WG init must NOT reach the STUN sink"
         );
+    }
+
+    /// R2 — retiring a demux slot aborts its recv loop and frees the
+    /// local-addr dedupe, so a direct-plane rebuild's re-ensure for the SAME
+    /// `ip:port` spawns a FRESH loop instead of being silently absorbed by
+    /// the dead slot (the trap that would defeat a same-stable-port
+    /// rebuild).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_direct_socket_frees_the_slot_for_reensure() {
+        let kp = WgKeypair::generate();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let local = sock.local_addr().unwrap();
+        let (mut dev, _rx) = WgDevice::new(kp.secret.clone());
+        dev.ensure_direct_demux(sock.clone());
+        let mut stun_events = dev.take_stun_events().unwrap();
+
+        let ext = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ping = crate::transport::stun::encode_binding_request([1u8; 12]);
+        ext.send_to(&ping, local).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), stun_events.recv())
+            .await
+            .expect("the first loop reads")
+            .expect("sink open");
+
+        assert!(dev.retire_direct_socket(local), "slot found and retired");
+        assert!(
+            !dev.retire_direct_socket(local),
+            "a second retire finds nothing"
+        );
+
+        // The dedupe no longer blocks: a re-ensure spawns a fresh loop that
+        // reads the same socket again.
+        dev.ensure_direct_demux(sock.clone());
+        let ping2 = crate::transport::stun::encode_binding_request([2u8; 12]);
+        ext.send_to(&ping2, local).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), stun_events.recv())
+            .await
+            .expect("the fresh loop reads after retire + re-ensure")
+            .expect("sink open");
+        assert_eq!(got.packet, ping2.to_vec());
     }
 }
