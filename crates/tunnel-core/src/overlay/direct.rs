@@ -661,6 +661,24 @@ pub fn derp_enabled() -> bool {
     }
 }
 
+/// U2 — does this node accept a SERVER-COMPUTED relay-tier verdict
+/// (`ROOMLER_NODE_OVERLAY_SERVER_RELAY_STRATEGY`) in place of its own local
+/// `relay_strategy()` derivation? **Default-OFF** (the inverse polarity of
+/// `derp_enabled`): server-authoritative tier selection is the U2 program,
+/// and it stays inert until deliberately enabled per host for soak, then
+/// fleet-wide. The capability is advertised in `OverlayJoin` only when this
+/// is on, and the server only stamps a per-edge verdict when BOTH ends
+/// advertise it — so an unset host, or a host talking to an unset peer,
+/// keeps the exact pre-U2 client-authoritative path.
+pub fn server_relay_strategy_enabled() -> bool {
+    matches!(
+        crate::env::node_env("OVERLAY_SERVER_RELAY_STRATEGY")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 /// Phase D — should this node GATHER + ADVERTISE its own srflx candidates? True
 /// when the srflx-direct tier is on OR single-relay is on. Single-relay needs it
 /// even with srflx-direct OFF: a single-relay DIALER (larger pubkey) runs no

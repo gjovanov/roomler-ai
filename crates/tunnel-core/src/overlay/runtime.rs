@@ -1285,6 +1285,11 @@ impl OverlayRuntime {
             // escalation push. Same local flag as `supports_derp` (a node with
             // DERP disabled can't be force-pinned onto it).
             supports_forced_derp: crate::overlay::direct::derp_enabled(),
+            // U2 — advertise that we accept a server-computed relay-tier
+            // verdict. Default-OFF (env/config `OVERLAY_SERVER_RELAY_STRATEGY`)
+            // until field-proven; the server only stamps a verdict when BOTH
+            // ends advertise this.
+            supports_server_relay_strategy: crate::overlay::direct::server_relay_strategy_enabled(),
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         }
@@ -2929,6 +2934,8 @@ mod tests {
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
+            supports_forced_derp: false,
+            relay_strategy: None,
             routes: vec![],
             agent_id: None,
             ingress_rules: None,
@@ -4638,6 +4645,8 @@ mod tests {
                 supports_quic: false,
                 supports_relay_single: false,
                 supports_derp: false,
+                supports_forced_derp: false,
+                relay_strategy: None,
                 routes: vec![],
                 agent_id: None,
                 ingress_rules: None,
@@ -4867,6 +4876,8 @@ mod tests {
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
+            supports_forced_derp: false,
+            relay_strategy: None,
             routes: vec![],
             agent_id: None,
             ingress_rules: None,
@@ -5419,6 +5430,8 @@ mod tests {
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
+            supports_forced_derp: false,
+            relay_strategy: None,
             routes,
             agent_id: None,
             ingress_rules: None,
@@ -5586,6 +5599,8 @@ mod tests {
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
+            supports_forced_derp: false,
+            relay_strategy: None,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
             agent_id: None,
             ingress_rules: None,
