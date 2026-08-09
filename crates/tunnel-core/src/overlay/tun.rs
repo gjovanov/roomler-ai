@@ -821,6 +821,40 @@ mod system {
             unsafe { DeleteIpForwardEntry2(&r) };
         }
 
+        /// N5 — pin the adapter's IPv4 interface METRIC (the route-war
+        /// priority: our connected `/10` + peer `/32`s must outrank a
+        /// full-tunnel VPN's captured routes). Typed replacement for the
+        /// blocking `netsh set interface metric=` in `up()`. The
+        /// `SitePrefixLength = 0` reset before `Set` is a documented API
+        /// quirk (`Get` returns a value `Set` rejects) — same handling as
+        /// the in-tree wintun-bindings `set_adapter_mtu`.
+        pub fn set_iface_metric_v4(luid: u64, metric: u32) -> std::io::Result<()> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::{
+                GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+                SetIpInterfaceEntry,
+            };
+            // SAFETY: Initialize fills valid defaults; Get fills the row for
+            // (family, luid); Set writes the mutated copy back.
+            unsafe {
+                let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+                InitializeIpInterfaceEntry(&mut row);
+                row.Family = AF_INET;
+                row.InterfaceLuid = NET_LUID_LH { Value: luid };
+                let rc = GetIpInterfaceEntry(&mut row);
+                if rc != NO_ERROR {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+                row.SitePrefixLength = 0;
+                row.Metric = metric;
+                row.UseAutomaticMetric = false;
+                let rc = SetIpInterfaceEntry(&mut row);
+                if rc != NO_ERROR {
+                    return Err(std::io::Error::from_raw_os_error(rc as i32));
+                }
+            }
+            Ok(())
+        }
+
         /// rc.279 — the OS-observed identity for our adapter LUID:
         /// `(ifIndex, "{GUID}")`. Diagnostics only (the bring-up identity
         /// log); `0` / `"?"` on conversion failure.
@@ -1710,13 +1744,15 @@ mod system {
             // range. Check Point Endpoint installs competing `/32`s via its NIC
             // at metric 1, which otherwise swallow overlay traffic (the packet
             // is bounced to the VPN gateway → "destination host unreachable").
-            // Best-effort + sync (`up` isn't async) — a blocking `netsh` at
-            // bring-up is fine; a failure just leaves the default metric.
+            // N5 — typed (`Get/SetIpInterfaceEntry`, in-memory µs) instead of
+            // the old blocking `netsh` spawn. Still best-effort: a failure
+            // just leaves the default metric.
             #[cfg(target_os = "windows")]
             {
-                let _ = std::process::Command::new("netsh")
-                    .args(["interface", "ipv4", "set", "interface", IF_NAME, "metric=1"])
-                    .output();
+                use tun::AbstractDeviceExt as _;
+                if let Err(e) = winroute::set_iface_metric_v4(dev.tun_luid(), 1) {
+                    tracing::warn!(%e, "overlay: interface metric pin failed; keeping the default");
+                }
             }
 
             // Dual-stack: assign the derived overlay v6 on the ULA /96 (the
