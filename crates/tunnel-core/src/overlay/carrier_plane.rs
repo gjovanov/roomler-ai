@@ -693,7 +693,16 @@ impl CarrierPlane {
                 ..Default::default()
             },
         };
-        let _ = self.lock().srflx_watch.send(shared.clone());
+        // send_replace, NOT send: the plane keeps no persistent receiver
+        // (the channel's initial one is dropped at construction), and
+        // `send` DROPS the value when there are zero receivers — which is
+        // exactly the case here, because ensure_srflx runs BEFORE any
+        // runtime's forwarder subscribes. That silently left the watch empty,
+        // so every forwarder read `[]` and never advertised, and the losing
+        // org of the gather-gate race went relay-locked (field 2026-08-10:
+        // random org per host stuck at srflx=[]). send_replace stores the
+        // value unconditionally, so late subscribers see the candidate.
+        self.lock().srflx_watch.send_replace(shared.clone());
         if let Some(rx) = sink {
             self.arm_keepalive(rx, stun_urls.to_vec(), &shared);
         }
@@ -869,7 +878,7 @@ impl CarrierPlane {
                                 new_srflx = %ep,
                                 "carrier plane: srflx mapping changed — every org re-advertises"
                             );
-                            let _ = plane.lock().srflx_watch.send(state.clone());
+                            plane.lock().srflx_watch.send_replace(state.clone());
                         }
                     }
                     Err(e) => {
@@ -1214,6 +1223,29 @@ mod tests {
                 assert!(seen.insert(idx), "index handed out twice: {idx}");
             }
         }
+    }
+
+    /// The srflx-watch send must persist the value even with ZERO receivers —
+    /// the real ordering is: ensure_srflx gathers and publishes BEFORE any
+    /// runtime's forwarder subscribes. Plain `watch::Sender::send` DROPS the
+    /// value when there are no receivers (the plane keeps none), which left
+    /// every forwarder reading `[]` and relay-locked the gather-gate loser
+    /// (field 2026-08-10). `send_replace` stores unconditionally.
+    #[tokio::test]
+    async fn srflx_watch_persists_value_sent_before_any_subscriber() {
+        let plane = CarrierPlane::new();
+        let shared = SrflxShared {
+            candidates: vec!["1.2.3.4:43648".to_string()],
+            my_nat: Some("cone".to_string()),
+            generation: 1,
+            ..Default::default()
+        };
+        // Publish BEFORE any forwarder subscribes (the exact production order).
+        plane.lock().srflx_watch.send_replace(shared);
+        // A late subscriber (the forwarder) MUST see the candidate, not `[]`.
+        let rx = plane.subscribe_srflx();
+        assert_eq!(rx.borrow().candidates, vec!["1.2.3.4:43648".to_string()]);
+        assert_eq!(rx.borrow().my_nat.as_deref(), Some("cone"));
     }
 
     /// P1-d protocol lock: a rebuild delivers Teardown to every subscriber,
