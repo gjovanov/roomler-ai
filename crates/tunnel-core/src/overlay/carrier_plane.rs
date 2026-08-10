@@ -135,6 +135,18 @@ struct PlaneState {
     /// `recv_from` the plane owns).
     stun_tx: mpsc::Sender<StunInbound>,
     stun_rx: Option<mpsc::Receiver<StunInbound>>,
+    /// The shared srflx state every attached runtime mirrors onto its own
+    /// control WS (see [`SrflxShared`]).
+    srflx_watch: tokio::sync::watch::Sender<SrflxShared>,
+    /// The plane keepalive task, once armed (aborted + re-armed by the
+    /// rebuild — the plane itself is process-lifetime).
+    keepalive: Option<JoinHandle<()>>,
+    /// P1-d — the runtimes subscribed to rebuild steps ([`PlaneEvent`]).
+    subscribers: Vec<mpsc::Sender<PlaneEvent>>,
+    /// P1-d — rebuild-in-flight latch + cooldown stamp (the plane twin of
+    /// the per-runtime `pending_rebuild`/`last_rebuild` pair).
+    rebuilding: bool,
+    last_rebuild: Option<Instant>,
 }
 
 /// The shared direct-carrier plane. See the module docs.
@@ -145,11 +157,15 @@ pub struct CarrierPlane {
     /// install per second it takes ~194 days to wrap, and a wrapped index
     /// collides only with a session that has been dead for exactly that long.
     index_alloc: AtomicU32,
+    /// Serializes [`ensure_srflx`](Self::ensure_srflx): the first caller
+    /// gathers while later callers wait, then read the cached result.
+    srflx_gate: tokio::sync::Mutex<bool>,
 }
 
 impl CarrierPlane {
     pub fn new() -> Arc<Self> {
         let (stun_tx, stun_rx) = mpsc::channel(16);
+        let (srflx_watch, _) = tokio::sync::watch::channel(SrflxShared::default());
         Arc::new(Self {
             state: Mutex::new(PlaneState {
                 engines: Vec::new(),
@@ -159,8 +175,14 @@ impl CarrierPlane {
                 next_engine_id: 1,
                 stun_tx,
                 stun_rx: Some(stun_rx),
+                srflx_watch,
+                keepalive: None,
+                subscribers: Vec::new(),
+                rebuilding: false,
+                last_rebuild: None,
             }),
             index_alloc: AtomicU32::new(0),
+            srflx_gate: tokio::sync::Mutex::new(false),
         })
     }
 
@@ -624,6 +646,378 @@ impl Drop for PlaneHandle {
     }
 }
 
+/// Multi-org v2 — the plane's shared srflx state: ONE gather + NAT probe +
+/// keepalive for the whole process, broadcast to every attached runtime via
+/// [`CarrierPlane::subscribe_srflx`] (each runtime advertises on its OWN
+/// control WS, after its OWN join — the server-side join-clears-srflx
+/// ordering holds per org). `generation` bumps on every change so a
+/// forwarder can tell a fresh value from the initial empty state.
+#[derive(Clone, Default)]
+pub struct SrflxShared {
+    pub stun_server: Option<SocketAddr>,
+    /// Advertised candidates; `[0]` is the punch candidate.
+    pub candidates: Vec<String>,
+    /// The punch pair — the advertised candidate and the plane socket that
+    /// owns its NAT mapping (peers' srflx are dialed FROM this socket).
+    pub punch: Option<(String, Arc<UdpSocket>)>,
+    pub my_nat: Option<String>,
+    /// What the LocalAPI shows when the tier is off/empty this run.
+    pub error: Option<String>,
+    pub generation: u64,
+}
+
+impl CarrierPlane {
+    /// Subscribe to the shared srflx state (see [`SrflxShared`]).
+    pub fn subscribe_srflx(&self) -> tokio::sync::watch::Receiver<SrflxShared> {
+        self.lock().srflx_watch.subscribe()
+    }
+
+    /// ONE srflx gather + NAT probe for the whole process. The first caller
+    /// performs it — via the plane's STUN sink, because the plane's recv
+    /// loops own the sockets and raw-socket STUN would be stolen by them —
+    /// and every later caller gets the cached result. Also arms the plane
+    /// keepalive, which holds the mapping open and re-publishes on change.
+    /// P1-d re-gathers per rebuild epoch; until then the result is
+    /// process-lifetime, like the plane's binds.
+    pub async fn ensure_srflx(self: &Arc<Self>, stun_urls: &[String]) -> SrflxShared {
+        let mut done = self.srflx_gate.lock().await;
+        if *done {
+            return self.lock().srflx_watch.borrow().clone();
+        }
+        let mut sink = self.lock().stun_rx.take();
+        let shared = match sink.as_mut() {
+            Some(rx) => self.gather_via_sink(stun_urls, rx).await,
+            None => SrflxShared {
+                generation: 1,
+                error: Some("plane STUN sink already taken".into()),
+                ..Default::default()
+            },
+        };
+        let _ = self.lock().srflx_watch.send(shared.clone());
+        if let Some(rx) = sink {
+            self.arm_keepalive(rx, stun_urls.to_vec(), &shared);
+        }
+        *done = true;
+        shared
+    }
+
+    /// The gather pass — the plane twin of the runtime's
+    /// `gather_and_advertise_srflx` core, minus the advertising (each
+    /// runtime does its own) and driven through the STUN sink.
+    async fn gather_via_sink(
+        &self,
+        stun_urls: &[String],
+        rx: &mut mpsc::Receiver<StunInbound>,
+    ) -> SrflxShared {
+        let mut out = SrflxShared {
+            generation: 1,
+            ..Default::default()
+        };
+        if !direct::srflx_gather_active() || stun_urls.is_empty() {
+            return out;
+        }
+        let Some(v) = self.view() else {
+            return out;
+        };
+        if v.socks.is_empty() {
+            return out;
+        }
+        let Some(server) = direct::resolve_stun_server(stun_urls, &v.my_ips).await else {
+            warn!(
+                urls = ?stun_urls,
+                "carrier plane: no resolvable STUN server — srflx tier OFF for every org this run"
+            );
+            out.error = Some(format!("no resolvable STUN server among {stun_urls:?}"));
+            return out;
+        };
+        out.stun_server = Some(server);
+        let pairs = tokio::time::timeout(super::runtime::SRFLX_GATHER_BUDGET, async {
+            let mut pairs: Vec<(String, Arc<UdpSocket>)> = Vec::new();
+            for (_ip, sock) in &v.socks {
+                match crate::transport::stun::srflx_query_via_sink(
+                    sock,
+                    rx,
+                    server,
+                    super::runtime::SRFLX_ATTEMPT_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(SocketAddr::V4(s)) if direct::is_public_v4(*s.ip()) => {
+                        let ep = SocketAddr::V4(s).to_string();
+                        if !pairs.iter().any(|(e, _)| e == &ep) {
+                            pairs.push((ep, sock.clone()));
+                        }
+                    }
+                    Ok(other) => {
+                        debug!(%other, "carrier plane: srflx candidate not public — skipping")
+                    }
+                    Err(e) => {
+                        debug!(%e, "carrier plane: srflx query failed on a socket — skipping")
+                    }
+                }
+            }
+            pairs
+        })
+        .await
+        .unwrap_or_default();
+        if pairs.is_empty() {
+            // WARN for the same reason the per-runtime pass warns: an empty
+            // srflx tier once died fleet-wide at debug! visibility.
+            warn!(
+                %server,
+                sockets = v.socks.len(),
+                "carrier plane: srflx gather yielded NO public candidate — every org's peers \
+                 will read this node as UDP-blocked (pairs fall to the relay/DERP tier)"
+            );
+            out.error = Some(format!(
+                "STUN yielded no public candidate from {server} ({} socket(s) probed)",
+                v.socks.len()
+            ));
+            return out;
+        }
+        let targets = direct::resolve_stun_targets(stun_urls, &v.my_ips).await;
+        let my_nat = if targets.len() >= 2 {
+            let punch_sock = pairs[0].1.clone();
+            let a = crate::transport::stun::srflx_query_via_sink(
+                &punch_sock,
+                rx,
+                targets[0],
+                super::runtime::SRFLX_ATTEMPT_TIMEOUT,
+            )
+            .await
+            .ok();
+            let b = crate::transport::stun::srflx_query_via_sink(
+                &punch_sock,
+                rx,
+                targets[1],
+                super::runtime::SRFLX_ATTEMPT_TIMEOUT,
+            )
+            .await
+            .ok();
+            match (a, b) {
+                (Some(a), Some(b)) => Some(if a == b { "cone" } else { "symmetric" }.to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        out.candidates = pairs.iter().map(|(e, _)| e.clone()).collect();
+        out.punch = pairs.into_iter().next();
+        out.my_nat = my_nat;
+        info!(
+            candidates = ?out.candidates,
+            my_nat = ?out.my_nat,
+            %server,
+            "carrier plane: srflx gathered ONCE for every attached org"
+        );
+        out
+    }
+
+    /// The plane keepalive — the process-wide twin of the per-runtime srflx
+    /// keepalive: re-query the pinned server on the punch socket each
+    /// interval, publish a changed mapping on the watch (every runtime's
+    /// forwarder then re-advertises on its own WS), re-resolve the server
+    /// after repeated failures. Owns the plane's STUN sink from here on.
+    fn arm_keepalive(
+        self: &Arc<Self>,
+        rx: mpsc::Receiver<StunInbound>,
+        stun_urls: Vec<String>,
+        seed: &SrflxShared,
+    ) {
+        let secs = direct::srflx_keepalive_secs();
+        let (Some(server0), Some((_, punch))) = (seed.stun_server, seed.punch.clone()) else {
+            self.lock().stun_rx = Some(rx);
+            return;
+        };
+        if !direct::srflx_enabled() || secs == 0 || seed.candidates.is_empty() {
+            self.lock().stun_rx = Some(rx);
+            return;
+        }
+        let plane = self.clone();
+        let my_ips: Vec<Ipv4Addr> = self.view().map(|v| v.my_ips).unwrap_or_default();
+        let mut state = seed.clone();
+        let handle = tokio::spawn(async move {
+            let mut rx = rx;
+            let mut server = server0;
+            let mut failures = 0u32;
+            const RERESOLVE_AFTER: u32 = 3;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The interval's immediate first tick — the gather just ran.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match crate::transport::stun::srflx_query_via_sink(
+                    &punch,
+                    &mut rx,
+                    server,
+                    super::runtime::SRFLX_ATTEMPT_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(cur) => {
+                        failures = 0;
+                        let ep = cur.to_string();
+                        if state.candidates.first() != Some(&ep) {
+                            if state.candidates.is_empty() {
+                                state.candidates.push(ep.clone());
+                            } else {
+                                state.candidates[0] = ep.clone();
+                            }
+                            state.generation += 1;
+                            info!(
+                                new_srflx = %ep,
+                                "carrier plane: srflx mapping changed — every org re-advertises"
+                            );
+                            let _ = plane.lock().srflx_watch.send(state.clone());
+                        }
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        debug!(
+                            %e, failures,
+                            "carrier plane: srflx keepalive query failed — retaining last advert"
+                        );
+                        if failures >= RERESOLVE_AFTER {
+                            if let Some(fresh) =
+                                direct::resolve_stun_server(&stun_urls, &my_ips).await
+                            {
+                                server = fresh;
+                            }
+                            failures = 0;
+                        }
+                    }
+                }
+            }
+        });
+        self.lock().keepalive = Some(handle);
+    }
+}
+
+/// Multi-org v2 P1-d — one step of the plane-wide direct-socket rebuild,
+/// delivered to every subscribed runtime.
+pub enum PlaneEvent {
+    /// Release every socket-pinning Arc (direct carriers, probes, the
+    /// runtime's `DirectCtx` view), then ack — the plane re-binds only when
+    /// every engine has released (or the 3 s straggler timeout fires; the
+    /// band walk absorbs a lingering port).
+    Teardown { ack: mpsc::Sender<()> },
+    /// The plane re-bound its socket set: re-join from the new endpoints,
+    /// re-gather (the plane's srflx cache was reset), re-install.
+    Ready,
+}
+
+impl CarrierPlane {
+    /// P1-d — subscribe a runtime to the plane's rebuild steps. One
+    /// subscription per attached runtime; a dropped receiver is pruned on
+    /// the next rebuild.
+    pub fn subscribe_events(&self) -> mpsc::Receiver<PlaneEvent> {
+        let (tx, rx) = mpsc::channel(4);
+        self.lock().subscribers.push(tx);
+        rx
+    }
+
+    /// P1-d — request a plane-wide rebuild. Debounced: an in-flight rebuild
+    /// swallows the request, and a non-authoritative one (net-change storms)
+    /// also respects [`REBUILD_COOLDOWN`](super::runtime::REBUILD_COOLDOWN);
+    /// authoritative triggers (resume, the embedder's fingerprint push)
+    /// bypass the cooldown, matching the per-runtime R3 semantics. Sync —
+    /// the executor runs on its own task, so any select arm can call this.
+    pub fn request_rebuild(self: &Arc<Self>, reason: &'static str, authoritative: bool) {
+        {
+            let mut st = self.lock();
+            if st.rebuilding {
+                return;
+            }
+            if !authoritative
+                && let Some(t) = st.last_rebuild
+                && t.elapsed() < super::runtime::REBUILD_COOLDOWN
+            {
+                return;
+            }
+            st.rebuilding = true;
+        }
+        let plane = self.clone();
+        tokio::spawn(async move { plane.run_rebuild(reason).await });
+    }
+
+    /// The rebuild executor: Teardown to every runtime → await acks (3 s
+    /// straggler timeout — a wedged org must not block the plane) → drop the
+    /// binds (recv loops + socket Arcs) → fresh STUN sink + srflx cache
+    /// reset → re-bind → Ready to every runtime. Ordering is load-bearing
+    /// exactly as in the per-runtime R3 it replaces: the ports only free
+    /// once every carrier/probe/view Arc is gone.
+    async fn run_rebuild(self: Arc<Self>, reason: &'static str) {
+        warn!(
+            reason,
+            "carrier plane: rebuilding the shared socket set for every org"
+        );
+        let subs: Vec<mpsc::Sender<PlaneEvent>> = {
+            let mut st = self.lock();
+            st.subscribers.retain(|s| !s.is_closed());
+            st.subscribers.clone()
+        };
+        let (ack_tx, mut ack_rx) = mpsc::channel::<()>(subs.len().max(1));
+        let mut expected = 0usize;
+        for s in &subs {
+            if s.try_send(PlaneEvent::Teardown {
+                ack: ack_tx.clone(),
+            })
+            .is_ok()
+            {
+                expected += 1;
+            }
+        }
+        drop(ack_tx);
+        let acked = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut n = 0usize;
+            while n < expected && ack_rx.recv().await.is_some() {
+                n += 1;
+            }
+            n
+        })
+        .await
+        .unwrap_or(0);
+        if acked < expected {
+            warn!(
+                acked,
+                expected,
+                "carrier plane: teardown ack timeout — re-binding anyway (band walk absorbs \
+                 a straggler's lingering port)"
+            );
+        }
+        let had_binds = {
+            let mut st = self.lock();
+            if let Some(h) = st.keepalive.take() {
+                h.abort();
+            }
+            // Fresh STUN sink: retired recv loops keep the dead sender; the
+            // loops adopted below clone the new one — the same discipline as
+            // the device-side `replace_stun_events`.
+            let (tx, rx) = mpsc::channel(16);
+            st.stun_tx = tx;
+            st.stun_rx = Some(rx);
+            // Dropping the binds aborts the recv loops and releases the
+            // plane's own socket Arcs.
+            st.binds.take().is_some()
+        };
+        // The srflx result was measured through sockets that no longer
+        // exist — the next `ensure_srflx` re-gathers on the new binds.
+        *self.srflx_gate.lock().await = false;
+        if had_binds && self.ensure_bound().await.is_none() {
+            warn!("carrier plane: re-bind found no usable LAN interface — direct path off");
+        }
+        {
+            let mut st = self.lock();
+            st.rebuilding = false;
+            st.last_rebuild = Some(Instant::now());
+            for s in &st.subscribers {
+                let _ = s.try_send(PlaneEvent::Ready);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Multi-org v2 proof: N engines share ONE socket pair and the plane
@@ -820,5 +1214,46 @@ mod tests {
                 assert!(seen.insert(idx), "index handed out twice: {idx}");
             }
         }
+    }
+
+    /// P1-d protocol lock: a rebuild delivers Teardown to every subscriber,
+    /// waits for their acks, then delivers Ready; a second request while one
+    /// is in flight is swallowed, a non-authoritative one inside the
+    /// cooldown is swallowed, and an authoritative one is not. The no-ack
+    /// straggler path re-binds after the timeout (paused time). Runs on an
+    /// UNBOUND plane — protocol only; the bind half is the runtime's own
+    /// rebuild coverage.
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_delivers_teardown_then_ready_to_every_subscriber() {
+        let plane = CarrierPlane::new();
+        let mut r1 = plane.subscribe_events();
+        let mut r2 = plane.subscribe_events();
+
+        plane.request_rebuild("test", true);
+        plane.request_rebuild("test-dup", true); // swallowed: in flight
+
+        let a1 = match r1.recv().await {
+            Some(PlaneEvent::Teardown { ack }) => ack,
+            _ => panic!("subscriber 1 expected Teardown"),
+        };
+        let a2 = match r2.recv().await {
+            Some(PlaneEvent::Teardown { ack }) => ack,
+            _ => panic!("subscriber 2 expected Teardown"),
+        };
+        a1.send(()).await.unwrap();
+        a2.send(()).await.unwrap();
+        assert!(matches!(r1.recv().await, Some(PlaneEvent::Ready)));
+        assert!(matches!(r2.recv().await, Some(PlaneEvent::Ready)));
+
+        // Cooldown (real-time clock): a net-change right after is swallowed…
+        plane.request_rebuild("net-change", false);
+        // …an authoritative resume is not. Nobody acks this round — the 3 s
+        // straggler timeout (paused tokio time auto-advances) re-binds and
+        // Ready still arrives.
+        plane.request_rebuild("resume", true);
+        assert!(matches!(r1.recv().await, Some(PlaneEvent::Teardown { .. })));
+        assert!(matches!(r2.recv().await, Some(PlaneEvent::Teardown { .. })));
+        assert!(matches!(r1.recv().await, Some(PlaneEvent::Ready)));
+        assert!(matches!(r2.recv().await, Some(PlaneEvent::Ready)));
     }
 }
