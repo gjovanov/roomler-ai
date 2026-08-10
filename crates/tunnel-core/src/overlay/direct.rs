@@ -736,15 +736,35 @@ pub fn is_public_v4(ip: Ipv4Addr) -> bool {
 /// genuinely same-subnet peer was already taken by the LAN tier, which runs
 /// first). `None` → the caller falls through to the next tier or the relay.
 pub fn pick_public_endpoint(my_ips: &[Ipv4Addr], candidates: &[String]) -> Option<SocketAddr> {
-    for ep in candidates {
-        if let Ok(SocketAddr::V4(sa)) = ep.trim().parse::<SocketAddr>()
-            && is_public_v4(*sa.ip())
-            && !my_ips.contains(sa.ip())
-        {
-            return Some(SocketAddr::V4(sa));
-        }
+    pick_public_endpoint_rotated(my_ips, candidates, 0)
+}
+
+/// A2 — [`pick_public_endpoint`] with dial-attempt ROTATION: viable candidate
+/// `attempt % viable.len()` instead of always the first. A multi-homed peer
+/// advertises several public/srflx candidates, but the dialer only ever tried
+/// `[0]` — the rest were dead candidate space (field 2026-08-10: mars's
+/// second public IP was advertised and never dialed). The caller passes the
+/// PathMonitor's per-(peer, tier) strike count as `attempt`, so each failed
+/// probe advances to the peer's next candidate and a success (strikes reset)
+/// returns to the primary.
+pub fn pick_public_endpoint_rotated(
+    my_ips: &[Ipv4Addr],
+    candidates: &[String],
+    attempt: u32,
+) -> Option<SocketAddr> {
+    let viable: Vec<SocketAddr> = candidates
+        .iter()
+        .filter_map(|ep| match ep.trim().parse::<SocketAddr>() {
+            Ok(SocketAddr::V4(sa)) if is_public_v4(*sa.ip()) && !my_ips.contains(sa.ip()) => {
+                Some(SocketAddr::V4(sa))
+            }
+            _ => None,
+        })
+        .collect();
+    if viable.is_empty() {
+        return None;
     }
-    None
+    viable.get(attempt as usize % viable.len()).copied()
 }
 
 /// Same-/24 test: two IPv4s share the top 24 bits. A strong, conservative
@@ -887,15 +907,19 @@ pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> 
     None
 }
 
-/// Phase C — resolve up to TWO DISTINCT STUN targets for the NAT-type probe.
-/// The probe compares our mapped address as two different servers see it: same
-/// ⇒ endpoint-independent mapping (cone — hole-punchable); different ⇒ symmetric
-/// (address/port-dependent — the peer can't predict our port). Prefers two
-/// DISTINCT IPs (the fleet resolves `coturn.roomler.ai` to several workers — the
-/// strongest test, catching address-dependent mapping); else falls back to two
-/// distinct ports on one IP (catches address-and-port-dependent mapping, the
-/// common symmetric). v4 only. 0-2 results; fewer than 2 ⇒ the caller can't
-/// classify (→ "unknown", stays optimistic and still attempts the punch).
+/// Phase C — resolve up to THREE DISTINCT STUN targets for the NAT-type probe.
+/// The probe compares our mapped address as different servers see it: all the
+/// same ⇒ endpoint-independent mapping (cone — hole-punchable); ANY pairwise
+/// difference ⇒ symmetric (address/port-dependent — the peer can't predict our
+/// port). A1 (NAT honesty): extra vantages are ranked by topological SPREAD —
+/// different /16 (another datacenter) > different IP > different port — because
+/// a NAT whose mapping is stable toward one subnet but per-destination
+/// elsewhere classifies as cone when every vantage shares that subnet (field
+/// 2026-08-10: CORPLAP-1 advertised `:51668` learned via the 5.9.157.x workers,
+/// while its REAL mapping toward a 94.130.141.x worker was `:43648` — the
+/// 2-same-/24-vantage probe said "cone" and every peer punched a dead port).
+/// v4 only. 0-3 results; fewer than 2 ⇒ the caller can't classify (→
+/// "unknown", stays optimistic and still attempts the punch).
 pub async fn resolve_stun_targets(stun_urls: &[String], exclude: &[Ipv4Addr]) -> Vec<SocketAddr> {
     // Same self-referential-worker skip as `resolve_stun_server` (see its doc):
     // a fleet host co-located with a coturn worker must not probe against its
@@ -928,25 +952,61 @@ pub async fn resolve_stun_targets(stun_urls: &[String], exclude: &[Ipv4Addr]) ->
     let mut out: Vec<SocketAddr> = Vec::new();
     if let Some(&first) = all.first() {
         out.push(first);
-        // Prefer a DIFFERENT IP; else any other distinct endpoint (diff port).
-        if let Some(&diff) = all
-            .iter()
-            .find(|a| a.ip() != first.ip())
-            .or_else(|| all.iter().find(|&&a| a != first))
-        {
-            out.push(diff);
+        // A1 — pick up to two more vantages by topological spread: a /16 no
+        // picked vantage sits in, else an unpicked IP, else any distinct
+        // endpoint (diff port).
+        let slash16 = |a: &SocketAddr| match a {
+            SocketAddr::V4(v) => {
+                let o = v.ip().octets();
+                Some((o[0], o[1]))
+            }
+            SocketAddr::V6(_) => None,
+        };
+        while out.len() < 3 {
+            let pick = all
+                .iter()
+                .find(|a| !out.contains(a) && out.iter().all(|o| slash16(a) != slash16(o)))
+                .or_else(|| {
+                    all.iter()
+                        .find(|a| !out.contains(a) && out.iter().all(|o| a.ip() != o.ip()))
+                })
+                .or_else(|| all.iter().find(|a| !out.contains(a)));
+            match pick {
+                Some(&p) => out.push(p),
+                None => break,
+            }
         }
     }
     out
 }
 
-/// Phase C — classify this node's NAT mapping by STUNning `sock` against TWO
-/// distinct `targets`. Endpoint-INDEPENDENT mapping (the same public `ip:port`
-/// from both) ⇒ `"cone"` (hole-punchable); a DIFFERENT mapping per target ⇒
-/// `"symmetric"` (not punchable). `None` when there are fewer than two targets
-/// or either query fails — the caller then advertises no NAT type and still
-/// ATTEMPTS the punch ("unknown" is optimistic). MUST run on the punch socket
-/// BEFORE its demux loop starts (same socket-read race as [`gather_srflx`]).
+/// A1 — classify a NAT from ≥2 observed mappings of ONE local socket toward
+/// distinct vantages: ANY pairwise difference ⇒ endpoint-dependent mapping
+/// (`"symmetric"` — peers cannot punch the advertised port); all equal ⇒
+/// `"cone"`. `None` with fewer than two mappings (vantage failures) — unknown
+/// stays optimistic. Pure; shared by [`probe_nat_type`] and the carrier
+/// plane's sink-driven twin.
+pub fn classify_nat_mappings(mappings: &[SocketAddr]) -> Option<&'static str> {
+    let (first, rest) = mappings.split_first()?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(if rest.iter().all(|m| m == first) {
+        "cone"
+    } else {
+        "symmetric"
+    })
+}
+
+/// Phase C — classify this node's NAT mapping by STUNning `sock` against the
+/// (2-3, see [`resolve_stun_targets`]) distinct `targets` and comparing the
+/// observed mappings via [`classify_nat_mappings`]: all equal ⇒ `"cone"`
+/// (hole-punchable); ANY difference ⇒ `"symmetric"` (not punchable at the
+/// advertised port). `None` when fewer than two vantages ANSWER — with three
+/// targets one dead vantage is tolerated (A1); the caller then advertises no
+/// NAT type and still ATTEMPTS the punch ("unknown" is optimistic). MUST run
+/// on the punch socket BEFORE its demux loop starts (same socket-read race as
+/// [`gather_srflx`]).
 pub async fn probe_nat_type(
     sock: &UdpSocket,
     targets: &[SocketAddr],
@@ -955,13 +1015,13 @@ pub async fn probe_nat_type(
     if targets.len() < 2 {
         return None;
     }
-    let a = crate::transport::stun::srflx_query(sock, targets[0], attempt_timeout)
-        .await
-        .ok()?;
-    let b = crate::transport::stun::srflx_query(sock, targets[1], attempt_timeout)
-        .await
-        .ok()?;
-    Some(if a == b { "cone" } else { "symmetric" })
+    let mut mappings: Vec<SocketAddr> = Vec::with_capacity(targets.len());
+    for t in targets {
+        if let Ok(m) = crate::transport::stun::srflx_query(sock, *t, attempt_timeout).await {
+            mappings.push(m);
+        }
+    }
+    classify_nat_mappings(&mappings)
 }
 
 /// Phase C — should we ATTEMPT a srflx hole-punch given both ends' NAT types?
@@ -1878,6 +1938,88 @@ mod tests {
             probe_nat_type(&sock4, &[a, dead], Duration::from_millis(150)).await,
             None
         );
+    }
+
+    /// A1 — the CORPLAP-1 case: with three vantages available, the second pick
+    /// must be the CROSS-DC one (different /16), not the same-/24 sibling —
+    /// otherwise a per-destination-subnet NAT looks cone.
+    #[tokio::test]
+    async fn resolve_stun_targets_prefers_cross_dc_third_vantage() {
+        let t = resolve_stun_targets(
+            &[
+                "stun:5.9.157.221:3478".to_string(),
+                "stun:5.9.157.226:3478".to_string(),
+                "stun:94.130.141.74:3478".to_string(),
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[0].ip().to_string(), "5.9.157.221");
+        // Different /16 beats the same-/24 sibling for the second vantage…
+        assert_eq!(t[1].ip().to_string(), "94.130.141.74");
+        // …and the sibling still joins as the third.
+        assert_eq!(t[2].ip().to_string(), "5.9.157.226");
+    }
+
+    /// A1 — three vantages: one dead vantage is tolerated (2 answers still
+    /// classify), and a mapping that only differs toward the THIRD vantage
+    /// (per-destination-subnet NAT, the CORPLAP-1 signature) is caught.
+    #[tokio::test]
+    async fn probe_nat_type_third_vantage_tolerance_and_detection() {
+        // Dead middle vantage, agreeing outer two → cone (tolerated).
+        let (a, _h1) = fake_stun_server([203, 0, 113, 9], 5000).await;
+        let (b, _h2) = fake_stun_server([203, 0, 113, 9], 5000).await;
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            probe_nat_type(&sock, &[a, dead, b], Duration::from_millis(300)).await,
+            Some("cone")
+        );
+
+        // Two agreeing vantages + a third observing a DIFFERENT mapping →
+        // symmetric (the 2-vantage probe would have said cone).
+        let (c, _h3) = fake_stun_server([203, 0, 113, 9], 5000).await;
+        let (d, _h4) = fake_stun_server([203, 0, 113, 9], 5000).await;
+        let (e, _h5) = fake_stun_server([203, 0, 113, 9], 6000).await;
+        let sock2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            probe_nat_type(&sock2, &[c, d, e], Duration::from_millis(500)).await,
+            Some("symmetric")
+        );
+    }
+
+    #[test]
+    fn classify_nat_mappings_cases() {
+        let a: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.7:6000".parse().unwrap();
+        assert_eq!(classify_nat_mappings(&[]), None);
+        assert_eq!(classify_nat_mappings(&[a]), None);
+        assert_eq!(classify_nat_mappings(&[a, a]), Some("cone"));
+        assert_eq!(classify_nat_mappings(&[a, a, a]), Some("cone"));
+        assert_eq!(classify_nat_mappings(&[a, b]), Some("symmetric"));
+        assert_eq!(classify_nat_mappings(&[a, a, b]), Some("symmetric"));
+    }
+
+    /// A2 — rotation walks every VIABLE candidate (non-public/self entries
+    /// never counted), wraps, and offset 0 is byte-identical to
+    /// [`pick_public_endpoint`].
+    #[test]
+    fn pick_public_endpoint_rotates_by_attempt() {
+        let my_ips: Vec<Ipv4Addr> = vec!["10.0.0.5".parse().unwrap()];
+        let cands = vec![
+            "94.130.141.98:43648".to_string(),
+            "192.168.1.10:43648".to_string(), // private — never viable
+            "94.130.141.74:43648".to_string(),
+        ];
+        let p0 = pick_public_endpoint_rotated(&my_ips, &cands, 0).unwrap();
+        let p1 = pick_public_endpoint_rotated(&my_ips, &cands, 1).unwrap();
+        let p2 = pick_public_endpoint_rotated(&my_ips, &cands, 2).unwrap();
+        assert_eq!(p0.ip().to_string(), "94.130.141.98");
+        assert_eq!(p1.ip().to_string(), "94.130.141.74");
+        assert_eq!(p2, p0, "offset wraps over the viable set");
+        assert_eq!(Some(p0), pick_public_endpoint(&my_ips, &cands));
+        assert_eq!(pick_public_endpoint_rotated(&my_ips, &[], 3), None);
     }
 
     #[test]
