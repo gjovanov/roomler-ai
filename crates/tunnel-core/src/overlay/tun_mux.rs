@@ -621,6 +621,12 @@ impl TunIo for MuxPort {
         self.real.write_packet(packet).await
     }
 
+    /// Multi-org v2 — a port is a facade over the shared device: per-adapter
+    /// consumers (subnet-router NAT) must scope to the REAL adapter's name.
+    fn os_name(&self) -> Option<String> {
+        self.real.os_name()
+    }
+
     async fn add_peer_route(&self, peer: Ipv4Addr) -> std::io::Result<()> {
         // Record BEFORE the (best-effort, fallible) OS install: the demux
         // must know the peer even when the OS route already exists or the

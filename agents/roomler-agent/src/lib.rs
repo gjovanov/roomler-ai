@@ -96,13 +96,16 @@ pub mod win_timer;
 pub fn purge_exit_routes() {
     #[cfg(feature = "overlay-l3")]
     {
-        tunnel_core::overlay::tun::purge_split_default();
+        // Multi-org v2 — the purges are per-adapter now; this boot/pre-exit
+        // path heals the LEGACY/PRIMARY adapter (per-org adapters are Phase
+        // 2c, whose reconciler will walk the configured set).
+        tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
         // Drop peer/subnet routes a PREVIOUS generation left on a persisted TUN.
         // Their crypto-router entries died with that runtime, so they black-hole
         // silently: the OS route looks right, the peer is online, and only the
         // traffic vanishes (field case 2026-08-03). Safe here because the router
         // is empty until `install_peers` runs, which re-adds the live set.
-        tunnel_core::overlay::tun::purge_stale_peer_routes();
+        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
         // S4b — also drop any leftover exit-node DNS steer. On Windows the `.`-root
         // NRPT rule is machine-global and PERSISTS across a crash/reboot, so a stale
         // rule pointing at a dead resolver would blackhole ALL DNS until removed —

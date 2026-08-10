@@ -38,6 +38,13 @@ pub trait TunIo: Send + Sync {
     /// Write one IP packet to the device.
     async fn write_packet(&self, packet: &[u8]) -> std::io::Result<()>;
 
+    /// The OS interface name backing this device, when it has one (SystemTun);
+    /// `None` for mocks/netstack. Multi-org v2: per-adapter consumers (subnet-
+    /// router NAT) must name THIS device, not the historical singleton.
+    fn os_name(&self) -> Option<String> {
+        None
+    }
+
     /// Install a host (`/32`) route for a peer's overlay IP via this device,
     /// so overlay traffic out-specifics any colliding *less*-specific route on
     /// the host's uplink — e.g. an ISP/corp **CGNAT `100.64.0.0/10`** that
@@ -287,11 +294,37 @@ mod floor_tests {
     }
 }
 
+/// The LEGACY/PRIMARY overlay NIC name — what [`SystemTun::up`] has always
+/// requested, and the fallback consumers use when a device cannot name
+/// itself ([`TunIo::os_name`] → `None`: mocks, netstack). Multi-org v2
+/// parameterizes every per-adapter code path on an instance name; this
+/// const stays as the single-adapter identity and the historical default.
+///
+/// Lives at module top level (not inside the `overlay-l3`-gated `system`
+/// module) because the runtime's NAT fallback needs it under plain
+/// `overlay` too.
+#[cfg(target_os = "windows")]
+pub const IF_NAME: &str = "roomler";
+
+#[cfg(target_os = "linux")]
+pub const IF_NAME: &str = "roomler0";
+
+/// macOS (and any other non-Windows/Linux platform) ignores a requested
+/// name — utun numbers are kernel-assigned — so this is only the REQUESTED
+/// name and a logging fallback. The real one comes from
+/// `SystemTun::if_name()`. That macOS had no `IF_NAME` at all is the reason
+/// its whole routing surface was a set of no-ops: there was nothing to
+/// address, so nothing addressed anything.
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub const IF_NAME: &str = "utun";
+
 /// The real OS TUN device. Behind `overlay-l3` so the WG core + the
 /// bridge logic stay device-free (and dependency-free) under plain
 /// `overlay`.
 #[cfg(feature = "overlay-l3")]
-pub use system::{SystemTun, purge_split_default, purge_stale_peer_routes};
+pub use system::{
+    SystemTun, TunOptions, org_tun_guid, purge_split_default, purge_stale_peer_routes,
+};
 
 #[cfg(feature = "overlay-l3")]
 mod system {
@@ -303,7 +336,7 @@ mod system {
 
     use async_trait::async_trait;
 
-    use super::TunIo;
+    use super::{IF_NAME, TunIo};
 
     // rc.208 — `AsyncDevice::tun_luid` (the wintun interface LUID) for the
     // IP Helper route ops; also used by the WFP guard in `up()`.
@@ -1217,13 +1250,21 @@ mod system {
         dev: Arc<tun::AsyncDevice>,
         /// The interface name the OS actually gave this device.
         ///
-        /// On Windows and Linux it is [`IF_NAME`], because the device is
+        /// On Windows and Linux it is the REQUESTED name ([`IF_NAME`] for
+        /// the legacy [`up`](Self::up); per-org names via
+        /// [`up_with`](Self::up_with)), because the device is
         /// created BY that name. On macOS it cannot be: utun numbers are
         /// kernel-assigned (`utun3`, `utun7`, …), so a hardcoded name meant
         /// every `ifconfig`/`route` call there addressed an interface that
         /// does not exist — which is exactly why the whole macOS routing
         /// surface used to be a set of no-ops. Captured once at bring-up.
         if_name: String,
+        /// Multi-org v2 — the derived-ULA on-link prefix length assigned to
+        /// THIS adapter (96 = the whole ULA, the single-adapter legacy;
+        /// per-org adapters carry 96 + their v4 block plen). Stored so
+        /// per-adapter consumers can read the device's v6 geometry — see
+        /// [`Self::v6_onlink_plen`].
+        v6_onlink_plen: u8,
         /// rc.288 — the CONNECTED overlay prefix (`100.64.0.0/10`), derived at
         /// bring-up from the assigned address + netmask. Defended at metric 0
         /// alongside the peer `/32`s: when a `/32` is momentarily missing,
@@ -1324,13 +1365,17 @@ mod system {
     /// registration can lag the adapter by seconds — bring-up must not block.
     /// Every step best-effort (an unelevated tunnel client simply can't do
     /// this; the overlay still runs — relay-side — without it).
+    ///
+    /// Multi-org v2 — `if_name` is THIS adapter's OS name (the
+    /// Private-profile set addresses the alias); the firewall rule half is
+    /// per-binary and unaffected.
     #[cfg(windows)]
-    fn spawn_windows_net_hygiene() {
+    fn spawn_windows_net_hygiene(if_name: String) {
         if hygiene_disabled(crate::env::node_env("TUN_HYGIENE").as_deref()) {
             tracing::info!("overlay: Windows net hygiene disabled via ROOMLER_NODE_TUN_HYGIENE");
             return;
         }
-        std::thread::spawn(|| {
+        std::thread::spawn(move || {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             // 1) Inbound-allow for this binary's UDP, all profiles.
@@ -1378,8 +1423,9 @@ mod system {
                     Err(e) => tracing::debug!(rule = %rule, %e, "overlay: netsh unavailable"),
                 }
             }
-            // 2) roomler adapter → Private profile (registration lags the
-            //    adapter, so retry over ~12 s before giving up quietly).
+            // 2) THIS overlay adapter → Private profile (registration lags
+            //    the adapter, so retry over ~12 s before giving up quietly).
+            let alias = if_name.replace('\'', "''");
             for attempt in 1..=6u32 {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let ok = std::process::Command::new("powershell")
@@ -1388,7 +1434,7 @@ mod system {
                         "-NonInteractive",
                         "-Command",
                         &format!(
-                            "Set-NetConnectionProfile -InterfaceAlias '{IF_NAME}' \
+                            "Set-NetConnectionProfile -InterfaceAlias '{alias}' \
                              -NetworkCategory Private -ErrorAction Stop"
                         ),
                     ])
@@ -1397,24 +1443,84 @@ mod system {
                     .map(|o| o.status.success())
                     .unwrap_or(false);
                 if ok {
-                    tracing::info!(attempt, "overlay: roomler adapter profile set to Private");
+                    tracing::info!(
+                        attempt,
+                        adapter = %if_name,
+                        "overlay: overlay adapter profile set to Private"
+                    );
                     return;
                 }
             }
             tracing::debug!(
-                "overlay: could not set the roomler adapter profile to Private \
+                adapter = %if_name,
+                "overlay: could not set the overlay adapter profile to Private \
                  (unelevated, or no connection profile registered)"
             );
         });
     }
 
     /// rc.279 — the roomler overlay adapter's constant requested GUID (see
-    /// the `device_guid` call in [`SystemTun::up`]). The value is arbitrary
-    /// but MUST stay fixed forever: Windows keys the interface's persistent
-    /// identity on it (the ifIndex/LUID mapping and the NLA network
-    /// signature that decides the firewall profile).
-    #[cfg(target_os = "windows")]
+    /// the `device_guid` call in [`SystemTun::up_with`]). The value is
+    /// arbitrary but MUST stay fixed forever: Windows keys the interface's
+    /// persistent identity on it (the ifIndex/LUID mapping and the NLA
+    /// network signature that decides the firewall profile).
+    ///
+    /// Ungated (multi-org v2): [`TunOptions::legacy`] and [`org_tun_guid`]
+    /// reference it on every platform; only the `device_guid` platform call
+    /// itself is Windows-only.
     const ROOMLER_TUN_GUID: u128 = 0xB5A7_D160_53F8_4E2D_9A6B_2C4E_71A0_D5C3;
+
+    /// Multi-org v2 — a stable per-(machine,org) Wintun GUID: SHA-256 of
+    /// "roomler-tun-v1" ‖ base GUID ‖ tenant_id, truncated to 128 bits with the
+    /// RFC 4122 version/variant bits forced (version 4 shape). Stable across
+    /// restarts and adapter recreates — the rc.279 identity property, per org.
+    pub fn org_tun_guid(tenant_id: &str) -> u128 {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"roomler-tun-v1");
+        h.update(ROOMLER_TUN_GUID.to_be_bytes());
+        h.update(tenant_id.as_bytes());
+        let digest = h.finalize();
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&digest[..16]);
+        b[6] = (b[6] & 0x0F) | 0x40; // version 4 shape
+        b[8] = (b[8] & 0x3F) | 0x80; // RFC 4122 variant
+        u128::from_be_bytes(b)
+    }
+
+    /// Multi-org v2 — per-adapter identity for [`SystemTun::up_with`]. The
+    /// legacy [`SystemTun::up`] fills the historical single-adapter values
+    /// (via [`TunOptions::legacy`]), so single-org behavior is byte-identical.
+    /// macOS ignores `name`/`guid` (utun names are kernel-assigned).
+    pub struct TunOptions {
+        pub name: String,
+        pub guid: u128,
+        pub ip: Ipv4Addr,
+        pub netmask: Ipv4Addr,
+        pub mtu: u16,
+        /// The derived-ULA on-link prefix length for THIS adapter. 96 = the whole
+        /// ULA (single-adapter legacy). Per-org adapters pass 96 + v4_plen so N
+        /// adapters hold disjoint embedded v6 prefixes (a /22 org block → /118).
+        pub v6_onlink_plen: u8,
+    }
+
+    impl TunOptions {
+        /// The historical single-adapter identity — exactly what
+        /// [`SystemTun::up`] has always requested ([`IF_NAME`], the rc.279
+        /// constant GUID, the whole-ULA `/96`), so `up()` delegating through
+        /// here stays byte-identical single-org behavior. Pure, so the
+        /// legacy values are locked by a unit test without a real device.
+        pub fn legacy(ip: Ipv4Addr, netmask: Ipv4Addr, mtu: u16) -> Self {
+            Self {
+                name: IF_NAME.to_string(),
+                guid: ROOMLER_TUN_GUID,
+                ip,
+                netmask,
+                mtu,
+                v6_onlink_plen: crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX,
+            }
+        }
+    }
 
     /// rc.279 — kill-switch for the stable adapter identity (constant
     /// requested GUID + boot stray-adapter sweep):
@@ -1482,28 +1588,49 @@ mod system {
     /// routes/DNS only). `Status -ne 'Up'` protects any LIVE adapter (an
     /// orphan with no owning process reports Disconnected), and
     /// once-per-process means a WS-reconnect bring-up can't touch the
-    /// previous session's still-closing adapter. With the stable requested
-    /// GUID, remove-and-recreate re-binds the same interface identity, so
-    /// sweeping even our own crash-orphan is harmless — while a leftover
-    /// suffixed dupe ("roomler 2") would otherwise capture the
-    /// alias-targeted config (the metric pin, derived v6, and
-    /// Private-profile set all address the NAME). Best-effort:
-    /// `pnputil /remove-device` needs admin; unelevated it just leaves the
-    /// strays in place.
+    /// previous session's still-closing adapter. A leftover suffixed dupe
+    /// ("roomler 2") would otherwise capture the alias-targeted config (the
+    /// metric pin, derived v6, and Private-profile set all address the
+    /// NAME). Best-effort: `pnputil /remove-device` needs admin; unelevated
+    /// it just leaves the strays in place.
+    ///
+    /// Multi-org v2 — `expected` is the set of adapter NAMES that must
+    /// SURVIVE the sweep: with per-org adapters, a sibling org's persisted
+    /// adapter between sessions (its runtime not yet started, so the device
+    /// reports non-Up) is NOT a stray, and removing it would discard that
+    /// org's stable interface identity. Only `^roomler` Wintun devices NOT
+    /// in the set are removed. The legacy caller passes just its own
+    /// requested name — with the stable requested GUID, create re-binds the
+    /// surviving orphan's identity by name+GUID, so protecting it is
+    /// equivalent to the old remove-and-recreate. NOTE the `Once` guard:
+    /// the FIRST bring-up's expected set is the one that runs, so a
+    /// multi-adapter caller (Phase 2c) must pass ALL configured adapter
+    /// names (or hoist the sweep before any create).
     #[cfg(target_os = "windows")]
-    fn sweep_stray_adapters_once() {
+    fn sweep_stray_adapters_once(expected: &[String]) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let script = "Get-NetAdapter -IncludeHidden | Where-Object { \
-                          $_.PnPDeviceID -like 'SWD\\WINTUN\\*' -and \
-                          $_.Name -match '^roomler' -and $_.Status -ne 'Up' } | \
-                          ForEach-Object { \
-                          pnputil /remove-device \"$($_.PnPDeviceID)\" > $null 2>&1; \
-                          if ($LASTEXITCODE -eq 0) { $_.Name } }";
+            // PowerShell array literal of survivors, single-quote escaped
+            // (`'` → `''` — names come from our own constants/config, but a
+            // quote must never break out of the literal).
+            let keep = expected
+                .iter()
+                .map(|n| format!("'{}'", n.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let script = format!(
+                "$keep = @({keep}); Get-NetAdapter -IncludeHidden | Where-Object {{ \
+                 $_.PnPDeviceID -like 'SWD\\WINTUN\\*' -and \
+                 $_.Name -match '^roomler' -and $_.Status -ne 'Up' -and \
+                 ($keep -notcontains $_.Name) }} | \
+                 ForEach-Object {{ \
+                 pnputil /remove-device \"$($_.PnPDeviceID)\" > $null 2>&1; \
+                 if ($LASTEXITCODE -eq 0) {{ $_.Name }} }}"
+            );
             match std::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output()
             {
@@ -1542,10 +1669,18 @@ mod system {
             }
         }
 
-        /// The interface name the OS gave this device — [`IF_NAME`] on
-        /// Windows/Linux, the kernel-assigned `utunN` on macOS.
+        /// The interface name the OS gave this device — the requested name
+        /// ([`IF_NAME`] for the legacy [`up`](Self::up)) on Windows/Linux,
+        /// the kernel-assigned `utunN` on macOS.
         pub fn if_name(&self) -> &str {
             &self.if_name
+        }
+
+        /// Multi-org v2 — the derived-ULA on-link prefix length this device
+        /// was brought up with (96 for the legacy single-adapter identity;
+        /// 96 + the org block's v4 plen for a per-org adapter).
+        pub fn v6_onlink_plen(&self) -> u8 {
+            self.v6_onlink_plen
         }
 
         /// Multi-org P2c — assign an ADDITIONAL local address (a secondary
@@ -1600,7 +1735,7 @@ mod system {
                     "replace".into(),
                     format!("{ip}/{prefix}"),
                     "dev".into(),
-                    IF_NAME.into(),
+                    self.if_name.clone(),
                 ];
                 run("ip", &args).map(|_| ())
             }
@@ -1674,7 +1809,7 @@ mod system {
                     "del".into(),
                     format!("{ip}/{prefix}"),
                     "dev".into(),
-                    IF_NAME.into(),
+                    self.if_name.clone(),
                 ],
             );
             #[cfg(target_os = "macos")]
@@ -1714,8 +1849,21 @@ mod system {
         /// `100.64.0.0/10`, nothing else on a host claims our random ULA, so
         /// there is no route war to win (the reason the v4 side needs both).
         pub fn up(self_ip: Ipv4Addr, netmask: Ipv4Addr, mtu: u16) -> std::io::Result<Self> {
+            Self::up_with(TunOptions::legacy(self_ip, netmask, mtu))
+        }
+
+        /// Multi-org v2 — [`up`](Self::up) with an explicit per-adapter
+        /// identity ([`TunOptions`]): name, requested GUID, and the derived-
+        /// ULA on-link prefix length all become instance parameters, so N
+        /// org adapters can coexist. The legacy `up()` delegates here with
+        /// [`TunOptions::legacy`] — byte-identical single-org behavior.
+        pub fn up_with(opts: TunOptions) -> std::io::Result<Self> {
             let mut config = tun::Configuration::default();
-            config.address(self_ip).netmask(netmask).mtu(mtu).up();
+            config
+                .address(opts.ip)
+                .netmask(opts.netmask)
+                .mtu(opts.mtu)
+                .up();
 
             // Stable adapter name (Wintun's `open` keys by name) + a STABLE
             // requested GUID. The name alone never gave reuse: a clean
@@ -1730,13 +1878,13 @@ mod system {
             // recreation — Tailscale ships the same pattern.
             #[cfg(target_os = "windows")]
             {
-                config.tun_name("roomler");
+                config.tun_name(opts.name.as_str());
                 if stable_guid_enabled() {
-                    config.platform_config(|p| p.device_guid(ROOMLER_TUN_GUID));
+                    config.platform_config(|p| p.device_guid(opts.guid));
                 }
             }
             #[cfg(target_os = "linux")]
-            config.tun_name("roomler0");
+            config.tun_name(opts.name.as_str());
 
             // rc.209 — Wintun's `WintunCreateAdapter` can transiently fail with
             // "device installation mutex: Access is denied" when a PRIOR adapter
@@ -1755,10 +1903,11 @@ mod system {
             const CREATE_ATTEMPTS: usize = 1;
             // rc.279 — before this process's first create, sweep stray
             // roomler Wintun devices left by crashed prior runs; see
-            // [`sweep_stray_adapters_once`].
+            // [`sweep_stray_adapters_once`]. This adapter's own requested
+            // name survives the sweep (multi-org v2 expected-set semantics).
             #[cfg(target_os = "windows")]
             if stable_guid_enabled() {
-                sweep_stray_adapters_once();
+                sweep_stray_adapters_once(std::slice::from_ref(&opts.name));
             }
 
             let dev = retry_create(
@@ -1785,13 +1934,17 @@ mod system {
                     Ok(n) if !n.is_empty() => n,
                     other => {
                         if let Err(e) = &other {
-                            tracing::debug!(%e, "overlay: TUN name query failed; assuming {IF_NAME}");
+                            tracing::debug!(
+                                %e,
+                                requested = %opts.name,
+                                "overlay: TUN name query failed; assuming the requested name"
+                            );
                         }
-                        IF_NAME.to_string()
+                        opts.name.clone()
                     }
                 }
             };
-            if if_name != IF_NAME {
+            if if_name != opts.name {
                 tracing::info!(%if_name, "overlay: OS-assigned TUN interface name");
             }
 
@@ -1820,7 +1973,7 @@ mod system {
             let tun_luid = dev.tun_luid();
             #[cfg(not(target_os = "windows"))]
             let tun_luid = 0u64;
-            assign_derived_v6(self_ip, &if_name, tun_luid);
+            assign_derived_v6(opts.ip, &if_name, tun_luid, opts.v6_onlink_plen);
 
             // Program WFP so the overlay's inbound survives a GPO-locked
             // Defender Firewall (Tailscale's approach). Best-effort: a
@@ -1855,7 +2008,7 @@ mod system {
             // allow (WG on the physical NICs) + the adapter's Private profile.
             // Fire-and-forget; see `spawn_windows_net_hygiene`.
             #[cfg(windows)]
-            spawn_windows_net_hygiene();
+            spawn_windows_net_hygiene(if_name.clone());
 
             // rc.279 — log the OS-observed adapter identity. Nothing logged
             // this before (the ifIndex-churn hunt had to reconstruct it from
@@ -1878,7 +2031,7 @@ mod system {
             // carrier-critical endpoints via the real uplink.
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let orig_default = {
-                let d = discover_default_route();
+                let d = discover_default_route(&if_name);
                 match &d {
                     Some(r) => tracing::info!(
                         gateway = %r.gateway, interface = %r.interface,
@@ -1897,7 +2050,7 @@ mod system {
             // exit egress then stays fail-closed (never leaks).
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             let orig_default_v6 = {
-                let d = discover_default_route_v6();
+                let d = discover_default_route_v6(&if_name);
                 match &d {
                     Some(r) => tracing::info!(
                         gateway = %r.gateway, interface = %r.interface,
@@ -1913,10 +2066,11 @@ mod system {
             Ok(Self {
                 dev,
                 if_name,
+                v6_onlink_plen: opts.v6_onlink_plen,
                 #[cfg(windows)]
-                connected_v4: prefix_len_of_mask(netmask).map(|plen| {
-                    let net =
-                        u32::from_be_bytes(self_ip.octets()) & u32::from_be_bytes(netmask.octets());
+                connected_v4: prefix_len_of_mask(opts.netmask).map(|plen| {
+                    let net = u32::from_be_bytes(opts.ip.octets())
+                        & u32::from_be_bytes(opts.netmask.octets());
                     (Ipv4Addr::from(net), plen)
                 }),
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1979,6 +2133,10 @@ mod system {
                 .map_err(|e| std::io::Error::other(e.to_string()))
         }
 
+        fn os_name(&self) -> Option<String> {
+            Some(self.if_name.clone())
+        }
+
         /// Add an on-link `/32` for `peer` via the overlay NIC. Windows uses
         /// `netsh` (by adapter name, so no LUID/index lookup); Linux uses
         /// `ip route replace` (idempotent). macOS utun is left to the
@@ -2022,7 +2180,7 @@ mod system {
                         "replace".into(),
                         format!("{peer}/32"),
                         "dev".into(),
-                        IF_NAME.into(),
+                        self.if_name.clone(),
                     ],
                 )
                 .await
@@ -2078,7 +2236,7 @@ mod system {
                         "replace".into(),
                         format!("{peer}/32"),
                         "dev".into(),
-                        IF_NAME.into(),
+                        self.if_name.clone(),
                         "src".into(),
                         src.to_string(),
                     ],
@@ -2155,7 +2313,7 @@ mod system {
                     "del".into(),
                     format!("{peer}/32"),
                     "dev".into(),
-                    IF_NAME.into(),
+                    self.if_name.clone(),
                 ],
             )
             .await;
@@ -2210,7 +2368,7 @@ mod system {
                     "replace".into(),
                     cidr.to_string(),
                     "dev".into(),
-                    IF_NAME.into(),
+                    self.if_name.clone(),
                 ]);
                 run_cmd("ip", args).await
             }
@@ -2269,7 +2427,7 @@ mod system {
                         "replace".into(),
                         cidr.to_string(),
                         "dev".into(),
-                        IF_NAME.into(),
+                        self.if_name.clone(),
                         "src".into(),
                         src.to_string(),
                     ],
@@ -2378,7 +2536,7 @@ mod system {
                     "del".into(),
                     cidr.to_string(),
                     "dev".into(),
-                    IF_NAME.into(),
+                    self.if_name.clone(),
                 ]);
                 let _ = run_cmd("ip", args).await;
             }
@@ -2566,13 +2724,6 @@ mod system {
         }
     }
 
-    /// The overlay NIC name we set in [`SystemTun::up`] — used to target
-    /// per-peer `/32` routes without a LUID/index lookup.
-    #[cfg(target_os = "windows")]
-    const IF_NAME: &str = "roomler";
-
-    #[cfg(target_os = "linux")]
-    const IF_NAME: &str = "roomler0";
     /// Does an interface listing mention `ip`?
     ///
     /// "Ask the interface instead of reading the error", for the ONE platform
@@ -2592,14 +2743,6 @@ mod system {
             .split(|c: char| !(c.is_ascii_digit() || c == '.'))
             .any(|tok| tok == want)
     }
-
-    /// macOS ignores a requested name — utun numbers are kernel-assigned —
-    /// so this is only the REQUESTED name and a logging fallback. The real
-    /// one comes from `SystemTun::if_name()`. That macOS had no `IF_NAME`
-    /// at all is the reason its whole routing surface was a set of no-ops:
-    /// there was nothing to address, so nothing addressed anything.
-    #[cfg(target_os = "macos")]
-    const IF_NAME: &str = "utun";
 
     /// Is `cidr` an IPv6 CIDR? A colon only ever appears in the v6 textual form
     /// (`"::/1"`, `"8000::/1"`, `"fd72:6f6f:6d6c::/96"`), never in a v4 one
@@ -2631,12 +2774,15 @@ mod system {
     ///
     /// Best-effort (an absent route just errors, ignored); sync `std::process` so
     /// it runs at boot and as a last gasp with no async runtime.
-    pub fn purge_split_default() {
+    ///
+    /// Multi-org v2 — `if_name` scopes the purge to ONE adapter; legacy
+    /// callers pass [`IF_NAME`] (the historical singleton).
+    pub fn purge_split_default(if_name: &str) {
         for cidr in crate::overlay::runtime::SPLIT_DEFAULT_V4
             .iter()
             .chain(crate::overlay::runtime::SPLIT_DEFAULT_V6.iter())
         {
-            purge_one(cidr);
+            purge_one(if_name, cidr);
         }
     }
 
@@ -2665,8 +2811,11 @@ mod system {
     ///
     /// Best-effort and sync, like [`purge_split_default`]: a failure just leaves
     /// the pre-existing (broken) state, never a worse one.
-    pub fn purge_stale_peer_routes() {
-        let stale: Vec<String> = enumerate_if_routes()
+    ///
+    /// Multi-org v2 — `if_name` scopes the reconcile to ONE adapter; legacy
+    /// callers pass [`IF_NAME`] (the historical singleton).
+    pub fn purge_stale_peer_routes(if_name: &str) {
+        let stale: Vec<String> = enumerate_if_routes(if_name)
             .into_iter()
             .filter(|c| !is_derived_prefix(c))
             .collect();
@@ -2674,7 +2823,7 @@ mod system {
             return;
         }
         for cidr in &stale {
-            purge_one(cidr);
+            purge_one(if_name, cidr);
         }
         tracing::info!(
             count = stale.len(), routes = ?stale,
@@ -2744,14 +2893,14 @@ mod system {
     /// `purge_one` delete the wrong route. True, and a good reason not to
     /// guess; but the real answer is that there is nothing to enumerate.)
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    fn enumerate_if_routes() -> Vec<String> {
+    fn enumerate_if_routes(_if_name: &str) -> Vec<String> {
         Vec::new()
     }
 
     #[cfg(target_os = "linux")]
-    fn enumerate_if_routes() -> Vec<String> {
+    fn enumerate_if_routes(if_name: &str) -> Vec<String> {
         let out = std::process::Command::new("ip")
-            .args(["route", "show", "dev", IF_NAME])
+            .args(["route", "show", "dev", if_name])
             .output();
         let Ok(out) = out else { return Vec::new() };
         String::from_utf8_lossy(&out.stdout)
@@ -2763,40 +2912,40 @@ mod system {
     }
 
     #[cfg(target_os = "windows")]
-    fn enumerate_if_routes() -> Vec<String> {
+    fn enumerate_if_routes(if_name: &str) -> Vec<String> {
         // N3 — typed FIB walk. The old `Get-NetRoute` PowerShell spawn cost
         // 0.5–2 s at bring-up AND inside `purge_exit_routes()` on every
         // `process::exit` path — launched from a process that was, by
         // definition, already wedged.
-        winroute::luid_for_alias(IF_NAME)
+        winroute::luid_for_alias(if_name)
             .map(winroute::list_cidrs)
             .unwrap_or_default()
     }
 
     #[cfg(target_os = "linux")]
-    fn purge_one(cidr: &str) {
+    fn purge_one(if_name: &str, cidr: &str) {
         let mut args: Vec<&str> = Vec::new();
         if is_v6_cidr(cidr) {
             args.push("-6");
         }
-        args.extend(["route", "del", cidr, "dev", IF_NAME]);
+        args.extend(["route", "del", cidr, "dev", if_name]);
         let _ = std::process::Command::new("ip").args(&args).output();
     }
 
     #[cfg(target_os = "windows")]
-    fn purge_one(cidr: &str) {
+    fn purge_one(if_name: &str, cidr: &str) {
         // N3 — typed delete (was the last Windows route MUTATION on netsh,
         // kept only because this path has no live SystemTun/LUID in hand).
         let Some((ip, plen)) = parse_cidr(cidr) else {
             return;
         };
-        if let Some(luid) = winroute::luid_for_alias(IF_NAME) {
+        if let Some(luid) = winroute::luid_for_alias(if_name) {
             winroute::del(luid, ip, plen);
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn purge_one(cidr: &str) {
+    fn purge_one(_if_name: &str, cidr: &str) {
         let (net, plen) = cidr.split_once('/').unwrap_or((cidr, ""));
         let family = if is_v6_cidr(cidr) { "-inet6" } else { "-inet" };
         // Interface-less delete: BSD `route delete` keys on the destination,
@@ -2816,10 +2965,12 @@ mod system {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-    fn purge_one(_cidr: &str) {}
+    fn purge_one(_if_name: &str, _cidr: &str) {}
 
-    /// Assign this node's derived overlay IPv6 (`fd72:6f6f:6d6c::<v4>`, `/96`
-    /// on-link) to the overlay NIC. Sync + best-effort (`up` isn't async): the
+    /// Assign this node's derived overlay IPv6 (`fd72:6f6f:6d6c::<v4>`,
+    /// `/plen` on-link — `/96` for the legacy single adapter, `96 + v4_plen`
+    /// for a per-org one) to the overlay NIC. Sync + best-effort (`up` isn't
+    /// async): the
     /// `tun` crate's `Configuration` carries no v6 surface, so Linux uses
     /// `ip -6 addr replace` (idempotent) and Windows the typed
     /// [`winaddr::ensure`] (N1 — idempotent by numeric error, which also
@@ -2831,13 +2982,14 @@ mod system {
         self_ip: Ipv4Addr,
         #[allow(unused_variables)] if_name: &str,
         #[allow(unused_variables)] luid: u64,
+        #[allow(unused_variables)] plen: u8,
     ) {
         let v6 = crate::overlay::router::derive_overlay_v6(self_ip);
         #[cfg(target_os = "linux")]
         {
-            let cidr = format!("{v6}/{}", crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX);
+            let cidr = format!("{v6}/{plen}");
             match std::process::Command::new("ip")
-                .args(["-6", "addr", "replace", &cidr, "dev", IF_NAME])
+                .args(["-6", "addr", "replace", &cidr, "dev", if_name])
                 .output()
             {
                 Ok(out) if out.status.success() => {
@@ -2857,7 +3009,6 @@ mod system {
         }
         #[cfg(target_os = "windows")]
         {
-            let plen = crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX;
             match winaddr::ensure(luid, std::net::IpAddr::V6(v6), plen) {
                 Ok(created) => {
                     tracing::info!(
@@ -2874,7 +3025,7 @@ mod system {
         }
         #[cfg(target_os = "macos")]
         {
-            let plen = crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX.to_string();
+            let plen = plen.to_string();
             // `-alias` first so a re-bring-up replaces rather than stacks;
             // it fails harmlessly when the address isn't there yet.
             let _ = std::process::Command::new("ifconfig")
@@ -2908,7 +3059,7 @@ mod system {
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         {
-            let _ = (v6, if_name);
+            let _ = (v6, if_name, plen);
         }
     }
 
@@ -2955,8 +3106,12 @@ mod system {
 
     /// Query the OS for the active IPv4 default route, picking the lowest-metric
     /// one on a multi-homed host. `None` on any error or when there is none.
+    /// `overlay_if` is THIS device's name — a default via the overlay itself is
+    /// never a valid exemption path (multi-org v2: the instance name, so a
+    /// sibling org's adapter still counts as a real uplink for filtering
+    /// purposes exactly as any other NIC would).
     #[cfg(target_os = "linux")]
-    fn discover_default_route() -> Option<OrigDefaultRoute> {
+    fn discover_default_route(overlay_if: &str) -> Option<OrigDefaultRoute> {
         let out = std::process::Command::new("ip")
             .args(["-4", "route", "show", "default"])
             .output()
@@ -2964,11 +3119,11 @@ mod system {
         if !out.status.success() {
             return None;
         }
-        parse_linux_default_route(&String::from_utf8_lossy(&out.stdout))
+        parse_linux_default_route(&String::from_utf8_lossy(&out.stdout), overlay_if)
     }
 
     #[cfg(target_os = "windows")]
-    fn discover_default_route() -> Option<OrigDefaultRoute> {
+    fn discover_default_route(_overlay_if: &str) -> Option<OrigDefaultRoute> {
         // N2 — `GetBestRoute2` toward the unspecified address answers "which
         // route would carry a default-bound packet right now" as a STRUCT,
         // replacing the fixed-position parse of `netsh show route`'s
@@ -2989,9 +3144,9 @@ mod system {
 
     /// Parse `ip -4 route show default` → the lowest-metric default route. Pure
     /// (OS-call-free) so it unit-tests against captured output. A default via our
-    /// own overlay NIC is ignored (never exempt via ourselves).
+    /// own overlay NIC (`overlay_if`) is ignored (never exempt via ourselves).
     #[cfg(target_os = "linux")]
-    fn parse_linux_default_route(output: &str) -> Option<OrigDefaultRoute> {
+    fn parse_linux_default_route(output: &str, overlay_if: &str) -> Option<OrigDefaultRoute> {
         fn tok_after<'a>(toks: &[&'a str], key: &str) -> Option<&'a str> {
             toks.iter()
                 .position(|t| *t == key)
@@ -3009,7 +3164,7 @@ mod system {
             let (Some(gateway), Some(interface)) = (gateway, interface) else {
                 continue;
             };
-            if interface == IF_NAME {
+            if interface == overlay_if {
                 continue; // never exempt via the overlay itself
             }
             // `onlink` default routes (Hetzner + many clouds) force the same flag
@@ -3050,9 +3205,10 @@ mod system {
     }
 
     /// Query the OS for the active IPv6 default route (lowest-metric). `None` on
-    /// error or when the host has no v6 default (v4-only uplink).
+    /// error or when the host has no v6 default (v4-only uplink). `overlay_if`
+    /// as in [`discover_default_route`].
     #[cfg(target_os = "linux")]
-    fn discover_default_route_v6() -> Option<OrigDefaultRoute6> {
+    fn discover_default_route_v6(overlay_if: &str) -> Option<OrigDefaultRoute6> {
         let out = std::process::Command::new("ip")
             .args(["-6", "route", "show", "default"])
             .output()
@@ -3060,11 +3216,11 @@ mod system {
         if !out.status.success() {
             return None;
         }
-        parse_linux_default_route_v6(&String::from_utf8_lossy(&out.stdout))
+        parse_linux_default_route_v6(&String::from_utf8_lossy(&out.stdout), overlay_if)
     }
 
     #[cfg(target_os = "windows")]
-    fn discover_default_route_v6() -> Option<OrigDefaultRoute6> {
+    fn discover_default_route_v6(_overlay_if: &str) -> Option<OrigDefaultRoute6> {
         // N2 — v6 twin of the typed discovery above. A link-local (`fe80::`)
         // next-hop comes back as an ADDRESS from the FIB — no `%zone` string
         // to strip; the ifIndex disambiguates it, as before.
@@ -3080,10 +3236,11 @@ mod system {
     }
 
     /// Parse `ip -6 route show default` → the lowest-metric v6 default (gateway +
-    /// dev). Pure. A default via our own overlay NIC is ignored; a link-local
-    /// (`fe80::`) gateway is accepted (the dev disambiguates its zone).
+    /// dev). Pure. A default via our own overlay NIC (`overlay_if`) is ignored;
+    /// a link-local (`fe80::`) gateway is accepted (the dev disambiguates its
+    /// zone).
     #[cfg(target_os = "linux")]
-    fn parse_linux_default_route_v6(output: &str) -> Option<OrigDefaultRoute6> {
+    fn parse_linux_default_route_v6(output: &str, overlay_if: &str) -> Option<OrigDefaultRoute6> {
         fn tok_after<'a>(toks: &[&'a str], key: &str) -> Option<&'a str> {
             toks.iter()
                 .position(|t| *t == key)
@@ -3101,7 +3258,7 @@ mod system {
             let (Some(gateway), Some(interface)) = (gateway, interface) else {
                 continue;
             };
-            if interface == IF_NAME {
+            if interface == overlay_if {
                 continue; // never exempt via the overlay itself
             }
             let onlink = toks.contains(&"onlink");
@@ -3267,6 +3424,61 @@ mod system {
             assert!(!is_derived_prefix("100.64.0.0"));
         }
 
+        /// Multi-org v2 — the per-org GUID derivation is deterministic (an
+        /// adapter must re-bind the SAME interface identity across restarts
+        /// and recreates — the rc.279 property, per org), org-distinct, and
+        /// RFC 4122-shaped (version 4 + variant bits forced).
+        #[test]
+        fn org_tun_guid_is_stable_distinct_and_rfc4122_shaped() {
+            use super::org_tun_guid;
+            let a = org_tun_guid("665f1c0001a2b3c4d5e6f708");
+            let b = org_tun_guid("665f1c0001a2b3c4d5e6f708");
+            let c = org_tun_guid("77aa000001a2b3c4d5e6f7ff");
+            // Determinism: same tenant → same GUID, across calls (and, since
+            // the derivation is SHA-256 of fixed inputs, across builds).
+            assert_eq!(a, b);
+            // Distinctness: two tenants must never collide onto one adapter
+            // identity.
+            assert_ne!(a, c);
+            // Neither derived GUID may collide with the legacy base GUID —
+            // the primary adapter keeps it.
+            assert_ne!(a, super::ROOMLER_TUN_GUID);
+            assert_ne!(c, super::ROOMLER_TUN_GUID);
+            for g in [a, c] {
+                let bytes = g.to_be_bytes();
+                assert_eq!(bytes[6] & 0xF0, 0x40, "version nibble must be 4");
+                assert_eq!(bytes[8] & 0xC0, 0x80, "variant bits must be 10x");
+            }
+            // The empty tenant id still yields a valid, distinct value (never
+            // panics — config-shape errors are caught elsewhere).
+            assert_ne!(org_tun_guid(""), a);
+        }
+
+        /// Multi-org v2 — the legacy [`super::TunOptions::legacy`] carries
+        /// EXACTLY the historical single-adapter identity, so `up()`
+        /// delegating through `up_with` is byte-identical single-org
+        /// behavior: the platform IF_NAME, the rc.279 constant GUID, and the
+        /// whole-ULA `/96` on-link prefix.
+        #[test]
+        fn legacy_tun_options_lock_the_single_adapter_identity() {
+            use std::net::Ipv4Addr;
+            let o = super::TunOptions::legacy(
+                Ipv4Addr::new(100, 64, 0, 2),
+                Ipv4Addr::new(255, 192, 0, 0),
+                1280,
+            );
+            assert_eq!(o.name, super::IF_NAME);
+            assert_eq!(o.guid, super::ROOMLER_TUN_GUID);
+            assert_eq!(o.ip, Ipv4Addr::new(100, 64, 0, 2));
+            assert_eq!(o.netmask, Ipv4Addr::new(255, 192, 0, 0));
+            assert_eq!(o.mtu, 1280);
+            assert_eq!(
+                o.v6_onlink_plen,
+                crate::overlay::router::OVERLAY_V6_ONLINK_PREFIX
+            );
+            assert_eq!(o.v6_onlink_plen, 96);
+        }
+
         /// P9 — the net-hygiene kill-switch parse: only an explicit falsy
         /// value disables; unset / anything else keeps the default ON.
         #[cfg(windows)]
@@ -3370,38 +3582,44 @@ mod system {
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_default_route_lowest_metric_skips_overlay() {
-            use super::parse_linux_default_route;
             use std::net::Ipv4Addr;
+            // Legacy instance name, as the single-adapter `up()` passes it.
+            let parse = |o: &str| super::parse_linux_default_route(o, "roomler0");
             // Lowest metric wins on a multi-homed host.
             let out = "default via 192.168.1.1 dev eth0 proto dhcp metric 100\n\
                        default via 10.8.0.1 dev tun0 metric 50\n";
-            let r = parse_linux_default_route(out).unwrap();
+            let r = parse(out).unwrap();
             assert_eq!(r.gateway, Ipv4Addr::new(10, 8, 0, 1));
             assert_eq!(r.interface, "tun0");
             // Missing metric == 0 == wins.
-            let r2 = parse_linux_default_route("default via 192.168.1.1 dev eth0\n").unwrap();
+            let r2 = parse("default via 192.168.1.1 dev eth0\n").unwrap();
             assert_eq!(r2.gateway, Ipv4Addr::new(192, 168, 1, 1));
             // A default via our own overlay NIC is ignored.
             let out3 = "default via 100.64.0.1 dev roomler0 metric 1\n\
                         default via 192.168.1.1 dev eth0 metric 100\n";
-            assert_eq!(parse_linux_default_route(out3).unwrap().interface, "eth0");
+            assert_eq!(parse(out3).unwrap().interface, "eth0");
+            // Multi-org v2 — the filter keys on the INSTANCE name: a per-org
+            // adapter skips itself, and the legacy name is then an ordinary
+            // (if implausible) uplink like any other NIC.
+            let out_org = "default via 100.65.4.1 dev roomler-acme metric 1\n\
+                           default via 192.168.1.1 dev eth0 metric 100\n";
+            assert_eq!(
+                super::parse_linux_default_route(out_org, "roomler-acme")
+                    .unwrap()
+                    .interface,
+                "eth0"
+            );
             // Hetzner/cloud `onlink` default is captured so the exemption /32
             // carries the flag (P5 field-test regression: without it the kernel
             // rejects the /32 with "Nexthop has invalid gateway").
-            let r_onlink =
-                parse_linux_default_route("default via 172.31.1.1 dev eth0 proto static onlink\n")
-                    .unwrap();
+            let r_onlink = parse("default via 172.31.1.1 dev eth0 proto static onlink\n").unwrap();
             assert_eq!(r_onlink.gateway, Ipv4Addr::new(172, 31, 1, 1));
             assert!(r_onlink.onlink);
             // A normal (non-onlink) default is not flagged.
-            assert!(
-                !parse_linux_default_route("default via 192.168.1.1 dev eth0\n")
-                    .unwrap()
-                    .onlink
-            );
+            assert!(!parse("default via 192.168.1.1 dev eth0\n").unwrap().onlink);
             // No default route present.
-            assert!(parse_linux_default_route("").is_none());
-            assert!(parse_linux_default_route("10.0.0.0/8 dev eth0\n").is_none());
+            assert!(parse("").is_none());
+            assert!(parse("10.0.0.0/8 dev eth0\n").is_none());
         }
 
         // N2 — the Windows default-route parsers (and these fixed-position
@@ -3412,33 +3630,29 @@ mod system {
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_default_route_v6_lowest_metric_skips_overlay() {
-            use super::parse_linux_default_route_v6;
             use std::net::Ipv6Addr;
+            // Legacy instance name, as the single-adapter `up()` passes it.
+            let parse = |o: &str| super::parse_linux_default_route_v6(o, "roomler0");
             // Lowest metric wins; a link-local gateway is accepted.
             let out = "default via fe80::1 dev eth0 proto ra metric 1024 pref medium\n\
                        default via 2a01:4f8::1 dev eth0 metric 100\n";
-            let r = parse_linux_default_route_v6(out).unwrap();
+            let r = parse(out).unwrap();
             assert_eq!(r.gateway, "2a01:4f8::1".parse::<Ipv6Addr>().unwrap());
             assert_eq!(r.interface, "eth0");
             // A default via our own overlay NIC is ignored.
             let out2 = "default via fe80::a dev roomler0 metric 1\n\
                         default via fe80::1 dev eth0 metric 100\n";
-            assert_eq!(
-                parse_linux_default_route_v6(out2).unwrap().interface,
-                "eth0"
-            );
+            assert_eq!(parse(out2).unwrap().interface, "eth0");
             // An `onlink` v6 default (point-to-point uplink) is flagged so the
             // /128 exemption carries the flag (P5 field-test regression).
             assert!(
-                parse_linux_default_route_v6(
-                    "default via fe80::1 dev eth0 proto static metric 100 onlink pref medium\n"
-                )
-                .unwrap()
-                .onlink
+                parse("default via fe80::1 dev eth0 proto static metric 100 onlink pref medium\n")
+                    .unwrap()
+                    .onlink
             );
             // None present.
-            assert!(parse_linux_default_route_v6("").is_none());
-            assert!(parse_linux_default_route_v6("2001:db8::/64 dev eth0\n").is_none());
+            assert!(parse("").is_none());
+            assert!(parse("2001:db8::/64 dev eth0\n").is_none());
         }
     }
 }
