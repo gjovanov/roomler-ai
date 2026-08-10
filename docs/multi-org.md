@@ -263,7 +263,7 @@ the OS TUN is used regardless of `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`).
 
 ---
 
-## 4a. Multi-org v2 — the shared carrier plane (`overlay_shared_carrier`, default OFF)
+## 4a. Multi-org v2 — the shared carrier plane (`overlay_shared_carrier`, default ON since rc.339)
 
 Historically every org runtime bound its own direct sockets off the SAME
 stable port base, deconflicted only by the blind band walk — so which org
@@ -285,13 +285,15 @@ org's engine attaches to:
   still advertises on its OWN control WS after its OWN join (the server's
   join-clears-srflx ordering holds per org).
 
-Flag OFF (the default): per-runtime binds, byte-identical to before. The
-default flips after the pc50045 soak; the per-org band race is then retired
-for good. Rebuilds under the flag are PLANE-WIDE (P1-d): any org's trigger
+Default ON since rc.339 (after the 4-host field soak: pc50045 + zeus +
+jupiter + mars, both flags, 08-08→08-10). Explicit `overlay_shared_carrier =
+false` is the kill switch: per-runtime binds, byte-identical to the
+pre-plane behavior, retained until the compensation-stack deletion.
+Rebuilds under the flag are PLANE-WIDE (P1-d): any org's trigger
 tears every org down (`Teardown`/ack, 3 s straggler timeout), the plane
 re-binds ONCE, and every org re-establishes on `Ready`.
 
-### Per-org TUN adapters (`overlay_tun_per_org`, default OFF)
+### Per-org TUN adapters (`overlay_tun_per_org`, default ON since rc.339)
 
 The second half of multi-org v2: with
 `overlay_tun_per_org` on (`ROOMLER_NODE_OVERLAY_TUN_PER_ORG`; requires
@@ -320,8 +322,10 @@ over the shared one:
 - ICE never gathers on `roomler-*` (the peer.rs interface deny-list), and
   the LAN gather's `roomler` prefix filter already covers them.
 
-Flag OFF (the default): the shared-TUN mux (§2, §4b) exactly as before.
-Both v2 flags compose independently; the end state runs both ON.
+Default ON since rc.339. Explicit `overlay_tun_per_org = false` is the kill
+switch: the shared-TUN mux (§2, §4b) exactly as before, retained until the
+compensation-stack deletion. Both v2 flags compose independently; the
+default state now runs both ON.
 
 ---
 
