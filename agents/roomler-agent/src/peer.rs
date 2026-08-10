@@ -7733,9 +7733,15 @@ async fn send_files_json(dc: &Arc<RTCDataChannel>, msg: &crate::files::FilesOutg
 /// second adapter, a `:N` alias) is caught too. Anything else — including a
 /// user interface merely CONTAINING "roomler" further in the name — is left
 /// alone; a false positive here silently removes a real candidate.
+///
+/// Multi-org v2: per-org adapters are named `roomler-<suffix>`, so the
+/// `roomler-` prefix is ours as well.
 fn is_overlay_iface(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
-    n == "roomler" || n.starts_with("roomler0") || n.starts_with("roomler.")
+    n == "roomler"
+        || n.starts_with("roomler-")
+        || n.starts_with("roomler0")
+        || n.starts_with("roomler.")
 }
 
 fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
@@ -7804,6 +7810,11 @@ mod overlay_iface_filter_tests {
         assert!(is_overlay_iface("ROOMLER")); // Windows aliases are case-y
         assert!(is_overlay_iface(" roomler ")); // and can carry whitespace
         assert!(is_overlay_iface("roomler0:1")); // suffixed alias
+        // Multi-org v2 — per-org adapters (`roomler-<suffix>`) are overlay
+        // ifaces too: their addresses must never leak into ICE candidates.
+        assert!(is_overlay_iface("roomler-acme"));
+        assert!(is_overlay_iface("ROOMLER-ACME"));
+        assert!(is_overlay_iface("roomler-acme:1"));
     }
 
     /// A false positive silently deletes a real ICE candidate, so the match
