@@ -298,9 +298,12 @@ The second half of multi-org v2: with
 `overlay_multi_org`), each org gets its **own adapter** instead of a facade
 over the shared one:
 
-- the primary KEEPS the legacy `roomler` name + GUID (no adapter churn on
-  the mode flip); a secondary is `roomler-<first 7 hex of its tenant id>`
-  with a stable per-org GUID (`org_tun_guid` — SHA-256, RFC 4122-shaped);
+- the primary KEEPS the legacy `IF_NAME` (`roomler` on Windows, `roomler0`
+  on Linux) + GUID (no adapter churn on the mode flip); a secondary is
+  `<IF_NAME>-<tenant-prefix>` with a stable per-org GUID (`org_tun_guid` —
+  SHA-256, RFC 4122-shaped). The tenant prefix is clamped to fit Linux's
+  15-char `IFNAMSIZ` (Windows `roomler-` → 7 hex; Linux `roomler0-` → 6),
+  so the secondary adapter name never overflows and the org's TUN comes up;
 - ONE address per adapter ⇒ OS source selection is trivially correct — the
   mux NAT, SkipAsSource reconcile, and Linux src hints never engage (their
   `roomler status` evidence counters stay zero, which is exactly the
