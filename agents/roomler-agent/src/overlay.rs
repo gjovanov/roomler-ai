@@ -106,6 +106,30 @@ struct RuntimeSlot {
 static RUNTIME_SLOTS: std::sync::Mutex<std::collections::BTreeMap<String, RuntimeSlot>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Multi-org v2 — the ONE process-wide shared carrier plane every org's
+/// engine attaches to when `overlay_shared_carrier` is on (one stable
+/// direct-socket set for the whole daemon; receiver-index demux). Created on
+/// first use, process-lifetime — like [`SHARED_MUX`], the plane must outlive
+/// any single org's session churn.
+static SHARED_PLANE: std::sync::Mutex<
+    Option<std::sync::Arc<tunnel_core::overlay::carrier_plane::CarrierPlane>>,
+> = std::sync::Mutex::new(None);
+
+/// The plane when the flag is on (`OVERLAY_SHARED_CARRIER` / config
+/// `overlay_shared_carrier`, built-in default OFF), else `None` — the
+/// runtime then binds per-runtime sockets exactly as before.
+fn shared_carrier_plane()
+-> Option<std::sync::Arc<tunnel_core::overlay::carrier_plane::CarrierPlane>> {
+    if !tunnel_core::env::flag("OVERLAY_SHARED_CARRIER", false) {
+        return None;
+    }
+    let mut g = SHARED_PLANE.lock().unwrap_or_else(|e| e.into_inner());
+    Some(
+        g.get_or_insert_with(tunnel_core::overlay::carrier_plane::CarrierPlane::new)
+            .clone(),
+    )
+}
+
 /// If overlay is enabled, spawn the node runtime (relay mode) and return
 /// the channel its control events arrive on. `None` when overlay is
 /// disabled or the node has no persisted WG key (generated at startup in
@@ -300,6 +324,9 @@ pub async fn maybe_start(
         .with_derp_mux_factory(derp_factory)
         // Multi-region DERP — per-URL regional relay opener (ticket-gated).
         .with_regional_derp_factory(regional_derp_factory)
+        // Multi-org v2 — every org's engine shares ONE process-wide socket
+        // set (receiver-index demux) instead of racing the port band.
+        .with_carrier_plane(shared_carrier_plane())
         // Unification P1 — publish the live mesh view for the LocalAPI so
         // `roomler status` / `peers` see per-device connection types.
         .with_peer_view(peer_view);
