@@ -1144,6 +1144,8 @@ mod system {
                     return Err(std::io::Error::from_raw_os_error(rc as i32));
                 }
             }
+            crate::evidence::SKIP_AS_SOURCE_FLIPS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 %ip, skip,
                 "overlay: SkipAsSource reconciled (nested multi-org block source-selection guard)"

@@ -129,6 +129,17 @@ pub struct NodeStatus {
     /// CLI builds render unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub orgs: Vec<OrgStatus>,
+    /// Multi-org v2 retirement evidence — cumulative compensation-layer
+    /// activity since daemon start ([`crate::evidence`]). The Phase-3
+    /// deletion gate reads these: fleet-wide zeros over the soak window is
+    /// the license to delete the layer. `None` from a daemon predating the
+    /// counters; consumers DIFF two readings, never judge absolutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux_nat_rewrites: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux_nat_restores: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_as_source_flips: Option<u64>,
 }
 
 /// Multi-org P1 — one enrollment's live state (see [`NodeStatus::orgs`]).
@@ -1784,6 +1795,9 @@ mod tests {
                 dns: None,
                 srflx: None,
                 orgs: Vec::new(),
+                mux_nat_rewrites: None,
+                mux_nat_restores: None,
+                skip_as_source_flips: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {

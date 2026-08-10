@@ -32,6 +32,7 @@ pub mod auth;
 pub mod driver;
 /// Node env-var reads with `ROOMLER_NODE_*` → legacy `ROOMLER_AGENT_*` fallback.
 pub mod env;
+pub mod evidence;
 pub mod forward;
 /// LocalAPI — the daemon's local control surface (P1: read-only protocol).
 pub mod localapi;
