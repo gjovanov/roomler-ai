@@ -586,12 +586,12 @@ type RelayAllocQueue = EpochQueue<AllocDone>;
 /// startup. `srflx_query` retries a few times, so worst-case per socket is a
 /// small multiple of this; the whole gather is additionally bounded by
 /// [`SRFLX_GATHER_BUDGET`] so an unreachable STUN server can't stall the join.
-const SRFLX_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
+pub(crate) const SRFLX_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
 /// Phase B — overall wall-clock cap on the startup srflx gather across all
 /// sockets. The common case (coturn reachable) resolves on the first attempt
 /// per socket in tens of ms; this only bounds the pathological all-unreachable
 /// case so the runtime never blocks the netmap→install path for long.
-const SRFLX_GATHER_BUDGET: Duration = Duration::from_secs(4);
+pub(crate) const SRFLX_GATHER_BUDGET: Duration = Duration::from_secs(4);
 
 /// Overlay control events the runtime consumes, fed in from the node's
 /// signaling loop (the `ServerMsg::Overlay*` handlers forward these).
@@ -852,6 +852,47 @@ fn spawn_srflx_keepalive(
     }
 }
 
+/// Multi-org v2 — the plane-mode replacement for [`spawn_srflx_keepalive`]:
+/// the ONE keepalive lives on the [`CarrierPlane`] (its sockets, its STUN
+/// sink); this task only mirrors its watch onto THIS runtime's control WS —
+/// re-advertising on a mapping change, and restoring the current advert on a
+/// reattach (the same two duties the per-runtime keepalive's select had).
+/// Ends when the watch (plane) or the reattach sender (runtime) goes away.
+fn spawn_plane_srflx_forwarder(
+    mut srflx_rx: watch::Receiver<super::carrier_plane::SrflxShared>,
+    outbound: ControlTx,
+    mut reattach_rx: tokio::sync::watch::Receiver<u64>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                c = srflx_rx.changed() => {
+                    if c.is_err() {
+                        break;
+                    }
+                }
+                c = reattach_rx.changed() => {
+                    if c.is_err() {
+                        break;
+                    }
+                }
+            }
+            let s = srflx_rx.borrow().clone();
+            if !s.candidates.is_empty()
+                && outbound
+                    .send(ClientMsg::OverlaySrflx {
+                        candidates: s.candidates,
+                        nat: s.my_nat,
+                    })
+                    .await
+                    .is_err()
+            {
+                debug!("overlay: plane srflx advert send failed (detached) — next event retries");
+            }
+        }
+    }))
+}
+
 /// R3 — minimum spacing between direct-plane rebuilds (the net-change
 /// trigger respects it; resume and the embedder's fingerprint push bypass
 /// it — those are authoritative). A rebuild is cheap but not free (~900 ms
@@ -967,6 +1008,9 @@ pub struct OverlayRuntime {
     /// silently on 2026-08-06 because both failure paths only logged at
     /// `debug!`.
     srflx_status: Option<crate::localapi::SrflxStatus>,
+    /// Multi-org v2 — the process-wide shared carrier plane, when this
+    /// runtime rides it (see [`with_carrier_plane`](Self::with_carrier_plane)).
+    carrier_plane: Option<Arc<super::carrier_plane::CarrierPlane>>,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1129,6 +1173,7 @@ impl OverlayRuntime {
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
             srflx_status: None,
+            carrier_plane: None,
         }
     }
 
@@ -1155,6 +1200,7 @@ impl OverlayRuntime {
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
             srflx_status: None,
+            carrier_plane: None,
         }
     }
 
@@ -1190,6 +1236,20 @@ impl OverlayRuntime {
     /// Multi-region DERP — install the per-URL regional relay opener.
     pub fn with_regional_derp_factory(mut self, factory: Option<RegionalDerpFactory>) -> Self {
         self.regional_derp_factory = factory;
+        self
+    }
+
+    /// Multi-org v2 — attach this runtime to the process-wide
+    /// [`CarrierPlane`](super::carrier_plane::CarrierPlane). Its `WgDevice`
+    /// then registers sessions on the plane (receiver-index demux on the
+    /// shared socket set), `setup_direct` consumes the plane's bound view
+    /// instead of binding its own, and the srflx gather/keepalive are the
+    /// plane's shared ones. `None` (the default) keeps every existing path.
+    pub fn with_carrier_plane(
+        mut self,
+        plane: Option<Arc<super::carrier_plane::CarrierPlane>>,
+    ) -> Self {
+        self.carrier_plane = plane;
         self
     }
 
@@ -1369,6 +1429,12 @@ impl OverlayRuntime {
         let netmask = netmask_for_prefix(prefix_of_cidr(&network.cidr).unwrap_or(10));
 
         let (mut wg, tun_rx) = WgDevice::new(self.keypair.secret.clone());
+        // Multi-org v2 — attach the device to the shared carrier plane BEFORE
+        // any peer installs: sessions then register on the plane's
+        // receiver-index demux instead of the device's source-keyed one.
+        if let Some(plane) = &self.carrier_plane {
+            wg.set_plane(plane.attach(wg.plane_hooks()));
+        }
         let tun: Arc<dyn TunIo> = match (self.tun_factory)(self_v4, netmask, self.mtu) {
             Ok(t) => t,
             Err(e) => {
@@ -1474,16 +1540,27 @@ impl OverlayRuntime {
         // restores it on the fresh session. Dropped when run() returns,
         // which ends the task.
         let (srflx_reattach_tx, srflx_reattach_rx) = tokio::sync::watch::channel(0u64);
-        let mut srflx_keepalive = spawn_srflx_keepalive(
-            &direct_ctx,
-            srflx_stun_server,
-            wg.take_stun_events(),
-            &network.stun_urls,
-            &srflx_advertised,
-            &srflx_my_nat,
-            self.outbound.clone(),
-            srflx_reattach_rx,
-        );
+        let mut srflx_keepalive = if let Some(plane) = &self.carrier_plane {
+            // Multi-org v2 — the plane owns the ONE keepalive (its sockets,
+            // its STUN sink); this runtime only forwards mapping changes and
+            // reattach restores onto ITS control WS.
+            spawn_plane_srflx_forwarder(
+                plane.subscribe_srflx(),
+                self.outbound.clone(),
+                srflx_reattach_rx,
+            )
+        } else {
+            spawn_srflx_keepalive(
+                &direct_ctx,
+                srflx_stun_server,
+                wg.take_stun_events(),
+                &network.stun_urls,
+                &srflx_advertised,
+                &srflx_my_nat,
+                self.outbound.clone(),
+                srflx_reattach_rx,
+            )
+        };
         // R3 — direct-plane rebuild scheduling: triggers (an addr/iface
         // event whose LAN-IP set actually changed, a resume-from-suspend, or
         // the embedder's fingerprint push) set the flag; ONE executor at the
@@ -1983,16 +2060,24 @@ impl OverlayRuntime {
                                 );
                                 r.set_udp_relay_ok(!srflx_advertised.is_empty());
                             }
-                            srflx_keepalive = spawn_srflx_keepalive(
-                                &direct_ctx,
-                                srflx_stun_server,
-                                stun_rx,
-                                &network.stun_urls,
-                                &srflx_advertised,
-                                &srflx_my_nat,
-                                self.outbound.clone(),
-                                srflx_reattach_tx.subscribe(),
-                            );
+                            srflx_keepalive = if let Some(plane) = &self.carrier_plane {
+                                spawn_plane_srflx_forwarder(
+                                    plane.subscribe_srflx(),
+                                    self.outbound.clone(),
+                                    srflx_reattach_tx.subscribe(),
+                                )
+                            } else {
+                                spawn_srflx_keepalive(
+                                    &direct_ctx,
+                                    srflx_stun_server,
+                                    stun_rx,
+                                    &network.stun_urls,
+                                    &srflx_advertised,
+                                    &srflx_my_nat,
+                                    self.outbound.clone(),
+                                    srflx_reattach_tx.subscribe(),
+                                )
+                            };
                             let peers_now: Vec<NetmapPeer> =
                                 current_peers.values().cloned().collect();
                             self.install_peers(
