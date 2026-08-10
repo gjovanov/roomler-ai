@@ -862,6 +862,7 @@ fn spawn_plane_srflx_forwarder(
     mut srflx_rx: watch::Receiver<super::carrier_plane::SrflxShared>,
     outbound: ControlTx,
     mut reattach_rx: tokio::sync::watch::Receiver<u64>,
+    label: Ipv4Addr,
 ) -> Option<tokio::task::JoinHandle<()>> {
     // Re-assert the shared srflx on a TIMER as well as on every change/
     // reattach. In plane mode the srflx gather is decoupled from each org's
@@ -876,31 +877,36 @@ fn spawn_plane_srflx_forwarder(
     // subscribe-after-set startup gap. Cadence tracks the NAT keepalive.
     let secs = super::direct::srflx_keepalive_secs().clamp(15, 60);
     Some(tokio::spawn(async move {
+        info!(self_v4 = %label, secs, "overlay: plane srflx forwarder started");
         let mut tick = tokio::time::interval(Duration::from_secs(secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            // `advertise` is false ONLY when a watch closed (plane gone or the
-            // runtime dropped its reattach sender) — then the task ends.
-            let advertise = tokio::select! {
-                c = srflx_rx.changed() => c.is_ok(),
-                c = reattach_rx.changed() => c.is_ok(),
-                _ = tick.tick() => true,
+            // DIAG (rc.337): a stuck one-org srflx=[] in the field — log the
+            // trigger + candidate count + send result so we can see whether
+            // THIS org's forwarder ticks/sends, and which watch closes it.
+            let trigger = tokio::select! {
+                c = srflx_rx.changed() => if c.is_ok() { "change" } else { "srflx-watch-closed" },
+                c = reattach_rx.changed() => if c.is_ok() { "reattach" } else { "reattach-watch-closed" },
+                _ = tick.tick() => "tick",
             };
-            if !advertise {
+            if trigger.ends_with("closed") {
+                warn!(self_v4 = %label, trigger, "overlay: plane srflx forwarder EXITING");
                 break;
             }
             let s = srflx_rx.borrow().clone();
-            if !s.candidates.is_empty()
-                && outbound
-                    .send(ClientMsg::OverlaySrflx {
-                        candidates: s.candidates,
-                        nat: s.my_nat,
-                    })
-                    .await
-                    .is_err()
-            {
-                debug!("overlay: plane srflx advert send failed (detached) — next tick retries");
+            let n = s.candidates.len();
+            if s.candidates.is_empty() {
+                debug!(self_v4 = %label, trigger, "overlay: plane srflx forwarder — watch empty, nothing to advertise");
+                continue;
             }
+            let sent = outbound
+                .send(ClientMsg::OverlaySrflx {
+                    candidates: s.candidates,
+                    nat: s.my_nat,
+                })
+                .await;
+            info!(self_v4 = %label, trigger, candidates = n, ok = sent.is_ok(),
+                "overlay: plane srflx re-advertised");
         }
     }))
 }
@@ -1571,6 +1577,7 @@ impl OverlayRuntime {
                 plane.subscribe_srflx(),
                 self.outbound.clone(),
                 srflx_reattach_rx,
+                self_v4,
             )
         } else {
             spawn_srflx_keepalive(
@@ -2095,6 +2102,7 @@ impl OverlayRuntime {
                                     plane.subscribe_srflx(),
                                     self.outbound.clone(),
                                     srflx_reattach_tx.subscribe(),
+                                    self_v4,
                                 )
                             } else {
                                 spawn_srflx_keepalive(
