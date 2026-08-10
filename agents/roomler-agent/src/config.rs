@@ -154,14 +154,16 @@ pub struct AgentConfig {
     /// set shared by every org's engine, inbound demultiplexed by WireGuard
     /// receiver index (`ROOMLER_NODE_OVERLAY_SHARED_CARRIER`). Retires the
     /// per-org stable-port band race (which org holds the base port stops
-    /// being spawn-order timing). Built-in default: off (soak flag).
+    /// being spawn-order timing). Built-in default: on since rc.339
+    /// (explicit `false` is the kill switch).
     #[serde(default)]
     pub overlay_shared_carrier: Option<bool>,
     /// Multi-org v2 per-org TUN adapters — each org gets its OWN device
     /// (own address space + route domain; one address per adapter, so OS
     /// source selection is trivially correct) instead of the shared-TUN mux
-    /// (`ROOMLER_NODE_OVERLAY_TUN_PER_ORG`). Built-in default: off (soak
-    /// flag). Requires `overlay_multi_org`.
+    /// (`ROOMLER_NODE_OVERLAY_TUN_PER_ORG`). Built-in default: on since
+    /// rc.339 (explicit `false` falls back to the shared-TUN mux). Only
+    /// engages when `overlay_multi_org` is on.
     #[serde(default)]
     pub overlay_tun_per_org: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
