@@ -32,16 +32,13 @@ use tracing::{info, warn};
 #[cfg(target_os = "windows")]
 const NAT_NAME: &str = "roomler-overlay";
 
-/// Overlay TUN interface name on Linux — matches `tun.rs` / `dns.rs`. Used to
-/// scope the `filter`/`FORWARD` ACCEPT rules (P5/A4) to overlay-forwarded
-/// traffic only.
-#[cfg(target_os = "linux")]
-const IF_NAME: &str = "roomler0";
-
 /// RAII guard for the OS forwarding/NAT state. `Drop` reverts whatever `enable`
 /// installed. A guard with `active == false` (nothing advertised, or setup
 /// failed) is an inert no-op.
 pub struct SubnetRouterGuard {
+    /// Multi-org v2 — the overlay adapter these rules were scoped to (the
+    /// `Drop` revert must name the SAME device the setup did).
+    if_name: String,
     overlay_cidr: String,
     active: bool,
 }
@@ -49,14 +46,25 @@ pub struct SubnetRouterGuard {
 /// Enable forwarding + NAT for `overlay_cidr` when `advertised_routes` is
 /// non-empty. Returns a guard that reverts on `Drop`. A no-op (inert guard) when
 /// nothing is advertised or the platform is unsupported.
-pub async fn enable(overlay_cidr: &str, advertised_routes: &[String]) -> SubnetRouterGuard {
+///
+/// Multi-org v2 — `if_name` is the overlay adapter to scope the rules to
+/// (formerly a module-level constant): per-org adapters must NAT/forward
+/// THEIR device, not the historical singleton. Legacy callers pass the
+/// device's own OS name, falling back to
+/// [`tun::IF_NAME`](crate::overlay::tun::IF_NAME).
+pub async fn enable(
+    if_name: &str,
+    overlay_cidr: &str,
+    advertised_routes: &[String],
+) -> SubnetRouterGuard {
     if advertised_routes.is_empty() {
         return SubnetRouterGuard {
+            if_name: if_name.to_string(),
             overlay_cidr: overlay_cidr.to_string(),
             active: false,
         };
     }
-    let fully_ok = setup(overlay_cidr, advertised_routes).await;
+    let fully_ok = setup(if_name, overlay_cidr, advertised_routes).await;
     // Arm the guard on any platform where `setup` installs rules, so `Drop`
     // reverts even a PARTIALLY-applied ruleset (each `-D` / `Remove-NetNat` is
     // idempotent — reverting an absent rule is a harmless no-op). `fully_ok`
@@ -65,20 +73,21 @@ pub async fn enable(overlay_cidr: &str, advertised_routes: &[String]) -> SubnetR
     // failed.
     let active = cfg!(any(target_os = "linux", target_os = "windows"));
     if active && fully_ok {
-        info!(%overlay_cidr, routes = ?advertised_routes,
+        info!(%if_name, %overlay_cidr, routes = ?advertised_routes,
             "overlay: subnet-router forwarding + NAT enabled");
     } else if active {
-        warn!(%overlay_cidr,
+        warn!(%if_name, %overlay_cidr,
             "overlay: subnet-router forwarding/NAT not fully enabled (see prior errors)");
     }
     SubnetRouterGuard {
+        if_name: if_name.to_string(),
         overlay_cidr: overlay_cidr.to_string(),
         active,
     }
 }
 
 #[cfg(target_os = "linux")]
-async fn setup(overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
+async fn setup(if_name: &str, overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
     // Global forwarding (leave it on at teardown — another service may rely on
     // it; we only remove our own rules).
     let _ = run(vec![
@@ -112,7 +121,7 @@ async fn setup(overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
         "-A".into(),
         "FORWARD".into(),
         "-i".into(),
-        IF_NAME.into(),
+        if_name.into(),
         "-j".into(),
         "ACCEPT".into(),
     ])
@@ -122,7 +131,7 @@ async fn setup(overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
         "-A".into(),
         "FORWARD".into(),
         "-o".into(),
-        IF_NAME.into(),
+        if_name.into(),
         "-m".into(),
         "conntrack".into(),
         "--ctstate".into(),
@@ -134,7 +143,7 @@ async fn setup(overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
     // P5/S3b — IPv6 exit egress (best-effort; independent of the v4 result so a
     // v4-only-uplink exit still reports v4 success). Clients keep v6 fail-closed
     // until this succeeds on the exit.
-    setup_v6().await;
+    setup_v6(if_name).await;
     nat_ok && fwd_out_ok && fwd_ret_ok
 }
 
@@ -142,7 +151,7 @@ async fn setup(overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
 /// effort + logged independently of v4: a v4-only uplink (no v6, no `ip6tables`)
 /// simply leaves v6 egress unavailable, and clients then stay v6-fail-closed.
 #[cfg(target_os = "linux")]
-async fn setup_v6() {
+async fn setup_v6(if_name: &str) {
     // Enable v6 forwarding. `accept_ra=2` so a host that forwards STILL accepts
     // Router Advertisements — otherwise `forwarding=1` downgrades RA acceptance
     // and a SLAAC/RA-configured uplink loses its OWN v6 default on the next RA,
@@ -181,7 +190,7 @@ async fn setup_v6() {
         "-A".into(),
         "FORWARD".into(),
         "-i".into(),
-        IF_NAME.into(),
+        if_name.into(),
         "-j".into(),
         "ACCEPT".into(),
     ])
@@ -191,7 +200,7 @@ async fn setup_v6() {
         "-A".into(),
         "FORWARD".into(),
         "-o".into(),
-        IF_NAME.into(),
+        if_name.into(),
         "-m".into(),
         "conntrack".into(),
         "--ctstate".into(),
@@ -211,7 +220,7 @@ async fn setup_v6() {
 }
 
 #[cfg(target_os = "windows")]
-async fn setup(overlay_cidr: &str, advertised_routes: &[String]) -> bool {
+async fn setup(if_name: &str, overlay_cidr: &str, advertised_routes: &[String]) -> bool {
     // P5/S3b — WinNAT (`New-NetNat`) has NO IPv6 API, so a Windows exit node
     // cannot NAT v6. Clients routing through a Windows exit stay v6-fail-closed
     // (their global v6 is encapsulated but dropped here — never leaked). v6 exit
@@ -250,15 +259,19 @@ async fn setup(overlay_cidr: &str, advertised_routes: &[String]) -> bool {
         .map(|c| format!("'{}'", c.trim().replace('\'', "")))
         .collect::<Vec<_>>()
         .join(",");
+    // Multi-org v2 — the overlay NIC is the INSTANCE adapter, not the
+    // historical `roomler` literal. Quote-sanitized like `targets` (the name
+    // comes from our own constants/config, but a `'` must never break out).
+    let alias = if_name.trim().replace('\'', "");
     let fwd_ok = run(vec![
         "powershell".into(),
         "-NoProfile".into(),
         "-Command".into(),
         format!(
             "$fail = 0; \
-             Set-NetIPInterface -InterfaceAlias roomler -AddressFamily IPv4 \
+             Set-NetIPInterface -InterfaceAlias '{alias}' -AddressFamily IPv4 \
                -Forwarding Enabled -ErrorAction SilentlyContinue; \
-             if ((Get-NetIPInterface -InterfaceAlias roomler -AddressFamily IPv4 \
+             if ((Get-NetIPInterface -InterfaceAlias '{alias}' -AddressFamily IPv4 \
                -ErrorAction SilentlyContinue | Select-Object -First 1).Forwarding \
                -ne 'Enabled') {{ $fail = 1 }}; \
              foreach ($c in @({targets})) {{ \
@@ -301,7 +314,7 @@ async fn setup(overlay_cidr: &str, advertised_routes: &[String]) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-async fn setup(_overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
+async fn setup(_if_name: &str, _overlay_cidr: &str, _advertised_routes: &[String]) -> bool {
     false
 }
 
@@ -327,14 +340,14 @@ impl Drop for SubnetRouterGuard {
                 .output();
             // Mirror the P5/A4 FORWARD ACCEPT rules from `setup`.
             let _ = std::process::Command::new("iptables")
-                .args(["-D", "FORWARD", "-i", IF_NAME, "-j", "ACCEPT"])
+                .args(["-D", "FORWARD", "-i", &self.if_name, "-j", "ACCEPT"])
                 .output();
             let _ = std::process::Command::new("iptables")
                 .args([
                     "-D",
                     "FORWARD",
                     "-o",
-                    IF_NAME,
+                    &self.if_name,
                     "-m",
                     "conntrack",
                     "--ctstate",
@@ -359,14 +372,14 @@ impl Drop for SubnetRouterGuard {
                 ])
                 .output();
             let _ = std::process::Command::new("ip6tables")
-                .args(["-D", "FORWARD", "-i", IF_NAME, "-j", "ACCEPT"])
+                .args(["-D", "FORWARD", "-i", &self.if_name, "-j", "ACCEPT"])
                 .output();
             let _ = std::process::Command::new("ip6tables")
                 .args([
                     "-D",
                     "FORWARD",
                     "-o",
-                    IF_NAME,
+                    &self.if_name,
                     "-m",
                     "conntrack",
                     "--ctstate",
@@ -389,7 +402,11 @@ impl Drop for SubnetRouterGuard {
                 ])
                 .output();
         }
-        info!(overlay_cidr = %self.overlay_cidr, "overlay: subnet-router forwarding/NAT reverted");
+        info!(
+            if_name = %self.if_name,
+            overlay_cidr = %self.overlay_cidr,
+            "overlay: subnet-router forwarding/NAT reverted"
+        );
     }
 }
 
