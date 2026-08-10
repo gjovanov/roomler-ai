@@ -263,6 +263,36 @@ the OS TUN is used regardless of `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`).
 
 ---
 
+## 4a. Multi-org v2 — the shared carrier plane (`overlay_shared_carrier`, default OFF)
+
+Historically every org runtime bound its own direct sockets off the SAME
+stable port base, deconflicted only by the blind band walk — so which org
+held 43648 was a spawn-order race that re-ran on every restart and swapped
+ports between orgs (NAT-mapping churn on the org that lost).
+
+With `overlay_shared_carrier` on (`ROOMLER_NODE_OVERLAY_SHARED_CARRIER`,
+config key `overlay_shared_carrier`), the daemon binds **ONE process-wide
+socket set** (`crates/tunnel-core/src/overlay/carrier_plane.rs`) that every
+org's engine attaches to:
+
+- inbound is demultiplexed by the **WireGuard receiver index** (session
+  indices are allocated plane-wide, unique across orgs), so two orgs'
+  sessions arriving from the SAME remote `ip:port` — the post-migration
+  normal when the peer is also multi-org — can never alias;
+- handshake initiations (no index on the wire) route by per-engine
+  static-key trial authentication, WireGuard's own model;
+- ONE srflx gather / NAT probe / keepalive serves every org; each runtime
+  still advertises on its OWN control WS after its OWN join (the server's
+  join-clears-srflx ordering holds per org).
+
+Flag OFF (the default): per-runtime binds, byte-identical to before. The
+default flips after the CORPLAP-1 soak; the per-org band race is then retired
+for good. Direct-plane REBUILDS under the flag still use the per-runtime
+path's sockets unchanged (the plane's binds persist across them) — the
+plane-level rebuild protocol is the next increment (P1-d).
+
+---
+
 ## 4b. Cross-org egress source normalization — the mux NAT (rc.328)
 
 With two org addresses on the ONE shared adapter (§2), the **OS** picks the

@@ -499,6 +499,21 @@ impl OverlayRuntime {
         if !matches!(self.mode, CarrierMode::Relay) || !direct::direct_enabled() {
             return None;
         }
+        // Multi-org v2 — plane mode: the process-wide socket set is bound
+        // ONCE by the plane; this runtime consumes a view of it instead of
+        // binding its own (the per-runtime band race this replaces). The
+        // punch socket + NAT class are stamped by the plane-side gather.
+        if let Some(plane) = &self.carrier_plane {
+            let v = plane.ensure_bound().await?;
+            return Some(DirectCtx {
+                socks: v.socks,
+                my_ips: v.my_ips,
+                endpoints: v.endpoints,
+                public_sock: v.public_sock,
+                punch: None,
+                my_nat: None,
+            });
+        }
         let ifaces = direct::gather_lan_interfaces();
         let my_ips: Vec<Ipv4Addr> = ifaces.iter().map(|(ip, _)| *ip).collect();
         if my_ips.is_empty() {
@@ -2001,7 +2016,12 @@ impl OverlayRuntime {
     /// touch `run()`'s loop locals. The caller must ALSO abort the srflx
     /// keepalive BEFORE calling (it owns a punch-socket Arc by value).
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn rebuild_direct_plane_sockets(
+    /// Steps 1-2 of the R3 rebuild, shared with the carrier-plane Teardown
+    /// step (P1-d): every direct carrier and in-flight upgrade probe dies —
+    /// their `Carrier`/pump/timer-task Arcs pin the old sockets, and the
+    /// plane may only re-bind once every engine has released them.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn teardown_direct_carriers(
         &self,
         wg: &mut WgDevice,
         by_node: &mut HashMap<ObjectId, Installed>,
@@ -2010,11 +2030,9 @@ impl OverlayRuntime {
         relay_bq: &mut RelayBuildQueue,
         alloc_q: &mut RelayAllocQueue,
         tun: &Arc<dyn TunIo>,
-        direct_ctx: &mut Option<DirectCtx>,
-    ) -> Option<mpsc::Receiver<crate::transport::stun::StunInbound>> {
-        // 1. Direct carriers die first — their Carrier/pump/timer-task Arcs
-        //    pin the old sockets. The shared teardown also drops each peer's
-        //    in-flight probe.
+    ) {
+        // 1. Direct carriers die first — the shared teardown also drops each
+        //    peer's in-flight probe.
         let direct_nids: Vec<ObjectId> = by_node
             .iter()
             .filter(|(_, e)| e.is_direct)
@@ -2044,6 +2062,24 @@ impl OverlayRuntime {
                 self.shadow(|s| s.mon.on_probe_aborted(&nid));
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn rebuild_direct_plane_sockets(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        relay: &mut Option<RelayCoordinator>,
+        relay_bq: &mut RelayBuildQueue,
+        alloc_q: &mut RelayAllocQueue,
+        tun: &Arc<dyn TunIo>,
+        direct_ctx: &mut Option<DirectCtx>,
+    ) -> Option<mpsc::Receiver<crate::transport::stun::StunInbound>> {
+        // 1+2 — every direct carrier and in-flight probe dies first (their
+        //    Arcs pin the old sockets).
+        self.teardown_direct_carriers(wg, by_node, upgrade_probes, relay, relay_bq, alloc_q, tun)
+            .await;
         // 3. Retire the old demux slots (aborts their recv loops) and drop
         //    the plane's own Arcs — with 1+2 done, the ports actually free.
         if let Some(old) = direct_ctx.take() {
@@ -2109,6 +2145,37 @@ impl OverlayRuntime {
             advertised: Vec::new(),
             my_nat: None,
         };
+        // Multi-org v2 — plane mode: ONE gather + NAT probe for the whole
+        // process (the plane's recv loops own the sockets, so per-runtime
+        // raw-socket STUN would be stolen anyway). Each runtime still
+        // advertises on ITS OWN control WS, after ITS OWN join — preserving
+        // the server-side join-clears-srflx ordering contract per org.
+        if let Some(plane) = self.carrier_plane.clone() {
+            let shared = plane.ensure_srflx(stun_urls).await;
+            if let Some(ctx) = direct_ctx.as_mut() {
+                ctx.punch = shared.punch.clone();
+                ctx.my_nat = shared.my_nat.clone();
+            }
+            self.srflx_status = Some(crate::localapi::SrflxStatus {
+                candidates: shared.candidates.clone(),
+                stun_server: shared.stun_server.map(|s| s.to_string()),
+                nat: shared.my_nat.clone(),
+                error: shared.error.clone(),
+            });
+            if !shared.candidates.is_empty() {
+                let _ = self
+                    .outbound
+                    .send(ClientMsg::OverlaySrflx {
+                        candidates: shared.candidates.clone(),
+                        nat: shared.my_nat.clone(),
+                    })
+                    .await;
+            }
+            out.stun_server = shared.stun_server;
+            out.advertised = shared.candidates;
+            out.my_nat = shared.my_nat;
+            return out;
+        }
         if !direct::srflx_gather_active() {
             return out;
         }
