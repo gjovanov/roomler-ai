@@ -905,7 +905,7 @@ fn spawn_plane_srflx_forwarder(
                     nat: s.my_nat,
                 })
                 .await;
-            info!(self_v4 = %label, trigger, candidates = n, ok = sent.is_ok(),
+            debug!(self_v4 = %label, trigger, candidates = n, ok = sent.is_ok(),
                 "overlay: plane srflx re-advertised");
         }
     }))
