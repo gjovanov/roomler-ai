@@ -195,6 +195,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Multi-org v2 shared carrier plane: every org's engine shares ONE process-wide direct-socket set (receiver-index demux) instead of racing the per-org port band. Built-in default: off.",
     ),
     (
+        "overlay_tun_per_org",
+        "tribool",
+        "Multi-org v2 per-org TUN adapters: each org gets its OWN device (own address space + route domain) instead of the shared-TUN mux; the source-selection compensation layers never engage. Requires overlay_multi_org. Built-in default: off.",
+    ),
+    (
         "overlay_tun_stable_guid",
         "tribool",
         "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
@@ -371,6 +376,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "overlay_mux_nat" => cfg.overlay_mux_nat.map(fmt_bool),
         "overlay_shared_carrier" => cfg.overlay_shared_carrier.map(fmt_bool),
+        "overlay_tun_per_org" => cfg.overlay_tun_per_org.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
@@ -564,6 +570,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_relay_tls" => cfg.overlay_relay_tls = parse_tribool(value)?,
         "overlay_mux_nat" => cfg.overlay_mux_nat = parse_tribool(value)?,
         "overlay_shared_carrier" => cfg.overlay_shared_carrier = parse_tribool(value)?,
+        "overlay_tun_per_org" => cfg.overlay_tun_per_org = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
@@ -792,6 +799,27 @@ mod tests {
         apply(&mut cfg, "overlay_shared_carrier", None).unwrap();
         assert_eq!(cfg.overlay_shared_carrier, None);
         assert!(apply(&mut cfg, "overlay_shared_carrier", Some("maybe")).is_err());
+    }
+
+    /// Multi-org v2 per-org-adapter soak flag set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_tun_per_org_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_tun_per_org", Some("on")).unwrap();
+        assert_eq!(cfg.overlay_tun_per_org, Some(true));
+        assert_eq!(
+            entry_for(&cfg, "overlay_tun_per_org")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("true")
+        );
+        apply(&mut cfg, "overlay_tun_per_org", Some("0")).unwrap();
+        assert_eq!(cfg.overlay_tun_per_org, Some(false));
+        apply(&mut cfg, "overlay_tun_per_org", None).unwrap();
+        assert_eq!(cfg.overlay_tun_per_org, None);
+        assert!(apply(&mut cfg, "overlay_tun_per_org", Some("maybe")).is_err());
     }
 
     /// rc.275 — the LAN-gather virtual-interface filter key set/echo/clear
