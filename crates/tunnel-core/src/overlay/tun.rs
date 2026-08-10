@@ -1605,9 +1605,16 @@ mod system {
     /// requested name — with the stable requested GUID, create re-binds the
     /// surviving orphan's identity by name+GUID, so protecting it is
     /// equivalent to the old remove-and-recreate. NOTE the `Once` guard:
-    /// the FIRST bring-up's expected set is the one that runs, so a
-    /// multi-adapter caller (Phase 2c) must pass ALL configured adapter
-    /// names (or hoist the sweep before any create).
+    /// the FIRST bring-up's expected set is the one that runs.
+    ///
+    /// Per-org adapters (`roomler-<suffix>`, Phase 2c) are structurally
+    /// EXEMPT (`-notmatch '^roomler-'`) rather than enumerated into
+    /// `expected`: orgs come up at their own pace, so the first org's sweep
+    /// cannot know its siblings' names — and a per-org adapter is
+    /// deliberately persistent anyway (explicit org REMOVAL owns its
+    /// cleanup, not the boot sweep). The sweep therefore only ever removes
+    /// legacy-shaped strays ("roomler", Windows duplicate-name "roomler 2",
+    /// "roomler0", …).
     #[cfg(target_os = "windows")]
     fn sweep_stray_adapters_once(expected: &[String]) {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1625,7 +1632,8 @@ mod system {
             let script = format!(
                 "$keep = @({keep}); Get-NetAdapter -IncludeHidden | Where-Object {{ \
                  $_.PnPDeviceID -like 'SWD\\WINTUN\\*' -and \
-                 $_.Name -match '^roomler' -and $_.Status -ne 'Up' -and \
+                 $_.Name -match '^roomler' -and $_.Name -notmatch '^roomler-' -and \
+                 $_.Status -ne 'Up' -and \
                  ($keep -notcontains $_.Name) }} | \
                  ForEach-Object {{ \
                  pnputil /remove-device \"$($_.PnPDeviceID)\" > $null 2>&1; \
