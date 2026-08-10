@@ -85,10 +85,17 @@ struct PlaneRoute {
     tunn: Arc<tokio::sync::Mutex<Tunn>>,
     ingress: Ingress,
     tun_tx: mpsc::Sender<Vec<u8>>,
-    /// The peer endpoint this session sends to. Inbound for the session is
-    /// accepted from this source ONLY — the same no-roam stance as the
-    /// source-keyed demux, so behavior under the plane is identical.
+    /// The peer endpoint this session sends to. Inbound is accepted from this
+    /// source; A3 roaming updates it in place on an AUTHENTICATED inbound from
+    /// a new source (kill switch `OVERLAY_ROAM`, else the strict no-roam
+    /// stance holds and behavior matches the source-keyed demux).
     expected_src: SocketAddr,
+    /// A3 — the peer's direct carrier, to repoint its outbound dst in place
+    /// on a roam (the send pump's `SendPeer` mirror shares the same `Arc`).
+    /// Weak so a dropped peer's carrier isn't pinned by the route table.
+    carrier: std::sync::Weak<Carrier>,
+    /// A3 — last adoption instant for this session (roam rate limit).
+    last_roam: Option<Instant>,
 }
 
 /// The plane's bound socket set (the process-wide twin of one runtime's
@@ -510,6 +517,24 @@ impl CarrierPlane {
                 let mut t = tunn.lock().await;
                 process_inbound(&mut t, n, buf, &reply, &tun_tx, &ingress).await;
             }
+            Routed::SessionRoam {
+                tunn,
+                ingress,
+                tun_tx,
+                idx,
+                new_src,
+            } => {
+                // A3 — reply to the OBSERVED source, process, and commit the
+                // roam ONLY on cryptographic success (process_inbound → true).
+                let reply = Carrier::direct(sock.clone(), new_src);
+                let authenticated = {
+                    let mut t = tunn.lock().await;
+                    process_inbound(&mut t, n, buf, &reply, &tun_tx, &ingress).await
+                };
+                if authenticated {
+                    self.commit_roam(idx, new_src);
+                }
+            }
             Routed::ForwardInit(tx) => {
                 let _ = tx.try_send(DirectInbound {
                     src,
@@ -545,9 +570,27 @@ impl CarrierPlane {
                 ingress: r.ingress.clone(),
                 tun_tx: r.tun_tx.clone(),
             },
+            // A3 — a known session (by receiver index) from a NEW source:
+            // route it to the session's Tunn as a ROAM CANDIDATE. Adoption
+            // commits only if the payload authenticates (handle_datagram
+            // calls `commit_roam` on success), so a forged index can spend
+            // one decap but never move an endpoint. Rate-limited per session.
+            Some(r)
+                if direct::roam_enabled()
+                    && r.last_roam
+                        .is_none_or(|t| t.elapsed() >= direct::ROAM_MIN_INTERVAL) =>
+            {
+                Routed::SessionRoam {
+                    tunn: r.tunn.clone(),
+                    ingress: r.ingress.clone(),
+                    tun_tx: r.tun_tx.clone(),
+                    idx,
+                    new_src: src,
+                }
+            }
             Some(r) => {
-                // Same conservative stance as the source-keyed demux: a known
-                // session from an unexpected source is dropped, not roamed.
+                // Roam off (or rate-limited): the strict no-roam stance — a
+                // known session from an unexpected source is dropped.
                 debug!(
                     idx,
                     %src,
@@ -558,6 +601,38 @@ impl CarrierPlane {
             }
             None => Routed::Drop,
         }
+    }
+
+    /// A3 — commit an authenticated roam: repoint the session's `expected_src`,
+    /// rekey the `(engine, src)` reverse map, and repoint the peer's carrier
+    /// dst in place. No-op if the route vanished or a concurrent roam already
+    /// moved it (idempotent).
+    fn commit_roam(&self, idx: u32, new_src: SocketAddr) {
+        let mut st = self.lock();
+        let Some(r) = st.routes.get(&idx) else {
+            return;
+        };
+        let old_src = r.expected_src;
+        if old_src == new_src {
+            return;
+        }
+        let engine = r.engine;
+        if let Some(c) = r.carrier.upgrade() {
+            c.set_direct_dst(new_src);
+        }
+        let r = st.routes.get_mut(&idx).expect("checked above");
+        r.expected_src = new_src;
+        r.last_roam = Some(Instant::now());
+        if st.by_src.get(&(engine, old_src)) == Some(&idx) {
+            st.by_src.remove(&(engine, old_src));
+        }
+        st.by_src.insert((engine, new_src), idx);
+        crate::evidence::ROAM_ADOPTIONS.fetch_add(1, Ordering::Relaxed);
+        info!(
+            idx, %old_src, %new_src,
+            "carrier plane: peer endpoint ROAMED — authenticated inbound from a new source \
+             adopted (outbound repointed)"
+        );
     }
 
     fn route_session_of(&self, engine: u64, src: SocketAddr) -> Routed {
@@ -602,6 +677,15 @@ enum Routed {
         ingress: Ingress,
         tun_tx: mpsc::Sender<Vec<u8>>,
     },
+    /// A3 — a known session (by receiver index) from a NEW source: process on
+    /// its Tunn, then `commit_roam(idx, new_src)` iff it authenticated.
+    SessionRoam {
+        tunn: Arc<tokio::sync::Mutex<Tunn>>,
+        ingress: Ingress,
+        tun_tx: mpsc::Sender<Vec<u8>>,
+        idx: u32,
+        new_src: SocketAddr,
+    },
     ForwardInit(mpsc::Sender<DirectInbound>),
     Drop,
 }
@@ -633,6 +717,7 @@ impl PlaneHandle {
         tunn: Arc<tokio::sync::Mutex<Tunn>>,
         ingress: Ingress,
         expected_src: SocketAddr,
+        carrier: std::sync::Weak<Carrier>,
     ) {
         let mut st = self.plane.lock();
         let Some(tun_tx) = st
@@ -659,6 +744,8 @@ impl PlaneHandle {
                     ingress,
                     tun_tx,
                     expected_src,
+                    carrier,
+                    last_roam: None,
                 },
             )
             .is_some()
@@ -1254,6 +1341,52 @@ mod tests {
                 .is_err(),
             "org 1's engine received a packet that belongs to org 2"
         );
+    }
+
+    /// A3 — the plane roam decision + commit seam: a sessionful datagram from
+    /// a NEW source (same receiver index) routes as a roam candidate; commit
+    /// moves `expected_src`, rekeys `by_src`, bumps the counter, and is
+    /// rate-limited; the original source still routes as a plain session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plane_roam_adopts_by_index_gated_and_rate_limited() {
+        let my_kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let plane = CarrierPlane::new();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        plane.adopt_socket(sock.clone());
+        let (mut dev, _rx) = engine(&plane, &my_kp).await;
+
+        let old_src: SocketAddr = "203.0.113.9:41000".parse().unwrap();
+        let ip = Ipv4Addr::new(100, 65, 4, 9);
+        // First registration in a fresh plane → session index 1.
+        dev.add_direct_peer(sock.clone(), peer_kp.public.to_bytes(), ip, old_src, false)
+            .await;
+        let idx = 1u32;
+
+        // Same source → plain session (no roam).
+        assert!(matches!(
+            plane.route_by_index(idx, old_src),
+            Routed::Session { .. }
+        ));
+        // New source (roam ON by default) → roam candidate naming the new src.
+        let new_src: SocketAddr = "198.51.100.5:52000".parse().unwrap();
+        match plane.route_by_index(idx, new_src) {
+            Routed::SessionRoam { new_src: n, .. } => assert_eq!(n, new_src),
+            _ => panic!("expected a roam candidate for a known index from a new source"),
+        }
+
+        // Commit the roam (as handle_datagram does after authentication).
+        let before = crate::evidence::ROAM_ADOPTIONS.load(Ordering::Relaxed);
+        plane.commit_roam(idx, new_src);
+        assert!(crate::evidence::ROAM_ADOPTIONS.load(Ordering::Relaxed) > before);
+        // The new source is now the session's expected source…
+        assert!(matches!(
+            plane.route_by_index(idx, new_src),
+            Routed::Session { .. }
+        ));
+        // …and immediately re-roaming to a THIRD source is rate-limited (drop).
+        let third: SocketAddr = "198.51.100.6:53000".parse().unwrap();
+        assert!(matches!(plane.route_by_index(idx, third), Routed::Drop));
     }
 
     /// An initiation from an unknown source is trial-authenticated against
