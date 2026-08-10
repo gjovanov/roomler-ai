@@ -349,6 +349,11 @@ impl LocalApiState for DaemonState {
             mux_nat_rewrites: Some(mux_nat_rewrites),
             mux_nat_restores: Some(mux_nat_restores),
             skip_as_source_flips: Some(skip_as_source_flips),
+            // PR-B1 — per-socket receive liveness + band-walk tripwire.
+            direct_socks: self.overlay.borrow().direct_socks.clone(),
+            direct_bind_walks: Some(
+                tunnel_core::evidence::DIRECT_BIND_WALKS.load(Ordering::Relaxed),
+            ),
         }
     }
 
@@ -1009,6 +1014,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            direct_socks: Vec::new(),
         }
     }
 
