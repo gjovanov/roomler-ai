@@ -29,6 +29,13 @@ pub static SKIP_AS_SOURCE_FLIPS: AtomicU64 = AtomicU64::new(0);
 /// sockets. Nonzero on a quiet host is a bug signal, not noise.
 pub static DIRECT_BIND_WALKS: AtomicU64 = AtomicU64::new(0);
 
+/// A3 — peer endpoints ADOPTED via WG-style roaming: an authenticated inbound
+/// from a source other than the peer's registered endpoint repointed the
+/// carrier. Expected to tick a few times as a symmetric-NAT peer's real
+/// mapping is learned, then settle; a steadily climbing count means endpoint
+/// thrash (a roam war or a spoof-probe storm) — worth a look, not silent.
+pub static ROAM_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
+
 /// One relaxed snapshot of all three, in declaration order.
 pub fn snapshot() -> (u64, u64, u64) {
     (
