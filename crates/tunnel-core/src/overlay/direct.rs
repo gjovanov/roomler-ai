@@ -907,6 +907,21 @@ pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> 
     None
 }
 
+/// A3 — WG-style endpoint roaming (`ROOMLER_NODE_OVERLAY_ROAM`, legacy
+/// `ROOMLER_AGENT_…`; default **ON**): adopt a peer's observed source after an
+/// AUTHENTICATED inbound from it, repointing the carrier in place. The kill
+/// switch reverts to the strict no-roam demux. Off ⇒ a symmetric-NAT peer
+/// whose real per-destination mapping differs from its advert stays on relay,
+/// and a mid-session NAT rebind waits out the rx-staleness rebuild.
+pub fn roam_enabled() -> bool {
+    crate::env::flag("OVERLAY_ROAM", true)
+}
+
+/// A3 — minimum interval between endpoint adoptions for ONE session: bounds
+/// roam thrash / a spoof-probe storm to ≤1 move/session/interval. A genuine
+/// symmetric-NAT punch adopts once and settles; a rebind is rare.
+pub(crate) const ROAM_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Phase C — resolve up to THREE DISTINCT STUN targets for the NAT-type probe.
 /// The probe compares our mapped address as different servers see it: all the
 /// same ⇒ endpoint-independent mapping (cone — hole-punchable); ANY pairwise
