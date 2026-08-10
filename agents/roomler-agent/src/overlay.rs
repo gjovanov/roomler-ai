@@ -657,17 +657,33 @@ static ORG_TUN_CACHE: std::sync::Mutex<
     >,
 > = std::sync::Mutex::new(None);
 
+/// Multi-org v2 — a per-org adapter name that FITS the OS limit. Linux caps
+/// interface names at `IFNAMSIZ-1` = 15 usable chars, and the base `IF_NAME`
+/// differs per platform (`roomler` on Windows = 7, `roomler0` on Linux = 8),
+/// so the naive `roomler0-<7hex>` (16) overflows on Linux and the kernel
+/// rejects it — the secondary org's TUN never comes up. The tenant suffix is
+/// truncated to whatever fits after `<IF_NAME>-`: Windows keeps 7 hex
+/// (`roomler-6a712a5`), Linux keeps 6 (`roomler0-6a712a`). Deterministic per
+/// (machine, org) — the suffix is a stable tenant-id prefix, and the FULL
+/// tenant still drives the distinct per-org GUID, so a 6-hex-prefix clash
+/// (negligible for a machine's handful of orgs) can't alias two devices.
+fn per_org_ifname(if_name: &str, org_key: &str) -> String {
+    const MAX_IFNAME: usize = 15; // IFNAMSIZ - 1 (Linux); Windows aliases allow more
+    let max_suffix = MAX_IFNAME.saturating_sub(if_name.len() + 1);
+    let short = &org_key[..org_key.len().min(max_suffix)];
+    format!("{if_name}-{short}")
+}
+
 /// Multi-org v2 — the per-org twin of [`systun_tun_factory`]: this org gets
 /// its OWN adapter with its own name, stable per-org GUID, and a derived-ULA
 /// on-link NARROWED to its block (`96 + v4_plen`), so N adapters hold
 /// nested-or-disjoint v6 prefixes and longest-prefix picks the right one.
 ///
-/// Naming: the primary KEEPS the legacy `roomler` name + GUID (no adapter
-/// churn on the mode flip); a secondary is `roomler-<first 7 hex of its
-/// tenant id>` — derived from what the factory already has, fits Linux
-/// IFNAMSIZ, and stays stable across restarts. The primary's on-link is
-/// narrowed too: its whole-/96 would otherwise cover every sibling's
-/// embedded ULA range.
+/// Naming: the primary KEEPS the legacy `IF_NAME` (`roomler` / `roomler0`) +
+/// GUID (no adapter churn on the mode flip); a secondary is
+/// [`per_org_ifname`] (length-clamped for Linux IFNAMSIZ) with a stable
+/// per-org GUID. The primary's on-link is narrowed too: its whole-/96 would
+/// otherwise cover every sibling's embedded ULA range.
 #[cfg(feature = "overlay-l3")]
 fn per_org_systun_factory(org_key: String, is_primary: bool) -> Option<TunFactory> {
     use tunnel_core::overlay::tun::{IF_NAME, TunOptions, org_tun_guid};
@@ -676,8 +692,7 @@ fn per_org_systun_factory(org_key: String, is_primary: bool) -> Option<TunFactor
         let mut opts = TunOptions::legacy(ip, nm, mtu);
         opts.v6_onlink_plen = 96 + plen;
         if !is_primary {
-            let short = &org_key[..org_key.len().min(7)];
-            opts.name = format!("{IF_NAME}-{short}");
+            opts.name = per_org_ifname(IF_NAME, &org_key);
             opts.guid = org_tun_guid(&org_key);
         }
         if !tunnel_core::env::flag("OVERLAY_TUN_PERSIST", true) {
@@ -954,6 +969,36 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
         warn!("overlay: event channel full/closed; dropping a netmap update");
     }
     None
+}
+
+#[cfg(test)]
+mod ifname_tests {
+    use super::per_org_ifname;
+
+    /// The per-org adapter name must never exceed Linux's 15-char IFNAMSIZ
+    /// limit — the bug the zeus canary caught: `roomler0-<7hex>` = 16.
+    #[test]
+    fn per_org_ifname_fits_ifnamsiz_on_every_platform() {
+        let tenant = "6a712a572ceed780ac1ccbce";
+        // Linux base "roomler0" (8): 15 - 9 = 6-hex suffix → 15 total.
+        let linux = per_org_ifname("roomler0", tenant);
+        assert_eq!(linux, "roomler0-6a712a");
+        assert!(linux.len() <= 15, "linux name too long: {linux}");
+        // Windows base "roomler" (7): 15 - 8 = 7-hex suffix → 15 total
+        // (unchanged from the pre-fix Windows behavior, which already fit).
+        let win = per_org_ifname("roomler", tenant);
+        assert_eq!(win, "roomler-6a712a5");
+        assert!(win.len() <= 15, "windows name too long: {win}");
+        // A short org key never overflows and keeps its full suffix.
+        assert_eq!(per_org_ifname("roomler0", "abc"), "roomler0-abc");
+        // Distinct tenants that share a 6-hex prefix would clash on NAME —
+        // acceptable (the full-tenant GUID still differs), and real fleet
+        // tenants (grox 69a1…, jovanov 6a71…) don't even share the first char.
+        assert_ne!(
+            per_org_ifname("roomler0", "69a1dbbad2000f26adc875ce"),
+            per_org_ifname("roomler0", "6a712a572ceed780ac1ccbce")
+        );
+    }
 }
 
 #[cfg(test)]
