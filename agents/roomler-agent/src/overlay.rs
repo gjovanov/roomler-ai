@@ -116,11 +116,12 @@ static SHARED_PLANE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 /// The plane when the flag is on (`OVERLAY_SHARED_CARRIER` / config
-/// `overlay_shared_carrier`, built-in default OFF), else `None` — the
-/// runtime then binds per-runtime sockets exactly as before.
+/// `overlay_shared_carrier`, built-in default ON since rc.339 — explicit
+/// `false` is the kill switch), else `None` — the runtime then binds
+/// per-runtime sockets exactly as before.
 fn shared_carrier_plane()
 -> Option<std::sync::Arc<tunnel_core::overlay::carrier_plane::CarrierPlane>> {
-    if !tunnel_core::env::flag("OVERLAY_SHARED_CARRIER", false) {
+    if !tunnel_core::env::flag("OVERLAY_SHARED_CARRIER", true) {
         return None;
     }
     let mut g = SHARED_PLANE.lock().unwrap_or_else(|e| e.into_inner());
@@ -250,9 +251,10 @@ pub async fn maybe_start(
         // Multi-org v2 — per-org adapters: each org gets its OWN device
         // (own address space, own route domain; one address per adapter, so
         // OS source selection is trivially correct and the mux NAT /
-        // SkipAsSource compensations never engage). Default OFF: the
-        // shared-TUN mux stays the fallback until the fleet soak flips it.
-        if tunnel_core::env::flag("OVERLAY_TUN_PER_ORG", false) {
+        // SkipAsSource compensations never engage). Default ON since rc.339
+        // (4-host field soak); explicit `false` falls back to the shared-TUN
+        // mux until the compensation stack is deleted.
+        if tunnel_core::env::flag("OVERLAY_TUN_PER_ORG", true) {
             per_org_systun_factory(cfg.tenant_id.clone(), !cfg.derived_org)?
         } else {
             mux_systun_factory(cfg.tenant_id.clone())?
