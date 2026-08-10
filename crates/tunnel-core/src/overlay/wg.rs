@@ -32,7 +32,7 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::ingress::{dst_ip_of, parse_l4, rules_permit};
 use super::router::{LocalScope, Router, RpfMode, RpfVerdict};
@@ -95,7 +95,13 @@ pub enum Carrier {
     /// Tier 1: direct UDP to the peer's (possibly hole-punched) endpoint.
     Direct {
         sock: Arc<UdpSocket>,
-        dst: SocketAddr,
+        /// A3 (WG-style roaming) — interior-mutable so an AUTHENTICATED
+        /// inbound from a new source can repoint our outbound in place
+        /// ([`Carrier::set_direct_dst`]): every holder of this `Arc` (the
+        /// send pump's `SendPeer` mirror, the timer task) follows instantly,
+        /// with no channel round-trip through the runtime. Uncontended
+        /// `RwLock` read per send — noise next to the syscall.
+        dst: std::sync::RwLock<SocketAddr>,
         /// Latched when `send` reports that the LOCAL end is gone — the bound
         /// source address vanished, or its interface lost its route. See the
         /// errno filter in [`Carrier::send`]: an ordinary dropped datagram
@@ -135,9 +141,31 @@ impl Carrier {
     pub fn direct(sock: Arc<UdpSocket>, dst: SocketAddr) -> Arc<Self> {
         Arc::new(Carrier::Direct {
             sock,
-            dst,
+            dst: std::sync::RwLock::new(dst),
             dead: AtomicBool::new(false),
         })
+    }
+
+    /// A3 — the current direct dst, `None` for relay/QUIC carriers.
+    pub fn direct_dst(&self) -> Option<SocketAddr> {
+        match self {
+            Carrier::Direct { dst, .. } => Some(*dst.read().unwrap_or_else(|e| e.into_inner())),
+            _ => None,
+        }
+    }
+
+    /// A3 (WG-style roaming) — repoint a direct carrier's dst in place.
+    /// Returns the previous dst; no-op `None` on non-direct carriers. Callers
+    /// gate on CRYPTOGRAPHIC evidence (an inbound that decapsulated without
+    /// error against this peer's session) — never on packet shape alone.
+    pub fn set_direct_dst(&self, new: SocketAddr) -> Option<SocketAddr> {
+        match self {
+            Carrier::Direct { dst, .. } => {
+                let mut d = dst.write().unwrap_or_else(|e| e.into_inner());
+                Some(std::mem::replace(&mut *d, new))
+            }
+            _ => None,
+        }
     }
 
     pub fn relay(conn: Arc<dyn RelayConn>, dst: SocketAddr) -> Arc<Self> {
@@ -254,7 +282,8 @@ impl Carrier {
             // ICMP-induced error, which is exactly the trap the old
             // always-false behaviour was avoiding.
             Carrier::Direct { sock, dst, dead } => {
-                let r = sock.send_to(buf, *dst).await;
+                let d = *dst.read().unwrap_or_else(|e| e.into_inner());
+                let r = sock.send_to(buf, d).await;
                 if let Err(e) = &r
                     && matches!(
                         e.kind(),
@@ -583,6 +612,22 @@ struct Peer {
     /// instead of the device demux. Removal/replacement unregisters by THIS
     /// key (indices never alias; source addresses can).
     plane_idx: Option<u32>,
+    /// A3 — the session index in the DEVICE demux's roaming side-map
+    /// ([`DirectDemux::index_routes`]), for device-mode direct peers. After a
+    /// roam the source-keyed entry lives under the ADOPTED source, so removal
+    /// resolves the current key through this index (the stale `direct_src`
+    /// would miss it). `None` for plane-mode (plane_idx covers it) and
+    /// relay peers.
+    direct_index: Option<u32>,
+}
+
+/// A3 — one session's roaming state in the device demux's index side-map:
+/// the CURRENT source key of its `DemuxRoutes` entry, the peer's carrier (to
+/// repoint outbound in place), and the last adoption instant (rate limit).
+struct IndexSlot {
+    src: SocketAddr,
+    carrier: std::sync::Weak<Carrier>,
+    last_roam: Option<Instant>,
 }
 
 impl Drop for Peer {
@@ -611,6 +656,13 @@ struct DirectDemux {
     /// PR-B1 — per-socket receive liveness, in lockstep with `socks`/`tasks`
     /// (snapshotted into `NodeStatus.direct_socks`).
     stats: Vec<Arc<super::direct::SockStat>>,
+    /// A3 — session index → roaming slot, shared with every recv loop: lets
+    /// an AUTHENTICATED sessionful datagram from an unexpected source find
+    /// its session (the wire receiver index survives a source change; the
+    /// source key doesn't) and be adopted. Keyed `receiver_idx >> 8`.
+    /// `std::sync` mutex: never held across an await, and the sync
+    /// replacement paths (`promote_direct_probe`) must purge slots too.
+    index_routes: Arc<std::sync::Mutex<HashMap<u32, IndexSlot>>>,
 }
 
 /// P1 (S6) — the send-relevant triple of one routed peer, mirrored from
@@ -891,10 +943,39 @@ impl WgDevice {
         if let (Some(idx), Some(h)) = (p.plane_idx, &self.plane) {
             h.unregister_route(idx);
         }
+        // A3 — the device-mode twin: drop the replaced peer's roaming slot
+        // (index-keyed, never aliases the replacement's). If the old session
+        // ROAMED, its source-keyed entry no longer sits under the key the
+        // replacement overwrote — best-effort remove it (`try_lock`: the
+        // rare contended miss leaves a dead-Tunn entry whose inbound
+        // decap-fails harmlessly).
+        if let (Some(idx), Some(demux)) = (p.direct_index, &self.direct) {
+            let slot = demux
+                .index_routes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&idx);
+            if let Some(slot) = slot
+                && Some(slot.src) != p.direct_src
+            {
+                match demux.routes.try_lock() {
+                    Ok(mut routes) => {
+                        routes.remove(&slot.src);
+                    }
+                    Err(_) => debug!(
+                        src = %slot.src,
+                        "wg: roamed source entry left behind on contended replacement"
+                    ),
+                }
+            }
+        }
     }
 
     /// Full demux cleanup for a peer leaving entirely (no replacement):
     /// plane route by index, or the device-local source-keyed entry.
+    /// (`unregister_plane_route` above already dropped the A3 roaming slot
+    /// and any roamed-away source entry; the original-key remove below is a
+    /// harmless miss when the session had roamed.)
     async fn unregister_direct(&self, p: &Peer) {
         self.unregister_plane_route(p);
         if p.plane_idx.is_none()
@@ -1160,6 +1241,7 @@ impl WgDevice {
                 stats: stats.clone(),
                 direct_src: None,
                 plane_idx: None,
+                direct_index: None,
             },
         ) {
             self.unregister_plane_route(&old);
@@ -1215,6 +1297,7 @@ impl WgDevice {
             socks: Vec::new(),
             tasks: Vec::new(),
             stats: Vec::new(),
+            index_routes: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         // One recv loop per interface socket, all feeding the shared `routes`.
         // Idempotent per interface so repeated installs don't spawn duplicates.
@@ -1229,6 +1312,7 @@ impl WgDevice {
         let task = tokio::spawn(run_direct_demux(
             sock.clone(),
             demux.routes.clone(),
+            demux.index_routes.clone(),
             tun_tx,
             self.direct_events_tx.clone(),
             self.stun_events_tx.clone(),
@@ -1293,11 +1377,7 @@ impl WgDevice {
         let Some((tunn, ingress)) = entry else {
             return;
         };
-        let reply = Arc::new(Carrier::Direct {
-            sock,
-            dst: src,
-            dead: AtomicBool::new(false),
-        });
+        let reply = Carrier::direct(sock, src);
         let mut buf = packet.to_vec();
         let n = buf.len();
         let mut t = tunn.lock().await;
@@ -1367,21 +1447,34 @@ impl WgDevice {
         let ingress = self.ingress_for(peer_public, stats.clone());
         // Register for demux BEFORE the handshake so inbound is routed —
         // on the plane by session index (unique across every attached
-        // engine), else in the device's source-keyed table.
-        let plane_idx = match &self.plane {
+        // engine), else in the device's source-keyed table. Both register
+        // the carrier weakly (A3) so an authenticated roam can repoint the
+        // outbound in place without a runtime round-trip.
+        let (plane_idx, direct_index) = match &self.plane {
             Some(h) => {
-                h.register_route(index, tunn.clone(), ingress, dst);
-                Some(index)
+                h.register_route(index, tunn.clone(), ingress, dst, Arc::downgrade(&carrier));
+                (Some(index), None)
             }
             None => {
-                self.direct
-                    .as_ref()
-                    .expect("checked above")
+                let demux = self.direct.as_ref().expect("checked above");
+                demux
                     .routes
                     .lock()
                     .await
                     .insert(dst, (tunn.clone(), ingress));
-                None
+                demux
+                    .index_routes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        index,
+                        IndexSlot {
+                            src: dst,
+                            carrier: Arc::downgrade(&carrier),
+                            last_roam: None,
+                        },
+                    );
+                (None, Some(index))
             }
         };
 
@@ -1450,6 +1543,7 @@ impl WgDevice {
             stats,
             direct_src: Some(dst),
             plane_idx,
+            direct_index,
         })
     }
 
@@ -1904,6 +1998,12 @@ impl WgDevice {
 /// Handle one inbound carrier datagram: decapsulate, echo any
 /// handshake/cookie/queued bytes back over the carrier, and deliver a
 /// decrypted IP packet to the TUN channel.
+///
+/// A3 — returns `true` iff the datagram AUTHENTICATED: non-empty and
+/// decapsulated without error against this session (data, a handshake step,
+/// or a keepalive — the same predicate `rx_any` liveness keys on). This is
+/// the roaming gate: an endpoint is adopted only on cryptographic proof,
+/// never on packet shape.
 pub(crate) async fn process_inbound(
     t: &mut Tunn,
     n: usize,
@@ -1911,12 +2011,13 @@ pub(crate) async fn process_inbound(
     carrier: &Arc<Carrier>,
     tun_tx: &mpsc::Sender<Vec<u8>>,
     ingress: &Ingress,
-) {
+) -> bool {
     let stats = &ingress.stats;
     // Decapsulate writes into a separate scratch buffer so the borrow on
     // the result doesn't alias the inbound `buf`.
     let mut out = vec![0u8; WG_BUF];
     let res = t.decapsulate(None, &buf[..n], &mut out);
+    let authenticated = n > 0 && !matches!(res, TunnResult::Err(_));
     // rc.206 — a non-empty inbound datagram that passed WG decapsulation (data, a
     // handshake step, OR a content-free persistent-keepalive → `Done`) proves we
     // HEARD from this peer: the liveness signal the health sweep keys rx-staleness
@@ -1925,7 +2026,7 @@ pub(crate) async fn process_inbound(
     // decapsulates to `Done` (boringtun's poll-for-queued-output shape — what the
     // flush loop below relies on), but a 0-byte UDP payload is never a real WG
     // packet, so it must not count as liveness. `Err` (replay / garbage) isn't.
-    if n > 0 && !matches!(res, TunnResult::Err(_)) {
+    if authenticated {
         stats.rx_any.fetch_add(1, Ordering::Relaxed);
         // Stage 2 — a HANDSHAKE RESPONSE (type 2) that decapsulated without
         // error means a handshake WE initiated just completed: boringtun only
@@ -2000,6 +2101,7 @@ pub(crate) async fn process_inbound(
             .handshake_at
             .store(mono_ms_now().max(1), Ordering::Relaxed);
     }
+    authenticated
 }
 
 /// Phase C — the WireGuard datagram shape: a 4-byte little-endian message type
@@ -2057,6 +2159,7 @@ pub(crate) fn authenticate_init_with(
 async fn run_direct_demux(
     sock: Arc<UdpSocket>,
     routes: Arc<Mutex<DemuxRoutes>>,
+    index_routes: Arc<std::sync::Mutex<HashMap<u32, IndexSlot>>>,
     tun_tx: mpsc::Sender<Vec<u8>>,
     events: mpsc::Sender<DirectInbound>,
     stun_events: mpsc::Sender<crate::transport::stun::StunInbound>,
@@ -2100,6 +2203,66 @@ async fn run_direct_demux(
         // contended only briefly.
         let entry = routes.lock().await.get(&src).cloned();
         let Some((tunn, ingress)) = entry else {
+            // A3 (WG-style roaming, `OVERLAY_ROAM`) — a SESSIONFUL datagram
+            // (response / data / cookie) from an unknown source still names
+            // its session by RECEIVER INDEX; adopt the observed source iff
+            // the payload AUTHENTICATES against that session (rate-limited
+            // per session). This is what completes a punch from a
+            // symmetric-NAT peer: its real per-destination mapping differs
+            // from its advert, so its packets arrive from a source nobody
+            // registered — and what follows a mid-session NAT rebind.
+            if super::direct::roam_enabled()
+                && let Ok(pkt) = Tunn::parse_incoming_packet(&buf[..n])
+                && let Some(idx) = match &pkt {
+                    Packet::HandshakeResponse(p) => Some(p.receiver_idx >> 8),
+                    Packet::PacketCookieReply(p) => Some(p.receiver_idx >> 8),
+                    Packet::PacketData(p) => Some(p.receiver_idx >> 8),
+                    Packet::HandshakeInit(_) => None,
+                }
+            {
+                let slot = {
+                    let m = index_routes.lock().unwrap_or_else(|e| e.into_inner());
+                    m.get(&idx).map(|s| (s.src, s.carrier.clone(), s.last_roam))
+                };
+                if let Some((old_src, weak, last)) = slot
+                    && old_src != src
+                    && last.is_none_or(|t| t.elapsed() >= super::direct::ROAM_MIN_INTERVAL)
+                {
+                    let sess = routes.lock().await.get(&old_src).cloned();
+                    if let Some((tunn, ingress)) = sess {
+                        let reply = Carrier::direct(sock.clone(), src);
+                        let authenticated = {
+                            let mut t = tunn.lock().await;
+                            process_inbound(&mut t, n, &mut buf, &reply, &tun_tx, &ingress).await
+                        };
+                        if authenticated {
+                            {
+                                let mut r = routes.lock().await;
+                                if let Some(e) = r.remove(&old_src) {
+                                    r.insert(src, e);
+                                }
+                            }
+                            {
+                                let mut m = index_routes.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(s) = m.get_mut(&idx) {
+                                    s.src = src;
+                                    s.last_roam = Some(Instant::now());
+                                }
+                            }
+                            if let Some(c) = weak.upgrade() {
+                                c.set_direct_dst(src);
+                            }
+                            crate::evidence::ROAM_ADOPTIONS.fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                %old_src, new_src = %src, idx,
+                                "wg: peer endpoint ROAMED — authenticated inbound from a new \
+                                 source adopted (outbound repointed)"
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
             // Phase A — an UNKNOWN source is no longer unconditionally dropped:
             // if the datagram is a well-formed WG handshake INITIATION, forward
             // it to the runtime (a NAT'd peer dialling our public endpoint, or
@@ -2128,11 +2291,7 @@ async fn run_direct_demux(
             }
             continue;
         };
-        let reply = Arc::new(Carrier::Direct {
-            sock: sock.clone(),
-            dst: src,
-            dead: AtomicBool::new(false),
-        });
+        let reply = Carrier::direct(sock.clone(), src);
         let mut t = tunn.lock().await;
         process_inbound(&mut t, n, &mut buf, &reply, &tun_tx, &ingress).await;
     }
@@ -2174,6 +2333,20 @@ mod tests {
     use super::*;
     use crate::overlay::WgKeypair;
     use std::time::Duration;
+
+    /// A3 — a direct carrier's dst is interior-mutable so an authenticated
+    /// roam repoints it in place for every `Arc` holder; relay/QUIC carriers
+    /// have no direct dst.
+    #[tokio::test]
+    async fn carrier_direct_dst_roundtrips() {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let a: SocketAddr = "203.0.113.9:41000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.5:52000".parse().unwrap();
+        let c = Carrier::direct(sock, a);
+        assert_eq!(c.direct_dst(), Some(a));
+        assert_eq!(c.set_direct_dst(b), Some(a)); // returns the previous dst
+        assert_eq!(c.direct_dst(), Some(b)); // every Arc holder now sees b
+    }
 
     /// Minimal well-formed IPv4 packet so boringtun routes it to
     /// `WriteToTunnelV4` (correct version nibble + total-length field +
