@@ -140,6 +140,31 @@ pub struct NodeStatus {
     pub mux_nat_restores: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_as_source_flips: Option<u64>,
+    /// PR-B1 — per-bound-direct-socket receive liveness, copied verbatim from
+    /// [`OverlayView::direct_socks`]. A socket whose `rx_pkts` is frozen while
+    /// peers punch its advertised endpoint is the 2026-08-10 wedge signature
+    /// (bound, reader-less, Recv-Q pegged). Empty from older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_socks: Vec<DirectSockStatus>,
+    /// PR-B1 tripwire — direct-socket binds that walked off the stable base
+    /// port this run ([`crate::evidence::DIRECT_BIND_WALKS`]). Nonzero on a
+    /// host with a configured stable port = external squatter OR an
+    /// in-process bind collision (bug signal). `None` from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_bind_walks: Option<u64>,
+}
+
+/// PR-B1 — one bound direct socket's receive liveness (plane or per-device
+/// demux). See [`NodeStatus::direct_socks`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DirectSockStatus {
+    /// The socket's bound `ip:port` (the wildcard public dialer is labeled).
+    pub local: String,
+    /// Datagrams the owning recv loop actually READ (cumulative since bind).
+    pub rx_pkts: u64,
+    /// Seconds since the last read datagram; `None` = never read one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rx_age_s: Option<u64>,
 }
 
 /// Multi-org P1 — one enrollment's live state (see [`NodeStatus::orgs`]).
@@ -761,6 +786,11 @@ pub struct OverlayView {
     /// on every gather (success or failure). The daemon copies it verbatim
     /// into [`NodeStatus::srflx`]. `None` before the first gather.
     pub srflx: Option<SrflxStatus>,
+    /// PR-B1 — per-bound-direct-socket receive liveness, filled by the overlay
+    /// runtime on every view publish (plane stats when the shared carrier
+    /// plane is on, per-device demux stats otherwise). The daemon copies it
+    /// verbatim into [`NodeStatus::direct_socks`].
+    pub direct_socks: Vec<DirectSockStatus>,
 }
 
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
@@ -1798,6 +1828,8 @@ mod tests {
                 mux_nat_rewrites: None,
                 mux_nat_restores: None,
                 skip_as_source_flips: None,
+                direct_socks: Vec::new(),
+                direct_bind_walks: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {

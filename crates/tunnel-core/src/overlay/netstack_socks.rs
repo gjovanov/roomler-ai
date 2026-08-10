@@ -347,6 +347,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            direct_socks: Vec::new(),
         };
         assert_eq!(
             resolve_overlay_host(&view, "100.64.0.9"),
@@ -420,6 +421,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            direct_socks: Vec::new(),
         });
         tokio::spawn(serve_socks5(handle_rx, view_rx, socks));
         (a, b, socks_addr, (handle_tx, view_tx))
