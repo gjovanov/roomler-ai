@@ -138,9 +138,15 @@ struct PlaneState {
     /// The shared srflx state every attached runtime mirrors onto its own
     /// control WS (see [`SrflxShared`]).
     srflx_watch: tokio::sync::watch::Sender<SrflxShared>,
-    /// The plane keepalive task, once armed (held for a future teardown;
-    /// today the plane is process-lifetime).
+    /// The plane keepalive task, once armed (aborted + re-armed by the
+    /// rebuild — the plane itself is process-lifetime).
     keepalive: Option<JoinHandle<()>>,
+    /// P1-d — the runtimes subscribed to rebuild steps ([`PlaneEvent`]).
+    subscribers: Vec<mpsc::Sender<PlaneEvent>>,
+    /// P1-d — rebuild-in-flight latch + cooldown stamp (the plane twin of
+    /// the per-runtime `pending_rebuild`/`last_rebuild` pair).
+    rebuilding: bool,
+    last_rebuild: Option<Instant>,
 }
 
 /// The shared direct-carrier plane. See the module docs.
@@ -171,6 +177,9 @@ impl CarrierPlane {
                 stun_rx: Some(stun_rx),
                 srflx_watch,
                 keepalive: None,
+                subscribers: Vec::new(),
+                rebuilding: false,
+                last_rebuild: None,
             }),
             index_alloc: AtomicU32::new(0),
             srflx_gate: tokio::sync::Mutex::new(false),
@@ -885,6 +894,130 @@ impl CarrierPlane {
     }
 }
 
+/// Multi-org v2 P1-d — one step of the plane-wide direct-socket rebuild,
+/// delivered to every subscribed runtime.
+pub enum PlaneEvent {
+    /// Release every socket-pinning Arc (direct carriers, probes, the
+    /// runtime's `DirectCtx` view), then ack — the plane re-binds only when
+    /// every engine has released (or the 3 s straggler timeout fires; the
+    /// band walk absorbs a lingering port).
+    Teardown { ack: mpsc::Sender<()> },
+    /// The plane re-bound its socket set: re-join from the new endpoints,
+    /// re-gather (the plane's srflx cache was reset), re-install.
+    Ready,
+}
+
+impl CarrierPlane {
+    /// P1-d — subscribe a runtime to the plane's rebuild steps. One
+    /// subscription per attached runtime; a dropped receiver is pruned on
+    /// the next rebuild.
+    pub fn subscribe_events(&self) -> mpsc::Receiver<PlaneEvent> {
+        let (tx, rx) = mpsc::channel(4);
+        self.lock().subscribers.push(tx);
+        rx
+    }
+
+    /// P1-d — request a plane-wide rebuild. Debounced: an in-flight rebuild
+    /// swallows the request, and a non-authoritative one (net-change storms)
+    /// also respects [`REBUILD_COOLDOWN`](super::runtime::REBUILD_COOLDOWN);
+    /// authoritative triggers (resume, the embedder's fingerprint push)
+    /// bypass the cooldown, matching the per-runtime R3 semantics. Sync —
+    /// the executor runs on its own task, so any select arm can call this.
+    pub fn request_rebuild(self: &Arc<Self>, reason: &'static str, authoritative: bool) {
+        {
+            let mut st = self.lock();
+            if st.rebuilding {
+                return;
+            }
+            if !authoritative
+                && let Some(t) = st.last_rebuild
+                && t.elapsed() < super::runtime::REBUILD_COOLDOWN
+            {
+                return;
+            }
+            st.rebuilding = true;
+        }
+        let plane = self.clone();
+        tokio::spawn(async move { plane.run_rebuild(reason).await });
+    }
+
+    /// The rebuild executor: Teardown to every runtime → await acks (3 s
+    /// straggler timeout — a wedged org must not block the plane) → drop the
+    /// binds (recv loops + socket Arcs) → fresh STUN sink + srflx cache
+    /// reset → re-bind → Ready to every runtime. Ordering is load-bearing
+    /// exactly as in the per-runtime R3 it replaces: the ports only free
+    /// once every carrier/probe/view Arc is gone.
+    async fn run_rebuild(self: Arc<Self>, reason: &'static str) {
+        warn!(
+            reason,
+            "carrier plane: rebuilding the shared socket set for every org"
+        );
+        let subs: Vec<mpsc::Sender<PlaneEvent>> = {
+            let mut st = self.lock();
+            st.subscribers.retain(|s| !s.is_closed());
+            st.subscribers.clone()
+        };
+        let (ack_tx, mut ack_rx) = mpsc::channel::<()>(subs.len().max(1));
+        let mut expected = 0usize;
+        for s in &subs {
+            if s.try_send(PlaneEvent::Teardown {
+                ack: ack_tx.clone(),
+            })
+            .is_ok()
+            {
+                expected += 1;
+            }
+        }
+        drop(ack_tx);
+        let acked = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut n = 0usize;
+            while n < expected && ack_rx.recv().await.is_some() {
+                n += 1;
+            }
+            n
+        })
+        .await
+        .unwrap_or(0);
+        if acked < expected {
+            warn!(
+                acked,
+                expected,
+                "carrier plane: teardown ack timeout — re-binding anyway (band walk absorbs \
+                 a straggler's lingering port)"
+            );
+        }
+        let had_binds = {
+            let mut st = self.lock();
+            if let Some(h) = st.keepalive.take() {
+                h.abort();
+            }
+            // Fresh STUN sink: retired recv loops keep the dead sender; the
+            // loops adopted below clone the new one — the same discipline as
+            // the device-side `replace_stun_events`.
+            let (tx, rx) = mpsc::channel(16);
+            st.stun_tx = tx;
+            st.stun_rx = Some(rx);
+            // Dropping the binds aborts the recv loops and releases the
+            // plane's own socket Arcs.
+            st.binds.take().is_some()
+        };
+        // The srflx result was measured through sockets that no longer
+        // exist — the next `ensure_srflx` re-gathers on the new binds.
+        *self.srflx_gate.lock().await = false;
+        if had_binds && self.ensure_bound().await.is_none() {
+            warn!("carrier plane: re-bind found no usable LAN interface — direct path off");
+        }
+        {
+            let mut st = self.lock();
+            st.rebuilding = false;
+            st.last_rebuild = Some(Instant::now());
+            for s in &st.subscribers {
+                let _ = s.try_send(PlaneEvent::Ready);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Multi-org v2 proof: N engines share ONE socket pair and the plane
@@ -1081,5 +1214,46 @@ mod tests {
                 assert!(seen.insert(idx), "index handed out twice: {idx}");
             }
         }
+    }
+
+    /// P1-d protocol lock: a rebuild delivers Teardown to every subscriber,
+    /// waits for their acks, then delivers Ready; a second request while one
+    /// is in flight is swallowed, a non-authoritative one inside the
+    /// cooldown is swallowed, and an authoritative one is not. The no-ack
+    /// straggler path re-binds after the timeout (paused time). Runs on an
+    /// UNBOUND plane — protocol only; the bind half is the runtime's own
+    /// rebuild coverage.
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_delivers_teardown_then_ready_to_every_subscriber() {
+        let plane = CarrierPlane::new();
+        let mut r1 = plane.subscribe_events();
+        let mut r2 = plane.subscribe_events();
+
+        plane.request_rebuild("test", true);
+        plane.request_rebuild("test-dup", true); // swallowed: in flight
+
+        let a1 = match r1.recv().await {
+            Some(PlaneEvent::Teardown { ack }) => ack,
+            _ => panic!("subscriber 1 expected Teardown"),
+        };
+        let a2 = match r2.recv().await {
+            Some(PlaneEvent::Teardown { ack }) => ack,
+            _ => panic!("subscriber 2 expected Teardown"),
+        };
+        a1.send(()).await.unwrap();
+        a2.send(()).await.unwrap();
+        assert!(matches!(r1.recv().await, Some(PlaneEvent::Ready)));
+        assert!(matches!(r2.recv().await, Some(PlaneEvent::Ready)));
+
+        // Cooldown (real-time clock): a net-change right after is swallowed…
+        plane.request_rebuild("net-change", false);
+        // …an authoritative resume is not. Nobody acks this round — the 3 s
+        // straggler timeout (paused tokio time auto-advances) re-binds and
+        // Ready still arrives.
+        plane.request_rebuild("resume", true);
+        assert!(matches!(r1.recv().await, Some(PlaneEvent::Teardown { .. })));
+        assert!(matches!(r2.recv().await, Some(PlaneEvent::Teardown { .. })));
+        assert!(matches!(r1.recv().await, Some(PlaneEvent::Ready)));
+        assert!(matches!(r2.recv().await, Some(PlaneEvent::Ready)));
     }
 }

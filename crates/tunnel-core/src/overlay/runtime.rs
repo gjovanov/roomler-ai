@@ -898,7 +898,7 @@ fn spawn_plane_srflx_forwarder(
 /// it — those are authoritative). A rebuild is cheap but not free (~900 ms
 /// worst-case port re-bind + a full re-establish wave), and interface
 /// events arrive in storms.
-const REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
+pub(crate) const REBUILD_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// How the runtime obtains a carrier for each peer.
 enum CarrierMode {
@@ -1431,10 +1431,12 @@ impl OverlayRuntime {
         let (mut wg, tun_rx) = WgDevice::new(self.keypair.secret.clone());
         // Multi-org v2 — attach the device to the shared carrier plane BEFORE
         // any peer installs: sessions then register on the plane's
-        // receiver-index demux instead of the device's source-keyed one.
-        if let Some(plane) = &self.carrier_plane {
+        // receiver-index demux instead of the device's source-keyed one. The
+        // events subscription is P1-d's rebuild protocol (Teardown/Ready).
+        let mut plane_events = self.carrier_plane.as_ref().map(|plane| {
             wg.set_plane(plane.attach(wg.plane_hooks()));
-        }
+            plane.subscribe_events()
+        });
         let tun: Arc<dyn TunIo> = match (self.tun_factory)(self_v4, netmask, self.mtu) {
             Ok(t) => t,
             Err(e) => {
@@ -2001,8 +2003,15 @@ impl OverlayRuntime {
                         // the sockets verbatim (the pre-R3 behavior). The
                         // executor below rebinds + re-joins + re-gathers +
                         // installs; authoritative, so the cooldown clears.
-                        pending_rebuild = Some("resume");
-                        last_rebuild = None;
+                        if let Some(plane) = &self.carrier_plane {
+                            // Multi-org v2 — the plane owns the sockets, so
+                            // the rebuild is plane-wide (every org tears
+                            // down, ONE re-bind, every org re-establishes).
+                            plane.request_rebuild("resume", true);
+                        } else {
+                            pending_rebuild = Some("resume");
+                            last_rebuild = None;
+                        }
                     }
                     // R3 — the ONE direct-plane rebuild executor: triggers
                     // only set `pending_rebuild`; this runs the ordered
@@ -2243,7 +2252,11 @@ impl OverlayRuntime {
                                             ?now_ips, ?plane_ips,
                                             "overlay: LAN address set changed — scheduling a direct-plane rebuild"
                                         );
-                                        pending_rebuild = Some("net-change");
+                                        if let Some(plane) = &self.carrier_plane {
+                                            plane.request_rebuild("net-change", false);
+                                        } else {
+                                            pending_rebuild = Some("net-change");
+                                        }
                                     }
                                 }
                             }
@@ -2307,6 +2320,42 @@ impl OverlayRuntime {
                             );
                             route_watch = None;
                             route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
+                        }
+                    }
+                },
+                // Multi-org v2 P1-d — the plane's rebuild steps. Teardown:
+                // release every socket-pinning Arc (direct carriers, probes,
+                // our DirectCtx view) and ack, so the plane can actually
+                // re-bind. Ready: the plane re-bound — run the R3 tail
+                // (join → gather → coordinator → install) via the ONE
+                // executor, authoritative. `pending()` when not attached.
+                pev = async {
+                    match plane_events.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<super::carrier_plane::PlaneEvent>>().await,
+                    }
+                } => {
+                    match pev {
+                        Some(super::carrier_plane::PlaneEvent::Teardown { ack }) => {
+                            let t_arm = Instant::now();
+                            self.teardown_direct_carriers(
+                                &mut wg, &mut by_node, &mut upgrade_probes,
+                                &mut relay, &mut relay_bq, &mut alloc_q, &tun,
+                            ).await;
+                            // Our view of the old sockets goes too — holding
+                            // it would keep the ports alive past the ack.
+                            direct_ctx = None;
+                            self.shadow(|s| s.mon.on_local_rebuild());
+                            let _ = ack.send(()).await;
+                            warn_if_slow("arm:plane_teardown", t_arm);
+                        }
+                        Some(super::carrier_plane::PlaneEvent::Ready) => {
+                            pending_rebuild = Some("plane-rebind");
+                            last_rebuild = None;
+                        }
+                        None => {
+                            // The plane is gone (test teardown) — stop polling.
+                            plane_events = None;
                         }
                     }
                 },
@@ -2653,8 +2702,12 @@ impl OverlayRuntime {
                         // on a WS reconnect. Authoritative: bypass the
                         // cooldown; the tick executor runs the sequence.
                         info!("overlay: embedder requested a direct-plane rebuild (fingerprint change)");
-                        pending_rebuild = Some("ws-fingerprint");
-                        last_rebuild = None;
+                        if let Some(plane) = &self.carrier_plane {
+                            plane.request_rebuild("ws-fingerprint", true);
+                        } else {
+                            pending_rebuild = Some("ws-fingerprint");
+                            last_rebuild = None;
+                        }
                     }
                     None => break,
                 },

@@ -2016,7 +2016,12 @@ impl OverlayRuntime {
     /// touch `run()`'s loop locals. The caller must ALSO abort the srflx
     /// keepalive BEFORE calling (it owns a punch-socket Arc by value).
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn rebuild_direct_plane_sockets(
+    /// Steps 1-2 of the R3 rebuild, shared with the carrier-plane Teardown
+    /// step (P1-d): every direct carrier and in-flight upgrade probe dies —
+    /// their `Carrier`/pump/timer-task Arcs pin the old sockets, and the
+    /// plane may only re-bind once every engine has released them.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn teardown_direct_carriers(
         &self,
         wg: &mut WgDevice,
         by_node: &mut HashMap<ObjectId, Installed>,
@@ -2025,11 +2030,9 @@ impl OverlayRuntime {
         relay_bq: &mut RelayBuildQueue,
         alloc_q: &mut RelayAllocQueue,
         tun: &Arc<dyn TunIo>,
-        direct_ctx: &mut Option<DirectCtx>,
-    ) -> Option<mpsc::Receiver<crate::transport::stun::StunInbound>> {
-        // 1. Direct carriers die first — their Carrier/pump/timer-task Arcs
-        //    pin the old sockets. The shared teardown also drops each peer's
-        //    in-flight probe.
+    ) {
+        // 1. Direct carriers die first — the shared teardown also drops each
+        //    peer's in-flight probe.
         let direct_nids: Vec<ObjectId> = by_node
             .iter()
             .filter(|(_, e)| e.is_direct)
@@ -2059,6 +2062,24 @@ impl OverlayRuntime {
                 self.shadow(|s| s.mon.on_probe_aborted(&nid));
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn rebuild_direct_plane_sockets(
+        &self,
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        upgrade_probes: &mut HashMap<ObjectId, UpgradeProbe>,
+        relay: &mut Option<RelayCoordinator>,
+        relay_bq: &mut RelayBuildQueue,
+        alloc_q: &mut RelayAllocQueue,
+        tun: &Arc<dyn TunIo>,
+        direct_ctx: &mut Option<DirectCtx>,
+    ) -> Option<mpsc::Receiver<crate::transport::stun::StunInbound>> {
+        // 1+2 — every direct carrier and in-flight probe dies first (their
+        //    Arcs pin the old sockets).
+        self.teardown_direct_carriers(wg, by_node, upgrade_probes, relay, relay_bq, alloc_q, tun)
+            .await;
         // 3. Retire the old demux slots (aborts their recv loops) and drop
         //    the plane's own Arcs — with 1+2 done, the ports actually free.
         if let Some(old) = direct_ctx.take() {
