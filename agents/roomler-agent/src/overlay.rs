@@ -247,7 +247,16 @@ pub async fn maybe_start(
                  netstack mode is single-org; using the shared OS TUN instead"
             );
         }
-        mux_systun_factory(cfg.tenant_id.clone())?
+        // Multi-org v2 — per-org adapters: each org gets its OWN device
+        // (own address space, own route domain; one address per adapter, so
+        // OS source selection is trivially correct and the mux NAT /
+        // SkipAsSource compensations never engage). Default OFF: the
+        // shared-TUN mux stays the fallback until the fleet soak flips it.
+        if tunnel_core::env::flag("OVERLAY_TUN_PER_ORG", false) {
+            per_org_systun_factory(cfg.tenant_id.clone(), !cfg.derived_org)?
+        } else {
+            mux_systun_factory(cfg.tenant_id.clone())?
+        }
     } else {
         match netstack_socks_port(cfg) {
             // Give the netstack SOCKS front a live mesh view so it can resolve
@@ -513,6 +522,7 @@ static SHARED_MUX: std::sync::Mutex<
 /// register), so it is safe to call unconditionally on teardown.
 pub fn release_org(org_key: &str) {
     release_shared_tun(org_key);
+    release_per_org_tun(org_key);
     release_netstack(org_key);
 }
 
@@ -626,6 +636,92 @@ fn mux_systun_factory(_org_key: String) -> Option<TunFactory> {
     );
     None
 }
+
+/// Multi-org v2 — per-org TUN devices, keyed by tenant. Same process-lifetime
+/// reuse contract as [`SYSTUN_CACHE`] (incl. the `overlay_tun_persist` kill
+/// switch), one entry per org. Dropping an entry releases the process's
+/// device handle; the ADAPTER persists by design (stable per-org GUID —
+/// explicit org removal owns real deletion, never a loop end, so an ESET-y
+/// host never sees device churn on reconnects).
+#[cfg(feature = "overlay-l3")]
+#[allow(clippy::type_complexity)]
+static ORG_TUN_CACHE: std::sync::Mutex<
+    Option<
+        std::collections::BTreeMap<
+            String,
+            (
+                (std::net::Ipv4Addr, std::net::Ipv4Addr, u16),
+                Arc<SystemTun>,
+            ),
+        >,
+    >,
+> = std::sync::Mutex::new(None);
+
+/// Multi-org v2 — the per-org twin of [`systun_tun_factory`]: this org gets
+/// its OWN adapter with its own name, stable per-org GUID, and a derived-ULA
+/// on-link NARROWED to its block (`96 + v4_plen`), so N adapters hold
+/// nested-or-disjoint v6 prefixes and longest-prefix picks the right one.
+///
+/// Naming: the primary KEEPS the legacy `roomler` name + GUID (no adapter
+/// churn on the mode flip); a secondary is `roomler-<first 7 hex of its
+/// tenant id>` — derived from what the factory already has, fits Linux
+/// IFNAMSIZ, and stays stable across restarts. The primary's on-link is
+/// narrowed too: its whole-/96 would otherwise cover every sibling's
+/// embedded ULA range.
+#[cfg(feature = "overlay-l3")]
+fn per_org_systun_factory(org_key: String, is_primary: bool) -> Option<TunFactory> {
+    use tunnel_core::overlay::tun::{IF_NAME, TunOptions, org_tun_guid};
+    Some(Box::new(move |ip, nm, mtu| {
+        let plen = u32::from(nm).count_ones() as u8;
+        let mut opts = TunOptions::legacy(ip, nm, mtu);
+        opts.v6_onlink_plen = 96 + plen;
+        if !is_primary {
+            let short = &org_key[..org_key.len().min(7)];
+            opts.name = format!("{IF_NAME}-{short}");
+            opts.guid = org_tun_guid(&org_key);
+        }
+        if !tunnel_core::env::flag("OVERLAY_TUN_PERSIST", true) {
+            return SystemTun::up_with(opts).map(|t| Arc::new(t) as Arc<dyn TunIo>);
+        }
+        let mut cache = ORG_TUN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = cache.get_or_insert_with(Default::default);
+        if let Some((params, dev)) = map.get(&org_key)
+            && *params == (ip, nm, mtu)
+            && dev.is_alive()
+        {
+            info!(org = %org_key, "overlay: reusing this org's process-lifetime TUN device (reconnect)");
+            return Ok(dev.clone() as Arc<dyn TunIo>);
+        }
+        // Param change (re-IP) or dead device: release the old handle BEFORE
+        // the new create (frees the adapter's device-install lock; the
+        // rc.209 retry inside `up_with` covers the release latency).
+        map.remove(&org_key);
+        let dev = Arc::new(SystemTun::up_with(opts)?);
+        map.insert(org_key.clone(), ((ip, nm, mtu), dev.clone()));
+        info!(org = %org_key, primary = is_primary, "overlay: per-org TUN device up");
+        Ok(dev as Arc<dyn TunIo>)
+    }))
+}
+#[cfg(not(feature = "overlay-l3"))]
+fn per_org_systun_factory(_org_key: String, _is_primary: bool) -> Option<TunFactory> {
+    warn!("overlay: overlay_tun_per_org requires an `overlay-l3` build; not joining");
+    None
+}
+
+/// Drop an org's per-org device HANDLE when its loop ends for good. The
+/// adapter itself persists (stable GUID re-binds it next start); explicit
+/// org removal owns real deletion.
+#[cfg(feature = "overlay-l3")]
+fn release_per_org_tun(org_key: &str) {
+    let mut cache = ORG_TUN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = cache.as_mut()
+        && map.remove(org_key).is_some()
+    {
+        info!(org = %org_key, "overlay: released the org's per-org TUN handle (adapter persists)");
+    }
+}
+#[cfg(not(feature = "overlay-l3"))]
+fn release_per_org_tun(_org_key: &str) {}
 
 /// Multi-org — one netstack handle channel PER ORG.
 ///
