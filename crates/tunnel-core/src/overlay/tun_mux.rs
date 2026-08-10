@@ -435,6 +435,7 @@ fn normalize_egress_src(
         return;
     }
     mux_nat::rewrite_src(pkt, &v, winner_self);
+    crate::evidence::MUX_NAT_REWRITES.fetch_add(1, Ordering::Relaxed);
     if !NAT_FIRST_REWRITE.swap(true, Ordering::Relaxed) {
         info!(
             orig = %v.src, wire = %winner_self,
@@ -566,6 +567,7 @@ impl MuxPort {
         };
         let mut pkt = packet.to_vec();
         mux_nat::rewrite_dst(&mut pkt, &v, orig);
+        crate::evidence::MUX_NAT_RESTORES.fetch_add(1, Ordering::Relaxed);
         debug!(
             wire = %v.dst, orig = %orig, src = %v.src,
             "tun-mux: ingress destination restored"
