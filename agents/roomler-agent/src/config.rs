@@ -157,6 +157,13 @@ pub struct AgentConfig {
     /// being spawn-order timing). Built-in default: off (soak flag).
     #[serde(default)]
     pub overlay_shared_carrier: Option<bool>,
+    /// Multi-org v2 per-org TUN adapters — each org gets its OWN device
+    /// (own address space + route domain; one address per adapter, so OS
+    /// source selection is trivially correct) instead of the shared-TUN mux
+    /// (`ROOMLER_NODE_OVERLAY_TUN_PER_ORG`). Built-in default: off (soak
+    /// flag). Requires `overlay_multi_org`.
+    #[serde(default)]
+    pub overlay_tun_per_org: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
     /// stray-adapter sweep, Windows only
     /// (`ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
@@ -1047,7 +1054,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 24] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 25] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1063,6 +1070,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 24]
         ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
         ("OVERLAY_MUX_NAT", cfg.overlay_mux_nat),
         ("OVERLAY_SHARED_CARRIER", cfg.overlay_shared_carrier),
+        ("OVERLAY_TUN_PER_ORG", cfg.overlay_tun_per_org),
         ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
         ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
@@ -1252,6 +1260,7 @@ mod tests {
             overlay_relay_tls: None,
             overlay_mux_nat: None,
             overlay_shared_carrier: None,
+            overlay_tun_per_org: None,
             overlay_tun_stable_guid: None,
             overlay_route_evict: None,
             overlay_tun_persist: None,
