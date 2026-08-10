@@ -211,6 +211,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            direct_socks: Vec::new(),
         };
         let out = s.sample(&view, (0, 0));
         assert_eq!(out.direct, 1);
@@ -245,6 +246,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            direct_socks: Vec::new(),
         };
         let out = s.sample(&view, (0, 0));
         assert_eq!(out.links.len(), 3);
@@ -279,6 +281,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            direct_socks: Vec::new(),
         };
         let out = s.sample(&view, (0, 0));
         assert_eq!(out.links.len(), 3);
