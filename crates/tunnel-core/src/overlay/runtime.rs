@@ -863,19 +863,31 @@ fn spawn_plane_srflx_forwarder(
     outbound: ControlTx,
     mut reattach_rx: tokio::sync::watch::Receiver<u64>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // Re-assert the shared srflx on a TIMER as well as on every change/
+    // reattach. In plane mode the srflx gather is decoupled from each org's
+    // WS: the server WIPES `srflx_endpoints` on every (re-)join, and a
+    // forwarder that only fires on `changed()` misses the current value if it
+    // subscribed AFTER the shared gather set it — so a re-join's one-shot
+    // re-advert is the only thing keeping the mesh populated, and if it races
+    // the join that org goes relay-locked (field 2026-08-10: pc50045's GROX
+    // mesh had `srflx=[]` while JOVANOV had the candidate — same plane socket,
+    // one org simply lost its advert). The idempotent periodic re-advert makes
+    // every org converge; the interval's immediate first tick also covers the
+    // subscribe-after-set startup gap. Cadence tracks the NAT keepalive.
+    let secs = super::direct::srflx_keepalive_secs().clamp(15, 60);
     Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {
-                c = srflx_rx.changed() => {
-                    if c.is_err() {
-                        break;
-                    }
-                }
-                c = reattach_rx.changed() => {
-                    if c.is_err() {
-                        break;
-                    }
-                }
+            // `advertise` is false ONLY when a watch closed (plane gone or the
+            // runtime dropped its reattach sender) — then the task ends.
+            let advertise = tokio::select! {
+                c = srflx_rx.changed() => c.is_ok(),
+                c = reattach_rx.changed() => c.is_ok(),
+                _ = tick.tick() => true,
+            };
+            if !advertise {
+                break;
             }
             let s = srflx_rx.borrow().clone();
             if !s.candidates.is_empty()
@@ -887,7 +899,7 @@ fn spawn_plane_srflx_forwarder(
                     .await
                     .is_err()
             {
-                debug!("overlay: plane srflx advert send failed (detached) — next event retries");
+                debug!("overlay: plane srflx advert send failed (detached) — next tick retries");
             }
         }
     }))
