@@ -287,9 +287,38 @@ org's engine attaches to:
 
 Flag OFF (the default): per-runtime binds, byte-identical to before. The
 default flips after the CORPLAP-1 soak; the per-org band race is then retired
-for good. Direct-plane REBUILDS under the flag still use the per-runtime
-path's sockets unchanged (the plane's binds persist across them) — the
-plane-level rebuild protocol is the next increment (P1-d).
+for good. Rebuilds under the flag are PLANE-WIDE (P1-d): any org's trigger
+tears every org down (`Teardown`/ack, 3 s straggler timeout), the plane
+re-binds ONCE, and every org re-establishes on `Ready`.
+
+### Per-org TUN adapters (`overlay_tun_per_org`, default OFF)
+
+The second half of multi-org v2: with
+`overlay_tun_per_org` on (`ROOMLER_NODE_OVERLAY_TUN_PER_ORG`; requires
+`overlay_multi_org`), each org gets its **own adapter** instead of a facade
+over the shared one:
+
+- the primary KEEPS the legacy `roomler` name + GUID (no adapter churn on
+  the mode flip); a secondary is `roomler-<first 7 hex of its tenant id>`
+  with a stable per-org GUID (`org_tun_guid` — SHA-256, RFC 4122-shaped);
+- ONE address per adapter ⇒ OS source selection is trivially correct — the
+  mux NAT, SkipAsSource reconcile, and Linux src hints never engage (their
+  `roomler status` evidence counters stay zero, which is exactly the
+  Phase-3 deletion gate);
+- each adapter's derived-ULA on-link is NARROWED to its block
+  (`/(96 + v4_plen)`, a `/22` org → `/118`; the primary's is narrowed too —
+  its whole `/96` would cover every sibling's embedded range), so v6
+  longest-prefix picks the right adapter;
+- the boot stray-adapter sweep structurally EXEMPTS `roomler-*` (orgs come
+  up at their own pace; a sibling's persisted adapter is not a stray);
+  explicit org removal owns real adapter deletion — a loop end only drops
+  the process's device handle, so an EDR-watched host never sees device
+  churn on reconnects;
+- ICE never gathers on `roomler-*` (the peer.rs interface deny-list), and
+  the LAN gather's `roomler` prefix filter already covers them.
+
+Flag OFF (the default): the shared-TUN mux (§2, §4b) exactly as before.
+Both v2 flags compose independently; the end state runs both ON.
 
 ---
 
