@@ -725,6 +725,10 @@ async fn run_srflx_keepalive(
 ) {
     const RERESOLVE_AFTER: u32 = 3;
     let mut failures: u32 = 0;
+    // PR-B1 tripwire — one WARN per outage (not per cycle): repeated
+    // keepalive failure means the advertised mapping may be dead (reader-less
+    // socket / filtered path); DEBUG-only left it invisible.
+    let mut warned = false;
     // rc.307 (B) — a pending (re-)advertise: set when the mapping changed or
     // a reattach fired, cleared by a successful send. A send failure now
     // means DETACHED (the runtime outlives sessions), never "runtime gone" —
@@ -750,6 +754,10 @@ async fn run_srflx_keepalive(
                 {
                     Ok(mapped) => {
                         failures = 0;
+                        if warned {
+                            warned = false;
+                            info!("overlay: srflx keepalive recovered");
+                        }
                         let ep = mapped.to_string();
                         if advertised.first().map(String::as_str) != Some(ep.as_str()) {
                             // Mapping changed → update the punch candidate `[0]`
@@ -765,7 +773,17 @@ async fn run_srflx_keepalive(
                     }
                     Err(e) => {
                         failures += 1;
-                        debug!(%e, failures, "overlay: srflx keepalive query failed — retaining last advert");
+                        if failures >= RERESOLVE_AFTER && !warned {
+                            warned = true;
+                            warn!(
+                                %e, failures,
+                                "overlay: srflx keepalive failing repeatedly — the advertised \
+                                 mapping may be DEAD (reader-less socket / filtered path?); \
+                                 peers punching it will fail"
+                            );
+                        } else {
+                            debug!(%e, failures, "overlay: srflx keepalive query failed — retaining last advert");
+                        }
                         if failures >= RERESOLVE_AFTER {
                             if let Some(fresh) =
                                 direct::resolve_stun_server(&stun_urls, &own_ips).await
@@ -1153,6 +1171,7 @@ fn build_overlay_view(
         exit_node: None,
         dns: None,
         srflx: None,
+        direct_socks: Vec::new(),
     }
 }
 
@@ -1304,6 +1323,7 @@ impl OverlayRuntime {
         current_peers: &HashMap<ObjectId, NetmapPeer>,
         probing: &HashMap<ObjectId, UpgradeProbe>,
         exit_status: Option<ExitNodeStatus>,
+        wg: &WgDevice,
     ) {
         if let Some(tx) = &self.peer_view {
             // Capture both clocks together so `last_seen_ms` (absolute epoch-ms)
@@ -1325,6 +1345,14 @@ impl OverlayRuntime {
             // NAT-traversal — ditto for the srflx gather outcome. An empty
             // candidate list here is the "why is everything on relay?" signal.
             view.srflx = self.srflx_status.clone();
+            // PR-B1 — per-socket receive liveness: a bound socket whose
+            // rx_pkts is frozen while its endpoint is advertised is the
+            // 2026-08-10 wedge signature (reader-less, Recv-Q pegged).
+            view.direct_socks = if let Some(p) = &self.carrier_plane {
+                p.socket_stats()
+            } else {
+                wg.direct_sock_stats()
+            };
             // send_replace never fails (unlike send) even if the receiver is
             // transiently absent, and keeps the value for the next borrow.
             tx.send_replace(view);
@@ -1819,6 +1847,7 @@ impl OverlayRuntime {
             &current_peers,
             &upgrade_probes,
             exit_node_status(self.exit_node.as_deref(), &exit_state),
+            &wg,
         );
 
         // Phase C (D8) — re-upgrade tick counter (see `REUPGRADE_EVERY_N_TICKS`).
@@ -1934,7 +1963,7 @@ impl OverlayRuntime {
                             // coturn worker may need an exit exemption, and the
                             // LocalAPI view must reflect the new carrier.
                             self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                         } else {
                             debug!(peer = %built.link.node_id, "overlay: dropping stale off-loop carrier build (peer removed/superseded mid-build)");
                         }
@@ -1965,7 +1994,7 @@ impl OverlayRuntime {
                                             // worker to exempt, and the LocalAPI view must
                                             // reflect the new carrier.
                                             self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                                         }
                                     }
                                     None => {
@@ -2124,7 +2153,7 @@ impl OverlayRuntime {
                                 "rebuild",
                             ).await;
                             self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                            self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                             warn_if_slow("rebuild_direct_plane", t0);
                         }
                     }
@@ -2178,6 +2207,7 @@ impl OverlayRuntime {
                         &current_peers,
                         &upgrade_probes,
                         exit_node_status(self.exit_node.as_deref(), &exit_state),
+                        &wg,
                     );
                     warn_if_slow("arm:fallback_sweep", t_arm);
                 },
@@ -2407,7 +2437,7 @@ impl OverlayRuntime {
                             &mut relay_bq, inb,
                         ).await;
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                         warn_if_slow("arm:direct_inbound", t_arm);
                     }
                 },
@@ -2576,7 +2606,7 @@ impl OverlayRuntime {
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq, "netmap").await;
                         warn_if_slow("install_peers(netmap)", t0);
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                         warn_if_slow("arm:netmap", t_arm);
                     }
                     Some(OverlayEvent::NetmapDelta { upserts, removes }) => {
@@ -2616,7 +2646,7 @@ impl OverlayRuntime {
                         warn_if_slow("install_peers(delta)", t0);
                         if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                         warn_if_slow("arm:netmap_delta", t_arm);
                     }
                     Some(OverlayEvent::RelayGrant { peer_node_id, ice_servers, pair_key }) => {
@@ -2702,7 +2732,7 @@ impl OverlayRuntime {
                                 self.install_ready(&mut wg, &mut by_node, &tun, link, &mut relay_bq).await;
                                 warn_if_slow("install_ready(spawn-or-sync)", t0);
                                 self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                                self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state));
+                                self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                             }
                         }
                         warn_if_slow("arm:force_derp", t_arm);
