@@ -94,12 +94,15 @@ pub(super) struct DirectCandidates {
 pub(super) fn resolve_direct_candidates(
     direct_ctx: Option<&DirectCtx>,
     cfg: &PeerConfig,
+    rot: CandidateRotation,
 ) -> DirectCandidates {
     let lan = direct_ctx
         .and_then(|ctx| direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints));
     let public = direct_ctx.and_then(|ctx| {
         (direct::public_direct_enabled() && ctx.public_sock.is_some())
-            .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.lan_endpoints))
+            .then(|| {
+                direct::pick_public_endpoint_rotated(&ctx.my_ips, &cfg.lan_endpoints, rot.public)
+            })
             .flatten()
     });
     let srflx = direct_ctx.and_then(|ctx| {
@@ -111,10 +114,21 @@ pub(super) fn resolve_direct_candidates(
                 &cfg.srflx_endpoints,
                 direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints).is_some(),
             ))
-        .then(|| direct::pick_public_endpoint(&ctx.my_ips, &cfg.srflx_endpoints))
+        .then(|| direct::pick_public_endpoint_rotated(&ctx.my_ips, &cfg.srflx_endpoints, rot.srflx))
         .flatten()
     });
     DirectCandidates { lan, public, srflx }
+}
+
+/// A2 — per-tier dial-attempt offsets for multi-candidate rotation: the
+/// PathMonitor's strike count per (peer, tier), so each failed probe advances
+/// [`direct::pick_public_endpoint_rotated`] to the peer's next advertised
+/// candidate and a success (strikes reset) returns to the primary. Default
+/// (zeros) = today's first-candidate behavior.
+#[derive(Default, Clone, Copy)]
+pub(super) struct CandidateRotation {
+    pub public: u32,
+    pub srflx: u32,
 }
 
 // The stable-port binder MOVED to `direct::bind_direct_socket` (multi-org v2:
@@ -822,7 +836,16 @@ impl OverlayRuntime {
             // gating below. This also closes the soak-#2 residual coupling
             // (a legacy cooldown withholding a dst the monitor held
             // eligible).
-            let cands = resolve_direct_candidates(direct_ctx, &cfg);
+            // A2 — rotate multi-candidate dials by the monitor's strike
+            // count: each failed probe advances to the peer's next advertised
+            // public/srflx candidate (success resets strikes → primary).
+            let rot = self
+                .shadow(|s| CandidateRotation {
+                    public: s.mon.strikes(&np.node_id, DirectTier::Public),
+                    srflx: s.mon.strikes(&np.node_id, DirectTier::Srflx),
+                })
+                .unwrap_or_default();
+            let cands = resolve_direct_candidates(direct_ctx, &cfg, rot);
             let direct_dst = cands.lan;
             let phase_a_dst = cands.public;
             let srflx_dst = cands.srflx;

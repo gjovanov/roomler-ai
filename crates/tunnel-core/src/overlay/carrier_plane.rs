@@ -865,29 +865,26 @@ impl CarrierPlane {
             ));
             return out;
         }
+        // A1 — up to three topologically-spread vantages; ANY pairwise
+        // mapping mismatch classifies symmetric (one dead vantage tolerated).
+        // Shared classifier with the per-runtime `probe_nat_type` twin.
         let targets = direct::resolve_stun_targets(stun_urls, &v.my_ips).await;
         let my_nat = if targets.len() >= 2 {
             let punch_sock = pairs[0].1.clone();
-            let a = crate::transport::stun::srflx_query_via_sink(
-                &punch_sock,
-                rx,
-                targets[0],
-                super::runtime::SRFLX_ATTEMPT_TIMEOUT,
-            )
-            .await
-            .ok();
-            let b = crate::transport::stun::srflx_query_via_sink(
-                &punch_sock,
-                rx,
-                targets[1],
-                super::runtime::SRFLX_ATTEMPT_TIMEOUT,
-            )
-            .await
-            .ok();
-            match (a, b) {
-                (Some(a), Some(b)) => Some(if a == b { "cone" } else { "symmetric" }.to_string()),
-                _ => None,
+            let mut mappings: Vec<SocketAddr> = Vec::with_capacity(targets.len());
+            for t in &targets {
+                if let Ok(m) = crate::transport::stun::srflx_query_via_sink(
+                    &punch_sock,
+                    rx,
+                    *t,
+                    super::runtime::SRFLX_ATTEMPT_TIMEOUT,
+                )
+                .await
+                {
+                    mappings.push(m);
+                }
             }
+            direct::classify_nat_mappings(&mappings).map(str::to_string)
         } else {
             None
         };
