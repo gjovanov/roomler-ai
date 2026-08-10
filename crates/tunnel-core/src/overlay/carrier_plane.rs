@@ -110,6 +110,10 @@ struct PlaneBinds {
     endpoints: Vec<String>,
     my_ips: Vec<Ipv4Addr>,
     tasks: Vec<JoinHandle<()>>,
+    /// PR-B1 — per-socket receive liveness, in lockstep with the recv loops
+    /// (`socks` order first, then the public dialer). Snapshotted into
+    /// `NodeStatus.direct_socks` so a reader-less socket is visible.
+    stats: Vec<Arc<direct::SockStat>>,
 }
 
 impl Drop for PlaneBinds {
@@ -160,6 +164,19 @@ pub struct CarrierPlane {
     /// Serializes [`ensure_srflx`](Self::ensure_srflx): the first caller
     /// gathers while later callers wait, then read the cached result.
     srflx_gate: tokio::sync::Mutex<bool>,
+    /// PR-B1 — serializes [`ensure_bound`](Self::ensure_bound) ACROSS its
+    /// awaits. The bind loop can take seconds (3×300 ms base retries per
+    /// socket), and two orgs attaching concurrently both used to pass the
+    /// empty-view fast-path, both bind, and the second `st.binds` assignment
+    /// dropped the first set — whose sockets the first runtime's `DirectCtx`
+    /// already held: bound, reader-less, still advertised. Field 2026-08-10:
+    /// mars/jupiter relay-locked, the advertised socket's Recv-Q pegged at
+    /// rmem, the winner walked the band to :43649. First caller binds; every
+    /// later caller waits here and reuses the same view.
+    bind_gate: tokio::sync::Mutex<()>,
+    /// Times the bind section actually ran (must stay ≤1 between rebuilds —
+    /// locked by `ensure_bound_binds_once_under_concurrent_attach`).
+    binds_performed: AtomicU32,
 }
 
 impl CarrierPlane {
@@ -183,6 +200,8 @@ impl CarrierPlane {
             }),
             index_alloc: AtomicU32::new(0),
             srflx_gate: tokio::sync::Mutex::new(false),
+            bind_gate: tokio::sync::Mutex::new(()),
+            binds_performed: AtomicU32::new(0),
         })
     }
 
@@ -222,6 +241,11 @@ impl CarrierPlane {
     /// walked once instead of raced per org. `None` when no LAN interface is
     /// usable (the caller stays relay-only, as today).
     pub async fn ensure_bound(self: &Arc<Self>) -> Option<PlaneView> {
+        // PR-B1 — hold the gate across the WHOLE bind (see `bind_gate`): the
+        // first caller binds, every later caller parks here and reuses its
+        // view. Without this, concurrent org attaches raced the empty-view
+        // check and the loser's sockets leaked bound-but-reader-less.
+        let _gate = self.bind_gate.lock().await;
         if let Some(v) = self.view() {
             return Some(v);
         }
@@ -281,23 +305,61 @@ impl CarrierPlane {
             public_dial = public_sock.is_some(),
             "carrier plane: direct sockets bound ONCE for every attached engine"
         );
+        self.binds_performed.fetch_add(1, Ordering::Relaxed);
         let mut tasks = Vec::new();
-        for (_, s) in &socks {
-            tasks.push(self.adopt_socket(s.clone()));
+        let mut stats: Vec<Arc<direct::SockStat>> = Vec::new();
+        for ((_, s), ep) in socks.iter().zip(&endpoints) {
+            let stat = direct::SockStat::new(ep.clone());
+            tasks.push(self.adopt_socket_with(s.clone(), Some(stat.clone())));
+            stats.push(stat);
         }
         if let Some(p) = &public_sock {
-            tasks.push(self.adopt_socket(p.clone()));
+            let local = p
+                .local_addr()
+                .map(|a| format!("{a} (public-dial)"))
+                .unwrap_or_else(|_| "public-dial".into());
+            let stat = direct::SockStat::new(local);
+            tasks.push(self.adopt_socket_with(p.clone(), Some(stat.clone())));
+            stats.push(stat);
         }
         let mut st = self.lock();
+        if st.binds.is_some() {
+            // Tripwire — structurally unreachable under `bind_gate`; if it
+            // ever fires the race guard regressed. Keep the EXISTING set (its
+            // sockets are already advertised/held) and discard ours cleanly:
+            // aborting our tasks drops the loops, and our socket Arcs die
+            // with the locals below, closing the fds.
+            warn!(
+                "carrier plane: bind completed against an already-bound plane — keeping the \
+                 existing set (tripwire: ensure_bound race guard failed?)"
+            );
+            for t in &tasks {
+                t.abort();
+            }
+            drop(st);
+            return self.view();
+        }
         st.binds = Some(PlaneBinds {
             socks,
             public_sock,
             endpoints,
             my_ips,
             tasks,
+            stats,
         });
         drop(st);
         self.view()
+    }
+
+    /// PR-B1 — per-socket receive liveness for `NodeStatus.direct_socks`:
+    /// one row per bound plane socket. A row whose `rx_pkts` is frozen while
+    /// its endpoint is advertised is the wedge signature.
+    pub fn socket_stats(&self) -> Vec<crate::localapi::DirectSockStatus> {
+        let st = self.lock();
+        st.binds
+            .as_ref()
+            .map(|b| b.stats.iter().map(|s| s.status()).collect())
+            .unwrap_or_default()
     }
 
     /// The current bound view, if [`ensure_bound`](Self::ensure_bound) ran.
@@ -311,11 +373,24 @@ impl CarrierPlane {
         })
     }
 
-    /// Spawn the plane's recv loop on `sock`. `ensure_bound` calls this for
-    /// each socket it binds; tests hand in loopback sockets directly.
+    /// Test seam: spawn the plane's recv loop on a caller-provided (loopback)
+    /// socket, no liveness stat. Production sockets go through `ensure_bound`,
+    /// which wires a [`direct::SockStat`] per socket.
+    #[cfg(test)]
     pub(crate) fn adopt_socket(self: &Arc<Self>, sock: Arc<UdpSocket>) -> JoinHandle<()> {
+        self.adopt_socket_with(sock, None)
+    }
+
+    /// The plane recv loop, with a PR-B1 liveness stat the loop bumps per
+    /// read datagram (`None` for test loops).
+    fn adopt_socket_with(
+        self: &Arc<Self>,
+        sock: Arc<UdpSocket>,
+        stat: Option<Arc<direct::SockStat>>,
+    ) -> JoinHandle<()> {
         let plane = self.clone();
         tokio::spawn(async move {
+            let local = sock.local_addr().map(|a| a.to_string()).unwrap_or_default();
             let mut buf = vec![0u8; super::wg::WG_BUF];
             // Per-source rate limit for forwarded unknown-source initiations —
             // loop-local, exactly like the per-device demux's.
@@ -324,10 +399,16 @@ impl CarrierPlane {
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(v) => v,
                     Err(e) => {
-                        debug!(%e, "carrier plane: recv ended; loop exiting");
+                        // PR-B1 tripwire — a dead recv loop leaves the socket
+                        // bound + advertised but reader-less; that's a WARN,
+                        // not a DEBUG nobody sees.
+                        warn!(%e, %local, "carrier plane: recv ended; loop exiting");
                         break;
                     }
                 };
+                if let Some(s) = &stat {
+                    s.bump();
+                }
                 let stun_tx = { plane.lock().stun_tx.clone() };
                 if crate::transport::stun::has_stun_cookie(&buf[..n]) && !is_wg_shaped(&buf[..n]) {
                     let _ = stun_tx.try_send(StunInbound {
@@ -849,6 +930,12 @@ impl CarrierPlane {
             let mut rx = rx;
             let mut server = server0;
             let mut failures = 0u32;
+            // PR-B1 tripwire — one WARN per outage (not per cycle): repeated
+            // keepalive failure is the "advertised mapping may be dead"
+            // signal, most notably a reader-less punch socket queueing the
+            // reply forever (the 2026-08-10 wedge). DEBUG-only left it
+            // invisible.
+            let mut warned = false;
             const RERESOLVE_AFTER: u32 = 3;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -866,6 +953,13 @@ impl CarrierPlane {
                 {
                     Ok(cur) => {
                         failures = 0;
+                        let mut publish = false;
+                        if warned {
+                            warned = false;
+                            state.error = None;
+                            publish = true;
+                            info!("carrier plane: srflx keepalive recovered");
+                        }
                         let ep = cur.to_string();
                         if state.candidates.first() != Some(&ep) {
                             if state.candidates.is_empty() {
@@ -873,20 +967,37 @@ impl CarrierPlane {
                             } else {
                                 state.candidates[0] = ep.clone();
                             }
-                            state.generation += 1;
+                            publish = true;
                             info!(
                                 new_srflx = %ep,
                                 "carrier plane: srflx mapping changed — every org re-advertises"
                             );
+                        }
+                        if publish {
+                            state.generation += 1;
                             plane.lock().srflx_watch.send_replace(state.clone());
                         }
                     }
                     Err(e) => {
                         failures += 1;
-                        debug!(
-                            %e, failures,
-                            "carrier plane: srflx keepalive query failed — retaining last advert"
-                        );
+                        if failures >= RERESOLVE_AFTER && !warned {
+                            warned = true;
+                            warn!(
+                                %e, failures,
+                                "carrier plane: srflx keepalive failing repeatedly — the \
+                                 advertised mapping may be DEAD (reader-less socket / filtered \
+                                 path?); peers punching it will fail"
+                            );
+                            state.error =
+                                Some(format!("srflx keepalive failing ({failures} consecutive)"));
+                            state.generation += 1;
+                            plane.lock().srflx_watch.send_replace(state.clone());
+                        } else {
+                            debug!(
+                                %e, failures,
+                                "carrier plane: srflx keepalive query failed — retaining last advert"
+                            );
+                        }
                         if failures >= RERESOLVE_AFTER {
                             if let Some(fresh) =
                                 direct::resolve_stun_server(&stun_urls, &my_ips).await
@@ -1287,5 +1398,34 @@ mod tests {
         assert!(matches!(r2.recv().await, Some(PlaneEvent::Teardown { .. })));
         assert!(matches!(r1.recv().await, Some(PlaneEvent::Ready)));
         assert!(matches!(r2.recv().await, Some(PlaneEvent::Ready)));
+    }
+
+    /// PR-B1 — the ensure_bound race lock: two orgs attaching concurrently
+    /// must produce exactly ONE bind pass and the SAME socket set. Field
+    /// 2026-08-10: without the gate, both passed the empty-view check, both
+    /// bound, and the loser's sockets stayed bound + advertised with no
+    /// reader (Recv-Q pegged at rmem) — mars/jupiter relay-locked fleet-wide.
+    /// Binds REAL host ports (band-walking if a local daemon holds the base);
+    /// on a host with no usable LAN interface both callers get `None`, and
+    /// the ≤1 assertion still locks the invariant.
+    #[tokio::test]
+    async fn ensure_bound_binds_once_under_concurrent_attach() {
+        let plane = CarrierPlane::new();
+        let (a, b) = tokio::join!(plane.ensure_bound(), plane.ensure_bound());
+        assert!(
+            plane.binds_performed.load(Ordering::Relaxed) <= 1,
+            "concurrent ensure_bound calls ran the bind section more than once"
+        );
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                assert_eq!(a.endpoints, b.endpoints);
+                assert!(
+                    Arc::ptr_eq(&a.socks[0].1, &b.socks[0].1),
+                    "both callers must share the SAME bound sockets, not parallel sets"
+                );
+            }
+            (None, None) => {} // no usable LAN interface (CI container)
+            _ => panic!("one caller bound while the other didn't"),
+        }
     }
 }
