@@ -1449,7 +1449,16 @@ impl OverlayRuntime {
         // Phase 1 — if this node advertises subnet routes, turn on IP forwarding
         // + NAT so overlay peers can reach the LANs it fronts. Held for the
         // runtime's lifetime; its `Drop` reverts on WS disconnect / shutdown.
-        let _subnet_router = super::nat::enable(&network.cidr, &self.advertised_routes).await;
+        // Multi-org v2 — the rules are scoped to THIS device's OS name; a
+        // device with no OS surface (mock, netstack) falls back to the
+        // historical per-platform singleton name, exactly as before.
+        let nat_if = tun.os_name();
+        let _subnet_router = super::nat::enable(
+            nat_if.as_deref().unwrap_or(super::tun::IF_NAME),
+            &network.cidr,
+            &self.advertised_routes,
+        )
+        .await;
 
         // P4 — publish the ingress destination scope from the SAME list that
         // just provisioned forwarding, so the filter and the forwarding it
