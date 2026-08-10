@@ -1037,10 +1037,16 @@ pub(crate) async fn bind_direct_socket(
         // The base is held by something that isn't just a slow hand-over.
         for port in candidates {
             if let Ok(s) = UdpSocket::bind((ip, port)).await {
+                // PR-B1 tripwire — on a host with a stable port this walk is
+                // either an external squatter or a second in-process binder
+                // colliding with leaked sockets (the 2026-08-10 ensure_bound
+                // race). Counted so `roomler status` shows it as a number.
+                crate::evidence::DIRECT_BIND_WALKS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::warn!(
                     %ip, base, port, what,
-                    "overlay: stable direct-port base unavailable (Hyper-V/WSL reservation?) — \
-                     using the next port in the band"
+                    "overlay: stable direct-port base unavailable (Hyper-V/WSL reservation, or \
+                     another in-process binder?) — using the next port in the band"
                 );
                 return Some(s);
             }
@@ -1058,6 +1064,56 @@ pub(crate) async fn bind_direct_socket(
             None
         }
     }
+}
+
+/// PR-B1 — per-bound-socket receive liveness, bumped by the recv loop that
+/// owns the socket (plane or per-device demux) and snapshotted into
+/// `NodeStatus.direct_socks`. Exists so a bound-but-reader-less socket (the
+/// 2026-08-10 ensure_bound-race wedge: advertised endpoint, Recv-Q pegged at
+/// rmem, zero reads) is visible in `roomler status` instead of only in
+/// `ss -uanp` queue depths.
+pub(crate) struct SockStat {
+    pub local: String,
+    pub rx_pkts: std::sync::atomic::AtomicU64,
+    /// Unix epoch millis of the last received datagram; 0 = never.
+    pub last_rx_ms: std::sync::atomic::AtomicU64,
+}
+
+impl SockStat {
+    pub fn new(local: String) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            local,
+            rx_pkts: std::sync::atomic::AtomicU64::new(0),
+            last_rx_ms: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// One datagram received on this socket.
+    pub fn bump(&self) {
+        use std::sync::atomic::Ordering;
+        self.rx_pkts.fetch_add(1, Ordering::Relaxed);
+        self.last_rx_ms.store(epoch_ms_now(), Ordering::Relaxed);
+    }
+
+    /// Snapshot for the LocalAPI (age computed against the wall clock the
+    /// stamps were taken with).
+    pub fn status(&self) -> crate::localapi::DirectSockStatus {
+        use std::sync::atomic::Ordering;
+        let last = self.last_rx_ms.load(Ordering::Relaxed);
+        crate::localapi::DirectSockStatus {
+            local: self.local.clone(),
+            rx_pkts: self.rx_pkts.load(Ordering::Relaxed),
+            last_rx_age_s: (last > 0).then(|| epoch_ms_now().saturating_sub(last) / 1000),
+        }
+    }
+}
+
+/// Wall-clock millis since the Unix epoch (0 on a pre-1970 clock).
+fn epoch_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

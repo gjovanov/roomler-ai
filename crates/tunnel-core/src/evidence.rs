@@ -22,6 +22,13 @@ pub static MUX_NAT_RESTORES: AtomicU64 = AtomicU64::new(0);
 /// reconcile pass counts nothing).
 pub static SKIP_AS_SOURCE_FLIPS: AtomicU64 = AtomicU64::new(0);
 
+/// PR-B1 tripwire — direct-socket binds that could NOT take the stable base
+/// port and walked the band. On a host with a configured stable port this is
+/// either an external squatter (Hyper-V/WSL reservation) or — the 2026-08-10
+/// wedge — a second in-process binder colliding with the first's leaked
+/// sockets. Nonzero on a quiet host is a bug signal, not noise.
+pub static DIRECT_BIND_WALKS: AtomicU64 = AtomicU64::new(0);
+
 /// One relaxed snapshot of all three, in declaration order.
 pub fn snapshot() -> (u64, u64, u64) {
     (

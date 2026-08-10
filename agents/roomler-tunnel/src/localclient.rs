@@ -916,6 +916,28 @@ fn print_status(s: &NodeStatus) {
             println!("  srflx       {} ({nat}{via})", srflx.candidates.join(", "));
         }
     }
+
+    // PR-B1 — per-bound-direct-socket receive liveness: a socket with rx=0 /
+    // a growing last_rx age while its endpoint is advertised is a dead reader
+    // (the 2026-08-10 wedge: bound, advertised, Recv-Q pegged, never read).
+    for ds in &s.direct_socks {
+        let last = match ds.last_rx_age_s {
+            Some(a) => format!("{a}s ago"),
+            None => "never".into(),
+        };
+        println!(
+            "  direct sock {}  rx={} last_rx={last}",
+            ds.local, ds.rx_pkts
+        );
+    }
+    if let Some(w) = s.direct_bind_walks
+        && w > 0
+    {
+        println!(
+            "  bind walks  {w} (stable direct port unavailable — squatter or in-process \
+             bind collision)"
+        );
+    }
 }
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {

@@ -608,6 +608,9 @@ struct DirectDemux {
     /// local address so `ensure_direct_demux` is idempotent per interface).
     socks: Vec<Arc<UdpSocket>>,
     tasks: Vec<JoinHandle<()>>,
+    /// PR-B1 — per-socket receive liveness, in lockstep with `socks`/`tasks`
+    /// (snapshotted into `NodeStatus.direct_socks`).
+    stats: Vec<Arc<super::direct::SockStat>>,
 }
 
 /// P1 (S6) — the send-relevant triple of one routed peer, mirrored from
@@ -1211,6 +1214,7 @@ impl WgDevice {
             routes: Arc::new(Mutex::new(HashMap::new())),
             socks: Vec::new(),
             tasks: Vec::new(),
+            stats: Vec::new(),
         });
         // One recv loop per interface socket, all feeding the shared `routes`.
         // Idempotent per interface so repeated installs don't spawn duplicates.
@@ -1221,15 +1225,18 @@ impl WgDevice {
         {
             return;
         }
+        let stat = super::direct::SockStat::new(local.to_string());
         let task = tokio::spawn(run_direct_demux(
             sock.clone(),
             demux.routes.clone(),
             tun_tx,
             self.direct_events_tx.clone(),
             self.stun_events_tx.clone(),
+            stat.clone(),
         ));
         demux.socks.push(sock);
         demux.tasks.push(task);
+        demux.stats.push(stat);
     }
 
     /// R2 — retire one direct socket's demux slot: abort its recv loop and
@@ -1252,11 +1259,21 @@ impl WgDevice {
         else {
             return false;
         };
-        // `socks`/`tasks` are pushed in lockstep (above), so index `i` names
-        // both halves of the slot.
+        // `socks`/`tasks`/`stats` are pushed in lockstep (above), so index
+        // `i` names every half of the slot.
         demux.socks.remove(i);
         demux.tasks.remove(i).abort();
+        demux.stats.remove(i);
         true
+    }
+
+    /// PR-B1 — per-socket receive liveness for `NodeStatus.direct_socks`
+    /// (device mode; the plane twin is `CarrierPlane::socket_stats`).
+    pub fn direct_sock_stats(&self) -> Vec<crate::localapi::DirectSockStatus> {
+        self.direct
+            .as_ref()
+            .map(|d| d.stats.iter().map(|s| s.status()).collect())
+            .unwrap_or_default()
     }
 
     /// Phase A — process ONE datagram for an already-registered direct route
@@ -2043,6 +2060,7 @@ async fn run_direct_demux(
     tun_tx: mpsc::Sender<Vec<u8>>,
     events: mpsc::Sender<DirectInbound>,
     stun_events: mpsc::Sender<crate::transport::stun::StunInbound>,
+    stat: Arc<super::direct::SockStat>,
 ) {
     let mut buf = vec![0u8; WG_BUF];
     // Phase A — per-source rate limit for forwarded unknown-source initiations
@@ -2052,10 +2070,13 @@ async fn run_direct_demux(
         let (n, src) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
-                debug!(%e, "wg direct demux recv ended; loop exiting");
+                // PR-B1 tripwire — a dead recv loop leaves the socket bound +
+                // advertised but reader-less; WARN, not a DEBUG nobody sees.
+                warn!(%e, local = %stat.local, "wg direct demux recv ended; loop exiting");
                 break;
             }
         };
+        stat.bump();
         // Phase C — demux-routed STUN. A datagram carrying the STUN magic
         // cookie that is NOT WireGuard-shaped is a Binding response for the
         // srflx keepalive task, whose query rides this shared socket (which the
