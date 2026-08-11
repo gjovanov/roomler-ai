@@ -2137,25 +2137,50 @@ pub(crate) async fn process_inbound(
                     // (same discipline as the handshake echo above).
                     super::dataprobe::overlay_echo_reply_in_place(pkt);
                     let mut enc = vec![0u8; WG_BUF];
-                    if let TunnResult::WriteToNetwork(b) = t.encapsulate(pkt, &mut enc) {
+                    let res = t.encapsulate(pkt, &mut enc);
+                    // Diagnostic — a responder that fails to encapsulate its
+                    // echo is INVISIBLE to the prober (it just sees a miss),
+                    // which is exactly how a healthy carrier gets
+                    // false-positive-demoted. Name the failing arm.
+                    let arm = match &res {
+                        TunnResult::WriteToNetwork(_) => "write_to_network",
+                        TunnResult::Done => "done",
+                        TunnResult::Err(_) => "err",
+                        _ => "other",
+                    };
+                    if super::direct::session_trace_enabled() {
+                        info!(arm, "overlay: data-probe responder encapsulate");
+                    }
+                    if let TunnResult::WriteToNetwork(b) = res {
                         let c = carrier.clone();
                         let out = b.to_vec();
                         tokio::spawn(async move {
                             let _ = c.send(&out).await;
                         });
+                    } else {
+                        debug!(arm, "overlay: data-probe echo NOT sent (encapsulate)");
                     }
                 } else {
                     // REPLY to one of OUR overlay-native probes — the round
                     // trip completed over the real DATA path.
                     stats.data_probe_replied.store(true, Ordering::Relaxed);
+                    if super::direct::session_trace_enabled() {
+                        info!(
+                            seq = _seq,
+                            "overlay: data-probe reply latched (overlay-echo)"
+                        );
+                    }
                 }
-            } else if super::dataprobe::parse_echo_reply(pkt).is_some() {
+            } else if let Some(seq) = super::dataprobe::parse_echo_reply(pkt) {
                 // Our own carrier data-probe's echo reply — the round-trip
                 // completed over the real DATA path. Latch the liveness signal
                 // and SUPPRESS the TUN write (the OS never issued this ping),
                 // and deliberately do NOT touch `rx`: the probe must not prop
                 // up the weaker one-way counter it exists to backstop.
                 stats.data_probe_replied.store(true, Ordering::Relaxed);
+                if super::direct::session_trace_enabled() {
+                    info!(seq, "overlay: data-probe reply latched (icmp)");
+                }
             } else if ingress.permits(IpAddr::V4(src), pkt) {
                 stats.rx.fetch_add(1, Ordering::Relaxed);
                 let _ = tun_tx.send(pkt.to_vec()).await;
