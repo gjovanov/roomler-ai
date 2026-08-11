@@ -917,6 +917,18 @@ pub fn session_trace_enabled() -> bool {
     crate::env::flag("OVERLAY_SESSION_TRACE", false)
 }
 
+/// Hybrid carrier data-probe (`ROOMLER_NODE_OVERLAY_DATA_PROBE`, legacy
+/// `ROOMLER_AGENT_…`; default **ON**): actively round-trip a tiny probe over
+/// each established DIRECT carrier's real DATA path every health-sweep tick,
+/// and demote to relay after [`super::lifecycle::DATA_PROBE_FAILS_TO_DEMOTE`]
+/// consecutive misses. The only reaper for a heavily-lossy carrier whose
+/// small retried WG handshakes still complete while bulk data drops (field
+/// 2026-08-11, CORPLAP-1/Check Point). Off ⇒ no probes, no probe-demote —
+/// byte-identical to the pre-probe behavior.
+pub fn data_probe_enabled() -> bool {
+    crate::env::flag("OVERLAY_DATA_PROBE", true)
+}
+
 /// B4 — carrier-plane socket-liveness watchdog
 /// (`ROOMLER_NODE_OVERLAY_PLANE_WATCHDOG`, legacy `ROOMLER_AGENT_…`; default
 /// **ON**): when the plane's punch-socket keepalive fails
