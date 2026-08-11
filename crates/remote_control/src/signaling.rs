@@ -762,6 +762,14 @@ pub enum ClientMsg {
         /// `OVERLAY_SERVER_RELAY_STRATEGY` env/config is on.
         #[serde(default)]
         supports_server_relay_strategy: bool,
+        /// Data-probe — the node's overlay engine answers the overlay-native
+        /// echo probe inline (the non-ICMP half of the hybrid carrier
+        /// data-probe). Persisted + echoed per-peer so a prober prefers the
+        /// engine-guaranteed echo toward capable peers (netstack-only nodes
+        /// have no OS ICMP responder) and falls back to the ICMP probe for
+        /// the rest. Absent from an older node ⇒ `false` ⇒ ICMP.
+        #[serde(default)]
+        supports_overlay_echo: bool,
         /// Phase 1 — subnet CIDRs this node offers to route for peers
         /// (`--advertise-routes` / config). The server stores them as *claimed*
         /// routes; an admin must **approve** each before it's distributed in the
@@ -1725,6 +1733,12 @@ pub struct NetmapPeer {
     /// before. Skipped-when-None so a pre-U2 node's wire shape is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_strategy: Option<RelayStrategyWire>,
+    /// Data-probe — this peer's overlay engine answers the overlay-native
+    /// echo probe inline. The prober uses the engine echo toward such peers
+    /// (guaranteed responder, netstack included) and the ICMP probe toward
+    /// the rest. Pre-capability server/peer ⇒ `false` ⇒ ICMP.
+    #[serde(default)]
+    pub supports_overlay_echo: bool,
     /// Phase 1 — subnet routes this peer is an **approved** router for (CIDR
     /// strings like `"192.168.1.0/24"`). A receiving node installs each CIDR
     /// into its router (allowed_ips) + OS route table pointing at this peer, so
@@ -2924,6 +2938,7 @@ mod tests {
             supports_relay_single: true,
             supports_derp: true,
             supports_forced_derp: true,
+            supports_overlay_echo: false,
             supports_server_relay_strategy: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
         };
@@ -2969,8 +2984,18 @@ mod tests {
         match serde_json::from_str::<ClientMsg>(legacy).unwrap() {
             ClientMsg::OverlayJoin {
                 supports_forced_derp,
+                supports_overlay_echo,
                 ..
-            } => assert!(!supports_forced_derp, "absent flag must default false"),
+            } => {
+                assert!(!supports_forced_derp, "absent flag must default false");
+                // Data-probe back-compat lock: a pre-capability join (no
+                // supports_overlay_echo key) defaults false ⇒ peers probe
+                // this node with ICMP, never the overlay-native echo.
+                assert!(
+                    !supports_overlay_echo,
+                    "absent supports_overlay_echo must default false"
+                );
+            }
             other => panic!("expected OverlayJoin, got {other:?}"),
         }
     }
@@ -3411,6 +3436,7 @@ mod tests {
                 supports_relay_single: true,
                 supports_derp: true,
                 supports_forced_derp: true,
+                supports_overlay_echo: false,
                 relay_strategy: Some(RelayStrategyWire::SingleRelayDialer),
                 routes: vec!["10.0.0.0/24".into()],
                 agent_id: Some(agent_id),
