@@ -337,6 +337,15 @@ impl OverlayRuntime {
                     poke_pending = e.last_poke_at.is_some(),
                     poke_since_s = trace_poke.map(|(s, _)| s.as_secs()),
                     poke_answered = trace_poke.map(|(_, a)| a),
+                    // A2 round-2 — the one-way inputs: does tx-DATA advance
+                    // (tx>last_tx) while rx-DATA stays flat (rx==last_rx)?
+                    // That's what must accumulate `bad_sweeps` → OneWay demote.
+                    tx,
+                    rx,
+                    dtx = tx.saturating_sub(last_tx),
+                    drx = rx.saturating_sub(last_rx),
+                    bad_sweeps_in = e.bad_sweeps,
+                    bad_sweeps_out = v.bad_sweeps,
                     death = ?v.death,
                     "overlay: session-trace (carrier health)"
                 );
