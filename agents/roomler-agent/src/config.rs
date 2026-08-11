@@ -188,6 +188,12 @@ pub struct AgentConfig {
     /// default: off.
     #[serde(default)]
     pub overlay_session_trace: Option<bool>,
+    /// Hybrid carrier data-probe: actively round-trip a tiny probe over each
+    /// established direct carrier and demote to relay on sustained loss
+    /// (`ROOMLER_NODE_OVERLAY_DATA_PROBE`). Catches a heavily-lossy carrier
+    /// that passes handshakes but drops data. Built-in default: on.
+    #[serde(default)]
+    pub overlay_data_probe: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
     /// stray-adapter sweep, Windows only
     /// (`ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
@@ -1078,7 +1084,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 28] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 29] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1098,6 +1104,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 28]
         ("OVERLAY_ROAM", cfg.overlay_roam),
         ("OVERLAY_PLANE_WATCHDOG", cfg.overlay_plane_watchdog),
         ("OVERLAY_SESSION_TRACE", cfg.overlay_session_trace),
+        ("OVERLAY_DATA_PROBE", cfg.overlay_data_probe),
         ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
         ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
@@ -1291,6 +1298,7 @@ mod tests {
             overlay_roam: None,
             overlay_plane_watchdog: None,
             overlay_session_trace: None,
+            overlay_data_probe: None,
             overlay_tun_stable_guid: None,
             overlay_route_evict: None,
             overlay_tun_persist: None,

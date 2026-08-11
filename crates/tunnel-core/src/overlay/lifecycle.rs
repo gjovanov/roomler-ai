@@ -263,7 +263,22 @@ pub(crate) enum DeathReason {
     /// rebuild it triggers supplies fresh evidence itself, so a transient blip
     /// recovers with zero penalty and can't feed the forced-DERP escalation.
     RekeyUnanswered,
+    /// Data-probe — our overlay carrier data-probe (an ICMP echo over the
+    /// real DATA path) went unanswered for [`DATA_PROBE_FAILS_TO_DEMOTE`]
+    /// consecutive rounds. The only reaper that catches a HEAVILY-LOSSY
+    /// direct carrier whose small retried WG handshakes still complete while
+    /// bulk data drops (field 2026-08-11, pc50045/Check Point). Books no
+    /// PathMonitor strike (like [`RekeyUnanswered`]): the relay it falls back
+    /// to is the reliable path for such a pair, and a transient blip re-probes
+    /// direct via make-before-break with zero penalty.
+    DataProbeDead,
 }
+
+/// Data-probe — consecutive unanswered probe rounds (one per health-sweep
+/// tick, ~5 s) before a direct carrier is demoted to relay. 4 ≈ 20 s of a
+/// black-holed DATA path — comfortably past a couple of lost round-trips, well
+/// short of a user waiting out the failure.
+pub(crate) const DATA_PROBE_FAILS_TO_DEMOTE: u32 = 4;
 
 impl DeathReason {
     /// U1 — the wire/diagnostic short string (rides
@@ -276,6 +291,7 @@ impl DeathReason {
             DeathReason::HandshakeDeadline => "handshake-deadline",
             DeathReason::OneWay => "one-way",
             DeathReason::RekeyUnanswered => "rekey-unanswered",
+            DeathReason::DataProbeDead => "data-probe-dead",
         }
     }
 }

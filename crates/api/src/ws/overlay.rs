@@ -89,6 +89,7 @@ pub async fn relay_overlay_msg_from_node(
             supports_derp,
             supports_forced_derp,
             supports_server_relay_strategy,
+            supports_overlay_echo,
             advertised_routes,
             ..
         } => {
@@ -103,6 +104,7 @@ pub async fn relay_overlay_msg_from_node(
                 supports_derp,
                 supports_forced_derp,
                 supports_server_relay_strategy,
+                supports_overlay_echo,
                 advertised_routes,
             )
             .await;
@@ -157,6 +159,7 @@ async fn handle_overlay_join(
     supports_derp: bool,
     supports_forced_derp: bool,
     supports_server_relay_strategy: bool,
+    supports_overlay_echo: bool,
     advertised_routes: Vec<String>,
 ) {
     let node_ref = ident.node_ref();
@@ -215,6 +218,7 @@ async fn handle_overlay_join(
                     supports_derp,
                     supports_forced_derp,
                     supports_server_relay_strategy,
+                    supports_overlay_echo,
                     &advertised_routes,
                 )
                 .await
@@ -273,6 +277,7 @@ async fn handle_overlay_join(
                         supports_derp,
                         supports_forced_derp,
                         supports_server_relay_strategy,
+                        supports_overlay_echo,
                         advertised_routes.clone(),
                     )
                     .await
@@ -1683,6 +1688,9 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // `server_relay_verdict`.
         supports_forced_derp: node.supports_forced_derp,
         relay_strategy: None,
+        // Data-probe — echo the peer's overlay-native-echo capability so
+        // probers pick the engine echo over ICMP for capable peers.
+        supports_overlay_echo: node.supports_overlay_echo,
         // Only the admin-APPROVED routes reach peers — and, once the tenant's
         // overlay ACL is enforcing, only the subset THIS recipient may install
         // (see `shape_peer`). `to_netmap_peer` keeps the permissive default so

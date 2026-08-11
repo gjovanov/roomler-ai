@@ -103,6 +103,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_roam: None,
         overlay_plane_watchdog: None,
         overlay_session_trace: None,
+        overlay_data_probe: None,
         overlay_tun_stable_guid: None,
         overlay_route_evict: None,
         overlay_tun_persist: None,
