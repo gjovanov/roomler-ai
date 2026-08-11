@@ -446,11 +446,27 @@ impl OverlayRuntime {
                         .get(nid)
                         .is_some_and(|np| np.supports_overlay_echo);
                     e.probe_seq = e.probe_seq.wrapping_add(1);
-                    if wg
+                    let sent = wg
                         .send_data_probe(self_ip, e.overlay_ip, e.probe_seq, native)
-                        .await
-                    {
+                        .await;
+                    if sent {
                         e.probe_outstanding = true;
+                    }
+                    // Diagnostic — the probe's own accounting, so a
+                    // false-positive demote can be traced to WHICH step
+                    // failed: not sent / sent-but-never-answered / which
+                    // responder mode was used.
+                    if crate::overlay::direct::session_trace_enabled() {
+                        tracing::info!(
+                            peer = %nid,
+                            overlay_ip = %e.overlay_ip,
+                            mode = if native { "overlay-echo" } else { "icmp" },
+                            seq = e.probe_seq,
+                            sent,
+                            replied_prev = replied,
+                            fails = e.probe_fails,
+                            "overlay: data-probe round"
+                        );
                     }
                 }
             } else if !e.is_direct {
