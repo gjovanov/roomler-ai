@@ -1340,6 +1340,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_overlay_echo: false,
             relay_strategy: None,
             relay_home: None,
         }
