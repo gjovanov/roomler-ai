@@ -354,6 +354,7 @@ impl LocalApiState for DaemonState {
             direct_bind_walks: Some(
                 tunnel_core::evidence::DIRECT_BIND_WALKS.load(Ordering::Relaxed),
             ),
+            roam_adoptions: Some(tunnel_core::evidence::ROAM_ADOPTIONS.load(Ordering::Relaxed)),
         }
     }
 
