@@ -152,6 +152,12 @@ pub struct NodeStatus {
     /// in-process bind collision (bug signal). `None` from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_bind_walks: Option<u64>,
+    /// A3 — peer endpoints adopted via WG-style roaming since daemon start
+    /// ([`crate::evidence::ROAM_ADOPTIONS`]). A few is normal (symmetric-NAT
+    /// mapping learned); a steadily climbing count is endpoint thrash. `None`
+    /// from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roam_adoptions: Option<u64>,
 }
 
 /// PR-B1 — one bound direct socket's receive liveness (plane or per-device
@@ -1830,6 +1836,7 @@ mod tests {
                 skip_as_source_flips: None,
                 direct_socks: Vec::new(),
                 direct_bind_walks: None,
+                roam_adoptions: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {

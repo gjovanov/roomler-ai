@@ -938,6 +938,11 @@ fn print_status(s: &NodeStatus) {
              bind collision)"
         );
     }
+    if let Some(r) = s.roam_adoptions
+        && r > 0
+    {
+        println!("  roam adopts {r} (peer endpoints adopted via WG-style roaming)");
+    }
 }
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {
