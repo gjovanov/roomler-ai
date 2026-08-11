@@ -62,6 +62,11 @@ pub struct PeerConfig {
     /// from U2 onward). Part of the both-ends gate for applying a
     /// server-computed `relay_strategy`.
     pub supports_forced_derp: bool,
+    /// Data-probe — the peer's overlay ENGINE answers the overlay-native
+    /// echo probe inline (guaranteed responder, netstack included). The
+    /// carrier data-probe uses the engine echo toward such peers and the
+    /// ICMP echo toward the rest. Pre-capability peer ⇒ `false` ⇒ ICMP.
+    pub supports_overlay_echo: bool,
     /// U2 — the server's relay-tier verdict for this edge, or `None` when the
     /// server didn't stamp one (pre-U2 server, or either end unflagged). When
     /// present AND our own `server_relay_strategy_enabled()` is on, the
@@ -96,6 +101,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         supports_relay_single: peer.supports_relay_single,
         supports_derp: peer.supports_derp,
         supports_forced_derp: peer.supports_forced_derp,
+        supports_overlay_echo: peer.supports_overlay_echo,
         relay_strategy: peer.relay_strategy,
         relay_home: peer.relay_home.clone(),
     })
@@ -123,6 +129,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
             agent_id: None,
