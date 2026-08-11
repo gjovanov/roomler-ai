@@ -217,7 +217,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_data_probe",
         "tribool",
-        "Hybrid carrier data-probe: round-trip a tiny probe over each established direct carrier and demote to relay on sustained loss (catches a lossy carrier that passes handshakes but drops data). Built-in default: on.",
+        "Hybrid carrier data-probe: round-trip a tiny probe over each established direct carrier and demote to relay on sustained loss (catches a lossy carrier that passes handshakes but drops data). Built-in default: OFF (opt-in; false-positived on healthy carriers at default-ON, rc.346).",
     ),
     (
         "overlay_tun_stable_guid",
