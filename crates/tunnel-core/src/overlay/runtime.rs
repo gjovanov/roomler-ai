@@ -3571,6 +3571,11 @@ mod tests {
     /// data-drops carrier neither the poke nor the one-way counter can see.
     #[tokio::test(flavor = "multi_thread")]
     async fn data_probe_misses_demote_and_replies_reset() {
+        // The probe is opt-in (default OFF since rc.347 — it false-positived
+        // in the field), so force the gate on for this test. Scoped to the
+        // probe key only; every other sweep test passes `UNSPECIFIED` and so
+        // is unaffected by the flag either way.
+        unsafe { std::env::set_var("ROOMLER_NODE_OVERLAY_DATA_PROBE", "1") };
         let kp = WgKeypair::generate();
         let peer_kp = WgKeypair::generate();
         let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
@@ -3671,6 +3676,7 @@ mod tests {
         .await;
         let e = by_node.get(&nid).expect("answered probes keep the carrier");
         assert_eq!(e.probe_fails, 0, "a reply resets the miss counter");
+        unsafe { std::env::remove_var("ROOMLER_NODE_OVERLAY_DATA_PROBE") };
     }
 
     /// A `TunIo` that records every peer-route add/remove, so the tests can
