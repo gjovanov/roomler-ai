@@ -264,6 +264,16 @@ impl SrflxStatus {
 pub struct PeerInfo {
     pub node_id: String,
     pub name: String,
+    /// Multi-org — the label of the org this peer belongs to (the `[[orgs]]`
+    /// label, or `primary`). A device in N orgs runs N overlay engines with
+    /// DISJOINT peer sets and disjoint address spaces, so a flat peer list is
+    /// ambiguous: two orgs can each hold a peer named the same, and the same
+    /// physical host appears once per shared org under different overlay IPs.
+    ///
+    /// Empty for a single-org device and for a daemon older than the field
+    /// (`#[serde(default)]` — an older CLI renders its flat table unchanged).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub org: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_ip: Option<String>,
     /// The peer's *derived* overlay IPv6 (`fd72:6f6f:6d6c::<their-v4>`),
@@ -1844,6 +1854,7 @@ mod tests {
                 PeerInfo {
                     node_id: "n2".into(),
                     name: "pc50045".into(),
+                    org: String::new(),
                     overlay_ip: Some("100.64.0.1".into()),
                     overlay_ip6: None,
                     online: true,
@@ -1860,6 +1871,7 @@ mod tests {
                 PeerInfo {
                     node_id: "n3".into(),
                     name: "home".into(),
+                    org: String::new(),
                     overlay_ip: Some("100.64.0.9".into()),
                     overlay_ip6: None,
                     online: true,

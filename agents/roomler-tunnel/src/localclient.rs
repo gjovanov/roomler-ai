@@ -954,9 +954,45 @@ fn print_peers(peers: &[PeerInfo], now_ms: u64) {
         println!("(no peers)");
         return;
     }
-    for p in peers {
-        println!("{}", fmt_peer_row(p, now_ms));
+    for (i, (org, rows)) in group_peers_by_org(peers).into_iter().enumerate() {
+        if let Some(org) = org {
+            if i > 0 {
+                println!();
+            }
+            println!("  ── org: {org} ──");
+        }
+        for p in rows {
+            println!("{}", fmt_peer_row(p, now_ms));
+        }
     }
+}
+
+/// Multi-org — group peers by org in FIRST-APPEARANCE order (the daemon emits
+/// the primary's mesh first, then each secondary). `None` as the group key
+/// means "print no header": that is the single-org case, where every row has
+/// an empty `org` and the output must stay byte-identical to the flat table
+/// older CLIs — and the diag bundle, which shells out to `roomler peers` —
+/// already expect. Rows with no org alongside labelled ones (mixed daemon
+/// shapes) are kept in a trailing `(unlabelled)` group rather than dropped.
+fn group_peers_by_org(peers: &[PeerInfo]) -> Vec<(Option<&str>, Vec<&PeerInfo>)> {
+    let mut order: Vec<&str> = Vec::new();
+    for p in peers {
+        if !p.org.is_empty() && !order.contains(&p.org.as_str()) {
+            order.push(p.org.as_str());
+        }
+    }
+    if order.is_empty() {
+        return vec![(None, peers.iter().collect())];
+    }
+    let mut out: Vec<(Option<&str>, Vec<&PeerInfo>)> = order
+        .into_iter()
+        .map(|org| (Some(org), peers.iter().filter(|p| p.org == org).collect()))
+        .collect();
+    let orphans: Vec<&PeerInfo> = peers.iter().filter(|p| p.org.is_empty()).collect();
+    if !orphans.is_empty() {
+        out.push((Some("(unlabelled)"), orphans));
+    }
+    out
 }
 
 fn print_flows(flows: &[FlowInfo]) {
@@ -1029,6 +1065,62 @@ fn route_state_word(s: &RouteState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer(name: &str, org: &str) -> PeerInfo {
+        PeerInfo {
+            node_id: name.into(),
+            name: name.into(),
+            org: org.into(),
+            overlay_ip: None,
+            overlay_ip6: None,
+            online: true,
+            connection: ConnectionType::Direct,
+            upgrading: false,
+            stalled: false,
+            rtt_ms: None,
+            last_seen_ms: None,
+            agent_id: None,
+            relay_local: None,
+            relay_dst: None,
+            debug: None,
+        }
+    }
+
+    /// Single-org (every row unlabelled) must render as ONE unheaded group —
+    /// byte-identical to the pre-multi-org flat table that older CLIs and the
+    /// diag bundle parse. Multi-org groups in first-appearance order.
+    #[test]
+    fn peers_group_by_org_first_appearance_and_single_org_is_flat() {
+        // Single-org: one group, no header.
+        let flat = vec![peer("a", ""), peer("b", "")];
+        let g = group_peers_by_org(&flat);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].0, None, "single-org must print no org header");
+        assert_eq!(g[0].1.len(), 2);
+
+        // Multi-org: primary first (as the daemon emits), then secondaries,
+        // each group holding only its own rows.
+        let multi = vec![
+            peer("p1", "primary"),
+            peer("j1", "jovanov"),
+            peer("p2", "primary"),
+        ];
+        let g = group_peers_by_org(&multi);
+        assert_eq!(
+            g.iter().map(|(o, _)| o.unwrap()).collect::<Vec<_>>(),
+            vec!["primary", "jovanov"]
+        );
+        assert_eq!(g[0].1.len(), 2);
+        assert_eq!(g[1].1.len(), 1);
+        assert_eq!(g[1].1[0].name, "j1");
+
+        // Mixed shapes: unlabelled rows are kept, not dropped.
+        let mixed = vec![peer("x", "primary"), peer("y", "")];
+        let g = group_peers_by_org(&mixed);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[1].0, Some("(unlabelled)"));
+        assert_eq!(g[1].1[0].name, "y");
+    }
 
     #[test]
     fn route_rows_render_each_state() {
@@ -1107,6 +1199,7 @@ mod tests {
         let online = PeerInfo {
             node_id: "n2".into(),
             name: "pc50045".into(),
+            org: String::new(),
             overlay_ip: Some("100.64.0.1".into()),
             overlay_ip6: Some("fd72:6f6f:6d6c::6440:1".into()),
             online: true,
@@ -1132,6 +1225,7 @@ mod tests {
         let offline = PeerInfo {
             node_id: "n3".into(),
             name: "home".into(),
+            org: String::new(),
             overlay_ip: None,
             overlay_ip6: None,
             online: false,
@@ -1157,6 +1251,7 @@ mod tests {
         let p = PeerInfo {
             node_id: "0123456789abcdef0123".into(),
             name: String::new(),
+            org: String::new(),
             overlay_ip: Some("100.64.0.7".into()),
             overlay_ip6: None,
             online: true,
@@ -1185,6 +1280,7 @@ mod tests {
         let mut p = PeerInfo {
             node_id: "n4".into(),
             name: "pc50045".into(),
+            org: String::new(),
             overlay_ip: Some("100.64.0.1".into()),
             overlay_ip6: None,
             online: true,

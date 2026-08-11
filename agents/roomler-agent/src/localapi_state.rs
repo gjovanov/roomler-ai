@@ -165,6 +165,10 @@ pub struct DaemonState {
     /// `None` in unit tests / states built without one → the field is empty
     /// (old-daemon shape).
     orgs: Option<OrgStatusRegistry>,
+    /// Multi-org — every SECONDARY org's live overlay view, labelled (see
+    /// [`OrgViewRegistry`]). `None`/empty ⇒ single-org: `peers` returns the
+    /// primary's flat list exactly as before.
+    org_views: Option<OrgViewRegistry>,
 }
 
 /// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
@@ -185,6 +189,15 @@ pub struct OrgRuntime {
 
 /// Shared registry of [`OrgRuntime`] rows (primary first).
 pub type OrgStatusRegistry = Arc<Mutex<Vec<OrgRuntime>>>;
+
+/// Multi-org — one SECONDARY org's live overlay view, labelled.
+///
+/// Each org runs its own [`OverlayRuntime`] publishing to its own `watch`
+/// channel; before this registry the secondaries' receivers were dropped on
+/// the floor (`main.rs`, `let (tx, _rx) = watch::channel(...)`), so `peers`
+/// could only ever show the primary's mesh. Registered at boot for every
+/// `[[orgs]]` entry and on a live `rc:agent.join_org`.
+pub type OrgViewRegistry = Arc<Mutex<Vec<(String, watch::Receiver<OverlayView>)>>>;
 
 impl DaemonState {
     /// Build from the enrolled config identity + the live handles. `mode` is the
@@ -219,6 +232,7 @@ impl DaemonState {
             routes: None,
             config_persist: None,
             orgs: None,
+            org_views: None,
         }
     }
 
@@ -227,6 +241,14 @@ impl DaemonState {
     /// (incl. tests) unchanged.
     pub fn with_orgs(mut self, orgs: OrgStatusRegistry) -> Self {
         self.orgs = Some(orgs);
+        self
+    }
+
+    /// Multi-org — attach the per-secondary-org overlay views so `peers`
+    /// reports EVERY org's mesh, not just the primary's. Absent (or empty) ⇒
+    /// single-org behaviour, byte-identical.
+    pub fn with_org_views(mut self, views: OrgViewRegistry) -> Self {
+        self.org_views = Some(views);
         self
     }
 
@@ -365,6 +387,33 @@ impl LocalApiState for DaemonState {
             return Vec::new();
         }
         let mut peers = self.overlay.borrow().peers.clone();
+        // Multi-org — append every SECONDARY org's mesh, labelled. Each org
+        // runs its own overlay engine with a DISJOINT peer set and address
+        // space, so without the label a merged list is ambiguous (the same
+        // host can appear once per shared org under different overlay IPs).
+        // Only stamp when there IS more than one org, so a single-org daemon's
+        // output stays byte-identical.
+        if let Some(views) = &self.org_views
+            && let Ok(views) = views.lock()
+            && !views.is_empty()
+        {
+            let primary_label = self
+                .orgs
+                .as_ref()
+                .and_then(|o| o.lock().ok())
+                .and_then(|rows| rows.iter().find(|r| r.primary).map(|r| r.label.clone()))
+                .unwrap_or_else(|| "primary".to_string());
+            for p in &mut peers {
+                p.org = primary_label.clone();
+            }
+            for (label, rx) in views.iter() {
+                let mut org_peers = rx.borrow().peers.clone();
+                for p in &mut org_peers {
+                    p.org = label.clone();
+                }
+                peers.extend(org_peers);
+            }
+        }
         // P3b-3: overlay a peer as `Tunnel` when its WG carrier is down and the
         // daemon reaches its backing agent via a live tunnel flow.
         apply_tunnel_override(&mut peers, &self.tunnel_hub.active_flow_agent_ids());
@@ -999,6 +1048,7 @@ mod tests {
             peers: vec![PeerInfo {
                 node_id: "n2".into(),
                 name: "peer".into(),
+                org: String::new(),
                 overlay_ip: Some("100.64.0.1".into()),
                 overlay_ip6: Some("fd72:6f6f:6d6c::6440:1".into()),
                 online: true,
@@ -1290,6 +1340,7 @@ mod tests {
             PeerInfo {
                 node_id: "n".into(),
                 name: "p".into(),
+                org: String::new(),
                 overlay_ip: None,
                 overlay_ip6: None,
                 online: true,

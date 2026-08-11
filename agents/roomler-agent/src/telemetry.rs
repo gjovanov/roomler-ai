@@ -168,6 +168,7 @@ mod tests {
         PeerInfo {
             node_id: "n".into(),
             name: "p".into(),
+            org: String::new(),
             overlay_ip: Some("100.64.0.9".into()),
             overlay_ip6: None,
             online,
