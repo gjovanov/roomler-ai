@@ -1014,6 +1014,11 @@ impl CarrierPlane {
             let mut rx = rx;
             let mut server = server0;
             let mut failures = 0u32;
+            // B4 — a SEPARATE consecutive-failure counter for the watchdog:
+            // `failures` resets every RERESOLVE_AFTER cycles (the STUN-server
+            // re-resolve), so it can't measure a sustained outage. This one
+            // resets ONLY on a successful query.
+            let mut watchdog_fails = 0u32;
             // PR-B1 tripwire — one WARN per outage (not per cycle): repeated
             // keepalive failure is the "advertised mapping may be dead"
             // signal, most notably a reader-less punch socket queueing the
@@ -1037,6 +1042,7 @@ impl CarrierPlane {
                 {
                     Ok(cur) => {
                         failures = 0;
+                        watchdog_fails = 0;
                         let mut publish = false;
                         if warned {
                             warned = false;
@@ -1064,6 +1070,23 @@ impl CarrierPlane {
                     }
                     Err(e) => {
                         failures += 1;
+                        watchdog_fails += 1;
+                        // B4 — sustained failure ⇒ the punch socket is dead
+                        // (reader-less / wedged); re-resolving the server
+                        // won't help. Self-heal via a debounced plane rebuild
+                        // (re-binds fresh sockets + re-arms this keepalive).
+                        if direct::plane_watchdog_enabled()
+                            && watchdog_fails >= direct::PLANE_WATCHDOG_FAILS
+                        {
+                            warn!(
+                                watchdog_fails,
+                                "carrier plane: srflx keepalive dead for {} cycles — watchdog \
+                                 forcing a plane rebuild (punch socket wedged?)",
+                                watchdog_fails
+                            );
+                            watchdog_fails = 0;
+                            plane.request_rebuild("srflx-keepalive-watchdog", true);
+                        }
                         if failures >= RERESOLVE_AFTER && !warned {
                             warned = true;
                             warn!(
