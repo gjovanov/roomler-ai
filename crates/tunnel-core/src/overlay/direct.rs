@@ -907,6 +907,23 @@ pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> 
     None
 }
 
+/// B4 — carrier-plane socket-liveness watchdog
+/// (`ROOMLER_NODE_OVERLAY_PLANE_WATCHDOG`, legacy `ROOMLER_AGENT_…`; default
+/// **ON**): when the plane's punch-socket keepalive fails
+/// [`PLANE_WATCHDOG_FAILS`] consecutive cycles (a reader-less / wedged socket
+/// — the 2026-08-10 class of bug B1 fixed structurally), self-heal by
+/// requesting a debounced plane rebuild that re-binds fresh sockets. The
+/// kill switch reverts to "warn only, never auto-rebuild".
+pub fn plane_watchdog_enabled() -> bool {
+    crate::env::flag("OVERLAY_PLANE_WATCHDOG", true)
+}
+
+/// B4 — consecutive plane-keepalive failures before the watchdog forces a
+/// rebuild. At the ~20 s keepalive interval this is ~2 min of a dead socket
+/// before self-heal — long enough that a transient STUN outage (which the
+/// re-resolve at 3 handles) never trips it, short enough to bound the wedge.
+pub const PLANE_WATCHDOG_FAILS: u32 = 6;
+
 /// A3 — WG-style endpoint roaming (`ROOMLER_NODE_OVERLAY_ROAM`, legacy
 /// `ROOMLER_AGENT_…`; default **ON**): adopt a peer's observed source after an
 /// AUTHENTICATED inbound from it, repointing the carrier in place. The kill
