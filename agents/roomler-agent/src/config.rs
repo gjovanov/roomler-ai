@@ -191,7 +191,7 @@ pub struct AgentConfig {
     /// Hybrid carrier data-probe: actively round-trip a tiny probe over each
     /// established direct carrier and demote to relay on sustained loss
     /// (`ROOMLER_NODE_OVERLAY_DATA_PROBE`). Catches a heavily-lossy carrier
-    /// that passes handshakes but drops data. Built-in default: on.
+    /// that passes handshakes but drops data. Built-in default: OFF (opt-in since rc.347).
     #[serde(default)]
     pub overlay_data_probe: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
