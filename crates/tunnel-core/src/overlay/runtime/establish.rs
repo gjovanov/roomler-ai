@@ -290,6 +290,9 @@ impl OverlayRuntime {
                 since_poke: now.saturating_duration_since(at),
                 answered: wg.peer_initiator_hs_answered(&e.pubkey, at),
             });
+            // Diagnostic — capture poke state before `poke` moves into
+            // `carrier_tick` (see `OVERLAY_SESSION_TRACE`).
+            let trace_poke = poke.as_ref().map(|p| (p.since_poke, p.answered));
             if poke.as_ref().is_some_and(|p| p.answered) {
                 e.last_poke_at = None;
             }
@@ -316,6 +319,28 @@ impl OverlayRuntime {
                     .is_some_and(|&until| until > now),
                 poke,
             });
+            // Diagnostic — per-direct-carrier health/poke trace (see
+            // `OVERLAY_SESSION_TRACE`). Shows why a uni-directional carrier
+            // isn't being revalidated: proof_age vs POKE_PROOF, rx silence,
+            // whether a poke is stuck pending, and the tick's death verdict.
+            if crate::overlay::direct::session_trace_enabled() && e.is_direct {
+                let proof_age = wg
+                    .peer_initiator_hs_age(&e.pubkey)
+                    .map_or(e.since.elapsed(), |a| a.min(e.since.elapsed()));
+                tracing::info!(
+                    peer = %nid,
+                    overlay_ip = %e.overlay_ip,
+                    tier = ?e.tier,
+                    hs_done = handshake_done,
+                    since_rx_s = since_last_rx.as_secs(),
+                    proof_age_s = proof_age.as_secs(),
+                    poke_pending = e.last_poke_at.is_some(),
+                    poke_since_s = trace_poke.map(|(s, _)| s.as_secs()),
+                    poke_answered = trace_poke.map(|(_, a)| a),
+                    death = ?v.death,
+                    "overlay: session-trace (carrier health)"
+                );
+            }
             // P3 PR-A — feed the sweep's evidence to the shadow monitor:
             // heard-this-sweep (Q credit), a stored one-way strike (Q debit),
             // and the strike-clear (a direct carrier genuinely receiving also
