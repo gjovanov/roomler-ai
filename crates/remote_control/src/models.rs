@@ -1379,6 +1379,12 @@ pub struct OverlayNode {
     /// `false` ⇒ the pair keeps the client-authoritative path.
     #[serde(default)]
     pub supports_server_relay_strategy: bool,
+    /// Data-probe — the node's overlay engine answers the overlay-native echo
+    /// probe inline (advertised on JOIN, echoed per-peer in the netmap so
+    /// probers prefer the engine-guaranteed echo). Absent on an older row ⇒
+    /// `false` ⇒ peers probe it with ICMP.
+    #[serde(default)]
+    pub supports_overlay_echo: bool,
     /// Phase 1 — subnet CIDRs this node CLAIMS it can route for peers (from its
     /// `--advertise-routes` config, refreshed on each join). Untrusted until an
     /// admin approves; see `approved_routes`.
