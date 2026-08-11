@@ -96,6 +96,9 @@ struct PlaneRoute {
     carrier: std::sync::Weak<Carrier>,
     /// A3 — last adoption instant for this session (roam rate limit).
     last_roam: Option<Instant>,
+    /// Diagnostic — last session-trace emission (throttle; see
+    /// `OVERLAY_SESSION_TRACE`).
+    last_trace: Option<Instant>,
 }
 
 /// The plane's bound socket set (the process-wide twin of one runtime's
@@ -563,7 +566,33 @@ impl CarrierPlane {
     }
 
     fn route_by_index(&self, idx: u32, src: SocketAddr) -> Routed {
-        let st = self.lock();
+        let mut st = self.lock();
+        // Diagnostic — per-session inbound trace (src vs expected vs verdict),
+        // throttled 2 s/session. Shows whether a session receives direct
+        // inbound at all and from which source (the uni-directional-carrier
+        // diagnosis: same-port = filtering, new-port-no-roam = roam gap,
+        // no-trace = relay-only inbound).
+        if direct::session_trace_enabled()
+            && let Some(r) = st.routes.get_mut(&idx)
+        {
+            let now = Instant::now();
+            if r.last_trace
+                .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(2))
+            {
+                r.last_trace = Some(now);
+                let verdict = if r.expected_src == src {
+                    "match"
+                } else if direct::roam_enabled() {
+                    "roam"
+                } else {
+                    "drop"
+                };
+                info!(
+                    idx, engine = r.engine, %src, expected = %r.expected_src, verdict,
+                    "carrier plane: session-trace (inbound)"
+                );
+            }
+        }
         match st.routes.get(&idx) {
             Some(r) if r.expected_src == src => Routed::Session {
                 tunn: r.tunn.clone(),
@@ -746,6 +775,7 @@ impl PlaneHandle {
                     expected_src,
                     carrier,
                     last_roam: None,
+                    last_trace: None,
                 },
             )
             .is_some()

@@ -210,6 +210,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Carrier-plane socket-liveness watchdog: force a debounced plane rebuild when the shared punch-socket keepalive fails N consecutive cycles (reader-less/wedged socket). off = warn-only. Built-in default: on.",
     ),
     (
+        "overlay_session_trace",
+        "tribool",
+        "Diagnostic: per-session plane-demux + carrier-health INFO traces (inbound src vs expected, poke/proof/rx state). Verbose; enable briefly on an affected host to diagnose a specific peer's carrier. Built-in default: off.",
+    ),
+    (
         "overlay_tun_stable_guid",
         "tribool",
         "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
@@ -389,6 +394,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_tun_per_org" => cfg.overlay_tun_per_org.map(fmt_bool),
         "overlay_roam" => cfg.overlay_roam.map(fmt_bool),
         "overlay_plane_watchdog" => cfg.overlay_plane_watchdog.map(fmt_bool),
+        "overlay_session_trace" => cfg.overlay_session_trace.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
@@ -585,6 +591,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_tun_per_org" => cfg.overlay_tun_per_org = parse_tribool(value)?,
         "overlay_roam" => cfg.overlay_roam = parse_tribool(value)?,
         "overlay_plane_watchdog" => cfg.overlay_plane_watchdog = parse_tribool(value)?,
+        "overlay_session_trace" => cfg.overlay_session_trace = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
@@ -852,6 +859,18 @@ mod tests {
         apply(&mut cfg, "overlay_plane_watchdog", None).unwrap();
         assert_eq!(cfg.overlay_plane_watchdog, None);
         assert!(apply(&mut cfg, "overlay_plane_watchdog", Some("maybe")).is_err());
+    }
+
+    /// Diagnostic session-trace kill switch set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_session_trace_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_session_trace", Some("on")).unwrap();
+        assert_eq!(cfg.overlay_session_trace, Some(true));
+        apply(&mut cfg, "overlay_session_trace", None).unwrap();
+        assert_eq!(cfg.overlay_session_trace, None);
+        assert!(apply(&mut cfg, "overlay_session_trace", Some("maybe")).is_err());
     }
 
     /// Multi-org v2 per-org-adapter soak flag set/echo/clear (per the
