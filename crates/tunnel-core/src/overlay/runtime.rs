@@ -300,6 +300,14 @@ struct Installed {
     /// it — `WgDevice::peer_initiator_hs_answered`); an unanswered poke past
     /// the tier's handshake deadline is a `DeathReason::RekeyUnanswered`.
     last_poke_at: Option<Instant>,
+    /// Data-probe — sequence of the last ICMP data-probe sent for this direct
+    /// carrier (bumped each round), and whether one is outstanding (sent last
+    /// tick, verdict pending this tick). Consecutive unanswered rounds count
+    /// into `probe_fails`; at [`lifecycle::DATA_PROBE_FAILS_TO_DEMOTE`] the
+    /// carrier is demoted to relay ([`DeathReason::DataProbeDead`]).
+    probe_seq: u16,
+    probe_outstanding: bool,
+    probe_fails: u32,
     /// rc.275 honesty — the health sweep's verdict that this carrier is
     /// SILENTLY ONE-WAY: installed past the warm-up grace with either no
     /// completed WG handshake ever (the pre-handshake zombie whose tx/rx
@@ -407,6 +415,9 @@ impl Installed {
             last_traffic: (0, 0),
             bad_sweeps: 0,
             last_poke_at: None,
+            probe_seq: 0,
+            probe_outstanding: false,
+            probe_fails: 0,
             stalled: false,
             initiated: false,
             hs_done: false,
@@ -1396,6 +1407,9 @@ impl OverlayRuntime {
             // until field-proven; the server only stamps a verdict when BOTH
             // ends advertise this.
             supports_server_relay_strategy: crate::overlay::direct::server_relay_strategy_enabled(),
+            // Data-probe — this build's engine answers the overlay-native
+            // echo inline (wired in `process_inbound`), so advertise it.
+            supports_overlay_echo: true,
             // Phase 1 — subnet routes we offer (admin must approve server-side).
             advertised_routes: self.advertised_routes.clone(),
         }
@@ -2161,6 +2175,9 @@ impl OverlayRuntime {
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
                         &mut relay_refresh_cooldown, &current_peers,
+                        // Data-probe src = our overlay v4 (UNSPECIFIED pre-join
+                        // disables probing for the sweep).
+                        self_ip.parse().unwrap_or(Ipv4Addr::UNSPECIFIED),
                     ).await;
                     warn_if_slow("sweep_carrier_health", t0);
                     // rc.208 — make-before-break: promote any upgrade probe whose
@@ -3132,6 +3149,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
             agent_id: None,
@@ -3279,6 +3297,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            Ipv4Addr::UNSPECIFIED, // tests don't exercise the data-probe
         )
         .await;
 
@@ -3379,6 +3398,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            Ipv4Addr::UNSPECIFIED, // tests don't exercise the data-probe
         )
         .await;
 
@@ -3466,6 +3486,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            Ipv4Addr::UNSPECIFIED, // tests don't exercise the data-probe
         )
         .await;
         assert!(
@@ -3487,6 +3508,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            Ipv4Addr::UNSPECIFIED, // tests don't exercise the data-probe
         )
         .await;
         assert!(
@@ -3533,12 +3555,122 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            Ipv4Addr::UNSPECIFIED, // tests don't exercise the data-probe
         )
         .await;
         assert!(
             by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_none()),
             "an answered poke clears and the carrier survives"
         );
+    }
+
+    /// Hybrid data-probe: consecutive unanswered probe rounds demote an
+    /// ESTABLISHED, rx-alive direct carrier to relay (`DataProbeDead`) with
+    /// NO monitor penalty, while an answered round resets the counter and the
+    /// carrier survives. This is the reaper for the handshakes-pass-but-
+    /// data-drops carrier neither the poke nor the one-way counter can see.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn data_probe_misses_demote_and_replies_reset() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 4);
+        let self_ip = Ipv4Addr::new(100, 64, 0, 9);
+        let pk = peer_kp.public.to_bytes();
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dead, true)
+            .await;
+        wg.test_latch_handshake_done(&pk);
+
+        let nid = ObjectId::from_bytes([8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::new();
+        // Pre-set "3 misses, one round outstanding": the verdict of one more
+        // unreplied round trips the demote. (Driving the send end-to-end
+        // needs a real WG session — encapsulation over a fake one returns
+        // `Done` after the first init — so the send path is covered by the
+        // field test and the verdict/demote accounting is exercised here.)
+        by_node.insert(
+            nid,
+            Installed {
+                since: Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
+                probe_outstanding: true,
+                probe_fails: DATA_PROBE_FAILS_TO_DEMOTE - 1,
+                ..Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now())
+            },
+        );
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        wg.test_bump_rx_any(&pk); // rx_any alive — rx-stale/poke never fire
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            self_ip,
+        )
+        .await;
+        assert!(
+            !by_node.contains_key(&nid),
+            "the final consecutive probe miss demotes the carrier"
+        );
+        {
+            let now = Instant::now();
+            let s = rt.path_shadow.lock().unwrap();
+            assert_eq!(
+                s.mon.strikes(&nid, DirectTier::Lan),
+                0,
+                "DataProbeDead books NO strike"
+            );
+            assert!(
+                s.mon.eligible(&nid, DirectTier::Lan, now),
+                "the tier stays immediately eligible for a re-upgrade"
+            );
+        }
+
+        // Answered variant: reinstall with 2 prior misses + a round
+        // outstanding; a reply THIS round resets the miss counter to 0 (so it
+        // never reaches the demote threshold) and the carrier survives.
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dead, true)
+            .await;
+        wg.test_latch_handshake_done(&pk);
+        by_node.insert(
+            nid,
+            Installed {
+                since: Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
+                probe_outstanding: true,
+                probe_fails: DATA_PROBE_FAILS_TO_DEMOTE - 2,
+                ..Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now())
+            },
+        );
+        wg.test_bump_rx_any(&pk);
+        wg.test_stamp_data_probe_replied(&pk); // the outstanding round is answered
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            self_ip,
+        )
+        .await;
+        let e = by_node.get(&nid).expect("answered probes keep the carrier");
+        assert_eq!(e.probe_fails, 0, "a reply resets the miss counter");
     }
 
     /// A `TunIo` that records every peer-route add/remove, so the tests can
@@ -4232,6 +4364,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            Ipv4Addr::UNSPECIFIED, // tests don't exercise the data-probe
         )
         .await;
 
@@ -4322,6 +4455,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            Ipv4Addr::UNSPECIFIED, // tests don't exercise the data-probe
         )
         .await;
 
@@ -4843,6 +4977,7 @@ mod tests {
                 supports_relay_single: false,
                 supports_derp: false,
                 supports_forced_derp: false,
+                supports_overlay_echo: false,
                 relay_strategy: None,
                 routes: vec![],
                 agent_id: None,
@@ -5074,6 +5209,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
             agent_id: None,
@@ -5628,6 +5764,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_overlay_echo: false,
             relay_strategy: None,
             routes,
             agent_id: None,
@@ -5797,6 +5934,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
             agent_id: None,

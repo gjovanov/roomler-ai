@@ -65,6 +65,7 @@ impl OverlayNodeDao {
         supports_derp: bool,
         supports_forced_derp: bool,
         supports_server_relay_strategy: bool,
+        supports_overlay_echo: bool,
         advertised_routes: Vec<String>,
     ) -> DaoResult<OverlayNode> {
         let now = DateTime::now();
@@ -94,6 +95,7 @@ impl OverlayNodeDao {
             supports_derp,
             supports_forced_derp,
             supports_server_relay_strategy,
+            supports_overlay_echo,
             // Phase 1 — the node's claimed routes; nothing approved until an
             // admin acts, so a fresh node routes for no one.
             advertised_routes,
@@ -131,6 +133,7 @@ impl OverlayNodeDao {
         supports_derp: bool,
         supports_forced_derp: bool,
         supports_server_relay_strategy: bool,
+        supports_overlay_echo: bool,
         advertised_routes: &[String],
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
@@ -177,6 +180,11 @@ impl OverlayNodeDao {
                         // U2 — refresh the server-relay-strategy opt-in likewise
                         // (an operator may flip OVERLAY_SERVER_RELAY_STRATEGY).
                         "supports_server_relay_strategy": supports_server_relay_strategy,
+                        // Data-probe — refresh the overlay-native-echo capability
+                        // on each re-join (a downgrade must clear it). Hand-built
+                        // doc: adding the field HERE is load-bearing (a doc!{} miss
+                        // is not a compile error and silently never persists).
+                        "supports_overlay_echo": supports_overlay_echo,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                         "updated_at": DateTime::now(),
