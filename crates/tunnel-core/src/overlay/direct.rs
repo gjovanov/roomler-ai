@@ -907,6 +907,16 @@ pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> 
     None
 }
 
+/// Diagnostic (`ROOMLER_NODE_OVERLAY_SESSION_TRACE`, default **off**): emit
+/// per-session INFO traces from the plane demux (inbound src vs expected_src
+/// vs verdict) and the carrier-health sweep (poke/proof/rx state per direct
+/// carrier). For field-diagnosing a specific peer's carrier (e.g. a
+/// uni-directional secondary-org srflx carrier that black-holes the initiator
+/// direction). Verbose — enable briefly on the affected host only.
+pub fn session_trace_enabled() -> bool {
+    crate::env::flag("OVERLAY_SESSION_TRACE", false)
+}
+
 /// B4 — carrier-plane socket-liveness watchdog
 /// (`ROOMLER_NODE_OVERLAY_PLANE_WATCHDOG`, legacy `ROOMLER_AGENT_…`; default
 /// **ON**): when the plane's punch-socket keepalive fails
