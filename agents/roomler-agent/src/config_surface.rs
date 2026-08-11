@@ -205,6 +205,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "WG-style endpoint roaming: adopt a peer's observed source after an authenticated inbound from it (repoints the carrier in place). Completes a punch from a symmetric-NAT peer and heals a mid-session NAT rebind. off = strict no-roam demux. Built-in default: on.",
     ),
     (
+        "overlay_plane_watchdog",
+        "tribool",
+        "Carrier-plane socket-liveness watchdog: force a debounced plane rebuild when the shared punch-socket keepalive fails N consecutive cycles (reader-less/wedged socket). off = warn-only. Built-in default: on.",
+    ),
+    (
         "overlay_tun_stable_guid",
         "tribool",
         "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
@@ -383,6 +388,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_shared_carrier" => cfg.overlay_shared_carrier.map(fmt_bool),
         "overlay_tun_per_org" => cfg.overlay_tun_per_org.map(fmt_bool),
         "overlay_roam" => cfg.overlay_roam.map(fmt_bool),
+        "overlay_plane_watchdog" => cfg.overlay_plane_watchdog.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
@@ -578,6 +584,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_shared_carrier" => cfg.overlay_shared_carrier = parse_tribool(value)?,
         "overlay_tun_per_org" => cfg.overlay_tun_per_org = parse_tribool(value)?,
         "overlay_roam" => cfg.overlay_roam = parse_tribool(value)?,
+        "overlay_plane_watchdog" => cfg.overlay_plane_watchdog = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
@@ -824,6 +831,27 @@ mod tests {
         apply(&mut cfg, "overlay_roam", None).unwrap();
         assert_eq!(cfg.overlay_roam, None);
         assert!(apply(&mut cfg, "overlay_roam", Some("maybe")).is_err());
+    }
+
+    /// B4 — plane-watchdog kill switch set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_plane_watchdog_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_plane_watchdog", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_plane_watchdog, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_plane_watchdog")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_plane_watchdog", Some("1")).unwrap();
+        assert_eq!(cfg.overlay_plane_watchdog, Some(true));
+        apply(&mut cfg, "overlay_plane_watchdog", None).unwrap();
+        assert_eq!(cfg.overlay_plane_watchdog, None);
+        assert!(apply(&mut cfg, "overlay_plane_watchdog", Some("maybe")).is_err());
     }
 
     /// Multi-org v2 per-org-adapter soak flag set/echo/clear (per the
