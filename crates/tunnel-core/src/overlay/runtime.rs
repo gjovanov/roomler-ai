@@ -1364,7 +1364,12 @@ impl OverlayRuntime {
             .disco_rounds
             .load(std::sync::atomic::Ordering::Relaxed)
             .is_multiple_of(60)
-            && let Some(s) = prober.summary()
+            && let Some(s) = prober.summary(|pk| {
+                by_node
+                    .values()
+                    .find(|e| &e.pubkey == pk)
+                    .map(|e| e.overlay_ip)
+            })
         {
             info!("overlay disco: {s}");
         }
