@@ -1047,6 +1047,8 @@ pub struct OverlayRuntime {
     /// Multi-org v2 — the process-wide shared carrier plane, when this
     /// runtime rides it (see [`with_carrier_plane`](Self::with_carrier_plane)).
     carrier_plane: Option<Arc<super::carrier_plane::CarrierPlane>>,
+    /// C2 — disco rounds completed, for the periodic summary cadence.
+    disco_rounds: std::sync::atomic::AtomicU64,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1215,6 +1217,7 @@ impl OverlayRuntime {
             dns_status: None,
             srflx_status: None,
             carrier_plane: None,
+            disco_rounds: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1242,6 +1245,7 @@ impl OverlayRuntime {
             dns_status: None,
             srflx_status: None,
             carrier_plane: None,
+            disco_rounds: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1320,6 +1324,61 @@ impl OverlayRuntime {
     /// Cheap (a few-element Vec + a `watch` replace); called at each point the
     /// netmap or a carrier changes. The `watch` keeps only the latest value, so
     /// coalescing bursts is automatic.
+    /// C2 — one disco round: absorb any pongs that arrived since the last
+    /// tick, then send one fresh ping per installed DIRECT carrier over the
+    /// exact socket+dst that carrier uses.
+    ///
+    /// Strictly measurement. It never demotes, penalises or re-ranks — the
+    /// table it fills is read only by the LocalAPI and the summary log. That
+    /// separation is deliberate: rc.346 coupled measurement to demotion in
+    /// one release and took healthy carriers down with it.
+    async fn disco_round(
+        &self,
+        prober: &mut super::disco::Prober,
+        rx: &mut Option<mpsc::Receiver<super::disco::DiscoInbound>>,
+        wg: &WgDevice,
+        by_node: &HashMap<ObjectId, Installed>,
+    ) {
+        if !crate::overlay::direct::disco_probe_enabled() {
+            return;
+        }
+        // Absorb replies first so this round's verdicts reflect the last one.
+        if let Some(rx) = rx.as_mut() {
+            while let Ok(p) = rx.try_recv() {
+                prober.on_pong(&p);
+            }
+        }
+        for e in by_node.values().filter(|e| e.is_direct) {
+            let (nonce, frame) =
+                prober.next_ping(&e.pubkey, &self.keypair.secret, &self.keypair.public);
+            if let Some(dst) = wg.sender().send_disco_raw(&e.pubkey, &frame).await {
+                prober.sent(e.pubkey, dst, nonce);
+            }
+        }
+        // C2.s only observable: a periodic digest. Every 60 rounds ≈ 5 min
+        // at the 5 s tick, so it is legible in a live journal without
+        // drowning it.
+        self.disco_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self
+            .disco_rounds
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(60)
+            && let Some(s) = prober.summary()
+        {
+            info!("overlay disco: {s}");
+        }
+
+        // Forget peers that left, so the table can't grow without bound.
+        let live: std::collections::HashSet<[u8; 32]> =
+            by_node.values().map(|e| e.pubkey).collect();
+        for s in prober.paths() {
+            if !live.contains(&s.peer) {
+                prober.forget(&s.peer);
+            }
+        }
+    }
+
     fn publish_view(
         &self,
         self_ip: &str,
@@ -1535,6 +1594,14 @@ impl OverlayRuntime {
         let mut by_node: HashMap<ObjectId, Installed> = HashMap::new();
         // rc.139 — peers whose stale relay was just refreshed (anti-ping-pong).
         let mut relay_refresh_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
+        // C2 — the disco prober + its pong sink (plane-fed). Inert unless
+        // `overlay_disco_probe` is on; the sink is `None` when this runtime
+        // has no plane (the device demux feeds its own path in C2b).
+        let mut disco = super::disco::Prober::default();
+        let mut disco_rx = self
+            .carrier_plane
+            .as_ref()
+            .and_then(|p| p.take_disco_events());
         // rc.208 — in-flight make-before-break upgrade probes (node → metadata).
         // The shadow carriers live in `WgDevice::probes`; this tracks tier +
         // deadline for `sweep_upgrade_probes`. Empty unless the feature is on.
@@ -2170,6 +2237,12 @@ impl OverlayRuntime {
                         &mut relay_refresh_cooldown, &current_peers,
                     ).await;
                     warn_if_slow("sweep_carrier_health", t0);
+                    // C2 — disco round: one out-of-tunnel echo per direct
+                    // carrier over the path it actually uses, then absorb the
+                    // replies. MEASUREMENT ONLY — nothing below reads the
+                    // table to make a routing decision (that is C3/C6, behind
+                    // their own flags). Default OFF.
+                    self.disco_round(&mut disco, &mut disco_rx, &wg, &by_node).await;
                     // rc.208 — make-before-break: promote any upgrade probe whose
                     // handshake latched (cut over to direct, drop the relay) and
                     // expire any that missed its deadline (keep the relay). Inert

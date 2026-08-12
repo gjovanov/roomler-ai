@@ -50,6 +50,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::direct;
+use super::disco::DiscoInbound;
 use super::wg::{
     Carrier, DirectInbound, Ingress, UNKNOWN_INIT_MAX_SOURCES, UNKNOWN_INIT_MIN_INTERVAL, WgSender,
     authenticate_init_with, is_wg_shaped, process_inbound,
@@ -153,6 +154,11 @@ struct PlaneState {
     /// `recv_from` the plane owns).
     stun_tx: mpsc::Sender<StunInbound>,
     stun_rx: Option<mpsc::Receiver<StunInbound>>,
+    /// C2 — verified disco PONGs, forwarded to the prober. Twin of the STUN
+    /// sink for the same reason: the plane owns `recv_from` on these sockets,
+    /// so the prober cannot read its own replies off the wire.
+    disco_tx: mpsc::Sender<DiscoInbound>,
+    disco_rx: Option<mpsc::Receiver<DiscoInbound>>,
     /// The shared srflx state every attached runtime mirrors onto its own
     /// control WS (see [`SrflxShared`]).
     srflx_watch: tokio::sync::watch::Sender<SrflxShared>,
@@ -196,6 +202,7 @@ pub struct CarrierPlane {
 impl CarrierPlane {
     pub fn new() -> Arc<Self> {
         let (stun_tx, stun_rx) = mpsc::channel(16);
+        let (disco_tx, disco_rx) = mpsc::channel(64);
         let (srflx_watch, _) = tokio::sync::watch::channel(SrflxShared::default());
         Arc::new(Self {
             state: Mutex::new(PlaneState {
@@ -205,6 +212,8 @@ impl CarrierPlane {
                 binds: None,
                 next_engine_id: 1,
                 stun_tx,
+                disco_tx,
+                disco_rx: Some(disco_rx),
                 stun_rx: Some(stun_rx),
                 srflx_watch,
                 keepalive: None,
@@ -431,14 +440,24 @@ impl CarrierPlane {
                 // attached engine, so each is tried in turn (N ≤ a handful,
                 // and only after the cheap shape + known-peer filters).
                 if super::disco::is_disco_shaped(&buf[..n]) {
-                    if super::direct::disco_respond_enabled()
-                        && let Some(pong) = plane.disco_respond(&buf[..n], src)
-                    {
-                        let s = sock.clone();
-                        tokio::spawn(async move {
-                            let _ = s.send_to(&pong, src).await;
-                        });
-                        crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                    match plane.disco_classify(&buf[..n], src) {
+                        super::disco::Verdict::Answer(pong)
+                            if super::direct::disco_respond_enabled() =>
+                        {
+                            let s = sock.clone();
+                            tokio::spawn(async move {
+                                let _ = s.send_to(&pong, src).await;
+                            });
+                            crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // C2 — a reply to OUR probe: hand it to the prober's
+                        // sink. `try_send` drops it if nobody took the
+                        // receiver (prober off) — harmless, exactly like STUN.
+                        super::disco::Verdict::Pong(p) => {
+                            let tx = { plane.lock().disco_tx.clone() };
+                            let _ = tx.try_send(p);
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -461,6 +480,12 @@ impl CarrierPlane {
     /// after the first take (one srflx keepalive per plane).
     pub fn take_stun_events(&self) -> Option<mpsc::Receiver<StunInbound>> {
         self.lock().stun_rx.take()
+    }
+
+    /// C2 — take the receiver for verified disco PONGs. `None` after the
+    /// first take (one prober per plane).
+    pub(crate) fn take_disco_events(&self) -> Option<mpsc::Receiver<DiscoInbound>> {
+        self.lock().disco_rx.take()
     }
 
     /// Route + process ONE WG datagram. Shared by the recv loops and
@@ -711,8 +736,10 @@ impl CarrierPlane {
     /// peer is that key. The plane indexes routes by session index, not by
     /// peer key, so this asks each engine's own send-mirror via the hook
     /// captured at attach.
-    fn disco_respond(&self, pkt: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
-        let sender = super::disco::claimed_sender(pkt)?;
+    fn disco_classify(&self, pkt: &[u8], src: SocketAddr) -> super::disco::Verdict {
+        let Some(sender) = super::disco::claimed_sender(pkt) else {
+            return super::disco::Verdict::Ignore;
+        };
         let engines: Vec<(StaticSecret, PublicKey, WgSender)> = {
             let st = self.lock();
             st.engines
@@ -720,11 +747,15 @@ impl CarrierPlane {
                 .map(|e| (e.secret.clone(), e.public, e.send.clone()))
                 .collect()
         };
-        engines.into_iter().find_map(|(secret, public, send)| {
-            super::disco::respond(pkt, src, &secret, &public, |pk| {
+        for (secret, public, send) in engines {
+            match super::disco::classify(pkt, src, &secret, &public, |pk| {
                 *pk == sender && send.has_peer(pk)
-            })
-        })
+            }) {
+                super::disco::Verdict::Ignore => continue,
+                v => return v,
+            }
+        }
+        super::disco::Verdict::Ignore
     }
 
     /// Try each attached engine's static against a handshake initiation.
