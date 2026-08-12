@@ -917,6 +917,20 @@ pub fn session_trace_enabled() -> bool {
     crate::env::flag("OVERLAY_SESSION_TRACE", false)
 }
 
+/// C2 — PROBE peers with out-of-tunnel disco echoes and record per-path
+/// loss + RTT (`ROOMLER_NODE_OVERLAY_DISCO_PROBE`; default **OFF**).
+///
+/// Strictly measurement: the table it fills is read by the LocalAPI and the
+/// summary log, never by anything that moves traffic. Scoring is C3 and
+/// authority is C6, each behind its own flag — that separation is why a bug
+/// here cannot repeat rc.346.
+///
+/// Default OFF until the C1 responder is fleet-wide: a prober whose peers
+/// cannot answer measures nothing but its own deployment order.
+pub fn disco_probe_enabled() -> bool {
+    crate::env::flag("OVERLAY_DISCO_PROBE", false)
+}
+
 /// C1 — answer out-of-tunnel disco echoes on the carrier socket
 /// (`ROOMLER_NODE_OVERLAY_DISCO_RESPOND`, legacy `ROOMLER_AGENT_…`; default
 /// **ON**). Answering is unconditional and costs a map lookup + one X25519
