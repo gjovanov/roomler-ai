@@ -71,6 +71,13 @@ pub struct EngineHooks {
     /// C1 (disco) — the engine.s send-side peer mirror, so the plane can ask
     /// "is this sender one of YOUR installed peers?" before spending a DH.
     pub send: WgSender,
+    /// C2 (disco) — where this engine.s PONGs are delivered. Per-engine, not
+    /// per-plane: N org engines share one plane, so a single plane-wide sink
+    /// would be taken by whichever engine asked first and leave every other
+    /// engine blind — every path it measures reading 100 % loss. Field
+    /// 2026-08-12: one engine reported 8 % on the same mars endpoint the
+    /// other reported 100 % on. Routed exactly like `direct_events`.
+    pub disco_events: mpsc::Sender<DiscoInbound>,
     pub direct_events: mpsc::Sender<DirectInbound>,
     pub tun_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -80,6 +87,7 @@ struct EngineEntry {
     secret: StaticSecret,
     public: PublicKey,
     send: WgSender,
+    disco_events: mpsc::Sender<DiscoInbound>,
     direct_events: mpsc::Sender<DirectInbound>,
     tun_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -154,11 +162,6 @@ struct PlaneState {
     /// `recv_from` the plane owns).
     stun_tx: mpsc::Sender<StunInbound>,
     stun_rx: Option<mpsc::Receiver<StunInbound>>,
-    /// C2 — verified disco PONGs, forwarded to the prober. Twin of the STUN
-    /// sink for the same reason: the plane owns `recv_from` on these sockets,
-    /// so the prober cannot read its own replies off the wire.
-    disco_tx: mpsc::Sender<DiscoInbound>,
-    disco_rx: Option<mpsc::Receiver<DiscoInbound>>,
     /// The shared srflx state every attached runtime mirrors onto its own
     /// control WS (see [`SrflxShared`]).
     srflx_watch: tokio::sync::watch::Sender<SrflxShared>,
@@ -202,7 +205,6 @@ pub struct CarrierPlane {
 impl CarrierPlane {
     pub fn new() -> Arc<Self> {
         let (stun_tx, stun_rx) = mpsc::channel(16);
-        let (disco_tx, disco_rx) = mpsc::channel(64);
         let (srflx_watch, _) = tokio::sync::watch::channel(SrflxShared::default());
         Arc::new(Self {
             state: Mutex::new(PlaneState {
@@ -212,8 +214,6 @@ impl CarrierPlane {
                 binds: None,
                 next_engine_id: 1,
                 stun_tx,
-                disco_tx,
-                disco_rx: Some(disco_rx),
                 stun_rx: Some(stun_rx),
                 srflx_watch,
                 keepalive: None,
@@ -244,6 +244,7 @@ impl CarrierPlane {
             secret: hooks.secret,
             public: hooks.public,
             send: hooks.send,
+            disco_events: hooks.disco_events,
             direct_events: hooks.direct_events,
             tun_tx: hooks.tun_tx,
         });
@@ -440,24 +441,16 @@ impl CarrierPlane {
                 // attached engine, so each is tried in turn (N ≤ a handful,
                 // and only after the cheap shape + known-peer filters).
                 if super::disco::is_disco_shaped(&buf[..n]) {
-                    match plane.disco_classify(&buf[..n], src) {
-                        super::disco::Verdict::Answer(pong)
-                            if super::direct::disco_respond_enabled() =>
-                        {
-                            let s = sock.clone();
-                            tokio::spawn(async move {
-                                let _ = s.send_to(&pong, src).await;
-                            });
-                            crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // C2 — a reply to OUR probe: hand it to the prober's
-                        // sink. `try_send` drops it if nobody took the
-                        // receiver (prober off) — harmless, exactly like STUN.
-                        super::disco::Verdict::Pong(p) => {
-                            let tx = { plane.lock().disco_tx.clone() };
-                            let _ = tx.try_send(p);
-                        }
-                        _ => {}
+                    // Pongs are routed to the owning engine inside; a ping
+                    // yields the bytes to echo back.
+                    if let Some(pong) = plane.disco_handle(&buf[..n], src)
+                        && super::direct::disco_respond_enabled()
+                    {
+                        let s = sock.clone();
+                        tokio::spawn(async move {
+                            let _ = s.send_to(&pong, src).await;
+                        });
+                        crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
                     }
                     continue;
                 }
@@ -480,12 +473,6 @@ impl CarrierPlane {
     /// after the first take (one srflx keepalive per plane).
     pub fn take_stun_events(&self) -> Option<mpsc::Receiver<StunInbound>> {
         self.lock().stun_rx.take()
-    }
-
-    /// C2 — take the receiver for verified disco PONGs. `None` after the
-    /// first take (one prober per plane).
-    pub(crate) fn take_disco_events(&self) -> Option<mpsc::Receiver<DiscoInbound>> {
-        self.lock().disco_rx.take()
     }
 
     /// Route + process ONE WG datagram. Shared by the recv loops and
@@ -736,26 +723,46 @@ impl CarrierPlane {
     /// peer is that key. The plane indexes routes by session index, not by
     /// peer key, so this asks each engine's own send-mirror via the hook
     /// captured at attach.
-    fn disco_classify(&self, pkt: &[u8], src: SocketAddr) -> super::disco::Verdict {
-        let Some(sender) = super::disco::claimed_sender(pkt) else {
-            return super::disco::Verdict::Ignore;
-        };
-        let engines: Vec<(StaticSecret, PublicKey, WgSender)> = {
+    /// Classify a disco datagram against every attached engine, and hand a
+    /// PONG to the OWNING engine.s sink (not a plane-wide one — see
+    /// `EngineHooks::disco_events`). Returns the pong bytes to send when the
+    /// datagram was a ping.
+    fn disco_handle(&self, pkt: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
+        let sender = super::disco::claimed_sender(pkt)?;
+        let engines: Vec<(
+            StaticSecret,
+            PublicKey,
+            WgSender,
+            mpsc::Sender<DiscoInbound>,
+        )> = {
             let st = self.lock();
             st.engines
                 .iter()
-                .map(|e| (e.secret.clone(), e.public, e.send.clone()))
+                .map(|e| {
+                    (
+                        e.secret.clone(),
+                        e.public,
+                        e.send.clone(),
+                        e.disco_events.clone(),
+                    )
+                })
                 .collect()
         };
-        for (secret, public, send) in engines {
+        for (secret, public, send, sink) in engines {
             match super::disco::classify(pkt, src, &secret, &public, |pk| {
                 *pk == sender && send.has_peer(pk)
             }) {
                 super::disco::Verdict::Ignore => continue,
-                v => return v,
+                super::disco::Verdict::Answer(pong) => return Some(pong),
+                // The engine that authenticated it is the engine that probed
+                // it: deliver there and nowhere else.
+                super::disco::Verdict::Pong(p) => {
+                    let _ = sink.try_send(p);
+                    return None;
+                }
             }
         }
-        super::disco::Verdict::Ignore
+        None
     }
 
     /// Try each attached engine's static against a handshake initiation.
@@ -1578,6 +1585,7 @@ mod tests {
             secret: kp1.secret.clone(),
             public: kp1.public,
             send: crate::overlay::wg::WgSender::new(),
+            disco_events: mpsc::channel(1).0,
             direct_events: tx_e.clone(),
             tun_tx: tx_t.clone(),
         });
@@ -1586,6 +1594,7 @@ mod tests {
             secret: kp2.secret.clone(),
             public: kp2.public,
             send: crate::overlay::wg::WgSender::new(),
+            disco_events: mpsc::channel(1).0,
             direct_events: tx_e,
             tun_tx: tx_t,
         });
