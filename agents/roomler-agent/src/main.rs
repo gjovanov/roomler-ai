@@ -2091,6 +2091,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // the spawned supervisors share the SAME instances.
     let primary_ctx = signaling::OrgCtx::primary();
     let mut org_spawns: Vec<OrgSpawn> = Vec::new();
+    // Multi-org — every secondary org.s live overlay view, so `peers` can
+    // report all orgs (the receivers used to be dropped on the floor).
+    let org_views: localapi_state::OrgViewRegistry = Default::default();
     let org_registry: localapi_state::OrgStatusRegistry = {
         let mut rows = vec![localapi_state::OrgRuntime {
             label: config::PRIMARY_ORG_LABEL.to_string(),
@@ -2152,7 +2155,8 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             // config path + the P6 write lock (profile-correct under SYSTEM).
             .with_config_persist(config_path.clone(), cfg_write_lock.clone())
             // Multi-org P1 — live per-enrollment rows for `roomler status`.
-            .with_orgs(org_registry.clone()),
+            .with_orgs(org_registry.clone())
+            .with_org_views(org_views.clone()),
         );
     // P3b-3: the RTT prober. Pings each carrier-reachable peer every
     // RTT_PROBE_INTERVAL into rtt_cache; exits on shutdown. A fresh
@@ -2215,8 +2219,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     let mut org_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for (org, org_ctx, org_connected, org_terminal) in org_spawns {
         let org_cfg = cfg.for_org(&org);
-        let (org_view_tx, _org_view_rx) =
+        let (org_view_tx, org_view_rx) =
             tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+        // Keep the receiver: this is what lets `peers` show this org.
+        if let Ok(mut v) = org_views.lock() {
+            v.push((org.label.clone(), org_view_rx));
+        }
         let org_slot: signaling::RttSampleSlot = Default::default();
         let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
             env!("CARGO_PKG_VERSION").to_string(),
@@ -2263,6 +2271,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let shutdown = shutdown_rx.clone();
         let broker = consent_broker.clone();
         let registry = org_registry.clone();
+        let org_views_for_join = org_views.clone();
         let enc = encoder_preference;
         let config_path_for_join = config_path.clone();
         // label -> that org loop's own shutdown sender, so a config change can
@@ -2347,8 +2356,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                     }
                 };
                 let org_cfg = base.for_org(&org);
-                let (org_view_tx, _rx) =
+                let (org_view_tx, org_view_rx) =
                     tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+                if let Ok(mut v) = org_views_for_join.lock() {
+                    v.push((org.label.clone(), org_view_rx));
+                }
                 let org_slot: signaling::RttSampleSlot = Default::default();
                 let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
                     env!("CARGO_PKG_VERSION").to_string(),
