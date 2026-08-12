@@ -37,12 +37,40 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows_sys::core::GUID;
 
-/// Stable identity for our WFP objects so they're greppable in
-/// `netsh wfp show filters` and recognizable if a dynamic session ever
-/// leaks. ASCII "ROOMLER\0PROVIDER" / "ROOMLER\0SUBLAYER" as u128 — no
-/// significance beyond being two fixed, distinct GUIDs.
-const PROVIDER_GUID: GUID = GUID::from_u128(0x524f4f4d_4c45_5200_5052_4f5649444552);
-const SUBLAYER_GUID: GUID = GUID::from_u128(0x524f4f4d_4c45_5200_5355_424c41594552);
+/// Identity for our WFP objects, greppable in `netsh wfp show filters` via the
+/// ASCII "ROOMLER" prefix and recognizable if a dynamic session ever leaks.
+///
+/// **PER-ADAPTER, not process-wide.** These were two fixed constants, and on a
+/// MULTI-ORG host that silently broke one org's inbound:
+///
+/// * org A's TUN opens dynamic session S_A and creates the provider + sublayer
+///   — **owned by S_A**, because the session is `FWPM_SESSION_FLAG_DYNAMIC`;
+/// * org B's TUN opens S_B, gets `FWP_E_ALREADY_EXISTS` for both (tolerated,
+///   by design) and adds its LUID-scoped filters **into S_A's sublayer**;
+/// * when S_A closes — TUN teardown on a runtime restart, an R3 direct-plane
+///   rebuild, an org reconnect — BFE reaps everything S_A owns, **including
+///   the shared sublayer, taking org B's filters with it**.
+///
+/// Org B then has no hard-permit while its guard still holds a live session
+/// and believes it installed one. On a corporate host whose endpoint software
+/// filters via WFP, that adapter falls back under the stateful filter:
+/// outbound-initiated flows still work, inbound-initiated flows are dropped.
+///
+/// Field 2026-08-12 (pc50045, grox + jovanov): exactly ONE org reachable
+/// inbound from every peer, flipping across restarts, while the host reached
+/// everyone on both orgs. `netsh wfp show filters` showed **4** permit filters
+/// — one adapter's worth ([`LAYERS`] is 4) — on a two-adapter host.
+///
+/// Mixing the LUID in gives each adapter its own provider + sublayer, so one
+/// session's teardown can never reap another's filters. Single-org hosts are
+/// unaffected either way (one session, one owner).
+fn provider_guid(luid: u64) -> GUID {
+    GUID::from_u128(0x524f4f4d_4c45_5200_0000_000000000000 | u128::from(luid))
+}
+
+fn sublayer_guid(luid: u64) -> GUID {
+    GUID::from_u128(0x524f4f4d_4c45_5201_0000_000000000000 | u128::from(luid))
+}
 
 const PROVIDER_NAME: &str = "Roomler Overlay";
 const SUBLAYER_NAME: &str = "Roomler Overlay Permit (LUID-scoped)";
@@ -60,6 +88,12 @@ const LAYERS: [GUID; 4] = [
     FWPM_LAYER_ALE_AUTH_CONNECT_V4,
     FWPM_LAYER_ALE_AUTH_CONNECT_V6,
 ];
+
+/// How many filters ONE adapter contributes. Logged on install so
+/// `netsh wfp show filters | Select-String Permit` reads as
+/// `count / FILTERS_PER_ADAPTER = adapters covered` — the check that would
+/// have caught the 2026-08-12 outage in seconds (4 filters, 2 adapters).
+pub const FILTERS_PER_ADAPTER: usize = LAYERS.len();
 
 /// `ROOMLER_AGENT_WFP_PERMIT` — default **ON** for `overlay-l3`. Set to
 /// `0`/`false`/`no`/`off` (case-insensitive) to skip WFP programming, e.g.
@@ -118,6 +152,7 @@ fn wide(s: &str) -> Vec<u16> {
 fn build_filter(
     layer: GUID,
     provider_key: *mut GUID,
+    sublayer: GUID,
     condition: *mut FWPM_FILTER_CONDITION0,
     name: *mut u16,
 ) -> FWPM_FILTER0 {
@@ -127,7 +162,7 @@ fn build_filter(
     f.displayData.name = name;
     f.providerKey = provider_key;
     f.layerKey = layer;
-    f.subLayerKey = SUBLAYER_GUID;
+    f.subLayerKey = sublayer;
     // Auto weight within our sublayer (FWP_EMPTY) — our sublayer's high
     // weight is what wins arbitration, not the per-filter weight.
     f.weight.r#type = FWP_EMPTY;
@@ -149,7 +184,10 @@ impl WfpGuard {
         let provider_name = wide(PROVIDER_NAME);
         let sublayer_name = wide(SUBLAYER_NAME);
         let filter_name = wide(FILTER_NAME);
-        let mut provider_key = PROVIDER_GUID;
+        // Per-adapter identity — see `provider_guid`. Two adapters must never
+        // share a session-owned object.
+        let mut provider_key = provider_guid(luid);
+        let sublayer_key = sublayer_guid(luid);
         let mut luid_val: u64 = luid;
 
         // SAFETY: every pointer handed to the WFP API below points at a
@@ -186,7 +224,7 @@ impl WfpGuard {
 
             // --- Provider (bookkeeping/owner tag). ---
             let mut provider: FWPM_PROVIDER0 = std::mem::zeroed();
-            provider.providerKey = PROVIDER_GUID;
+            provider.providerKey = provider_key;
             provider.displayData.name = provider_name.as_ptr() as *mut u16;
             let rc = FwpmProviderAdd0(engine, &provider, std::ptr::null_mut());
             if rc != 0 && rc != FWP_E_ALREADY_EXISTS as u32 {
@@ -195,7 +233,7 @@ impl WfpGuard {
 
             // --- Sublayer at weight 0xFFFE (arbitrated before MPSSVC). ---
             let mut sublayer: FWPM_SUBLAYER0 = std::mem::zeroed();
-            sublayer.subLayerKey = SUBLAYER_GUID;
+            sublayer.subLayerKey = sublayer_key;
             sublayer.displayData.name = sublayer_name.as_ptr() as *mut u16;
             sublayer.providerKey = &mut provider_key;
             sublayer.weight = SUBLAYER_WEIGHT;
@@ -215,6 +253,7 @@ impl WfpGuard {
                 let filter = build_filter(
                     layer,
                     &mut provider_key,
+                    sublayer_key,
                     &mut condition,
                     filter_name.as_ptr() as *mut u16,
                 );
@@ -279,26 +318,61 @@ mod tests {
             | (u64::from_be_bytes(g.data4) as u128)
     }
 
+    const LUID_A: u64 = 0x0035_0080_0000_0000;
+    const LUID_B: u64 = 0x0035_0080_0100_0000;
+
     #[test]
     fn provider_and_sublayer_guids_are_distinct() {
         assert_ne!(
-            guid_u128(PROVIDER_GUID),
-            guid_u128(SUBLAYER_GUID),
+            guid_u128(provider_guid(LUID_A)),
+            guid_u128(sublayer_guid(LUID_A)),
             "provider and sublayer GUIDs must differ"
         );
     }
 
+    /// THE multi-org invariant. Two adapters must not share a provider or a
+    /// sublayer: the session is DYNAMIC, so a shared object is owned by
+    /// whichever adapter created it first, and closing that session reaps the
+    /// other adapter's filters with it — leaving one org silently without a
+    /// hard-permit while its guard still reports success.
+    ///
+    /// Field 2026-08-12 (pc50045): exactly one org reachable inbound, flipping
+    /// per boot; `netsh wfp show filters` showed 4 permit filters — one
+    /// adapter's worth — on a two-adapter host.
     #[test]
-    fn guids_are_stable_golden_values() {
-        // Lock the identity so a refactor can't silently rotate it (the
-        // values are what operators grep for in `netsh wfp show filters`).
+    fn each_adapter_gets_its_own_provider_and_sublayer() {
+        assert_ne!(
+            guid_u128(provider_guid(LUID_A)),
+            guid_u128(provider_guid(LUID_B)),
+            "two adapters must not share a provider"
+        );
+        assert_ne!(
+            guid_u128(sublayer_guid(LUID_A)),
+            guid_u128(sublayer_guid(LUID_B)),
+            "two adapters must not share a sublayer — the reaping bug"
+        );
+        // And no cross-collision between the two namespaces.
+        assert_ne!(
+            guid_u128(provider_guid(LUID_A)),
+            guid_u128(sublayer_guid(LUID_B))
+        );
+    }
+
+    #[test]
+    fn guids_are_stable_for_a_given_luid() {
+        // Operators grep these in `netsh wfp show filters`; the "ROOMLER"
+        // prefix stays fixed and only the low bits carry the LUID.
         assert_eq!(
-            guid_u128(PROVIDER_GUID),
-            0x524f4f4d_4c45_5200_5052_4f5649444552
+            guid_u128(provider_guid(LUID_A)),
+            guid_u128(provider_guid(LUID_A))
         );
         assert_eq!(
-            guid_u128(SUBLAYER_GUID),
-            0x524f4f4d_4c45_5200_5355_424c41594552
+            guid_u128(provider_guid(LUID_A)),
+            0x524f4f4d_4c45_5200_0000_000000000000 | u128::from(LUID_A)
+        );
+        assert_eq!(
+            guid_u128(sublayer_guid(LUID_A)),
+            0x524f4f4d_4c45_5201_0000_000000000000 | u128::from(LUID_A)
         );
     }
 
@@ -336,7 +410,7 @@ mod tests {
 
     #[test]
     fn build_filter_locks_hard_permit_semantics() {
-        let mut provider_key = PROVIDER_GUID;
+        let mut provider_key = provider_guid(LUID_A);
         let mut luid_val: u64 = 0x0123_4567_89ab_cdef;
         let mut condition: FWPM_FILTER_CONDITION0 = unsafe { std::mem::zeroed() };
         condition.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
@@ -348,6 +422,7 @@ mod tests {
         let f = build_filter(
             FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
             &mut provider_key,
+            sublayer_guid(LUID_A),
             &mut condition,
             name.as_mut_ptr(),
         );
@@ -358,7 +433,7 @@ mod tests {
             0,
             "must be a HARD permit (clears action-write right) to beat a GPO block"
         );
-        assert_eq!(guid_u128(f.subLayerKey), guid_u128(SUBLAYER_GUID));
+        assert_eq!(guid_u128(f.subLayerKey), guid_u128(sublayer_guid(LUID_A)));
         assert_eq!(f.numFilterConditions, 1, "exactly one condition");
         assert_eq!(
             guid_u128(f.layerKey),
