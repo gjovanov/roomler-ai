@@ -1312,10 +1312,10 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
     // Unix only — std cannot open a directory as a File on Windows, and the
     // temp-file `sync_all()` above is the load-bearing half regardless.
     #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
