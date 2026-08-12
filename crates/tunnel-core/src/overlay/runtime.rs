@@ -1128,6 +1128,10 @@ fn build_overlay_view(
             PeerInfo {
                 node_id: np.node_id.to_hex(),
                 name: np.name.clone(),
+                // Multi-org — the runtime is org-agnostic (it has no tenant
+                // identity); the DAEMON stamps this when it merges the
+                // per-org views, since only it knows which view is which org.
+                org: String::new(),
                 overlay_ip: (!np.overlay_ip.is_empty()).then(|| np.overlay_ip.clone()),
                 overlay_ip6: derived_v6_of(&np.overlay_ip),
                 online: np.reachable,
