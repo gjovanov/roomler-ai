@@ -1597,11 +1597,8 @@ impl OverlayRuntime {
         // C2 — the disco prober + its pong sink (plane-fed). Inert unless
         // `overlay_disco_probe` is on; the sink is `None` when this runtime
         // has no plane (the device demux feeds its own path in C2b).
-        let mut disco = super::disco::Prober::default();
-        let mut disco_rx = self
-            .carrier_plane
-            .as_ref()
-            .and_then(|p| p.take_disco_events());
+        let mut disco = super::disco::Prober::new();
+        let mut disco_rx = wg.take_disco_events();
         // rc.208 — in-flight make-before-break upgrade probes (node → metadata).
         // The shadow carriers live in `WgDevice::probes`; this tracks tier +
         // deadline for `sweep_upgrade_probes`. Empty unless the feature is on.
