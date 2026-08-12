@@ -245,10 +245,6 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
-        // Data-probe — OUR overlay v4 (the probe's inner source).
-        // `UNSPECIFIED` (pre-join / tests that don't exercise probing)
-        // disables the probe driver for the sweep.
-        self_ip: Ipv4Addr,
     ) {
         let now = Instant::now();
         // P3 PR-A — the shadow monitor consumes the same env read the legacy
@@ -410,71 +406,6 @@ impl OverlayRuntime {
                     );
                 }
             }
-            // Hybrid data-probe — the data-plane liveness backstop for an
-            // ESTABLISHED direct carrier. Handshake-based signals cannot tell
-            // healthy from heavily-lossy (small retried handshakes complete
-            // over a path dropping bulk data — field 2026-08-11, CORPLAP-1),
-            // and the one-way counter resets on rekey pauses + rx trickle.
-            // So: one tiny probe per tick over the REAL data path; the peer's
-            // ENGINE echoes it when it advertised `supports_overlay_echo`
-            // (guaranteed responder, netstack included), else its OS answers
-            // the ICMP form. Consecutive misses demote to relay — which is
-            // the reliable path for such a pair — with no monitor penalty
-            // (make-before-break re-attempts direct once the path recovers).
-            if v.death.is_none()
-                && e.is_direct
-                && handshake_done
-                && self_ip != Ipv4Addr::UNSPECIFIED
-                && crate::overlay::direct::data_probe_enabled()
-            {
-                // Drain unconditionally so a LATE reply from a prior round
-                // can't credit the next one.
-                let replied = wg.peer_take_data_probe_replied(&e.pubkey);
-                if e.probe_outstanding {
-                    if replied {
-                        e.probe_fails = 0;
-                    } else {
-                        e.probe_fails += 1;
-                    }
-                    e.probe_outstanding = false;
-                }
-                if e.probe_fails >= crate::overlay::lifecycle::DATA_PROBE_FAILS_TO_DEMOTE {
-                    e.probe_fails = 0;
-                    dead.push((*nid, e.tier, DeathReason::DataProbeDead));
-                } else {
-                    let native = current_peers
-                        .get(nid)
-                        .is_some_and(|np| np.supports_overlay_echo);
-                    e.probe_seq = e.probe_seq.wrapping_add(1);
-                    let sent = wg
-                        .send_data_probe(self_ip, e.overlay_ip, e.probe_seq, native)
-                        .await;
-                    if sent {
-                        e.probe_outstanding = true;
-                    }
-                    // Diagnostic — the probe's own accounting, so a
-                    // false-positive demote can be traced to WHICH step
-                    // failed: not sent / sent-but-never-answered / which
-                    // responder mode was used.
-                    if crate::overlay::direct::session_trace_enabled() {
-                        tracing::info!(
-                            peer = %nid,
-                            overlay_ip = %e.overlay_ip,
-                            mode = if native { "overlay-echo" } else { "icmp" },
-                            seq = e.probe_seq,
-                            sent,
-                            replied_prev = replied,
-                            fails = e.probe_fails,
-                            "overlay: data-probe round"
-                        );
-                    }
-                }
-            } else if !e.is_direct {
-                // Relay carriers aren't probed; clear leftovers so a later
-                // re-promote to direct starts a fresh probe window.
-                e.probe_outstanding = false;
-                e.probe_fails = 0;
-            }
         }
         for (nid, tier, reason) in dead {
             let Some(e) = by_node.remove(&nid) else {
@@ -493,12 +424,7 @@ impl OverlayRuntime {
                 // penalty (see `PathMonitor::on_death`), so the tier is
                 // legitimately still eligible and the tripwire would
                 // false-fire its MODEL-BUG warning on every poke death.
-                if tier.is_direct()
-                    && !matches!(
-                        reason,
-                        DeathReason::RekeyUnanswered | DeathReason::DataProbeDead
-                    )
-                {
+                if tier.is_direct() && !matches!(reason, DeathReason::RekeyUnanswered) {
                     s.assert_ineligible(&nid, tier, now);
                 }
             });
@@ -536,18 +462,6 @@ impl OverlayRuntime {
                     warn!(
                         peer = %nid, tier = tier_name,
                         "overlay: established direct carrier failed active revalidation (forced rekey unanswered — path filtered / VPN / NAT rebind?) — rebuilding via relay"
-                    );
-                } else if reason == DeathReason::DataProbeDead {
-                    // Data-probe — the carrier's small retried WG handshakes
-                    // kept completing (so the Stage-2 poke never fired) but our
-                    // ICMP data-probe round trips over the real DATA path went
-                    // unanswered: a HEAVILY-LOSSY / black-holed data path a
-                    // firewall passes handshakes through (field 2026-08-11,
-                    // CORPLAP-1/Check Point). No strike booked — a re-upgrade may
-                    // re-attempt direct once the path recovers.
-                    warn!(
-                        peer = %nid, tier = tier_name,
-                        "overlay: established direct carrier fails the data-probe (handshakes pass but data round-trips are lost — lossy path / stateful firewall?) — rebuilding via relay"
                     );
                 } else if reason == DeathReason::RxStale {
                     // rc.206 — an ESTABLISHED direct carrier that went silent
