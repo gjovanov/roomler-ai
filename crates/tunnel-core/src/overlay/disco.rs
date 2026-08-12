@@ -523,6 +523,24 @@ impl Prober {
         ))
     }
 
+    /// Drop every row for `peer` except the endpoint we are CURRENTLY probing.
+    ///
+    /// We only ever probe a peer's current direct carrier, so a row for any
+    /// other endpoint is stale by construction — the carrier moved (NAT
+    /// rebind, roam, re-establish). Left in place it keeps its last loss
+    /// reading forever, and the digest reports a dead endpoint that nothing
+    /// is probing as though it were a live lossy path.
+    ///
+    /// Field 2026-08-12: zeus reported `100.65.0.5@37.63.112.129:62349
+    /// loss=47%` for 25 minutes after pc50045 had rebound to `:59669` —
+    /// indistinguishable, in the digest, from a genuinely failing carrier.
+    /// `forget` only covers peers that LEFT the mesh; this covers a peer that
+    /// stayed and moved.
+    pub(crate) fn retain_path(&mut self, peer: &[u8; 32], keep: SocketAddr) {
+        self.table.retain(|(p, d), _| p != peer || *d == keep);
+        self.pending.retain(|_, (p, d, _)| p != peer || *d == keep);
+    }
+
     /// Drop state for a peer that left the mesh.
     pub(crate) fn forget(&mut self, peer: &[u8; 32]) {
         self.table.retain(|(p, _), _| p != peer);
@@ -709,6 +727,40 @@ mod tests {
             }
             _ => panic!("a verified pong must be surfaced for routing"),
         }
+    }
+
+    /// A carrier that MOVES must not leave its old endpoint in the table
+    /// reading as a live lossy path.
+    ///
+    /// Field 2026-08-12: pc50045 rebound from `:62349` to `:59669`; zeus kept
+    /// reporting `100.65.0.5@…:62349 loss=47%` for 25 minutes afterwards.
+    /// `forget` only prunes peers that LEFT the mesh — a peer that stays and
+    /// moves accumulates a permanent dead row, which is indistinguishable in
+    /// the digest from a real black-hole and would feed C3 a phantom.
+    #[test]
+    fn a_moved_carrier_drops_its_old_endpoint_row() {
+        let (a_s, a_p) = kp();
+        let (_b_s, b_p) = kp();
+        let peer = *b_p.as_bytes();
+        let old: SocketAddr = "203.0.113.7:62349".parse().unwrap();
+        let new: SocketAddr = "203.0.113.7:59669".parse().unwrap();
+        let mut pr = Prober::default();
+
+        // Six unanswered rounds on the old endpoint ⇒ it reads lossy.
+        for _ in 0..6 {
+            let (nonce, _f) = pr.next_ping(&peer, &a_s, &a_p);
+            pr.sent(peer, old, nonce);
+        }
+        assert_eq!(pr.paths().len(), 1);
+
+        // The carrier moves; the next round goes to the new endpoint.
+        let (nonce, _f) = pr.next_ping(&peer, &a_s, &a_p);
+        pr.sent(peer, new, nonce);
+        pr.retain_path(&peer, new);
+
+        let p = pr.paths();
+        assert_eq!(p.len(), 1, "the dead endpoint must not linger");
+        assert_eq!(p[0].dst, new);
     }
 
     /// RTT is measured to when the pong ARRIVED, not to when the prober got
