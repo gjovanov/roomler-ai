@@ -188,12 +188,18 @@ pub struct AgentConfig {
     /// default: off.
     #[serde(default)]
     pub overlay_session_trace: Option<bool>,
-    /// Hybrid carrier data-probe: actively round-trip a tiny probe over each
-    /// established direct carrier and demote to relay on sustained loss
-    /// (`ROOMLER_NODE_OVERLAY_DATA_PROBE`). Catches a heavily-lossy carrier
-    /// that passes handshakes but drops data. Built-in default: OFF (opt-in since rc.347).
+    /// RETIRED in C1 — the in-tunnel data-probe is deleted (it could only
+    /// catch a fully-dead path, and shipping its prober before the fleet had
+    /// responders caused the rc.346 false-positive demotes). Kept as a DEAD,
+    /// IGNORED key for one release so an existing `overlay_data_probe=…` in a
+    /// deployed config still parses instead of failing the whole file.
     #[serde(default)]
     pub overlay_data_probe: Option<bool>,
+    /// C1 — answer out-of-tunnel disco echoes on the carrier socket
+    /// (`ROOMLER_NODE_OVERLAY_DISCO_RESPOND`). Answering only; nothing on this
+    /// node probes yet. Built-in default: ON.
+    #[serde(default)]
+    pub overlay_disco_respond: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
     /// stray-adapter sweep, Windows only
     /// (`ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
@@ -1104,7 +1110,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 29]
         ("OVERLAY_ROAM", cfg.overlay_roam),
         ("OVERLAY_PLANE_WATCHDOG", cfg.overlay_plane_watchdog),
         ("OVERLAY_SESSION_TRACE", cfg.overlay_session_trace),
-        ("OVERLAY_DATA_PROBE", cfg.overlay_data_probe),
+        ("OVERLAY_DISCO_RESPOND", cfg.overlay_disco_respond),
         ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
         ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
@@ -1299,6 +1305,7 @@ mod tests {
             overlay_plane_watchdog: None,
             overlay_session_trace: None,
             overlay_data_probe: None,
+            overlay_disco_respond: None,
             overlay_tun_stable_guid: None,
             overlay_route_evict: None,
             overlay_tun_persist: None,
