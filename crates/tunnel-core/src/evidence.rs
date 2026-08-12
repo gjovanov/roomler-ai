@@ -36,6 +36,12 @@ pub static DIRECT_BIND_WALKS: AtomicU64 = AtomicU64::new(0);
 /// thrash (a roam war or a spoof-probe storm) — worth a look, not silent.
 pub static ROAM_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// C1 (disco) — out-of-tunnel carrier echoes this node ANSWERED. The
+/// responder-only stage has no other observable: a node that answers is a
+/// node the future prober can measure, so this counter IS the C1 field gate
+/// (every node nonzero before any prober ships).
+pub static DISCO_ANSWERED: AtomicU64 = AtomicU64::new(0);
+
 /// One relaxed snapshot of all three, in declaration order.
 pub fn snapshot() -> (u64, u64, u64) {
     (

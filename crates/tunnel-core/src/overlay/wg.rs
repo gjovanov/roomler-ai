@@ -404,12 +404,6 @@ pub struct PeerStats {
     /// per [`RPF_LOG_THROTTLE_MS`] so neither a spoofing flood nor a
     /// misconfigured subnet router turns a per-packet check into a log flood.
     rpf_logged_at: AtomicU64,
-    /// Data-probe — set the instant we decapsulate a reply to one of our
-    /// overlay carrier data-probes (`dataprobe::parse_echo_reply`). The health
-    /// sweep DRAINS it each tick ([`WgDevice::peer_take_data_probe_replied`]):
-    /// a bidirectional round trip over the real DATA path — the one liveness
-    /// signal a handshake-passing-but-data-dropping carrier can't fake.
-    data_probe_replied: AtomicBool,
 }
 
 /// P3 PR-B — process-monotonic epoch for [`PeerStats::handshake_at`] stamps.
@@ -728,7 +722,14 @@ struct SendState {
 pub struct WgSender(Arc<std::sync::RwLock<SendState>>);
 
 impl WgSender {
-    fn new() -> Self {
+    /// C1 (disco) — is `pk` an installed peer? Reuses the send-side mirror
+    /// (kept key-for-key with `WgDevice::peers`, debug-asserted) so the disco
+    /// responder can reject an unknown sender BEFORE spending an X25519.
+    pub(crate) fn has_peer(&self, pk: &[u8; 32]) -> bool {
+        self.0.read().unwrap().peers.contains_key(pk)
+    }
+
+    pub(crate) fn new() -> Self {
         Self(Arc::new(std::sync::RwLock::new(SendState {
             router: Router::new(),
             scope: LocalScope::default(),
@@ -921,6 +922,7 @@ impl WgDevice {
         super::carrier_plane::EngineHooks {
             secret: self.secret.clone(),
             public: self.public,
+            send: self.send.clone(),
             direct_events: self.direct_events_tx.clone(),
             tun_tx: self.tun_tx.clone(),
         }
@@ -1298,6 +1300,10 @@ impl WgDevice {
             }
         };
         let tun_tx = self.tun_tx.clone();
+        // C1 — captured BEFORE the `&mut self` demux borrow below.
+        let secret_for_disco = self.secret.clone();
+        let public_for_disco = self.public;
+        let send_for_disco = self.send.clone();
         let demux = self.direct.get_or_insert_with(|| DirectDemux {
             routes: Arc::new(Mutex::new(HashMap::new())),
             socks: Vec::new(),
@@ -1319,6 +1325,9 @@ impl WgDevice {
             sock.clone(),
             demux.routes.clone(),
             demux.index_routes.clone(),
+            secret_for_disco,
+            public_for_disco,
+            send_for_disco,
             tun_tx,
             self.direct_events_tx.clone(),
             self.stun_events_tx.clone(),
@@ -1769,45 +1778,6 @@ impl WgDevice {
         ))
     }
 
-    /// Data-probe — drain the "a probe round-trip completed" flag for this
-    /// peer (see [`PeerStats::data_probe_replied`]). `true` iff at least one
-    /// of our echo-probes was answered since the last drain. Single-consumer:
-    /// only the health sweep calls it (the swap resets it). `false` for an
-    /// unknown peer.
-    pub fn peer_take_data_probe_replied(&self, peer_public: &[u8; 32]) -> bool {
-        self.peers
-            .get(peer_public)
-            .map(|p| p.stats.data_probe_replied.swap(false, Ordering::Relaxed))
-            .unwrap_or(false)
-    }
-
-    /// Data-probe — send one probe (`self_ip` → `dst_ip`, `seq`) encapsulated
-    /// over `dst_ip`'s session, so it rides the exact WG DATA path. `false`
-    /// if there's no route/session. `native` picks the format: the
-    /// overlay-native echo (peer's ENGINE answers — for peers advertising
-    /// `supports_overlay_echo`, incl. netstack-only nodes) vs the ICMP echo
-    /// (the peer's OS answers a ping to its own overlay IP — no capability
-    /// needed, old peers reply too).
-    pub async fn send_data_probe(
-        &self,
-        self_ip: Ipv4Addr,
-        dst_ip: Ipv4Addr,
-        seq: u16,
-        native: bool,
-    ) -> bool {
-        let pkt = if native {
-            super::dataprobe::build_overlay_echo(
-                self_ip,
-                dst_ip,
-                super::dataprobe::ECHO_KIND_REQUEST,
-                seq,
-            )
-        } else {
-            super::dataprobe::echo_request(self_ip, dst_ip, seq)
-        };
-        self.send.send_ip_packet(&pkt).await
-    }
-
     /// rc.206 — consume and return how many authenticated inbound packets we've
     /// heard from this peer since the last call (see `PeerStats::rx_any`),
     /// resetting the counter to 0. The health sweep calls this once per peer per
@@ -2038,15 +2008,6 @@ impl WgDevice {
             p.stats.rx_any.fetch_add(1, Ordering::Relaxed);
         }
     }
-
-    /// Test-only: simulate a data-probe reply landing for this peer (the
-    /// recv-path latch the sweep drains via `peer_take_data_probe_replied`).
-    #[cfg(test)]
-    pub fn test_stamp_data_probe_replied(&self, peer_public: &[u8; 32]) {
-        if let Some(p) = self.peers.get(peer_public) {
-            p.stats.data_probe_replied.store(true, Ordering::Relaxed);
-        }
-    }
 }
 
 /// Handle one inbound carrier datagram: decapsulate, echo any
@@ -2127,61 +2088,7 @@ pub(crate) async fn process_inbound(
         // enforced on ingress. It was discarded until P4, which is what let any
         // peer with a live session write an arbitrary source into our TUN.
         TunnResult::WriteToTunnelV4(pkt, src) => {
-            if let Some((kind, _seq)) = super::dataprobe::parse_overlay_echo(pkt) {
-                if kind == super::dataprobe::ECHO_KIND_REQUEST {
-                    // Overlay-native echo REQUEST from the peer: answer it
-                    // INLINE over the same carrier (we hold this session's
-                    // Tunn) and never write it to the TUN — the engine itself
-                    // is the responder, so netstack-only nodes (no OS ICMP)
-                    // answer too. Encapsulate under the lock, send off-path
-                    // (same discipline as the handshake echo above).
-                    super::dataprobe::overlay_echo_reply_in_place(pkt);
-                    let mut enc = vec![0u8; WG_BUF];
-                    let res = t.encapsulate(pkt, &mut enc);
-                    // Diagnostic — a responder that fails to encapsulate its
-                    // echo is INVISIBLE to the prober (it just sees a miss),
-                    // which is exactly how a healthy carrier gets
-                    // false-positive-demoted. Name the failing arm.
-                    let arm = match &res {
-                        TunnResult::WriteToNetwork(_) => "write_to_network",
-                        TunnResult::Done => "done",
-                        TunnResult::Err(_) => "err",
-                        _ => "other",
-                    };
-                    if super::direct::session_trace_enabled() {
-                        info!(arm, "overlay: data-probe responder encapsulate");
-                    }
-                    if let TunnResult::WriteToNetwork(b) = res {
-                        let c = carrier.clone();
-                        let out = b.to_vec();
-                        tokio::spawn(async move {
-                            let _ = c.send(&out).await;
-                        });
-                    } else {
-                        debug!(arm, "overlay: data-probe echo NOT sent (encapsulate)");
-                    }
-                } else {
-                    // REPLY to one of OUR overlay-native probes — the round
-                    // trip completed over the real DATA path.
-                    stats.data_probe_replied.store(true, Ordering::Relaxed);
-                    if super::direct::session_trace_enabled() {
-                        info!(
-                            seq = _seq,
-                            "overlay: data-probe reply latched (overlay-echo)"
-                        );
-                    }
-                }
-            } else if let Some(seq) = super::dataprobe::parse_echo_reply(pkt) {
-                // Our own carrier data-probe's echo reply — the round-trip
-                // completed over the real DATA path. Latch the liveness signal
-                // and SUPPRESS the TUN write (the OS never issued this ping),
-                // and deliberately do NOT touch `rx`: the probe must not prop
-                // up the weaker one-way counter it exists to backstop.
-                stats.data_probe_replied.store(true, Ordering::Relaxed);
-                if super::direct::session_trace_enabled() {
-                    info!(seq, "overlay: data-probe reply latched (icmp)");
-                }
-            } else if ingress.permits(IpAddr::V4(src), pkt) {
+            if ingress.permits(IpAddr::V4(src), pkt) {
                 stats.rx.fetch_add(1, Ordering::Relaxed);
                 let _ = tun_tx.send(pkt.to_vec()).await;
             }
@@ -2264,10 +2171,15 @@ pub(crate) fn authenticate_init_with(
 /// `Tunn` and replying over the same socket. One loop serves all direct peers,
 /// so N same-subnet peers share one socket without racing. Exits when the
 /// socket errors (device gone / dropped).
+#[allow(clippy::too_many_arguments)] // C1 — plus the disco responder identity
 async fn run_direct_demux(
     sock: Arc<UdpSocket>,
     routes: Arc<Mutex<DemuxRoutes>>,
     index_routes: Arc<std::sync::Mutex<HashMap<u32, IndexSlot>>>,
+    // C1 — disco responder identity + the installed-peer mirror.
+    disco_secret: StaticSecret,
+    disco_public: PublicKey,
+    disco_routes: WgSender,
     tun_tx: mpsc::Sender<Vec<u8>>,
     events: mpsc::Sender<DirectInbound>,
     stun_events: mpsc::Sender<crate::transport::stun::StunInbound>,
@@ -2304,6 +2216,25 @@ async fn run_direct_demux(
                 src,
                 packet: buf[..n].to_vec(),
             });
+            continue;
+        }
+        // C1 — disco: an out-of-tunnel carrier echo, answered unconditionally
+        // by the daemon (no OS, no firewall, no tunnel session). Its shape is
+        // disjoint from WG and STUN by construction (see `overlay::disco`), so
+        // this can never steal a live datagram.
+        if super::disco::is_disco_shaped(&buf[..n]) {
+            if super::direct::disco_respond_enabled()
+                && let Some(pong) =
+                    super::disco::respond(&buf[..n], src, &disco_secret, &disco_public, |pk| {
+                        disco_routes.has_peer(pk)
+                    })
+            {
+                let s = sock.clone();
+                tokio::spawn(async move {
+                    let _ = s.send_to(&pong, src).await;
+                });
+                crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
+            }
             continue;
         }
         // Clone the Arcs out under the routes lock, then release it before the
