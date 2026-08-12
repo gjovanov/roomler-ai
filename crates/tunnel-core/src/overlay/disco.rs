@@ -217,6 +217,9 @@ pub(crate) fn classify(
             sender: d.sender,
             nonce: d.nonce,
             src,
+            // Stamp on the receive path, while we are still holding the
+            // packet — see `DiscoInbound::at`.
+            at: std::time::Instant::now(),
         }),
         _ => Verdict::Ignore,
     }
@@ -281,6 +284,16 @@ pub struct DiscoInbound {
     pub nonce: [u8; 8],
     /// Where the pong came FROM (the remote end of the measured path).
     pub src: SocketAddr,
+    /// When the pong was AUTHENTICATED on the carrier socket — not when the
+    /// prober got round to reading it.
+    ///
+    /// The prober drains this channel once per 5 s round, so measuring RTT at
+    /// drain time charges every sample the full distance to the next tick.
+    /// Field 2026-08-12: every path reported `rtt=5000ms` — exactly one tick —
+    /// including paths answering every single probe at `loss=0%`. Loss was
+    /// unaffected (the pong is still credited to its nonce), which is what
+    /// made the RTT obviously wrong rather than plausibly bad.
+    pub at: std::time::Instant,
 }
 
 // ───────────────────────────── C2: the path table ─────────────────────────
@@ -452,7 +465,10 @@ impl Prober {
         if p.sender != peer || p.src != dst {
             return;
         }
-        let rtt = at.elapsed().as_secs_f64() * 1000.0;
+        // Measure to when the pong ARRIVED, not to now: this channel is
+        // drained once per round, so `at.elapsed()` would charge every sample
+        // the full distance to the next tick. See `DiscoInbound::at`.
+        let rtt = p.at.saturating_duration_since(at).as_secs_f64() * 1000.0;
         if let Some(s) = self.table.get_mut(&(peer, dst)) {
             s.on_pong(p.nonce, rtt);
         }
@@ -648,6 +664,43 @@ mod tests {
         assert_eq!(stale.rtt_ms, None);
     }
 
+    /// RTT is measured to when the pong ARRIVED, not to when the prober got
+    /// round to reading it.
+    ///
+    /// Locks the 2026-08-12 field reading: the prober drains its pong channel
+    /// once per 5 s round, so charging `at.elapsed()` at drain time reported
+    /// `rtt=5000ms` — exactly one tick — on EVERY path, including ones
+    /// answering every probe at `loss=0%`. Loss was right and RTT was garbage,
+    /// which is the only reason it was obviously a bug rather than a bad peer.
+    #[test]
+    fn rtt_measures_arrival_not_drain_time() {
+        let (a_s, a_p) = kp();
+        let (_b_s, b_p) = kp();
+        let peer = *b_p.as_bytes();
+        let dst: SocketAddr = "203.0.113.11:41000".parse().unwrap();
+        let mut pr = Prober::default();
+
+        let (nonce, _frame) = pr.next_ping(&peer, &a_s, &a_p);
+        pr.sent(peer, dst, nonce);
+        // The pong comes back promptly...
+        let arrived = std::time::Instant::now();
+        // ...but sits in the channel until the next round.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        pr.on_pong(&DiscoInbound {
+            sender: peer,
+            nonce,
+            src: dst,
+            at: arrived,
+        });
+
+        let rtt = pr.paths()[0].rtt_ms.expect("an RTT was measured");
+        assert!(
+            rtt < 20.0,
+            "RTT must reflect arrival, not the {}ms spent queued; got {rtt}ms",
+            40
+        );
+    }
+
     /// The prober's round accounting: a path that answers reads healthy, a
     /// path that goes silent accrues LOSS (never a death), and an unmatched
     /// or late pong credits nothing.
@@ -668,6 +721,7 @@ mod tests {
                 sender: peer,
                 nonce,
                 src: dst,
+                at: std::time::Instant::now(),
             });
         }
         let p = pr.paths();
@@ -690,6 +744,7 @@ mod tests {
             sender: peer,
             nonce: [0xEE; 8],
             src: dst,
+            at: std::time::Instant::now(),
         });
         assert_eq!(
             pr.paths()[0].loss,
