@@ -158,6 +158,12 @@ pub struct NodeStatus {
     /// from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roam_adoptions: Option<u64>,
+    /// C1 (disco) — out-of-tunnel carrier echoes this node ANSWERED
+    /// ([`crate::evidence::DISCO_ANSWERED`]). Nonzero on every node is the C1
+    /// field gate: the fleet can answer, so a prober may ship next. `None`
+    /// from a daemon predating the responder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disco_answered: Option<u64>,
 }
 
 /// PR-B1 — one bound direct socket's receive liveness (plane or per-device
@@ -1847,6 +1853,7 @@ mod tests {
                 direct_socks: Vec::new(),
                 direct_bind_walks: None,
                 roam_adoptions: None,
+                disco_answered: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
