@@ -722,6 +722,33 @@ struct SendState {
 pub struct WgSender(Arc<std::sync::RwLock<SendState>>);
 
 impl WgSender {
+    /// C2 (disco) — send a RAW, out-of-tunnel datagram over this peer's
+    /// DIRECT carrier path: the carrier's own socket, to the carrier's current
+    /// dst. Returns the dst it went to, so the prober can key the measurement
+    /// by the exact path. `None` for an unknown peer or a relay carrier (a
+    /// relay leg is measured in C4, when it becomes a warm candidate).
+    ///
+    /// Raw on purpose: measuring INSIDE the tunnel is what made rc.346 depend
+    /// on the peer's OS. This rides the same socket the carrier's WG datagrams
+    /// ride, so it measures precisely what real data experiences.
+    pub(crate) async fn send_disco_raw(
+        &self,
+        peer_public: &[u8; 32],
+        bytes: &[u8],
+    ) -> Option<SocketAddr> {
+        let carrier = {
+            let g = self.0.read().unwrap();
+            g.peers.get(peer_public)?.carrier.clone()
+        };
+        let (sock, dst) = match &*carrier {
+            Carrier::Direct { sock, dst, .. } => {
+                (sock.clone(), *dst.read().unwrap_or_else(|e| e.into_inner()))
+            }
+            _ => return None,
+        };
+        sock.send_to(bytes, dst).await.ok().map(|_| dst)
+    }
+
     /// C1 (disco) — is `pk` an installed peer? Reuses the send-side mirror
     /// (kept key-for-key with `WgDevice::peers`, debug-asserted) so the disco
     /// responder can reject an unknown sender BEFORE spending an X25519.
