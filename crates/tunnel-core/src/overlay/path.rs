@@ -519,10 +519,7 @@ impl PathMonitor {
         // Both active-proof deaths book NO penalty: the relay they fall back
         // to is the reliable path, and a transient blip should re-attempt
         // direct via make-before-break with zero suppression.
-        if matches!(
-            reason,
-            DeathReason::RekeyUnanswered | DeathReason::DataProbeDead
-        ) {
+        if matches!(reason, DeathReason::RekeyUnanswered) {
             self.peers
                 .entry(*peer)
                 .or_default()
