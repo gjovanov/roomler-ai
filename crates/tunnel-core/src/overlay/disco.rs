@@ -274,7 +274,7 @@ fn decode_observed(src: &[u8]) -> Option<SocketAddr> {
 /// path it arrived on so the prober can attribute the sample to the exact
 /// (local socket, remote endpoint) pair it probed.
 #[derive(Debug, Clone)]
-pub(crate) struct DiscoInbound {
+pub struct DiscoInbound {
     /// The peer that answered (its WG static public key).
     pub sender: [u8; 32],
     /// The nonce being answered — matched against the outstanding round.
@@ -390,12 +390,25 @@ pub(crate) struct Prober {
     table: std::collections::HashMap<([u8; 32], SocketAddr), PathStats>,
     /// Outstanding rounds: nonce → (peer, path, sent-at).
     pending: std::collections::HashMap<[u8; 8], ([u8; 32], SocketAddr, std::time::Instant)>,
-    /// Monotonic nonce source — unique per round so a late pong from an
-    /// earlier round can never be credited to the current one.
+    /// Nonce source. Seeded RANDOMLY per prober, not from zero: two org
+    /// engines on one host both mint rounds, and when they share a peer at
+    /// the SAME endpoint (the multi-org norm — e.g. one relay in both orgs)
+    /// a from-zero counter makes their nonces collide, so a pong for one
+    /// engine.s round validates against the other.s pending entry and yields
+    /// a garbage RTT. Field 2026-08-12: `rtt=5000ms` on a 40 ms path.
     seq: u64,
 }
 
 impl Prober {
+    /// A prober with a randomly-seeded nonce space (see `seq`).
+    pub(crate) fn new() -> Self {
+        use rand::RngCore;
+        Self {
+            seq: rand::rng().next_u64(),
+            ..Default::default()
+        }
+    }
+
     /// Build the next ping for `peer` and remember the round. The caller
     /// sends the bytes over that peer's carrier and reports the dst back via
     /// [`Self::sent`].
