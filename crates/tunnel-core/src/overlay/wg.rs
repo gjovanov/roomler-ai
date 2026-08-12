@@ -1371,6 +1371,7 @@ impl WgDevice {
             secret_for_disco,
             public_for_disco,
             send_for_disco,
+            self.disco_events_tx.clone(),
             tun_tx,
             self.direct_events_tx.clone(),
             self.stun_events_tx.clone(),
@@ -2223,6 +2224,10 @@ async fn run_direct_demux(
     disco_secret: StaticSecret,
     disco_public: PublicKey,
     disco_routes: WgSender,
+    // C2 — where a verified PONG goes. This seam used to answer pings via
+    // `disco::respond` and DROP pongs on the floor, so any path whose carrier
+    // socket was served here measured 100 % loss while carrying WG data fine.
+    disco_events: mpsc::Sender<super::disco::DiscoInbound>,
     tun_tx: mpsc::Sender<Vec<u8>>,
     events: mpsc::Sender<DirectInbound>,
     stun_events: mpsc::Sender<crate::transport::stun::StunInbound>,
@@ -2266,17 +2271,33 @@ async fn run_direct_demux(
         // disjoint from WG and STUN by construction (see `overlay::disco`), so
         // this can never steal a live datagram.
         if super::disco::is_disco_shaped(&buf[..n]) {
-            if super::direct::disco_respond_enabled()
-                && let Some(pong) =
-                    super::disco::respond(&buf[..n], src, &disco_secret, &disco_public, |pk| {
-                        disco_routes.has_peer(pk)
-                    })
-            {
-                let s = sock.clone();
-                tokio::spawn(async move {
-                    let _ = s.send_to(&pong, src).await;
-                });
-                crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
+            // Use `classify`, NOT `respond`. `respond` only yields a value for
+            // a PING; a PONG arriving here returned `None` and fell through to
+            // `continue`, i.e. it was dropped. That broke C2's measurement for
+            // every path whose carrier socket is served by this seam rather
+            // than the carrier plane: the peer answered (its DISCO_ANSWERED
+            // climbed), the reply arrived, and the prober never saw it — so a
+            // healthy carrier read `loss=100%`. Field 2026-08-12: zeus→jupiter
+            // and zeus→neo16-wsl on grox, both 0 % by ping, both 100 % by
+            // disco, while the SAME jupiter measured correctly on the other
+            // org's engine. `classify`'s own doc already promised the two
+            // seams could not diverge; now they don't.
+            match super::disco::classify(&buf[..n], src, &disco_secret, &disco_public, |pk| {
+                disco_routes.has_peer(pk)
+            }) {
+                super::disco::Verdict::Answer(pong) => {
+                    if super::direct::disco_respond_enabled() {
+                        let s = sock.clone();
+                        tokio::spawn(async move {
+                            let _ = s.send_to(&pong, src).await;
+                        });
+                        crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                super::disco::Verdict::Pong(p) => {
+                    let _ = disco_events.try_send(p);
+                }
+                super::disco::Verdict::Ignore => {}
             }
             continue;
         }
