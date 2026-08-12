@@ -29,7 +29,7 @@ pub mod bridge;
 /// receiver index (initiations by per-engine static-key trial).
 pub mod carrier_plane;
 pub mod direct;
-pub(crate) mod disco;
+pub mod disco;
 pub mod dns;
 pub mod ingress;
 pub(crate) mod lifecycle;

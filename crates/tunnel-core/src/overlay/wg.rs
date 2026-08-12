@@ -865,6 +865,9 @@ pub struct WgDevice {
     /// once by the runtime ([`take_direct_events`](Self::take_direct_events)).
     direct_events_tx: mpsc::Sender<DirectInbound>,
     direct_events_rx: Option<mpsc::Receiver<DirectInbound>>,
+    /// C2 — this engine's disco-pong sink (per-engine; see `take_disco_events`).
+    disco_events_tx: mpsc::Sender<super::disco::DiscoInbound>,
+    disco_events_rx: Option<mpsc::Receiver<super::disco::DiscoInbound>>,
     /// Phase C — STUN Binding responses forwarded by the demux loops (a
     /// datagram carrying the STUN cookie that is not WG-shaped). The srflx
     /// keepalive task's query rides a shared direct socket whose `recv_from`
@@ -907,6 +910,7 @@ impl WgDevice {
         let public = PublicKey::from(&secret);
         let (tun_tx, tun_rx) = mpsc::channel(256);
         let (direct_events_tx, direct_events_rx) = mpsc::channel(16);
+        let (disco_events_tx, disco_events_rx) = mpsc::channel(64);
         let (stun_events_tx, stun_events_rx) = mpsc::channel(16);
         let rpf = RpfMode::parse(crate::env::node_env("OVERLAY_RPF").as_deref());
         tracing::info!(
@@ -924,6 +928,8 @@ impl WgDevice {
                 next_index: 1,
                 direct: None,
                 direct_events_tx,
+                disco_events_tx,
+                disco_events_rx: Some(disco_events_rx),
                 direct_events_rx: Some(direct_events_rx),
                 stun_events_tx,
                 stun_events_rx: Some(stun_events_rx),
@@ -951,6 +957,7 @@ impl WgDevice {
             public: self.public,
             send: self.send.clone(),
             direct_events: self.direct_events_tx.clone(),
+            disco_events: self.disco_events_tx.clone(),
             tun_tx: self.tun_tx.clone(),
         }
     }
@@ -1029,6 +1036,15 @@ impl WgDevice {
             stats,
             mode: self.rpf,
         }
+    }
+
+    /// C2 — take THIS device.s disco-pong receiver (per-engine: N org
+    /// engines share one plane, so a plane-wide sink would blind all but the
+    /// first taker). `None` after the first take.
+    pub(crate) fn take_disco_events(
+        &mut self,
+    ) -> Option<mpsc::Receiver<super::disco::DiscoInbound>> {
+        self.disco_events_rx.take()
     }
 
     /// Phase A — take the receiver for unknown-source handshake initiations
