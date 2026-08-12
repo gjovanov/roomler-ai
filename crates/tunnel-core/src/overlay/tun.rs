@@ -1996,6 +1996,8 @@ mod system {
                     Ok(g) => {
                         tracing::info!(
                             luid = format_args!("{luid:#x}"),
+                            adapter = %if_name,
+                            filters = crate::overlay::wfp::FILTERS_PER_ADAPTER,
                             "overlay: WFP hard-permit installed for the roomler adapter"
                         );
                         Some(g)
