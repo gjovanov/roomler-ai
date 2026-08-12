@@ -51,7 +51,7 @@ use tracing::{debug, info, warn};
 
 use super::direct;
 use super::wg::{
-    Carrier, DirectInbound, Ingress, UNKNOWN_INIT_MAX_SOURCES, UNKNOWN_INIT_MIN_INTERVAL,
+    Carrier, DirectInbound, Ingress, UNKNOWN_INIT_MAX_SOURCES, UNKNOWN_INIT_MIN_INTERVAL, WgSender,
     authenticate_init_with, is_wg_shaped, process_inbound,
 };
 use crate::transport::stun::StunInbound;
@@ -67,6 +67,9 @@ const INDEX_SPACE: u32 = 1 << 24;
 pub struct EngineHooks {
     pub secret: StaticSecret,
     pub public: PublicKey,
+    /// C1 (disco) — the engine.s send-side peer mirror, so the plane can ask
+    /// "is this sender one of YOUR installed peers?" before spending a DH.
+    pub send: WgSender,
     pub direct_events: mpsc::Sender<DirectInbound>,
     pub tun_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -75,6 +78,7 @@ struct EngineEntry {
     id: u64,
     secret: StaticSecret,
     public: PublicKey,
+    send: WgSender,
     direct_events: mpsc::Sender<DirectInbound>,
     tun_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -230,6 +234,7 @@ impl CarrierPlane {
             id,
             secret: hooks.secret,
             public: hooks.public,
+            send: hooks.send,
             direct_events: hooks.direct_events,
             tun_tx: hooks.tun_tx,
         });
@@ -418,6 +423,24 @@ impl CarrierPlane {
                 };
                 if let Some(s) = &stat {
                     s.bump();
+                }
+                // C1 — disco: the out-of-tunnel carrier echo, answered
+                // unconditionally. Shape-disjoint from WG and STUN by
+                // construction (see `overlay::disco`), so it can never steal a
+                // live datagram. On the plane the sender may belong to ANY
+                // attached engine, so each is tried in turn (N ≤ a handful,
+                // and only after the cheap shape + known-peer filters).
+                if super::disco::is_disco_shaped(&buf[..n]) {
+                    if super::direct::disco_respond_enabled()
+                        && let Some(pong) = plane.disco_respond(&buf[..n], src)
+                    {
+                        let s = sock.clone();
+                        tokio::spawn(async move {
+                            let _ = s.send_to(&pong, src).await;
+                        });
+                        crate::evidence::DISCO_ANSWERED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
                 }
                 let stun_tx = { plane.lock().stun_tx.clone() };
                 if crate::transport::stun::has_stun_cookie(&buf[..n]) && !is_wg_shaped(&buf[..n]) {
@@ -678,6 +701,30 @@ impl CarrierPlane {
             },
             None => Routed::Drop,
         }
+    }
+
+    /// C1 — answer a disco ping on behalf of whichever attached engine knows
+    /// the sender. Engines are snapshotted out of the lock so the X25519 runs
+    /// unlocked, exactly like [`authenticate_against_engines`].
+    ///
+    /// "Knows the sender" here is: the engine has a live session route whose
+    /// peer is that key. The plane indexes routes by session index, not by
+    /// peer key, so this asks each engine's own send-mirror via the hook
+    /// captured at attach.
+    fn disco_respond(&self, pkt: &[u8], src: SocketAddr) -> Option<Vec<u8>> {
+        let sender = super::disco::claimed_sender(pkt)?;
+        let engines: Vec<(StaticSecret, PublicKey, WgSender)> = {
+            let st = self.lock();
+            st.engines
+                .iter()
+                .map(|e| (e.secret.clone(), e.public, e.send.clone()))
+                .collect()
+        };
+        engines.into_iter().find_map(|(secret, public, send)| {
+            super::disco::respond(pkt, src, &secret, &public, |pk| {
+                *pk == sender && send.has_peer(pk)
+            })
+        })
     }
 
     /// Try each attached engine's static against a handshake initiation.
@@ -1499,6 +1546,7 @@ mod tests {
         let h1 = plane.attach(EngineHooks {
             secret: kp1.secret.clone(),
             public: kp1.public,
+            send: crate::overlay::wg::WgSender::new(),
             direct_events: tx_e.clone(),
             tun_tx: tx_t.clone(),
         });
@@ -1506,6 +1554,7 @@ mod tests {
         let h2 = plane.attach(EngineHooks {
             secret: kp2.secret.clone(),
             public: kp2.public,
+            send: crate::overlay::wg::WgSender::new(),
             direct_events: tx_e,
             tun_tx: tx_t,
         });

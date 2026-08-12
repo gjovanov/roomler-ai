@@ -215,9 +215,9 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Diagnostic: per-session plane-demux + carrier-health INFO traces (inbound src vs expected, poke/proof/rx state). Verbose; enable briefly on an affected host to diagnose a specific peer's carrier. Built-in default: off.",
     ),
     (
-        "overlay_data_probe",
+        "overlay_disco_respond",
         "tribool",
-        "Hybrid carrier data-probe: round-trip a tiny probe over each established direct carrier and demote to relay on sustained loss (catches a lossy carrier that passes handshakes but drops data). Built-in default: OFF (opt-in; false-positived on healthy carriers at default-ON, rc.346).",
+        "Answer out-of-tunnel disco echoes on the carrier socket (path liveness, answered by the daemon itself — no OS, firewall or tunnel session involved). Answering only; this node does not probe. Built-in default: on.",
     ),
     (
         "overlay_tun_stable_guid",
@@ -400,7 +400,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_roam" => cfg.overlay_roam.map(fmt_bool),
         "overlay_plane_watchdog" => cfg.overlay_plane_watchdog.map(fmt_bool),
         "overlay_session_trace" => cfg.overlay_session_trace.map(fmt_bool),
-        "overlay_data_probe" => cfg.overlay_data_probe.map(fmt_bool),
+        "overlay_disco_respond" => cfg.overlay_disco_respond.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
@@ -598,7 +598,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_roam" => cfg.overlay_roam = parse_tribool(value)?,
         "overlay_plane_watchdog" => cfg.overlay_plane_watchdog = parse_tribool(value)?,
         "overlay_session_trace" => cfg.overlay_session_trace = parse_tribool(value)?,
-        "overlay_data_probe" => cfg.overlay_data_probe = parse_tribool(value)?,
+        "overlay_disco_respond" => cfg.overlay_disco_respond = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
@@ -868,25 +868,16 @@ mod tests {
         assert!(apply(&mut cfg, "overlay_plane_watchdog", Some("maybe")).is_err());
     }
 
-    /// Hybrid data-probe kill switch set/echo/clear (per the
+    /// C1 — the disco responder kill switch set/echo/clear (per the
     /// every-new-env-gets-a-config-key rule).
     #[test]
-    fn overlay_data_probe_set_echo_clear() {
+    fn overlay_disco_respond_set_echo_clear() {
         let mut cfg = crate::config::test_fixture();
-        apply(&mut cfg, "overlay_data_probe", Some("off")).unwrap();
-        assert_eq!(cfg.overlay_data_probe, Some(false));
-        assert_eq!(
-            entry_for(&cfg, "overlay_data_probe")
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("false")
-        );
-        apply(&mut cfg, "overlay_data_probe", Some("1")).unwrap();
-        assert_eq!(cfg.overlay_data_probe, Some(true));
-        apply(&mut cfg, "overlay_data_probe", None).unwrap();
-        assert_eq!(cfg.overlay_data_probe, None);
-        assert!(apply(&mut cfg, "overlay_data_probe", Some("maybe")).is_err());
+        apply(&mut cfg, "overlay_disco_respond", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_disco_respond, Some(false));
+        apply(&mut cfg, "overlay_disco_respond", None).unwrap();
+        assert_eq!(cfg.overlay_disco_respond, None);
+        assert!(apply(&mut cfg, "overlay_disco_respond", Some("maybe")).is_err());
     }
 
     /// Diagnostic session-trace kill switch set/echo/clear (per the

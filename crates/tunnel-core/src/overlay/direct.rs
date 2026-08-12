@@ -917,21 +917,16 @@ pub fn session_trace_enabled() -> bool {
     crate::env::flag("OVERLAY_SESSION_TRACE", false)
 }
 
-/// Hybrid carrier data-probe (`ROOMLER_NODE_OVERLAY_DATA_PROBE`, legacy
-/// `ROOMLER_AGENT_…`; default **OFF** since rc.347): actively round-trip a tiny probe over
-/// each established DIRECT carrier's real DATA path every health-sweep tick,
-/// and demote to relay after [`super::lifecycle::DATA_PROBE_FAILS_TO_DEMOTE`]
-/// consecutive misses. The only reaper for a heavily-lossy carrier whose
-/// small retried WG handshakes still complete while bulk data drops (field
-/// 2026-08-11, pc50045/Check Point).
+/// C1 — answer out-of-tunnel disco echoes on the carrier socket
+/// (`ROOMLER_NODE_OVERLAY_DISCO_RESPOND`, legacy `ROOMLER_AGENT_…`; default
+/// **ON**). Answering is unconditional and costs a map lookup + one X25519
+/// per verified ping; nothing on this node ASKS yet (the prober is C2).
 ///
-/// Default **OFF** since rc.347: at default-ON it FALSE-POSITIVED on healthy
-/// carriers in the field (2026-08-12 — zeus/neo16 showed `stalled` on 0 ms
-/// same-DC peers, 4 `fails the data-probe` demotes in 5 min plus re-punch
-/// churn). The responder side is not yet proven for every peer/OS combo, so
-/// the probe is opt-in until the reply path is root-caused and re-validated.
-pub fn data_probe_enabled() -> bool {
-    crate::env::flag("OVERLAY_DATA_PROBE", false)
+/// Default-ON on purpose, and it is the deployment barrier the rc.346
+/// regression paid for: a prober that punishes non-answer must ship at least
+/// one release AFTER every peer can answer. Responder first, always.
+pub fn disco_respond_enabled() -> bool {
+    crate::env::flag("OVERLAY_DISCO_RESPOND", true)
 }
 
 /// B4 — carrier-plane socket-liveness watchdog
