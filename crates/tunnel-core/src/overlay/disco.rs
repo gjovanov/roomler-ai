@@ -168,22 +168,58 @@ pub(crate) fn respond(
     public: &PublicKey,
     known_peer: impl Fn(&[u8; 32]) -> bool,
 ) -> Option<Vec<u8>> {
-    let sender = claimed_sender(pkt)?;
+    match classify(pkt, src, secret, public, known_peer) {
+        Verdict::Answer(pong) => Some(pong),
+        _ => None,
+    }
+}
+
+/// What a recv loop should do with a disco datagram.
+pub(crate) enum Verdict {
+    /// A verified PING — send these bytes back to the source.
+    Answer(Vec<u8>),
+    /// A verified PONG — hand it to the prober's sink (C2).
+    Pong(DiscoInbound),
+    /// Not ours / unknown sender / bad MAC ⇒ drop silently.
+    Ignore,
+}
+
+/// Verify a disco datagram once and say what to do with it. Both recv seams
+/// (device demux + carrier plane) call exactly this, so ping-answering and
+/// pong-routing can never diverge between them.
+pub(crate) fn classify(
+    pkt: &[u8],
+    src: SocketAddr,
+    secret: &StaticSecret,
+    public: &PublicKey,
+    known_peer: impl Fn(&[u8; 32]) -> bool,
+) -> Verdict {
+    let Some(sender) = claimed_sender(pkt) else {
+        return Verdict::Ignore;
+    };
+    // Known-peer check BEFORE any crypto: a forged flood costs a map lookup.
     if !known_peer(&sender) {
-        return None;
+        return Verdict::Ignore;
     }
     let shared = shared_secret(secret, &PublicKey::from(sender));
-    let d = parse(pkt, &shared)?;
-    if d.kind != KIND_PING {
-        return None; // a pong is for the prober (C2), not the responder
+    let Some(d) = parse(pkt, &shared) else {
+        return Verdict::Ignore;
+    };
+    match d.kind {
+        KIND_PING => Verdict::Answer(build(
+            KIND_PONG,
+            d.nonce,
+            public.as_bytes(),
+            Some(src),
+            &shared,
+        )),
+        KIND_PONG => Verdict::Pong(DiscoInbound {
+            sender: d.sender,
+            nonce: d.nonce,
+            src,
+        }),
+        _ => Verdict::Ignore,
     }
-    Some(build(
-        KIND_PONG,
-        d.nonce,
-        public.as_bytes(),
-        Some(src),
-        &shared,
-    ))
 }
 
 fn mac(body: &[u8], shared: &[u8; 32]) -> [u8; 16] {
@@ -231,6 +267,235 @@ fn decode_observed(src: &[u8]) -> Option<SocketAddr> {
             Some(SocketAddr::from((o, port)))
         }
         _ => None,
+    }
+}
+
+/// C2 — a verified PONG handed from a recv loop to the prober. Carries the
+/// path it arrived on so the prober can attribute the sample to the exact
+/// (local socket, remote endpoint) pair it probed.
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoInbound {
+    /// The peer that answered (its WG static public key).
+    pub sender: [u8; 32],
+    /// The nonce being answered — matched against the outstanding round.
+    pub nonce: [u8; 8],
+    /// Where the pong came FROM (the remote end of the measured path).
+    pub src: SocketAddr,
+}
+
+// ───────────────────────────── C2: the path table ─────────────────────────
+//
+// The measurement C1 made possible. Keyed by (peer, local socket, remote
+// endpoint) — the granularity the tier model structurally lacks, where every
+// advertised endpoint of a peer collapses into ONE `TierState` and is
+// disambiguated only by a strike-count rotation.
+//
+// Two rules are load-bearing, both paid for in the field:
+//
+// 1. **Silence is never negative evidence.** A missing pong lowers nothing.
+//    A path loses only by DECAYING while rivals accumulate fresh pongs. This
+//    is what makes a mixed fleet safe with no capability bit: a peer that
+//    cannot answer simply never wins that path, instead of being punished.
+// 2. **Loss is a WINDOWED RATE, never a consecutive-miss count.** rc.346's
+//    reaper counted consecutive misses and could therefore only catch a
+//    FULLY dead path: on the live grox carrier (~20 % delivery, `tx=17..22
+//    rx=3..4`) roughly one probe in five got through and reset the counter,
+//    so it demoted nothing. A rate sees 80 % loss for what it is.
+
+/// How many recent rounds the loss rate is computed over. At the steady 30 s
+/// cadence that is ~8 minutes of history; at the 5 s discovery cadence, ~80 s.
+pub(crate) const LOSS_WINDOW: u32 = 16;
+
+/// One measured path to one peer.
+///
+/// `allow(dead_code)`: the prober that drives this lands in the NEXT commit
+/// (C2b). Same convention as the repo's defensive-enum rule — the allow is
+/// temporary and must be removed when the consumer lands. Shipping the table
+/// first keeps the measurement primitives reviewable on their own, and they
+/// are already locked by `loss_is_a_rate_so_a_lossy_path_cannot_hide`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PathStats {
+    /// Rounds issued into the window (saturating at [`LOSS_WINDOW`]).
+    sent: u32,
+    /// Rounds answered within the window.
+    answered: u32,
+    /// Smoothed round-trip, `None` until the first pong.
+    pub rtt_ms: Option<f64>,
+    /// The nonce of the round currently outstanding, if any.
+    pending: Option<[u8; 8]>,
+}
+
+impl PathStats {
+    /// Record that a round was issued with `nonce`. A still-outstanding
+    /// previous round counts as unanswered — that is the ONLY way `sent`
+    /// outpaces `answered`, and it is a rate input, never a death.
+    pub(crate) fn on_sent(&mut self, nonce: [u8; 8]) {
+        self.sent = (self.sent + 1).min(LOSS_WINDOW);
+        if self.sent >= LOSS_WINDOW {
+            // Slide: keep the ratio, halve both so recent rounds dominate.
+            self.sent = self.sent.div_ceil(2);
+            self.answered = self.answered.div_ceil(2);
+        }
+        self.pending = Some(nonce);
+    }
+
+    /// Record a pong. Only a MATCHING nonce counts — a late pong from an
+    /// earlier round is ignored rather than credited to the current one.
+    pub(crate) fn on_pong(&mut self, nonce: [u8; 8], rtt_ms: f64) {
+        if self.pending != Some(nonce) {
+            return;
+        }
+        self.pending = None;
+        self.answered = (self.answered + 1).min(self.sent);
+        // EWMA, α = 0.3 — fast enough to track a real path change, slow
+        // enough that one scheduling hiccup doesn't dominate.
+        self.rtt_ms = Some(match self.rtt_ms {
+            Some(prev) => prev * 0.7 + rtt_ms * 0.3,
+            None => rtt_ms,
+        });
+    }
+
+    /// Fraction of windowed rounds that went unanswered, 0.0..=1.0. `None`
+    /// until the window has enough rounds to mean anything — an unmeasured
+    /// path must never look like a bad one.
+    pub(crate) fn loss(&self) -> Option<f64> {
+        if self.sent < 4 {
+            return None;
+        }
+        Some(1.0 - (self.answered as f64 / self.sent as f64))
+    }
+}
+
+/// One measured path, as reported out of the [`Prober`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PathSample {
+    pub peer: [u8; 32],
+    pub dst: SocketAddr,
+    /// Windowed loss 0.0..=1.0; `None` until enough rounds to judge — an
+    /// unmeasured path must never read as a bad one.
+    pub loss: Option<f64>,
+    pub rtt_ms: Option<f64>,
+}
+
+/// C2 — the prober: one round per peer per tick over that peer's CURRENT
+/// direct-carrier path, plus the windowed table of what came back.
+///
+/// Deliberately measurement-only. Nothing here demotes, penalises, or ranks —
+/// `paths()` is read by the LocalAPI and the summary log, and by nothing that
+/// makes a routing decision. Scoring (C3) and authority (C6) are separate
+/// stages behind their own flags, precisely so a bug here cannot move traffic.
+#[derive(Default)]
+pub(crate) struct Prober {
+    /// (peer pubkey, remote endpoint) → windowed stats.
+    table: std::collections::HashMap<([u8; 32], SocketAddr), PathStats>,
+    /// Outstanding rounds: nonce → (peer, path, sent-at).
+    pending: std::collections::HashMap<[u8; 8], ([u8; 32], SocketAddr, std::time::Instant)>,
+    /// Monotonic nonce source — unique per round so a late pong from an
+    /// earlier round can never be credited to the current one.
+    seq: u64,
+}
+
+impl Prober {
+    /// Build the next ping for `peer` and remember the round. The caller
+    /// sends the bytes over that peer's carrier and reports the dst back via
+    /// [`Self::sent`].
+    pub(crate) fn next_ping(
+        &mut self,
+        peer: &[u8; 32],
+        secret: &StaticSecret,
+        public: &PublicKey,
+    ) -> ([u8; 8], Vec<u8>) {
+        self.seq = self.seq.wrapping_add(1);
+        let nonce = self.seq.to_be_bytes();
+        let shared = shared_secret(secret, &PublicKey::from(*peer));
+        (
+            nonce,
+            build(KIND_PING, nonce, public.as_bytes(), None, &shared),
+        )
+    }
+
+    /// Record that the round actually went out to `dst`.
+    pub(crate) fn sent(&mut self, peer: [u8; 32], dst: SocketAddr, nonce: [u8; 8]) {
+        self.table.entry((peer, dst)).or_default().on_sent(nonce);
+        self.pending
+            .insert(nonce, (peer, dst, std::time::Instant::now()));
+        // Bound the pending map: a path that never answers would otherwise
+        // accumulate one entry per round forever.
+        if self.pending.len() > 512 {
+            let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(120);
+            self.pending.retain(|_, (_, _, at)| *at > cutoff);
+        }
+    }
+
+    /// Record a verified pong. Unmatched nonces (a late reply, or a path we
+    /// never probed) are ignored rather than credited.
+    pub(crate) fn on_pong(&mut self, p: &DiscoInbound) {
+        let Some((peer, dst, at)) = self.pending.remove(&p.nonce) else {
+            return;
+        };
+        // The nonce alone is not enough: a pong must come from the PEER and
+        // the PATH we probed, or the sample would be attributed to the wrong
+        // path (and a peer could credit a path it does not actually serve).
+        if p.sender != peer || p.src != dst {
+            return;
+        }
+        let rtt = at.elapsed().as_secs_f64() * 1000.0;
+        if let Some(s) = self.table.get_mut(&(peer, dst)) {
+            s.on_pong(p.nonce, rtt);
+        }
+    }
+
+    /// Every measured path.
+    pub(crate) fn paths(&self) -> Vec<PathSample> {
+        self.table
+            .iter()
+            .map(|((peer, dst), s)| PathSample {
+                peer: *peer,
+                dst: *dst,
+                loss: s.loss(),
+                rtt_ms: s.rtt_ms,
+            })
+            .collect()
+    }
+
+    /// A compact, operator-readable digest of what the paths measure right
+    /// now: how many are measured, and the WORST few by loss. This is C2's
+    /// entire observable — the stage deliberately produces a log line and a
+    /// LocalAPI field, and no behaviour.
+    ///
+    /// `None` until at least one path has enough rounds to judge, so a
+    /// freshly-started prober says nothing rather than something misleading.
+    pub(crate) fn summary(&self) -> Option<String> {
+        let mut worst: Vec<(f64, SocketAddr, Option<f64>)> = self
+            .paths()
+            .into_iter()
+            .filter_map(|p| p.loss.map(|l| (l, p.dst, p.rtt_ms)))
+            .collect();
+        if worst.is_empty() {
+            return None;
+        }
+        let measured = worst.len();
+        worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let lossy = worst.iter().filter(|(l, _, _)| *l > 0.1).count();
+        let top: Vec<String> = worst
+            .iter()
+            .take(3)
+            .map(|(l, dst, rtt)| match rtt {
+                Some(r) => format!("{dst} loss={:.0}% rtt={r:.0}ms", l * 100.0),
+                None => format!("{dst} loss={:.0}% rtt=—", l * 100.0),
+            })
+            .collect();
+        Some(format!(
+            "paths={} lossy={lossy} worst=[{}]",
+            measured,
+            top.join(", ")
+        ))
+    }
+
+    /// Drop state for a peer that left the mesh.
+    pub(crate) fn forget(&mut self, peer: &[u8; 32]) {
+        self.table.retain(|(p, _), _| p != peer);
+        self.pending.retain(|_, (p, _, _)| p != peer);
     }
 }
 
@@ -322,6 +587,106 @@ mod tests {
         let mut bad_kind = ping.clone();
         bad_kind[OFF_KIND] = 9;
         assert!(parse(&bad_kind, &ba).is_none());
+    }
+
+    /// THE regression lock. rc.346 counted CONSECUTIVE misses, so a path that
+    /// delivered ~20 % (the real grox carrier: `tx=17..22 rx=3..4`) reset the
+    /// counter roughly every fifth round and was never detected. A windowed
+    /// RATE must see that same path as ~80 % lossy — while a healthy path
+    /// reads ~0 and an unmeasured one reads `None`, never "bad".
+    #[test]
+    fn loss_is_a_rate_so_a_lossy_path_cannot_hide() {
+        // ~20 % delivery: 1 pong per 5 rounds — the shape that defeated the
+        // consecutive-miss reaper.
+        let mut lossy = PathStats::default();
+        for i in 0..10u32 {
+            let n = [i as u8; 8];
+            lossy.on_sent(n);
+            if i % 5 == 0 {
+                lossy.on_pong(n, 40.0);
+            }
+        }
+        let l = lossy.loss().expect("enough rounds to judge");
+        assert!(
+            l > 0.6,
+            "a ~20% delivery path must read as heavily lossy, got {l}"
+        );
+
+        // A healthy path reads ~0 loss.
+        let mut good = PathStats::default();
+        for i in 0..10u32 {
+            let n = [i as u8; 8];
+            good.on_sent(n);
+            good.on_pong(n, 10.0);
+        }
+        assert_eq!(good.loss(), Some(0.0));
+        assert!(good.rtt_ms.unwrap() > 0.0);
+
+        // An UNMEASURED path is `None` — never mistaken for a bad one. This
+        // is the "silence is not negative evidence" rule in code.
+        let mut fresh = PathStats::default();
+        fresh.on_sent([1u8; 8]);
+        assert_eq!(fresh.loss(), None, "too few rounds must not read as loss");
+
+        // A stale pong (wrong nonce) credits nothing.
+        let mut stale = PathStats::default();
+        stale.on_sent([1u8; 8]);
+        stale.on_pong([9u8; 8], 5.0);
+        assert_eq!(stale.rtt_ms, None);
+    }
+
+    /// The prober's round accounting: a path that answers reads healthy, a
+    /// path that goes silent accrues LOSS (never a death), and an unmatched
+    /// or late pong credits nothing.
+    #[test]
+    fn prober_rounds_measure_loss_without_punishing_silence() {
+        let (a_s, a_p) = kp();
+        let (_b_s, b_p) = kp();
+        let peer = *b_p.as_bytes();
+        let dst: SocketAddr = "203.0.113.9:41000".parse().unwrap();
+        let mut pr = Prober::default();
+
+        // Six answered rounds ⇒ zero loss, an RTT is known.
+        for _ in 0..6 {
+            let (nonce, frame) = pr.next_ping(&peer, &a_s, &a_p);
+            assert!(is_disco_shaped(&frame));
+            pr.sent(peer, dst, nonce);
+            pr.on_pong(&DiscoInbound {
+                sender: peer,
+                nonce,
+                src: dst,
+            });
+        }
+        let p = pr.paths();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].loss, Some(0.0), "answered rounds ⇒ no loss");
+        assert!(p[0].rtt_ms.is_some(), "an RTT was measured");
+
+        // Six silent rounds ⇒ the loss RATE climbs. Nothing else happens:
+        // there is no death, no penalty, no ranking — measurement only.
+        for _ in 0..6 {
+            let (nonce, _f) = pr.next_ping(&peer, &a_s, &a_p);
+            pr.sent(peer, dst, nonce);
+        }
+        let loss = pr.paths()[0].loss.expect("measured");
+        assert!(loss > 0.0, "silence must show as loss, got {loss}");
+
+        // An unknown nonce credits nothing.
+        let before = pr.paths()[0].loss;
+        pr.on_pong(&DiscoInbound {
+            sender: peer,
+            nonce: [0xEE; 8],
+            src: dst,
+        });
+        assert_eq!(
+            pr.paths()[0].loss,
+            before,
+            "an unmatched pong must not credit"
+        );
+
+        // Forgetting a departed peer clears its paths.
+        pr.forget(&peer);
+        assert!(pr.paths().is_empty());
     }
 
     #[test]

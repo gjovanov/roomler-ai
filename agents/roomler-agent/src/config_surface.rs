@@ -220,6 +220,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Answer out-of-tunnel disco echoes on the carrier socket (path liveness, answered by the daemon itself — no OS, firewall or tunnel session involved). Answering only; this node does not probe. Built-in default: on.",
     ),
     (
+        "overlay_disco_probe",
+        "tribool",
+        "Probe peers with out-of-tunnel disco echoes and record per-path loss + RTT. Measurement only — nothing acts on the table (scoring is a later stage). Built-in default: off; enable only where every peer already answers.",
+    ),
+    (
         "overlay_tun_stable_guid",
         "tribool",
         "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
@@ -401,6 +406,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_plane_watchdog" => cfg.overlay_plane_watchdog.map(fmt_bool),
         "overlay_session_trace" => cfg.overlay_session_trace.map(fmt_bool),
         "overlay_disco_respond" => cfg.overlay_disco_respond.map(fmt_bool),
+        "overlay_disco_probe" => cfg.overlay_disco_probe.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
@@ -599,6 +605,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_plane_watchdog" => cfg.overlay_plane_watchdog = parse_tribool(value)?,
         "overlay_session_trace" => cfg.overlay_session_trace = parse_tribool(value)?,
         "overlay_disco_respond" => cfg.overlay_disco_respond = parse_tribool(value)?,
+        "overlay_disco_probe" => cfg.overlay_disco_probe = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
@@ -870,6 +877,16 @@ mod tests {
 
     /// C1 — the disco responder kill switch set/echo/clear (per the
     /// every-new-env-gets-a-config-key rule).
+    #[test]
+    fn overlay_disco_probe_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_disco_probe", Some("on")).unwrap();
+        assert_eq!(cfg.overlay_disco_probe, Some(true));
+        apply(&mut cfg, "overlay_disco_probe", None).unwrap();
+        assert_eq!(cfg.overlay_disco_probe, None);
+        assert!(apply(&mut cfg, "overlay_disco_probe", Some("maybe")).is_err());
+    }
+
     #[test]
     fn overlay_disco_respond_set_echo_clear() {
         let mut cfg = crate::config::test_fixture();
