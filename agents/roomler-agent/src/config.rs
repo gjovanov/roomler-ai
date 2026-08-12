@@ -1176,9 +1176,68 @@ pub fn machine_global_config_path() -> PathBuf {
     crate::appdirs::machine_global_dir().join("config.toml")
 }
 
+/// Sibling copy of the last config that both saved AND parsed, kept so an
+/// unreadable live file can be recovered without re-enrolling the host.
+fn prev_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension("toml.prev")
+}
+
 pub fn load(path: &PathBuf) -> Result<AgentConfig> {
+    let err = match try_load(path) {
+        Ok(cfg) => return Ok(cfg),
+        Err(e) => e,
+    };
+
+    // SELF-HEAL (2026-08-12): the live file is unreadable — on neo16 an
+    // unclean shutdown left it the right length and entirely NUL, and the
+    // worker then exit-1'd every 60 s for hours because a bricked config
+    // has no recovery path but re-enrollment. If the `.prev` rotation
+    // parses, promote it: a slightly stale config still holds the same
+    // `agent_token`/`machine_id`, so the host rejoins on its own and the
+    // server reconciles the rest. Loud, because silently running on an
+    // older config must never look like a normal boot.
+    let prev = prev_path(path);
+    match try_load(&prev) {
+        Ok(cfg) => {
+            tracing::error!(
+                path = %path.display(),
+                recovered_from = %prev.display(),
+                error = %format!("{err:#}"),
+                "config unreadable — RECOVERED from the previous good copy; \
+                 the live file was likely truncated by an unclean shutdown"
+            );
+            // Reinstate it as the live file so the next save has a base.
+            if let Err(e) = save(path, &cfg) {
+                tracing::warn!(error = %format!("{e:#}"), "could not reinstate recovered config");
+            }
+            Ok(cfg)
+        }
+        Err(prev_err) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %format!("{err:#}"),
+                prev = %prev_path(path).display(),
+                prev_error = %format!("{prev_err:#}"),
+                "config unreadable and no usable previous copy — the host must be re-enrolled"
+            );
+            Err(err)
+        }
+    }
+}
+
+fn try_load(path: &PathBuf) -> Result<AgentConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config at {}", path.display()))?;
+    // An all-NUL file of the correct length is the signature of a power loss
+    // between `rename` and the data reaching disk. `toml` reports it as a
+    // parse error at line 1, which reads like a hand-edit typo; name it.
+    if !raw.is_empty() && raw.bytes().all(|b| b == 0) {
+        anyhow::bail!(
+            "config at {} is {} bytes of NUL (truncated by an unclean shutdown)",
+            path.display(),
+            raw.len()
+        );
+    }
     let cfg: AgentConfig =
         toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
     Ok(cfg)
@@ -1199,9 +1258,28 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
     // pid-suffixed so two PROCESSES (daemon + tray/CLI) can't collide on
     // the temp file itself; last-writer-wins on the rename is the
     // documented cross-process limitation.
+    //
+    // DURABILITY (2026-08-12): rename-atomicity alone does NOT survive
+    // power loss — it only orders the *metadata*. NTFS journals metadata
+    // but not file data, so a rename can land while the temp file's bytes
+    // are still in the page cache; the post-crash file then has the right
+    // name and the right LENGTH but is entirely NUL. That is not a
+    // hypothetical: neo16 lost power mid-save and came back with a
+    // 2995-byte all-NUL config.toml, which crash-looped the worker
+    // (exit 1 immediately after "resolved load path") until re-enrolled.
+    // `sync_all()` before the rename is what makes the guarantee real:
+    // the bytes are on disk first, so the crash window can only ever
+    // yield the OLD file or the NEW file.
     let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, serialised)
-        .with_context(|| format!("writing config temp file {}", tmp.display()))?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("creating config temp file {}", tmp.display()))?;
+        f.write_all(serialised.as_bytes())
+            .with_context(|| format!("writing config temp file {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync config temp file {}", tmp.display()))?;
+    }
 
     // Tighten permissions on Unix BEFORE the rename — the file holds a
     // bearer token, and the temp file must never be world-readable even
@@ -1214,11 +1292,31 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
         std::fs::set_permissions(&tmp, perms)?;
     }
 
+    // Rotate the outgoing file to `.prev` so `load` has something to recover
+    // from. Gated on it still parsing: a corrupt live file must never be
+    // allowed to overwrite the last known-good rotation. Best-effort — a
+    // failed rotation costs recoverability, not correctness. On Unix
+    // `fs::copy` carries the source's 0600 across, so the token stays private.
+    if try_load(path).is_ok() {
+        let _ = std::fs::copy(path, prev_path(path));
+    }
+
     std::fs::rename(&tmp, path).with_context(|| {
         // Best-effort cleanup so failed saves don't accrete temp files.
         let _ = std::fs::remove_file(&tmp);
         format!("renaming config into place at {}", path.display())
     })?;
+
+    // Make the rename itself durable. Best-effort: a failure here means the
+    // save is still correct in the page cache, so it must not fail the call.
+    // Unix only — std cannot open a directory as a File on Windows, and the
+    // temp-file `sync_all()` above is the load-bearing half regardless.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -1237,6 +1335,84 @@ fn derive_ws_url(http_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Smallest document `try_load` accepts — enough to exercise save/load.
+    fn minimal_toml() -> String {
+        r#"
+server_url = "https://roomler.ai"
+agent_token = "tok"
+agent_id = "aid"
+tenant_id = "tid"
+machine_id = "mid"
+machine_name = "neo16"
+"#
+        .to_string()
+    }
+
+    /// Locks the neo16 incident (2026-08-12): an unclean shutdown left
+    /// config.toml the right LENGTH and entirely NUL, and the worker exit-1'd
+    /// every 60 s for hours because a bricked config had no recovery path.
+    /// Two properties: the corruption is named rather than reported as a
+    /// line-1 TOML syntax error, and the `.prev` rotation heals the host.
+    #[test]
+    fn all_nul_config_is_named_and_recovered_from_the_previous_copy() {
+        let dir = std::env::temp_dir().join(format!("rmlcfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        // A good save, then a second one — the first rotates into `.prev`.
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).expect("minimal config parses");
+        save(&path, &cfg).expect("first save");
+        save(&path, &cfg).expect("second save populates .prev");
+        assert!(prev_path(&path).exists(), ".prev rotation must exist");
+
+        // Reproduce the corruption exactly: same length, all NUL.
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+
+        // Named, not "expected an equals, found an identifier at line 1".
+        let msg = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(
+            msg.contains("NUL") && msg.contains("unclean shutdown"),
+            "corruption must be named, got: {msg}"
+        );
+
+        // And the host heals instead of crash-looping.
+        let healed = load(&path).expect("must recover from .prev");
+        assert_eq!(healed.machine_name, "neo16");
+        assert_eq!(healed.agent_token, "tok");
+        // The recovered copy is reinstated, so the next boot is clean.
+        assert_eq!(
+            try_load(&path).expect("live file reinstated").machine_id,
+            "mid"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A corrupt live file must never be allowed to destroy the good rotation.
+    #[test]
+    fn rotation_refuses_to_overwrite_prev_with_a_corrupt_live_file() {
+        let dir = std::env::temp_dir().join(format!("rmlcfg2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).expect("parses");
+        save(&path, &cfg).unwrap();
+        save(&path, &cfg).unwrap();
+        let good = std::fs::read_to_string(prev_path(&path)).unwrap();
+
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        save(&path, &cfg).unwrap(); // save over the corrupt file
+
+        assert_eq!(
+            std::fs::read_to_string(prev_path(&path)).unwrap(),
+            good,
+            ".prev must still hold the last PARSEABLE config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn ws_url_from_https() {
