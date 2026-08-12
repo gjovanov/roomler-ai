@@ -151,28 +151,14 @@ pub(crate) fn shared_secret(secret: &StaticSecret, peer_public: &PublicKey) -> [
     secret.diffie_hellman(peer_public).to_bytes()
 }
 
-/// Answer a disco PING: verify it and build the pong to send back to `src`.
-/// `None` = not for us / not a ping / unknown sender / bad MAC ⇒ drop.
-///
-/// `known_peer` is consulted BEFORE any crypto so a flood of forged frames
-/// costs a map lookup, never an X25519. A pong is exactly as long as the ping
-/// ([`FRAME_LEN`]), so this can never be used as a reflection amplifier.
-///
-/// C1 answers peers this device has installed. That is also sufficient for
-/// C2's "measure a path we are not currently routing over": the PEER is
-/// installed, it is the ENDPOINT that differs.
-pub(crate) fn respond(
-    pkt: &[u8],
-    src: SocketAddr,
-    secret: &StaticSecret,
-    public: &PublicKey,
-    known_peer: impl Fn(&[u8; 32]) -> bool,
-) -> Option<Vec<u8>> {
-    match classify(pkt, src, secret, public, known_peer) {
-        Verdict::Answer(pong) => Some(pong),
-        _ => None,
-    }
-}
+// A ping-only `respond()` helper used to live here, wrapping `classify` and
+// discarding everything that was not an Answer. It has been DELETED rather
+// than kept for convenience: the device-demux seam switched on it, so every
+// PONG that arrived there was silently dropped, and any path served by that
+// socket measured `loss=100%` while carrying WG data perfectly (zeus→jupiter
+// on grox, 0 % by ping, 2026-08-12). A helper that answers half the protocol
+// is a trap for the next seam; with it gone, a caller must handle the whole
+// [`Verdict`] and the two seams cannot drift apart again.
 
 /// What a recv loop should do with a disco datagram.
 pub(crate) enum Verdict {
@@ -678,6 +664,51 @@ mod tests {
         stale.on_sent([1u8; 8]);
         stale.on_pong([9u8; 8], 5.0);
         assert_eq!(stale.rtt_ms, None);
+    }
+
+    /// A recv seam must handle BOTH directions of the protocol.
+    ///
+    /// The device demux used to switch on a ping-only `respond()` helper, so
+    /// every PONG that landed on that socket was dropped: the peer answered,
+    /// the reply arrived, the prober never saw it, and a healthy carrier read
+    /// `loss=100%` (zeus→jupiter on grox, 0 % by ping, 2026-08-12). The helper
+    /// is gone; this pins what replaced it — ONE entry point that surfaces a
+    /// ping and a pong distinguishably, so a seam cannot silently serve half.
+    #[test]
+    fn classify_surfaces_both_directions_so_no_seam_can_serve_half() {
+        let (a_s, a_p) = kp();
+        let (b_s, b_p) = kp();
+        let src: SocketAddr = "203.0.113.20:41000".parse().unwrap();
+
+        // A ping from B lands on A's seam ⇒ answerable.
+        let ping = build(
+            KIND_PING,
+            [3u8; 8],
+            b_p.as_bytes(),
+            None,
+            &shared_secret(&b_s, &a_p),
+        );
+        match classify(&ping, src, &a_s, &a_p, |_| true) {
+            Verdict::Answer(pong) => assert_eq!(pong.len(), FRAME_LEN, "reply never amplifies"),
+            _ => panic!("a verified ping must be answerable"),
+        }
+
+        // B's pong to A's round lands on the SAME seam ⇒ routable, not dropped.
+        let pong = build(
+            KIND_PONG,
+            [7u8; 8],
+            b_p.as_bytes(),
+            Some(src),
+            &shared_secret(&b_s, &a_p),
+        );
+        match classify(&pong, src, &a_s, &a_p, |_| true) {
+            Verdict::Pong(p) => {
+                assert_eq!(p.sender, *b_p.as_bytes());
+                assert_eq!(p.nonce, [7u8; 8]);
+                assert_eq!(p.src, src);
+            }
+            _ => panic!("a verified pong must be surfaced for routing"),
+        }
     }
 
     /// RTT is measured to when the pong ARRIVED, not to when the prober got
