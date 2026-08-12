@@ -866,7 +866,33 @@ fn spawn_srflx_keepalive(
                 reattach_rx,
             )))
         }
-        _ => None,
+        // NEVER return None silently. An org with no re-advert task keeps
+        // whatever endpoint its one-shot join advert published — and the
+        // server WIPES `srflx_endpoints` on every (re-)join, so if that
+        // one-shot raced the socket bind, the org is pinned to a stale or
+        // empty endpoint FOREVER. Every peer then dials a dead NAT mapping,
+        // including peers on the same LAN, while the host's own outbound
+        // works perfectly — so it presents as "that org is black-holed" with
+        // nothing in the log to explain it.
+        //
+        // Field 2026-08-12 (CORPLAP-1, dual-org): grox reachable, jovanov 100 %
+        // loss from EVERY peer; zeus aimed at :62349 while the host had
+        // rebound to :59669. Restarting only swapped which org was stale.
+        // Diagnosis cost hours precisely because this arm said nothing.
+        (punch, stun, rx) => {
+            warn!(
+                has_punch_sock = punch.is_some(),
+                has_stun_server = stun.is_some(),
+                has_stun_sink = rx.is_some(),
+                srflx_enabled = direct::srflx_enabled(),
+                keepalive_secs = secs,
+                advertised = advertised.len(),
+                "overlay: NO srflx re-advert task for this org — its endpoint \
+                 can never be refreshed after a NAT rebind; peers will keep \
+                 dialing the last advertised mapping"
+            );
+            None
+        }
     }
 }
 
@@ -1353,6 +1379,10 @@ impl OverlayRuntime {
                 prober.next_ping(&e.pubkey, &self.keypair.secret, &self.keypair.public);
             if let Some(dst) = wg.sender().send_disco_raw(&e.pubkey, &frame).await {
                 prober.sent(e.pubkey, dst, nonce);
+                // The carrier can move under us (NAT rebind, roam,
+                // re-establish). Anything we are no longer probing for this
+                // peer is stale — see `retain_path`.
+                prober.retain_path(&e.pubkey, dst);
             }
         }
         // C2.s only observable: a periodic digest. Every 60 rounds ≈ 5 min
@@ -1673,7 +1703,16 @@ impl OverlayRuntime {
         // restores it on the fresh session. Dropped when run() returns,
         // which ends the task.
         let (srflx_reattach_tx, srflx_reattach_rx) = tokio::sync::watch::channel(0u64);
+        // Which re-advert path THIS org took, and whether it got one at all.
+        // `overlay_shared_carrier=true` is supposed to mean "plane", but
+        // CORPLAP-1 had it set and produced no plane log lines whatsoever —
+        // there was no way to tell a plane-mode host from a legacy one, or a
+        // spawned forwarder from a silently-skipped one, without this.
         let mut srflx_keepalive = if let Some(plane) = &self.carrier_plane {
+            info!(
+                self_v4 = %self_v4,
+                "overlay: srflx re-advert via the carrier PLANE forwarder"
+            );
             // Multi-org v2 — the plane owns the ONE keepalive (its sockets,
             // its STUN sink); this runtime only forwards mapping changes and
             // reattach restores onto ITS control WS.
@@ -1684,6 +1723,10 @@ impl OverlayRuntime {
                 self_v4,
             )
         } else {
+            info!(
+                self_v4 = %self_v4,
+                "overlay: srflx re-advert via the LEGACY per-org keepalive (no carrier plane)"
+            );
             spawn_srflx_keepalive(
                 &direct_ctx,
                 srflx_stun_server,
@@ -1695,6 +1738,13 @@ impl OverlayRuntime {
                 srflx_reattach_rx,
             )
         };
+        if srflx_keepalive.is_none() {
+            warn!(
+                self_v4 = %self_v4,
+                "overlay: this org has NO srflx re-advert task at all — a NAT \
+                 rebind will strand every peer on a dead mapping until restart"
+            );
+        }
         // R3 — direct-plane rebuild scheduling: triggers (an addr/iface
         // event whose LAN-IP set actually changed, a resume-from-suspend, or
         // the embedder's fingerprint push) set the flag; ONE executor at the
