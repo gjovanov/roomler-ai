@@ -494,24 +494,40 @@ impl Prober {
     ///
     /// `None` until at least one path has enough rounds to judge, so a
     /// freshly-started prober says nothing rather than something misleading.
-    pub(crate) fn summary(&self) -> Option<String> {
-        let mut worst: Vec<(f64, SocketAddr, Option<f64>)> = self
+    /// `label` names the peer behind a path — pass the overlay IP. Without it
+    /// the digest is endpoint-only, and attributing a loss figure to a named
+    /// host means reverse-engineering public IPs by hand (2026-08-12: working
+    /// out which of four Hetzner addresses was mars took longer than reading
+    /// the number). The overlay IP also discriminates the ORG for free, since
+    /// each org engine logs its own line with no other marker: `100.65.4.x`
+    /// is one org's block, `100.65.0.x` the other's.
+    pub(crate) fn summary(
+        &self,
+        label: impl Fn(&[u8; 32]) -> Option<std::net::Ipv4Addr>,
+    ) -> Option<String> {
+        let mut worst: Vec<(f64, [u8; 32], SocketAddr, Option<f64>)> = self
             .paths()
             .into_iter()
-            .filter_map(|p| p.loss.map(|l| (l, p.dst, p.rtt_ms)))
+            .filter_map(|p| p.loss.map(|l| (l, p.peer, p.dst, p.rtt_ms)))
             .collect();
         if worst.is_empty() {
             return None;
         }
         let measured = worst.len();
         worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let lossy = worst.iter().filter(|(l, _, _)| *l > 0.1).count();
+        let lossy = worst.iter().filter(|(l, _, _, _)| *l > 0.1).count();
         let top: Vec<String> = worst
             .iter()
             .take(3)
-            .map(|(l, dst, rtt)| match rtt {
-                Some(r) => format!("{dst} loss={:.0}% rtt={r:.0}ms", l * 100.0),
-                None => format!("{dst} loss={:.0}% rtt=—", l * 100.0),
+            .map(|(l, peer, dst, rtt)| {
+                let who = match label(peer) {
+                    Some(ip) => format!("{ip}@{dst}"),
+                    None => format!("{dst}"),
+                };
+                match rtt {
+                    Some(r) => format!("{who} loss={:.0}% rtt={r:.0}ms", l * 100.0),
+                    None => format!("{who} loss={:.0}% rtt=—", l * 100.0),
+                }
             })
             .collect();
         Some(format!(
