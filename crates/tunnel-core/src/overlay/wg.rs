@@ -1225,6 +1225,42 @@ impl WgDevice {
 
         let stats = Arc::new(PeerStats::default());
 
+        // Multi-org v2 — register this session on the plane's receiver-index
+        // demux even though it is NOT a direct install.
+        //
+        // Only `add_direct_peer` used to register, so a peer installed on a
+        // RELAY carrier had a live session whose receiver index the plane did
+        // not know. When the FAR end held a direct carrier and sent WG data
+        // straight to the shared socket, `route_by_index` found nothing and
+        // dropped it — silently, pre-decrypt. Carriers are negotiated per
+        // side, so this asymmetry is normal, not exotic.
+        //
+        // Field 2026-08-12 (pc50045, dual-org): the org whose peers sat on
+        // relay was unreachable inbound from EVERY peer while the other org
+        // was fine, and a restart flipped which one — whichever org happened
+        // to get direct on both ends won. Its carrier socket rx climbed the
+        // whole time (packets arriving) while its TUN rx stayed at idle
+        // (nothing decrypted), and disco kept answering at 39 ms because disco
+        // is demuxed by SHAPE before WG and needs no route at all.
+        //
+        // `expected_src` is UNSPECIFIED: a relay session has no direct source
+        // to expect, so the first authenticated direct inbound takes the A3
+        // roam path, which commits only after the payload authenticates and
+        // then repoints the carrier in place. Strictly additive — these
+        // datagrams were dropped before. Indices are unique process-wide
+        // (`index_alloc`, locked by a test), so this cannot capture another
+        // engine's traffic.
+        if let Some(h) = &self.plane {
+            let ingress = self.ingress_for(peer_public, stats.clone());
+            h.register_route(
+                index,
+                tunn.clone(),
+                ingress,
+                SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                Arc::downgrade(&carrier),
+            );
+        }
+
         // recv task: carrier → decapsulate → tun / network echo.
         let recv_tunn = tunn.clone();
         let recv_carrier = carrier.clone();

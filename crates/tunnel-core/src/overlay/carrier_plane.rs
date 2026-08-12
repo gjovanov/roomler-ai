@@ -155,6 +155,11 @@ struct PlaneState {
     /// on that session's `Tunn`. Keyed by `(engine, src)` — the same remote
     /// `ip:port` legitimately appears once per org.
     by_src: HashMap<(u64, SocketAddr), u32>,
+    /// Throttle for the unregistered-receiver-index WARN (see
+    /// [`CarrierPlane::route_by_index`]). Plane-wide, not per index: the
+    /// point is to surface the CONDITION, and a junk flood must not become a
+    /// log flood.
+    last_unknown_idx_log: Option<Instant>,
     binds: Option<PlaneBinds>,
     next_engine_id: u64,
     /// Demux-routed STUN Binding responses (the plane twin of the device's
@@ -211,6 +216,7 @@ impl CarrierPlane {
                 engines: Vec::new(),
                 routes: HashMap::new(),
                 by_src: HashMap::new(),
+                last_unknown_idx_log: None,
                 binds: None,
                 next_engine_id: 1,
                 stun_tx,
@@ -663,7 +669,32 @@ impl CarrierPlane {
                 );
                 Routed::Drop
             }
-            None => Routed::Drop,
+            None => {
+                // An authenticated-looking session datagram for an index no
+                // engine registered. This was a bare `Drop` with NO log, and
+                // that silence is what made the 2026-08-12 pc50045 outage take
+                // a day: packets arrived on the carrier socket, nothing
+                // reached any TUN, and every layer above reported health.
+                //
+                // Throttled hard — a junk flood must not become a log flood.
+                let now = Instant::now();
+                if st
+                    .last_unknown_idx_log
+                    .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_secs(10))
+                {
+                    st.last_unknown_idx_log = Some(now);
+                    let registered = st.routes.len();
+                    warn!(
+                        idx,
+                        %src,
+                        registered,
+                        "carrier plane: session datagram for an UNREGISTERED receiver index — \
+                         dropped pre-decrypt. A peer installed on a relay carrier whose far end \
+                         dials us directly looks exactly like this."
+                    );
+                }
+                Routed::Drop
+            }
         }
     }
 
@@ -1373,6 +1404,59 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc::Receiver;
     use tokio::time::timeout;
+
+    /// A peer installed on a RELAY carrier must still be reachable by
+    /// receiver index on the plane.
+    ///
+    /// Only `add_direct_peer` used to register a plane route, so a
+    /// relay-installed session had a live index the plane did not know. When
+    /// the far end held a DIRECT carrier and dialled the shared socket,
+    /// `route_by_index` returned `None` and the datagram was dropped
+    /// pre-decrypt — silently. Carriers are negotiated per side, so that
+    /// asymmetry is routine.
+    ///
+    /// Field 2026-08-12 (pc50045, dual-org): the org whose peers sat on relay
+    /// was unreachable inbound from EVERY peer, its socket rx climbing while
+    /// its TUN rx stayed at idle; a restart only changed WHICH org lost.
+    #[tokio::test]
+    async fn add_peer_registers_a_plane_route_so_relay_sessions_are_reachable() {
+        let plane = CarrierPlane::new();
+        let (tx_e, _rx_e) = mpsc::channel(8);
+        let (tx_t, _rx_t) = mpsc::channel(8);
+        let kp = WgKeypair::generate();
+        let peer = WgKeypair::generate();
+
+        let mut dev = WgDevice::new(kp.secret.clone()).0;
+        dev.set_plane(plane.attach(EngineHooks {
+            secret: kp.secret.clone(),
+            public: kp.public,
+            send: dev.sender(),
+            disco_events: mpsc::channel(1).0,
+            direct_events: tx_e,
+            tun_tx: tx_t,
+        }));
+
+        // Install via `add_peer` — the generic path relay carriers take.
+        // Carrier KIND is irrelevant to the invariant: what matters is that
+        // this entry point registers an index route at all.
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let carrier = Carrier::direct(sock, "127.0.0.1:9".parse().unwrap());
+        dev.add_peer(
+            *peer.public.as_bytes(),
+            Ipv4Addr::new(100, 65, 4, 28),
+            carrier,
+            false,
+        );
+
+        // The session must be in the plane's index table, or authenticated
+        // direct inbound for it has nowhere to go.
+        let st = plane.lock();
+        assert_eq!(
+            st.routes.len(),
+            1,
+            "a relay-installed session must register a plane route"
+        );
+    }
 
     /// Minimal well-formed IPv4 packet (version nibble + total length + dst),
     /// the same shape the wg two-device tests use.
