@@ -1785,6 +1785,23 @@ impl WgDevice {
         }
     }
 
+    /// Did an MBB upgrade probe hear ANYTHING back from the far end?
+    ///
+    /// Non-draining, unlike `peer_take_rx_any` (single-consumer, owned by the
+    /// health sweep). This is the field that splits a probe failure into the
+    /// two cases that imply DIFFERENT fixes: nothing heard ⇒ the two ends'
+    /// probe windows are not aligned; something heard but no session ⇒ the
+    /// handshake deadline is too tight. `did not handshake within deadline`
+    /// alone cannot tell them apart, which is why a 4.7-minute convergence on
+    /// a 4 ms LAN path could not be explained from the log (2026-08-13).
+    pub fn probe_saw_inbound(&self, peer_public: &[u8; 32]) -> bool {
+        self.probes.get(peer_public).is_some_and(|p| {
+            p.stats.rx_any.load(Ordering::Relaxed) > 0
+                || p.stats.rx.load(Ordering::Relaxed) > 0
+                || p.stats.handshake.load(Ordering::Relaxed)
+        })
+    }
+
     /// Test-only: latch a probe's handshake-done flag without a live two-device
     /// session (mirrors [`test_latch_handshake_done`] for the shadow map).
     #[cfg(test)]
