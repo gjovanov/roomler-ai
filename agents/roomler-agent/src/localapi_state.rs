@@ -1061,6 +1061,9 @@ mod tests {
                 agent_id: None,
                 relay_local: Some("94.130.141.74:10850".into()),
                 relay_dst: Some("5.9.157.226:12728".into()),
+                relay_kind: None,
+                relay_transport: None,
+                relay_server: None,
                 debug: None,
             }],
             exit_node: None,
@@ -1353,6 +1356,9 @@ mod tests {
                 agent_id: agent.map(|s| s.into()),
                 relay_local: None,
                 relay_dst: None,
+                relay_kind: None,
+                relay_transport: None,
+                relay_server: None,
                 debug: None,
             }
         }
