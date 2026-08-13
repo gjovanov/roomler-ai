@@ -710,6 +710,26 @@ fn connection_label(c: ConnectionType) -> &'static str {
     }
 }
 
+/// `relay` qualified with WHICH relay and HOW it is reached —
+/// `relay:turn/udp`, `relay:derp/tcp`, or plain `relay` when the daemon is
+/// older than the fields (they are `#[serde(default)]`).
+///
+/// A bare `relay` could not distinguish a ~50 ms coturn/UDP hop from a
+/// ~175 ms DERP/TCP one, nor a healthy PoP from a DEAD one: on 2026-08-12 a
+/// coturn worker was down for 90 minutes while agents crash-looped and this
+/// column said only "relay". Non-relay rows are unchanged.
+fn relay_qualified_label(p: &PeerInfo) -> String {
+    let base = connection_label(p.connection);
+    if !matches!(p.connection, ConnectionType::Relay) {
+        return base.to_string();
+    }
+    match (p.relay_kind.as_deref(), p.relay_transport.as_deref()) {
+        (Some(k), Some(t)) => format!("{base}:{k}/{t}"),
+        (Some(k), None) => format!("{base}:{k}"),
+        _ => base.to_string(),
+    }
+}
+
 /// Render an optional `Display` value, falling back to the em-dash.
 fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
     match v {
@@ -792,10 +812,10 @@ fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
         } else if p.upgrading && matches!(p.connection, ConnectionType::Relay) {
             "upgrading".to_string()
         } else {
-            connection_label(p.connection).to_string()
+            relay_qualified_label(p)
         };
     format!(
-        "{} {:<20} {:<16} {:<26} {:<9} {:>7} {}",
+        "{} {:<20} {:<16} {:<26} {:<15} {:>7} {}",
         up_glyph(p.online),
         name,
         opt(p.overlay_ip.as_deref()),
@@ -947,7 +967,7 @@ fn print_status(s: &NodeStatus) {
 
 fn print_peers(peers: &[PeerInfo], now_ms: u64) {
     println!(
-        "  {:<20} {:<16} {:<26} {:<9} {:>7} LAST SEEN",
+        "  {:<20} {:<16} {:<26} {:<15} {:>7} LAST SEEN",
         "NAME", "OVERLAY IP", "OVERLAY IP6", "CONN", "RTT"
     );
     if peers.is_empty() {
@@ -1082,8 +1102,41 @@ mod tests {
             agent_id: None,
             relay_local: None,
             relay_dst: None,
+            relay_kind: None,
+            relay_transport: None,
+            relay_server: None,
             debug: None,
         }
+    }
+
+    /// A relayed peer must say WHICH relay and HOW — a bare `relay` hid a dead
+    /// coturn PoP for 90 minutes on 2026-08-12, and makes a ~50 ms UDP hop
+    /// indistinguishable from a ~175 ms DERP/TCP one.
+    #[test]
+    fn relay_rows_name_the_relay_kind_and_transport() {
+        let mut p = peer("zeus", "");
+        p.connection = ConnectionType::Relay;
+
+        p.relay_kind = Some("turn".into());
+        p.relay_transport = Some("udp".into());
+        assert_eq!(relay_qualified_label(&p), "relay:turn/udp");
+
+        p.relay_kind = Some("derp".into());
+        p.relay_transport = Some("tcp".into());
+        assert_eq!(relay_qualified_label(&p), "relay:derp/tcp");
+
+        // Older daemon: the fields are `#[serde(default)]`, so the row must
+        // degrade to the historical word rather than render "relay:".
+        p.relay_kind = None;
+        p.relay_transport = None;
+        assert_eq!(relay_qualified_label(&p), "relay");
+
+        // A DIRECT peer never carries a relay qualifier, even if stale fields
+        // linger in the payload.
+        let mut d = peer("mars", "");
+        d.relay_kind = Some("turn".into());
+        d.relay_transport = Some("udp".into());
+        assert_eq!(relay_qualified_label(&d), "direct");
     }
 
     /// Single-org (every row unlabelled) must render as ONE unheaded group —
@@ -1211,6 +1264,9 @@ mod tests {
             agent_id: None,
             relay_local: None,
             relay_dst: None,
+            relay_kind: None,
+            relay_transport: None,
+            relay_server: None,
             debug: None,
         };
         let row = fmt_peer_row(&online, now);
@@ -1237,6 +1293,9 @@ mod tests {
             agent_id: None,
             relay_local: None,
             relay_dst: None,
+            relay_kind: None,
+            relay_transport: None,
+            relay_server: None,
             debug: None,
         };
         let row = fmt_peer_row(&offline, now);
@@ -1263,6 +1322,9 @@ mod tests {
             agent_id: None,
             relay_local: None,
             relay_dst: None,
+            relay_kind: None,
+            relay_transport: None,
+            relay_server: None,
             debug: None,
         };
         let row = fmt_peer_row(&p, now);
@@ -1292,6 +1354,9 @@ mod tests {
             agent_id: None,
             relay_local: None,
             relay_dst: None,
+            relay_kind: None,
+            relay_transport: None,
+            relay_server: None,
             debug: None,
         };
         assert!(fmt_peer_row(&p, now).contains("stalled"));
