@@ -1124,6 +1124,10 @@ fn build_overlay_view(
     probing: &HashMap<ObjectId, UpgradeProbe>,
     now: Instant,
     epoch_now_ms: u64,
+    // Transport half of the relay label, keyed by peer pubkey. The KIND lives
+    // on `Installed`; only the carrier knows udp-vs-tcp and which PoP served
+    // the allocation, and this fn has no carrier access. Empty in tests.
+    relay_transport: &HashMap<[u8; 32], (crate::transport::relay::RelayTransport, Option<String>)>,
 ) -> OverlayView {
     let mut peers: Vec<PeerInfo> = current_peers
         .values()
@@ -1168,6 +1172,18 @@ fn build_overlay_view(
                 // shows each end's coturn worker; same IP on both = same-worker.
                 relay_local: inst.and_then(|i| i.relay_local).map(|a| a.to_string()),
                 relay_dst: inst.and_then(|i| i.relay_dst).map(|a| a.to_string()),
+                // Promote the relay label out of the JSON-only `debug` block:
+                // the human table showed a bare `relay` for both a coturn hop
+                // and a DERP one, so a dead PoP was invisible there.
+                relay_kind: inst
+                    .and_then(|i| i.relay_kind)
+                    .map(|k| k.as_str().to_string()),
+                relay_transport: inst
+                    .and_then(|i| relay_transport.get(&i.pubkey))
+                    .map(|(t, _)| t.as_str().to_string()),
+                relay_server: inst
+                    .and_then(|i| relay_transport.get(&i.pubkey))
+                    .and_then(|(_, s)| s.clone()),
                 // rc.276 diagnostics — the carrier forensic snapshot (JSON-only).
                 debug: inst.map(|i| PeerCarrierDebug {
                     tier: match i.tier {
@@ -1433,8 +1449,29 @@ impl OverlayRuntime {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let mut view =
-                build_overlay_view(self_ip, by_node, current_peers, probing, now, epoch_now_ms);
+            // Carrier-side half of the relay label; the view builder is pure
+            // over peers and has no `wg` access of its own.
+            let relay_transport: HashMap<
+                [u8; 32],
+                (crate::transport::relay::RelayTransport, Option<String>),
+            > = by_node
+                .values()
+                .filter(|i| !i.is_direct)
+                .filter_map(|i| {
+                    wg.sender()
+                        .relay_transport_info(&i.pubkey)
+                        .map(|info| (i.pubkey, info))
+                })
+                .collect();
+            let mut view = build_overlay_view(
+                self_ip,
+                by_node,
+                current_peers,
+                probing,
+                now,
+                epoch_now_ms,
+                &relay_transport,
+            );
             // S4 — the exit-node routing status the runtime holds (the view
             // builder is pure over peers, so this is grafted on after).
             view.exit_node = exit_status;
@@ -5057,7 +5094,15 @@ mod tests {
         probes.insert(r, dummy_probe());
         probes.insert(d, dummy_probe());
 
-        let view = build_overlay_view("100.64.0.9", &by_node, &current, &probes, now, epoch_now_ms);
+        let view = build_overlay_view(
+            "100.64.0.9",
+            &by_node,
+            &current,
+            &probes,
+            now,
+            epoch_now_ms,
+            &Default::default(),
+        );
         assert_eq!(view.self_ip.as_deref(), Some("100.64.0.9"));
         assert_eq!(view.peers.len(), 4);
         assert!(

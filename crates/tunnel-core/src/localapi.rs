@@ -302,6 +302,23 @@ pub struct PeerInfo {
     /// pre-rc.275 daemon ⇒ `false` (wire-compatible both ways).
     #[serde(default)]
     pub stalled: bool,
+    /// Which relay this peer's carrier rides, when relayed: `turn` | `derp`.
+    ///
+    /// A bare `relay` in the CONN column could not distinguish a 52 ms coturn
+    /// hop from a 175 ms DERP one, nor a healthy PoP from a DEAD one — on
+    /// 2026-08-12 a coturn worker was down for 90 minutes while agents
+    /// crash-looped and this column said only "relay". Empty for direct peers
+    /// and for daemons older than the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_kind: Option<String>,
+    /// How that relay is reached: `udp` | `tcp`. Load-bearing for latency
+    /// expectations, and for corporate paths where only 443/TCP survives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_transport: Option<String>,
+    /// The relay server / PoP, when the carrier knows it (`host:port`). This
+    /// is what you would check `kubectl -n coturn get pods` against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1873,6 +1890,9 @@ mod tests {
                     agent_id: Some("6a074fe5ef3ba556ab041966".into()),
                     relay_local: Some("94.130.141.74:10850".into()),
                     relay_dst: Some("5.9.157.226:12728".into()),
+                    relay_kind: None,
+                    relay_transport: None,
+                    relay_server: None,
                     debug: None,
                 },
                 PeerInfo {
@@ -1890,6 +1910,9 @@ mod tests {
                     agent_id: None,
                     relay_local: None,
                     relay_dst: None,
+                    relay_kind: None,
+                    relay_transport: None,
+                    relay_server: None,
                     debug: None,
                 },
             ]
