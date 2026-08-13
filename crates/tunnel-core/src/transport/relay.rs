@@ -62,6 +62,42 @@ pub trait RelayConn: Send + Sync + 'static {
     /// TURN conn) — what quinn reports as its `local_addr` and what the
     /// peer dials.
     fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// How this relay leg is reached — operator-facing.
+    ///
+    /// `roomler peers` printed a bare `relay` for every relayed carrier, so a
+    /// 52 ms coturn/UDP hop and a 175 ms DERP/TCP hop were indistinguishable.
+    /// The relay *kind* is an overlay-layer decision and already exists as
+    /// [`crate::overlay::relay_link::RelayKind`]; only the transport is a
+    /// transport-layer fact, so only it lives here. Defaulted so test doubles
+    /// and future impls need not care.
+    fn relay_transport(&self) -> RelayTransport {
+        RelayTransport::Udp
+    }
+    /// The relay server / PoP this leg goes through, when known — the thing
+    /// you would check `kubectl -n coturn get pods` for.
+    fn relay_server(&self) -> Option<String> {
+        None
+    }
+}
+
+/// How a relay leg is reached. Load-bearing for latency expectations and for
+/// corporate paths, where only 443 survives. Orthogonal to
+/// [`crate::overlay::relay_link::RelayKind`]: DERP is always TCP/WS, a coturn
+/// allocation can be either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayTransport {
+    Udp,
+    Tcp,
+}
+
+impl RelayTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelayTransport::Udp => "udp",
+            RelayTransport::Tcp => "tcp",
+        }
+    }
 }
 
 /// Max datagram we'll relay. QUIC keeps datagrams ≤ the path MTU
@@ -232,6 +268,11 @@ impl AsyncUdpSocket for RelayUdpSocket {
 /// stay alive for the relay's lifetime — dropping the client tears the
 /// allocation down.
 pub struct TurnRelayConn {
+    /// How this allocation was reached (udp `turn:` vs tcp/tls `turns:`) and
+    /// which PoP served it — surfaced in `roomler peers` so a dead relay is
+    /// distinguishable from a healthy one.
+    transport: RelayTransport,
+    server: String,
     /// Kept alive on purpose: the client's `listen()` task is what feeds
     /// `relay`'s `recv_from`. Never touched after construction; dropping
     /// it closes the allocation on coturn.
@@ -252,6 +293,13 @@ impl fmt::Debug for TurnRelayConn {
 
 #[async_trait]
 impl RelayConn for TurnRelayConn {
+    fn relay_transport(&self) -> RelayTransport {
+        self.transport
+    }
+    fn relay_server(&self) -> Option<String> {
+        Some(self.server.clone())
+    }
+
     async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
         self.relay.send_to(buf, dst).await.map_err(util_to_io)
     }
@@ -338,6 +386,8 @@ pub async fn allocate_turn_relay(
     tracing::info!(%turn_server, %relayed_addr, "TURN allocation established");
 
     Ok(TurnRelayConn {
+        transport: RelayTransport::Udp,
+        server: turn_server.to_string(),
         _client: client,
         relay: Arc::new(relay),
         relayed_addr,
@@ -680,6 +730,8 @@ pub async fn allocate_turn_relay_tls(
     tracing::info!(%host, port, %relayed_addr, "TURNS/TCP TURN allocation established");
 
     Ok(TurnRelayConn {
+        transport: RelayTransport::Tcp,
+        server: format!("{host}:{port}"),
         _client: client,
         relay: Arc::new(relay),
         relayed_addr,

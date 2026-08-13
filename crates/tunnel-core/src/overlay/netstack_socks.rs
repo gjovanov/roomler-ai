@@ -333,6 +333,9 @@ mod tests {
             agent_id: None,
             relay_local: None,
             relay_dst: None,
+            relay_kind: None,
+            relay_transport: None,
+            relay_server: None,
             debug: None,
         }
     }

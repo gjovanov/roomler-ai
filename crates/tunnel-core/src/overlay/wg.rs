@@ -146,6 +146,27 @@ impl Carrier {
         })
     }
 
+    /// How this carrier's relay leg is reached, `None` when it is direct.
+    ///
+    /// `(transport, server)` — e.g. `(Udp, Some("5.9.157.221:3478"))`. The
+    /// relay KIND (turn/derp) is an overlay decision already carried by
+    /// `Installed::relay_kind`; this adds the transport-layer half so
+    /// `roomler peers` can print `relay:turn/udp` rather than a bare `relay`
+    /// — a 52 ms coturn/UDP hop and a 175 ms DERP/TCP hop used to look
+    /// identical, as did a healthy PoP and a dead one (2026-08-12: a coturn
+    /// worker was down 90 min while this column said nothing).
+    pub fn relay_transport_info(
+        &self,
+    ) -> Option<(crate::transport::relay::RelayTransport, Option<String>)> {
+        match self {
+            Carrier::Relay { conn, .. } => Some((conn.relay_transport(), conn.relay_server())),
+            // QUIC rides a coturn allocation; the QUIC framing is the payload,
+            // the relay underneath is still TURN-over-UDP.
+            Carrier::QuicRelay { .. } => Some((crate::transport::relay::RelayTransport::Udp, None)),
+            Carrier::Direct { .. } => None,
+        }
+    }
+
     /// A3 — the current direct dst, `None` for relay/QUIC carriers.
     pub fn direct_dst(&self) -> Option<SocketAddr> {
         match self {
@@ -747,6 +768,16 @@ impl WgSender {
             _ => return None,
         };
         sock.send_to(bytes, dst).await.ok().map(|_| dst)
+    }
+
+    /// The relay transport + server for `pk`'s carrier, `None` when direct or
+    /// unknown. Reads the same send-side mirror `send_disco_raw` uses.
+    pub(crate) fn relay_transport_info(
+        &self,
+        peer_public: &[u8; 32],
+    ) -> Option<(crate::transport::relay::RelayTransport, Option<String>)> {
+        let g = self.0.read().unwrap();
+        g.peers.get(peer_public)?.carrier.relay_transport_info()
     }
 
     /// C1 (disco) — is `pk` an installed peer? Reuses the send-side mirror

@@ -95,6 +95,14 @@ impl DerpConn {
 
 #[async_trait]
 impl RelayConn for DerpConn {
+    // DERP is always the server's `/derp` WebSocket, i.e. TCP — which is why
+    // it reads slower than a coturn UDP hop and why the two must not both
+    // print a bare "relay". The mux owns the URL, not the per-peer conn, so
+    // `relay_server` stays `None` here rather than guessing.
+    fn relay_transport(&self) -> crate::transport::relay::RelayTransport {
+        crate::transport::relay::RelayTransport::Tcp
+    }
+
     async fn send_to(&self, buf: &[u8], _dst: SocketAddr) -> io::Result<usize> {
         if !self.alive.load(Ordering::Relaxed) {
             return Err(io::Error::new(
