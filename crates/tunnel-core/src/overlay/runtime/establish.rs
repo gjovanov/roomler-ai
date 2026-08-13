@@ -1642,8 +1642,13 @@ impl OverlayRuntime {
                     tun.add_peer_route(p.overlay_ip).await.ok();
                     // PR-E — the latch already cleared the tier's strikes in
                     // the monitor (`on_probe_result(Latched)`, fed above).
+                    // `probe_ms` is how long THIS probe took to latch; paired
+                    // with the `waited_ms` on each preceding failure it gives
+                    // total time-to-converge without timestamp arithmetic —
+                    // the metric any cadence tuning has to move.
                     info!(
                         peer = %nid, overlay_ip = %p.overlay_ip, tier = ?p.tier,
+                        probe_ms = now.saturating_duration_since(p.since).as_millis() as u64,
                         "overlay: make-before-break — direct carrier promoted (relay held throughout; zero stall)"
                     );
                 } else {
@@ -1668,6 +1673,20 @@ impl OverlayRuntime {
                         .on_probe_result(nid, p.tier, path::ProbeOutcome::Expired, mbb, now);
                     s.assert_ineligible(nid, p.tier, now);
                 });
+                // Read the probe's counters BEFORE dropping it: this is the
+                // only moment the answer exists.
+                //
+                // `saw_inbound` splits a failure into the two cases that imply
+                // DIFFERENT fixes, which the bare "did not handshake" line
+                // could not distinguish:
+                //   false ⇒ nothing came back at all — the two ends' probe
+                //           windows are not aligned (a cadence/phase problem);
+                //   true  ⇒ the far end answered but no session latched — the
+                //           handshake deadline is too tight for this path.
+                // Field 2026-08-13: pc50045 took 4 attempts / ~4.7 min to
+                // promote a 4 ms LAN path and the log could not say which.
+                let saw_inbound = wg.probe_saw_inbound(&p.pubkey);
+                let waited_ms = now.saturating_duration_since(p.since).as_millis() as u64;
                 wg.drop_direct_probe(&p.pubkey).await;
                 let tier_name = match p.tier {
                     DirectTier::Srflx => "srflx",
@@ -1675,7 +1694,7 @@ impl OverlayRuntime {
                     _ => "LAN",
                 };
                 info!(
-                    peer = %nid, tier = tier_name,
+                    peer = %nid, tier = tier_name, dst = %p.dst, waited_ms, saw_inbound,
                     "overlay: make-before-break — direct probe did not handshake within deadline; kept relay (no stall)"
                 );
                 settled.push(*nid);
