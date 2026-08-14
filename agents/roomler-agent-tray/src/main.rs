@@ -13,9 +13,9 @@
 //! Architecture:
 //! - The desktop app is a **thin client**: live node/peer/flow/route
 //!   state comes from the running daemon over the LocalAPI
-//!   (`tunnel_core::localapi::Client`); consent decisions go the same
+//!   (`roomler_localapi::Client`); consent decisions go the same
 //!   way (P2b — the daemon owns the profile-correct sentinel dir).
-//! - Enrollment goes through `roomler_agent::enrollment::enroll` as a
+//! - Enrollment goes through `roomler_agent_core::enrollment::enroll` as a
 //!   direct lib call (no subprocess).
 //! - Service control / self-update shell out to the daemon CLI
 //!   (`roomlerd service install`, `roomlerd self-update`).
@@ -151,7 +151,7 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
     let mut seen: HashSet<String> = HashSet::new();
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        let current: HashSet<String> = match tunnel_core::localapi::connect().await {
+        let current: HashSet<String> = match roomler_localapi::connect().await {
             Ok(mut c) => c
                 .consent_pending()
                 .await

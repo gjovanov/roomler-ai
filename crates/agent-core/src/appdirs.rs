@@ -89,6 +89,17 @@ pub fn machine_global_dir() -> PathBuf {
         .clone()
 }
 
+/// The SCM-service log directory (`%PROGRAMDATA%\roomler\<segment>\service-logs`).
+///
+/// P3e lever E: canonical home for the path both sides need — the daemon's
+/// `win_service::default_log_dir` delegates here, and the desktop companion
+/// resolves the same directory to show/open SCM logs without linking the
+/// daemon. Windows-only like [`machine_global_dir`].
+#[cfg(target_os = "windows")]
+pub fn service_log_dir() -> PathBuf {
+    machine_global_dir().join("service-logs")
+}
+
 // ─── S1b: one-shot legacy-tree migration ───────────────────────────────────
 
 /// Notes from the last [`migrate_legacy_trees`] run — logged by the caller
