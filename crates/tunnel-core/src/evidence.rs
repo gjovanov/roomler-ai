@@ -42,6 +42,19 @@ pub static ROAM_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 /// (every node nonzero before any prober ships).
 pub static DISCO_ANSWERED: AtomicU64 = AtomicU64::new(0);
 
+/// C2 (disco) — verified PONGs dropped because the owning engine's sink was
+/// full. Every drop reads as LOSS in that engine's per-path table upstream
+/// (the exact silent seam the 2026-08-12 half-protocol incident hid in), so
+/// a nonzero here re-frames a bad loss number as backpressure, not path
+/// quality.
+pub static DISCO_PONG_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Authenticated/limiter-passed handshake initiations dropped because the
+/// engine's accept channel (`direct_events`, depth 16) was full. Each drop
+/// costs the initiating peer a ~5 s retransmit; a burst here during a
+/// churn storm explains "slow re-establish" without blaming the network.
+pub static DIRECT_INBOUND_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// One relaxed snapshot of all three, in declaration order.
 pub fn snapshot() -> (u64, u64, u64) {
     (
