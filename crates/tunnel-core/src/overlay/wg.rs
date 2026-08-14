@@ -2523,11 +2523,17 @@ async fn run_direct_demux(
                     .is_none_or(|t| t.elapsed() >= UNKNOWN_INIT_MIN_INTERVAL);
                 if fresh && recent_unknown.len() < UNKNOWN_INIT_MAX_SOURCES {
                     recent_unknown.insert(src, Instant::now());
-                    let _ = events.try_send(DirectInbound {
-                        src,
-                        sock: sock.clone(),
-                        packet: buf[..n].to_vec(),
-                    });
+                    if events
+                        .try_send(DirectInbound {
+                            src,
+                            sock: sock.clone(),
+                            packet: buf[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        crate::evidence::DIRECT_INBOUND_DROPS.fetch_add(1, Ordering::Relaxed);
+                        debug!(%src, "wg demux: accept channel full — initiation dropped");
+                    }
                 }
             }
             continue;

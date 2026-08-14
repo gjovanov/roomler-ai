@@ -666,11 +666,20 @@ impl CarrierPlane {
                 }
             }
             Routed::ForwardInit(tx) => {
-                let _ = tx.try_send(DirectInbound {
-                    src,
-                    sock: sock.clone(),
-                    packet: buf[..n].to_vec(),
-                });
+                if tx
+                    .try_send(DirectInbound {
+                        src,
+                        sock: sock.clone(),
+                        packet: buf[..n].to_vec(),
+                    })
+                    .is_err()
+                {
+                    // Depth-16 channel full — the peer retries in ~5 s;
+                    // count it so a churn storm's slow re-establish is
+                    // attributable (LOG-every-silent-drop).
+                    crate::evidence::DIRECT_INBOUND_DROPS.fetch_add(1, Ordering::Relaxed);
+                    debug!(%src, "carrier plane: accept channel full — initiation dropped");
+                }
             }
             Routed::Drop => {}
         }
@@ -901,7 +910,12 @@ impl CarrierPlane {
                 // The engine that authenticated it is the engine that probed
                 // it: deliver there and nowhere else.
                 super::disco::Verdict::Pong(p) => {
-                    let _ = sink.try_send(p);
+                    if sink.try_send(p).is_err() {
+                        // A dropped verified pong reads as LOSS in the
+                        // owner's per-path table — count it so a bad loss
+                        // number can be re-framed as backpressure.
+                        crate::evidence::DISCO_PONG_DROPS.fetch_add(1, Ordering::Relaxed);
+                    }
                     return None;
                 }
             }
@@ -1531,7 +1545,18 @@ impl CarrierPlane {
             st.rebuilding = false;
             st.last_rebuild = Some(Instant::now());
             for s in &st.subscribers {
-                let _ = s.try_send(PlaneEvent::Ready);
+                // A dropped Ready means that org NEVER re-establishes after
+                // this plane-wide rebuild — Teardown has an ack + straggler
+                // timeout, but Ready was fire-and-forget-and-silent. WARN,
+                // don't upgrade to a retry loop here: the subscriber channel
+                // going unserviced is a runtime-loop failure the org's own
+                // watchdogs surface; the missing piece was the breadcrumb.
+                if s.try_send(PlaneEvent::Ready).is_err() {
+                    warn!(
+                        "carrier plane: PlaneEvent::Ready DROPPED (subscriber channel \
+                         full/closed) — that org will not re-establish after this rebuild"
+                    );
+                }
             }
         }
     }
