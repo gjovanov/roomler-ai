@@ -1194,7 +1194,6 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// `%PROGRAMDATA%` can't be resolved (it always can on a sane
 /// Windows install; the `C:\ProgramData` literal is the documented
 /// fallback used elsewhere in the crate).
-#[cfg(target_os = "windows")]
 /// W4(c) — restrict the machine-global config directory to SYSTEM +
 /// Administrators, inheritance OFF, applied to existing children (`/T`).
 /// SIDs, not names, so it survives localized Windows (this fleet runs
@@ -1233,6 +1232,7 @@ fn harden_machine_global_dir(dir: &std::path::Path) {
     }
 }
 
+#[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
     crate::appdirs::machine_global_dir().join("config.toml")
 }
