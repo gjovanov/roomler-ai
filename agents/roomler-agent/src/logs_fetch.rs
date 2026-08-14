@@ -357,6 +357,8 @@ mod tests {
     // field smoke + the browser-side parser tests.
 
     #[test]
+    // Compile-time contract lock — the constant-ness IS the point.
+    #[allow(clippy::assertions_on_constants)]
     fn mono_threshold_safely_under_sctp_boundary() {
         // SCTP max_message_size default is 65536. MONO_THRESHOLD_BYTES
         // must leave room for `{"t":"rc:logs-fetch.reply","ok":true,
@@ -367,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn chunk_bytes_safely_under_sctp_boundary() {
         // Each chunk envelope = ~60 B overhead + CHUNK_BYTES of
         // line text. Total serialised < 65536 by a comfortable
@@ -375,6 +378,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn mono_threshold_is_below_chunk_budget() {
         // Single-envelope path takes precedence over chunked when
         // payload fits — MONO_THRESHOLD ≤ CHUNK_BYTES so we never
