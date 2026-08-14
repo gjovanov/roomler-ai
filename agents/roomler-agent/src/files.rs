@@ -1968,6 +1968,16 @@ fn download_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Serializes every test that mutates the process-global HOME /
+    /// USERPROFILE (`begin()` resolves the Downloads dir through them, and
+    /// tests run in parallel threads). Without this the mutations race:
+    /// `round_trip_begin_chunk_end` resolved its destination inside
+    /// `concurrent_upload_and_download…`'s hijacked HOME and failed on the
+    /// final rename (flake observed 2026-08-14 under full-suite
+    /// parallelism). tokio Mutex, not std: the guard is held across the
+    /// tests' awaits by design.
+    static HOME_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn sanitize_strips_path_components() {
         assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
@@ -2130,6 +2140,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_with_dest_path_lands_in_dest() {
+        let _env = HOME_ENV_LOCK.lock().await;
         // End-to-end: a `begin` call with dest_path should produce a
         // path under the dest dir, not under Downloads.
         let base = std::env::temp_dir().join(format!(
@@ -2625,6 +2636,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_upload_and_download_do_not_contend() {
+        let _env = HOME_ENV_LOCK.lock().await;
         // Critique #2 in the plan said an in-flight upload should
         // not block a concurrent download (and vice versa). Locks
         // the invariant: incoming + outgoing each have their own
@@ -2734,6 +2746,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_begin_chunk_end() {
+        let _env = HOME_ENV_LOCK.lock().await;
         let h = FilesHandler::new();
         let tmp = tempdir_or_skip().await;
         // Override the download-dir resolver by ensuring the sanitized
