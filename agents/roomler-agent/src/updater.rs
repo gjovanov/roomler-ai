@@ -2378,6 +2378,8 @@ mod tests {
     }
 
     #[test]
+    // Compile-time contract lock — the constant-ness IS the point.
+    #[allow(clippy::assertions_on_constants)]
     fn defer_constants_have_sensible_values() {
         // TRANSFER_DEFER_RECHECK should be shorter than CHECK_INTERVAL
         // (the whole point — react faster when uploads finish).
