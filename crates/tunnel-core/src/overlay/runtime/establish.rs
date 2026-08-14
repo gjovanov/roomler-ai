@@ -1372,6 +1372,7 @@ impl OverlayRuntime {
                             overlay_ip: cfg.overlay_ip,
                             carrier,
                             relay_parts: None,
+                            extra_permission_targets: Vec::new(),
                             supports_quic: cfg.supports_quic,
                             single_relay: None,
                             relay_kind: RelayKind::Turn,
@@ -1939,7 +1940,10 @@ impl OverlayRuntime {
         // they do the bootstrap by hand). The 1-byte datagram is below WG's
         // minimum message size, so boringtun ignores it.
         if let Some((conn, dst)) = &link.relay_parts {
-            let _ = conn.send_to(b"\x00", *dst).await;
+            // W6 phase-2 — visible + measured (was `let _ =`): the send blocks
+            // on CreatePermission, so its latency is the permission RTT and
+            // its error means coturn drops this peer's inbound wholesale.
+            let _ = crate::overlay::wg::assert_relay_permission(conn, *dst, "install").await;
         }
         // Phase D — a single-relay link FORCES the QUIC carrier, ignoring the
         // `OVERLAY_QUIC` opt-in: a raw `Carrier::Relay` discards the recv source
@@ -1988,6 +1992,17 @@ impl OverlayRuntime {
             let epoch = relay_bq.stamp(link.node_id);
             let tx = relay_bq.tx.clone();
             tokio::spawn(async move {
+                // W6 phase-2 — the ANCHOR permits EVERY distinct public srflx
+                // IP the dialer advertises (permissions are IP-scoped): a
+                // multi-homed dialer's raw dial socket picks its source by
+                // route, and a permission for only the FIRST advertised IP
+                // silently drops the whole dial at coturn. Off-loop by
+                // construction (this spawn), so the permission RTTs cannot
+                // stall the runtime.
+                for t in &link.extra_permission_targets {
+                    let _ = crate::overlay::wg::assert_relay_permission(&conn, *t, "anchor-extra")
+                        .await;
+                }
                 let quic = match Carrier::quic_relay(
                     conn.clone(),
                     dst,
@@ -2010,7 +2025,11 @@ impl OverlayRuntime {
                               "overlay: QUIC carrier build failed; using raw relay");
                         // Permission bootstrap for the raw fallback (the QUIC
                         // attempt sent its own, but re-assert — it's 1 byte).
-                        let _ = conn.send_to(b"\x00", dst).await;
+                        // W6 phase-2: measured — if THIS one succeeds after the
+                        // build's failed, the failed permission explains rx=0.
+                        let _ =
+                            crate::overlay::wg::assert_relay_permission(&conn, dst, "raw-fallback")
+                                .await;
                         None
                     }
                 };
