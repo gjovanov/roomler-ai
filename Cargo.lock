@@ -7212,6 +7212,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",
+ "roomler-tunnel",
  "scrap",
  "serde",
  "serde_json",
@@ -7458,6 +7459,13 @@ dependencies = [
  "webrtc",
  "webrtc-util",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "roomler-cli-shim"
+version = "0.3.0-rc.363"
+dependencies = [
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
