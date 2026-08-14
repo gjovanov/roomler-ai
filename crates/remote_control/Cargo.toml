@@ -11,6 +11,9 @@ path = "src/lib.rs"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# CIDR matching for models::host_matches (moved here from tunnel-core policy
+# in P3e lever E — the matcher lives next to its canonical shapes). Pure, tiny.
+ipnet = "2"
 thiserror.workspace = true
 tracing.workspace = true
 dashmap.workspace = true

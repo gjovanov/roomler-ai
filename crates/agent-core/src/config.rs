@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::tunnel::acl::AgentForwardAcl;
+use crate::acl::AgentForwardAcl;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -436,7 +436,7 @@ pub struct AgentConfig {
     /// in the TOML. The browser only ever sends an allowlist KEY, never a
     /// command line. See `agents/roomler-agent/src/apps/`.
     #[serde(default)]
-    pub virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig,
+    pub virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig,
 
     /// Phase 3b: opt into the overlay L3 mesh. Default off — an
     /// `overlay-l3` build only joins the mesh when this is set.
@@ -546,7 +546,7 @@ pub struct AgentConfig {
     /// Each enabled entry is reconciled into a live daemon flow on every
     /// startup (and on change) by `tunnel::route_reconciler` — the
     /// persistent counterpart of the ephemeral LocalAPI `CreateForward`
-    /// flows. The struct is `tunnel_core::localapi::RouteDescriptor`, one
+    /// flows. The struct is `roomler_localapi::RouteDescriptor`, one
     /// type for wire + disk. Managed via `roomler route add/rm/...` or the
     /// desktop Tunnels pane (the DAEMON writes this field — LocalAPI verbs
     /// persist through the daemon's config-write lock); hand-editing the
@@ -556,7 +556,7 @@ pub struct AgentConfig {
     /// this field (no unknown-field preservation) — declared routes do not
     /// survive an auto-rollback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tunnel_routes: Vec<tunnel_core::localapi::RouteDescriptor>,
+    pub tunnel_routes: Vec<roomler_localapi::RouteDescriptor>,
 
     /// Multi-org P1: SECONDARY enrollments (`[[orgs]]`). The top-level scalar
     /// identity fields (`server_url` / `agent_token` / `agent_id` /
@@ -1103,9 +1103,95 @@ pub type WriteLock = std::sync::Arc<tokio::sync::Mutex<()>>;
 
 /// A fully-populated config for unit tests in other modules (the route
 /// reconciler persists through real [`save`]/[`load`] round-trips).
-#[cfg(test)]
+///
+/// `#[cfg(test)]` alone stopped working when this module moved to its own
+/// crate (P3e lever E): a DOWNSTREAM crate's test build compiles THIS crate
+/// in normal mode, so the fixture vanished for `roomler-agent`'s tests. The
+/// `test-fixtures` feature is the standard escape — roomler-agent enables it
+/// from `[dev-dependencies]` only, so no production build ever carries it.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn test_fixture() -> AgentConfig {
-    tests::fixture()
+    AgentConfig {
+        server_url: "https://example.invalid".into(),
+        ws_url: None,
+        agent_token: "tok".into(),
+        agent_id: "aid".into(),
+        tenant_id: "tid".into(),
+        machine_id: "mid".into(),
+        machine_name: "host".into(),
+        encoder_preference: EncoderPreferenceChoice::Auto,
+        update_check_interval_h: None,
+        enable_remote_browse: true,
+        auto_grant_session: true,
+        exec_enabled: false,
+        overlay_quic: None,
+        overlay_direct: None,
+        overlay_derp: None,
+        overlay_server_relay_strategy: None,
+        overlay_mbb: None,
+        overlay_lan_iface_filter: None,
+        overlay_wsl_mirrored_guard: None,
+        overlay_init_auth_first: None,
+        overlay_srflx_seek: None,
+        overlay_pathmon: None,
+        overlay_route_events: None,
+        overlay_route_tick_secs: None,
+        overlay_relay_tls: None,
+        overlay_mux_nat: None,
+        overlay_shared_carrier: None,
+        overlay_tun_per_org: None,
+        overlay_roam: None,
+        overlay_plane_watchdog: None,
+        overlay_session_trace: None,
+        overlay_data_probe: None,
+        overlay_disco_respond: None,
+        overlay_disco_probe: None,
+        overlay_tun_stable_guid: None,
+        overlay_route_evict: None,
+        overlay_tun_persist: None,
+        overlay_route_metric0: None,
+        overlay_direct_port: None,
+        local_turn: None,
+        dns_aaaa: None,
+        auto_update: None,
+        logs_upload_disabled: None,
+        rate_factor_h264: None,
+        rate_factor_hevc: None,
+        rate_factor_vp9: None,
+        rate_factor_av1: None,
+        ice_follow_renomination: None,
+        ice_warm_standby: None,
+        ice_overlay_host_deprioritize: None,
+        overlay_tier_detect: None,
+        overlay_rtt_q: None,
+        relay_probe: None,
+        text_mod_neutralize: None,
+        overlay_demote: None,
+        overlay_upward_probe: None,
+        rc_max_sessions: None,
+        shared_encoder: None,
+        overlay_rpf: None,
+        last_known_good_version: None,
+        crash_count: 0,
+        last_crash_unix: 0,
+        rollback_attempted: false,
+        last_run_unhealthy: false,
+        config_schema_version: None,
+        forward_acl: AgentForwardAcl::default(),
+        virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig::default(),
+        overlay_enabled: false,
+        overlay_multi_org: false,
+        netstack_socks_port: None,
+        derived_org: false,
+        overlay_wg_secret_key: None,
+        overlay_advertised_routes: Vec::new(),
+        overlay_exit_node_enabled: false,
+        overlay_exit_node: None,
+        advertise_routes: Vec::new(),
+        advertise_local_subnets: true,
+        tunnel_routes: Vec::new(),
+        orgs: Vec::new(),
+    }
 }
 
 /// rc.280 — the operator-grade bool knobs bridged config→env (the S2
@@ -1480,88 +1566,11 @@ machine_name = "neo16"
         );
     }
 
+    // The fixture body moved to `super::test_fixture` (P3e lever E: it must
+    // exist under the `test-fixtures` FEATURE too, and this `#[cfg(test)]`
+    // module doesn't). Alias kept so the 29 in-module callers read the same.
     pub(super) fn fixture() -> AgentConfig {
-        AgentConfig {
-            server_url: "https://example.invalid".into(),
-            ws_url: None,
-            agent_token: "tok".into(),
-            agent_id: "aid".into(),
-            tenant_id: "tid".into(),
-            machine_id: "mid".into(),
-            machine_name: "host".into(),
-            encoder_preference: EncoderPreferenceChoice::Auto,
-            update_check_interval_h: None,
-            enable_remote_browse: true,
-            auto_grant_session: true,
-            exec_enabled: false,
-            overlay_quic: None,
-            overlay_direct: None,
-            overlay_derp: None,
-            overlay_server_relay_strategy: None,
-            overlay_mbb: None,
-            overlay_lan_iface_filter: None,
-            overlay_wsl_mirrored_guard: None,
-            overlay_init_auth_first: None,
-            overlay_srflx_seek: None,
-            overlay_pathmon: None,
-            overlay_route_events: None,
-            overlay_route_tick_secs: None,
-            overlay_relay_tls: None,
-            overlay_mux_nat: None,
-            overlay_shared_carrier: None,
-            overlay_tun_per_org: None,
-            overlay_roam: None,
-            overlay_plane_watchdog: None,
-            overlay_session_trace: None,
-            overlay_data_probe: None,
-            overlay_disco_respond: None,
-            overlay_disco_probe: None,
-            overlay_tun_stable_guid: None,
-            overlay_route_evict: None,
-            overlay_tun_persist: None,
-            overlay_route_metric0: None,
-            overlay_direct_port: None,
-            local_turn: None,
-            dns_aaaa: None,
-            auto_update: None,
-            logs_upload_disabled: None,
-            rate_factor_h264: None,
-            rate_factor_hevc: None,
-            rate_factor_vp9: None,
-            rate_factor_av1: None,
-            ice_follow_renomination: None,
-            ice_warm_standby: None,
-            ice_overlay_host_deprioritize: None,
-            overlay_tier_detect: None,
-            overlay_rtt_q: None,
-            relay_probe: None,
-            text_mod_neutralize: None,
-            overlay_demote: None,
-            overlay_upward_probe: None,
-            rc_max_sessions: None,
-            shared_encoder: None,
-            overlay_rpf: None,
-            last_known_good_version: None,
-            crash_count: 0,
-            last_crash_unix: 0,
-            rollback_attempted: false,
-            last_run_unhealthy: false,
-            config_schema_version: None,
-            forward_acl: AgentForwardAcl::default(),
-            virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig::default(),
-            overlay_enabled: false,
-            overlay_multi_org: false,
-            netstack_socks_port: None,
-            derived_org: false,
-            overlay_wg_secret_key: None,
-            overlay_advertised_routes: Vec::new(),
-            overlay_exit_node_enabled: false,
-            overlay_exit_node: None,
-            advertise_routes: Vec::new(),
-            advertise_local_subnets: true,
-            tunnel_routes: Vec::new(),
-            orgs: Vec::new(),
-        }
+        super::test_fixture()
     }
 
     /// A minimal valid secondary-org entry for tests.
@@ -1633,9 +1642,9 @@ machine_name = "neo16"
         cfg.overlay_enabled = true;
         cfg.overlay_wg_secret_key = Some("PRIMARY-KEY".into());
         cfg.overlay_exit_node = Some("exit-1".into());
-        cfg.tunnel_routes = vec![tunnel_core::localapi::RouteDescriptor {
+        cfg.tunnel_routes = vec![roomler_localapi::RouteDescriptor {
             id: "r1".into(),
-            kind: tunnel_core::localapi::FlowKind::Forward,
+            kind: roomler_localapi::FlowKind::Forward,
             node: "aid".into(),
             local: 18080,
             remote: Some("127.0.0.1:80".into()),

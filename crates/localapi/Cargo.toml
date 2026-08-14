@@ -1,0 +1,37 @@
+[package]
+name = "roomler-localapi"
+version.workspace = true
+edition.workspace = true
+description = "Roomler LocalAPI — the daemon's local control-surface protocol (wire types, client, and dispatch)."
+
+[lib]
+name = "roomler_localapi"
+path = "src/lib.rs"
+
+# P3e lever E: this used to be `tunnel-core::localapi`. It moved out verbatim
+# because it is the ONE thing thin clients need from tunnel-core — the desktop
+# companion reads node/peer/route state over it — while tunnel-core itself
+# carries the whole data plane (webrtc, quinn, turn, rustls are NON-optional
+# deps there, 285 crates in its default graph). Depending on the protocol no
+# longer means compiling the transport. tunnel-core re-exports this crate as
+# `tunnel_core::localapi`, so every existing call site is unchanged.
+#
+# Keep this crate leaf-shaped: newline-delimited JSON over a named pipe / unix
+# socket, nothing else. If something here ever needs a transport type, put the
+# type in the wire protocol instead.
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+# Just the pipe security descriptor (SDDL -> SECURITY_ATTRIBUTES) and its
+# LocalFree. Same 0.61 line the rest of the tree resolves.
+version = "0.61"
+features = [
+    "Win32_Foundation",             # LocalFree
+    "Win32_Security",               # PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES
+    "Win32_Security_Authorization", # ConvertStringSecurityDescriptorToSecurityDescriptorW
+]
