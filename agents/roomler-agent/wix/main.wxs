@@ -136,9 +136,17 @@
                              dies with the CLI file; Part='last' + implicit
                              Permanent='no' removes only our segment on
                              uninstall, and msiexec broadcasts
-                             WM_SETTINGCHANGE itself. The workflow builds
-                             target\release\roomler.exe via
-                             `cargo build -p roomler-tunnel [dash][dash]release`
+                             WM_SETTINGCHANGE itself. P3e lever D: the file is
+                             now the ~150 KB roomler-cli-shim, which re-execs
+                             `roomlerd cli` — the daemon owns the command
+                             surface, so this MSI no longer carries a second
+                             22.1 MiB copy of crates roomlerd already links.
+                             Installed NAME is unchanged (roomler.exe), so the
+                             PATH entry, user muscle memory and the
+                             installer-smoke payload asserts all still hold.
+                             The workflow builds
+                             target\release\roomler-shim.exe via
+                             `cargo build -p roomler-cli-shim [dash][dash]release`
                              before cargo-wix runs. HKCU KeyPath like siblings
                              (ICE38, user-profile dir). -->
                         <Component Id='TunnelExe' Guid='17E45A00-7EB6-44E0-97DB-2A6DB2D79683'>
@@ -153,7 +161,7 @@
                                 Id='roomler_tunnel_cli_exe'
                                 Name='roomler.exe'
                                 DiskId='1'
-                                Source='target\release\roomler.exe' />
+                                Source='target\release\roomler-shim.exe' />
                             <Environment
                                 Id='TunnelPathEnvPerUser'
                                 Name='PATH'
@@ -211,7 +219,26 @@
                                 Source='target\release\wintun.dll' />
                         </Component>
                         <!-- App-local Microsoft VC++ 2015-2022 x64 runtime
-                             (the full Microsoft.VC14x.CRT folder). The release
+                             (only the DLLs our binaries actually import; the
+                             full Microsoft.VC14x.CRT folder shipped through
+                             rc.363 and carried 1.12 MiB of dead weight). The
+                             import tables say msvcp140 + vcruntime140 +
+                             vcruntime140_1 and nothing else: roomlerd.exe
+                             imports all three, roomler.exe imports
+                             vcruntime140, roomler-desktop.exe imports no CRT
+                             at all, and msvcp140.dll itself pulls only the two
+                             vcruntime DLLs. concrt140, vccorlib140,
+                             msvcp140_1, msvcp140_2, msvcp140_atomic_wait and
+                             msvcp140_codecvt_ids are satellite DLLs that a
+                             consuming binary imports DIRECTLY when it uses the
+                             matching STL feature (std::atomic wait, codecvt
+                             facet ids, ...); none of ours does. Re-verify
+                             after adding a C++ dependency with:
+                               dumpbin -dependents <exe> | findstr /i 140
+                             and extend this component plus the workflow's
+                             staging list together if a new name appears.
+                             installer-smoke asserts the three by name. The
+                             release
                              roomlerd.exe links the CRT dynamically (its C++
                              encoder objects; the vcpkg static-md policy keeps
                              /MD), so a fresh Windows box without any VC++
@@ -234,13 +261,7 @@
                                 Type='integer'
                                 Value='1'
                                 KeyPath='yes' />
-                            <File Id='crt_concrt140' Name='concrt140.dll' DiskId='1' Source='target\release\concrt140.dll' />
                             <File Id='crt_msvcp140' Name='msvcp140.dll' DiskId='1' Source='target\release\msvcp140.dll' />
-                            <File Id='crt_msvcp140_1' Name='msvcp140_1.dll' DiskId='1' Source='target\release\msvcp140_1.dll' />
-                            <File Id='crt_msvcp140_2' Name='msvcp140_2.dll' DiskId='1' Source='target\release\msvcp140_2.dll' />
-                            <File Id='crt_msvcp140_atomic_wait' Name='msvcp140_atomic_wait.dll' DiskId='1' Source='target\release\msvcp140_atomic_wait.dll' />
-                            <File Id='crt_msvcp140_codecvt_ids' Name='msvcp140_codecvt_ids.dll' DiskId='1' Source='target\release\msvcp140_codecvt_ids.dll' />
-                            <File Id='crt_vccorlib140' Name='vccorlib140.dll' DiskId='1' Source='target\release\vccorlib140.dll' />
                             <File Id='crt_vcruntime140' Name='vcruntime140.dll' DiskId='1' Source='target\release\vcruntime140.dll' />
                             <File Id='crt_vcruntime140_1' Name='vcruntime140_1.dll' DiskId='1' Source='target\release\vcruntime140_1.dll' />
                         </Component>

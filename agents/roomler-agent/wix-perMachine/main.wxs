@@ -139,9 +139,15 @@
                          dies with the CLI file; Part='last' + implicit
                          Permanent='no' removes only our segment on
                          uninstall, and msiexec broadcasts WM_SETTINGCHANGE
-                         itself. The workflow builds
-                         target\release\roomler.exe via
-                         `cargo build -p roomler-tunnel [dash][dash]release`
+                         itself. P3e lever D: the file is now the ~150 KB
+                         roomler-cli-shim, which re-execs `roomlerd cli` —
+                         the daemon owns the command surface, so this MSI no
+                         longer carries a second 22.1 MiB copy of crates
+                         roomlerd already links. Installed NAME is unchanged
+                         (roomler.exe), so the PATH entry and the
+                         installer-smoke payload asserts still hold. The
+                         workflow builds target\release\roomler-shim.exe via
+                         `cargo build -p roomler-cli-shim [dash][dash]release`
                          before cargo-wix runs. Keys off the file itself
                          like its siblings (system-scoped dir). -->
                     <Component Id='TunnelExe' Guid='833F7BA5-4323-403A-BBC5-B77C42E9F27A' Win64='yes'>
@@ -150,7 +156,7 @@
                             Name='roomler.exe'
                             DiskId='1'
                             KeyPath='yes'
-                            Source='target\release\roomler.exe' />
+                            Source='target\release\roomler-shim.exe' />
                         <Environment
                             Id='TunnelPathEnvPerMachine'
                             Name='PATH'
@@ -190,8 +196,22 @@
                             Source='target\release\wintun.dll' />
                     </Component>
 
-                    <!-- App-local Microsoft VC++ 2015-2022 x64 runtime (the
-                         full Microsoft.VC14x.CRT folder). The release
+                    <!-- App-local Microsoft VC++ 2015-2022 x64 runtime (only
+                         the DLLs our binaries actually import; the full
+                         Microsoft.VC14x.CRT folder shipped through rc.363 and
+                         carried 1.12 MiB of dead weight). Import tables:
+                         roomlerd.exe needs msvcp140 + vcruntime140 +
+                         vcruntime140_1, roomler.exe needs vcruntime140,
+                         roomler-desktop.exe needs no CRT, and msvcp140.dll
+                         itself pulls only the two vcruntime DLLs. The dropped
+                         six (concrt140, vccorlib140, msvcp140_1, msvcp140_2,
+                         msvcp140_atomic_wait, msvcp140_codecvt_ids) are
+                         satellites a consuming binary imports DIRECTLY when it
+                         uses the matching STL feature; none of ours does.
+                         Re-verify after adding a C++ dependency with
+                         `dumpbin -dependents <exe> | findstr /i 140` and
+                         extend this component plus the workflow staging list
+                         together. The release
                          roomlerd.exe links the CRT dynamically (its C++
                          encoder objects; the vcpkg static-md policy keeps
                          /MD), so a fresh Windows box without any VC++
@@ -206,17 +226,13 @@
                          VC++ runtime step. One component for the whole set,
                          keyed off msvcp140.dll. NB the GUID must be EXPLICIT:
                          Guid='*' is only legal on multi-file components when
-                         every non-keypath file is unversioned, and all nine
-                         CRT DLLs carry versions (light fails with LGHT0368
-                         otherwise; burned the first rc.266 tag run). -->
+                         every non-keypath file is unversioned, and every CRT
+                         DLL carries a version (light fails with LGHT0368
+                         otherwise; burned the first rc.266 tag run). That is
+                         unchanged by the trim: still multi-file, still
+                         versioned. -->
                     <Component Id='VcRedistCrt' Guid='6CB601C1-A505-49D9-97D9-C3015DDCF990' Win64='yes'>
                         <File Id='crt_msvcp140' Name='msvcp140.dll' DiskId='1' KeyPath='yes' Source='target\release\msvcp140.dll' />
-                        <File Id='crt_concrt140' Name='concrt140.dll' DiskId='1' Source='target\release\concrt140.dll' />
-                        <File Id='crt_msvcp140_1' Name='msvcp140_1.dll' DiskId='1' Source='target\release\msvcp140_1.dll' />
-                        <File Id='crt_msvcp140_2' Name='msvcp140_2.dll' DiskId='1' Source='target\release\msvcp140_2.dll' />
-                        <File Id='crt_msvcp140_atomic_wait' Name='msvcp140_atomic_wait.dll' DiskId='1' Source='target\release\msvcp140_atomic_wait.dll' />
-                        <File Id='crt_msvcp140_codecvt_ids' Name='msvcp140_codecvt_ids.dll' DiskId='1' Source='target\release\msvcp140_codecvt_ids.dll' />
-                        <File Id='crt_vccorlib140' Name='vccorlib140.dll' DiskId='1' Source='target\release\vccorlib140.dll' />
                         <File Id='crt_vcruntime140' Name='vcruntime140.dll' DiskId='1' Source='target\release\vcruntime140.dll' />
                         <File Id='crt_vcruntime140_1' Name='vcruntime140_1.dll' DiskId='1' Source='target\release\vcruntime140_1.dll' />
                     </Component>
