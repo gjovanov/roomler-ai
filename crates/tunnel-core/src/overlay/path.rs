@@ -1645,8 +1645,65 @@ mod tests {
         );
     }
 
+    /// What ACTUALLY paces a LAN retry after a FAILED make-before-break probe.
+    ///
+    /// `LAN_PROBE_SPACING` (60 s from the attempt) reads like the governing
+    /// constant, and the module doc points at it — but a failed probe also
+    /// books a penalty, and eligibility only returns after one `H_ORDINARY`
+    /// (60 s) half-life measured from the FAILURE. Since the failure lands one
+    /// handshake deadline after the attempt, the half-life always finishes
+    /// LATER than the spacing pin: the pin never binds, and the effective
+    /// cadence is `deadline + H_ORDINARY`, not 60 s.
+    ///
+    /// Field 2026-08-13: pc50045's LAN probes retried every ~90 s, not 60 s,
+    /// and reconciling that by hand from timestamps took longer than the
+    /// incident it was buried in. This pins the real relationship so a future
+    /// reader does not re-derive it — and so any cadence tuning has to state
+    /// which of the two constants it is actually moving.
+    #[test]
+    fn failed_lan_probe_is_paced_by_the_penalty_half_life_not_the_spacing_pin() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let t0 = Instant::now();
+        let deadline = crate::overlay::lifecycle::LAN_HANDSHAKE_DEADLINE;
+
+        m.on_probe_started(&a, DirectTier::Lan, t0);
+        // The probe misses its handshake deadline — a real failure, which
+        // books a penalty (unlike `on_probe_aborted`, which books none).
+        m.on_probe_result(
+            &a,
+            DirectTier::Lan,
+            ProbeOutcome::Expired,
+            true,
+            t0 + deadline,
+        );
+
+        // The spacing pin alone would allow a retry here…
+        let at_spacing = t0 + LAN_PROBE_SPACING + Duration::from_secs(1);
+        assert!(
+            !m.eligible(&a, DirectTier::Lan, at_spacing),
+            "spacing pin is NOT the binding constraint — the penalty still suppresses LAN"
+        );
+
+        // …but eligibility only returns one half-life after the FAILURE.
+        let after_half_life = t0 + deadline + H_ORDINARY + Duration::from_secs(1);
+        assert!(
+            m.eligible(&a, DirectTier::Lan, after_half_life),
+            "one H_ORDINARY past the failure, LAN must be eligible again"
+        );
+
+        // The effective gap therefore exceeds the documented spacing by about
+        // one handshake deadline — this is the ~90 s seen in the field.
+        assert!(
+            after_half_life.saturating_duration_since(t0) > LAN_PROBE_SPACING,
+            "effective cadence must be understood as deadline + H_ORDINARY"
+        );
+    }
+
     /// F2 — the LAN spacing pin holds under adversarial Q and with no
-    /// penalty on the books (probe aborted without failure).
+    /// penalty on the books (probe aborted without failure). Contrast with
+    /// `failed_lan_probe_is_paced_by_the_penalty_half_life_not_the_spacing_pin`
+    /// above: with a penalty booked, the pin is no longer what binds.
     #[test]
     fn lan_spacing_pinned_under_q_extremes() {
         let mut m = PathMonitor::default();
