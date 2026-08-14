@@ -1745,6 +1745,14 @@ impl OverlayRuntime {
         // pc50045 had it set and produced no plane log lines whatsoever —
         // there was no way to tell a plane-mode host from a legacy one, or a
         // spawned forwarder from a silently-skipped one, without this.
+        // W5 — this runtime's OWN receiver on the plane's shared srflx watch,
+        // consumed by a select arm below: the forwarder re-ADVERTISES on the
+        // WS, but four runtime-local copies also go stale on a shared-state
+        // change (DirectCtx.punch/my_nat, the relay coordinator's
+        // udp_relay_ok, the srflx_* locals, the LocalAPI status) — before
+        // this, `set_udp_relay_ok`'s only caller was the rebuild path, so a
+        // NONE→SOME recovery left the node frozen as universal relay anchor.
+        let mut plane_srflx_rx = self.carrier_plane.as_ref().map(|p| p.subscribe_srflx());
         let mut srflx_keepalive = if let Some(plane) = &self.carrier_plane {
             info!(
                 self_v4 = %self_v4,
@@ -2468,6 +2476,19 @@ impl OverlayRuntime {
                                 });
                                 if check_due && pending_rebuild.is_none() {
                                     last_netcheck = Some(Instant::now());
+                                    // W5(c) — poke the plane srflx task
+                                    // UNCONDITIONALLY on an addr/iface event:
+                                    // a corp-VPN connect changes NAT reality
+                                    // without touching the LAN-IP set (the
+                                    // VPN adapter is deny-listed from the
+                                    // gather), so the net-change rebuild
+                                    // below never fires for it — and before
+                                    // W5, a NONE stayed NONE forever. Notify
+                                    // coalesces; SEEKING re-gathers now,
+                                    // ESTABLISHED re-verifies the mapping.
+                                    if let Some(plane) = &self.carrier_plane {
+                                        plane.notify_regather();
+                                    }
                                     let mut now_ips = direct::gather_lan_ips();
                                     now_ips.sort_unstable();
                                     let mut plane_ips: Vec<Ipv4Addr> = direct_ctx
@@ -2549,6 +2570,54 @@ impl OverlayRuntime {
                             route_watch = None;
                             route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
                         }
+                    }
+                },
+                // W5 — the plane's shared srflx state changed (mapping moved,
+                // keepalive outage flagged, or a SEEKING re-gather RECOVERED
+                // a candidate after NONE). Refresh the four runtime-local
+                // copies a watch-publish alone never reached; the pairing
+                // itself follows from the regrade tick + the monitor's
+                // reupgrade sweep reading the refreshed state — no forced
+                // re-install here.
+                changed = async {
+                    match plane_srflx_rx.as_mut() {
+                        Some(r) => r.changed().await.is_ok(),
+                        None => std::future::pending::<bool>().await,
+                    }
+                } => {
+                    if changed {
+                        let s = plane_srflx_rx
+                            .as_ref()
+                            .map(|r| r.borrow().clone())
+                            .unwrap_or_default();
+                        if let Some(ctx) = direct_ctx.as_mut() {
+                            ctx.punch = s.punch.clone();
+                            ctx.my_nat = s.my_nat.clone();
+                        }
+                        srflx_advertised = s.candidates.clone();
+                        srflx_my_nat = s.my_nat.clone();
+                        // (srflx_stun_server deliberately NOT refreshed: in
+                        // plane mode that local only ever feeds the LEGACY
+                        // keepalive spawn, which never runs here; the rebuild
+                        // arm re-derives it from its own fresh gather.)
+                        if let Some(r) = relay.as_mut() {
+                            r.set_udp_relay_ok(!s.candidates.is_empty());
+                        }
+                        self.srflx_status = Some(crate::localapi::SrflxStatus {
+                            candidates: s.candidates.clone(),
+                            stun_server: s.stun_server.map(|x| x.to_string()),
+                            nat: s.my_nat.clone(),
+                            error: s.error.clone(),
+                        });
+                        info!(
+                            candidates = ?s.candidates,
+                            generation = s.generation,
+                            udp_relay_ok = !s.candidates.is_empty(),
+                            "overlay: shared srflx state refreshed from the plane watch"
+                        );
+                    } else {
+                        // Watch closed (plane gone in tests) — stop polling.
+                        plane_srflx_rx = None;
                     }
                 },
                 // Multi-org v2 P1-d — the plane's rebuild steps. Teardown:

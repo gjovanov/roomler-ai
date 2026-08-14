@@ -1073,6 +1073,22 @@ pub fn roam_enabled() -> bool {
     crate::env::flag("OVERLAY_ROAM", true)
 }
 
+/// W5 — srflx SEEKING mode (`ROOMLER_NODE_OVERLAY_SRFLX_SEEK`, legacy
+/// `ROOMLER_AGENT_…`; default **ON**): when the plane's srflx gather yields
+/// NO candidate, keep the plane srflx task alive in a query-only state that
+/// periodically re-gathers (backoff 20 s → ×3 → 300 s cap, plus an
+/// immediate poke on interface events). Before this, a NONE gather returned
+/// the STUN sink and NOTHING ever re-queried — `srflx NONE` was sticky for
+/// the daemon's lifetime (field 2026-08-14: pc50045 on the corp VPN stayed
+/// NONE across VPN cycles, which also made it the universal relay ANCHOR).
+/// The B4 watchdog stays INERT in SEEKING (there is no advertised mapping
+/// to defend; on a genuinely UDP-blocked host it would otherwise force a
+/// full plane rebuild every few cycles forever). The kill switch restores
+/// the old return-the-sink behaviour.
+pub fn srflx_seek_enabled() -> bool {
+    crate::env::flag("OVERLAY_SRFLX_SEEK", true)
+}
+
 /// Auth-first type-1 routing on a MULTI-ORG carrier plane
 /// (`ROOMLER_NODE_OVERLAY_INIT_AUTH_FIRST`, legacy `ROOMLER_AGENT_…`; default
 /// **ON**): with more than one engine attached, an inbound handshake
