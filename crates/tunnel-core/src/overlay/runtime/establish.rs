@@ -2006,7 +2006,7 @@ impl OverlayRuntime {
                         // for cone-ish dialers (port-preserving mapping); a
                         // symmetric dialer stays dark until the health sweep
                         // re-coordinates.
-                        warn!(peer = %link.node_id, %e, single_relay = ?link.single_relay,
+                        warn!(peer = %link.node_id, %e, single_relay = ?link.single_relay, am_server,
                               "overlay: QUIC carrier build failed; using raw relay");
                         // Permission bootstrap for the raw fallback (the QUIC
                         // attempt sent its own, but re-assert — it's 1 byte).
