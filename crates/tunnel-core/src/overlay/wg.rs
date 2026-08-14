@@ -89,6 +89,38 @@ pub fn overlay_quic_enabled() -> bool {
     }
 }
 
+/// W6 phase-2 — open the coturn permission toward `dst` and SAY what
+/// happened. The turn client's `send_to` blocks on CreatePermission (with
+/// retries), so this 1-byte stray's latency IS the permission round trip,
+/// and its error means coturn drops EVERY inbound from that peer until a
+/// later send re-asserts. This was `let _ = conn.send_to(…)` at three
+/// sites — three silent drops (field 2026-08-15: every QUIC rendezvous on
+/// CORPLAP-1 timed out with rx=0 on BOTH sides and nothing said why).
+/// Returns (elapsed_ms, ok) so callers can fold it into their own logs.
+pub(crate) async fn assert_relay_permission(
+    conn: &Arc<dyn RelayConn>,
+    dst: SocketAddr,
+    context: &'static str,
+) -> (u64, bool) {
+    let t0 = std::time::Instant::now();
+    let res = conn.send_to(b"\x00", dst).await;
+    let ms = t0.elapsed().as_millis() as u64;
+    match &res {
+        Ok(_) if ms >= 500 => {
+            info!(%dst, ms, context, "overlay relay: permission bootstrap SLOW");
+        }
+        Ok(_) => {
+            debug!(%dst, ms, context, "overlay relay: permission bootstrap ok");
+        }
+        Err(e) => {
+            warn!(%dst, ms, %e, context,
+                  "overlay relay: permission bootstrap FAILED — coturn drops this \
+                   peer's inbound until a later send re-asserts");
+        }
+    }
+    (ms, res.is_ok())
+}
+
 /// How a peer's WG datagrams reach it. Both arms are "send bytes to a
 /// dst / recv bytes"; boringtun output rides either unchanged.
 pub enum Carrier {
@@ -214,7 +246,12 @@ impl Carrier {
     ) -> anyhow::Result<Arc<Self>> {
         use anyhow::{Context as _, bail};
 
-        let _ = conn.send_to(b"\x00", dst).await;
+        let (perm_ms, perm_ok) = assert_relay_permission(&conn, dst, "quic-build").await;
+        let perm = if perm_ok {
+            format!("perm={perm_ms}ms")
+        } else {
+            format!("perm=FAILED@{perm_ms}ms")
+        };
         let sock = Arc::new(RelayUdpSocket::new(conn)?);
         // W6 — rendezvous instrumentation. Field 2026-08-14 (CORPLAP-1): EVERY
         // relay build logged "accept timed out → raw relay", but the log
@@ -231,14 +268,14 @@ impl Carrier {
                 .await
                 .with_context(|| {
                     format!(
-                        "QUIC-over-TURN server accept timed out ({}s window, permission_dst={dst}, {})",
+                        "QUIC-over-TURN server accept timed out ({}s window, permission_dst={dst}, {perm}, {})",
                         timeout.as_secs(),
                         rx_stats.describe()
                     )
                 })?
                 .with_context(|| {
                     format!(
-                        "QUIC-over-TURN server: no incoming connection (permission_dst={dst}, {})",
+                        "QUIC-over-TURN server: no incoming connection (permission_dst={dst}, {perm}, {})",
                         rx_stats.describe()
                     )
                 })?
@@ -263,14 +300,14 @@ impl Carrier {
                 .await
                 .with_context(|| {
                     format!(
-                        "QUIC-over-TURN client connect timed out ({}s window, dst={dst}, {})",
+                        "QUIC-over-TURN client connect timed out ({}s window, dst={dst}, {perm}, {})",
                         timeout.as_secs(),
                         rx_stats.describe()
                     )
                 })?
                 .with_context(|| {
                     format!(
-                        "QUIC-over-TURN client handshake failed (dst={dst}, {})",
+                        "QUIC-over-TURN client handshake failed (dst={dst}, {perm}, {})",
                         rx_stats.describe()
                     )
                 })?;
