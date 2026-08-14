@@ -2376,3 +2376,155 @@ pub(super) struct SrflxGather {
     pub(super) advertised: Vec<String>,
     pub(super) my_nat: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    //! First tests in this file (2026-08-14 debt audit: 2,378 prod LOC,
+    //! zero tests) — seeded at the decision helper the W5 srflx work edits
+    //! next: `resolve_direct_candidates` gates which direct tiers get
+    //! dialed at all, and each case below encodes a shipped field lesson.
+
+    use super::*;
+
+    fn peer(lan: &[&str], srflx: &[&str], nat: Option<&str>) -> PeerConfig {
+        PeerConfig {
+            public_key: [7u8; 32],
+            overlay_ip: Ipv4Addr::new(100, 65, 4, 9),
+            name: "t".into(),
+            subnets: vec![],
+            endpoints: vec![],
+            lan_endpoints: lan.iter().map(|s| s.to_string()).collect(),
+            srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
+            srflx_nat: nat.map(|s| s.to_string()),
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_overlay_echo: false,
+            relay_strategy: None,
+            relay_home: None,
+        }
+    }
+
+    async fn ctx(punch_candidate: Option<&str>, my_nat: Option<&str>) -> DirectCtx {
+        let punch = match punch_candidate {
+            Some(c) => {
+                let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                Some((c.to_string(), s))
+            }
+            None => None,
+        };
+        DirectCtx {
+            socks: vec![],
+            my_ips: vec![Ipv4Addr::new(192, 168, 68, 126)],
+            endpoints: vec![],
+            public_sock: None,
+            punch,
+            my_nat: my_nat.map(|s| s.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn srflx_tier_needs_a_punch_socket() {
+        let p = peer(&[], &["37.63.112.129:43649"], Some("cone"));
+        let none = resolve_direct_candidates(
+            Some(&ctx(None, Some("cone")).await),
+            &p,
+            CandidateRotation::default(),
+        );
+        assert!(
+            none.srflx.is_none(),
+            "no punch socket -> no srflx dial (the srflx-NONE victim state)"
+        );
+        let some = resolve_direct_candidates(
+            Some(&ctx(Some("5.5.5.5:1"), Some("cone")).await),
+            &p,
+            CandidateRotation::default(),
+        );
+        assert_eq!(some.srflx, Some("37.63.112.129:43649".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn srflx_skipped_only_when_both_ends_are_symmetric() {
+        let c = ctx(Some("5.5.5.5:1"), Some("symmetric")).await;
+        let both = resolve_direct_candidates(
+            Some(&c),
+            &peer(&[], &["37.63.112.129:43649"], Some("symmetric")),
+            CandidateRotation::default(),
+        );
+        assert!(both.srflx.is_none(), "symmetric<->symmetric cannot punch");
+        let one_cone = resolve_direct_candidates(
+            Some(&c),
+            &peer(&[], &["37.63.112.129:43649"], Some("cone")),
+            CandidateRotation::default(),
+        );
+        assert!(one_cone.srflx.is_some(), "one cone end keeps the punch");
+    }
+
+    #[tokio::test]
+    async fn same_nat_hairpin_suppresses_srflx_only_when_a_lan_path_exists() {
+        // The peer's srflx shares OUR public IP (same NAT). With a
+        // same-subnet LAN candidate the punch is pointless; WITHOUT one it
+        // must stay — the #436 lesson: a phantom LAN candidate wrongly
+        // suppressed srflx and the pair was left with no direct tier at all.
+        let c = ctx(Some("37.63.112.129:43649"), Some("cone")).await;
+        let with_lan = resolve_direct_candidates(
+            Some(&c),
+            &peer(
+                &["192.168.68.4:43648"],
+                &["37.63.112.129:43610"],
+                Some("cone"),
+            ),
+            CandidateRotation::default(),
+        );
+        assert!(with_lan.lan.is_some());
+        assert!(
+            with_lan.srflx.is_none(),
+            "hairpin + LAN present -> srflx suppressed"
+        );
+        let without_lan = resolve_direct_candidates(
+            Some(&c),
+            &peer(&[], &["37.63.112.129:43610"], Some("cone")),
+            CandidateRotation::default(),
+        );
+        assert!(
+            without_lan.srflx.is_some(),
+            "hairpin WITHOUT a LAN candidate keeps srflx"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_tier_stays_off_under_the_default_flag() {
+        let mut c = ctx(None, None).await;
+        c.public_sock = Some(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        let got = resolve_direct_candidates(
+            Some(&c),
+            &peer(&["5.9.157.221:43648"], &[], None),
+            CandidateRotation::default(),
+        );
+        assert!(got.public.is_none(), "OVERLAY_PUBLIC_DIRECT is default-OFF");
+    }
+
+    #[tokio::test]
+    async fn lan_candidate_comes_from_the_shared_slash24_only() {
+        let c = ctx(None, None).await;
+        let on_link = resolve_direct_candidates(
+            Some(&c),
+            &peer(&["192.168.68.4:43648"], &[], None),
+            CandidateRotation::default(),
+        );
+        assert_eq!(
+            on_link.lan,
+            Some((
+                Ipv4Addr::new(192, 168, 68, 126),
+                "192.168.68.4:43648".parse().unwrap()
+            ))
+        );
+        let off_link = resolve_direct_candidates(
+            Some(&c),
+            &peer(&["10.0.0.4:43648"], &[], None),
+            CandidateRotation::default(),
+        );
+        assert!(off_link.lan.is_none());
+    }
+}
