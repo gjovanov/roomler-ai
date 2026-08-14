@@ -1069,6 +1069,23 @@ pub fn roam_enabled() -> bool {
     crate::env::flag("OVERLAY_ROAM", true)
 }
 
+/// Auth-first type-1 routing on a MULTI-ORG carrier plane
+/// (`ROOMLER_NODE_OVERLAY_INIT_AUTH_FIRST`, legacy `ROOMLER_AGENT_…`; default
+/// **ON**): with more than one engine attached, an inbound handshake
+/// initiation is routed by trial-authentication against each engine's static
+/// (candidates-with-a-session-at-that-source first), never by the
+/// source-keyed shortcut alone. With N orgs sharing ONE socket on both hosts,
+/// both orgs' sessions arrive from the SAME remote `ip:port`, and the
+/// shortcut deterministically delivered the second org's inits into the
+/// first org's `Tunn` — the dual-org direct mutual-exclusion lockout (field
+/// 2026-08-14: mars/jupiter/zeus direct on exactly one org each, the loser
+/// pinned to relay until a restart swapped the winner). Single-engine planes
+/// keep the shortcut either way. The kill switch restores the legacy
+/// shortcut on multi-org planes too. Read once at plane construction.
+pub fn init_auth_first_enabled() -> bool {
+    crate::env::flag("OVERLAY_INIT_AUTH_FIRST", true)
+}
+
 /// A3 — minimum interval between endpoint adoptions for ONE session: bounds
 /// roam thrash / a spoof-probe storm to ≤1 move/session/interval. A genuine
 /// symmetric-NAT punch adopts once and settles; a rebind is rare.
