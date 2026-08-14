@@ -21,6 +21,11 @@ path = "src/main.rs"
 [dependencies]
 # Shared protocol types (ClientMsg, ServerMsg, etc.)
 roomler-ai-remote-control = { path = "../../crates/remote_control" }
+# P3e lever E — the daemon-free building blocks (config, enrollment, machine,
+# logging, sentinels, ACL, apps-config shapes) live in agent-core so the
+# desktop companion can link them without this crate's data plane. lib.rs
+# re-exports each module under its old `crate::` path.
+roomler-agent-core = { path = "../../crates/agent-core" }
 # Tunnel ACL types + helpers (DestinationRule / HostPattern / dst_matches).
 # Agent-side allowlist is belt-and-suspenders for the server-side gate.
 roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
@@ -443,18 +448,22 @@ system-context = []
 # plane + TUN device from tunnel-core. Default-OFF + gated on the
 # `overlay_enabled` config. The agent runs privileged (service), so the
 # TUN device + routes come up directly (no helper).
-overlay-l3 = ["roomler-ai-tunnel-core/overlay-l3"]
+overlay-l3 = ["roomler-ai-tunnel-core/overlay-l3", "roomler-agent-core/overlay-l3"]
 # Netstack overlay surface — the OS-free twin of `overlay-l3`. Instead of a
 # real TUN, the node terminates the overlay CIDR in a userspace smoltcp stack
 # and exposes a loopback SOCKS5 front, so a locked-down host (full-tunnel VPN)
 # reaches the mesh with NO OS routing. Opt in per-run with the env var
 # `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>` (see `overlay.rs`). Independent
 # of `overlay-l3`; a build may carry either or both (config picks at runtime).
-overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack"]
+overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack", "roomler-agent-core/overlay-netstack"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# Turns on `config::test_fixture` for THIS crate's test builds (feature
+# unification applies dev-dep features to the normal dep during `cargo
+# test`); production builds never see it.
+roomler-agent-core = { path = "../../crates/agent-core", features = ["test-fixtures"] }
 # File-DC integration test (tests/file_dc.rs) needs the zip crate
 # to unpack the agent's streaming-zip output and verify content.
 zip = { version = "2", default-features = false, features = ["deflate"] }
