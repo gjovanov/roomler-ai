@@ -463,6 +463,33 @@ pub async fn set_magic_dns(
             "magic_dns_domain has invalid characters".to_string(),
         ));
     }
+    // W2 — reserved-name guard for zones under the product domain: the
+    // agent resolver is AUTHORITATIVE for its zone (in-zone miss =
+    // NXDOMAIN, never forwarded), so a tenant zone named after fleet
+    // infrastructure would shadow it org-wide from EVERY member host — a
+    // zone `coturn.roomler.ai` NXDOMAINs the relay fleet itself. Only
+    // `*.roomler.ai` is guarded; foreign apex domains are the operator's
+    // own business.
+    if let Some(d) = &domain
+        && let Some(label) = d.strip_suffix(".roomler.ai").map(|p| {
+            // The rightmost remaining label is the [org] slot directly
+            // under roomler.ai (e.g. "grox" from "grox.roomler.ai").
+            p.rsplit('.').next().unwrap_or(p).to_string()
+        })
+    {
+        const RESERVED: &[&str] = &[
+            "api", "argocd", "grafana", "mail", "registry", "staging", "www",
+        ];
+        let shadowed = RESERVED.contains(&label.as_str())
+            || label.starts_with("coturn")
+            || label.starts_with("derp");
+        if shadowed {
+            return Err(ApiError::BadRequest(format!(
+                "magic_dns_domain '{label}.roomler.ai' would shadow reserved \
+                 infrastructure names for every org member; pick another name"
+            )));
+        }
+    }
     let nameservers: Vec<String> = body
         .magic_dns_nameservers
         .into_iter()
