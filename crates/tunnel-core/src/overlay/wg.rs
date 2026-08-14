@@ -1120,6 +1120,22 @@ impl WgDevice {
         self.peers.get(peer_public)?.direct_src
     }
 
+    /// Re-assert a plane-registered peer's `(engine, src)` reverse entry from
+    /// an AUTHENTICATED inbound init (the ForwardInit livelock breaker): a
+    /// session whose reverse entry was clobbered by a replacement's
+    /// register-then-unregister, or moved by a roam the device's `direct_src`
+    /// never learned about, cycles auth → Drop → ForwardInit → feed → auth
+    /// forever, each pass costing a DH and terminating nowhere. Same-`src`
+    /// heals the entry in place; a differing `src` commits a full roam.
+    /// No-op off the plane or for unknown/relay-only peers.
+    pub fn reassert_plane_src(&self, peer_public: &[u8; 32], src: SocketAddr) {
+        if let (Some(h), Some(p)) = (&self.plane, self.peers.get(peer_public))
+            && let Some(idx) = p.plane_idx
+        {
+            h.reassert_src(idx, src);
+        }
+    }
+
     /// Phase A — EXTRACT + AUTHENTICATE a WireGuard handshake INITIATION with
     /// no per-peer state, returning the initiator's static public key **only if
     /// the init is cryptographically genuine**. Used by the runtime before it
