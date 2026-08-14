@@ -52,8 +52,16 @@ impl OverlayRuntime {
         let node_id = np.node_id;
 
         // Already direct on THIS exact source → nothing to change; just answer
-        // the init (it may be a keepalive-driven rehandshake).
+        // the init (it may be a keepalive-driven rehandshake). Re-assert the
+        // plane's reverse entry FIRST: this init reached us via ForwardInit,
+        // which for a live session at this source means its `(engine, src)`
+        // entry is missing (clobbered by a replacement's register+unregister,
+        // or moved by a roam `direct_src` never learned about). Without the
+        // re-assert, `feed_direct` routes the packet straight back through the
+        // same auth → Drop → ForwardInit path — a livelock burning a DH per
+        // cycle and never answering the peer.
         if wg.direct_src_of(&pubkey) == Some(inb.src) {
+            wg.reassert_plane_src(&pubkey, inb.src);
             wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
             return;
         }
