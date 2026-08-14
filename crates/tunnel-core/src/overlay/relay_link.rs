@@ -148,6 +148,16 @@ pub struct ReadyLink {
     /// upgrade the carrier to QUIC-over-TURN in `install_ready`, falling back
     /// to the already-built raw `carrier` on failure.
     pub relay_parts: Option<(Arc<dyn RelayConn>, SocketAddr)>,
+    /// W6 phase-2 — ADDITIONAL public srflx addresses of the peer, beyond
+    /// `relay_parts.1`, that the ANCHOR must open coturn permissions for.
+    /// Permissions are IP-scoped; the anchor's `\x00` bootstrap used to
+    /// target only the FIRST advertised srflx, so a multi-homed dialer
+    /// (mars: 94.130.141.74 + .98 — one plane sock per local IP, several
+    /// srflx adverts) whose fresh raw dial socket egressed from another of
+    /// its addresses was silently dropped at coturn (field 2026-08-15:
+    /// QUIC rendezvous rx=0 on both sides, raw fallback fine). Distinct
+    /// IPs only, primary excluded; empty for non-anchor links.
+    pub extra_permission_targets: Vec<SocketAddr>,
     /// rc.142 — the peer advertised QUIC-over-TURN support. `install_ready`
     /// only attempts the QUIC upgrade when this is set (both ends must agree).
     pub supports_quic: bool,
@@ -1130,6 +1140,11 @@ impl RelayCoordinator {
                 .filter_map(|e| e.parse().ok())
                 .find(|s: &SocketAddr| Some(s.ip()) == our_worker_ip)?
         };
+        let extra_permission_targets = if single_anchor {
+            extra_srflx_permission_targets(&a.peer.srflx_endpoints, dst.ip())
+        } else {
+            Vec::new()
+        };
         let carrier = Carrier::relay(a.conn.clone(), dst);
         let link = ReadyLink {
             node_id: *node_id,
@@ -1137,13 +1152,16 @@ impl RelayCoordinator {
             overlay_ip: a.peer.overlay_ip,
             carrier,
             relay_parts: Some((a.conn.clone(), dst)),
+            extra_permission_targets,
             supports_quic: a.peer.supports_quic,
             single_relay: single_anchor.then_some(true),
             relay_kind: RelayKind::Turn,
             subnets: a.peer.subnets.clone(),
         };
         self.allocated.remove(node_id);
-        info!(peer = %node_id, %dst, single_relay = single_anchor, "overlay relay: link ready");
+        info!(peer = %node_id, %dst, single_relay = single_anchor,
+              extra_perms = link.extra_permission_targets.len(),
+              "overlay relay: link ready");
         Some(link)
     }
 
@@ -1173,6 +1191,18 @@ impl RelayCoordinator {
             crate::overlay::direct::force_egress_interface(&sock, ix);
         }
         let conn: Arc<dyn RelayConn> = Arc::new(crate::transport::relay::UdpRelayConn(sock));
+        // W6 phase-2 — say which SOURCE the OS picked for the dial: the
+        // anchor's coturn permission is IP-scoped to OUR ADVERTISED srflx,
+        // and a multi-homed host can route toward R from another of its
+        // addresses — coturn then drops the whole dial silently. A
+        // throwaway connect() does source selection without sending.
+        let src_ip = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .ok()
+            .and_then(|p| {
+                p.connect(r).ok()?;
+                p.local_addr().ok()
+            })
+            .map(|a| a.ip());
         let carrier = Carrier::relay(conn.clone(), r);
         let link = ReadyLink {
             node_id: *node_id,
@@ -1180,13 +1210,15 @@ impl RelayCoordinator {
             overlay_ip: peer.overlay_ip,
             carrier,
             relay_parts: Some((conn, r)),
+            extra_permission_targets: Vec::new(),
             supports_quic: peer.supports_quic,
             single_relay: Some(false),
             relay_kind: RelayKind::Turn,
             subnets: peer.subnets.clone(),
         };
         self.dialing.remove(node_id);
-        info!(peer = %node_id, %r, "overlay relay: single-relay dialer link ready (raw → anchor R)");
+        info!(peer = %node_id, %r, ?src_ip,
+              "overlay relay: single-relay dialer link ready (raw → anchor R)");
         Some(link)
     }
 
@@ -1213,6 +1245,7 @@ impl RelayCoordinator {
             overlay_ip: peer.overlay_ip,
             carrier,
             relay_parts: Some((conn, dst)),
+            extra_permission_targets: Vec::new(),
             supports_quic: false, // DERP raw v1: never QUIC-over-DERP (A2)
             single_relay: None,   // symmetric — no anchor/dialer role
             relay_kind: RelayKind::Derp,
@@ -1304,10 +1337,63 @@ async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
     pick
 }
 
+/// W6 phase-2 — the dialer's OTHER public srflx addresses (distinct IPs,
+/// `primary` excluded, LAN skipped, capped at 3) the anchor must ALSO open
+/// coturn permissions for. Permissions are IP-scoped, so one entry per IP
+/// suffices; a multi-homed dialer advertises one srflx per plane sock and
+/// its raw dial socket picks a source by route — any advertised IP may be
+/// the one that shows up at coturn.
+fn extra_srflx_permission_targets(srflx: &[String], primary: IpAddr) -> Vec<SocketAddr> {
+    let mut seen = vec![primary];
+    let mut out = Vec::new();
+    for s in srflx.iter().filter_map(|e| e.parse::<SocketAddr>().ok()) {
+        if is_lan_addr(s.ip()) || seen.contains(&s.ip()) {
+            continue;
+        }
+        seen.push(s.ip());
+        out.push(s);
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// W6 phase-2 — the anchor permits every DISTINCT public srflx IP the
+    /// dialer advertises, beyond the primary: same-IP re-adverts collapse,
+    /// LAN entries and garbage are skipped, and the list is capped.
+    #[test]
+    fn extra_permission_targets_are_distinct_public_ips_beyond_the_primary() {
+        let srflx = vec![
+            "94.130.141.98:43648".to_string(),  // primary's IP — excluded
+            "94.130.141.98:51000".to_string(),  // same IP, other port — collapsed
+            "94.130.141.74:43648".to_string(),  // the multi-homed second IP
+            "192.168.68.106:43648".to_string(), // LAN — skipped
+            "not-an-addr".to_string(),          // garbage — skipped
+            "62.210.194.66:43648".to_string(),
+        ];
+        let primary: IpAddr = "94.130.141.98".parse().unwrap();
+        let got = extra_srflx_permission_targets(&srflx, primary);
+        assert_eq!(
+            got,
+            vec![
+                "94.130.141.74:43648".parse::<SocketAddr>().unwrap(),
+                "62.210.194.66:43648".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+
+        // Cap at 3 distinct extras.
+        let many: Vec<String> = (1..=6).map(|i| format!("203.0.113.{i}:1000")).collect();
+        assert_eq!(
+            extra_srflx_permission_targets(&many, "198.51.100.1".parse().unwrap()).len(),
+            3
+        );
+    }
 
     fn ice(url: &str) -> IceServer {
         IceServer {
