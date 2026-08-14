@@ -1575,6 +1575,14 @@ pub struct PeerLink {
     pub tx: u64,
     #[serde(default)]
     pub rx: u64,
+    /// Relay flavour + transport as one qualified suffix — `turn/udp`,
+    /// `turn/tcp`, `derp/tcp` — the same detail the CLI's CONN column
+    /// renders after `relay:` (wave 4). A bare carrier can't distinguish a
+    /// ~50 ms coturn/UDP hop from a ~175 ms DERP/TCP one, which is exactly
+    /// what the mesh graph exists to show. `None` for non-relay edges and
+    /// for agents older than the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 /// One region's probe outcome in [`ClientMsg::RelayProbeReport`].
@@ -2118,14 +2126,26 @@ mod tests {
                 overlay_tx_bytes: 8_192,
                 tunnel_rx_bytes: 65_536,
                 tunnel_tx_bytes: 1_024,
-                links: vec![PeerLink {
-                    node: "6a1f00000000000000000001".into(),
-                    carrier: "direct".into(),
-                    rtt_ms: Some(12),
-                    stalled: false,
-                    tx: 512,
-                    rx: 256,
-                }],
+                links: vec![
+                    PeerLink {
+                        node: "6a1f00000000000000000001".into(),
+                        carrier: "direct".into(),
+                        rtt_ms: Some(12),
+                        stalled: false,
+                        tx: 512,
+                        rx: 256,
+                        relay: None,
+                    },
+                    PeerLink {
+                        node: "6a1f00000000000000000002".into(),
+                        carrier: "relay".into(),
+                        rtt_ms: Some(87),
+                        stalled: false,
+                        tx: 0,
+                        rx: 0,
+                        relay: Some("turn/udp".into()),
+                    },
+                ],
             }),
             // The value that matters operationally: a measured ZERO must be
             // distinguishable on the wire from an agent that doesn't report.
@@ -2151,6 +2171,14 @@ mod tests {
         // bytes has to stay distinguishable from an agent too old to count.
         assert!(s.contains(r#""tx":512"#));
         assert!(s.contains(r#""rx":256"#));
+        // Wave 4: the relay qualifier serialises when present and is SKIPPED
+        // when absent — a direct edge must not carry a null `relay` key
+        // (pre-wave-4 payloads stay byte-identical for such links).
+        assert!(s.contains(r#""relay":"turn/udp""#));
+        assert!(
+            !s.contains(r#""relay":null"#),
+            "a direct edge must omit `relay`, not null it: {s}"
+        );
         assert!(s.contains(r#""overlay_rx_bytes":4096"#));
         assert!(s.contains(r#""overlay_tx_bytes":8192"#));
         assert!(s.contains(r#""tunnel_rx_bytes":65536"#));

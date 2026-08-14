@@ -41,6 +41,26 @@
 
       <svg :width="size" :height="size" role="img" class="mesh-svg">
         <title>Overlay mesh: devices, their control-plane links and peer carriers</title>
+        <defs>
+          <!-- Asymmetric pairs: each half of the chord wears ITS end's
+               carrier colour (userSpaceOnUse maps the A→B line onto the
+               curved path well enough to read at a glance). -->
+          <linearGradient
+            v-for="g in gradientDefs"
+            :id="g.id"
+            :key="g.id"
+            gradientUnits="userSpaceOnUse"
+            :x1="g.x1"
+            :y1="g.y1"
+            :x2="g.x2"
+            :y2="g.y2"
+          >
+            <stop offset="0%" :stop-color="g.from" />
+            <stop offset="42%" :stop-color="g.from" />
+            <stop offset="58%" :stop-color="g.to" />
+            <stop offset="100%" :stop-color="g.to" />
+          </linearGradient>
+        </defs>
         <g :transform="`translate(${size / 2},${size / 2})`">
           <!-- Ring guide -->
           <circle :r="radius" class="mesh-ring" />
@@ -64,7 +84,7 @@
             v-for="e in visibleEdges"
             :key="e.key"
             :d="e.d"
-            :stroke="carrierColor(e.carrier)"
+            :stroke="e.stroke"
             :stroke-dasharray="e.stalled ? '4 3' : undefined"
             :stroke-width="e.hovered ? 3 : 1.6"
             :opacity="e.hovered ? 1 : 0.65"
@@ -111,6 +131,11 @@
 
       <div class="mesh-legend text-caption text-medium-emphasis">
         {{ visibleNodes.length }} devices · {{ visibleEdges.length }} links shown
+        <template v-if="asymmetricCount > 0">
+          · {{ asymmetricCount }} asymmetric
+          <span class="mesh-asym-swatch" aria-hidden="true" />
+          <span>two-colour = each side's own carrier</span>
+        </template>
       </div>
     </template>
   </div>
@@ -125,6 +150,12 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { lineRadial, curveBundle } from 'd3-shape'
 import { useTheme } from 'vuetify'
+import {
+  edgeSides,
+  participatingCarriers,
+  qualifiedCarrier,
+  type MeshEdgeEnd,
+} from '@/utils/mesh'
 
 export interface MeshNode {
   /** overlay node id (what edges are keyed by) */
@@ -141,7 +172,13 @@ export interface MeshEdge {
   rtt_ms?: number | null
   stalled?: boolean
   reports?: number
+  /** Wave 4 — each end's own report; see `@/utils/mesh`. */
+  ends?: MeshEdgeEnd[]
 }
+
+// Gradient ids must be document-unique; a per-instance prefix keeps two
+// graphs on one page from cross-referencing each other's defs.
+let instanceCounter = 0
 
 const props = withDefaults(
   defineProps<{
@@ -235,9 +272,16 @@ const visibleNodes = computed(() =>
   showOffline.value ? placed.value : placed.value.filter((n) => n.online),
 )
 
+// Per-class counts follow the same rule as visibility: an asymmetric edge
+// counts toward BOTH its classes, so the chip numbers always match what
+// toggling that chip affects.
 const edgeCounts = computed<Record<string, number>>(() => {
   const out: Record<string, number> = {}
-  for (const e of props.edges) out[e.carrier] = (out[e.carrier] ?? 0) + 1
+  for (const e of props.edges) {
+    for (const c of participatingCarriers(e.carrier, e.ends)) {
+      out[c] = (out[c] ?? 0) + 1
+    }
+  }
   return out
 })
 
@@ -248,19 +292,45 @@ const chord = lineRadial<{ a: number; r: number }>()
   .radius((d) => d.r)
   .curve(curveBundle.beta(0.75))
 
+interface EdgeGradient {
+  id: string
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  from: string
+  to: string
+}
 interface DrawnEdge {
   key: string
   d: string
-  carrier: string
+  stroke: string
+  grad?: EdgeGradient
+  asymmetric: boolean
   stalled: boolean
   hovered: boolean
   tip: string
 }
+
+const gradPrefix = `mesh-grad-${++instanceCounter}`
+
+/** One tooltip line per reported direction, in the CLI's vocabulary. */
+function directionLine(fromName: string, toName: string, end: MeshEdgeEnd): string {
+  return (
+    `${fromName} → ${toName}: ${qualifiedCarrier(end.carrier, end.relay)}` +
+    (end.rtt_ms != null ? ` · ${end.rtt_ms} ms` : '') +
+    (end.stalled ? ' · stalled' : '')
+  )
+}
+
 const visibleEdges = computed<DrawnEdge[]>(() => {
   const byId = new Map(visibleNodes.value.map((n) => [n.id, n]))
   const out: DrawnEdge[] = []
   for (const e of props.edges) {
-    if (!shownCarriers.value.includes(e.carrier)) continue
+    // Visible if ANY participating class is enabled: hiding "relay" must
+    // not also hide the direct half of an asymmetric pair.
+    if (!participatingCarriers(e.carrier, e.ends).some((c) => shownCarriers.value.includes(c)))
+      continue
     const a = byId.get(e.from)
     const b = byId.get(e.to)
     if (!a || !b) continue // an endpoint is hidden (offline filter)
@@ -272,21 +342,54 @@ const visibleEdges = computed<DrawnEdge[]>(() => {
       { a: (a.angle + b.angle) / 2 + Math.PI / 2, r: radius.value * 0.35 },
       { a: b.angle + Math.PI / 2, r: radius.value },
     ]
+    const sides = edgeSides(e.ends, e.from, e.to)
+
+    let stroke = carrierColor(e.carrier)
+    let grad: EdgeGradient | undefined
+    if (sides.asymmetric && sides.from && sides.to) {
+      grad = {
+        id: `${gradPrefix}-${out.length}`,
+        x1: a.x,
+        y1: a.y,
+        x2: b.x,
+        y2: b.y,
+        from: carrierColor(sides.from.carrier),
+        to: carrierColor(sides.to.carrier),
+      }
+      stroke = `url(#${grad.id})`
+    }
+
+    // Per-direction tooltip when the ends are known; the legacy merged
+    // line otherwise (old server payload, or an edge with no reports).
+    const lines: string[] = []
+    if (sides.from) lines.push(directionLine(a.name, b.name, sides.from))
+    if (sides.to) lines.push(directionLine(b.name, a.name, sides.to))
+    if (!lines.length) {
+      lines.push(
+        `${a.name} ↔ ${b.name} · ${e.carrier}` + (e.rtt_ms != null ? ` · ${e.rtt_ms} ms` : ''),
+      )
+    }
+    if (e.stalled && !sides.from?.stalled && !sides.to?.stalled) lines.push('stalled')
+    if (e.reports === 1) lines.push('one-sided — only one end reported')
+
     out.push({
       key,
       d: chord(pts) ?? '',
-      carrier: e.carrier,
+      stroke,
+      grad,
+      asymmetric: sides.asymmetric,
       stalled: !!e.stalled,
       hovered: hoverEdge.value === key,
-      tip:
-        `${a.name} ↔ ${b.name} · ${e.carrier}` +
-        (e.rtt_ms != null ? ` · ${e.rtt_ms} ms` : '') +
-        (e.stalled ? ' · stalled' : '') +
-        (e.reports === 1 ? ' · one-sided' : ''),
+      tip: lines.join('\n'),
     })
   }
   return out
 })
+
+const gradientDefs = computed<EdgeGradient[]>(() =>
+  visibleEdges.value.flatMap((e) => (e.grad ? [e.grad] : [])),
+)
+const asymmetricCount = computed(() => visibleEdges.value.filter((e) => e.asymmetric).length)
 
 const tooltip = computed(() => {
   if (hoverEdge.value) {
@@ -369,8 +472,23 @@ const tooltip = computed(() => {
   border-radius: 6px;
   padding: 4px 10px;
   pointer-events: none;
-  white-space: nowrap;
+  /* One line per direction — an asymmetric edge reads as two claims. */
+  white-space: pre-line;
+  text-align: left;
   z-index: 2;
+}
+.mesh-asym-swatch {
+  display: inline-block;
+  width: 22px;
+  height: 6px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin: 0 4px;
+  background: linear-gradient(
+    to right,
+    rgb(var(--v-theme-success)) 42%,
+    rgb(var(--v-theme-warning)) 58%
+  );
 }
 .mesh-dot {
   display: inline-block;
