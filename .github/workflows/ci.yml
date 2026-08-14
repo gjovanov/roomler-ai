@@ -199,38 +199,6 @@ jobs:
       - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
         run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
 
-  windows-overlay-clippy:
-    # Windows-only code was entirely UN-LINTED: the Rust job runs on
-    # ubuntu-latest, so its `-D warnings` never compiles the 66
-    # `#[cfg(windows)]` sites in overlay/ (wfp.rs alone is 456 LOC), the
-    # win_service supervisor, or the Windows halves of tun.rs/dns.rs/nat.rs.
-    # A dead-code warning shipped in rc.359 sat invisible for 5 rc's
-    # because only local Windows builds ever saw it (2026-08-14 audit).
-    #
-    # Crate-scoped on purpose — a workspace-wide `--all-features` clippy
-    # does NOT build on Windows (audiopus pulls cmake); these two lanes
-    # mirror the Linux feature lanes and the local dev gates exactly.
-    # `--all-targets`/`--tests` included: test-only code is where the
-    # first fix wave's lints lived (constant asserts, guard-across-await).
-    name: Windows overlay clippy
-    runs-on: windows-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.95.0
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        continue-on-error: true
-        with:
-          shared-key: ci-windows-clippy
-          cache-on-failure: true
-      - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
-        run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
-      - name: Clippy roomler-agent (overlay-l3, incl. tests)
-        run: cargo clippy -p roomler-agent --features overlay-l3 --tests -- -D warnings
-
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
         # someone's Mac, with launchctl's famously unhelpful diagnostics.
@@ -269,6 +237,38 @@ jobs:
           echo "test binary: $BIN"
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" macos_kernel_tests \
             --test-threads=1 --nocapture
+
+  windows-overlay-clippy:
+    # Windows-only code was entirely UN-LINTED: the Rust job runs on
+    # ubuntu-latest, so its `-D warnings` never compiles the 66
+    # `#[cfg(windows)]` sites in overlay/ (wfp.rs alone is 456 LOC), the
+    # win_service supervisor, or the Windows halves of tun.rs/dns.rs/nat.rs.
+    # A dead-code warning shipped in rc.359 sat invisible for 5 rc's
+    # because only local Windows builds ever saw it (2026-08-14 audit).
+    #
+    # Crate-scoped on purpose — a workspace-wide `--all-features` clippy
+    # does NOT build on Windows (audiopus pulls cmake); these two lanes
+    # mirror the Linux feature lanes and the local dev gates exactly.
+    # `--all-targets`/`--tests` included: test-only code is where the
+    # first fix wave's lints lived (constant asserts, guard-across-await).
+    name: Windows overlay clippy
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          shared-key: ci-windows-clippy
+          cache-on-failure: true
+      - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
+        run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
+      - name: Clippy roomler-agent (overlay-l3, incl. tests)
+        run: cargo clippy -p roomler-agent --features overlay-l3 --tests -- -D warnings
 
   frontend:
     name: Frontend checks
