@@ -216,21 +216,64 @@ impl Carrier {
 
         let _ = conn.send_to(b"\x00", dst).await;
         let sock = Arc::new(RelayUdpSocket::new(conn)?);
+        // W6 — rendezvous instrumentation. Field 2026-08-14 (CORPLAP-1): EVERY
+        // relay build logged "accept timed out → raw relay", but the log
+        // could not say WHY — dialer never dialed (rendezvous miss), dialer's
+        // packets dropped at coturn (permission-IP mismatch), or handshake
+        // broke mid-flight. The rx counters + the permission dst in the
+        // failure text discriminate those; widen/retry decisions (W6 phase 2)
+        // are made from this data, not blind.
+        let rx_stats = sock.rx_stats();
 
         let (peer, quic) = if am_server {
             let peer = QuicPeer::server_over_relay_datagram(sock)?;
             let quic = tokio::time::timeout(timeout, peer.accept())
                 .await
-                .context("QUIC-over-TURN server accept timed out")?
-                .context("QUIC-over-TURN server: no incoming connection")?
+                .with_context(|| {
+                    format!(
+                        "QUIC-over-TURN server accept timed out ({}s window, permission_dst={dst}, {})",
+                        timeout.as_secs(),
+                        rx_stats.describe()
+                    )
+                })?
+                .with_context(|| {
+                    format!(
+                        "QUIC-over-TURN server: no incoming connection (permission_dst={dst}, {})",
+                        rx_stats.describe()
+                    )
+                })?
                 .context("QUIC-over-TURN server handshake failed")?;
+            // The dialer's source as coturn observed it vs what it advertised.
+            // The permission is IP-scoped, so a different IP could never get
+            // this far; a different PORT is the dialer's NAT allocating
+            // per-destination mappings — symmetric-NAT evidence worth keeping
+            // visible while the rendezvous field data accumulates.
+            let observed = quic.remote_address();
+            if observed == dst {
+                debug!(%observed, "QUIC-over-TURN server: dialer arrived from its advertised srflx");
+            } else {
+                info!(%observed, advertised = %dst,
+                      "QUIC-over-TURN server: dialer's observed source differs from its \
+                       advertised srflx (per-destination NAT mapping)");
+            }
             (peer, quic)
         } else {
             let peer = QuicPeer::client_over_relay_datagram(sock)?;
             let quic = tokio::time::timeout(timeout, peer.connect(dst))
                 .await
-                .context("QUIC-over-TURN client connect timed out")?
-                .context("QUIC-over-TURN client handshake failed")?;
+                .with_context(|| {
+                    format!(
+                        "QUIC-over-TURN client connect timed out ({}s window, dst={dst}, {})",
+                        timeout.as_secs(),
+                        rx_stats.describe()
+                    )
+                })?
+                .with_context(|| {
+                    format!(
+                        "QUIC-over-TURN client handshake failed (dst={dst}, {})",
+                        rx_stats.describe()
+                    )
+                })?;
             (peer, quic)
         };
 
