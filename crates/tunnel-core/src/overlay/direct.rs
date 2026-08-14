@@ -784,6 +784,21 @@ pub fn same_subnet_24(a: Ipv4Addr, b: Ipv4Addr) -> bool {
 /// over the LAN even when a full-tunnel VPN has hijacked the default route).
 /// `None` if the peer advertised no same-subnet endpoint (→ caller falls back
 /// to the relay).
+///
+/// A peer advertising one of **our own** addresses is skipped. That is not a
+/// hypothetical: WSL in mirrored mode shares the host's NICs, so the guest
+/// advertises the host's Wi-Fi address verbatim, and the /24 test passes
+/// trivially against ourselves. Dialling it cannot work by construction — the
+/// packet is delivered to this host's own stack and never reaches the peer.
+///
+/// Field 2026-08-14, neo16: `dst=192.168.68.126:43648` (its OWN Wi-Fi address)
+/// probed every 90 s for 14 days across two WSL peers — 12 684 consecutive
+/// failures, zero successes. The wasted probes were the visible half. The
+/// expensive half was silent: [`srflx_hairpin_pointless`] takes "a LAN
+/// candidate exists" as its same-NAT signal, so the phantom candidate also
+/// SUPPRESSED the srflx tier, leaving the pair pinned to the relay with no
+/// tier left that could ever promote. Two hosts on the same machine were
+/// relaying through a TCP DERP server because of it.
 pub fn pick_same_subnet_endpoint(
     my_ips: &[Ipv4Addr],
     endpoints: &[String],
@@ -793,6 +808,10 @@ pub fn pick_same_subnet_endpoint(
         let raw = ep.trim();
         if let Ok(SocketAddr::V4(sa)) = raw.parse::<SocketAddr>()
             && is_usable_lan_ipv4(*sa.ip())
+            // Skip THIS endpoint rather than abandoning the search: a peer can
+            // advertise several, and a self-address must not shadow a usable
+            // one later in the list.
+            && !my_ips.contains(sa.ip())
             && let Some(local) = my_ips.iter().find(|me| same_subnet_24(**me, *sa.ip()))
         {
             return Some((*local, SocketAddr::V4(sa)));
@@ -1672,6 +1691,43 @@ mod tests {
         // A same-subnet but CGNAT endpoint is rejected.
         let cgnat = vec!["100.64.0.110:51820".to_string()];
         assert!(pick_same_subnet_endpoint(&["100.64.0.103".parse().unwrap()], &cgnat).is_none());
+    }
+
+    /// A peer advertising OUR OWN address is not a LAN candidate — dialling it
+    /// never leaves this host.
+    ///
+    /// Field 2026-08-14, neo16 (192.168.68.126 on Wi-Fi): both WSL peers run in
+    /// mirrored mode, which shares the host's NICs, so each advertised the
+    /// host's own address on its own port. The /24 test passed against
+    /// ourselves and the LAN probe ran every 90 s for 14 days — 12 684
+    /// failures, zero successes. Worse, the phantom candidate fed
+    /// `srflx_hairpin_pointless`, suppressing srflx too, so the pair could
+    /// never promote off `relay:derp/tcp` by ANY tier.
+    #[test]
+    fn our_own_address_is_never_a_lan_candidate() {
+        let me: [Ipv4Addr; 1] = ["192.168.68.126".parse().unwrap()];
+
+        // Exactly what neo16 probed 12 684 times. Different port, same host.
+        let wsl_mirrored = vec!["192.168.68.126:43648".to_string()];
+        assert!(
+            pick_same_subnet_endpoint(&me, &wsl_mirrored).is_none(),
+            "our own address cannot be dialled off-box, whatever the port"
+        );
+
+        // A real neighbour on the same /24 is still picked — the guard must not
+        // disable the LAN tier generally.
+        let neighbour = vec!["192.168.68.119:43648".to_string()];
+        assert!(pick_same_subnet_endpoint(&me, &neighbour).is_some());
+
+        // And a self-address earlier in the list must not shadow a usable one
+        // after it: the guard skips the endpoint, it does not end the search.
+        let both = vec![
+            "192.168.68.126:43648".to_string(),
+            "192.168.68.119:43648".to_string(),
+        ];
+        let (local, ep) = pick_same_subnet_endpoint(&me, &both).expect("neighbour still reachable");
+        assert_eq!(local, me[0]);
+        assert_eq!(ep, "192.168.68.119:43648".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
