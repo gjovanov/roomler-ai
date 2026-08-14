@@ -2100,6 +2100,21 @@ const agentHasAv1 = computed<boolean>(() => {
     || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-av1_'))
   )
 })
+// Whether the AGENT can encode HEVC. The HEVC option used to be gated on
+// the BROWSER's decoder alone, so a Chrome with HW H.265 offered HEVC on
+// an agent that cannot produce it (an aarch64 Linux agent advertising
+// only h264 + data-channel-vp9-444 still showed HEVC selectable, while
+// AV1 — which checks both ends — correctly greyed out).
+const agentHasHevc = computed<boolean>(() => {
+  const caps = agent.value?.capabilities
+  // Caps not loaded yet → optimistic, same contract as AV1.
+  if (!caps) return true
+  return (
+    (caps.transports ?? []).includes('data-channel-hevc')
+    || (caps.codecs ?? []).includes('h265')
+    || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-hevc_'))
+  )
+})
 // Opt-in "receive host audio" toggle. Same "takes effect on next
 // Connect" shape as the transport toggles above (the recvonly audio
 // transceiver + `audio_enabled` request flag are fixed at offer time),
@@ -2238,9 +2253,12 @@ const codecChoiceOptions = computed(() => {
     : !agentHasAv1.value
       ? 'This agent has no AV1 hardware encoder'
       : 'Best quality per bit — needs HW on both ends'
-  const hevcReason = rc.hevcSupported.value
-    ? 'HW H.265 encode on the agent (NVENC/QSV/AMF)'
-    : 'This browser lacks a HW HEVC decoder'
+  const hevcOk = rc.hevcSupported.value && agentHasHevc.value
+  const hevcReason = !rc.hevcSupported.value
+    ? 'This browser lacks a HW HEVC decoder'
+    : !agentHasHevc.value
+      ? 'This agent has no HEVC encoder'
+      : 'HW H.265 encode on the agent (NVENC/QSV/AMF)'
   const vp9Reason = rc.vp9_444Supported.value
     ? 'Software VP9 — universally decodable'
     : 'This browser can’t decode VP9 profile 1'
@@ -2258,7 +2276,7 @@ const codecChoiceOptions = computed(() => {
     {
       title: 'HEVC (H.265)',
       value: 'hevc',
-      props: { disabled: !rc.hevcSupported.value, subtitle: hevcReason },
+      props: { disabled: !hevcOk, subtitle: hevcReason },
     },
     {
       title: 'VP9 · crisp text (4:4:4)',
