@@ -143,9 +143,9 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // a fresh install skips the rc.18 migration on first launch.
         config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),
         // T2.8 default = enabled + empty allowlist (trust server).
-        forward_acl: crate::tunnel::acl::AgentForwardAcl::default(),
+        forward_acl: crate::acl::AgentForwardAcl::default(),
         // Remote app-launch: default = enabled with a seeded bash/tmux entry.
-        virtual_desktop_apps: crate::apps::VirtualDesktopAppsConfig::default(),
+        virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig::default(),
         // Phase 3b: overlay opt-in, off until the operator enables it.
         overlay_enabled: false,
         // Multi-org P2c: secondary-org TUN sharing, off until opted in.
