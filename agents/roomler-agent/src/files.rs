@@ -2607,7 +2607,7 @@ mod tests {
         let _count = walk_handle.await.unwrap().expect("walk_and_zip");
         let sink = drain_handle.await.unwrap();
 
-        assert!(sink.len() > 0, "zip output should be non-empty");
+        assert!(!sink.is_empty(), "zip output should be non-empty");
         // The zip MUST end with the End-of-Central-Directory record
         // (PKzip signature 0x06054b50). If walk_and_zip exited
         // without `.close()` we'd see truncated output.
@@ -2868,10 +2868,13 @@ mod tests {
         assert_eq!(meta.dest_dir, canonical_dest);
 
         // Registry was populated. Lookup canonicalises to the same
-        // path as what `begin()` stored.
-        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(g.get(&id).map(|p| p.as_path()), Some(meta_path.as_path()));
-        drop(g);
+        // path as what `begin()` stored. (Block-scoped, not drop():
+        // clippy's await_holding_lock drop-tracking doesn't credit an
+        // explicit drop and flags the guard against the await below.)
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g.get(&id).map(|p| p.as_path()), Some(meta_path.as_path()));
+        }
 
         h.abort().await;
         let _ = tokio::fs::remove_dir_all(&dest).await;
@@ -2908,10 +2911,11 @@ mod tests {
         // all gone.
         let staging_parent = dest.join(".roomler-partial");
         assert!(!staging_parent.join(&id).exists(), "per-id dir leaked");
-        // Registry entry removed.
-        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(g.get(&id).is_none(), "registry entry leaked");
-        drop(g);
+        // Registry entry removed. (Block-scoped for await_holding_lock.)
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.get(&id).is_none(), "registry entry leaked");
+        }
         let _ = tokio::fs::remove_dir_all(&dest).await;
     }
 
@@ -3244,14 +3248,16 @@ mod tests {
         assert_eq!(kept, 1, "should keep the 1h-old dir");
         assert!(!stale_dir.exists(), "stale dir should be removed");
         assert!(fresh_dir.exists(), "fresh dir should survive");
-        // Fresh entry is in the registry.
-        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            g.contains_key("rc19-sweep-fresh"),
-            "fresh id missing from registry: {:?}",
-            g.keys().collect::<Vec<_>>()
-        );
-        drop(g);
+        // Fresh entry is in the registry. (Block-scoped for
+        // await_holding_lock.)
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                g.contains_key("rc19-sweep-fresh"),
+                "fresh id missing from registry: {:?}",
+                g.keys().collect::<Vec<_>>()
+            );
+        }
         let _ = tokio::fs::remove_dir_all(&dest).await;
     }
 

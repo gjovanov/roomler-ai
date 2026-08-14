@@ -1753,6 +1753,8 @@ mod tests {
     // ─── Phase 4: observability constants pinned ─────────────────────────────
 
     #[test]
+    // Compile-time contract lock — the constant-ness IS the point.
+    #[allow(clippy::assertions_on_constants)]
     fn respawn_alarm_threshold_aligns_with_backoff_cap() {
         // RESPAWN_ALARM_THRESHOLD is the observability signal — past
         // this many consecutive failures the supervisor escalates to

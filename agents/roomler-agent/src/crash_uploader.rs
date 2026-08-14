@@ -349,6 +349,8 @@ mod tests {
     }
 
     #[test]
+    // Compile-time contract lock — the constant-ness IS the point.
+    #[allow(clippy::assertions_on_constants)]
     fn crash_drain_interval_is_reasonable() {
         // Phase 4 pin: too short → wasted CPU + needless HTTP load on
         // long-running healthy agents. Too long → sidecars sit on
