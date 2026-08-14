@@ -5,6 +5,8 @@ members = [
     "crates/db",
     "crates/services",
     "crates/remote_control",
+    "crates/localapi",
+    "crates/agent-core",
     "crates/tunnel-core",
     # P5 — the webrtc-ice fork's substance (TURNS/TCP Conn adapter), extracted
     # so the vendored tree is a mechanical patch. Consumed by tunnel-core AND
@@ -20,6 +22,7 @@ members = [
 
     "agents/roomler-agent",
     "agents/roomler-agent-tray",
+    "agents/roomler-cli-shim",
     "agents/roomler-setup",
     "agents/roomler-tunnel",
 ]

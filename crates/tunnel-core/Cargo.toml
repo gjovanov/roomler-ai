@@ -13,6 +13,10 @@ path = "src/lib.rs"
 # ClientMsg/ServerMsg enum in T2; tunnel-core re-exports the subset
 # it cares about so callers have one import).
 roomler-ai-remote-control = { path = "../remote_control" }
+# The LocalAPI protocol, re-exported from lib.rs as `tunnel_core::localapi`
+# (P3e lever E — it lives in a leaf crate so thin clients can speak it without
+# compiling this crate's data plane).
+roomler-localapi = { path = "../localapi" }
 
 # Async + concurrency
 tokio = { workspace = true }

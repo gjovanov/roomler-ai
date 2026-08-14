@@ -580,8 +580,40 @@ fn self_heal_machine_global_config(loaded_path: &std::path::Path, cfg: &config::
 #[cfg(not(all(feature = "system-context", target_os = "windows")))]
 fn self_heal_machine_global_config(_loaded_path: &std::path::Path, _cfg: &config::AgentConfig) {}
 
+/// `roomlerd cli <args...>` → the argv to hand to the embedded `roomler`
+/// CLI, or `None` for every other invocation.
+///
+/// P3e lever D: daemon hosts install a ~150 KB `roomler.exe` shim that
+/// re-execs us this way, instead of the MSI carrying a second full copy of
+/// the tunnel CLI (rc.361: 22.1 MiB, ~92 % of it crates we already link).
+///
+/// Read straight from raw argv, on purpose. Routing it through the daemon's
+/// own clap enum would mean a CLI call first ran every daemon-startup side
+/// effect below — DPI awareness, the 1 ms multimedia timer, the legacy-tree
+/// migration, `logging::init` — none of which the standalone `roomler`
+/// binary does. Element 0 is re-labelled so usage text still reads
+/// `roomler ...` rather than `roomlerd ...`.
+fn embedded_cli_args() -> Option<Vec<std::ffi::OsString>> {
+    let mut it = std::env::args_os();
+    let _exe = it.next()?;
+    if it.next()? != "cli" {
+        return None;
+    }
+    let mut argv = vec![std::ffi::OsString::from("roomler")];
+    argv.extend(it);
+    Some(argv)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // P3e lever D — embedded `roomler` CLI. MUST stay the first statement in
+    // main(): everything below is daemon-startup setup that a CLI invocation
+    // has no business performing. See `embedded_cli_args`.
+    if let Some(argv) = embedded_cli_args() {
+        return roomler_tunnel::cli::run_from(argv, roomler_tunnel::cli::Origin::EmbeddedInDaemon)
+            .await;
+    }
+
     // Set per-monitor-V2 DPI awareness as the very first thing on
     // Windows. Capture frames (WGC / DXGI / scrap) are always physical
     // pixels regardless of awareness, but enigo's mouse-position APIs

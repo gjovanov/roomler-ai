@@ -130,7 +130,7 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub orgs: Vec<OrgStatus>,
     /// Multi-org v2 retirement evidence — cumulative compensation-layer
-    /// activity since daemon start ([`crate::evidence`]). The Phase-3
+    /// activity since daemon start (`tunnel_core::evidence`). The Phase-3
     /// deletion gate reads these: fleet-wide zeros over the soak window is
     /// the license to delete the layer. `None` from a daemon predating the
     /// counters; consumers DIFF two readings, never judge absolutes.
@@ -147,19 +147,19 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_socks: Vec<DirectSockStatus>,
     /// PR-B1 tripwire — direct-socket binds that walked off the stable base
-    /// port this run ([`crate::evidence::DIRECT_BIND_WALKS`]). Nonzero on a
+    /// port this run (`tunnel_core::evidence::DIRECT_BIND_WALKS`). Nonzero on a
     /// host with a configured stable port = external squatter OR an
     /// in-process bind collision (bug signal). `None` from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_bind_walks: Option<u64>,
     /// A3 — peer endpoints adopted via WG-style roaming since daemon start
-    /// ([`crate::evidence::ROAM_ADOPTIONS`]). A few is normal (symmetric-NAT
+    /// (`tunnel_core::evidence::ROAM_ADOPTIONS`). A few is normal (symmetric-NAT
     /// mapping learned); a steadily climbing count is endpoint thrash. `None`
     /// from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roam_adoptions: Option<u64>,
     /// C1 (disco) — out-of-tunnel carrier echoes this node ANSWERED
-    /// ([`crate::evidence::DISCO_ANSWERED`]). Nonzero on every node is the C1
+    /// (`tunnel_core::evidence::DISCO_ANSWERED`). Nonzero on every node is the C1
     /// field gate: the fleet can answer, so a prober may ship next. `None`
     /// from a daemon predating the responder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
