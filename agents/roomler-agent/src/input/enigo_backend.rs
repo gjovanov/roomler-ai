@@ -53,7 +53,26 @@ impl EnigoInjector {
             .context("spawn input thread")?;
 
         ready_rx.recv().context("input thread never responded")??;
-        Ok(Self { tx, has_perm: true })
+
+        // macOS: Enigo::new succeeds even when Accessibility is denied —
+        // the OS then swallows every CGEventPost with no error anywhere
+        // ("the mouse doesn't move and nothing logs"). Probe honestly.
+        #[cfg(target_os = "macos")]
+        let has_perm = {
+            let trusted = crate::tcc::accessibility_trusted();
+            if !trusted {
+                tracing::warn!(
+                    "macOS Accessibility permission MISSING — injected input will be silently dropped. \
+                     Grant it under System Settings → Privacy & Security → Accessibility, then restart the \
+                     agent (launchctl kickstart -k gui/$UID/com.roomler.agent)"
+                );
+            }
+            trusted
+        };
+        #[cfg(not(target_os = "macos"))]
+        let has_perm = true;
+
+        Ok(Self { tx, has_perm })
     }
 }
 
