@@ -6,6 +6,24 @@
 
 use super::*;
 
+/// Classify an authenticated inbound init's SOURCE into a direct tier: a
+/// public source matching the peer's advertised srflx is a hole-punch
+/// (Phase C), any other public source is a direct-to-public dial (Phase A),
+/// a private source is a same-LAN roam. Returns `(tier, is_public_src)` —
+/// the bool also gates the exit-exemption dst on install. Pure.
+pub(super) fn classify_inbound_src(src: SocketAddr, peer_srflx: &[String]) -> (DirectTier, bool) {
+    let is_public = matches!(src, SocketAddr::V4(v4) if direct::is_public_v4(*v4.ip()));
+    let src_str = src.to_string();
+    let tier = if is_public && peer_srflx.iter().any(|e| e.trim() == src_str) {
+        DirectTier::Srflx
+    } else if is_public {
+        DirectTier::Public
+    } else {
+        DirectTier::Lan
+    };
+    (tier, is_public)
+}
+
 impl OverlayRuntime {
     /// Phase A — act on an AUTHENTICATED inbound direct handshake initiation
     /// forwarded by a demux loop ([`crate::overlay::wg::DirectInbound`]): a NAT'd client
@@ -66,22 +84,10 @@ impl OverlayRuntime {
             return;
         }
 
-        // Classify the arriving source into a tier. A public source that
-        // matches this peer's advertised srflx is a hole-punch (Phase C); any
-        // other public source is a direct-to-public dial (Phase A); a private
-        // source is a same-LAN roam.
+        // Classify the arriving source into a tier (pure helper below).
         let now = Instant::now();
         let make_before_break = crate::overlay::direct::make_before_break_enabled();
-        let is_public_src = matches!(inb.src, SocketAddr::V4(v4) if direct::is_public_v4(*v4.ip()));
-        let src_str = inb.src.to_string();
-        let is_srflx_src = is_public_src && np.srflx_endpoints.iter().any(|e| e.trim() == src_str);
-        let tier = if is_srflx_src {
-            DirectTier::Srflx
-        } else if is_public_src {
-            DirectTier::Public
-        } else {
-            DirectTier::Lan
-        };
+        let (tier, is_public_src) = classify_inbound_src(inb.src, &np.srflx_endpoints);
 
         // P3 PR-A — the monitor's inbound decision (evidence feed + its own
         // D9 clear + eligibility gate), against the PRE-mutation incumbent.
@@ -215,5 +221,57 @@ impl OverlayRuntime {
         // Answer the init that triggered this, immediately.
         wg.feed_direct(inb.src, inb.sock.clone(), &inb.packet).await;
         info!(peer = %node_id, src = %inb.src, ?tier, "overlay: accepted authenticated inbound direct handshake");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! First tests in this module (2026-08-14 debt audit: 219 LOC, zero
+    //! tests). The full `handle_direct_inbound` needs a live WgDevice +
+    //! runtime; the extracted pure classifier is the decision logic worth
+    //! locking first — a mis-tiered inbound picks the wrong deadline,
+    //! cooldown, and exit-exemption.
+
+    use super::*;
+
+    fn srflx(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn private_source_is_a_lan_roam() {
+        let (tier, public) =
+            classify_inbound_src("192.168.68.4:43648".parse().unwrap(), &srflx(&[]));
+        assert_eq!(tier, DirectTier::Lan);
+        assert!(!public);
+    }
+
+    #[test]
+    fn public_source_matching_the_peers_srflx_is_a_punch() {
+        let (tier, public) = classify_inbound_src(
+            "37.63.112.129:43649".parse().unwrap(),
+            &srflx(&["37.63.112.129:43649", "5.9.157.221:43648"]),
+        );
+        assert_eq!(tier, DirectTier::Srflx);
+        assert!(public);
+    }
+
+    #[test]
+    fn srflx_match_tolerates_whitespace_in_the_advert() {
+        let (tier, _) = classify_inbound_src(
+            "37.63.112.129:43649".parse().unwrap(),
+            &srflx(&[" 37.63.112.129:43649 "]),
+        );
+        assert_eq!(tier, DirectTier::Srflx);
+    }
+
+    #[test]
+    fn public_source_not_in_the_advert_is_a_public_dial() {
+        let (tier, public) = classify_inbound_src(
+            "94.130.141.98:43648".parse().unwrap(),
+            &srflx(&["37.63.112.129:43649"]),
+        );
+        assert_eq!(tier, DirectTier::Public);
+        assert!(public);
     }
 }
