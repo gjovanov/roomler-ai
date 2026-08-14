@@ -35,7 +35,14 @@ pub mod env;
 pub mod evidence;
 pub mod forward;
 /// LocalAPI — the daemon's local control surface (P1: read-only protocol).
-pub mod localapi;
+///
+/// P3e lever E moved the module OUT to the leaf crate `roomler-localapi` and
+/// re-exports it here, so `tunnel_core::localapi::…` still resolves for every
+/// existing caller. The point of the move is the other direction: a thin
+/// client (the desktop companion) can now depend on the protocol WITHOUT
+/// compiling this crate's data plane — webrtc, quinn, turn and rustls are
+/// non-optional here, 285 crates in the default graph.
+pub use roomler_localapi as localapi;
 pub mod mux;
 /// Overlay L3 data plane (userspace WireGuard mesh) — feature `overlay`.
 #[cfg(feature = "overlay")]

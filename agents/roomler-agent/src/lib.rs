@@ -2,7 +2,19 @@
 //! CLI shell around these modules; exposing them here lets integration
 //! tests drive the agent in-process against a `TestApp` server.
 
-pub mod appdirs;
+// P3e lever E: the daemon-free building blocks (appdirs, machine, config,
+// config_surface, enrollment, logging, logs_upload, crash_recorder, the
+// notify primitives, the forward ACL, the apps config shapes) moved to the
+// `roomler-agent-core` crate so the desktop companion can link them without
+// this crate's data plane. Re-exported here under their old `crate::` paths —
+// every internal call site is unchanged. `notify` stays a real module (it
+// layers the daemon-only worker-aware wrappers over the core primitives);
+// `apps` re-exports the moved config shapes; the ACL is re-exported inside
+// `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
+pub use roomler_agent_core::{
+    appdirs, config, config_surface, crash_recorder, enrollment, logging, logs_upload, machine,
+};
+
 pub mod apps;
 #[cfg(feature = "audio")]
 pub mod audio;
@@ -10,10 +22,7 @@ pub mod capture;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
 pub mod companion;
-pub mod config;
-pub mod config_surface;
 pub mod consent;
-pub mod crash_recorder;
 pub mod crash_uploader;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod derp;
@@ -22,7 +31,6 @@ pub mod displays;
 #[cfg(target_os = "windows")]
 pub mod dpi;
 pub mod encode;
-pub mod enrollment;
 pub mod exec;
 pub mod files;
 pub mod fp16;
@@ -36,10 +44,7 @@ pub mod jwt_introspect;
 pub mod localapi_state;
 pub mod lock_overlay;
 pub mod lock_state;
-pub mod logging;
 pub mod logs_fetch;
-pub mod logs_upload;
-pub mod machine;
 pub mod mdns_resolve;
 // P5 — crate-private: its surface leans on `peer::TargetResolution`
 // (pub(crate)) and nothing outside the agent consumes it. Compiled on

@@ -38,11 +38,10 @@
 //! The pure parsers + resolvers live here (portable, unit-tested); the
 //! platform I/O lives in the cfg-gated submodules.
 
-use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 #[cfg(target_os = "linux")]
@@ -119,70 +118,11 @@ pub trait WindowManager: Send + Sync {
 // Config (`[virtual_desktop_apps]` in the agent config.toml)
 // ---------------------------------------------------------------------------
 
-/// Remote app-launch config. Default: enabled with a seeded bash/tmux
-/// entry so a fresh VD host offers "New bash session" out of the box.
-/// Operators add htop/mc/… per host. Mirrors the [`crate::tunnel::acl`]
-/// allowlist pattern.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VirtualDesktopAppsConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Friendly key → command spec. The browser sends only the KEY.
-    #[serde(default)]
-    pub allowlist: BTreeMap<String, AppSpec>,
-}
-
-/// One launchable app. `command` is argv (no shell interpolation).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppSpec {
-    /// argv[0..] — executed directly, never through a shell.
-    pub command: Vec<String>,
-    /// Display label; falls back to the key when absent.
-    #[serde(default)]
-    pub label: Option<String>,
-    /// Wrap in a terminal (Linux `xterm -e …`) — for TUI apps.
-    #[serde(default)]
-    pub terminal: bool,
-    /// tmux-backed shell: launch creates/attaches a persistent session.
-    #[serde(default)]
-    pub tmux: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for VirtualDesktopAppsConfig {
-    fn default() -> Self {
-        let mut allowlist = BTreeMap::new();
-        // Seed an OS-appropriate shell so a fresh host has one launchable
-        // entry out of the box; operators add more in the TOML.
-        #[cfg(target_os = "windows")]
-        allowlist.insert(
-            "cmd".to_string(),
-            AppSpec {
-                command: vec!["cmd.exe".to_string()],
-                label: Some("New Command Prompt".to_string()),
-                terminal: false,
-                tmux: false,
-            },
-        );
-        #[cfg(not(target_os = "windows"))]
-        allowlist.insert(
-            "bash".to_string(),
-            AppSpec {
-                command: vec!["bash".to_string()],
-                label: Some("New bash session".to_string()),
-                terminal: true,
-                tmux: true,
-            },
-        );
-        Self {
-            enabled: true,
-            allowlist,
-        }
-    }
-}
+// The serde shapes moved to `roomler-agent-core::apps_config` in P3e lever E
+// (AgentConfig embeds them, and AgentConfig lives there now); the launch
+// machinery around them stays HERE. Re-exported under the old paths so
+// `crate::apps::VirtualDesktopAppsConfig` remains valid everywhere.
+pub use roomler_agent_core::apps_config::{AppSpec, VirtualDesktopAppsConfig};
 
 // ---------------------------------------------------------------------------
 // Process-global config install (mirrors `files::set_remote_browse_enabled`)
@@ -519,6 +459,7 @@ pub fn classify_title(raw: &str) -> ClassifiedTitle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn cfg_with(keys: &[(&str, bool)]) -> VirtualDesktopAppsConfig {
         let mut allowlist = BTreeMap::new();
