@@ -2275,6 +2275,44 @@ pub(crate) fn is_wg_shaped(pkt: &[u8]) -> bool {
     pkt.len() >= 4 && matches!(pkt[0], 1..=4) && pkt[1] == 0 && pkt[2] == 0 && pkt[3] == 0
 }
 
+/// A handshake INITIATION's mac1 covers everything before its own offset:
+/// 4 type/reserved + 4 sender_idx + 32 ephemeral + 48 enc_static + 28
+/// enc_timestamp = 116 bytes; mac1 is the 16 bytes at 116..132 (mac2 fills
+/// 132..148).
+const INIT_MAC1_OFFSET: usize = 116;
+
+/// Precompute the mac1 verification key for a responder static:
+/// `Blake2s256("mac1----" || responder_pub)` — WireGuard's LABEL_MAC1
+/// construction. Derived from PUBLIC data, so a matching mac1 proves only
+/// "addressed to this key", never authenticity — it is a ROUTER's
+/// pre-filter (which engine should spend the DH), not an authenticator.
+pub(crate) fn mac1_key_for(public: &PublicKey) -> [u8; 32] {
+    use blake2::{Blake2s256, Digest};
+    let mut h = Blake2s256::new();
+    h.update(b"mac1----");
+    h.update(public.as_bytes());
+    h.finalize().into()
+}
+
+/// Verify a type-1 packet's mac1 against a precomputed [`mac1_key_for`]
+/// key. ~1 µs of keyed Blake2s vs the X25519 that
+/// [`authenticate_init_with`] spends — run per candidate engine BEFORE the
+/// DH, so a spoofed or foreign initiation costs no asymmetric crypto.
+/// Plain (non-constant-time) compare is fine: the key derives from a
+/// public key, so timing leaks nothing secret.
+pub(crate) fn init_mac1_matches(mac1_key: &[u8; 32], packet: &[u8]) -> bool {
+    use blake2::digest::Mac;
+    type Mac1 = blake2::Blake2sMac<blake2::digest::consts::U16>;
+    if packet.len() < INIT_MAC1_OFFSET + 16 {
+        return false;
+    }
+    let Ok(mut m) = <Mac1 as Mac>::new_from_slice(mac1_key) else {
+        return false;
+    };
+    m.update(&packet[..INIT_MAC1_OFFSET]);
+    m.finalize().into_bytes().as_slice() == &packet[INIT_MAC1_OFFSET..INIT_MAC1_OFFSET + 16]
+}
+
 /// Phase A / carrier plane — the keypair-parameterized core of
 /// [`WgDevice::authenticate_init`], so the shared carrier plane can trial a
 /// handshake initiation against EACH attached engine's static (an init is
@@ -2536,6 +2574,38 @@ mod tests {
     use super::*;
     use crate::overlay::WgKeypair;
     use std::time::Duration;
+
+    /// The mac1 pre-filter against boringtun ground truth: a genuine
+    /// initiation's mac1 matches ONLY the responder static it is sealed
+    /// to, breaks on any covered-byte tamper, and short inputs never
+    /// match. This is what lets the plane pick the one engine worth an
+    /// X25519 for ~1 µs.
+    #[test]
+    fn init_mac1_binds_to_the_sealed_responder_only() {
+        let (initiator, r1, r2) = (
+            WgKeypair::generate(),
+            WgKeypair::generate(),
+            WgKeypair::generate(),
+        );
+        let init = test_genuine_init(&initiator.secret, r1.public.to_bytes());
+        let k1 = mac1_key_for(&r1.public);
+        let k2 = mac1_key_for(&r2.public);
+        assert!(
+            init_mac1_matches(&k1, &init),
+            "mac1 must match the responder the init is sealed to"
+        );
+        assert!(
+            !init_mac1_matches(&k2, &init),
+            "mac1 must not match any other responder"
+        );
+        assert!(!init_mac1_matches(&k1, &init[..100]), "short input");
+        let mut tampered = init.clone();
+        tampered[10] ^= 1;
+        assert!(
+            !init_mac1_matches(&k1, &tampered),
+            "a covered-byte tamper must break the mac"
+        );
+    }
 
     /// A3 — a direct carrier's dst is interior-mutable so an authenticated
     /// roam repoints it in place for every `Arc` holder; relay/QUIC carriers
