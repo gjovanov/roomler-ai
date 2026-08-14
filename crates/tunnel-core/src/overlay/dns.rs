@@ -256,8 +256,14 @@ async fn forward_upstream(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>>
 // Per-OS split-DNS config
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The overlay NIC name (matches `tun.rs`). Linux only — the Windows path keys
-/// its NRPT rule off the domain, not the interface.
+/// The DEFAULT overlay NIC name (matches `tun.rs`) — the Linux fallback when
+/// the caller can't name its link. W2: multi-org hosts run one resolver PER
+/// ORG on that org's own TUN link (`roomler0`, `roomler0-<hex>`, …), and
+/// `resolvectl dns/domain <link> …` REPLACES the link's settings — so every
+/// org steering the hard-coded `roomler0` meant the second org overwrote the
+/// first, and either guard's Drop reverted BOTH zones. Callers now pass
+/// their own link name; the Windows path is unaffected (NRPT rules are
+/// keyed per namespace, not per interface).
 #[cfg(target_os = "linux")]
 const DNS_IF_NAME: &str = "roomler0";
 
@@ -267,6 +273,10 @@ const DNS_IF_NAME: &str = "roomler0";
 /// OS on that host (the resolver still runs).
 pub struct DnsOsGuard {
     magic_domain: String,
+    /// The Linux link this guard configured (owned so Drop reverts exactly
+    /// what setup touched — never a sibling org's link). Unused on Windows.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    link: String,
     active: bool,
 }
 
@@ -279,20 +289,31 @@ impl DnsOsGuard {
 }
 
 /// Route `magic_domain` queries to our `resolver_ip` at the OS level. Returns a
-/// guard that reverts on `Drop`.
-pub async fn configure_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> DnsOsGuard {
-    let active = setup_os(resolver_ip, magic_domain).await;
+/// guard that reverts on `Drop`. `link` is the caller's OWN overlay link name
+/// (`TunIo::os_name()`), load-bearing on multi-org Linux hosts (see
+/// [`DNS_IF_NAME`]); `None` falls back to the single-org default.
+pub async fn configure_os(
+    resolver_ip: Ipv4Addr,
+    magic_domain: &str,
+    link: Option<&str>,
+) -> DnsOsGuard {
+    #[cfg(target_os = "linux")]
+    let link_owned = link.unwrap_or(DNS_IF_NAME).to_string();
+    #[cfg(not(target_os = "linux"))]
+    let link_owned = link.unwrap_or_default().to_string();
+    let active = setup_os(resolver_ip, magic_domain, &link_owned).await;
     if active {
-        info!(%resolver_ip, domain = %magic_domain, "magicdns: OS split-DNS configured");
+        info!(%resolver_ip, domain = %magic_domain, link = %link_owned, "magicdns: OS split-DNS configured");
     }
     DnsOsGuard {
         magic_domain: magic_domain.to_string(),
+        link: link_owned,
         active,
     }
 }
 
 #[cfg(target_os = "windows")]
-async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> bool {
+async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str, _link: &str) -> bool {
     // NRPT split-DNS: only `*.<domain>` queries go to our resolver; everything
     // else stays on the system resolvers. Idempotent-ish — clear a stale rule
     // for this namespace first.
@@ -317,20 +338,23 @@ async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> bool {
-    // systemd-resolved: point the overlay link at our resolver and mark
-    // `<domain>` a routing-only domain (`~`) so only it resolves here.
+async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str, link: &str) -> bool {
+    // systemd-resolved: point THIS ORG'S overlay link at our resolver and
+    // mark `<domain>` a routing-only domain (`~`) so only it resolves here.
+    // Per-link on purpose: sibling orgs steer their own links, so N zones
+    // coexist (resolvectl REPLACES a link's settings — the shared-link
+    // variant made the second org clobber the first).
     let a = run_cmd(vec![
         "resolvectl".into(),
         "dns".into(),
-        DNS_IF_NAME.into(),
+        link.into(),
         resolver_ip.to_string(),
     ])
     .await;
     let b = run_cmd(vec![
         "resolvectl".into(),
         "domain".into(),
-        DNS_IF_NAME.into(),
+        link.into(),
         format!("~{magic_domain}"),
     ])
     .await;
@@ -338,7 +362,7 @@ async fn setup_os(resolver_ip: Ipv4Addr, magic_domain: &str) -> bool {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-async fn setup_os(_resolver_ip: Ipv4Addr, _magic_domain: &str) -> bool {
+async fn setup_os(_resolver_ip: Ipv4Addr, _magic_domain: &str, _link: &str) -> bool {
     false
 }
 
@@ -363,8 +387,11 @@ impl Drop for DnsOsGuard {
         }
         #[cfg(target_os = "linux")]
         {
+            // Revert exactly the link WE configured — a sibling org's guard
+            // must never be able to strip this org's steering (the shared
+            // hard-coded link made either teardown revert both zones).
             let _ = std::process::Command::new("resolvectl")
-                .args(["revert", DNS_IF_NAME])
+                .args(["revert", &self.link])
                 .output();
         }
         info!(domain = %self.magic_domain, "magicdns: OS split-DNS reverted");

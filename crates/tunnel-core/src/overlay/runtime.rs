@@ -679,8 +679,19 @@ fn prefix_of_cidr(cidr: &str) -> Option<u8> {
 }
 
 /// Phase 2 MagicDNS — rebuild the resolver's `name → overlay-IP` map from the
-/// current netmap peers (named peers only). Called after each netmap change.
-async fn sync_name_map(names: &dns::NameMap, peers: &HashMap<ObjectId, NetmapPeer>) {
+/// current netmap peers PLUS this node itself. Called after each netmap
+/// change. The self entry matters because the netmap's peer list excludes
+/// self: without it, `<own-name>.<domain>` was NXDOMAIN from the node's own
+/// resolver (W2 field find, 2026-08-14 — the NameMap doc claimed
+/// self-inclusion that never existed). `self_name` comes from the server's
+/// `OverlayNetworkInfo.self_name` (`None` from a pre-W2 server ⇒ peers-only,
+/// the old behaviour).
+async fn sync_name_map(
+    names: &dns::NameMap,
+    peers: &HashMap<ObjectId, NetmapPeer>,
+    self_name: Option<&str>,
+    self_v4: Ipv4Addr,
+) {
     let mut map = names.write().await;
     map.clear();
     for p in peers.values() {
@@ -690,6 +701,9 @@ async fn sync_name_map(names: &dns::NameMap, peers: &HashMap<ObjectId, NetmapPee
         if let Ok(ip) = p.overlay_ip.parse::<Ipv4Addr>() {
             map.insert(p.name.clone(), ip);
         }
+    }
+    if let Some(me) = self_name.filter(|s| !s.is_empty()) {
+        map.insert(me.to_string(), self_v4);
     }
 }
 
@@ -1833,7 +1847,13 @@ impl OverlayRuntime {
         let mut dns_bound = false;
         let dns_names: Option<dns::NameMap> = if let Some(magic_domain) = dns_magic.clone() {
             let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-            sync_name_map(&names, &current_peers).await;
+            sync_name_map(
+                &names,
+                &current_peers,
+                network.self_name.as_deref(),
+                self_v4,
+            )
+            .await;
             let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(dns::run(
                 dns::DnsConfig {
@@ -1868,7 +1888,8 @@ impl OverlayRuntime {
             // don't resolve via the OS (SOCKS DOMAIN resolution still
             // works), surfaced below as `os_steer_active=false`.
             if dns_bound {
-                _dns_os_guard = Some(dns::configure_os(self_v4, &magic_domain).await);
+                _dns_os_guard =
+                    Some(dns::configure_os(self_v4, &magic_domain, tun.os_name().as_deref()).await);
             } else {
                 tracing::warn!(
                     %magic_domain,
@@ -2839,7 +2860,7 @@ impl OverlayRuntime {
                                 &mut relay_refresh_cooldown,
                             ).await;
                         }
-                        if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
+                        if let Some(names) = &dns_names { sync_name_map(names, &current_peers, network.self_name.as_deref(), self_v4).await; }
                         let t0 = Instant::now();
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &peers, direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq, "netmap").await;
                         warn_if_slow("install_peers(netmap)", t0);
@@ -2882,7 +2903,7 @@ impl OverlayRuntime {
                         let t0 = Instant::now();
                         self.install_peers(&mut wg, &mut by_node, &mut relay, &tun, &upserts, direct_ctx.as_ref(), &mut upgrade_probes, &mut relay_bq, "delta").await;
                         warn_if_slow("install_peers(delta)", t0);
-                        if let Some(names) = &dns_names { sync_name_map(names, &current_peers).await; }
+                        if let Some(names) = &dns_names { sync_name_map(names, &current_peers, network.self_name.as_deref(), self_v4).await; }
                         self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
                         self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
                         warn_if_slow("arm:netmap_delta", t_arm);
@@ -3042,6 +3063,30 @@ mod tests {
 
     use super::*;
     use std::io;
+
+    /// W2 — the resolver's name map must include the node ITSELF (the
+    /// netmap's peer list excludes self, so before this fix
+    /// `<own-name>.<domain>` was NXDOMAIN from the node's own resolver;
+    /// the NameMap doc claimed a self-inclusion that never existed). A
+    /// pre-W2 server sends no `self_name` ⇒ peers-only, the old shape.
+    #[tokio::test]
+    async fn sync_name_map_includes_self_when_the_server_names_us() {
+        let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let me = Ipv4Addr::new(100, 65, 4, 2);
+        sync_name_map(&names, &HashMap::new(), Some("neo16"), me).await;
+        assert_eq!(
+            names.read().await.get("neo16"),
+            Some(&me),
+            "own name must resolve to own overlay IP"
+        );
+        sync_name_map(&names, &HashMap::new(), None, me).await;
+        assert!(
+            names.read().await.is_empty(),
+            "pre-W2 server (no self_name) keeps the peers-only shape"
+        );
+        sync_name_map(&names, &HashMap::new(), Some(""), me).await;
+        assert!(names.read().await.is_empty(), "empty name never inserted");
+    }
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::net::UdpSocket;
@@ -5303,6 +5348,7 @@ mod tests {
             mtu: 1280,
             magic_domain: None,
             nameservers: vec![],
+            self_name: None,
             stun_urls: vec![],
         }
     }
