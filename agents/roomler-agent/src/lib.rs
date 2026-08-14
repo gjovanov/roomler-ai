@@ -71,6 +71,8 @@ pub mod signaling;
 pub mod subnet_detect;
 #[cfg(feature = "system-context")]
 pub mod system_context;
+#[cfg(target_os = "macos")]
+pub mod tcc;
 pub mod telemetry;
 pub mod tunnel;
 pub mod updater;

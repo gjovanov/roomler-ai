@@ -1280,6 +1280,44 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// `%PROGRAMDATA%` can't be resolved (it always can on a sane
 /// Windows install; the `C:\ProgramData` literal is the documented
 /// fallback used elsewhere in the crate).
+/// W4(c) — restrict the machine-global config directory to SYSTEM +
+/// Administrators, inheritance OFF, applied to existing children (`/T`).
+/// SIDs, not names, so it survives localized Windows (this fleet runs
+/// German builds where BUILTIN\Users is "Benutzer"): S-1-5-18 = SYSTEM,
+/// S-1-5-32-544 = Administrators, S-1-5-32-545 = Users, S-1-5-11 =
+/// Authenticated Users. Idempotent and best-effort: a failure WARNs and
+/// the save proceeds — an unhardened save is the pre-W4 status quo, not a
+/// new exposure. Closing the remaining pre-planted-CONTENT hole (verify
+/// the file's OWNER at SystemContext load) is tracked for the Track-A
+/// config unification.
+#[cfg(windows)]
+fn harden_machine_global_dir(dir: &std::path::Path) {
+    let d = dir.display().to_string();
+    let steps: [&[&str]; 3] = [
+        &["/inheritance:r"],
+        &["/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"],
+        &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
+    ];
+    for args in steps {
+        match std::process::Command::new("icacls")
+            .arg(&d)
+            .args(args)
+            .output()
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => tracing::warn!(
+                dir = %d, ?args,
+                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                "config: machine-global dir ACL hardening step failed"
+            ),
+            Err(e) => {
+                tracing::warn!(dir = %d, %e, "config: icacls spawn failed; dir ACL unhardened");
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
     crate::appdirs::machine_global_dir().join("config.toml")
@@ -1399,6 +1437,18 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
         let mut perms = std::fs::metadata(&tmp)?.permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&tmp, perms)?;
+    }
+    // W4(c) — the Windows twin, for the MACHINE-GLOBAL location only: the
+    // ProgramData default ACL leaves the config (agent bearer token!)
+    // BUILTIN\Users-readable, and a non-admin could even pre-create the
+    // dir/file a SYSTEM-context worker later loads. Harden the directory
+    // before the rename so the renamed file and the `.prev` rotation
+    // inherit the tightened ACEs; `/T` re-ACLs children already present.
+    #[cfg(windows)]
+    if path.starts_with(crate::appdirs::machine_global_dir())
+        && let Some(dir) = path.parent()
+    {
+        harden_machine_global_dir(dir);
     }
 
     // Rotate the outgoing file to `.prev` so `load` has something to recover
