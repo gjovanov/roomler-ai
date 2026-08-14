@@ -795,11 +795,19 @@ pub async fn tenant_mesh(
     // Edges: merge the two ends' snapshots. Both report the same pair,
     // and they can legitimately disagree — take the worse carrier and
     // the lower RTT, and remember whether both ends actually agreed.
+    // Freshness gate (wave 4): a snapshot is one heartbeat old at most
+    // while its agent lives, and FROZEN forever once it dies — a dead
+    // agent's last "direct to X" claim would otherwise keep outvoting the
+    // live end's "offline" for up to the 7-day TTL. Letting per-direction
+    // `ends` through without this turned 40 of 62 prod edges "asymmetric"
+    // on first render: stale-vs-live disagreements wearing the costume of
+    // routing asymmetry. Six missed heartbeats = no vote.
+    let fresh_floor = DateTime::from_millis(DateTime::now().timestamp_millis() - 180 * 1000);
     let snapshots = agg(
         &state,
         roomler_ai_services::dao::stats::STATS_MESH,
         vec![
-            doc! { "$match": { "tenant_id": tid } },
+            doc! { "$match": { "tenant_id": tid, "ts": { "$gte": fresh_floor } } },
             doc! { "$set": { "from": { "$toString": "$agent_id" } } },
             doc! { "$project": { "_id": 0, "from": 1, "links": 1 } },
         ],
