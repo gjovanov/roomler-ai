@@ -19,7 +19,7 @@
 //! `restart_required = true`.
 
 use crate::config::{AgentConfig, EncoderPreferenceChoice};
-use tunnel_core::localapi::ConfigEntry;
+use roomler_localapi::ConfigEntry;
 
 /// Mirror of `tunnel_core::overlay::direct::MAX_DIRECT_PORT_BASE`
 /// (`u16::MAX - PUBLIC_DIAL_PORT_OFFSET - DIRECT_PORT_BAND`): the largest

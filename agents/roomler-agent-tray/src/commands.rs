@@ -6,13 +6,13 @@
 //! Ok and rejects with the String on Err. The HTML/JS layer in
 //! `src/front/` consumes these via `window.__TAURI__.core.invoke`.
 
-use roomler_agent::config::{self, AgentConfig};
-use roomler_agent::enrollment::{self, EnrollInputs};
-use roomler_agent::{logging, notify};
+use roomler_agent_core::config::{self, AgentConfig};
+use roomler_agent_core::enrollment::{self, EnrollInputs};
+use roomler_agent_core::{logging, notify};
+use roomler_localapi::{self as localapi, ConsentRequest, FlowInfo, NodeStatus, PeerInfo};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tunnel_core::localapi::{self, ConsentRequest, FlowInfo, NodeStatus, PeerInfo};
 
 /// What the SPA shows on the status page. Returned from
 /// [`cmd_status`]. All fields are JSON-friendly primitives so the
@@ -94,15 +94,15 @@ fn status_report() -> StatusReport {
 /// The daemon log directory to show / open. `logging::log_dir()` only works IN
 /// the agent process (its `LOG_DIR` OnceLock); the desktop app never runs that
 /// setup, so it computes the path directly. An SCM/SYSTEM service writes to the
-/// deterministic machine-global dir (`win_service::default_log_dir` =
+/// deterministic machine-global dir (`appdirs::service_log_dir` =
 /// `%PROGRAMDATA%\...\service-logs`) — used exactly when an SCM service is the
 /// registered flavour. Keyed on the flavour, NOT dir-existence: a
 /// flavour-switched box can carry a stale (SYSTEM-ACL'd, undeletable) service
 /// dir forever, which must not shadow the per-user daemon's real logs.
 fn resolve_log_dir_path(is_scm: bool) -> Option<PathBuf> {
     #[cfg(windows)]
-    if is_scm && let Some(service_logs) = roomler_agent::win_service::default_log_dir() {
-        return Some(service_logs);
+    if is_scm {
+        return Some(roomler_agent_core::appdirs::service_log_dir());
     }
     #[cfg(not(windows))]
     let _ = is_scm;
@@ -340,7 +340,7 @@ pub async fn cmd_enroll(
         Ok(p) => p,
         Err(_) => config::default_config_path().map_err(|e| format!("Config path: {e}"))?,
     };
-    let machine_id = roomler_agent::machine::derive_machine_id(&path);
+    let machine_id = roomler_agent_core::machine::derive_machine_id(&path);
     let cfg = enrollment::enroll(EnrollInputs {
         server_url: &server,
         enrollment_token: &trimmed_token,
@@ -416,7 +416,7 @@ pub async fn cmd_config_entries() -> Result<Vec<localapi::ConfigEntry>, String> 
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
         let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        Ok(roomler_agent::config_surface::entries(&cfg))
+        Ok(roomler_agent_core::config_surface::entries(&cfg))
     })
     .await
     .map_err(|e| format!("task join: {e}"))?
@@ -460,9 +460,9 @@ fn config_set_blocking(
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
     let mut cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-    roomler_agent::config_surface::apply(&mut cfg, &key, value.as_deref())?;
+    roomler_agent_core::config_surface::apply(&mut cfg, &key, value.as_deref())?;
     config::save(&path, &cfg).map_err(|e| explain_save_error(e, &path, machine_global))?;
-    roomler_agent::config_surface::entry_for(&cfg, &key)
+    roomler_agent_core::config_surface::entry_for(&cfg, &key)
         .ok_or_else(|| format!("unknown config key {key:?}"))
 }
 
@@ -614,10 +614,10 @@ pub async fn cmd_tail_log(source: String, max_bytes: Option<u64>) -> Result<LogT
         });
     }
     tokio::task::spawn_blocking(move || {
-        let path = roomler_agent::logging::tail_source_path(&source)
+        let path = roomler_agent_core::logging::tail_source_path(&source)
             .ok_or_else(|| format!("no log file found for source {source:?}"))?;
         let cap = max_bytes.unwrap_or(32 * 1024).clamp(512, 64 * 1024);
-        let (size, content) = roomler_agent::logging::read_tail(&path, cap)
+        let (size, content) = roomler_agent_core::logging::read_tail(&path, cap)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         Ok(LogTailReport {
             path: path.display().to_string(),
@@ -873,7 +873,7 @@ pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
 /// when the daemon is down (an empty list is indistinguishable from
 /// "no routes", and the Devices section already surfaces daemon-down).
 #[tauri::command]
-pub async fn cmd_route_list() -> Vec<tunnel_core::localapi::RouteInfo> {
+pub async fn cmd_route_list() -> Vec<roomler_localapi::RouteInfo> {
     match localapi::connect().await {
         Ok(mut c) => c.route_list().await.unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -887,8 +887,8 @@ pub async fn cmd_route_list() -> Vec<tunnel_core::localapi::RouteInfo> {
 /// generated when the form left it blank).
 #[tauri::command]
 pub async fn cmd_route_add(
-    route: tunnel_core::localapi::RouteDescriptor,
-) -> Result<tunnel_core::localapi::RouteDescriptor, String> {
+    route: roomler_localapi::RouteDescriptor,
+) -> Result<roomler_localapi::RouteDescriptor, String> {
     let mut client = localapi::connect().await.map_err(daemon_unreachable)?;
     client.route_add(route).await.map_err(|e| e.to_string())
 }

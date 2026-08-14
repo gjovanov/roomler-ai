@@ -254,39 +254,12 @@ pub fn check_forward_request(
     }
 }
 
-/// Match a `(dst_host, dst_port)` tuple against a single destination
-/// rule. T2.3 wires this into the full
-/// `evaluate(policies, subject, agent, dst)` flow.
-pub fn dst_matches(rule: &DestinationRule, dst_host: &str, dst_port: u16) -> bool {
-    if dst_port < rule.port_range.low || dst_port > rule.port_range.high {
-        return false;
-    }
-    host_matches(&rule.host_pattern, dst_host)
-}
-
-pub fn host_matches(pattern: &HostPattern, host: &str) -> bool {
-    match pattern {
-        HostPattern::Exact(s) => s.eq_ignore_ascii_case(host),
-        HostPattern::Wildcard(s) => match s.strip_prefix("*.") {
-            Some(suffix) => {
-                host.to_ascii_lowercase()
-                    .ends_with(&suffix.to_ascii_lowercase())
-                    && host.len() > suffix.len()
-                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
-            }
-            // A wildcard without a leading "*." is treated as exact —
-            // safer than allow-all.
-            None => s.eq_ignore_ascii_case(host),
-        },
-        HostPattern::Cidr(cidr) => match (
-            cidr.parse::<ipnet::IpNet>(),
-            host.parse::<std::net::IpAddr>(),
-        ) {
-            (Ok(net), Ok(ip)) => net.contains(&ip),
-            _ => false,
-        },
-    }
-}
+// `dst_matches` / `host_matches` moved to `remote_control::models` in P3e
+// lever E — the matcher now lives next to the shapes it matches over, and
+// `roomler-agent-core`'s ACL can call it without this crate's data plane.
+// Re-exported here so every existing `policy::dst_matches` caller (the
+// forward gate, the agent ACL tests, T2.3's evaluate flow) is unchanged.
+pub use roomler_ai_remote_control::models::{dst_matches, host_matches};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Overlay L3 ACL
