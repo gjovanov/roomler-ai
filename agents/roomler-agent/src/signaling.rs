@@ -472,69 +472,66 @@ pub async fn run(
             }
             Err(ConnectError::ReplacedByNewer { message }) => {
                 let now = std::time::Instant::now();
-                // Drop events older than the 5 min rolling window
-                // BEFORE pushing the new one (so escalation depends
-                // only on what's actually within the window).
+                // Drop events older than the rolling window BEFORE pushing
+                // the new one (so escalation depends only on what's actually
+                // within the window). W4(d): 30 min, not 5 — the backoff
+                // ladder below reaches 15 min, and a 5 min window would have
+                // emptied mid-sleep and reset a live duel back to full speed.
                 recent_replacements
-                    .retain(|t| now.duration_since(*t) < Duration::from_secs(5 * 60));
+                    .retain(|t| now.duration_since(*t) < Duration::from_secs(30 * 60));
                 recent_replacements.push(now);
+                let displacements = recent_replacements.len();
                 warn!(
                     %message,
-                    count = recent_replacements.len(),
+                    count = displacements,
                     "server signalled this connection was replaced; staggering reconnect to break the duel"
                 );
 
-                if recent_replacements.len() >= 3 {
+                // Legacy escalation (`ws_replaced_exit = true`): sentinel +
+                // process exit at the 3rd displacement, exactly as before
+                // W4(d). Off by default — see below.
+                if displacements >= 3 && cfg.ws_replaced_exit.unwrap_or(false) {
                     // Multi-org P1: a secondary org's duel terminates only
                     // its own loop (see the FatalGoodbye arm's rationale).
                     if !ctx.is_primary {
                         warn!(
                             org = %ctx.label,
-                            displacements = recent_replacements.len(),
+                            displacements,
                             "duplicate-instance duel on this org — stopping its loop \
                              (other orgs unaffected)"
                         );
                         return Err(anyhow::anyhow!(
-                            "duplicate-instance duel: displaced {}× in 5 min — another \
-                             process is using this org's agent_id ({message})",
-                            recent_replacements.len()
+                            "duplicate-instance duel: displaced {displacements}× in the \
+                             window — another process is using this org's agent_id ({message})",
                         ));
                     }
-                    let body = format!(
-                        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
-                         This connection has been displaced {} times in the last 5 minutes — \
-                         another process (different physical host with a copy of this \
-                         config.toml, or a tray companion, etc.) is using the same agent_id. \
-                         Stop the duplicate or re-enrol THIS host with a fresh enrollment \
-                         JWT to mint a new agent_id.",
-                        recent_replacements.len()
-                    );
-                    match notify::raise_attention_machine_aware_with_reason(
-                        notify::REASON_DUPLICATE,
-                        &body,
-                    ) {
-                        Ok(path) => warn!(
-                            path = %path.display(),
-                            displacements = recent_replacements.len(),
-                            "wrote needs-attention sentinel for ReplacedByNewer escalation"
-                        ),
-                        Err(e) => warn!(
-                            error = %e,
-                            "failed to write needs-attention sentinel for ReplacedByNewer escalation"
-                        ),
-                    }
+                    write_replaced_sentinel(&message, displacements);
                     // P5/A2 — bypasses RAII; drop any exit-node split-default so
                     // a duel-losing instance doesn't leave the host blackholed.
                     crate::purge_exit_routes();
                     std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
                 }
 
-                // Back off 60 s minimum — long enough that two
-                // duelling instances stagger out of phase and one
-                // wins. Shorter would put both in sync and burn
-                // attempts before the escalation gate.
+                // W4(d) — NO process exit by default. Field (CORPLAP-1, every
+                // VPN transition): displacement storms on TLS-inspected paths
+                // are ZOMBIE half-open WSes — self-limiting once the server's
+                // receive-liveness reaps them — and each exit tore down the
+                // WHOLE overlay (carriers, TUN, routes) for an event that
+                // needed none of it. A TRUE duplicate-instance duel (copied
+                // config.toml on another machine) isn't fixed by exiting
+                // either: the supervisor respawns straight back into the
+                // duel. Instead the operator sentinel is raised once per
+                // storm and the ladder parks the loser at 15 min; the
+                // overlay keeps running on its last netmap throughout.
+                if displacements == 3 && ctx.is_primary {
+                    write_replaced_sentinel(&message, displacements);
+                }
+
+                // 60 s minimum — long enough that two duelling instances
+                // stagger out of phase and one wins; sustained duels climb
+                // the ladder instead of escalating to an exit.
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                    _ = tokio::time::sleep(replaced_backoff_for(displacements)) => {},
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() { return Ok(()); }
                     },
@@ -583,6 +580,50 @@ pub(crate) fn auth_backoff_for(consecutive_failures: u32) -> Duration {
         2 => Duration::from_secs(60),
         3 => Duration::from_secs(5 * 60),
         _ => Duration::from_secs(60 * 60),
+    }
+}
+
+/// W4(d) — ReplacedByNewer backoff ladder (displacements counted over a
+/// 30 min rolling window). Zombie half-open WSes self-limit once the
+/// server reaps them, so early rungs stay quick; a sustained TRUE duel
+/// parks the loser at the 15 min cap with the operator sentinel raised —
+/// it never exits the process (the overlay keeps carrying traffic on its
+/// last netmap; `ws_replaced_exit = true` restores the legacy exit).
+///
+/// 1st/2nd → 60 s (stagger two live dialers out of phase)
+/// 3rd → 2 min, 4th → 4 min, 5th → 8 min, 6th+ → 15 min
+pub(crate) fn replaced_backoff_for(displacements: usize) -> Duration {
+    match displacements {
+        0..=2 => Duration::from_secs(60),
+        3 => Duration::from_secs(120),
+        4 => Duration::from_secs(240),
+        5 => Duration::from_secs(480),
+        _ => Duration::from_secs(900),
+    }
+}
+
+/// The ReplacedByNewer operator sentinel — written once per storm (at the
+/// 3rd displacement in the window), whether or not the legacy exit is on.
+fn write_replaced_sentinel(message: &str, displacements: usize) {
+    let body = format!(
+        "Roomler agent: duplicate-instance duel detected.\n\n{message}\n\n\
+         This connection has been displaced {displacements} times in the current \
+         window — another process (different physical host with a copy of this \
+         config.toml, or a stale half-open connection through a TLS-inspecting \
+         middlebox) is using the same agent_id. The agent stays up and backs \
+         off; if this persists, stop the duplicate or re-enrol THIS host with \
+         a fresh enrollment JWT to mint a new agent_id."
+    );
+    match notify::raise_attention_machine_aware_with_reason(notify::REASON_DUPLICATE, &body) {
+        Ok(path) => warn!(
+            path = %path.display(),
+            displacements,
+            "wrote needs-attention sentinel for ReplacedByNewer escalation"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "failed to write needs-attention sentinel for ReplacedByNewer escalation"
+        ),
     }
 }
 
@@ -2317,6 +2358,26 @@ mod tests {
                 d >= last,
                 "ladder must be monotonic non-decreasing; failed at n={n}"
             );
+            last = d;
+        }
+    }
+
+    /// W4(d) — the displacement ladder pins each rung, stays monotonic and
+    /// PARKS at 15 min: a sustained duel must never re-accelerate, and the
+    /// default path never escalates to a process exit at any count.
+    #[test]
+    fn replaced_ladder_parks_at_fifteen_minutes() {
+        assert_eq!(replaced_backoff_for(1), Duration::from_secs(60));
+        assert_eq!(replaced_backoff_for(2), Duration::from_secs(60));
+        assert_eq!(replaced_backoff_for(3), Duration::from_secs(120));
+        assert_eq!(replaced_backoff_for(4), Duration::from_secs(240));
+        assert_eq!(replaced_backoff_for(5), Duration::from_secs(480));
+        assert_eq!(replaced_backoff_for(6), Duration::from_secs(900));
+        assert_eq!(replaced_backoff_for(500), Duration::from_secs(900));
+        let mut last = Duration::ZERO;
+        for n in 1..=20usize {
+            let d = replaced_backoff_for(n);
+            assert!(d >= last, "ladder must be monotonic; failed at n={n}");
             last = d;
         }
     }
