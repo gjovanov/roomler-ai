@@ -24,6 +24,12 @@ roomler-ai-remote-control = { path = "../../crates/remote_control" }
 # Tunnel ACL types + helpers (DestinationRule / HostPattern / dst_matches).
 # Agent-side allowlist is belt-and-suspenders for the server-side gate.
 roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
+# P3e lever D — the `roomler` command surface, dispatched by `roomlerd cli`.
+# Daemon hosts install a ~150 KB shim as roomler.exe instead of a second full
+# CLI binary (rc.361: 22.1 MiB, ~92 % of it crates this daemon already links).
+# Cheap to add: this crate's lib is CLI glue over tunnel-core + remote-control,
+# both of which are already in the graph above.
+roomler-tunnel = { path = "../roomler-tunnel" }
 
 # Async + networking
 tokio = { workspace = true }

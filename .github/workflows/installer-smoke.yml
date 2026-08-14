@@ -66,21 +66,23 @@ jobs:
           cargo build -p roomler-agent --release `
             --features "mf-encoder,scrap-capture,openh264-encoder,enigo-input,clipboard,viewer-indicator,system-context"
 
-      - name: Build tunnel CLI (roomler.exe) for the MSI bundle (P4b)
+      - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
         shell: pwsh
         run: |
-          # P4b: wix/main.wxs UNCONDITIONALLY bundles a `TunnelExe`
-          # component from target\release\roomler.exe (the MSI carries
-          # the tunnel CLI — node-stack unification Option A), so the
-          # WiX `light` step needs the EXE present or it fails with
-          # LGHT0103, same failure mode as the wintun.dll staging
-          # below. Mirrors release-agent.yml's tunnel build step.
-          cargo build -p roomler-tunnel --release
-          if (-not (Test-Path target\release\roomler.exe)) {
-            Write-Host "::error::roomler.exe not produced — TunnelExe harvest would fail (LGHT0103)"
+          # wix/main.wxs UNCONDITIONALLY bundles a `TunnelExe` component, so
+          # the WiX `light` step needs its source EXE present or it fails with
+          # LGHT0103 — same failure mode as the wintun.dll staging below.
+          # P3e lever D moved that source from the full tunnel CLI to the
+          # ~150 KB shim that re-execs `roomlerd cli`; the INSTALLED name is
+          # still roomler.exe, which is what the payload assert below checks.
+          # Mirrors release-agent.yml's shim build step.
+          cargo build -p roomler-cli-shim --release
+          if (-not (Test-Path target\release\roomler-shim.exe)) {
+            Write-Host "::error::roomler-shim.exe not produced — TunnelExe harvest would fail (LGHT0103)"
             exit 1
           }
-          Write-Host "Staged roomler.exe ($([math]::Round((Get-Item target\release\roomler.exe).Length/1MB,1)) MB) for the TunnelExe component"
+          $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
+          Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
 
       - name: Stage wintun.dll for the MSI bundle
         shell: pwsh
@@ -115,9 +117,11 @@ jobs:
           $crtDir = Get-ChildItem -Directory "$vsRoot\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
                     Sort-Object FullName | Select-Object -Last 1
           if (-not $crtDir) { Write-Host "::error::no Microsoft.VC14x.CRT redist folder under $vsRoot"; exit 1 }
-          $expected = @('concrt140.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
-                        'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll', 'vccorlib140.dll',
-                        'vcruntime140.dll', 'vcruntime140_1.dll')
+          # Kept in lockstep with release-agent.yml: only the three CRT DLLs
+          # our binaries import (see that step's comment for the import-table
+          # evidence and the re-check recipe). The payload assert below locks
+          # the same three by name.
+          $expected = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
           foreach ($n in $expected) {
             $src = Join-Path $crtDir.FullName $n
             if (-not (Test-Path $src)) { Write-Host "::error::$n missing from $($crtDir.FullName) -- VcRedistCrt harvest would fail (LGHT0103)"; exit 1 }
