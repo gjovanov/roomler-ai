@@ -141,6 +141,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Auth-first handshake routing on a multi-org carrier plane: route an inbound WG initiation by trial-authentication instead of the source shortcut (fixes the dual-org direct lockout). Built-in default: on.",
     ),
     (
+        "overlay_srflx_seek",
+        "tribool",
+        "srflx SEEKING mode: when the STUN gather finds no public candidate, keep re-gathering with backoff + on interface events instead of staying NONE for the daemon lifetime. Built-in default: on.",
+    ),
+    (
         "overlay_pathmon",
         "string",
         "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
@@ -401,6 +406,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard.map(fmt_bool),
         "overlay_init_auth_first" => cfg.overlay_init_auth_first.map(fmt_bool),
+        "overlay_srflx_seek" => cfg.overlay_srflx_seek.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
         "overlay_rpf" => cfg.overlay_rpf.clone(),
@@ -508,6 +514,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter = parse_tribool(value)?,
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard = parse_tribool(value)?,
         "overlay_init_auth_first" => cfg.overlay_init_auth_first = parse_tribool(value)?,
+        "overlay_srflx_seek" => cfg.overlay_srflx_seek = parse_tribool(value)?,
         "overlay_pathmon" => {
             cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -971,6 +978,32 @@ mod tests {
             crate::config::env_bridge_bools(&cfg)
                 .iter()
                 .any(|(k, _)| *k == "OVERLAY_WSL_MIRRORED_GUARD"),
+            "key must be bridged to the daemon's env"
+        );
+    }
+
+    /// The srflx SEEKING key set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule). This is the kill switch for
+    /// the W5 self-healing NONE-regather; off restores the pre-W5
+    /// return-the-sink (sticky NONE) behaviour.
+    #[test]
+    fn overlay_srflx_seek_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_srflx_seek", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_srflx_seek, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_srflx_seek")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_srflx_seek", None).unwrap();
+        assert_eq!(cfg.overlay_srflx_seek, None, "clear → built-in default");
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(k, _)| *k == "OVERLAY_SRFLX_SEEK"),
             "key must be bridged to the daemon's env"
         );
     }
