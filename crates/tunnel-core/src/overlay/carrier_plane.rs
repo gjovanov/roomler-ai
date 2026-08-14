@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -160,6 +160,11 @@ struct PlaneState {
     /// point is to surface the CONDITION, and a junk flood must not become a
     /// log flood.
     last_unknown_idx_log: Option<Instant>,
+    /// Throttle for the initiation-authenticated-to-no-engine WARN (the
+    /// type-1 twin of `last_unknown_idx_log`). Before this WARN existed, a
+    /// sibling org's init eaten by the wrong engine died as a DEBUG-only
+    /// decap error — the dual-org direct lockout ran silent for weeks.
+    last_foreign_init_log: Option<Instant>,
     binds: Option<PlaneBinds>,
     next_engine_id: u64,
     /// Demux-routed STUN Binding responses (the plane twin of the device's
@@ -205,6 +210,17 @@ pub struct CarrierPlane {
     /// Times the bind section actually ran (must stay ≤1 between rebuilds —
     /// locked by `ensure_bound_binds_once_under_concurrent_attach`).
     binds_performed: AtomicU32,
+    /// Auth-first type-1 routing (kill switch `OVERLAY_INIT_AUTH_FIRST`,
+    /// default ON; read once at construction — config keys freeze at daemon
+    /// start anyway). ON: with more than one engine attached, an inbound
+    /// handshake initiation is routed by trial-authentication, never by the
+    /// source-keyed shortcut — two orgs sharing one remote `ip:port` is the
+    /// NORMAL multi-org state, and the shortcut deterministically fed the
+    /// second org's inits to whichever org held a session at that source
+    /// first (field 2026-08-14: every dual-org pair direct on exactly one
+    /// org, the other locked on relay until a restart swapped the winner).
+    /// OFF restores the legacy shortcut.
+    init_auth_first: AtomicBool,
 }
 
 impl CarrierPlane {
@@ -217,6 +233,7 @@ impl CarrierPlane {
                 routes: HashMap::new(),
                 by_src: HashMap::new(),
                 last_unknown_idx_log: None,
+                last_foreign_init_log: None,
                 binds: None,
                 next_engine_id: 1,
                 stun_tx,
@@ -231,7 +248,15 @@ impl CarrierPlane {
             srflx_gate: tokio::sync::Mutex::new(false),
             bind_gate: tokio::sync::Mutex::new(()),
             binds_performed: AtomicU32::new(0),
+            init_auth_first: AtomicBool::new(direct::init_auth_first_enabled()),
         })
+    }
+
+    /// Test seam: flip the auth-first routing switch (production reads the
+    /// `OVERLAY_INIT_AUTH_FIRST` flag once at construction).
+    #[cfg(test)]
+    pub(crate) fn set_init_auth_first(&self, on: bool) {
+        self.init_auth_first.store(on, Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PlaneState> {
@@ -424,8 +449,16 @@ impl CarrierPlane {
             let local = sock.local_addr().map(|a| a.to_string()).unwrap_or_default();
             let mut buf = vec![0u8; super::wg::WG_BUF];
             // Per-source rate limit for forwarded unknown-source initiations —
-            // loop-local, exactly like the per-device demux's.
-            let mut recent_unknown: HashMap<SocketAddr, Instant> = HashMap::new();
+            // loop-local, like the per-device demux's, but counting per window:
+            // N attached orgs may each legitimately init from ONE remote
+            // `ip:port` (shared far-end socket), and boringtun's ~5 s
+            // retransmit keeps them phase-locked — a 1-per-src limiter starves
+            // one org indefinitely.
+            let mut recent_unknown: HashMap<SocketAddr, (Instant, u32)> = HashMap::new();
+            // Throttle for the STUN-channel-full WARN (a dropped Binding
+            // response starves the srflx keepalive, whose watchdog then
+            // rebuilds the whole plane — that must not be invisible).
+            let mut last_stun_drop_log: Option<Instant> = None;
             loop {
                 let (n, src) = match sock.recv_from(&mut buf).await {
                     Ok(v) => v,
@@ -462,10 +495,22 @@ impl CarrierPlane {
                 }
                 let stun_tx = { plane.lock().stun_tx.clone() };
                 if crate::transport::stun::has_stun_cookie(&buf[..n]) && !is_wg_shaped(&buf[..n]) {
-                    let _ = stun_tx.try_send(StunInbound {
-                        src,
-                        packet: buf[..n].to_vec(),
-                    });
+                    if stun_tx
+                        .try_send(StunInbound {
+                            src,
+                            packet: buf[..n].to_vec(),
+                        })
+                        .is_err()
+                        && last_stun_drop_log
+                            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                    {
+                        last_stun_drop_log = Some(Instant::now());
+                        warn!(
+                            %src, %local,
+                            "carrier plane: STUN response dropped (channel full) — a starved \
+                             srflx keepalive ends in a watchdog plane rebuild"
+                        );
+                    }
                     continue;
                 }
                 plane
@@ -490,7 +535,7 @@ impl CarrierPlane {
         src: SocketAddr,
         buf: &mut [u8],
         n: usize,
-        mut recent_unknown: Option<&mut HashMap<SocketAddr, Instant>>,
+        mut recent_unknown: Option<&mut HashMap<SocketAddr, (Instant, u32)>>,
     ) {
         let routed = match Tunn::parse_incoming_packet(&buf[..n]) {
             // Sessionful message types carry OUR receiver index — the exact
@@ -499,33 +544,47 @@ impl CarrierPlane {
             Ok(Packet::PacketCookieReply(p)) => self.route_by_index(p.receiver_idx >> 8, src),
             Ok(Packet::PacketData(p)) => self.route_by_index(p.receiver_idx >> 8, src),
             // An initiation carries no receiver index; route it by static key
-            // the way WireGuard does. Fast path first: if exactly one engine
-            // already has a session with this source, it's that session's
-            // rekey — no crypto needed, same trust as the source-keyed demux.
+            // the way WireGuard does. The source-keyed shortcut below is safe
+            // ONLY when one engine is attached: with N orgs on one socket,
+            // BOTH ends' orgs collapse onto the same remote `ip:port`, so "one
+            // engine has a session with this source" routinely means "the
+            // OTHER org's engine" — and an init delivered to the wrong Tunn
+            // dies as a debug-only decap error. Field 2026-08-14: that made
+            // dual-org direct a mutual-exclusion ratchet (whichever org lost
+            // its session could never re-handshake: its inits were eaten,
+            // so it never answered, so it never re-registered — absorbing).
             Ok(Packet::HandshakeInit(_)) => {
-                let candidates: Vec<u64> = {
+                let (candidates, engines_len) = {
                     let st = self.lock();
-                    st.engines
+                    let c: Vec<u64> = st
+                        .engines
                         .iter()
                         .map(|e| e.id)
                         .filter(|id| st.by_src.contains_key(&(*id, src)))
-                        .collect()
+                        .collect();
+                    (c, st.engines.len())
                 };
+                let auth_first = engines_len > 1 && self.init_auth_first.load(Ordering::Relaxed);
                 match candidates.as_slice() {
-                    [only] => self.route_session_of(*only, src),
-                    // Zero OR several engines know this source: authenticate
-                    // to find the owner (the init is sealed to exactly one
-                    // engine's static). Zero-known sources are rate-limited
-                    // FIRST so a junk flood never burns a DH per engine —
-                    // the same CPU profile as the per-device demux.
+                    // Single-org plane (or the kill switch is off): an init
+                    // from a source the engine has a session with is that
+                    // session's rekey — no crypto needed, org-unambiguous.
+                    [only] if !auth_first => self.route_session_of(*only, src),
+                    // Multi-org: authenticate to find the owner (the init is
+                    // sealed to exactly one engine's static) — candidates
+                    // first, so the common case (a genuine rekey) pays one
+                    // DH. Zero-known sources are rate-limited FIRST so a junk
+                    // flood never burns a DH per engine; the window admits
+                    // one init per ATTACHED ENGINE per source, because N
+                    // orgs legitimately init from one shared far-end socket.
                     _ => {
                         if candidates.is_empty()
                             && let Some(recent) = recent_unknown.take()
-                            && !unknown_init_fresh(recent, src)
+                            && !unknown_init_fresh(recent, src, engines_len.max(1) as u32)
                         {
                             Routed::Drop
                         } else {
-                            match self.authenticate_against_engines(&buf[..n]) {
+                            match self.authenticate_against_engines(&buf[..n], &candidates) {
                                 Some(engine) => match self.route_session_of(engine, src) {
                                     Routed::Drop => {
                                         let ev = {
@@ -542,7 +601,29 @@ impl CarrierPlane {
                                     }
                                     hit => hit,
                                 },
-                                None => Routed::Drop,
+                                None => {
+                                    // Sealed to NO attached engine — foreign
+                                    // or forged. This was a silent drop (or
+                                    // worse, a wrong-Tunn decap error at
+                                    // DEBUG); surface the condition, hard
+                                    // throttled like the unregistered-index
+                                    // WARN.
+                                    let now = Instant::now();
+                                    let mut st = self.lock();
+                                    if st.last_foreign_init_log.is_none_or(|t| {
+                                        now.duration_since(t) >= std::time::Duration::from_secs(10)
+                                    }) {
+                                        st.last_foreign_init_log = Some(now);
+                                        warn!(
+                                            %src,
+                                            engines = st.engines.len(),
+                                            "carrier plane: handshake initiation authenticated \
+                                             to NO attached engine — dropped (foreign key, or \
+                                             an org this host has not joined)"
+                                        );
+                                    }
+                                    Routed::Drop
+                                }
                             }
                         }
                     }
@@ -590,18 +671,39 @@ impl CarrierPlane {
         }
 
         // Local helper wants a name — defined after use for readability.
-        fn unknown_init_fresh(recent: &mut HashMap<SocketAddr, Instant>, src: SocketAddr) -> bool {
+        // Admits up to `per_src` initiations per source per window: one per
+        // attached engine, because two orgs' inits from the SAME remote
+        // `ip:port` retransmit phase-locked (~5 s apart on both) and a
+        // 1-per-window limiter starved one org indefinitely.
+        fn unknown_init_fresh(
+            recent: &mut HashMap<SocketAddr, (Instant, u32)>,
+            src: SocketAddr,
+            per_src: u32,
+        ) -> bool {
             if recent.len() >= UNKNOWN_INIT_MAX_SOURCES {
-                recent.retain(|_, t| t.elapsed() < UNKNOWN_INIT_MIN_INTERVAL);
+                recent.retain(|_, (t, _)| t.elapsed() < UNKNOWN_INIT_MIN_INTERVAL);
             }
-            let fresh = recent
-                .get(&src)
-                .is_none_or(|t| t.elapsed() >= UNKNOWN_INIT_MIN_INTERVAL);
-            if fresh && recent.len() < UNKNOWN_INIT_MAX_SOURCES {
-                recent.insert(src, Instant::now());
-                true
-            } else {
-                false
+            match recent.get_mut(&src) {
+                Some((t, count)) if t.elapsed() < UNKNOWN_INIT_MIN_INTERVAL => {
+                    if *count < per_src {
+                        *count += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Some(entry) => {
+                    *entry = (Instant::now(), 1);
+                    true
+                }
+                None => {
+                    if recent.len() < UNKNOWN_INIT_MAX_SOURCES {
+                        recent.insert(src, (Instant::now(), 1));
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
         }
     }
@@ -708,10 +810,16 @@ impl CarrierPlane {
             return;
         };
         let old_src = r.expected_src;
+        let engine = r.engine;
         if old_src == new_src {
+            // Heal-only: a same-`(engine, src)` REPLACEMENT registration that
+            // later unregistered leaves a live route with NO reverse entry —
+            // its rekey inits then Drop out of `route_session_of` forever
+            // (the ForwardInit livelock precondition). Re-asserting the entry
+            // is idempotent when it is already present.
+            st.by_src.insert((engine, new_src), idx);
             return;
         }
-        let engine = r.engine;
         if let Some(c) = r.carrier.upgrade() {
             c.set_direct_dst(new_src);
         }
@@ -798,14 +906,17 @@ impl CarrierPlane {
 
     /// Try each attached engine's static against a handshake initiation.
     /// Engines are snapshotted out of the lock — the DH runs unlocked.
-    fn authenticate_against_engines(&self, init: &[u8]) -> Option<u64> {
-        let engines: Vec<(u64, StaticSecret, PublicKey)> = {
+    /// `preferred` engines (the ones with a `by_src` session at the packet's
+    /// source) are tried first: a genuine rekey then costs one DH.
+    fn authenticate_against_engines(&self, init: &[u8], preferred: &[u64]) -> Option<u64> {
+        let mut engines: Vec<(u64, StaticSecret, PublicKey)> = {
             let st = self.lock();
             st.engines
                 .iter()
                 .map(|e| (e.id, e.secret.clone(), e.public))
                 .collect()
         };
+        engines.sort_by_key(|(id, _, _)| !preferred.contains(id));
         engines
             .into_iter()
             .find(|(_, secret, public)| authenticate_init_with(secret, public, init).is_some())
@@ -878,7 +989,19 @@ impl PlaneHandle {
             );
             return;
         };
-        st.by_src.insert((self.id, expected_src), idx);
+        // Visibility, not a guard: a same-peer re-install to the same dst
+        // legitimately overwrites (the old route unregisters right after and
+        // leaves the new entry alone), but a DIFFERENT session losing its
+        // reverse entry here is the §2(b) orphan — its rekey inits stop
+        // resolving until `commit_roam`'s heal path re-asserts it.
+        if let Some(old) = st.by_src.insert((self.id, expected_src), idx)
+            && old != idx
+        {
+            debug!(
+                engine = self.id, %expected_src, old, new = idx,
+                "carrier plane: by_src reverse entry overwritten by a new session"
+            );
+        }
         if st
             .routes
             .insert(
@@ -916,6 +1039,17 @@ impl PlaneHandle {
                 st.by_src.remove(&key);
             }
         }
+    }
+
+    /// Re-assert (or roam) a live session's source mapping from an
+    /// AUTHENTICATED inbound init: same `src` heals a missing/clobbered
+    /// `by_src` reverse entry (the ForwardInit livelock breaker — without it,
+    /// an init whose session lost its reverse entry cycles
+    /// auth → Drop → ForwardInit → feed → auth forever); a NEW `src` commits
+    /// a full roam (expected_src + reverse map + carrier dst). Callers must
+    /// have authenticated the packet — this moves routing state.
+    pub(crate) fn reassert_src(&self, idx: u32, src: SocketAddr) {
+        self.plane.commit_roam(idx, src);
     }
 
     /// Process ONE datagram as if it had arrived on a plane socket — the
@@ -1654,6 +1788,220 @@ mod tests {
                 .await
                 .is_err(),
             "an init sealed to no attached engine was forwarded"
+        );
+    }
+
+    /// THE dual-org lockout repro (field 2026-08-14): org 2 holds a direct
+    /// session at the shared remote `ip:port`; org 1 (on relay there — no
+    /// `by_src` entry) punches with an init sealed to org 1's static, from
+    /// that same source. The source-keyed shortcut delivered it into org 2's
+    /// `Tunn`, where it died as a debug-only decap error — so org 1 never
+    /// answered, never registered, and could never leave relay. Auth-first
+    /// routing must land it on org 1's accept channel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_org_on_relay_can_punch_while_a_sibling_holds_direct_at_the_same_src() {
+        let (e1_kp, e2_kp) = (WgKeypair::generate(), WgKeypair::generate());
+        let plane = CarrierPlane::new();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        plane.adopt_socket(sock.clone());
+
+        let (mut e1, _rx1) = engine(&plane, &e1_kp).await;
+        let (mut e2, _rx2) = engine(&plane, &e2_kp).await;
+        let mut e1_events = e1.take_direct_events().unwrap();
+
+        // ONE far-end socket both orgs share — the normal multi-org state.
+        let dialer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let far = dialer.local_addr().unwrap();
+
+        // Org 2 is the "winner": a direct session registered at `far`.
+        let peer2 = WgKeypair::generate();
+        e2.add_direct_peer(
+            sock.clone(),
+            peer2.public.to_bytes(),
+            Ipv4Addr::new(100, 65, 8, 2),
+            far,
+            false,
+        )
+        .await;
+
+        // Org 1's far end punches from the SAME source.
+        let far1 = WgKeypair::generate();
+        let init = test_genuine_init(&far1.secret, e1_kp.public.to_bytes());
+        dialer.send_to(&init, addr).await.unwrap();
+
+        let ev: DirectInbound = timeout(Duration::from_secs(2), e1_events.recv())
+            .await
+            .expect("org 1's init was eaten by org 2's session (the dual-org lockout)")
+            .unwrap();
+        assert_eq!(ev.packet, init);
+        assert_eq!(ev.src, far);
+    }
+
+    /// The kill switch (`OVERLAY_INIT_AUTH_FIRST` off) restores the legacy
+    /// source-keyed shortcut on a multi-org plane — org 1's init from org 2's
+    /// claimed source is eaten again. Locks that the switch actually
+    /// switches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kill_switch_restores_the_legacy_source_shortcut() {
+        let (e1_kp, e2_kp) = (WgKeypair::generate(), WgKeypair::generate());
+        let plane = CarrierPlane::new();
+        plane.set_init_auth_first(false);
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        plane.adopt_socket(sock.clone());
+
+        let (mut e1, _rx1) = engine(&plane, &e1_kp).await;
+        let (mut e2, _rx2) = engine(&plane, &e2_kp).await;
+        let mut e1_events = e1.take_direct_events().unwrap();
+
+        let dialer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let far = dialer.local_addr().unwrap();
+        let peer2 = WgKeypair::generate();
+        e2.add_direct_peer(
+            sock.clone(),
+            peer2.public.to_bytes(),
+            Ipv4Addr::new(100, 65, 8, 2),
+            far,
+            false,
+        )
+        .await;
+
+        let far1 = WgKeypair::generate();
+        let init = test_genuine_init(&far1.secret, e1_kp.public.to_bytes());
+        dialer.send_to(&init, addr).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(200), e1_events.recv())
+                .await
+                .is_err(),
+            "with the kill switch off the legacy shortcut must apply (init eaten)"
+        );
+    }
+
+    /// A SINGLE-engine plane keeps the no-crypto shortcut: a genuine rekey
+    /// init from the session's source is processed on the session `Tunn`
+    /// (observable: the handshake RESPONSE comes back), and nothing is
+    /// forwarded to the accept channel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_engine_plane_keeps_the_sourcekeyed_shortcut() {
+        let e1_kp = WgKeypair::generate();
+        let plane = CarrierPlane::new();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        plane.adopt_socket(sock.clone());
+
+        let (mut e1, _rx1) = engine(&plane, &e1_kp).await;
+        let mut e1_events = e1.take_direct_events().unwrap();
+
+        let dialer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let far = dialer.local_addr().unwrap();
+        let peer_x = WgKeypair::generate();
+        e1.add_direct_peer(
+            sock.clone(),
+            peer_x.public.to_bytes(),
+            Ipv4Addr::new(100, 65, 4, 7),
+            far,
+            false,
+        )
+        .await;
+
+        // A genuine rekey: sealed BY the installed peer TO this engine, from
+        // the session's registered source.
+        let init = test_genuine_init(&peer_x.secret, e1_kp.public.to_bytes());
+        dialer.send_to(&init, addr).await.unwrap();
+        let mut rbuf = [0u8; 256];
+        let (rn, rsrc) = timeout(Duration::from_secs(2), dialer.recv_from(&mut rbuf))
+            .await
+            .expect("no handshake response — the rekey shortcut regressed")
+            .unwrap();
+        assert_eq!(rsrc, addr);
+        assert!(rn >= 4 && rbuf[0] == 2, "expected a handshake RESPONSE");
+        assert!(
+            timeout(Duration::from_millis(150), e1_events.recv())
+                .await
+                .is_err(),
+            "a session rekey must not take the ForwardInit accept path"
+        );
+    }
+
+    /// Org fairness in the unknown-source limiter: two orgs' far ends share
+    /// one remote socket, and both punch within one window. The old
+    /// 1-per-src-per-2s limiter dropped the second org's init every window
+    /// (both retransmit ~5 s, phase-locked — it starved indefinitely).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_orgs_inits_from_one_source_both_pass_the_limiter() {
+        let (e1_kp, e2_kp) = (WgKeypair::generate(), WgKeypair::generate());
+        let plane = CarrierPlane::new();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        plane.adopt_socket(sock);
+
+        let (mut e1, _rx1) = engine(&plane, &e1_kp).await;
+        let (mut e2, _rx2) = engine(&plane, &e2_kp).await;
+        let mut e1_events = e1.take_direct_events().unwrap();
+        let mut e2_events = e2.take_direct_events().unwrap();
+
+        let dialer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (far1, far2) = (WgKeypair::generate(), WgKeypair::generate());
+        let i1 = test_genuine_init(&far1.secret, e1_kp.public.to_bytes());
+        let i2 = test_genuine_init(&far2.secret, e2_kp.public.to_bytes());
+        dialer.send_to(&i1, addr).await.unwrap();
+        dialer.send_to(&i2, addr).await.unwrap();
+
+        let got1: DirectInbound = timeout(Duration::from_secs(2), e1_events.recv())
+            .await
+            .expect("org 1's init never arrived")
+            .unwrap();
+        assert_eq!(got1.packet, i1);
+        let got2: DirectInbound = timeout(Duration::from_secs(2), e2_events.recv())
+            .await
+            .expect("org 2's init was starved by the per-source limiter")
+            .unwrap();
+        assert_eq!(got2.packet, i2);
+    }
+
+    /// The ForwardInit livelock breaker's plane half: a live route whose
+    /// `(engine, src)` reverse entry was clobbered away (same-source
+    /// replacement registered then unregistered) no longer resolves — until
+    /// `reassert_plane_src` heals the entry in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reassert_src_heals_a_clobbered_reverse_entry() {
+        let e_kp = WgKeypair::generate();
+        let plane = CarrierPlane::new();
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        plane.adopt_socket(sock.clone());
+        let (mut dev, _rx) = engine(&plane, &e_kp).await;
+
+        let shared: SocketAddr = "203.0.113.7:43648".parse().unwrap();
+        let (peer_a, peer_b) = (WgKeypair::generate(), WgKeypair::generate());
+        dev.add_direct_peer(
+            sock.clone(),
+            peer_a.public.to_bytes(),
+            Ipv4Addr::new(100, 65, 4, 3),
+            shared,
+            false,
+        )
+        .await;
+        // A second session at the SAME (engine, src) clobbers A's reverse
+        // entry; removing it then deletes the entry outright (§2(b) orphan).
+        dev.add_direct_peer(
+            sock.clone(),
+            peer_b.public.to_bytes(),
+            Ipv4Addr::new(100, 65, 4, 4),
+            shared,
+            false,
+        )
+        .await;
+        dev.remove_peer(&peer_b.public.to_bytes()).await;
+
+        assert!(
+            matches!(plane.route_session_of(1, shared), Routed::Drop),
+            "precondition: the surviving route must be orphaned from by_src"
+        );
+        dev.reassert_plane_src(&peer_a.public.to_bytes(), shared);
+        assert!(
+            matches!(plane.route_session_of(1, shared), Routed::Session { .. }),
+            "reassert_plane_src must heal the reverse entry for the live session"
         );
     }
 
