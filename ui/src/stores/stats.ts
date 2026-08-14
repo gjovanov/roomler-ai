@@ -96,6 +96,17 @@ export interface MeshPayload {
     rtt_ms?: number | null
     stalled?: boolean
     reports?: number
+    /** Wave 4 — each end's own view of the pair. `node` is the reporter;
+     *  `carrier`/`relay` is how it reaches the other end, so a pair that
+     *  is direct one way and relayed the other arrives as two entries. */
+    ends?: Array<{
+      node: string
+      carrier: string
+      /** CLI-style qualifier: `turn/udp` / `derp/tcp`; null pre-wave-4. */
+      relay?: string | null
+      rtt_ms?: number | null
+      stalled?: boolean
+    }>
   }>
 }
 
