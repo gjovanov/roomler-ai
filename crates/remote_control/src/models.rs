@@ -574,6 +574,46 @@ pub struct DestinationRule {
     pub proto: ProtocolKind,
 }
 
+/// Match a `(dst_host, dst_port)` tuple against a single destination
+/// rule.
+///
+/// Lived in `tunnel_core::policy` until P3e lever E moved it HERE, next to
+/// the shapes it matches over (this crate is where `HostPattern` /
+/// `PortRange` / `DestinationRule` are canonical — the doc block above this
+/// section says so). The move lets `roomler-agent-core`'s config-side ACL
+/// evaluate rules without depending on tunnel-core's data plane; tunnel-core
+/// re-exports both fns from `policy` so its callers are unchanged.
+pub fn dst_matches(rule: &DestinationRule, dst_host: &str, dst_port: u16) -> bool {
+    if dst_port < rule.port_range.low || dst_port > rule.port_range.high {
+        return false;
+    }
+    host_matches(&rule.host_pattern, dst_host)
+}
+
+pub fn host_matches(pattern: &HostPattern, host: &str) -> bool {
+    match pattern {
+        HostPattern::Exact(s) => s.eq_ignore_ascii_case(host),
+        HostPattern::Wildcard(s) => match s.strip_prefix("*.") {
+            Some(suffix) => {
+                host.to_ascii_lowercase()
+                    .ends_with(&suffix.to_ascii_lowercase())
+                    && host.len() > suffix.len()
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+            }
+            // A wildcard without a leading "*." is treated as exact —
+            // safer than allow-all.
+            None => s.eq_ignore_ascii_case(host),
+        },
+        HostPattern::Cidr(cidr) => match (
+            cidr.parse::<ipnet::IpNet>(),
+            host.parse::<std::net::IpAddr>(),
+        ) {
+            (Ok(net), Ok(ip)) => net.contains(&ip),
+            _ => false,
+        },
+    }
+}
+
 /// Who a policy applies to. `{"kind":"all_users"}` is the catch-all
 /// (default-allow lite — still scoped to the tenant). Externally
 /// tagged would be cleaner but mixes object-vs-string on the wire

@@ -12,17 +12,23 @@ name = "roomler-desktop"
 path = "src/main.rs"
 
 [dependencies]
-# Lib dep on the agent so the tray can call `enrollment::enroll` and
-# `config::save` directly, without a subprocess. Pulls the agent's
-# config struct shape + enrollment HTTP client transitively.
-roomler-agent = { path = "../roomler-agent" }
+# P3e lever E: the tray calls `enrollment::enroll`, `config::save`,
+# `machine::derive_machine_id`, the log tail, and the sentinel reader — all of
+# which live in agent-core now. Before the split this was a lib dep on the
+# FULL `roomler-agent`, which pulled the entire data plane (webrtc family,
+# quinn, turn, openh264-sys2, tokio-tungstenite, async_zip, …) into a GUI that
+# never opens a session. One deliberate loss: `win_service::default_log_dir`
+# — replaced by the same one-liner over `appdirs` (see commands.rs).
+roomler-agent-core = { path = "../../crates/agent-core" }
 
 # LocalAPI client (unification P2): the tray reads live node/peer state from
-# the running daemon via `tunnel_core::localapi::Client`. Adds ZERO new crates
-# to the build — tunnel-core is already in the graph transitively via
-# `roomler-agent` → `roomler-ai-tunnel-core`; the direct dep just makes the
-# `localapi` module nameable from tray code.
-roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
+# the running daemon over the LocalAPI. P3e lever E: the dep is the LEAF
+# protocol crate, NOT tunnel-core — the tray only ever speaks the pipe
+# protocol, and depending on tunnel-core would compile the whole data plane
+# (webrtc, quinn, turn, rustls are non-optional there). The `use` paths below
+# say `roomler_localapi as localapi`, byte-compatible with the wire either way
+# because tunnel-core's own `localapi` is a re-export of this same crate.
+roomler-localapi = { path = "../../crates/localapi" }
 
 # Tauri 2.x runtime + tray + plugins.
 #

@@ -98,7 +98,9 @@ pub const RUN_SUBCOMMAND: &str = "service-run";
 /// scoped worker logs go elsewhere (under `%LOCALAPPDATA%`); the SCM-
 /// launched service runs as SYSTEM and can't write there.
 pub fn default_log_dir() -> Option<PathBuf> {
-    Some(crate::appdirs::machine_global_dir().join("service-logs"))
+    // Canonical path lives in agent-core (P3e lever E) so the desktop
+    // companion resolves the same directory without linking this crate.
+    Some(roomler_agent_core::appdirs::service_log_dir())
 }
 
 /// Transactional takeover install (P3D rename).
