@@ -214,6 +214,12 @@ pub struct CarrierPlane {
     /// Times the bind section actually ran (must stay ≤1 between rebuilds —
     /// locked by `ensure_bound_binds_once_under_concurrent_attach`).
     binds_performed: AtomicU32,
+    /// W5 — pokes the plane srflx task: SEEKING re-gathers immediately,
+    /// ESTABLISHED re-queries the mapping immediately. Fired by the
+    /// runtimes' interface-event arm (a VPN connect can change NAT reality
+    /// without changing the LAN-IP set, so the net-change rebuild never
+    /// fires for it). tokio Notify coalesces storms into one permit.
+    regather: tokio::sync::Notify,
     /// Auth-first type-1 routing (kill switch `OVERLAY_INIT_AUTH_FIRST`,
     /// default ON; read once at construction — config keys freeze at daemon
     /// start anyway). ON: with more than one engine attached, an inbound
@@ -252,8 +258,15 @@ impl CarrierPlane {
             srflx_gate: tokio::sync::Mutex::new(false),
             bind_gate: tokio::sync::Mutex::new(()),
             binds_performed: AtomicU32::new(0),
+            regather: tokio::sync::Notify::new(),
             init_auth_first: AtomicBool::new(direct::init_auth_first_enabled()),
         })
+    }
+
+    /// W5 — poke the plane srflx task (see the `regather` field). Sync and
+    /// cheap; callable from any select arm.
+    pub fn notify_regather(&self) {
+        self.regather.notify_one();
     }
 
     /// Test seam: flip the auth-first routing switch (production reads the
@@ -1159,14 +1172,14 @@ impl CarrierPlane {
             return self.lock().srflx_watch.borrow().clone();
         }
         let mut sink = self.lock().stun_rx.take();
-        let shared = match sink.as_mut() {
-            Some(rx) => self.gather_via_sink(stun_urls, rx).await,
-            None => SrflxShared {
-                generation: 1,
-                error: Some("plane STUN sink already taken".into()),
-                ..Default::default()
-            },
+        let Some(rx) = sink.as_mut() else {
+            // The srflx task already owns the sink (it lives for the plane
+            // epoch). Return the CURRENT state without publishing anything:
+            // the old error-publish here clobbered a good watch value with
+            // "sink already taken" (the W5 review's landmine).
+            return self.lock().srflx_watch.borrow().clone();
         };
+        let shared = self.gather_via_sink(stun_urls, rx).await;
         // send_replace, NOT send: the plane keeps no persistent receiver
         // (the channel's initial one is dropped at construction), and
         // `send` DROPS the value when there are zero receivers — which is
@@ -1178,7 +1191,7 @@ impl CarrierPlane {
         // value unconditionally, so late subscribers see the candidate.
         self.lock().srflx_watch.send_replace(shared.clone());
         if let Some(rx) = sink {
-            self.arm_keepalive(rx, stun_urls.to_vec(), &shared);
+            self.spawn_srflx_task(rx, stun_urls.to_vec(), &shared);
         }
         *done = true;
         shared
@@ -1205,55 +1218,81 @@ impl CarrierPlane {
         if v.socks.is_empty() {
             return out;
         }
-        let Some(server) = direct::resolve_stun_server(stun_urls, &v.my_ips).await else {
+        // W5(a) — walk the topologically-spread vantage list AT GATHER TIME.
+        // The old single-`resolve_stun_server` pick used the FIRST resolved
+        // address for every socket, so one corp path that drops UDP to that
+        // /16 read as "srflx NONE" even when the other vantages were fine
+        // (field 2026-08-14: pc50045's error named 94.130.141.74 while
+        // 5.9.157.x would have answered).
+        let mut targets = direct::resolve_stun_targets(stun_urls, &v.my_ips).await;
+        if targets.is_empty()
+            && let Some(s) = direct::resolve_stun_server(stun_urls, &v.my_ips).await
+        {
+            targets.push(s);
+        }
+        if targets.is_empty() {
             warn!(
                 urls = ?stun_urls,
                 "carrier plane: no resolvable STUN server — srflx tier OFF for every org this run"
             );
             out.error = Some(format!("no resolvable STUN server among {stun_urls:?}"));
             return out;
-        };
-        out.stun_server = Some(server);
-        let pairs = tokio::time::timeout(super::runtime::SRFLX_GATHER_BUDGET, async {
-            let mut pairs: Vec<(String, Arc<UdpSocket>)> = Vec::new();
-            for (_ip, sock) in &v.socks {
-                match crate::transport::stun::srflx_query_via_sink(
-                    sock,
-                    rx,
-                    server,
-                    super::runtime::SRFLX_ATTEMPT_TIMEOUT,
-                )
-                .await
-                {
-                    Ok(SocketAddr::V4(s)) if direct::is_public_v4(*s.ip()) => {
-                        let ep = SocketAddr::V4(s).to_string();
-                        if !pairs.iter().any(|(e, _)| e == &ep) {
-                            pairs.push((ep, sock.clone()));
+        }
+        let mut pairs: Vec<(String, Arc<UdpSocket>)> = Vec::new();
+        let mut tried = 0usize;
+        for server in targets.iter().take(3).copied() {
+            tried += 1;
+            out.stun_server = Some(server);
+            pairs = tokio::time::timeout(super::runtime::SRFLX_GATHER_BUDGET, async {
+                let mut pairs: Vec<(String, Arc<UdpSocket>)> = Vec::new();
+                for (_ip, sock) in &v.socks {
+                    match crate::transport::stun::srflx_query_via_sink(
+                        sock,
+                        rx,
+                        server,
+                        super::runtime::SRFLX_ATTEMPT_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(SocketAddr::V4(s)) if direct::is_public_v4(*s.ip()) => {
+                            let ep = SocketAddr::V4(s).to_string();
+                            if !pairs.iter().any(|(e, _)| e == &ep) {
+                                pairs.push((ep, sock.clone()));
+                            }
+                        }
+                        Ok(other) => {
+                            debug!(%other, "carrier plane: srflx candidate not public — skipping")
+                        }
+                        Err(e) => {
+                            debug!(%e, "carrier plane: srflx query failed on a socket — skipping")
                         }
                     }
-                    Ok(other) => {
-                        debug!(%other, "carrier plane: srflx candidate not public — skipping")
-                    }
-                    Err(e) => {
-                        debug!(%e, "carrier plane: srflx query failed on a socket — skipping")
-                    }
                 }
+                pairs
+            })
+            .await
+            .unwrap_or_default();
+            if !pairs.is_empty() {
+                break;
             }
-            pairs
-        })
-        .await
-        .unwrap_or_default();
+            info!(
+                %server,
+                remaining = targets.len().saturating_sub(tried).min(2),
+                "carrier plane: srflx gather empty from this vantage — trying the next"
+            );
+        }
         if pairs.is_empty() {
             // WARN for the same reason the per-runtime pass warns: an empty
             // srflx tier once died fleet-wide at debug! visibility.
             warn!(
-                %server,
+                vantages = tried,
                 sockets = v.socks.len(),
                 "carrier plane: srflx gather yielded NO public candidate — every org's peers \
                  will read this node as UDP-blocked (pairs fall to the relay/DERP tier)"
             );
             out.error = Some(format!(
-                "STUN yielded no public candidate from {server} ({} socket(s) probed)",
+                "STUN yielded no public candidate ({} vantage(s), {} socket(s) probed)",
+                tried,
                 v.socks.len()
             ));
             return out;
@@ -1261,7 +1300,7 @@ impl CarrierPlane {
         // A1 — up to three topologically-spread vantages; ANY pairwise
         // mapping mismatch classifies symmetric (one dead vantage tolerated).
         // Shared classifier with the per-runtime `probe_nat_type` twin.
-        let targets = direct::resolve_stun_targets(stun_urls, &v.my_ips).await;
+        // (The list was already resolved above — reuse it.)
         let my_nat = if targets.len() >= 2 {
             let punch_sock = pairs[0].1.clone();
             let mut mappings: Vec<SocketAddr> = Vec::with_capacity(targets.len());
@@ -1287,29 +1326,48 @@ impl CarrierPlane {
         info!(
             candidates = ?out.candidates,
             my_nat = ?out.my_nat,
-            %server,
+            server = ?out.stun_server,
             "carrier plane: srflx gathered ONCE for every attached org"
         );
         out
     }
 
-    /// The plane keepalive — the process-wide twin of the per-runtime srflx
-    /// keepalive: re-query the pinned server on the punch socket each
-    /// interval, publish a changed mapping on the watch (every runtime's
-    /// forwarder then re-advertises on its own WS), re-resolve the server
-    /// after repeated failures. Owns the plane's STUN sink from here on.
-    fn arm_keepalive(
+    /// W5 — the persistent plane srflx task: owns the STUN sink for the
+    /// plane epoch, in two states.
+    ///
+    /// **SEEKING** (no punch yet — the gather found nothing): periodically
+    /// re-run the FULL multi-vantage gather with backoff (keepalive-secs
+    /// floor 20 s, ×3 per miss, 300 s cap), plus an immediate pass when
+    /// [`notify_regather`](CarrierPlane::notify_regather) pokes (interface
+    /// events — a VPN connect changes NAT reality without changing the LAN
+    /// set). Before W5 a NONE gather returned the sink and NOTHING ever
+    /// re-queried: `srflx NONE` was sticky for the daemon lifetime, which
+    /// also made the node the universal relay ANCHOR (`set_udp_relay_ok`
+    /// false forever). The B4 watchdog is INERT here BY CONSTRUCTION —
+    /// there is no advertised mapping to defend, and on a genuinely
+    /// UDP-blocked host it would force an authoritative plane rebuild
+    /// every few cycles forever.
+    ///
+    /// **ESTABLISHED** (punch exists): the pre-W5 keepalive verbatim —
+    /// re-query the pinned server on the punch socket each interval,
+    /// publish a changed mapping on the watch (every runtime's forwarder
+    /// re-advertises on its own WS; the runtimes' srflx-watch arm refreshes
+    /// their carriers' view), re-resolve the server after repeated
+    /// failures, B4 watchdog ARMED. A regather poke here runs the query
+    /// immediately instead of waiting out the tick.
+    fn spawn_srflx_task(
         self: &Arc<Self>,
         rx: mpsc::Receiver<StunInbound>,
         stun_urls: Vec<String>,
         seed: &SrflxShared,
     ) {
         let secs = direct::srflx_keepalive_secs();
-        let (Some(server0), Some((_, punch))) = (seed.stun_server, seed.punch.clone()) else {
+        if !direct::srflx_enabled() || secs == 0 {
             self.lock().stun_rx = Some(rx);
             return;
-        };
-        if !direct::srflx_enabled() || secs == 0 || seed.candidates.is_empty() {
+        }
+        if seed.punch.is_none() && !direct::srflx_seek_enabled() {
+            // Kill switch: restore the pre-W5 sticky-NONE behaviour.
             self.lock().stun_rx = Some(rx);
             return;
         }
@@ -1318,7 +1376,46 @@ impl CarrierPlane {
         let mut state = seed.clone();
         let handle = tokio::spawn(async move {
             let mut rx = rx;
-            let mut server = server0;
+            // ---- SEEKING ----
+            if state.punch.is_none() {
+                let mut delay = std::time::Duration::from_secs(secs.max(20));
+                const SEEK_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = plane.regather.notified() => {
+                            info!("carrier plane: srflx re-gather poked (interface event) while SEEKING");
+                        }
+                    }
+                    let fresh = plane.gather_via_sink(&stun_urls, &mut rx).await;
+                    if fresh.punch.is_some() {
+                        state = SrflxShared {
+                            generation: state.generation + 1,
+                            ..fresh
+                        };
+                        plane.lock().srflx_watch.send_replace(state.clone());
+                        info!(
+                            candidates = ?state.candidates,
+                            my_nat = ?state.my_nat,
+                            "carrier plane: srflx RECOVERED after NONE — every org re-advertises \
+                             and re-pairs"
+                        );
+                        break; // → ESTABLISHED below
+                    }
+                    delay = (delay * 3).min(SEEK_CAP);
+                    debug!(
+                        next_secs = delay.as_secs(),
+                        "carrier plane: srflx still NONE — backing off"
+                    );
+                }
+            }
+            // ---- ESTABLISHED ----
+            let (Some(mut server), Some((_, punch))) = (state.stun_server, state.punch.clone())
+            else {
+                // A gather success always sets both; defensive only.
+                warn!("carrier plane: srflx task seeded without server/punch — exiting");
+                return;
+            };
             let mut failures = 0u32;
             // B4 — a SEPARATE consecutive-failure counter for the watchdog:
             // `failures` resets every RERESOLVE_AFTER cycles (the STUN-server
@@ -1337,7 +1434,12 @@ impl CarrierPlane {
             // The interval's immediate first tick — the gather just ran.
             tick.tick().await;
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = plane.regather.notified() => {
+                        info!("carrier plane: srflx keepalive poked (interface event) — querying now");
+                    }
+                }
                 match crate::transport::stun::srflx_query_via_sink(
                     &punch,
                     &mut rx,
@@ -2039,6 +2141,38 @@ mod tests {
         assert!(
             matches!(plane.route_session_of(1, shared), Routed::Session { .. }),
             "reassert_plane_src must heal the reverse entry for the live session"
+        );
+    }
+
+    /// W5 — when the persistent srflx task owns the STUN sink,
+    /// `ensure_srflx` must return the CURRENT watch value untouched. The
+    /// pre-W5 code published an error ("sink already taken") over whatever
+    /// the watch held — clobbering a good candidate that a later subscriber
+    /// (or the LocalAPI) would then read as NONE.
+    #[tokio::test]
+    async fn ensure_srflx_returns_cache_untouched_when_the_sink_is_owned() {
+        let plane = CarrierPlane::new();
+        // Simulate the task owning the sink.
+        let _sink = plane.lock().stun_rx.take();
+        // A good shared value is already published.
+        let good = SrflxShared {
+            candidates: vec!["37.63.112.129:43649".into()],
+            my_nat: Some("cone".into()),
+            generation: 7,
+            ..Default::default()
+        };
+        plane.lock().srflx_watch.send_replace(good.clone());
+
+        let got = plane
+            .ensure_srflx(&["stun:example.invalid:3478".into()])
+            .await;
+        assert_eq!(got.candidates, good.candidates);
+        assert_eq!(got.generation, 7);
+        assert!(got.error.is_none(), "must not clobber with a sink error");
+        let watched = plane.lock().srflx_watch.borrow().clone();
+        assert_eq!(
+            watched.candidates, good.candidates,
+            "the watch value must survive the call"
         );
     }
 
