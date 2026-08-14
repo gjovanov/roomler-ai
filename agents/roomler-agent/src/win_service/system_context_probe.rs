@@ -767,11 +767,13 @@ mod tests {
 
     #[test]
     fn cadence_counts_total_sums_all_buckets() {
-        let mut c = CadenceCounts::default();
-        c.ok = 10;
-        c.would_block = 100;
-        c.access_lost = 1;
-        c.other = 2;
+        let c = CadenceCounts {
+            ok: 10,
+            would_block: 100,
+            access_lost: 1,
+            other: 2,
+            ..Default::default()
+        };
         assert_eq!(c.total(), 113);
     }
 
