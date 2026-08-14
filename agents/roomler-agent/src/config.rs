@@ -133,6 +133,13 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_INIT_AUTH_FIRST`). Built-in default: on.
     #[serde(default)]
     pub overlay_init_auth_first: Option<bool>,
+    /// srflx SEEKING mode — when the shared gather finds NO public candidate,
+    /// keep re-gathering with backoff (20 s → ×3 → 300 s cap) plus an
+    /// immediate retry on interface events, instead of the pre-W5 sticky
+    /// "srflx NONE for the daemon lifetime"
+    /// (`ROOMLER_NODE_OVERLAY_SRFLX_SEEK`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_srflx_seek: Option<bool>,
     /// Overlay PathMonitor engagement (`ROOMLER_NODE_OVERLAY_PATHMON`):
     /// `on` (authoritative — the built-in default since PR-D's two green
     /// soaks) | `shadow` (fed + compared, legacy decides — the per-host
@@ -1109,7 +1116,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 32] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 33] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1123,6 +1130,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 32]
         ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
         ("OVERLAY_WSL_MIRRORED_GUARD", cfg.overlay_wsl_mirrored_guard),
         ("OVERLAY_INIT_AUTH_FIRST", cfg.overlay_init_auth_first),
+        ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
         ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
         ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
         ("OVERLAY_MUX_NAT", cfg.overlay_mux_nat),
@@ -1494,6 +1502,7 @@ machine_name = "neo16"
             overlay_lan_iface_filter: None,
             overlay_wsl_mirrored_guard: None,
             overlay_init_auth_first: None,
+            overlay_srflx_seek: None,
             overlay_pathmon: None,
             overlay_route_events: None,
             overlay_route_tick_secs: None,
