@@ -17,12 +17,26 @@ use crate::config::TunnelConfig;
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 /// Installer-proxy platform token (matches the api `normalise_platform`).
+/// Only `windows-x86_64` has a real self-update path (see `update` below); the
+/// other tokens only fill the "download it yourself from {url}" hint. A
+/// catch-all keeps the CLI COMPILING on targets the server has no artifact for
+/// (e.g. aarch64 Linux — a source build on Fedora Asahi hit E0425 here) instead
+/// of failing to build at all.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const PLATFORM: &str = "windows-x86_64";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const PLATFORM: &str = "linux-x86_64";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const PLATFORM: &str = "linux-aarch64";
 #[cfg(target_os = "macos")]
 const PLATFORM: &str = "macos";
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
+    target_os = "macos",
+)))]
+const PLATFORM: &str = "unknown";
 
 #[derive(serde::Deserialize)]
 struct ReleaseAsset {
