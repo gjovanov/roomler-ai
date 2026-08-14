@@ -131,6 +131,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "LAN-gather virtual-interface filter (skip WSL/Hyper-V/other-VPN adapters). Built-in default: on.",
     ),
     (
+        "overlay_wsl_mirrored_guard",
+        "tribool",
+        "WSL2 mirrored-networking guard: a mirrored guest shares the Windows host's adapters, so skip its LAN gather (binding the host's address starves the host agent). Built-in default: on.",
+    ),
+    (
         "overlay_pathmon",
         "string",
         "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
@@ -389,6 +394,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_server_relay_strategy" => cfg.overlay_server_relay_strategy.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
+        "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
         "overlay_rpf" => cfg.overlay_rpf.clone(),
@@ -494,6 +500,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "overlay_mbb" => cfg.overlay_mbb = parse_tribool(value)?,
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter = parse_tribool(value)?,
+        "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard = parse_tribool(value)?,
         "overlay_pathmon" => {
             cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -928,6 +935,37 @@ mod tests {
         apply(&mut cfg, "overlay_tun_per_org", None).unwrap();
         assert_eq!(cfg.overlay_tun_per_org, None);
         assert!(apply(&mut cfg, "overlay_tun_per_org", Some("maybe")).is_err());
+    }
+
+    /// The WSL2 mirrored-networking guard key set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule). The kill switch matters here:
+    /// the guard SUPPRESSES a guest's whole LAN gather, so a misdetection
+    /// must be recoverable with `roomler config set …` and no rebuild.
+    #[test]
+    fn overlay_wsl_mirrored_guard_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_wsl_mirrored_guard", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_wsl_mirrored_guard, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_wsl_mirrored_guard")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_wsl_mirrored_guard", None).unwrap();
+        assert_eq!(
+            cfg.overlay_wsl_mirrored_guard, None,
+            "clear → built-in default"
+        );
+        // The env bridge must carry it, or `config set` writes TOML the daemon
+        // silently ignores — the exact failure the bridge test guards against.
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(k, _)| *k == "OVERLAY_WSL_MIRRORED_GUARD"),
+            "key must be bridged to the daemon's env"
+        );
     }
 
     /// rc.275 — the LAN-gather virtual-interface filter key set/echo/clear
