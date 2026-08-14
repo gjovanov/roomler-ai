@@ -754,11 +754,30 @@ fn system_swap_enabled() -> bool {
     }
 }
 
+/// W4 — the exit code Windows session teardown delivers to processes in a
+/// dying session (`DBG_TERMINATE_PROCESS`, 0x40010004). Field 2026-08-14
+/// (CORPLAP-1): logon-screen transitions and Check-Point-VPN session flaps
+/// killed the worker with this code, and each death escalated the backoff
+/// ladder (a flapping session keeps uptime under the 30 s healthy
+/// threshold) — a multi-minute mesh outage manufactured from a
+/// seconds-long OS event. Session teardown is the OS's action, not a
+/// worker crash; it must neither escalate the ladder nor pollute fleet
+/// crash metrics. NOTE: the supervisor's OWN terminate() exits the worker
+/// with code 1 and reaps it via `current.take()` BEFORE the ladder ever
+/// sees it — 0x40010004 exits observed at the reap site are always
+/// external.
+pub const SESSION_TEARDOWN_EXIT_CODE: u32 = 0x4001_0004;
+
 /// Decide how to react to a worker exit. Returns the reaction plus
 /// the new value for `consecutive_failures`.
 pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReaction, u32) {
     if code == 0 {
         (ExitReaction::Respawn, 0)
+    } else if code == SESSION_TEARDOWN_EXIT_CODE {
+        // Counter reset (not a crash) but a 2 s floor, never zero-delay: an
+        // external tool spamming this exit code must not create a
+        // spawn-kill hot loop.
+        (ExitReaction::Backoff(RESPAWN_BACKOFF_INITIAL), 0)
     } else {
         let next = consecutive_failures.saturating_add(1);
         (ExitReaction::Backoff(next_backoff(next)), next)
@@ -778,10 +797,15 @@ pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReacti
 ///     `needs-attention.txt` sentinel; the supervisor's fleet-crash
 ///     dashboard would treat code-7 exits as silent crashes and
 ///     mask the operator-action signal.
+///   * `SESSION_TEARDOWN_EXIT_CODE` (W4) — Windows killed the session,
+///     not the worker; recording every logon/VPN session flap as a
+///     `SupervisorDetected` crash buried real crashes in the fleet
+///     dashboard (CORPLAP-1 logged several per day).
 pub fn should_record_supervisor_crash(code: u32) -> bool {
     code != 0
         && code != crate::watchdog::STALL_EXIT_CODE as u32
         && code != crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
+        && code != SESSION_TEARDOWN_EXIT_CODE
 }
 
 /// Compute the next backoff duration given how many consecutive
@@ -1597,6 +1621,30 @@ mod tests {
         // Runaway counter must not panic on overflow.
         let (_, next) = decide_exit_reaction(1, u32::MAX);
         assert_eq!(next, u32::MAX);
+    }
+
+    /// W4 — Windows session teardown (0x40010004) is the OS's action, not a
+    /// crash: counter RESETS (a logon/VPN flap storm must not climb toward
+    /// the 60 s cap — the CORPLAP-1 multi-minute-outage class) but the respawn
+    /// keeps a 2 s floor so a spoofed exit code can't create a hot loop.
+    /// And it never pollutes fleet crash metrics.
+    #[test]
+    fn session_teardown_resets_the_ladder_with_a_floor_and_records_no_crash() {
+        assert_eq!(
+            decide_exit_reaction(SESSION_TEARDOWN_EXIT_CODE, 6),
+            (ExitReaction::Backoff(RESPAWN_BACKOFF_INITIAL), 0),
+            "mid-ladder session teardown must reset the counter"
+        );
+        assert_eq!(
+            decide_exit_reaction(SESSION_TEARDOWN_EXIT_CODE, 0),
+            (ExitReaction::Backoff(RESPAWN_BACKOFF_INITIAL), 0)
+        );
+        assert!(!should_record_supervisor_crash(SESSION_TEARDOWN_EXIT_CODE));
+        // A real crash right AFTER a teardown starts a FRESH ladder (2 s).
+        assert_eq!(
+            decide_exit_reaction(1, 0),
+            (ExitReaction::Backoff(Duration::from_secs(2)), 1)
+        );
     }
 
     // ─── B2 regression: supervisor crash-record exclusion ────────────
