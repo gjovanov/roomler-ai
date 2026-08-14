@@ -142,6 +142,23 @@ pub fn gather_lan_ips() -> Vec<Ipv4Addr> {
 pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
     let mut out: Vec<(Ipv4Addr, Option<u32>)> = Vec::new();
     let filter = lan_iface_filter_enabled();
+    // A WSL2 guest under MIRRORED networking has NO LAN identity of its own:
+    // every address it can see is the Windows host's, mirrored in. Gathering
+    // them is actively harmful, not merely useless —
+    //
+    //   * the guest binds `(host_lan_ip, port)` and STARVES the host agent's
+    //     own socket. Field 2026-08-14: neo16 went 8/8 direct → 0/8, every
+    //     peer `saw_inbound=false`, until the guest's agent was stopped. A
+    //     different port did NOT help; the address is what matters.
+    //   * the host, seeing the guest advertise the host's own address, gets a
+    //     phantom LAN candidate — which then suppresses srflx as a same-NAT
+    //     hairpin, leaving the pair with no tier that can ever promote (#436).
+    //
+    // The guest keeps srflx + relay, which is the honest reachability of a
+    // machine with no independent network presence.
+    if wsl_mirrored_guard_enabled() && wsl2_mirrored_networking() {
+        return out;
+    }
     if let Ok(addrs) = if_addrs::get_if_addrs() {
         for a in addrs {
             if let std::net::IpAddr::V4(ip) = a.ip()
@@ -201,6 +218,69 @@ pub fn lan_iface_filter_enabled() -> bool {
         }
         None => true,
     }
+}
+
+/// Gate for the WSL2 **mirrored-networking** guard
+/// (`ROOMLER_NODE_OVERLAY_WSL_MIRRORED_GUARD`; config `overlay_wsl_mirrored_guard`).
+/// Default **ON**; set `0`/`false`/`no`/`off` to restore the pre-guard gather.
+pub fn wsl_mirrored_guard_enabled() -> bool {
+    crate::env::flag("OVERLAY_WSL_MIRRORED_GUARD", true)
+}
+
+/// The loopback-scoped address WSL2 assigns for host access. Its presence
+/// alongside a WSL2 kernel is the marker for **mirrored** networking — in NAT
+/// mode the guest gets a private `172.x` on `eth0` and no such loopback alias.
+#[cfg(target_os = "linux")]
+const WSL_MIRRORED_HOST_ACCESS: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 254);
+
+/// Pure half of [`wsl2_mirrored_networking`] so the classification is testable
+/// without `/proc` or a WSL kernel.
+fn wsl2_mirrored_from_parts(osrelease: &str, has_host_access_alias: bool) -> bool {
+    osrelease.to_ascii_lowercase().contains("wsl2") && has_host_access_alias
+}
+
+/// Are we a WSL2 guest running **mirrored** networking?
+///
+/// Mirrored mode gives the guest the HOST's adapters verbatim, so every
+/// non-overlay address it can see belongs to the Windows host, not to it.
+/// Field 2026-08-14, neo16's guest:
+///
+/// ```text
+/// lo    10.255.255.254/32   ← the marker
+/// eth2  192.168.68.126/24   ← the host's Wi-Fi address
+/// eth3  100.65.0.6/22       ← the host's OVERLAY address
+/// eth4  100.65.4.2/22       ← the host's OVERLAY address
+/// ```
+///
+/// Cached: mirrored-vs-NAT cannot change without restarting the guest.
+#[cfg(target_os = "linux")]
+pub fn wsl2_mirrored_networking() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let osrelease = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+        let alias = if_addrs::get_if_addrs().is_ok_and(|addrs| {
+            addrs.iter().any(|a| match a.ip() {
+                std::net::IpAddr::V4(ip) => ip == WSL_MIRRORED_HOST_ACCESS,
+                _ => false,
+            })
+        });
+        let mirrored = wsl2_mirrored_from_parts(&osrelease, alias);
+        if mirrored {
+            tracing::warn!(
+                "overlay: WSL2 MIRRORED networking detected — this guest shares the Windows \
+                 host's adapters, so its visible LAN addresses belong to the HOST. Skipping \
+                 them for LAN candidates and direct binds; the guest reaches the mesh via \
+                 srflx/relay. Binding them starves the host agent's own sockets (2026-08-14)."
+            );
+        }
+        mirrored
+    })
+}
+
+/// Non-Linux hosts are never a WSL guest.
+#[cfg(not(target_os = "linux"))]
+pub fn wsl2_mirrored_networking() -> bool {
+    false
 }
 
 /// rc.275 hygiene — `true` when an interface must NOT be advertised as a LAN
@@ -1691,6 +1771,61 @@ mod tests {
         // A same-subnet but CGNAT endpoint is rejected.
         let cgnat = vec!["100.64.0.110:51820".to_string()];
         assert!(pick_same_subnet_endpoint(&["100.64.0.103".parse().unwrap()], &cgnat).is_none());
+    }
+
+    /// WSL2 mirrored networking is detected only when BOTH markers agree.
+    ///
+    /// The kernel string alone is not enough: a WSL2 guest in the DEFAULT NAT
+    /// mode has its own private `172.x` on `eth0` and a genuine (if host-only)
+    /// LAN identity — suppressing its gather there would be a regression for
+    /// every NAT-mode guest on the fleet. The `10.255.255.254` loopback alias
+    /// is what WSL adds specifically for mirrored host access.
+    #[test]
+    fn wsl2_mirrored_needs_both_the_kernel_and_the_host_access_alias() {
+        let wsl = "6.6.87.2-microsoft-standard-WSL2"; // neo16's guest, verbatim
+        assert!(
+            wsl2_mirrored_from_parts(wsl, true),
+            "WSL2 kernel + host-access alias = mirrored"
+        );
+        assert!(
+            !wsl2_mirrored_from_parts(wsl, false),
+            "WSL2 kernel WITHOUT the alias is NAT mode — it keeps its own LAN gather"
+        );
+        assert!(
+            !wsl2_mirrored_from_parts("6.8.0-51-generic", true),
+            "a bare-metal Linux host that happens to hold 10.255.255.254 is NOT WSL"
+        );
+        assert!(!wsl2_mirrored_from_parts("", false));
+        // Case-insensitive: the kernel string's casing is not a contract.
+        assert!(wsl2_mirrored_from_parts(
+            "5.15.0-microsoft-standard-wsl2",
+            true
+        ));
+    }
+
+    /// The guard is default-ON with a kill switch, matching every other
+    /// overlay gate — a misdetection must be recoverable without a rebuild.
+    #[test]
+    fn wsl_mirrored_guard_defaults_on_with_kill_switch() {
+        // SAFETY: single-threaded test, restored before returning.
+        let key = "ROOMLER_NODE_OVERLAY_WSL_MIRRORED_GUARD";
+        unsafe { std::env::remove_var(key) };
+        assert!(wsl_mirrored_guard_enabled(), "default ON");
+        unsafe { std::env::set_var(key, "0") };
+        assert!(!wsl_mirrored_guard_enabled(), "0 disables");
+        unsafe { std::env::set_var(key, "off") };
+        assert!(!wsl_mirrored_guard_enabled(), "off disables");
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// Non-Linux can never be a WSL guest, so the guard must be inert there —
+    /// this is what keeps the Windows/macOS gather untouched.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn wsl_detection_is_inert_off_linux() {
+        assert!(!wsl2_mirrored_networking());
+        // …and therefore the gather is NOT short-circuited on this platform.
+        // (Can't assert non-empty: CI runners may have no usable LAN NIC.)
     }
 
     /// A peer advertising OUR OWN address is not a LAN candidate — dialling it
