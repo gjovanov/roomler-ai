@@ -894,11 +894,12 @@ jobs:
           # and the shim that replaces it is ~0.15 MB. Ceiling drops with it:
           # 36 -> 30 MB, keeping the same ~5 MB of headroom over the baseline
           # that the P4b guard had.
-          # FIRST BUILD AFTER THIS CHANGE: read the "::notice::per-Machine MSI"
-          # line and set $p4bBaseline to that measured value. A baseline left
-          # too high is exactly the silent failure this guard exists to catch —
-          # it would swallow a multi-MB regression as "within budget".
-          $p4bBaseline = 24.5
+          # Baseline PINNED from the first post-change build (rehearsal run
+          # 31850087288's sibling, 2026-08-15): both flavours measured
+          # 25.45 MB. A baseline left above the real value is exactly the
+          # silent failure this guard exists to catch — it would swallow a
+          # multi-MB regression as "within budget".
+          $p4bBaseline = 25.45
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
