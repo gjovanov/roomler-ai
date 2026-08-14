@@ -136,6 +136,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "WSL2 mirrored-networking guard: a mirrored guest shares the Windows host's adapters, so skip its LAN gather (binding the host's address starves the host agent). Built-in default: on.",
     ),
     (
+        "overlay_init_auth_first",
+        "tribool",
+        "Auth-first handshake routing on a multi-org carrier plane: route an inbound WG initiation by trial-authentication instead of the source shortcut (fixes the dual-org direct lockout). Built-in default: on.",
+    ),
+    (
         "overlay_pathmon",
         "string",
         "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
@@ -395,6 +400,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard.map(fmt_bool),
+        "overlay_init_auth_first" => cfg.overlay_init_auth_first.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
         "overlay_rpf" => cfg.overlay_rpf.clone(),
@@ -501,6 +507,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_mbb" => cfg.overlay_mbb = parse_tribool(value)?,
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter = parse_tribool(value)?,
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard = parse_tribool(value)?,
+        "overlay_init_auth_first" => cfg.overlay_init_auth_first = parse_tribool(value)?,
         "overlay_pathmon" => {
             cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -964,6 +971,35 @@ mod tests {
             crate::config::env_bridge_bools(&cfg)
                 .iter()
                 .any(|(k, _)| *k == "OVERLAY_WSL_MIRRORED_GUARD"),
+            "key must be bridged to the daemon's env"
+        );
+    }
+
+    /// The auth-first type-1 routing key set/echo/clear (per the
+    /// every-new-env-gets-a-config-key rule). This is the kill switch for
+    /// the dual-org lockout fix — it must be flippable per host with
+    /// `roomler config set …` and no rebuild.
+    #[test]
+    fn overlay_init_auth_first_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, "overlay_init_auth_first", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_init_auth_first, Some(false));
+        assert_eq!(
+            entry_for(&cfg, "overlay_init_auth_first")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
+        );
+        apply(&mut cfg, "overlay_init_auth_first", None).unwrap();
+        assert_eq!(
+            cfg.overlay_init_auth_first, None,
+            "clear → built-in default"
+        );
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(k, _)| *k == "OVERLAY_INIT_AUTH_FIRST"),
             "key must be bridged to the daemon's env"
         );
     }
