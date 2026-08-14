@@ -234,7 +234,11 @@ pub fn wsl_mirrored_guard_enabled() -> bool {
 const WSL_MIRRORED_HOST_ACCESS: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 254);
 
 /// Pure half of [`wsl2_mirrored_networking`] so the classification is testable
-/// without `/proc` or a WSL kernel.
+/// without `/proc` or a WSL kernel. cfg-gated to its callers (the Linux
+/// detector + tests) — on Windows/macOS non-test builds it would otherwise
+/// be dead code, and those builds are exactly the ones CI's Linux matrix
+/// never lints.
+#[cfg(any(target_os = "linux", test))]
 fn wsl2_mirrored_from_parts(osrelease: &str, has_host_access_alias: bool) -> bool {
     osrelease.to_ascii_lowercase().contains("wsl2") && has_host_access_alias
 }
