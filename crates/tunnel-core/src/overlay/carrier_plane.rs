@@ -86,6 +86,10 @@ struct EngineEntry {
     id: u64,
     secret: StaticSecret,
     public: PublicKey,
+    /// Precomputed `Blake2s256(LABEL_MAC1 || public)` — the ~1 µs mac1
+    /// pre-filter that decides WHICH engine (if any) is worth an X25519
+    /// during initiation trial-authentication. Router state, not a secret.
+    mac1_key: [u8; 32],
     send: WgSender,
     disco_events: mpsc::Sender<DiscoInbound>,
     direct_events: mpsc::Sender<DirectInbound>,
@@ -272,6 +276,7 @@ impl CarrierPlane {
         st.next_engine_id += 1;
         st.engines.push(EngineEntry {
             id,
+            mac1_key: super::wg::mac1_key_for(&hooks.public),
             secret: hooks.secret,
             public: hooks.public,
             send: hooks.send,
@@ -905,22 +910,29 @@ impl CarrierPlane {
     }
 
     /// Try each attached engine's static against a handshake initiation.
-    /// Engines are snapshotted out of the lock — the DH runs unlocked.
+    /// Engines are snapshotted out of the lock — the crypto runs unlocked.
     /// `preferred` engines (the ones with a `by_src` session at the packet's
     /// source) are tried first: a genuine rekey then costs one DH.
+    ///
+    /// The mac1 pre-filter runs first (per engine, ~1 µs keyed Blake2s):
+    /// an initiation is mac1-keyed to exactly one responder static, so a
+    /// spoofed/foreign packet — including one from a source that holds a
+    /// live `by_src` entry and therefore bypasses the unknown-source
+    /// limiter — is rejected without ever reaching an X25519.
     fn authenticate_against_engines(&self, init: &[u8], preferred: &[u64]) -> Option<u64> {
-        let mut engines: Vec<(u64, StaticSecret, PublicKey)> = {
+        let mut engines: Vec<(u64, StaticSecret, PublicKey, [u8; 32])> = {
             let st = self.lock();
             st.engines
                 .iter()
-                .map(|e| (e.id, e.secret.clone(), e.public))
+                .map(|e| (e.id, e.secret.clone(), e.public, e.mac1_key))
                 .collect()
         };
-        engines.sort_by_key(|(id, _, _)| !preferred.contains(id));
+        engines.sort_by_key(|(id, _, _, _)| !preferred.contains(id));
         engines
             .into_iter()
-            .find(|(_, secret, public)| authenticate_init_with(secret, public, init).is_some())
-            .map(|(id, _, _)| id)
+            .filter(|(_, _, _, mac1_key)| super::wg::init_mac1_matches(mac1_key, init))
+            .find(|(_, secret, public, _)| authenticate_init_with(secret, public, init).is_some())
+            .map(|(id, _, _, _)| id)
     }
 }
 

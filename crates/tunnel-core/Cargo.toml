@@ -95,6 +95,10 @@ tcp-turn-conn = { path = "../tcp-turn-conn" }
 # comes from boringtun's re-exported `x25519`. Feature-gated so default
 # builds stay overlay-free (same discipline as the agent's `vp9-444`).
 boringtun = { version = "0.7", optional = true }
+# mac1 pre-filter (same blake2 boringtun itself uses — no new lock entry):
+# verify a handshake initiation's mac1 against each engine's static BEFORE
+# spending an X25519 in trial-authentication.
+blake2 = { version = "0.10", optional = true }
 base64 = { workspace = true, optional = true }
 
 # Overlay direct LAN path (rc.131/132): enumerate the node's local interface
@@ -161,7 +165,7 @@ features = [
 
 [features]
 # Userspace WireGuard L3 overlay (Phase 2+). Off by default.
-overlay = ["dep:boringtun", "dep:base64", "dep:if-addrs"]
+overlay = ["dep:boringtun", "dep:base64", "dep:if-addrs", "dep:blake2"]
 # Phase 3: the OS TUN device (`overlay::tun::SystemTun`) on top of the WG
 # core. `overlay` alone gives the WG device + the bridge logic + the
 # in-memory MockTun loopback test (no real device); `overlay-l3` adds the
