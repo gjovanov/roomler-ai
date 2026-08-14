@@ -1179,7 +1179,7 @@ impl CarrierPlane {
             // "sink already taken" (the W5 review's landmine).
             return self.lock().srflx_watch.borrow().clone();
         };
-        let shared = self.gather_via_sink(stun_urls, rx).await;
+        let shared = self.gather_via_sink(stun_urls, rx, false).await;
         // send_replace, NOT send: the plane keeps no persistent receiver
         // (the channel's initial one is dropped at construction), and
         // `send` DROPS the value when there are zero receivers — which is
@@ -1200,10 +1200,18 @@ impl CarrierPlane {
     /// The gather pass — the plane twin of the runtime's
     /// `gather_and_advertise_srflx` core, minus the advertising (each
     /// runtime does its own) and driven through the STUN sink.
+    ///
+    /// `quiet` — demote the per-vantage progress lines and the all-empty
+    /// WARN to debug. The SEEKING task re-walks every backoff tick (and on
+    /// every interface-event poke), so at full verbosity a UDP-blocked host
+    /// wrote the same 4 lines per walk forever — field 2026-08-14: 40k srflx
+    /// lines in one day's log on CORPLAP-1. The task keeps its own low-rate
+    /// heartbeat instead.
     async fn gather_via_sink(
         &self,
         stun_urls: &[String],
         rx: &mut mpsc::Receiver<StunInbound>,
+        quiet: bool,
     ) -> SrflxShared {
         let mut out = SrflxShared {
             generation: 1,
@@ -1275,21 +1283,40 @@ impl CarrierPlane {
             if !pairs.is_empty() {
                 break;
             }
-            info!(
-                %server,
-                remaining = targets.len().saturating_sub(tried).min(2),
-                "carrier plane: srflx gather empty from this vantage — trying the next"
-            );
+            let remaining = targets.len().saturating_sub(tried).min(2);
+            if quiet {
+                debug!(
+                    %server,
+                    remaining,
+                    "carrier plane: srflx gather empty from this vantage — trying the next"
+                );
+            } else {
+                info!(
+                    %server,
+                    remaining,
+                    "carrier plane: srflx gather empty from this vantage — trying the next"
+                );
+            }
         }
         if pairs.is_empty() {
             // WARN for the same reason the per-runtime pass warns: an empty
-            // srflx tier once died fleet-wide at debug! visibility.
-            warn!(
-                vantages = tried,
-                sockets = v.socks.len(),
-                "carrier plane: srflx gather yielded NO public candidate — every org's peers \
-                 will read this node as UDP-blocked (pairs fall to the relay/DERP tier)"
-            );
+            // srflx tier once died fleet-wide at debug! visibility. (Quiet
+            // repeat walks demote it — the FIRST verdict already warned.)
+            if quiet {
+                debug!(
+                    vantages = tried,
+                    sockets = v.socks.len(),
+                    "carrier plane: srflx gather yielded NO public candidate — every org's peers \
+                     will read this node as UDP-blocked (pairs fall to the relay/DERP tier)"
+                );
+            } else {
+                warn!(
+                    vantages = tried,
+                    sockets = v.socks.len(),
+                    "carrier plane: srflx gather yielded NO public candidate — every org's peers \
+                     will read this node as UDP-blocked (pairs fall to the relay/DERP tier)"
+                );
+            }
             out.error = Some(format!(
                 "STUN yielded no public candidate ({} vantage(s), {} socket(s) probed)",
                 tried,
@@ -1380,14 +1407,33 @@ impl CarrierPlane {
             if state.punch.is_none() {
                 let mut delay = std::time::Duration::from_secs(secs.max(20));
                 const SEEK_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+                let mut last_walk: Option<std::time::Instant> = None;
+                let mut walks: u64 = 0;
                 loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
+                    let poked = tokio::select! {
+                        _ = tokio::time::sleep(delay) => false,
                         _ = plane.regather.notified() => {
-                            info!("carrier plane: srflx re-gather poked (interface event) while SEEKING");
+                            debug!("carrier plane: srflx re-gather poked (interface event) while SEEKING");
+                            true
+                        }
+                    };
+                    // W6 — pokes bypass the backoff BY DESIGN (a VPN drop
+                    // must re-gather fast), but a churny event source must
+                    // not turn that into a continuous STUN loop: field
+                    // 2026-08-14, CORPLAP-1 under Check Point emitted an
+                    // interface event every ~6 s, so SEEKING walked all 3
+                    // vantages back-to-back for 15 minutes (~140 walks)
+                    // until the source quieted. Timer-driven walks never
+                    // wait — their spacing IS the backoff.
+                    if poked {
+                        let wait = poke_floor_wait(last_walk.map(|t| t.elapsed()));
+                        if !wait.is_zero() {
+                            tokio::time::sleep(wait).await;
                         }
                     }
-                    let fresh = plane.gather_via_sink(&stun_urls, &mut rx).await;
+                    let fresh = plane.gather_via_sink(&stun_urls, &mut rx, walks > 0).await;
+                    last_walk = Some(std::time::Instant::now());
+                    walks += 1;
                     if fresh.punch.is_some() {
                         state = SrflxShared {
                             generation: state.generation + 1,
@@ -1397,16 +1443,28 @@ impl CarrierPlane {
                         info!(
                             candidates = ?state.candidates,
                             my_nat = ?state.my_nat,
+                            walks,
                             "carrier plane: srflx RECOVERED after NONE — every org re-advertises \
                              and re-pairs"
                         );
                         break; // → ESTABLISHED below
                     }
                     delay = (delay * 3).min(SEEK_CAP);
-                    debug!(
-                        next_secs = delay.as_secs(),
-                        "carrier plane: srflx still NONE — backing off"
-                    );
+                    // Low-rate heartbeat (walk 1, 11, 21, …) — the per-walk
+                    // detail is at debug since the quiet-gather demotion.
+                    if walks % 10 == 1 {
+                        info!(
+                            walks,
+                            next_secs = delay.as_secs(),
+                            "carrier plane: srflx still NONE — seeking continues \
+                             (per-walk detail at debug)"
+                        );
+                    } else {
+                        debug!(
+                            next_secs = delay.as_secs(),
+                            "carrier plane: srflx still NONE — backing off"
+                        );
+                    }
                 }
             }
             // ---- ESTABLISHED ----
@@ -1433,13 +1491,25 @@ impl CarrierPlane {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // The interval's immediate first tick — the gather just ran.
             tick.tick().await;
+            // W6 — poke-storm floor (see SEEKING): a poked query here is only
+            // an ACCELERATION of the ≤`secs` tick, so under an interface-event
+            // storm a too-soon poke is skipped outright — the regular
+            // keepalive re-queries within the interval anyway, and the tick
+            // cadence itself must NEVER be floored (Check Point grandfathering
+            // depends on the ≤25 s keepalive holding the session entry).
+            let mut last_query: Option<std::time::Instant> = None;
             loop {
-                tokio::select! {
-                    _ = tick.tick() => {}
+                let poked = tokio::select! {
+                    _ = tick.tick() => false,
                     _ = plane.regather.notified() => {
-                        info!("carrier plane: srflx keepalive poked (interface event) — querying now");
+                        debug!("carrier plane: srflx keepalive poked (interface event) — querying now");
+                        true
                     }
+                };
+                if poked && !poke_floor_wait(last_query.map(|t| t.elapsed())).is_zero() {
+                    continue;
                 }
+                last_query = Some(std::time::Instant::now());
                 match crate::transport::stun::srflx_query_via_sink(
                     &punch,
                     &mut rx,
@@ -1664,6 +1734,21 @@ impl CarrierPlane {
     }
 }
 
+/// W6 — minimum spacing between POKED srflx walks/queries. Interface-event
+/// pokes bypass the SEEKING backoff by design, so a churny event source
+/// (field 2026-08-14: Check Point on CORPLAP-1 emitted one every ~6 s) would
+/// otherwise drive back-to-back multi-vantage STUN walks indefinitely.
+const SEEK_POKE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a POKED walk must still wait to honour [`SEEK_POKE_FLOOR`].
+/// `None` (no walk yet) waits nothing — the first poke is always immediate.
+fn poke_floor_wait(since_last_walk: Option<std::time::Duration>) -> std::time::Duration {
+    match since_last_walk {
+        Some(s) => SEEK_POKE_FLOOR.saturating_sub(s),
+        None => std::time::Duration::ZERO,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Multi-org v2 proof: N engines share ONE socket pair and the plane
@@ -1677,6 +1762,24 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc::Receiver;
     use tokio::time::timeout;
+
+    /// W6 — a poke storm cannot walk faster than the floor: only the FIRST
+    /// poke is immediate; later ones wait out the remainder, and a poke
+    /// after a long quiet gap (the VPN-drop recovery case) waits nothing.
+    #[test]
+    fn a_poke_storm_cannot_walk_faster_than_the_floor() {
+        assert_eq!(poke_floor_wait(None), Duration::ZERO);
+        assert_eq!(
+            poke_floor_wait(Some(Duration::from_secs(6))),
+            Duration::from_secs(24),
+            "6 s after a walk, a poked re-walk still owes 24 s"
+        );
+        assert_eq!(
+            poke_floor_wait(Some(Duration::from_secs(31))),
+            Duration::ZERO,
+            "past the floor a poke walks immediately"
+        );
+    }
 
     /// A peer installed on a RELAY carrier must still be reachable by
     /// receiver index on the plane.
