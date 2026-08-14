@@ -52,6 +52,20 @@ pub struct ScrapCapture {
 
 impl ScrapCapture {
     pub fn primary(target_fps: u32, downscale: DownscalePolicy) -> Result<Self> {
+        // macOS: a missing Screen Recording grant does NOT fail
+        // Capturer::new — CGDisplayStream opens fine and delivers
+        // wallpaper-only frames, which reads as "black screen" with an
+        // empty log. Preflight and say so; the request call also lands
+        // the app in the Screen Recording pane so granting is one toggle.
+        #[cfg(target_os = "macos")]
+        if !crate::tcc::screen_recording_granted() && !crate::tcc::request_screen_recording() {
+            tracing::warn!(
+                "macOS Screen Recording permission MISSING — capture will deliver blank/wallpaper-only frames. \
+                 Grant it under System Settings → Privacy & Security → Screen Recording, then restart the agent \
+                 (launchctl kickstart -k gui/$UID/com.roomler.agent)"
+            );
+        }
+
         // Build the Capturer on the worker thread so it never crosses
         // thread boundaries; use a ready-ack channel to surface any
         // init failure back to the caller synchronously.
