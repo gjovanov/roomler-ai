@@ -16,23 +16,46 @@ use tunnel_core::localapi::{ConnectionType, OverlayView, PeerInfo};
 /// How this node currently reaches a peer, as ONE label.
 ///
 /// `ConnectionType` has no `Derp` variant — DERP is a relay flavour only
-/// the carrier forensics block distinguishes — so the split lives here,
-/// used by both the aggregate counters and the per-edge report.
+/// the relay-detail fields distinguish — so the split lives here, used by
+/// both the aggregate counters and the per-edge report. The TOP-LEVEL
+/// `relay_kind` (carrier consolidation) is preferred; the forensics block
+/// is the fallback for a runtime that predates it.
 fn carrier_label(p: &PeerInfo) -> &'static str {
     match p.connection {
         ConnectionType::Direct => "direct",
         ConnectionType::Relay => {
-            let is_derp = p
-                .debug
-                .as_ref()
-                .map(|d| d.relay_kind.as_deref() == Some("derp"))
-                .unwrap_or(false);
-            if is_derp { "derp" } else { "relay" }
+            let kind = p
+                .relay_kind
+                .as_deref()
+                .or_else(|| p.debug.as_ref().and_then(|d| d.relay_kind.as_deref()));
+            if kind == Some("derp") {
+                "derp"
+            } else {
+                "relay"
+            }
         }
         ConnectionType::Tunnel => "tunnel",
         ConnectionType::Blocked => "blocked",
         ConnectionType::Offline => "offline",
     }
+}
+
+/// The relay qualifier the CLI shows after `relay:` — `turn/udp`,
+/// `derp/tcp`, or just the kind when the transport is unknown (wave 4).
+/// `None` for anything that isn't relayed, so a direct edge never carries
+/// a stale flavour.
+fn relay_qualifier(p: &PeerInfo) -> Option<String> {
+    if !matches!(p.connection, ConnectionType::Relay) {
+        return None;
+    }
+    let kind = p
+        .relay_kind
+        .as_deref()
+        .or_else(|| p.debug.as_ref().and_then(|d| d.relay_kind.as_deref()))?;
+    Some(match p.relay_transport.as_deref() {
+        Some(t) => format!("{kind}/{t}"),
+        None => kind.to_string(),
+    })
 }
 
 pub struct SysSampler {
@@ -108,6 +131,7 @@ impl SysSampler {
                 stalled: p.stalled,
                 tx,
                 rx,
+                relay: relay_qualifier(p),
             });
             if !p.online {
                 continue;
@@ -147,6 +171,13 @@ impl SysSampler {
 mod tests {
     use super::*;
     use tunnel_core::localapi::{PeerCarrierDebug, PeerInfo};
+
+    fn peer_with_relay(kind: &str, transport: Option<&str>) -> PeerInfo {
+        let mut p = peer(true, ConnectionType::Relay, Some(30), None);
+        p.relay_kind = Some(kind.into());
+        p.relay_transport = transport.map(Into::into);
+        p
+    }
 
     fn peer_with_bytes(
         online: bool,
@@ -294,5 +325,55 @@ mod tests {
         assert_eq!(out.links[2].tx, 0, "carrier-less peer reports zero volume");
         assert_eq!(out.overlay_tx_bytes, 130);
         assert_eq!(out.overlay_rx_bytes, 207);
+    }
+
+    /// Wave 4 — each relay edge carries the CLI's qualifier (`turn/udp`,
+    /// `derp/tcp`); the top-level fields are authoritative and the carrier
+    /// split follows them, with the forensics block only as fallback.
+    #[test]
+    fn relay_edges_carry_the_qualified_flavour() {
+        let mut s = SysSampler::new();
+        let view = OverlayView {
+            self_ip: Some("100.64.0.7".into()),
+            self_ip6: None,
+            peers: vec![
+                peer_with_relay("turn", Some("udp")),
+                peer_with_relay("derp", Some("tcp")),
+                // Kind without transport degrades like the CLI: `turn`,
+                // never an invented protocol.
+                peer_with_relay("turn", None),
+                // Direct peers carry NO qualifier, even if a stale kind
+                // lingers from a previous carrier.
+                {
+                    let mut p = peer(true, ConnectionType::Direct, Some(5), None);
+                    p.relay_kind = Some("turn".into());
+                    p
+                },
+                // Pre-consolidation runtime: only the debug block knows.
+                peer(true, ConnectionType::Relay, Some(60), Some("derp")),
+            ],
+            exit_node: None,
+            dns: None,
+            srflx: None,
+            direct_socks: Vec::new(),
+        };
+        let out = s.sample(&view, (0, 0));
+        assert_eq!(out.links[0].relay.as_deref(), Some("turn/udp"));
+        assert_eq!(out.links[0].carrier, "relay");
+        assert_eq!(out.links[1].relay.as_deref(), Some("derp/tcp"));
+        assert_eq!(
+            out.links[1].carrier, "derp",
+            "top-level relay_kind must drive the derp split"
+        );
+        assert_eq!(out.links[2].relay.as_deref(), Some("turn"));
+        assert_eq!(
+            out.links[3].relay, None,
+            "direct edge never carries a flavour"
+        );
+        assert_eq!(out.links[4].relay.as_deref(), Some("derp"));
+        assert_eq!(
+            out.links[4].carrier, "derp",
+            "debug fallback still splits derp"
+        );
     }
 }
