@@ -388,6 +388,10 @@ async fn handle_overlay_join(
                 mtu: network.mtu,
                 magic_domain,
                 nameservers,
+                // W2 MagicDNS — the joiner's own name, for self-resolution
+                // (`<own-name>.<domain>`): peers exclude self, so without
+                // this the node's resolver NXDOMAINs its own name.
+                self_name: (!self_node.name.is_empty()).then(|| self_node.name.clone()),
                 // NAT-traversal Phase B — the STUN endpoints a node queries to
                 // gather its srflx candidates, derived from the configured
                 // coturn workers (a `turn:host:port` UDP listener also answers

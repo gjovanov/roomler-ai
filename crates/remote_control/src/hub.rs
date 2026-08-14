@@ -1741,7 +1741,7 @@ mod tests {
         hub.forward_offer(sid, "v=0".into()).unwrap();
         tokio::time::sleep(NEGOTIATING_TIMEOUT + Duration::from_secs(1)).await;
         assert!(
-            matches!(ctl_rx.try_recv(), Err(_)),
+            ctl_rx.try_recv().is_err(),
             "session with an offer must not be reaped at the deadline"
         );
     }
