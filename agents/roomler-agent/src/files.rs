@@ -1968,6 +1968,16 @@ fn download_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Serializes every test that mutates the process-global HOME /
+    /// USERPROFILE (`begin()` resolves the Downloads dir through them, and
+    /// tests run in parallel threads). Without this the mutations race:
+    /// `round_trip_begin_chunk_end` resolved its destination inside
+    /// `concurrent_upload_and_download…`'s hijacked HOME and failed on the
+    /// final rename (flake observed 2026-08-14 under full-suite
+    /// parallelism). tokio Mutex, not std: the guard is held across the
+    /// tests' awaits by design.
+    static HOME_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn sanitize_strips_path_components() {
         assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
@@ -2130,6 +2140,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_with_dest_path_lands_in_dest() {
+        let _env = HOME_ENV_LOCK.lock().await;
         // End-to-end: a `begin` call with dest_path should produce a
         // path under the dest dir, not under Downloads.
         let base = std::env::temp_dir().join(format!(
@@ -2607,7 +2618,7 @@ mod tests {
         let _count = walk_handle.await.unwrap().expect("walk_and_zip");
         let sink = drain_handle.await.unwrap();
 
-        assert!(sink.len() > 0, "zip output should be non-empty");
+        assert!(!sink.is_empty(), "zip output should be non-empty");
         // The zip MUST end with the End-of-Central-Directory record
         // (PKzip signature 0x06054b50). If walk_and_zip exited
         // without `.close()` we'd see truncated output.
@@ -2625,6 +2636,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_upload_and_download_do_not_contend() {
+        let _env = HOME_ENV_LOCK.lock().await;
         // Critique #2 in the plan said an in-flight upload should
         // not block a concurrent download (and vice versa). Locks
         // the invariant: incoming + outgoing each have their own
@@ -2734,6 +2746,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_begin_chunk_end() {
+        let _env = HOME_ENV_LOCK.lock().await;
         let h = FilesHandler::new();
         let tmp = tempdir_or_skip().await;
         // Override the download-dir resolver by ensuring the sanitized
@@ -2868,10 +2881,13 @@ mod tests {
         assert_eq!(meta.dest_dir, canonical_dest);
 
         // Registry was populated. Lookup canonicalises to the same
-        // path as what `begin()` stored.
-        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(g.get(&id).map(|p| p.as_path()), Some(meta_path.as_path()));
-        drop(g);
+        // path as what `begin()` stored. (Block-scoped, not drop():
+        // clippy's await_holding_lock drop-tracking doesn't credit an
+        // explicit drop and flags the guard against the await below.)
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g.get(&id).map(|p| p.as_path()), Some(meta_path.as_path()));
+        }
 
         h.abort().await;
         let _ = tokio::fs::remove_dir_all(&dest).await;
@@ -2908,10 +2924,11 @@ mod tests {
         // all gone.
         let staging_parent = dest.join(".roomler-partial");
         assert!(!staging_parent.join(&id).exists(), "per-id dir leaked");
-        // Registry entry removed.
-        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(g.get(&id).is_none(), "registry entry leaked");
-        drop(g);
+        // Registry entry removed. (Block-scoped for await_holding_lock.)
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.get(&id).is_none(), "registry entry leaked");
+        }
         let _ = tokio::fs::remove_dir_all(&dest).await;
     }
 
@@ -3244,14 +3261,16 @@ mod tests {
         assert_eq!(kept, 1, "should keep the 1h-old dir");
         assert!(!stale_dir.exists(), "stale dir should be removed");
         assert!(fresh_dir.exists(), "fresh dir should survive");
-        // Fresh entry is in the registry.
-        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            g.contains_key("rc19-sweep-fresh"),
-            "fresh id missing from registry: {:?}",
-            g.keys().collect::<Vec<_>>()
-        );
-        drop(g);
+        // Fresh entry is in the registry. (Block-scoped for
+        // await_holding_lock.)
+        {
+            let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                g.contains_key("rc19-sweep-fresh"),
+                "fresh id missing from registry: {:?}",
+                g.keys().collect::<Vec<_>>()
+            );
+        }
         let _ = tokio::fs::remove_dir_all(&dest).await;
     }
 
