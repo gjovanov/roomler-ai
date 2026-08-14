@@ -320,6 +320,11 @@ pub(crate) struct PathStats {
     answered: u32,
     /// Smoothed round-trip, `None` until the first pong.
     pub rtt_ms: Option<f64>,
+    /// W6 — the last [`LOSS_WINDOW`] raw RTT samples, oldest first. The
+    /// EWMA above hides spikes by design; judging "large ping variability"
+    /// (field 2026-08-14: CORPLAP-1→zeus 42 ms baseline, 374 ms spikes on a
+    /// TCP relay) needs the tail of the distribution, not the mean.
+    recent_rtts: std::collections::VecDeque<f64>,
     /// The nonce of the round currently outstanding, if any.
     pending: Option<[u8; 8]>,
 }
@@ -352,6 +357,23 @@ impl PathStats {
             Some(prev) => prev * 0.7 + rtt_ms * 0.3,
             None => rtt_ms,
         });
+        self.recent_rtts.push_back(rtt_ms);
+        if self.recent_rtts.len() > LOSS_WINDOW as usize {
+            self.recent_rtts.pop_front();
+        }
+    }
+
+    /// W6 — the tail of the windowed RTT distribution: `(p95, max)` over
+    /// the last [`LOSS_WINDOW`] answered rounds. `None` until 4 samples —
+    /// an unmeasured path must never read as a spiky one.
+    pub(crate) fn rtt_tail(&self) -> Option<(f64, f64)> {
+        if self.recent_rtts.len() < 4 {
+            return None;
+        }
+        let mut v: Vec<f64> = self.recent_rtts.iter().copied().collect();
+        v.sort_by(f64::total_cmp);
+        let idx = ((v.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+        Some((v[idx.min(v.len() - 1)], v[v.len() - 1]))
     }
 
     /// Fraction of windowed rounds that went unanswered, 0.0..=1.0. `None`
@@ -374,6 +396,11 @@ pub(crate) struct PathSample {
     /// unmeasured path must never read as a bad one.
     pub loss: Option<f64>,
     pub rtt_ms: Option<f64>,
+    /// W6 — 95th percentile of the raw RTT window (spike visibility; the
+    /// EWMA `rtt_ms` smooths spikes away by design).
+    pub rtt_p95_ms: Option<f64>,
+    /// W6 — worst raw RTT in the window.
+    pub rtt_max_ms: Option<f64>,
 }
 
 /// C2 — the prober: one round per peer per tick over that peer's CURRENT
@@ -464,11 +491,16 @@ impl Prober {
     pub(crate) fn paths(&self) -> Vec<PathSample> {
         self.table
             .iter()
-            .map(|((peer, dst), s)| PathSample {
-                peer: *peer,
-                dst: *dst,
-                loss: s.loss(),
-                rtt_ms: s.rtt_ms,
+            .map(|((peer, dst), s)| {
+                let tail = s.rtt_tail();
+                PathSample {
+                    peer: *peer,
+                    dst: *dst,
+                    loss: s.loss(),
+                    rtt_ms: s.rtt_ms,
+                    rtt_p95_ms: tail.map(|t| t.0),
+                    rtt_max_ms: tail.map(|t| t.1),
+                }
             })
             .collect()
     }
@@ -491,28 +523,37 @@ impl Prober {
         &self,
         label: impl Fn(&[u8; 32]) -> Option<std::net::Ipv4Addr>,
     ) -> Option<String> {
-        let mut worst: Vec<(f64, [u8; 32], SocketAddr, Option<f64>)> = self
+        let mut worst: Vec<(f64, PathSample)> = self
             .paths()
             .into_iter()
-            .filter_map(|p| p.loss.map(|l| (l, p.peer, p.dst, p.rtt_ms)))
+            .filter_map(|p| p.loss.map(|l| (l, p)))
             .collect();
         if worst.is_empty() {
             return None;
         }
         let measured = worst.len();
         worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let lossy = worst.iter().filter(|(l, _, _, _)| *l > 0.1).count();
+        let lossy = worst.iter().filter(|(l, _)| *l > 0.1).count();
         let top: Vec<String> = worst
             .iter()
             .take(3)
-            .map(|(l, peer, dst, rtt)| {
-                let who = match label(peer) {
-                    Some(ip) => format!("{ip}@{dst}"),
-                    None => format!("{dst}"),
+            .map(|(l, p)| {
+                let who = match label(&p.peer) {
+                    Some(ip) => format!("{ip}@{}", p.dst),
+                    None => format!("{}", p.dst),
                 };
-                match rtt {
-                    Some(r) => format!("{who} loss={:.0}% rtt={r:.0}ms", l * 100.0),
-                    None => format!("{who} loss={:.0}% rtt=—", l * 100.0),
+                let rtt = match p.rtt_ms {
+                    Some(r) => format!("{r:.0}"),
+                    None => "—".to_string(),
+                };
+                // W6 — the p95/max tail names the spiky-but-low-mean path
+                // (TCP-relay head-of-line stalls) that the EWMA alone hides.
+                match (p.rtt_p95_ms, p.rtt_max_ms) {
+                    (Some(p95), Some(max)) => format!(
+                        "{who} loss={:.0}% rtt={rtt}ms p95={p95:.0} max={max:.0}",
+                        l * 100.0
+                    ),
+                    _ => format!("{who} loss={:.0}% rtt={rtt}ms", l * 100.0),
                 }
             })
             .collect();
@@ -682,6 +723,53 @@ mod tests {
         stale.on_sent([1u8; 8]);
         stale.on_pong([9u8; 8], 5.0);
         assert_eq!(stale.rtt_ms, None);
+    }
+
+    /// W6 — the rtt tail reports the spike the EWMA hides: the field shape
+    /// (42 ms baseline, one 374 ms head-of-line stall on a TCP relay) must
+    /// surface in p95/max while the smoothed mean stays low.
+    #[test]
+    fn rtt_tail_reports_the_spike_the_ewma_hides() {
+        let mut s = PathStats::default();
+        for i in 0..12u32 {
+            let n = [i as u8; 8];
+            s.on_sent(n);
+            s.on_pong(n, if i == 7 { 374.0 } else { 42.0 });
+        }
+        let ewma = s.rtt_ms.expect("answered rounds");
+        assert!(ewma < 120.0, "the EWMA smooths the spike away: {ewma}");
+        let (p95, max) = s.rtt_tail().expect("enough samples");
+        assert_eq!(max, 374.0);
+        // 12 samples: p95 index = ceil(11.4) - 1 = 11 → the max itself.
+        assert_eq!(p95, 374.0);
+
+        // Too few samples → None, never a verdict.
+        let mut fresh = PathStats::default();
+        for i in 0..3u32 {
+            let n = [i as u8; 8];
+            fresh.on_sent(n);
+            fresh.on_pong(n, 10.0);
+        }
+        assert_eq!(fresh.rtt_tail(), None);
+
+        // The window slides: more than LOSS_WINDOW pongs keep only the
+        // last LOSS_WINDOW samples, so an old spike eventually ages out.
+        let mut slide = PathStats::default();
+        let mut i = 0u32;
+        let mut nonce = move || {
+            i += 1;
+            [i as u8; 8]
+        };
+        let n0 = nonce();
+        slide.on_sent(n0);
+        slide.on_pong(n0, 900.0); // the old spike
+        for _ in 0..LOSS_WINDOW {
+            let n = nonce();
+            slide.on_sent(n);
+            slide.on_pong(n, 20.0);
+        }
+        let (_, max) = slide.rtt_tail().expect("full window");
+        assert_eq!(max, 20.0, "the 900 ms sample must have aged out");
     }
 
     /// A recv seam must handle BOTH directions of the protocol.
