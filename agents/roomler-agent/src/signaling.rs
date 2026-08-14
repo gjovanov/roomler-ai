@@ -749,7 +749,7 @@ async fn connect_once(
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
     // peer, and tears down when this connection's `overlay_evt_tx` drops.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
-    let overlay_evt_tx = crate::overlay::maybe_start(
+    let mut overlay_evt_tx = crate::overlay::maybe_start(
         cfg,
         outbound_tx.clone(),
         overlay_view_tx.clone(),
@@ -901,6 +901,30 @@ async fn connect_once(
                 }
             }
             _ = keepalive.tick() => {
+                // W4(a) — TUN-death self-heal. The overlay runtime EXITS when
+                // its TUN dies (a contract the runtime tests pin), and before
+                // this the only respawner was the NEXT control-WS reconnect
+                // discovering the closed slot — a healthy WS + a dead TUN
+                // meant silently no mesh, indefinitely. A closed event sender
+                // IS the death signal and `maybe_start` IS the respawner
+                // (fingerprint/slot logic included); the 25 s keepalive
+                // cadence is the natural retry backoff. (The B1 RTT hook
+                // stays bound to the old runtime until the next reconnect —
+                // harmless: its weak upgrade fails and samples drop.)
+                #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+                if overlay_evt_tx.as_ref().is_some_and(|t| t.is_closed()) {
+                    warn!(
+                        "overlay runtime exited mid-session (TUN death?) — respawning now \
+                         instead of waiting for the next reconnect"
+                    );
+                    overlay_evt_tx = crate::overlay::maybe_start(
+                        cfg,
+                        outbound_tx.clone(),
+                        overlay_view_tx.clone(),
+                        derp_ticket_slot.clone(),
+                    )
+                    .await;
+                }
                 let wall_gap = skew_wall.elapsed().unwrap_or_default();
                 let mono_gap = skew_mono.elapsed();
                 skew_wall = std::time::SystemTime::now();
