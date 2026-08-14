@@ -812,6 +812,12 @@ pub async fn tenant_mesh(
         rtt_ms: Option<i64>,
         stalled: bool,
         reports: u8,
+        // Wave 4 — each end's OWN view of the pair (`node` = the reporter,
+        // `carrier`/`relay`/`rtt_ms` = how it reaches the other end). The
+        // merged fields above stay for the class toggle and colour, but an
+        // asymmetric pair — direct one way, relayed the other — is real
+        // routing information the pessimistic merge was erasing.
+        ends: Vec<serde_json::Value>,
     }
     // The two ends of an edge arrive in DIFFERENT id spaces: a snapshot
     // is keyed by the reporting AGENT, while the links inside it name
@@ -863,6 +869,13 @@ pub async fn tenant_mesh(
             let e = edges.entry(key).or_default();
             e.reports += 1;
             e.stalled |= stalled;
+            e.ends.push(serde_json::json!({
+                "node": from,
+                "carrier": carrier,
+                "relay": l.get("relay").and_then(|v| v.as_str()),
+                "rtt_ms": rtt,
+                "stalled": stalled,
+            }));
             if e.carrier.is_empty() || carrier_rank(carrier) > carrier_rank(&e.carrier) {
                 e.carrier = carrier.to_string();
             }
@@ -886,6 +899,7 @@ pub async fn tenant_mesh(
                 // offline, or pre-mesh). Worth surfacing: a one-sided
                 // edge is a weaker claim than a corroborated one.
                 "reports": e.reports,
+                "ends": e.ends,
             })
         })
         .collect();

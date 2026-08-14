@@ -459,22 +459,7 @@ pub async fn handle_agent_socket(
                                     // is consumed below.
                                     let mesh_links: Vec<bson::Document> = sys
                                         .as_ref()
-                                        .map(|s| {
-                                            s.links
-                                                .iter()
-                                                .map(|l| {
-                                                    bson::doc! {
-                                                        "node": &l.node,
-                                                        "carrier": &l.carrier,
-                                                        "rtt_ms": l.rtt_ms.map(i64::from),
-                                                        "stalled": l.stalled,
-                                                        // Wave 3 per-edge volume.
-                                                        "tx": l.tx as i64,
-                                                        "rx": l.rx as i64,
-                                                    }
-                                                })
-                                                .collect()
-                                        })
+                                        .map(|s| s.links.iter().map(mesh_link_doc).collect())
                                         .unwrap_or_default();
                                     let sys_doc = sys.map(|s| machine_sys_doc(&s, srflx_count));
                                     if let Err(e) = state
@@ -1902,6 +1887,25 @@ fn machine_sys_doc(s: &AgentSysStats, srflx_count: Option<u8>) -> bson::Document
     }
 }
 
+/// One mesh edge as persisted into `stats_mesh`. Same hand-built-doc
+/// contract as [`machine_sys_doc`] and the same trap: a new `PeerLink`
+/// field vanishes silently unless it is listed here.
+/// `mesh_link_doc_carries_every_field` below is the guard.
+fn mesh_link_doc(l: &roomler_ai_remote_control::signaling::PeerLink) -> bson::Document {
+    bson::doc! {
+        "node": &l.node,
+        "carrier": &l.carrier,
+        "rtt_ms": l.rtt_ms.map(i64::from),
+        "stalled": l.stalled,
+        // Wave 3 per-edge volume.
+        "tx": l.tx as i64,
+        "rx": l.rx as i64,
+        // Wave 4 relay flavour ("turn/udp" / "derp/tcp"); Null on a
+        // direct edge or a pre-wave-4 agent.
+        "relay": l.relay.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1951,5 +1955,28 @@ mod tests {
         // A measured zero must persist as 0, never as absent — "can't
         // hole-punch" and "didn't report" are different facts.
         assert_eq!(d.get_i64("srflx_count").unwrap(), 0);
+    }
+
+    /// Every `PeerLink` field must survive into the persisted edge — same
+    /// silent-drop trap as the sys doc, same guard discipline.
+    #[test]
+    fn mesh_link_doc_carries_every_field() {
+        let l = roomler_ai_remote_control::signaling::PeerLink {
+            node: "6a1f00000000000000000001".into(),
+            carrier: "relay".into(),
+            rtt_ms: Some(87),
+            stalled: true,
+            tx: 512,
+            rx: 0,
+            relay: Some("turn/udp".into()),
+        };
+        let d = mesh_link_doc(&l);
+        assert_eq!(d.get_str("node").unwrap(), "6a1f00000000000000000001");
+        assert_eq!(d.get_str("carrier").unwrap(), "relay");
+        assert_eq!(d.get_i64("rtt_ms").unwrap(), 87);
+        assert!(d.get_bool("stalled").unwrap());
+        assert_eq!(d.get_i64("tx").unwrap(), 512);
+        assert_eq!(d.get_i64("rx").unwrap(), 0);
+        assert_eq!(d.get_str("relay").unwrap(), "turn/udp");
     }
 }
