@@ -104,6 +104,38 @@ impl RelayTransport {
 /// (~1200–1452); 2 KiB is comfortable headroom and bounds the recv buf.
 const MAX_DATAGRAM: usize = 2048;
 
+/// W6 — rendezvous instrumentation: what actually ARRIVED on this relay
+/// socket. Read at QUIC accept/connect failure time to discriminate "the
+/// peer's packets never reached this allocation" (a rendezvous miss, or a
+/// coturn permission-IP mismatch silently dropping them) from "packets
+/// flowed but the handshake itself failed". A `stray` is the 1-byte `\x00`
+/// permission bootstrap both ends fire — strays WITHOUT quic-sized frames
+/// mean the relay path delivers and the QUIC end simply never dialed.
+#[derive(Debug, Default)]
+pub struct RelayRxStats {
+    /// Datagrams big enough to be QUIC frames (≥ 32 B).
+    pub quic: std::sync::atomic::AtomicU64,
+    /// Tiny datagrams — the `\x00` permission bootstraps and other noise.
+    pub stray: std::sync::atomic::AtomicU64,
+    /// The most recent datagram's relayed source.
+    pub last_src: Mutex<Option<SocketAddr>>,
+}
+
+impl RelayRxStats {
+    /// Render for error contexts / log lines:
+    /// `rx_quic=3 rx_stray=1 last_src=Some(1.2.3.4:56789)`.
+    pub fn describe(&self) -> String {
+        use std::sync::atomic::Ordering;
+        let last = *self.last_src.lock().unwrap_or_else(|e| e.into_inner());
+        format!(
+            "rx_quic={} rx_stray={} last_src={:?}",
+            self.quic.load(Ordering::Relaxed),
+            self.stray.load(Ordering::Relaxed),
+            last
+        )
+    }
+}
+
 /// quinn `AsyncUdpSocket` backed by a [`RelayConn`]. See module docs.
 pub struct RelayUdpSocket {
     local_addr: SocketAddr,
@@ -111,6 +143,8 @@ pub struct RelayUdpSocket {
     send_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     /// `poll_recv` drains here; the fill task feeds it from `recv_from`.
     recv_rx: Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+    /// W6 — inbound counters, shared with the fill task.
+    rx_stats: Arc<RelayRxStats>,
     send_task: tokio::task::JoinHandle<()>,
     recv_task: tokio::task::JoinHandle<()>,
 }
@@ -140,11 +174,23 @@ impl RelayUdpSocket {
             }
         });
 
+        let rx_stats = Arc::new(RelayRxStats::default());
+        let fill_stats = Arc::clone(&rx_stats);
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_DATAGRAM];
             loop {
                 match conn.recv_from(&mut buf).await {
                     Ok((n, src)) => {
+                        use std::sync::atomic::Ordering;
+                        if n >= 32 {
+                            fill_stats.quic.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            fill_stats.stray.fetch_add(1, Ordering::Relaxed);
+                        }
+                        *fill_stats
+                            .last_src
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(src);
                         // Channel closed = the socket was dropped; stop.
                         if recv_tx.send((buf[..n].to_vec(), src)).is_err() {
                             break;
@@ -162,9 +208,16 @@ impl RelayUdpSocket {
             local_addr,
             send_tx,
             recv_rx: Mutex::new(recv_rx),
+            rx_stats,
             send_task,
             recv_task,
         })
+    }
+
+    /// W6 — the inbound counters (shared handle; live-updated by the fill
+    /// task for as long as this socket exists).
+    pub fn rx_stats(&self) -> Arc<RelayRxStats> {
+        Arc::clone(&self.rx_stats)
     }
 }
 
