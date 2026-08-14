@@ -382,7 +382,25 @@ jobs:
           "$llvm\bin"              | Out-File -FilePath $env:GITHUB_PATH -Append
           & "$llvm\bin\clang.exe" --version
 
+      # pkgconf is ~1 MB of prebuilt tool, but `vcpkg install` spends ~96 s per
+      # run (measured on the rc.363 release: the 3rd-costliest step in this
+      # job) re-materialising it. Cache the tools dir so the step below
+      # degenerates into a PATH append. Same GitHub cache-isolation rule as the
+      # Swatinem blocks: a save on a tag ref can never be restored by a future
+      # tag, so only non-tag runs (the master seed rehearsals) write it while
+      # tag runs restore the default-branch entry. The key is deliberately
+      # constant — pkgconf is a frozen build tool here, not a dependency; bump
+      # the -vN suffix if it ever needs refreshing.
+      - name: Restore cached pkgconf
+        id: pkgconf_cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\vcpkg\installed\x64-windows\tools\pkgconf
+          key: pkgconf-x64-windows-v1
+
       - name: Install pkg-config (env-libvpx-sys + ffmpeg-sys build scripts need it)
+        id: pkgconf_install
         shell: pwsh
         run: |
           # `env-libvpx-sys` / `ffmpeg-sys-next` build.rs shell out to
@@ -394,10 +412,20 @@ jobs:
           # pkgconfiglite` downloaded its binary from SourceForge, which
           # timed out and failed the rc.151 MSI build. Kept as a retried
           # fallback.
+          $tools = 'C:\vcpkg\installed\x64-windows\tools\pkgconf'
           $got = $false
-          if (Test-Path 'C:\vcpkg\vcpkg.exe') {
+          # Cache hit: the tools dir is already on disk (including the
+          # pkg-config.exe alias, which was copied in before the save), so
+          # skip the vcpkg install entirely.
+          if (Test-Path "$tools\pkgconf.exe") {
+            Write-Host "pkgconf restored from cache — skipping vcpkg install"
+            Copy-Item "$tools\pkgconf.exe" "$tools\pkg-config.exe" -Force
+            $tools | Out-File -FilePath $env:GITHUB_PATH -Append
+            $env:PATH = "$tools;$env:PATH"
+            $got = $true
+          }
+          if (-not $got -and (Test-Path 'C:\vcpkg\vcpkg.exe')) {
             C:\vcpkg\vcpkg.exe install pkgconf:x64-windows
-            $tools = 'C:\vcpkg\installed\x64-windows\tools\pkgconf'
             if (Test-Path "$tools\pkgconf.exe") {
               # The *-sys scripts invoke the command `pkg-config`; pkgconf is
               # a drop-in replacement, so expose it under that name too.
@@ -416,8 +444,26 @@ jobs:
               Start-Sleep -Seconds 15
             }
           }
+          # Tells the save step below whether there is actually a vcpkg-shaped
+          # tools dir worth caching (the choco fallback leaves it empty).
+          # NB `hashFiles()` can't be used for this: it only globs inside
+          # GITHUB_WORKSPACE, so it would silently return '' for a C:\vcpkg
+          # path and the save would never run.
+          $hasVcpkgPkgconf = if (Test-Path (Join-Path $tools 'pkgconf.exe')) { 'true' } else { 'false' }
+          "vcpkg_pkgconf=$hasVcpkgPkgconf" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           # Fails the step loudly if neither path produced a usable pkg-config.
           pkg-config --version
+
+      # Only seeds from non-tag runs (see the restore step's comment), and only
+      # when the vcpkg tools dir is really populated — GitHub cache keys are
+      # write-once, so caching an empty dir under this key would stick.
+      - name: Save pkgconf cache
+        if: steps.pkgconf_cache.outputs.cache-hit != 'true' && github.ref_type != 'tag' && steps.pkgconf_install.outputs.vcpkg_pkgconf == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg\installed\x64-windows\tools\pkgconf
+          key: pkgconf-x64-windows-v1
 
       - name: Fetch vendored libvpx 1.12.0 (matches pre-generated bindings)
         shell: pwsh
@@ -610,24 +656,33 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack"
 
-      - name: Build tunnel CLI (roomler.exe) for the MSI bundle (P4b)
+      - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
         shell: pwsh
         run: |
-          # P4b (node-stack unification Option A): both MSIs carry the
-          # tunnel CLI so daemon installs subsume it and the MSI becomes
-          # the ONE updater for the whole node stack. Default features —
-          # LOCKSTEP with release-tunnel.yml's Windows build so the
-          # MSI-carried copy matches the standalone-zip policy. Shares
-          # this job's target dir + cache; the differently-featured
-          # shared deps only cost rebuild time. Both wxs files reference
-          # target\release\roomler.exe at harvest time, so this MUST run
-          # before the two cargo-wix builds below.
-          cargo build -p roomler-tunnel --release
-          if (-not (Test-Path target\release\roomler.exe)) {
-            Write-Host "::error::roomler.exe not produced — the TunnelExe wxs component would fail the MSI harvest (LGHT0103)"
+          # P4b put the tunnel CLI inside both MSIs so daemon installs subsume
+          # it and the MSI stays the ONE updater for the node stack. That is
+          # unchanged — what changed (P3e lever D) is HOW: the daemon now owns
+          # the command surface (`roomlerd cli` → roomler_tunnel::cli) and the
+          # MSI carries a ~150 KB shim instead of a second full binary.
+          #
+          # rc.361 measurements that motivated it: roomler.exe was 22.1 MiB of
+          # which cargo-bloat attributes only 1.16 MiB to CLI-specific code —
+          # the rest duplicated std/webrtc/tunnel_core/tokio/rustls/reqwest/
+          # quinn/clap that roomlerd.exe already links. This step also used to
+          # cost 143 s (3rd-costliest in the job) because it rebuilt shared
+          # deps under a DIFFERENT feature set than the agent build above.
+          #
+          # Both wxs files reference target\release\roomler-shim.exe at harvest
+          # time, so this MUST still run before the two cargo-wix builds below.
+          # Tunnel-ONLY hosts are unaffected: release-tunnel.yml keeps building
+          # and shipping the real standalone `roomler` binary.
+          cargo build -p roomler-cli-shim --release
+          if (-not (Test-Path target\release\roomler-shim.exe)) {
+            Write-Host "::error::roomler-shim.exe not produced — the TunnelExe wxs component would fail the MSI harvest (LGHT0103)"
             exit 1
           }
-          Write-Host "Staged roomler.exe ($([math]::Round((Get-Item target\release\roomler.exe).Length/1MB,1)) MB) for the TunnelExe component"
+          $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
+          Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
 
       # The rc.65 "Verify FFmpeg link via unit test" step is GONE: even in
       # --release with the exact build feature set, `cargo test` cost 5m33s
@@ -722,8 +777,8 @@ jobs:
       - name: Stage VC++ runtime DLLs alongside agent binary (app-local CRT)
         shell: pwsh
         run: |
-          # Both wxs files bundle a `VcRedistCrt` component (the full
-          # Microsoft.VC14x.CRT x64 folder) so the install is
+          # Both wxs files bundle a `VcRedistCrt` component (the three CRT
+          # DLLs our binaries actually import) so the install is
           # self-contained on machines without any VC++ 2015-2022
           # redistributable -- a fresh Windows box otherwise pops
           # "vcruntime140_1.dll was not found" the moment install.ps1
@@ -739,9 +794,17 @@ jobs:
           $crtDir = Get-ChildItem -Directory "$vsRoot\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -ErrorAction SilentlyContinue |
                     Sort-Object FullName | Select-Object -Last 1
           if (-not $crtDir) { Write-Host "::error::no Microsoft.VC14x.CRT redist folder under $vsRoot"; exit 1 }
-          $expected = @('concrt140.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
-                        'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll', 'vccorlib140.dll',
-                        'vcruntime140.dll', 'vcruntime140_1.dll')
+          # Only what the import tables ask for: roomlerd.exe needs all three,
+          # roomler.exe needs vcruntime140, roomler-desktop.exe needs none, and
+          # msvcp140.dll itself imports only the two vcruntime DLLs. The other
+          # six redist DLLs (concrt140, vccorlib140, msvcp140_1, msvcp140_2,
+          # msvcp140_atomic_wait, msvcp140_codecvt_ids) are satellites a
+          # consuming binary imports DIRECTLY when it uses the matching STL
+          # feature; nothing we ship does, so they were 1.12 MiB of dead
+          # payload per install. If a new C++ dependency lands, re-check with
+          # `dumpbin -dependents target\release\roomlerd.exe | findstr /i 140`
+          # and extend this list AND both wxs VcRedistCrt components together.
+          $expected = @('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
           foreach ($n in $expected) {
             $src = Join-Path $crtDir.FullName $n
             if (-not (Test-Path $src)) { Write-Host "::error::$n missing from $($crtDir.FullName) -- VcRedistCrt harvest would fail (LGHT0103)"; exit 1 }
@@ -825,16 +888,27 @@ jobs:
           $msiPerUser = (Get-Item "${{ steps.locate.outputs.artifact }}").Length / 1MB
           $msiPerMachine = (Get-Item "${{ steps.locate_pm.outputs.artifact }}").Length / 1MB
           $maxMsi = [math]::Max($msiPerUser, $msiPerMachine)
-          $p4bBaseline = 29.0
+          # P3e lever D re-baseline. rc.361 measured 31.97 MB with the full
+          # 22.1 MiB tunnel CLI inside; the CLI's compressed contribution was
+          # ~7.6 MB (measured as the rc.194 -> rc.195 step when P4b added it),
+          # and the shim that replaces it is ~0.15 MB. Ceiling drops with it:
+          # 36 -> 30 MB, keeping the same ~5 MB of headroom over the baseline
+          # that the P4b guard had.
+          # Baseline PINNED from the first post-change build (rehearsal run
+          # 31850087288's sibling, 2026-08-15): both flavours measured
+          # 25.45 MB. A baseline left above the real value is exactly the
+          # silent failure this guard exists to catch — it would swallow a
+          # multi-MB regression as "within budget".
+          $p4bBaseline = 25.45
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
-          Write-Host "::notice::P4b baseline = $p4bBaseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
-          if ($maxMsi -gt 36) {
-            Write-Host "::error::MSI exceeds the 36 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info)."
+          Write-Host "::notice::baseline = $p4bBaseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
+          if ($maxMsi -gt 30) {
+            Write-Host "::error::MSI exceeds the 30 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
             exit 1
           } elseif ($deltaMB -gt 2) {
-            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the P4b baseline (still under the 36 MB ceiling). Re-baseline deliberately or investigate."
+            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the 30 MB ceiling). Re-baseline deliberately or investigate."
           } else {
             Write-Host "::notice::MSI within the P4b size budget."
           }

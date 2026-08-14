@@ -14,8 +14,8 @@
 //! single rule shape covers both gates and the same `dst_matches`
 //! helper applies.
 
+use roomler_ai_remote_control::models::{DestinationRule, ProtocolKind, dst_matches};
 use serde::{Deserialize, Serialize};
-use tunnel_core::policy::{DestinationRule, ProtocolKind, dst_matches};
 
 /// Why the agent rejected a forward request. Maps to wire-level
 /// `RejectKind::AgentAclDenied` (the agent's local denial — distinct
@@ -98,7 +98,7 @@ impl AgentForwardAcl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnel_core::policy::{HostPattern, PortRange};
+    use roomler_ai_remote_control::models::{HostPattern, PortRange};
 
     fn rule(p: HostPattern, low: u16, high: u16) -> DestinationRule {
         DestinationRule {
