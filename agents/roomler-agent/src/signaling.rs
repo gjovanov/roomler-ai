@@ -1091,12 +1091,23 @@ async fn connect_once(
                     .srflx
                     .as_ref()
                     .map(|s| s.candidates.len().min(u8::MAX as usize) as u8);
+                // C4 stage 2 — advertise the live warm allocation's relayed
+                // address so the server holds it pair-less: a peer whose
+                // pair to this node dies can dial it WITHOUT a coordination
+                // round-trip through this (possibly captured) WS.
+                let warm_relay = overlay_view_tx
+                    .borrow()
+                    .warm_relay
+                    .as_ref()
+                    .filter(|w| w.state == "live")
+                    .and_then(|w| w.relayed.clone());
                 let hb = ClientMsg::AgentHeartbeat {
                     rss_mb: sys.rss_mb,
                     cpu_pct: sys.cpu_pct,
                     active_sessions: peers.len().min(u8::MAX as usize) as u8,
                     sys: Some(sys),
                     srflx_count,
+                    warm_relay,
                 };
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
