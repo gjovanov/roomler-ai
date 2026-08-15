@@ -312,6 +312,32 @@ Notes:
 
 ---
 
+## 6b. SOCKS5 — one proxy instead of N forwards
+
+A forward maps one destination; a SOCKS5 proxy maps *everything the agent can
+reach* (still policy-gated per destination, TCP **and** UDP):
+
+```powershell
+# Exit through one agent:
+roomler socks5 --agent <AGENT-CORP-hex> --local 127.0.0.1:1080
+
+# Mesh mode — omit --agent: one proxy for the whole tenant.
+# Address an agent by NAME (or 24-hex id) as the SOCKS hostname,
+# and LAN IPs route to whichever agent advertises that subnet:
+roomler socks5 --local 127.0.0.1:1080
+curl --socks5-hostname 127.0.0.1:1080 http://agent-corp:8080/
+```
+
+Point a browser, `curl --socks5-hostname`, or any SOCKS-capable app at it. Every
+flow shows up in the same audit trail as forwards. Concepts (UDP ASSOCIATE,
+longest-prefix LAN routing, transports): [tunnels.md](tunnels.md).
+
+> Naming note: the standalone binary is `roomler` (a `roomler-tunnel` alias is
+> still shipped); on daemon hosts `roomler` is a shim into `roomlerd cli` —
+> same commands either way.
+
+---
+
 ## 7. Audit + diagnostics
 
 **Admin → Tenant → Tunnels → click a tunnel-client → Audit** lists every `PeerOpen` / `TcpAccept` / `TcpReject` / `TcpDialFailed` / `TcpClosed` with timestamps, bytes-in/out, destination, and reject reason.
