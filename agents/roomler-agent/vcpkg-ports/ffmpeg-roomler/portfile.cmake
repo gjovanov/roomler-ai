@@ -29,7 +29,7 @@
 #
 # Pre-flight HEVC WebCodecs spike (2026-05-26) locked the framer design:
 # Annex-B, 4-byte start codes, no description on VideoDecoder.configure().
-# See `docs/hevc-webcodecs-spike.html` for the test page that proved this.
+# See the retired `docs/hevc-webcodecs-spike.html` (git history) for the test page that proved this.
 # =============================================================================
 
 # TODO(rc.65): pin the SHA512 once we settle on the FFmpeg release. n7.1

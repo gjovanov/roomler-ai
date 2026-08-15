@@ -12,7 +12,7 @@
 //!
 //! **IPv6 (dual-stack)**: a node's overlay v6 is *derived* from its overlay
 //! v4 — the v4 embedded in the low 32 bits of Roomler's ULA `/96`
-//! ([`derive_overlay_v6`], `docs/netstack-ipv6-plan.md`). Routing therefore
+//! ([`derive_overlay_v6`], `docs/overlay-communication.md`). Routing therefore
 //! needs **no v6 table**: [`Router::dst_of_ip_packet`] unmaps a derived-ULA
 //! destination back to its embedded v4 and routes on the existing v4 entries,
 //! covering every present and future peer with zero per-peer state and zero
@@ -25,7 +25,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// Roomler's overlay IPv6 ULA — `fd72:6f6f:6d6c::/48` (`fd` + ASCII "rooml").
 /// A node's overlay v6 is its overlay v4 embedded in the low 32 bits of the
 /// fixed `/96` inside this ULA, so v6 is *derived*, never separately allocated
-/// (see `docs/netstack-ipv6-plan.md`). Pinned once — every derived address
+/// (see `docs/overlay-communication.md`). Pinned once — every derived address
 /// bakes it in, so it must never change.
 const OVERLAY_ULA_HEXTETS: [u16; 6] = [0xfd72, 0x6f6f, 0x6d6c, 0, 0, 0];
 /// On-link prefix for the derived-v6 network: the fixed `/96` (48-bit ULA + 48
