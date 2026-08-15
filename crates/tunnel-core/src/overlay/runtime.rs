@@ -37,7 +37,10 @@ use super::dns;
 use super::netmap::{PeerConfig, peer_config_from_netmap};
 use super::relay_link::{ReadyLink, RelayCoordinator, RelayKind};
 use super::tun::TunIo;
-use super::wg::{Carrier, QUIC_BUILD_TIMEOUT, WG_OVERHEAD, WgDevice, overlay_quic_enabled};
+use super::wg::{
+    Carrier, QUIC_BUILD_TIMEOUT, QUIC_UPGRADE_DEADLINE, QUIC_UPGRADE_RETRY_GAP, WG_OVERHEAD,
+    WgDevice, overlay_quic_enabled,
+};
 use crate::localapi::{
     ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PeerCarrierDebug, PeerInfo,
 };
