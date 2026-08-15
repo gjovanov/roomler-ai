@@ -55,26 +55,20 @@ jobs:
           before=$(awk -F'\t' '{s+=$4} END{printf "%d", s/1048576}' /tmp/caches.tsv)
           deleted=0
           freed=0
-          seed_refresh=0
+          # NOTE (lock-keyed seeds, 2026-08-15): release-lane cache keys
+          # now carry a per-Cargo.lock suffix, so every rehearsal save
+          # lands under a fresh key and seeds refresh ORGANICALLY (the
+          # post-release reseed builds the new generation warm from the
+          # previous one). The old age-based seed deletion + re-dispatch
+          # is gone — superseded generations simply go idle and fall to
+          # the 96 h sweep below.
           while IFS=$'\t' read -r id ref last size key created; do
             last_s=$(date -d "$last" +%s)
             idle=$(( now - last_s ))
-            created_s=$(date -d "$created" +%s)
-            age=$(( now - created_s ))
             del=""
             case "$ref" in
               refs/pull/*) [ "$idle" -gt 172800 ] && del="pr-idle" ;;
               refs/tags/*|refs/heads/refs/tags/*) del="tag-ref" ;;
-              refs/heads/master)
-                # Release-lane seed refresh: flat keys are immutable, so a
-                # week-old seed must be deleted for the next reseed (which
-                # this workflow dispatches below) to save a fresh one.
-                case "$key" in
-                  v0-rust-agent-*|v0-rust-installer-smoke-windows*)
-                    [ "$age" -gt 604800 ] && { del="seed-age-7d"; seed_refresh=1; }
-                    ;;
-                esac
-                ;;
             esac
             [ -z "$del" ] && [ "$idle" -gt 345600 ] && del="idle-96h"
             if [ -n "$del" ]; then
@@ -87,26 +81,3 @@ jobs:
           done < /tmp/caches.tsv
           echo "---"
           echo "pool before: ${before} MB; deleted ${deleted} entries; freed $((freed / 1048576)) MB"
-          echo "seed_refresh=${seed_refresh}" >> "$GITHUB_OUTPUT"
-
-      - name: Dispatch reseed rehearsal (seed was age-refreshed)
-        if: steps.sweep.outputs.seed_refresh == '1'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Same GITHUB_TOKEN workflow_dispatch exception as
-          # seed-release-caches.yml; version read from master so
-          # validate-version passes.
-          version=$(gh api 'repos/${{ github.repository }}/contents/Cargo.toml?ref=master' --jq .content | base64 -d | awk '
-            /^\[workspace\.package\]/ {in_section=1; next}
-            /^\[/ {in_section=0}
-            in_section && /^version[[:space:]]*=/ {
-              gsub(/"/, "", $3)
-              print $3
-              exit
-            }
-          ')
-          echo "Re-seeding after age-based seed deletion (workspace ${version})"
-          gh workflow run release-agent.yml --ref master \
-            -f version="${version}" -f publish_release=false
