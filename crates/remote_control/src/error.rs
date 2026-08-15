@@ -44,6 +44,10 @@ pub enum Error {
     #[error("no result from device {0} within the deadline")]
     ExecTimeout(String),
 
+    // Server-only (P3e Phase 3): the driver error can only arise from the
+    // `server`-gated audit/hub paths, and carrying the variant unconditionally
+    // is what dragged mongodb into every agent-side binary.
+    #[cfg(feature = "server")]
     #[error(transparent)]
     Mongo(#[from] mongodb::error::Error),
 
