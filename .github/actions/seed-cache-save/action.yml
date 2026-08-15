@@ -1,0 +1,36 @@
+name: seed-cache-save
+description: >-
+  Prune + save the cargo seed under this Cargo.lock's unique key (must
+  mirror seed-cache-restore's path list + key exactly). Because the key is
+  unique per lockfile, saves ALWAYS land — GitHub cache immutability never
+  blocks a refresh, so no delete steps and no absent-key window exist
+  anywhere. A same-lockfile twin rehearsal loses the save reservation
+  race and warns ("cache already exists") — harmless, the winner's
+  content is equivalent. Superseded generations go idle and fall to
+  cache-janitor's 96 h sweep.
+inputs:
+  shared-key:
+    description: Cache family name (must match the restore call)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Prune before save
+      shell: bash
+      run: |
+        # rust-cache-style trim: registry sources + git checkouts re-extract
+        # cheaply from the cached index/db; incremental dirs are rebuilt
+        # every run anyway. Keeps a generation at roughly Swatinem size.
+        rm -rf ~/.cargo/registry/src ~/.cargo/git/checkouts 2>/dev/null || true
+        rm -rf target/release/incremental target/debug 2>/dev/null || true
+        du -sh target ~/.cargo 2>/dev/null || true
+
+    - uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ~/.cargo/bin
+          target
+        key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}
