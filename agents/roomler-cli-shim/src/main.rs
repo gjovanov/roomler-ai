@@ -24,7 +24,10 @@
 //! * Ctrl-C is deliberately ignored HERE so the child owns it. Windows
 //!   delivers CTRL_C_EVENT to every process in the console group; if this
 //!   launcher took the default action it would exit first and leave the
-//!   long-running child (`roomler run`, `roomler forward`) orphaned.
+//!   long-running child (`roomler run`, `roomler forward`) orphaned. Unix is
+//!   the same story with SIGINT/SIGQUIT and the foreground process group —
+//!   parent ignores, child resets to default in pre_exec (P3e Phase 2: the
+//!   .deb ships this launcher as /usr/bin/roomler on daemon hosts).
 //! * The child is located next to this executable rather than via PATH, so a
 //!   different Roomler install elsewhere on PATH can never be dispatched to.
 
@@ -44,11 +47,24 @@ fn ignore_ctrl_c() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
 fn ignore_ctrl_c() {
-    // No-op off Windows: this launcher only ships in the Windows MSIs, and
-    // POSIX signal disposition is inherited by the child anyway.
+    // P3e Phase 2 — the .deb ships this launcher as /usr/bin/roomler too.
+    // The terminal delivers SIGINT/SIGQUIT to the whole foreground process
+    // GROUP, i.e. to us AND the child. The child must handle them (Ctrl-C
+    // tears down `roomler run` / `roomler forward` cleanly); we must NOT die
+    // first and orphan it — the standard wrapper convention (what `sh -c`
+    // does while waiting on a foreground job). The child would inherit the
+    // ignored disposition across fork+exec, so spawn() below resets both to
+    // SIG_DFL in the child via pre_exec.
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+    }
 }
+
+#[cfg(not(any(target_os = "windows", unix)))]
+fn ignore_ctrl_c() {}
 
 // Exits via `std::process::exit` rather than returning `ExitCode`, because
 // `ExitCode: From<u8>` would TRUNCATE the child's code — a script checking for
@@ -78,14 +94,35 @@ fn main() -> ! {
 
     // argv[0] is dropped: the daemon re-labels it as `roomler` before handing
     // the vector to clap, so usage/help text still reads `roomler ...`.
-    let status = Command::new(&daemon)
-        .arg("cli")
-        .args(std::env::args_os().skip(1))
-        .status();
+    let mut cmd = Command::new(&daemon);
+    cmd.arg("cli").args(std::env::args_os().skip(1));
 
-    match status {
-        // Pass the child's exit code through UNTRUNCATED.
-        Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+    // Undo the parent's SIG_IGN in the child (inherited across fork+exec) so
+    // the CLI sees Ctrl-C exactly as the standalone binary would.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+
+    match cmd.status() {
+        // Pass the child's exit code through UNTRUNCATED. A child killed by a
+        // signal has no code — mirror the shell's 128+n so callers can still
+        // tell SIGINT (130) from a real failure.
+        Ok(s) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = s.signal() {
+                    std::process::exit(128 + sig);
+                }
+            }
+            std::process::exit(s.code().unwrap_or(1))
+        }
         Err(e) => {
             eprintln!("roomler: failed to launch {}: {e}", daemon.display());
             std::process::exit(EXIT_NO_DAEMON);
