@@ -44,6 +44,7 @@ impl AgentDao {
             status: AgentStatus::Offline,
             last_seen_at: now,
             last_presence: None,
+            warm_relay_endpoint: None,
             displays: Vec::new(),
             capabilities: AgentCaps::default(),
             access_policy: AccessPolicy::default(),
@@ -201,16 +202,28 @@ impl AgentDao {
     /// arrives over a live registered WS, so Online is definitionally
     /// true — and this bounds any status-clobber race (a displaced
     /// handler's or a late reaper's wrongful `Offline`) to ≤30 s.
-    pub async fn touch_heartbeat(&self, agent_id: ObjectId) -> DaoResult<bool> {
-        self.base
-            .update_by_id(
-                agent_id,
-                doc! { "$set": {
-                    "last_seen_at": DateTime::now(),
-                    "status": bson::to_bson(&AgentStatus::Online).unwrap(),
-                } },
-            )
-            .await
+    pub async fn touch_heartbeat(
+        &self,
+        agent_id: ObjectId,
+        warm_relay: Option<&str>,
+    ) -> DaoResult<bool> {
+        // C4 stage 2 — the standing warm allocation's relayed address rides
+        // the same per-heartbeat write: stored pair-less so a peer can be
+        // handed a dial target for this agent without waking its (possibly
+        // captured) control WS; `$unset` while no leg is live so a stale
+        // address can never be served.
+        let mut set = doc! {
+            "last_seen_at": DateTime::now(),
+            "status": bson::to_bson(&AgentStatus::Online).unwrap(),
+        };
+        let update = match warm_relay {
+            Some(ep) => {
+                set.insert("warm_relay_endpoint", ep);
+                doc! { "$set": set }
+            }
+            None => doc! { "$set": set, "$unset": { "warm_relay_endpoint": "" } },
+        };
+        self.base.update_by_id(agent_id, update).await
     }
 
     /// Multi-region relay PoPs: persist the agent's derived `relay_home` and
