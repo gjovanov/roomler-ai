@@ -236,6 +236,19 @@ pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
     out
 }
 
+/// First `(ip, ifindex)` from the deny-listed LAN gather — the physical-uplink
+/// egress candidate for a TURN/STUN client socket on a corp-VPN-captured host.
+/// An UNSPECIFIED-bound socket source-selects the captured default route and
+/// its UDP dies inside the tunnel; binding this IP (+ the `IP_UNICAST_IF` pin
+/// when the index is known) escapes the capture exactly like the direct socks
+/// do. Field 2026-08-15 pc55331: srflx `cone via 5.9.157.221:3478` from the
+/// bound direct sock while the unbound warm TURN allocate to the SAME host
+/// failed every candidate. `None` when the gather is empty (enumeration
+/// failure or a WSL-mirrored guest) — callers then keep the unbound behaviour.
+pub fn first_non_vpn_uplink() -> Option<(Ipv4Addr, Option<u32>)> {
+    gather_lan_interfaces().into_iter().next()
+}
+
 /// rc.275 hygiene — gate for the LAN-gather virtual-interface filter
 /// (`ROOMLER_NODE_OVERLAY_LAN_IFACE_FILTER`; legacy `ROOMLER_AGENT_…` alias
 /// honoured — see [`crate::env::node_env`]). Default **ON**; set
