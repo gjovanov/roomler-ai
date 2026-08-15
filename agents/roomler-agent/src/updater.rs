@@ -429,14 +429,28 @@ pub fn pick_asset_for_windows(
 #[cfg(any(not(target_os = "windows"), test))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
-    let arch_linux = cfg!(all(target_os = "linux", target_arch = "x86_64"));
-    let arch_mac = cfg!(target_os = "macos");
+    let mac = cfg!(target_os = "macos");
+    let linux = cfg!(target_os = "linux");
+    // The .deb match MUST be arch-qualified. It used to accept any `.deb`,
+    // which was harmless only while exactly one Linux .deb existed per
+    // release; the moment a second architecture ships, an x86_64 agent
+    // would happily download an arm64 package (asset order is GitHub's,
+    // not ours) and dpkg it. Match the arch token the release filenames
+    // already carry (`…-x86_64-unknown-linux-gnu.deb`), keeping the
+    // legacy `_amd64.deb` cargo-deb spelling for old releases.
+    let arch_tokens: &[&str] = if cfg!(target_arch = "x86_64") {
+        &["x86_64", "amd64"]
+    } else if cfg!(target_arch = "aarch64") {
+        &["aarch64", "arm64"]
+    } else {
+        &[]
+    };
     for a in assets {
         let lower = a.name.to_lowercase();
-        if arch_linux && (lower.ends_with("_amd64.deb") || lower.ends_with(".deb")) {
+        if linux && lower.ends_with(".deb") && arch_tokens.iter().any(|t| lower.contains(t)) {
             return Some(a);
         }
-        if arch_mac && lower.ends_with(".pkg") {
+        if mac && lower.ends_with(".pkg") {
             return Some(a);
         }
     }
@@ -1815,6 +1829,17 @@ mod tests {
                 size: 2345,
                 digest: None,
             },
+            // Both Linux arches, so this stays meaningful wherever it runs.
+            // The fixture used to carry only the amd64 .deb, which quietly
+            // assumed an x86_64 host — it fails on an aarch64 Linux box
+            // (found by running this suite on a real arm64 agent, a target
+            // CI has no job for).
+            GithubAsset {
+                name: "roomler-agent-0.1.36-aarch64-unknown-linux-gnu.deb".into(),
+                browser_download_url: "https://example.invalid/foo-arm64.deb".into(),
+                size: 2346,
+                digest: None,
+            },
             GithubAsset {
                 name: "roomler-agent-0.1.36-x86_64-apple-darwin.pkg".into(),
                 browser_download_url: "https://example.invalid/foo.pkg".into(),
@@ -1828,7 +1853,14 @@ mod tests {
         #[cfg(target_os = "windows")]
         assert!(name.ends_with(".msi"));
         #[cfg(target_os = "linux")]
-        assert!(name.ends_with(".deb"));
+        {
+            assert!(name.ends_with(".deb"));
+            // …and the one built for THIS arch, never the sibling.
+            #[cfg(target_arch = "x86_64")]
+            assert!(!name.contains("aarch64"), "x86_64 host picked {name}");
+            #[cfg(target_arch = "aarch64")]
+            assert!(name.contains("aarch64"), "aarch64 host picked {name}");
+        }
         #[cfg(target_os = "macos")]
         assert!(name.ends_with(".pkg"));
         let _ = name; // silence unused warning on non-matched targets
@@ -1942,6 +1974,49 @@ mod tests {
         assert!(pick_latest_release(vec![]).is_none());
         assert!(pick_latest_release(vec![mk_release("random-1.0.0", false, false)]).is_none());
         assert!(pick_latest_release(vec![mk_release("agent-v0.1.0", true, false)]).is_none());
+    }
+
+    /// A release carrying BOTH Linux architectures must never hand an
+    /// agent the other one. Before the arch qualifier, `ends_with(".deb")`
+    /// matched whichever .deb GitHub listed first, so publishing an arm64
+    /// package would have made every x86_64 agent dpkg a foreign binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pick_asset_never_crosses_linux_architectures() {
+        let mk = |name: &str| GithubAsset {
+            name: name.into(),
+            browser_download_url: "https://example.invalid/x.deb".into(),
+            size: 1,
+            digest: None,
+        };
+        // arm64 deliberately FIRST, so a naive picker would take it.
+        let assets = vec![
+            mk("roomler-agent-0.3.0-rc.366-aarch64-unknown-linux-gnu.deb"),
+            mk("roomler-agent-0.3.0-rc.366-x86_64-unknown-linux-gnu.deb"),
+        ];
+        let name = &pick_asset_for_unix(&assets)
+            .expect("a Linux deb must match")
+            .name;
+        #[cfg(target_arch = "x86_64")]
+        assert!(name.contains("x86_64"), "x86_64 agent took {name}");
+        #[cfg(target_arch = "aarch64")]
+        assert!(name.contains("aarch64"), "aarch64 agent took {name}");
+        let _ = name;
+    }
+
+    /// An x86_64-only release must be SKIPPED on arm64 rather than
+    /// installed — the field case that made `Update all` a silent no-op
+    /// on the aarch64 host (2026-08-15).
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn pick_asset_skips_x86_only_release_on_arm64() {
+        let assets = vec![GithubAsset {
+            name: "roomler-agent-0.3.0-rc.366-x86_64-unknown-linux-gnu.deb".into(),
+            browser_download_url: "https://example.invalid/x.deb".into(),
+            size: 1,
+            digest: None,
+        }];
+        assert!(pick_asset_for_unix(&assets).is_none());
     }
 
     #[test]
