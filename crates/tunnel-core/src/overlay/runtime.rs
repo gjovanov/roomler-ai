@@ -2684,6 +2684,7 @@ impl OverlayRuntime {
                             candidates: s.candidates.clone(),
                             stun_server: s.stun_server.map(|x| x.to_string()),
                             nat: s.my_nat.clone(),
+                            via_public_dial: s.via_public_dial,
                             error: s.error.clone(),
                         });
                         info!(
@@ -3904,9 +3905,7 @@ mod tests {
                 // enough that the stale-proof trigger (POKE_PROOF_AFTER,
                 // 120 s — since_proof falls back to install age when we never
                 // initiated) is nowhere near: NO passive trigger can fire.
-                since: Instant::now()
-                    .checked_sub(Duration::from_secs(30))
-                    .unwrap(),
+                since: Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
                 last_rx_at: Instant::now(),
                 ..Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now())
             },
