@@ -91,6 +91,17 @@ pub(super) struct DirectCandidates {
     pub(super) srflx: Option<std::net::SocketAddr>,
 }
 
+/// How many consecutive failed LAN probes disprove the "the peer's LAN
+/// candidate actually works" premise of the P8 hairpin gate. 2026-08-15
+/// field (home mesh with client isolation): same-subnet client↔client
+/// traffic was DEAD at the AP — raw UDP and ICMP both directions — while
+/// the candidates stayed advertised, and mesh-node roaming made it FLAP
+/// (a 03:17 LAN handshake worked; by 07:10 the same path was black). With
+/// presence treated as usability, the gate suppressed the srflx hairpin —
+/// the only direct tier a same-NAT pair has there — so pairs demoted
+/// during a VPN window stayed relay-locked until a daemon restart.
+pub(super) const LAN_DEAD_STRIKES: u32 = 3;
+
 pub(super) fn resolve_direct_candidates(
     direct_ctx: Option<&DirectCtx>,
     cfg: &PeerConfig,
@@ -105,6 +116,12 @@ pub(super) fn resolve_direct_candidates(
             })
             .flatten()
     });
+    // The hairpin gate takes LAN health, not LAN presence: a candidate that
+    // keeps failing its probes ([`LAN_DEAD_STRIKES`]) no longer counts as
+    // "the tier that actually works", and the hairpin punch unlocks. The
+    // LAN candidate itself keeps being dialed — if the AP starts forwarding
+    // again (mesh roam), its strikes clear and the premise is restored.
+    let lan_usable = lan.is_some() && rot.lan < LAN_DEAD_STRIKES;
     let srflx = direct_ctx.and_then(|ctx| {
         (direct::srflx_enabled()
             && ctx.punch.is_some()
@@ -112,7 +129,7 @@ pub(super) fn resolve_direct_candidates(
             && !direct::srflx_hairpin_pointless(
                 ctx.punch.as_ref().map(|(s, _)| s.as_str()),
                 &cfg.srflx_endpoints,
-                direct::pick_same_subnet_endpoint(&ctx.my_ips, &cfg.lan_endpoints).is_some(),
+                lan_usable,
             ))
         .then(|| direct::pick_public_endpoint_rotated(&ctx.my_ips, &cfg.srflx_endpoints, rot.srflx))
         .flatten()
@@ -129,6 +146,10 @@ pub(super) fn resolve_direct_candidates(
 pub(super) struct CandidateRotation {
     pub public: u32,
     pub srflx: u32,
+    /// LAN-tier strike count — not a rotation offset (the LAN pick is the
+    /// single same-subnet match): [`resolve_direct_candidates`] reads it as
+    /// the LAN-health input to the P8 hairpin gate ([`LAN_DEAD_STRIKES`]).
+    pub lan: u32,
 }
 
 // The stable-port binder MOVED to `direct::bind_direct_socket` (multi-org v2:
@@ -896,6 +917,7 @@ impl OverlayRuntime {
                 .shadow(|s| CandidateRotation {
                     public: s.mon.strikes(&np.node_id, DirectTier::Public),
                     srflx: s.mon.strikes(&np.node_id, DirectTier::Srflx),
+                    lan: s.mon.strikes(&np.node_id, DirectTier::Lan),
                 })
                 .unwrap_or_default();
             let cands = resolve_direct_candidates(direct_ctx, &cfg, rot);
@@ -2608,6 +2630,51 @@ mod tests {
         assert!(
             without_lan.srflx.is_some(),
             "hairpin WITHOUT a LAN candidate keeps srflx"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_lan_strikes_unlock_the_hairpin_punch() {
+        // 2026-08-15 field: an AP with client isolation (or cross-node mesh
+        // roaming) leaves the peer's LAN candidate advertised but DEAD —
+        // every tier=Lan probe reads saw_inbound=false while raw same-subnet
+        // UDP + ICMP measure dead both directions. Presence-as-usability
+        // suppressed the hairpin srflx dial, so same-NAT pairs demoted
+        // during a VPN window sat relay-locked forever (a restart's fresh
+        // punch matrix was the only way out). After LAN_DEAD_STRIKES failed
+        // LAN probes the hairpin must unlock — while the LAN candidate
+        // keeps being dialed so a recovered AP path clears the strikes.
+        let c = ctx(Some("37.63.112.129:43650"), Some("cone")).await;
+        let p = peer(
+            &["192.168.68.106:43650"],
+            &["37.63.112.129:43721"],
+            Some("cone"),
+        );
+        let below = resolve_direct_candidates(
+            Some(&c),
+            &p,
+            CandidateRotation {
+                lan: LAN_DEAD_STRIKES - 1,
+                ..Default::default()
+            },
+        );
+        assert!(
+            below.srflx.is_none(),
+            "below the threshold the LAN premise still holds"
+        );
+        let dead = resolve_direct_candidates(
+            Some(&c),
+            &p,
+            CandidateRotation {
+                lan: LAN_DEAD_STRIKES,
+                ..Default::default()
+            },
+        );
+        assert!(dead.lan.is_some(), "the LAN candidate keeps being probed");
+        assert_eq!(
+            dead.srflx,
+            Some("37.63.112.129:43721".parse().unwrap()),
+            "a dead LAN unlocks the hairpin srflx dial"
         );
     }
 
