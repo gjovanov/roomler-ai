@@ -1938,6 +1938,13 @@ impl OverlayRuntime {
         // subscription back (see `route_events` module doc).
         let mut route_watch = super::route_events::spawn_route_watch();
         let mut last_route_wave: Option<Instant> = None;
+        // Net-change poke acceleration — one-shot flag set by the addr/iface
+        // route-event arm, consumed by the next fallback sweep: every
+        // established DIRECT carrier gets a forced revalidation poke, so a
+        // captured-route casualty (corp-VPN connect) dies at its handshake
+        // deadline (~seconds) instead of waiting out `POKE_SILENCE_AFTER` +
+        // the passive rx-stale race (~90 s observed, CORPLAP-1 2026-08-15).
+        let mut netchange_poke_due = false;
         // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't
         // keep its competing capture routes installed. First tick fires
         // immediately; skip it (routes are freshly installed by
@@ -2392,6 +2399,7 @@ impl OverlayRuntime {
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
                         &mut relay_refresh_cooldown, &current_peers,
+                        std::mem::take(&mut netchange_poke_due),
                     ).await;
                     warn_if_slow("sweep_carrier_health", t0);
                     // C2 — disco round: one out-of-tunnel echo per direct
@@ -2548,6 +2556,15 @@ impl OverlayRuntime {
                                     // ESTABLISHED re-verifies the mapping.
                                     if let Some(plane) = &self.carrier_plane {
                                         plane.notify_regather();
+                                    }
+                                    // Net-change poke acceleration — the event
+                                    // is the suspicion: the next sweep force-
+                                    // revalidates every established direct
+                                    // carrier (answered pokes clear free; a
+                                    // captured-route casualty dies at its
+                                    // handshake deadline, not ~90 s later).
+                                    if direct::netchange_poke_enabled() {
+                                        netchange_poke_due = true;
                                     }
                                     let mut now_ips = direct::gather_lan_ips();
                                     now_ips.sort_unstable();
@@ -3720,6 +3737,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            false,
         )
         .await;
 
@@ -3820,6 +3838,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            false,
         )
         .await;
 
@@ -3844,6 +3863,91 @@ mod tests {
             s.mon.eligible(&nid, DirectTier::Public, now)
                 && s.mon.strikes(&nid, DirectTier::Public) == 0,
             "CC1: the public-direct tier is NOT poisoned"
+        );
+    }
+
+    /// Net-change acceleration — `force_poke` arms a revalidation poke on an
+    /// established direct carrier with FRESH rx (none of the passive gates
+    /// met), and without the flag the same sweep arms nothing. This is the
+    /// contract that collapses the CORPLAP-1 CP-connect failover from ~90 s
+    /// (waiting out `POKE_SILENCE_AFTER` + the rx-stale race) to ~one
+    /// handshake deadline: the OS route event is the suspicion, the poke is
+    /// the honest proof either way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn netchange_force_poke_arms_without_silence() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 5);
+        let pk = peer_kp.public.to_bytes();
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dead, true)
+            .await;
+        wg.test_latch_handshake_done(&pk);
+
+        let nid = ObjectId::from_bytes([8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                // Past the warm-up grace but heard from JUST NOW, and young
+                // enough that the stale-proof trigger (POKE_PROOF_AFTER,
+                // 120 s — since_proof falls back to install age when we never
+                // initiated) is nowhere near: NO passive trigger can fire.
+                since: Instant::now()
+                    .checked_sub(Duration::from_secs(30))
+                    .unwrap(),
+                last_rx_at: Instant::now(),
+                ..Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now())
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        // Control: no net-change flag → the fresh carrier is left alone.
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            false,
+        )
+        .await;
+        assert!(
+            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_none()),
+            "fresh carrier is not poked without the net-change flag"
+        );
+
+        // Net-change flag → the same fresh carrier gets a forced poke armed
+        // (and survives the sweep — arming never kills).
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            true,
+        )
+        .await;
+        assert!(
+            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_some()),
+            "net-change forces a revalidation poke despite fresh rx"
         );
     }
 
@@ -3907,6 +4011,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            false,
         )
         .await;
         assert!(
@@ -3928,6 +4033,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            false,
         )
         .await;
         assert!(
@@ -3974,6 +4080,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            false,
         )
         .await;
         assert!(
@@ -4673,6 +4780,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            false,
         )
         .await;
 
@@ -4763,6 +4871,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
+            false,
         )
         .await;
 
