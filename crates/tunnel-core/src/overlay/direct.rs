@@ -249,6 +249,27 @@ pub fn first_non_vpn_uplink() -> Option<(Ipv4Addr, Option<u32>)> {
     gather_lan_interfaces().into_iter().next()
 }
 
+/// Net-change poke acceleration — gate for arming forced revalidation pokes
+/// on every established direct carrier when an OS addr/iface event fires
+/// (`ROOMLER_NODE_OVERLAY_NETCHANGE_POKE`; legacy `ROOMLER_AGENT_…` alias
+/// honoured). Default **ON**; set `0`/`false`/`no`/`off` to fall back to the
+/// passive gates (`POKE_SILENCE_AFTER` + rx-stale) if forced pokes ever
+/// misbehave in the field. The mechanism is safe by construction — an
+/// answered poke clears with no side effects — so this exists as an
+/// emergency valve, not a rollout gate.
+pub fn netchange_poke_enabled() -> bool {
+    match crate::env::node_env("OVERLAY_NETCHANGE_POKE") {
+        Some(v) => {
+            let t = v.trim();
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
+        }
+        None => true,
+    }
+}
+
 /// rc.275 hygiene — gate for the LAN-gather virtual-interface filter
 /// (`ROOMLER_NODE_OVERLAY_LAN_IFACE_FILTER`; legacy `ROOMLER_AGENT_…` alias
 /// honoured — see [`crate::env::node_env`]). Default **ON**; set
