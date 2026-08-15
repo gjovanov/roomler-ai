@@ -141,15 +141,47 @@ install_daemon_linux() {
     releases="$STAGE/releases.json"
     say "resolving latest agent release via $SERVER/api/agent/latest-release"
     curl -fsSL -o "$releases" "$SERVER/api/agent/latest-release"
-    url="$(asset_field_for "$releases" 'x86_64-unknown-linux-gnu\.deb' browser_download_url)"
-    digest="$(asset_field_for "$releases" 'x86_64-unknown-linux-gnu\.deb' digest)"
-    [ -n "$url" ] || { echo "error: no linux .deb asset in the latest agent release" >&2; exit 1; }
-    deb="$STAGE/roomler-agent.deb"
+
+    # Two axes, same rules as the agent's own updater
+    # (docs/linux-self-update.md): the arch we are running, and a format this
+    # host can actually install. A .deb needs dpkg/apt — on Fedora / RHEL /
+    # SUSE / Arch it downloads and then fails — so those hosts take the
+    # self-contained tarball.
+    case "$(uname -m)" in
+        x86_64|amd64)   arch=x86_64 ;;
+        aarch64|arm64)  arch=aarch64 ;;
+        *) echo "error: unsupported Linux architecture $(uname -m)" >&2; exit 1 ;;
+    esac
+    if command -v dpkg >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1; then
+        fmt=deb
+    else
+        fmt=tar.gz
+    fi
+    say "host: linux/$arch, installing the .$fmt"
+
+    pattern="${arch}-unknown-linux-gnu\\.${fmt}"
+    url="$(asset_field_for "$releases" "$pattern" browser_download_url)"
+    digest="$(asset_field_for "$releases" "$pattern" digest)"
+    if [ -z "$url" ] && [ "$fmt" = deb ]; then
+        # A Debian host whose .deb is missing still installs via the tarball
+        # rather than treating an absent artifact as a dead end.
+        say "no .deb for ${arch} in this release — falling back to the tarball"
+        fmt=tar.gz
+        pattern="${arch}-unknown-linux-gnu\\.tar\\.gz"
+        url="$(asset_field_for "$releases" "$pattern" browser_download_url)"
+        digest="$(asset_field_for "$releases" "$pattern" digest)"
+    fi
+    [ -n "$url" ] || { echo "error: no linux/${arch} .${fmt} asset in the latest agent release" >&2; exit 1; }
+    deb="$STAGE/roomler-agent.${fmt}"
     download "$url" "$deb"
     verify_sha256 "$deb" "$digest"
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
-        say "download-only: would run: sudo dpkg -i $deb"
+        if [ "$fmt" = deb ]; then
+            say "download-only: would run: sudo dpkg -i $deb"
+        else
+            say "download-only: would run: sudo tar -xzf $deb --strip-components=1 -C /"
+        fi
         if [ "$SYSTEM" = 1 ]; then
             say "download-only: would run: sudo roomlerd --config $SYSTEM_CONFIG enroll --server $SERVER --token <token> --name $NAME"
             say "download-only: would run: sudo systemctl enable --now roomlerd.service"
@@ -160,8 +192,19 @@ install_daemon_linux() {
         return 0
     fi
 
-    say "installing the roomlerd daemon (.deb — sudo required)"
-    sudo dpkg -i "$deb" || sudo apt-get -f install -y
+    if [ "$fmt" = deb ]; then
+        say "installing the roomlerd daemon (.deb — sudo required)"
+        sudo dpkg -i "$deb" || sudo apt-get -f install -y
+    else
+        say "installing the roomlerd daemon (tarball — sudo required)"
+        # --strip-components=1 drops the versioned prefix dir so the payload
+        # lands at /usr/bin, /usr/lib/roomler-agent, /usr/lib/systemd/…
+        # (identical to what the .deb installs). On a FIRST install there are
+        # no operator-edited units to protect, so unpacking wholesale is fine;
+        # the agent's own updater is the path that preserves them on upgrade.
+        sudo tar -xzf "$deb" --strip-components=1 -C /
+        sudo test -x /usr/bin/roomlerd || { echo "error: tarball did not install /usr/bin/roomlerd" >&2; exit 1; }
+    fi
 
     enroll_daemon /usr/bin/roomlerd
 
@@ -177,7 +220,7 @@ install_daemon_linux() {
         systemctl --user enable --now roomler.service
         say "daemon status: $(systemctl --user is-active roomler.service || true)"
         say "NOTE: on a headless host, run 'sudo loginctl enable-linger $USER' so the user unit runs without an open session."
-        say "NOTE: a per-user daemon cannot install its own updates (a .deb needs root). Re-run with --system for unattended self-update."
+        say "NOTE: a per-user daemon cannot install its own updates (writing /usr needs root, whichever format). Re-run with --system for unattended self-update."
     fi
 }
 
