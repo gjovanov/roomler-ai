@@ -624,6 +624,10 @@ pub enum OverlayEvent {
         ice_servers: Vec<IceServer>,
         pair_key: String,
     },
+    /// C4 stage 1 — pair-less coturn creds for the standing WARM
+    /// allocation (the reply to our own `rc:overlay.warm_relay_request`;
+    /// relay mode only, gated by `overlay_warm_relay`).
+    WarmRelayGrant { ice_servers: Vec<IceServer> },
     /// P7 — server-pushed per-pair DERP escalation: the server observed
     /// sustained TURN churn for this pair and tells BOTH ends to pin it onto
     /// the DERP carrier for `ttl_ms`. Pushed (never grant-borne) because the
@@ -1084,6 +1088,10 @@ pub struct OverlayRuntime {
     /// silently on 2026-08-06 because both failure paths only logged at
     /// `debug!`.
     srflx_status: Option<crate::localapi::SrflxStatus>,
+    /// C4 stage 1 — the warm allocation's state, published into
+    /// [`OverlayView::warm_relay`](crate::localapi::OverlayView) on every
+    /// view publish. `None` while the feature is off.
+    warm_relay_status: Option<crate::localapi::WarmRelayStatus>,
     /// Multi-org v2 — the process-wide shared carrier plane, when this
     /// runtime rides it (see [`with_carrier_plane`](Self::with_carrier_plane)).
     carrier_plane: Option<Arc<super::carrier_plane::CarrierPlane>>,
@@ -1233,6 +1241,7 @@ fn build_overlay_view(
         exit_node: None,
         dns: None,
         srflx: None,
+        warm_relay: None,
         direct_socks: Vec::new(),
     }
 }
@@ -1272,6 +1281,7 @@ impl OverlayRuntime {
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
             srflx_status: None,
+            warm_relay_status: None,
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1300,6 +1310,7 @@ impl OverlayRuntime {
             path_shadow: std::sync::Mutex::new(PathShadow::new()),
             dns_status: None,
             srflx_status: None,
+            warm_relay_status: None,
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1494,6 +1505,8 @@ impl OverlayRuntime {
             // NAT-traversal — ditto for the srflx gather outcome. An empty
             // candidate list here is the "why is everything on relay?" signal.
             view.srflx = self.srflx_status.clone();
+            // C4 stage 1 — ditto for the warm allocation state.
+            view.warm_relay = self.warm_relay_status.clone();
             // PR-B1 — per-socket receive liveness: a bound socket whose
             // rx_pkts is frozen while its endpoint is advertised is the
             // 2026-08-10 wedge signature (reader-less, Recv-Q pegged).
@@ -1613,6 +1626,7 @@ impl OverlayRuntime {
                 }
                 Some(OverlayEvent::NetmapDelta { .. }) => continue, // pre-netmap; ignore
                 Some(OverlayEvent::RelayGrant { .. }) => continue,  // pre-netmap; ignore
+                Some(OverlayEvent::WarmRelayGrant { .. }) => continue, // pre-netmap; ignore
                 Some(OverlayEvent::ForceDerp { .. }) => continue,   // pre-netmap; ignore
                 Some(OverlayEvent::RttSample { .. }) => continue,   // pre-netmap; ignore
                 Some(OverlayEvent::RebuildDirect) => continue,      // pre-netmap; no plane yet
@@ -1991,6 +2005,18 @@ impl OverlayRuntime {
             }
             CarrierMode::Direct(_) => None,
         };
+        // C4 stage 1 — the warm-allocation manager's loop-side state
+        // (measurement-only; see `warm_relay` module + docs/overlay-warm-relay.md).
+        let warm_enabled =
+            super::direct::warm_relay_enabled() && matches!(self.mode, CarrierMode::Relay);
+        let mut warm = super::warm_relay::WarmRelay::default();
+        let (warm_tx, mut warm_rx) = mpsc::channel::<super::warm_relay::WarmMsg>(4);
+        let mut warm_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        warm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        if warm_enabled {
+            info!("overlay warm relay: enabled — will establish once srflx proves UDP egress");
+        }
+
         // rc.211 — off-loop relay carrier builds (see `RelayBuildQueue`).
         // Created before the FIRST install so the startup batch can spawn too.
         let (built_tx, mut built_rx) = mpsc::channel::<BuiltRelay>(16);
@@ -2651,6 +2677,74 @@ impl OverlayRuntime {
                         plane_srflx_rx = None;
                     }
                 },
+                // C4 stage 1 — warm-allocation cadence: request creds when
+                // UDP provably works (srflx non-empty) and nothing is live;
+                // probe liveness (a 1-byte permission assert, spawned
+                // off-loop) while one is. The probe succeeding while srflx
+                // is NONE is THE measurement: the flow is grandfathered.
+                _ = warm_tick.tick(), if warm_enabled => {
+                    let now = Instant::now();
+                    if warm.request_due(now) && !srflx_advertised.is_empty() {
+                        warm.note_requested(now);
+                        if self.outbound.send(ClientMsg::OverlayWarmRelayRequest {}).await.is_ok() {
+                            debug!("overlay warm relay: creds requested (srflx proves UDP egress)");
+                        }
+                    }
+                    if warm.probe_due(now)
+                        && let Some((conn, dst)) = warm.probe_parts()
+                    {
+                        warm.note_probe_started();
+                        let tx = warm_tx.clone();
+                        tokio::spawn(async move {
+                            let (_ms, ok) =
+                                super::wg::assert_relay_permission(&conn, dst, "warm-probe").await;
+                            let msg = if ok {
+                                super::warm_relay::WarmMsg::ProbeOk
+                            } else {
+                                super::warm_relay::WarmMsg::ProbeFailed(
+                                    "permission assert through the allocation failed".into(),
+                                )
+                            };
+                            let _ = tx.send(msg).await;
+                        });
+                    }
+                    self.warm_relay_status = Some(warm.status(now));
+                },
+                Some(wm) = warm_rx.recv() => {
+                    let now = Instant::now();
+                    let probe_ok = matches!(wm, super::warm_relay::WarmMsg::ProbeOk);
+                    match warm.apply(wm, now) {
+                        super::warm_relay::WarmTransition::Established => {
+                            let s = warm.status(now);
+                            info!(
+                                relayed = s.relayed.as_deref().unwrap_or("?"),
+                                cred_expiry_in_s = s.cred_expiry_in_s.unwrap_or(-1),
+                                "overlay warm relay: ESTABLISHED — standing UDP allocation live"
+                            );
+                        }
+                        super::warm_relay::WarmTransition::EstablishFailed => {
+                            warn!(
+                                detail = warm.status(now).detail.as_deref().unwrap_or("?"),
+                                "overlay warm relay: establish failed; retrying on the spacing"
+                            );
+                        }
+                        super::warm_relay::WarmTransition::Lost => {
+                            warn!(
+                                detail = warm.status(now).detail.as_deref().unwrap_or("?"),
+                                "overlay warm relay: LOST — will re-establish when UDP egress returns"
+                            );
+                        }
+                        super::warm_relay::WarmTransition::ProbeOk => {}
+                    }
+                    if probe_ok && srflx_advertised.is_empty() && !warm.grandfather_logged {
+                        warm.grandfather_logged = true;
+                        info!(
+                            "overlay warm relay: srflx is NONE but the warm allocation still \
+                             answers — the flow is GRANDFATHERED across the network transition"
+                        );
+                    }
+                    self.warm_relay_status = Some(warm.status(now));
+                },
                 // Multi-org v2 P1-d — the plane's rebuild steps. Teardown:
                 // release every socket-pinning Arc (direct carriers, probes,
                 // our DirectCtx view) and ack, so the plane can actually
@@ -2940,6 +3034,54 @@ impl OverlayRuntime {
                             }
                         }
                         warn_if_slow("arm:relay_grant", t_arm);
+                    }
+                    // C4 stage 1 — warm-allocation creds arrived: allocate
+                    // over TURN/UDP off-loop (UDP-or-nothing — a TCP "warm"
+                    // allocation would just be today's TURNS fallback), and
+                    // let the warm_rx arm commit the outcome.
+                    Some(OverlayEvent::WarmRelayGrant { ice_servers }) => {
+                        if warm_enabled {
+                            match super::relay_link::turn_creds(&ice_servers) {
+                                Some((urls, user, cred)) => {
+                                    let udp = super::warm_relay::udp_turn_urls(&urls);
+                                    if udp.is_empty() {
+                                        warn!("overlay warm relay: grant carried no UDP turn urls; skipping");
+                                    } else {
+                                        let expiry = super::warm_relay::ephemeral_cred_expiry_s(&user);
+                                        let probe_dst = srflx_advertised
+                                            .first()
+                                            .and_then(|e| e.parse().ok());
+                                        let tx = warm_tx.clone();
+                                        tokio::spawn(async move {
+                                            let msg = match crate::transport::relay::allocate_relay_from_ice_tiered(
+                                                &udp, &user, &cred, false,
+                                            )
+                                            .await
+                                            {
+                                                Ok(c) => {
+                                                    let conn: std::sync::Arc<dyn crate::transport::relay::RelayConn> =
+                                                        std::sync::Arc::new(c);
+                                                    match conn.local_addr() {
+                                                        Ok(relayed) => super::warm_relay::WarmMsg::Established {
+                                                            conn,
+                                                            relayed,
+                                                            cred_expiry_epoch_s: expiry,
+                                                            probe_dst,
+                                                        },
+                                                        Err(e) => super::warm_relay::WarmMsg::EstablishFailed(
+                                                            format!("relayed addr unreadable: {e}"),
+                                                        ),
+                                                    }
+                                                }
+                                                Err(e) => super::warm_relay::WarmMsg::EstablishFailed(e.to_string()),
+                                            };
+                                            let _ = tx.send(msg).await;
+                                        });
+                                    }
+                                }
+                                None => warn!("overlay warm relay: grant carried no turn creds; skipping"),
+                            }
+                        }
                     }
                     Some(OverlayEvent::ForceDerp { peer_node_id, ttl_ms, derp_url }) => {
                         let t_arm = Instant::now();

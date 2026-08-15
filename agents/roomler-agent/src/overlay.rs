@@ -955,6 +955,11 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
             ice_servers,
             pair_key,
         },
+        // C4 stage 1 — pair-less creds for the standing warm allocation
+        // (the reply to the runtime's own warm_relay_request).
+        ServerMsg::OverlayWarmRelayGrant { ice_servers } => {
+            OverlayEvent::WarmRelayGrant { ice_servers }
+        }
         // P7 — server-pushed per-pair DERP escalation (corp TURN churn).
         ServerMsg::OverlayForceDerp {
             peer_node_id,

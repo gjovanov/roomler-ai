@@ -351,6 +351,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            warm_relay: None,
             direct_socks: Vec::new(),
         };
         assert_eq!(
@@ -425,6 +426,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            warm_relay: None,
             direct_socks: Vec::new(),
         });
         tokio::spawn(serve_socks5(handle_rx, view_rx, socks));
