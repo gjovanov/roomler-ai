@@ -289,6 +289,12 @@ pub struct WarmRelayStatus {
     /// the future rendezvous `R`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relayed: Option<String>,
+    /// C4 stage 2 — which transport the warm leg rides: `udp` (the
+    /// grandfather-measurable flavor) or `tls` (TURNS/TCP:443 — the
+    /// strict-corp fallback that survives a VPN capture). `None` from a
+    /// pre-stage-2 daemon or while nothing is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flavor: Option<String>,
     /// Seconds since the allocation was established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub age_s: Option<u64>,

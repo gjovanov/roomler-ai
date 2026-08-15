@@ -2705,10 +2705,19 @@ impl OverlayRuntime {
                 // is NONE is THE measurement: the flow is grandfathered.
                 _ = warm_tick.tick(), if warm_enabled => {
                     let now = Instant::now();
-                    if warm.request_due(now) && !srflx_advertised.is_empty() {
+                    // C4 stage 2 — request whenever nothing is live: the
+                    // stage-1 srflx gate ("only when UDP provably works")
+                    // kept strict-corp hosts permanently warm-less, and
+                    // those are exactly the hosts the standing leg exists
+                    // for. The FLAVOR decision at grant time consumes the
+                    // srflx evidence instead (empty ⇒ TLS leg).
+                    if warm.request_due(now) {
                         warm.note_requested(now);
                         if self.outbound.send(ClientMsg::OverlayWarmRelayRequest {}).await.is_ok() {
-                            debug!("overlay warm relay: creds requested (srflx proves UDP egress)");
+                            debug!(
+                                udp_dead = srflx_advertised.is_empty(),
+                                "overlay warm relay: creds requested"
+                            );
                         }
                     }
                     if warm.probe_due(now)
@@ -2739,8 +2748,9 @@ impl OverlayRuntime {
                             let s = warm.status(now);
                             info!(
                                 relayed = s.relayed.as_deref().unwrap_or("?"),
+                                flavor = s.flavor.as_deref().unwrap_or("?"),
                                 cred_expiry_in_s = s.cred_expiry_in_s.unwrap_or(-1),
-                                "overlay warm relay: ESTABLISHED — standing UDP allocation live"
+                                "overlay warm relay: ESTABLISHED — standing allocation live"
                             );
                         }
                         super::warm_relay::WarmTransition::EstablishFailed => {
@@ -3070,15 +3080,28 @@ impl OverlayRuntime {
                         if warm_enabled {
                             match super::relay_link::turn_creds(&ice_servers) {
                                 Some((urls, user, cred)) => {
-                                    let udp = super::warm_relay::udp_turn_urls(&urls);
-                                    if udp.is_empty() {
-                                        warn!("overlay warm relay: grant carried no UDP turn urls; skipping");
+                                    // C4 stage 2 — flavor ladder: UDP while it can work
+                                    // (the grandfather-measurable leg), TURNS/TCP:443 when
+                                    // fresh UDP is provably dead right now (srflx empty —
+                                    // the strict-corp case the standing leg exists for).
+                                    let flavor = warm.next_flavor(srflx_advertised.is_empty());
+                                    let alloc_urls = match flavor {
+                                        super::warm_relay::WarmFlavor::Udp => {
+                                            super::warm_relay::udp_turn_urls(&urls)
+                                        }
+                                        // The tiered allocator's `tls_only` walks the
+                                        // `turns:` urls itself — hand it the full grant.
+                                        super::warm_relay::WarmFlavor::Tls => urls.clone(),
+                                    };
+                                    let tls_only = flavor == super::warm_relay::WarmFlavor::Tls;
+                                    if alloc_urls.is_empty() {
+                                        warn!(?flavor, "overlay warm relay: grant carried no usable turn urls; skipping");
                                     } else {
                                         let expiry = super::warm_relay::ephemeral_cred_expiry_s(&user);
                                         let tx = warm_tx.clone();
                                         tokio::spawn(async move {
                                             let msg = match crate::transport::relay::allocate_relay_from_ice_tiered(
-                                                &udp, &user, &cred, false,
+                                                &alloc_urls, &user, &cred, tls_only,
                                             )
                                             .await
                                             {
@@ -3090,13 +3113,18 @@ impl OverlayRuntime {
                                                             conn,
                                                             relayed,
                                                             cred_expiry_epoch_s: expiry,
+                                                            flavor,
                                                         },
-                                                        Err(e) => super::warm_relay::WarmMsg::EstablishFailed(
-                                                            format!("relayed addr unreadable: {e}"),
-                                                        ),
+                                                        Err(e) => super::warm_relay::WarmMsg::EstablishFailed {
+                                                            flavor,
+                                                            error: format!("relayed addr unreadable: {e}"),
+                                                        },
                                                     }
                                                 }
-                                                Err(e) => super::warm_relay::WarmMsg::EstablishFailed(e.to_string()),
+                                                Err(e) => super::warm_relay::WarmMsg::EstablishFailed {
+                                                    flavor,
+                                                    error: e.to_string(),
+                                                },
                                             };
                                             let _ = tx.send(msg).await;
                                         });
