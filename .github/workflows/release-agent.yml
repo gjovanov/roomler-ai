@@ -572,16 +572,21 @@ jobs:
       # LGPL-verified) and fetched from the vendored-ffmpeg-8.1.2 release
       # in seconds. Re-dispatch that workflow when bumping FFmpeg.
       # =======================================================================
-      - name: Fetch vendored FFmpeg 8.1.2 (win64 static-md, LGPL)
+      - name: Fetch vendored FFmpeg 8.1.2 (win64 static-md, LGPL, minimal)
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $dl = "$env:RUNNER_TEMP\ffdl"
+          # P3e lever B: the MINIMAL tree — --disable-everything + exactly the
+          # ten HW encoders the agent dispatches (avcodec.lib 139.3 -> 12.1 MB;
+          # vendor-ffmpeg-windows.yml's verify step asserts the symbol set).
+          # Rollback = drop the `-minimal` suffix here; the full zip stays on
+          # the same release untouched.
           gh release download vendored-ffmpeg-8.1.2 --repo "${{ github.repository }}" `
-            --pattern 'ffmpeg-8.1.2-win64-msvc-static-md-lgpl.zip*' --dir $dl
-          $zip = "$dl\ffmpeg-8.1.2-win64-msvc-static-md-lgpl.zip"
+            --pattern 'ffmpeg-8.1.2-win64-msvc-static-md-lgpl-minimal.zip*' --dir $dl
+          $zip = "$dl\ffmpeg-8.1.2-win64-msvc-static-md-lgpl-minimal.zip"
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
           if ($actual -ne $expected) { Write-Host "::error::vendored FFmpeg sha256 mismatch (got $actual, want $expected)"; exit 1 }
