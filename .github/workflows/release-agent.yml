@@ -36,6 +36,21 @@ on:
 permissions:
   contents: write
 
+# P3e Phase 2: single-codegen-unit release artifacts. Set as WORKFLOW env
+# (cargo reads CARGO_PROFILE_RELEASE_* like a Cargo.toml [profile.release]
+# key) instead of the workspace manifest, deliberately: the manifest form
+# would also slow the API docker image build on the build host, which ships
+# in a container where binary size is irrelevant. Measured on the rc.363
+# tree (32-core box, cold): roomlerd 31.95 -> 26.07 MiB (-18.4%) at 128 ->
+# 200 s; the standalone CLI 21.29 -> 15.53 MiB (-27.1%). NB fat/thin LTO
+# both LOSE to this on size AND build time for these binaries (thin is
+# +5% SIZE over baseline) — do not "upgrade" this to lto without
+# re-measuring. First run after this change rebuilds the caches (the env
+# is part of cargo's fingerprint); that one-time cost is the same class as
+# any dependency bump.
+env:
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+
 jobs:
   # ---------------------------------------------------------------------------
   # 0. Validate that the requested version matches Cargo.toml.
@@ -268,12 +283,19 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder"
 
-      # The `roomler` CLI lives in the roomler-tunnel package and is now a .deb
-      # asset, so it has to exist before `cargo deb --no-build` runs. Without
-      # this the .deb shipped only the daemon and every upgrade left a stale
-      # CLI behind (field-caught 2026-08-06: rc.205 CLI vs rc.311 daemon).
-      - name: Build the roomler CLI (shipped in the .deb alongside roomlerd)
-        run: cargo build -p roomler-tunnel --release
+      # P3e Phase 2: the .deb's `roomler` is now the CLI SHIM (re-execs
+      # `roomlerd cli`) — the Linux twin of the rc.365 MSI change. It must
+      # exist before `cargo deb --no-build` runs (the assets list references
+      # target/release/roomler-shim). Replaces the 143 s full-CLI build that
+      # duplicated ~21 MiB of the daemon's crates inside the .deb, and
+      # structurally retires the CLI/daemon version-skew failure class
+      # (field-caught 2026-08-06: rc.205 CLI vs rc.311 daemon) — the command
+      # surface now lives inside roomlerd itself. Tunnel-ONLY Linux hosts
+      # still get the real standalone binary from release-tunnel.yml.
+      - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
+        run: |
+          cargo build -p roomler-cli-shim --release
+          test -f target/release/roomler-shim || { echo "::error::roomler-shim not produced — the cargo-deb assets entry would fail"; exit 1; }
 
       - name: Bundle FFmpeg into the .deb (self-contained, RPATH)
         run: |
@@ -894,21 +916,21 @@ jobs:
           # and the shim that replaces it is ~0.15 MB. Ceiling drops with it:
           # 36 -> 30 MB, keeping the same ~5 MB of headroom over the baseline
           # that the P4b guard had.
-          # Baseline PINNED from the first post-change build (rehearsal run
-          # 31850087288's sibling, 2026-08-15): both flavours measured
-          # 25.45 MB. A baseline left above the real value is exactly the
-          # silent failure this guard exists to catch — it would swallow a
-          # multi-MB regression as "within budget".
-          $p4bBaseline = 25.45
+          # Baseline PINNED from the P3e Phase-2 rehearsal (run 31869144675,
+          # 2026-08-15): both flavours measured 20.3 MB (ffmpeg codec+format
+          # trim + codegen-units=1). A baseline left above the real value is
+          # exactly the silent failure this guard exists to catch — it would
+          # swallow a multi-MB regression as "within budget".
+          $p4bBaseline = 20.3
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
           Write-Host "::notice::baseline = $p4bBaseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
-          if ($maxMsi -gt 30) {
-            Write-Host "::error::MSI exceeds the 30 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
+          if ($maxMsi -gt 25) {
+            Write-Host "::error::MSI exceeds the 25 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
             exit 1
           } elseif ($deltaMB -gt 2) {
-            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the 30 MB ceiling). Re-baseline deliberately or investigate."
+            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the 25 MB ceiling). Re-baseline deliberately or investigate."
           } else {
             Write-Host "::notice::MSI within the P4b size budget."
           }
