@@ -91,6 +91,24 @@ const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
 /// unreachable anyway.
 const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// Pong-RTT degradation bound for the control WS. Field pc50045 2026-08-15
+/// ~20:00Z: a WS that SURVIVED a corp-VPN route capture kept "working"
+/// with application round-trips over 60 s — every send completed into the
+/// local TCP
+/// buffer ([`WS_SEND_TIMEOUT`] never fired) and frames DID eventually
+/// arrive (the RX deadline never fired), but overlay relay grants and
+/// fleet-RPC rode a molasses path: the primary org's pairs sat
+/// carrier-less while the SECONDARY org, whose WS had reconnected fresh
+/// after the capture, relayed fine. Liveness checks cannot see this; only
+/// latency can. The keepalive ping carries its send time and the echoed
+/// pong measures the true round trip.
+const WS_PONG_RTT_DEGRADED: Duration = Duration::from_secs(20);
+
+/// Consecutive degraded pongs before the WS is cycled — one slow pong can
+/// be a scheduler/GC blip; two spaced a keepalive interval apart is a path
+/// verdict. Worst-case detection ≈ 2 × 25 s keepalive + the RTT itself.
+const WS_PONG_RTT_STRIKES: u32 = 2;
+
 /// A5 — minimum wall-vs-monotonic skew that reads as suspend/resume at a
 /// keepalive tick (mirrors the overlay runtime's `RESUME_SKEW_THRESHOLD`).
 /// Below this it's scheduler jitter; above it the host slept and the WS is
@@ -953,6 +971,10 @@ async fn connect_once(
     // `WS_RX_DEADLINE` on the keepalive tick. See the const's doc for why
     // send-success is not a liveness signal.
     let mut last_rx = std::time::Instant::now();
+    // Pong-RTT detector state: pings stamp `ws_epoch`-relative millis into
+    // their payload; the echoed pong yields an exact application-level RTT.
+    let ws_epoch = std::time::Instant::now();
+    let mut slow_pongs: u32 = 0;
 
     // A5 — resume detection. Every timer here runs on the MONOTONIC clock,
     // which excludes suspend on Windows/Linux — so after a sleep the RX
@@ -1032,7 +1054,9 @@ async fn connect_once(
                         last_rx.elapsed().as_secs()
                     )));
                 }
-                if let Err(e) = send_frame(&mut ws, Message::Ping(Vec::new().into())).await {
+                if let Err(e) =
+                    send_frame(&mut ws, Message::Ping(ping_payload(ws_epoch).into())).await
+                {
                     warn!(%e, "keepalive ping failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
@@ -1239,8 +1263,43 @@ async fn connect_once(
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
-                // Pong (the server's auto-reply to our keepalive), Binary,
-                // raw frames — any inbound frame proves the link is alive.
+                Some(Ok(Message::Pong(payload))) => {
+                    last_rx = std::time::Instant::now();
+                    // Zombie-slow WS detector (see [`WS_PONG_RTT_DEGRADED`]):
+                    // a pong echoing one of OUR stamped pings measures the
+                    // true application round trip. Two consecutive verdicts
+                    // over the bound mean the path is unusable for the
+                    // request/reply traffic that rides it (relay grants,
+                    // exec) — cycle to a fresh connection; the persistent
+                    // overlay runtime rides through WS reconnects untouched.
+                    if let Some(rtt) = pong_rtt(&payload, ws_epoch) {
+                        if rtt >= WS_PONG_RTT_DEGRADED {
+                            slow_pongs += 1;
+                            warn!(
+                                rtt_s = rtt.as_secs(),
+                                strikes = slow_pongs,
+                                "control WS pong RTT degraded"
+                            );
+                            if slow_pongs >= WS_PONG_RTT_STRIKES {
+                                close_all_peers(&mut peers, &indicator).await;
+                                close_all_tunnel_peers(&mut tunnel_peers).await;
+                                close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                                return Err(ConnectError::Transient(anyhow::anyhow!(
+                                    "control WS degraded: pong rtt {} s ({} consecutive over \
+                                     the {} s bound) — cycling to a fresh connection",
+                                    rtt.as_secs(),
+                                    slow_pongs,
+                                    WS_PONG_RTT_DEGRADED.as_secs()
+                                )));
+                            }
+                        } else {
+                            slow_pongs = 0;
+                        }
+                    }
+                    watchdog::tick(ctx.pump);
+                }
+                // Binary / raw frames — any inbound frame proves the link
+                // is alive.
                 Some(Ok(_)) => {
                     last_rx = std::time::Instant::now();
                 }
@@ -2374,6 +2433,22 @@ async fn send_msg(ws: &mut Ws, msg: &ClientMsg) -> Result<()> {
     send_frame(ws, Message::text(json)).await
 }
 
+/// Keepalive ping payload: `ws_epoch`-relative send time in millis, 8 bytes
+/// BE. RFC 6455 §5.5.3 makes the peer echo it verbatim in the pong, turning
+/// every keepalive into an application-level RTT probe for free.
+fn ping_payload(epoch: std::time::Instant) -> Vec<u8> {
+    (epoch.elapsed().as_millis() as u64).to_be_bytes().to_vec()
+}
+
+/// Decode a pong payload stamped by [`ping_payload`] into the measured
+/// round trip. `None` for foreign shapes (an unsolicited server pong, or a
+/// pre-upgrade peer that strips payloads) — those simply don't vote.
+fn pong_rtt(payload: &[u8], epoch: std::time::Instant) -> Option<Duration> {
+    let ms = u64::from_be_bytes(payload.try_into().ok()?);
+    let now = epoch.elapsed().as_millis() as u64;
+    Some(Duration::from_millis(now.saturating_sub(ms)))
+}
+
 fn detect_os() -> OsKind {
     match std::env::consts::OS {
         "linux" => OsKind::Linux,
@@ -2424,6 +2499,46 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keepalive ping payload must round-trip through [`pong_rtt`] as a
+    /// near-zero RTT, and foreign pong shapes must abstain rather than
+    /// vote — the zombie-slow-WS detector (field pc50045 2026-08-15) only
+    /// ever acts on pongs that echo OUR stamp.
+    #[test]
+    fn pong_rtt_round_trips_and_rejects_foreign_payloads() {
+        let epoch = std::time::Instant::now();
+        let p = ping_payload(epoch);
+        assert_eq!(p.len(), 8);
+        let rtt = pong_rtt(&p, epoch).expect("own stamp decodes");
+        assert!(
+            rtt < WS_PONG_RTT_DEGRADED,
+            "an immediate echo must read healthy, got {rtt:?}"
+        );
+        assert_eq!(
+            pong_rtt(&[], epoch),
+            None,
+            "empty (unsolicited) pong abstains"
+        );
+        assert_eq!(
+            pong_rtt(&[1, 2, 3], epoch),
+            None,
+            "short foreign payload abstains"
+        );
+        // A stamp from 25 s ago reads as a degraded round trip. Use an
+        // epoch shifted into the past so "now" is ~30 s along it — a fresh
+        // epoch's elapsed() is ~0 and the stale stamp would saturate to 0.
+        let old_epoch = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(30))
+            .expect("30 s before now is representable");
+        let stale = ((old_epoch.elapsed().as_millis() as u64) - 25_000)
+            .to_be_bytes()
+            .to_vec();
+        let slow = pong_rtt(&stale, old_epoch).expect("stamped payload decodes");
+        assert!(
+            slow >= WS_PONG_RTT_DEGRADED,
+            "a 25 s echo must read degraded, got {slow:?}"
+        );
+    }
 
     #[test]
     fn auth_backoff_ladder_pins_each_step() {
