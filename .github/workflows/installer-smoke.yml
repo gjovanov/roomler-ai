@@ -45,26 +45,32 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Refresh the cache seed (delete BEFORE restore)
+        # Deleting the flat key BEFORE the restore makes this run's restore
+        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
+        # green non-tag run repopulates the seed with fresh content. The
+        # earlier delete-AFTER-restore variant had two proven holes
+        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
+        # post-save when the restore was an exact hit ("Cache up-to-date"),
+        # and two concurrent rehearsals (seed-release-caches dispatched a
+        # twin 7 s after a manual one) could delete+skip in an interleaving
+        # that left the key ABSENT for the next tag. Delete-before-restore
+        # is race-proof for freshness: worst case both runs build cold and
+        # the last save wins. Cost: rehearsals always build cold — which is
+        # exactly the freshest possible seed; tag runs never delete.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
+
       - name: Cache cargo
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
           shared-key: installer-smoke-windows
-
-      - name: Refresh the cache seed
-        # Kept in LOCKSTEP with release-agent.yml's companions block (it
-        # restores this same shared key). Swatinem's shared-key is a flat
-        # IMMUTABLE key — a `key:` input is IGNORED alongside shared-key —
-        # so without this delete-after-restore every save here skip-saves
-        # and the seed stales forever (2026-08-15 incident: an Aug-9 seed
-        # survived the whole P3e program). This workflow runs on master
-        # pushes + dispatch only, never on tags, so no tag-gating needed.
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
 
       - name: Install WiX Toolset v3 + cargo-wix
         shell: pwsh
