@@ -76,6 +76,12 @@ pub struct PeerConfig {
     /// DROPPED by this conversion. Carried so the client's region/worker
     /// selection matches the server's when it computes the strategy.
     pub relay_home: Option<String>,
+    /// C4 stage 2 (PR-B) — the peer's STANDING warm TURN allocation's relayed
+    /// address, refreshed by its heartbeats while the leg is live. A
+    /// single-relay DIALER falls back to this when the anchor's per-pair
+    /// relay advert hasn't landed (or can't — its control WS is captured);
+    /// validated against the coturn worker set like any anchor advert.
+    pub warm_relay_endpoint: Option<String>,
 }
 
 /// Decode a netmap peer. `None` if the pubkey isn't valid base64/length
@@ -104,6 +110,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         supports_overlay_echo: peer.supports_overlay_echo,
         relay_strategy: peer.relay_strategy,
         relay_home: peer.relay_home.clone(),
+        warm_relay_endpoint: peer.warm_relay_endpoint.clone(),
     })
 }
 
@@ -124,6 +131,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             relay_home: None,
+            warm_relay_endpoint: None,
             reachable,
             supports_quic: false,
             supports_relay_single: false,
