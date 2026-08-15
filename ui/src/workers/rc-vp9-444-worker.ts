@@ -2,7 +2,7 @@
 
 /**
  * Phase Y.2 — VP9 4:4:4 decoder worker for the DataChannel-bypass
- * video transport. See `docs/vp9-444-plan.md`.
+ * video transport. See `docs/encoders.md`.
  *
  * Receives length-prefixed encoded VP9 frames from the main thread
  * (which forwards them off `RTCDataChannel.onmessage`), reassembles

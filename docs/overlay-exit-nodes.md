@@ -115,6 +115,21 @@ have hit the default route reroutes through the exit.
 
 ## The self-wedge safety model
 
+```mermaid
+flowchart TB
+    OPT["client opts in:<br/>overlay_exit_node = name|hex"] --> RES["resolve BEFORE any routing change:<br/>server IPs · coturn IPs · exit's WG endpoint"]
+    RES --> PIN["pin /32 (/128) HOST EXEMPTIONS<br/>via the original gateway"]
+    PIN --> OK{"every exemption<br/>installed?"}
+    OK -->|no| WITHHOLD["WITHHOLD default routing<br/>ExitNodeStatus.withheld_reason set<br/>normal mesh keeps working"]
+    OK -->|yes| SPLIT["install split-default via the TUN:<br/>0.0.0.0/1 + 128.0.0.0/1<br/>(v6: ::/1 + 8000::/1)"]
+    SPLIT --> DNS["steer DNS to the exit's vantage<br/>(NRPT / resolvectl — no leak)"]
+    SPLIT --> GUARD["route-guard re-asserts every 2 s"]
+    CRASH["hard exit / crash"] -.-> HEAL["boot reconciler + purge_exit_routes()<br/>remove any stale /1 split"]
+```
+
+The split-default (`/1` + `/1`) out-specifics the OS default route without ever
+*replacing* it — removing the two halves instantly restores normal routing.
+
 Four layers, each defending against a different way to cut yourself off:
 
 - **Exemptions first.** Before *any* default route is installed, the client
