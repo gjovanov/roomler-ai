@@ -2743,6 +2743,12 @@ impl OverlayRuntime {
                 Some(wm) = warm_rx.recv() => {
                     let now = Instant::now();
                     let probe_ok = matches!(wm, super::warm_relay::WarmMsg::ProbeOk);
+                    // PR-B — grab the leg's conn before `apply` consumes the
+                    // message; the coordinator's fast-commit slot mirrors it.
+                    let established_conn = match &wm {
+                        super::warm_relay::WarmMsg::Established { conn, .. } => Some(conn.clone()),
+                        _ => None,
+                    };
                     match warm.apply(wm, now) {
                         super::warm_relay::WarmTransition::Established => {
                             let s = warm.status(now);
@@ -2752,6 +2758,13 @@ impl OverlayRuntime {
                                 cred_expiry_in_s = s.cred_expiry_in_s.unwrap_or(-1),
                                 "overlay warm relay: ESTABLISHED — standing allocation live"
                             );
+                            // PR-B — arm the anchor fast-commit: the next
+                            // single-relay-anchor pair (typically the one a
+                            // VPN capture just killed) commits this leg
+                            // instead of running the request round-trips.
+                            if let Some(r) = relay.as_mut() {
+                                r.set_warm_leg(established_conn);
+                            }
                         }
                         super::warm_relay::WarmTransition::EstablishFailed => {
                             warn!(
@@ -2764,6 +2777,12 @@ impl OverlayRuntime {
                                 detail = warm.status(now).detail.as_deref().unwrap_or("?"),
                                 "overlay warm relay: LOST — will re-establish when UDP egress returns"
                             );
+                            // PR-B — a dead leg must never fast-commit; the
+                            // committed pair's own carrier dies on its own
+                            // terms (health sweep) and re-requests normally.
+                            if let Some(r) = relay.as_mut() {
+                                r.set_warm_leg(None);
+                            }
                         }
                         super::warm_relay::WarmTransition::ProbeMissed => {
                             info!(
@@ -3613,6 +3632,7 @@ mod tests {
             srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
             srflx_nat: None,
             relay_home: None,
+            warm_relay_endpoint: None,
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,
@@ -5415,6 +5435,7 @@ mod tests {
                 srflx_endpoints: vec![],
                 srflx_nat: None,
                 relay_home: None,
+                warm_relay_endpoint: None,
                 reachable,
                 supports_quic: false,
                 supports_relay_single: false,
@@ -5656,6 +5677,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             relay_home: None,
+            warm_relay_endpoint: None,
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,
@@ -6211,6 +6233,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             relay_home: None,
+            warm_relay_endpoint: None,
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,
@@ -6381,6 +6404,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             relay_home: None,
+            warm_relay_endpoint: None,
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,

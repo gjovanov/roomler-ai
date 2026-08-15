@@ -2917,6 +2917,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             relay_home: None,
+            warm_relay_endpoint: None,
             reachable: true,
             supports_quic: false,
             supports_relay_single: false,
