@@ -22,7 +22,9 @@ tracing-subscriber.workspace = true
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-roomler-ai-remote-control = { path = "../remote_control" }
+# default-features = false drops the `server` half (Mongo audit DAO + Hub) —
+# this crate only needs the wire/model/permission surface (P3e Phase 3).
+roomler-ai-remote-control = { path = "../remote_control", default-features = false }
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }
