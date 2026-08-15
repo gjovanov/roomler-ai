@@ -78,7 +78,11 @@ jobs:
           choco install -y wixtoolset
           $wixBin = Get-ChildItem 'C:\Program Files (x86)\WiX Toolset v*\bin' | Select-Object -First 1
           "$($wixBin.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append
-          cargo install cargo-wix --locked
+          # Idempotent: the seed caches (#488) can restore ~/.cargo/bin with
+          # the tool present; a plain install hard-errors on it.
+          if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
+            cargo install cargo-wix --locked
+          }
 
       - name: Build agent (release, minimal feature set)
         # Chunk 6A scope: install/uninstall validation only. Drop

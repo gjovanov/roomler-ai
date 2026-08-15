@@ -206,7 +206,11 @@ jobs:
           shared-key: agent-linux
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
+        # Idempotent: the lockfile-generation seed caches (#488) restore
+        # ~/.cargo/bin WITH the tool already present, and a plain
+        # `cargo install` hard-errors on an existing binary (rc.383's
+        # release run died on exactly this in all three build jobs).
+        run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
 
       - name: Fetch vendored FFmpeg 8.1.2 (for the ffmpeg-encoder HEVC backend)
         env:
@@ -482,7 +486,11 @@ jobs:
           shared-key: agent-linux-arm64
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
+        # Idempotent: the lockfile-generation seed caches (#488) restore
+        # ~/.cargo/bin WITH the tool already present, and a plain
+        # `cargo install` hard-errors on an existing binary (rc.383's
+        # release run died on exactly this in all three build jobs).
+        run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
 
       - name: Build agent (release, full + vp9-444, no ffmpeg-encoder)
         env:
@@ -821,7 +829,13 @@ jobs:
           "$($wixBin.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Install cargo-wix
-        run: cargo install cargo-wix --locked
+        # Idempotent for the same reason as the cargo-deb steps: the seed
+        # caches restore the tool and a plain install errors on it.
+        shell: pwsh
+        run: |
+          if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
+            cargo install cargo-wix --locked
+          }
 
       - name: Build agent (release, full-hw + vp9-444 + system-context + ffmpeg-encoder)
         # `vp9-444` (without `-bindgen`) uses env-libvpx-sys's
