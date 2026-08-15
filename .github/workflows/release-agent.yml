@@ -35,11 +35,11 @@ on:
 
 permissions:
   contents: write
-  # For the "Refresh the cache seed" steps: `gh cache delete` needs
-  # actions:write. Deleting the flat seed between restore and save is what
-  # lets every green rehearsal actually refresh cache CONTENT — Swatinem's
-  # shared-key is immutable and skip-saves otherwise (2026-08-15 incident:
-  # an Aug-9 seed survived the whole P3e program).
+  # actions:write is for the `reseed` job's workflow_dispatch. (The #485
+  # "delete BEFORE restore" seed steps are gone: cache keys now carry a
+  # per-Cargo.lock suffix, so saves always land under a fresh key and
+  # restores prefix-fall-back to the newest generation — no absent-key
+  # window, no forced-cold rehearsals.)
   actions: write
 
 # P3e Phase 2: single-codegen-unit release artifacts. Set as WORKFLOW env
@@ -190,76 +190,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
+      - name: Restore cargo seed (lockfile-generation keys)
+        # Explicit actions/cache with OUR key scheme -- rust-cache cannot
+        # express "unique key + prefix restore + no env hash": with
+        # add-rust-environment-hash-key:false its `key:` input is folded
+        # into the dropped component (a no-op -- #482, re-proven by probe
+        # run 31907241610). Unique key per Cargo.lock => saves always
+        # land; prefix restore => never an absent-key window (the rc.382
+        # race); no env hash => no runner-image warm/cold lottery. Full
+        # story in .github/actions/seed-cache-restore. The paired save
+        # step is at the end of this job.
         continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-linux-Linux-x64" --repo "${{ github.repository }}" || true
-
-      - name: Cache cargo
-        # `continue-on-error: true` so a flaky cache *save* (which
-        # runs as a post-job step) can't sink an otherwise-green
-        # build. Symptom from agent-v0.1.53 attempt 1: every build
-        # step + smoke + artifact-upload succeeded but the post-job
-        # tar/zstd write returned non-zero → job marked failure →
-        # `Publish GitHub Release` skipped. The cache is an
-        # optimisation, not a correctness gate.
-        continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
         with:
-          workspaces: '. -> target'
           shared-key: agent-linux
-          # Tag-ref cache saves can never be restored by a future tag run
-          # (GH cache isolation: own ref or default branch only) — they
-          # were just piling ~0.5 GB of dead weight per tag against the
-          # repo's 10 GB budget. Only non-tag runs (workflow_dispatch
-          # rehearsals, which execute on master) save — seeding the cache
-          # every subsequent tag build restores.
-          save-if: ${{ github.ref_type != 'tag' }}
-          # cache-on-failure: a seed rehearsal that compiles everything but
-          # dies in a LATER step must still save its caches — 2026-07-28 a
-          # dispatched rehearsal built 20 min of agent+tunnel and then hit
-          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
-          # and every release until 07-30 ran fully cold (+~14 min each).
-          # Tag runs are unaffected (save-if above already gates them off).
-          cache-on-failure: true
-          # No env-hash in the key: rc.282 (run 30707448990) proved the
-          # windows-latest runner-image mix flips rust-cache's environment
-          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
-          # same lockfile) — warm/cold alternated with the image lottery,
-          # and toolchain bumps orphaned seeds the same way (07-23). With
-          # the toolchain pinned via dtolnay + the key's platform + the
-          # lockfile hash, the env hash only ever ADDED instability; a
-          # stale-toolchain restore just makes cargo rebuild what differs.
-          add-rust-environment-hash-key: false
-          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
-          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
-          # skip-save ("cache already exists"), so after any dependency-graph
-          # or profile change every tag build restores a stale seed and runs
-          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
-          # program; rc.378-380 built ~14 min against it while three green
-          # same-day rehearsals refreshed nothing). A `key:` input does NOT
-          # fix this — Swatinem IGNORES it when shared-key is set (proven on
-          # run 31903646429: the merge carrying `key:` still computed the
-          # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
-          # restore, so the restore MISSES and this action's post-job save
-          # lands unconditionally with this run's fresh content under the
-          # same stable key tag builds restore.
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -470,6 +414,18 @@ jobs:
             ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
 
+      - name: Save cargo seed (new lockfile generation)
+        # always(): preserves cache-on-failure semantics -- a rehearsal
+        # that builds and then dies later must still seed (the 07-28
+        # incident). Non-tag only: tag-ref saves are unrestorable dead
+        # weight. A same-lockfile twin save loses the reservation and
+        # warns -- harmless.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        with:
+          shared-key: agent-linux
+
   # ---------------------------------------------------------------------------
   # 1b. Linux aarch64 — the same .deb for arm64 hosts.
   #
@@ -510,49 +466,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
+      - name: Restore cargo seed (lockfile-generation keys)
+        # Explicit actions/cache with OUR key scheme -- rust-cache cannot
+        # express "unique key + prefix restore + no env hash": with
+        # add-rust-environment-hash-key:false its `key:` input is folded
+        # into the dropped component (a no-op -- #482, re-proven by probe
+        # run 31907241610). Unique key per Cargo.lock => saves always
+        # land; prefix restore => never an absent-key window (the rc.382
+        # race); no env hash => no runner-image warm/cold lottery. Full
+        # story in .github/actions/seed-cache-restore. The paired save
+        # step is at the end of this job.
         continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-linux-arm64-Linux-arm64" --repo "${{ github.repository }}" || true
-
-      - name: Cache cargo
-        continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
         with:
-          workspaces: '. -> target'
           shared-key: agent-linux-arm64
-          save-if: ${{ github.ref_type != 'tag' }}
-          cache-on-failure: true
-          add-rust-environment-hash-key: false
-          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
-          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
-          # skip-save ("cache already exists"), so after any dependency-graph
-          # or profile change every tag build restores a stale seed and runs
-          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
-          # program; rc.378-380 built ~14 min against it while three green
-          # same-day rehearsals refreshed nothing). A `key:` input does NOT
-          # fix this — Swatinem IGNORES it when shared-key is set (proven on
-          # run 31903646429: the merge carrying `key:` still computed the
-          # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
-          # restore, so the restore MISSES and this action's post-job save
-          # lands unconditionally with this run's fresh content under the
-          # same stable key tag builds restore.
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -631,6 +558,18 @@ jobs:
             ${{ steps.tar.outputs.artifact }}
             ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
+
+      - name: Save cargo seed (new lockfile generation)
+        # always(): preserves cache-on-failure semantics -- a rehearsal
+        # that builds and then dies later must still seed (the 07-28
+        # incident). Non-tag only: tag-ref saves are unrestorable dead
+        # weight. A same-lockfile twin save loses the reservation and
+        # warns -- harmless.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        with:
+          shared-key: agent-linux-arm64
 
   # ---------------------------------------------------------------------------
   # 2. Windows — MSI via cargo-wix. Unsigned unless WIN_CODESIGN_PFX_BASE64
@@ -857,74 +796,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
+      - name: Restore cargo seed (lockfile-generation keys)
+        # Explicit actions/cache with OUR key scheme -- rust-cache cannot
+        # express "unique key + prefix restore + no env hash": with
+        # add-rust-environment-hash-key:false its `key:` input is folded
+        # into the dropped component (a no-op -- #482, re-proven by probe
+        # run 31907241610). Unique key per Cargo.lock => saves always
+        # land; prefix restore => never an absent-key window (the rc.382
+        # race); no env hash => no runner-image warm/cold lottery. Full
+        # story in .github/actions/seed-cache-restore. The paired save
+        # step is at the end of this job.
         continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-windows-vp9-444-Windows_NT-x64" --repo "${{ github.repository }}" || true
-
-      - name: Cache cargo
-        # `continue-on-error: true` so a flaky cache *save* (which
-        # runs as a post-job step) can't sink an otherwise-green
-        # build. Symptom from agent-v0.1.53 attempt 1: every build
-        # step + smoke + artifact-upload succeeded but the post-job
-        # tar/zstd write returned non-zero → job marked failure →
-        # `Publish GitHub Release` skipped. The cache is an
-        # optimisation, not a correctness gate.
-        continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
         with:
-          workspaces: '. -> target'
           shared-key: agent-windows-vp9-444
-          # Tag-ref cache saves can never be restored by a future tag run
-          # (GH cache isolation: own ref or default branch only). Only
-          # non-tag runs (workflow_dispatch rehearsals on master) save —
-          # seeding the cache every subsequent tag build restores.
-          save-if: ${{ github.ref_type != 'tag' }}
-          # cache-on-failure: a seed rehearsal that compiles everything but
-          # dies in a LATER step must still save its caches — 2026-07-28 a
-          # dispatched rehearsal built 20 min of agent+tunnel and then hit
-          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
-          # and every release until 07-30 ran fully cold (+~14 min each).
-          # Tag runs are unaffected (save-if above already gates them off).
-          cache-on-failure: true
-          # No env-hash in the key: rc.282 (run 30707448990) proved the
-          # windows-latest runner-image mix flips rust-cache's environment
-          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
-          # same lockfile) — warm/cold alternated with the image lottery,
-          # and toolchain bumps orphaned seeds the same way (07-23). With
-          # the toolchain pinned via dtolnay + the key's platform + the
-          # lockfile hash, the env hash only ever ADDED instability; a
-          # stale-toolchain restore just makes cargo rebuild what differs.
-          add-rust-environment-hash-key: false
-          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
-          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
-          # skip-save ("cache already exists"), so after any dependency-graph
-          # or profile change every tag build restores a stale seed and runs
-          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
-          # program; rc.378-380 built ~14 min against it while three green
-          # same-day rehearsals refreshed nothing). A `key:` input does NOT
-          # fix this — Swatinem IGNORES it when shared-key is set (proven on
-          # run 31903646429: the merge carrying `key:` still computed the
-          # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
-          # restore, so the restore MISSES and this action's post-job save
-          # lands unconditionally with this run's fresh content under the
-          # same stable key tag builds restore.
 
       - name: Install WiX Toolset v3
         shell: pwsh
@@ -1293,6 +1178,18 @@ jobs:
             ${{ steps.locate_pm.outputs.artifact }}.sha256
           retention-days: 30
 
+      - name: Save cargo seed (new lockfile generation)
+        # always(): preserves cache-on-failure semantics -- a rehearsal
+        # that builds and then dies later must still seed (the 07-28
+        # incident). Non-tag only: tag-ref saves are unrestorable dead
+        # weight. A same-lockfile twin save loses the reservation and
+        # warns -- harmless.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        with:
+          shared-key: agent-windows-vp9-444
+
   # ---------------------------------------------------------------------------
   # 2b. Windows companion — the roomler-desktop EXE, built in PARALLEL with
   #     the MSI job. The crate deps on roomler-agent with DEFAULT features
@@ -1316,71 +1213,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
+      - name: Restore cargo seed (lockfile-generation keys)
+        # Explicit actions/cache with OUR key scheme -- rust-cache cannot
+        # express "unique key + prefix restore + no env hash": with
+        # add-rust-environment-hash-key:false its `key:` input is folded
+        # into the dropped component (a no-op -- #482, re-proven by probe
+        # run 31907241610). Unique key per Cargo.lock => saves always
+        # land; prefix restore => never an absent-key window (the rc.382
+        # race); no env hash => no runner-image warm/cold lottery. Full
+        # story in .github/actions/seed-cache-restore. The paired save
+        # step is at the end of this job.
         continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
-
-      - name: Cache cargo
-        # `continue-on-error: true` so a flaky cache save can't sink an
-        # otherwise-green build (same rationale as the sibling jobs).
-        # shared-key reuses installer-smoke's master-seeded cache — same
-        # rustc pin + lockfile → same derived key, and installer-smoke
-        # runs on master pushes so its cache IS restorable here (unlike
-        # anything saved on a tag ref). save-if: only non-tag runs
-        # (dispatch rehearsals on master) save, enriching that key with
-        # the Tauri artifacts this job compiles.
-        continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
         with:
-          workspaces: '. -> target'
           shared-key: installer-smoke-windows
-          save-if: ${{ github.ref_type != 'tag' }}
-          # cache-on-failure: a seed rehearsal that compiles everything but
-          # dies in a LATER step must still save its caches — 2026-07-28 a
-          # dispatched rehearsal built 20 min of agent+tunnel and then hit
-          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
-          # and every release until 07-30 ran fully cold (+~14 min each).
-          # Tag runs are unaffected (save-if above already gates them off).
-          cache-on-failure: true
-          # No env-hash in the key: rc.282 (run 30707448990) proved the
-          # windows-latest runner-image mix flips rust-cache's environment
-          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
-          # same lockfile) — warm/cold alternated with the image lottery,
-          # and toolchain bumps orphaned seeds the same way (07-23). With
-          # the toolchain pinned via dtolnay + the key's platform + the
-          # lockfile hash, the env hash only ever ADDED instability; a
-          # stale-toolchain restore just makes cargo rebuild what differs.
-          add-rust-environment-hash-key: false
-          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
-          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
-          # skip-save ("cache already exists"), so after any dependency-graph
-          # or profile change every tag build restores a stale seed and runs
-          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
-          # program; rc.378-380 built ~14 min against it while three green
-          # same-day rehearsals refreshed nothing). A `key:` input does NOT
-          # fix this — Swatinem IGNORES it when shared-key is set (proven on
-          # run 31903646429: the merge carrying `key:` still computed the
-          # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
-          # restore, so the restore MISSES and this action's post-job save
-          # lands unconditionally with this run's fresh content under the
-          # same stable key tag builds restore.
 
       # rc.18: the Tauri tray companion. Tray's Cargo.toml uses
       # `frontendDist: "../src/front"` pointing at static HTML/CSS/JS —
@@ -1469,6 +1315,18 @@ jobs:
             ${{ steps.locate_tray.outputs.artifact }}.sha256
           retention-days: 30
 
+      - name: Save cargo seed (new lockfile generation)
+        # always(): preserves cache-on-failure semantics -- a rehearsal
+        # that builds and then dies later must still seed (the 07-28
+        # incident). Non-tag only: tag-ref saves are unrestorable dead
+        # weight. A same-lockfile twin save loses the reservation and
+        # warns -- harmless.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        with:
+          shared-key: installer-smoke-windows
+
   # ---------------------------------------------------------------------------
   # 3. macOS — signed + notarised .pkg. Unsigned unless Apple secrets present.
   # ---------------------------------------------------------------------------
@@ -1496,74 +1354,20 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
+      - name: Restore cargo seed (lockfile-generation keys)
+        # Explicit actions/cache with OUR key scheme -- rust-cache cannot
+        # express "unique key + prefix restore + no env hash": with
+        # add-rust-environment-hash-key:false its `key:` input is folded
+        # into the dropped component (a no-op -- #482, re-proven by probe
+        # run 31907241610). Unique key per Cargo.lock => saves always
+        # land; prefix restore => never an absent-key window (the rc.382
+        # race); no env hash => no runner-image warm/cold lottery. Full
+        # story in .github/actions/seed-cache-restore. The paired save
+        # step is at the end of this job.
         continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-macos-Darwin-arm64" --repo "${{ github.repository }}" || true
-
-      - name: Cache cargo
-        # `continue-on-error: true` so a flaky cache *save* (which
-        # runs as a post-job step) can't sink an otherwise-green
-        # build. Symptom from agent-v0.1.53 attempt 1: every build
-        # step + smoke + artifact-upload succeeded but the post-job
-        # tar/zstd write returned non-zero → job marked failure →
-        # `Publish GitHub Release` skipped. The cache is an
-        # optimisation, not a correctness gate.
-        continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/seed-cache-restore
         with:
-          workspaces: '. -> target'
           shared-key: agent-macos
-          # Tag-ref cache saves can never be restored by a future tag run
-          # (GH cache isolation: own ref or default branch only). Only
-          # non-tag runs (workflow_dispatch rehearsals on master) save —
-          # seeding the cache every subsequent tag build restores.
-          save-if: ${{ github.ref_type != 'tag' }}
-          # cache-on-failure: a seed rehearsal that compiles everything but
-          # dies in a LATER step must still save its caches — 2026-07-28 a
-          # dispatched rehearsal built 20 min of agent+tunnel and then hit
-          # LGHT0368 in a mid-day wxs state; the failed job saved nothing
-          # and every release until 07-30 ran fully cold (+~14 min each).
-          # Tag runs are unaffected (save-if above already gates them off).
-          cache-on-failure: true
-          # No env-hash in the key: rc.282 (run 30707448990) proved the
-          # windows-latest runner-image mix flips rust-cache's environment
-          # hash run-to-run (0c34b334 vs e76361e6, same pinned toolchain,
-          # same lockfile) — warm/cold alternated with the image lottery,
-          # and toolchain bumps orphaned seeds the same way (07-23). With
-          # the toolchain pinned via dtolnay + the key's platform + the
-          # lockfile hash, the env hash only ever ADDED instability; a
-          # stale-toolchain restore just makes cargo rebuild what differs.
-          add-rust-environment-hash-key: false
-          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
-          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
-          # skip-save ("cache already exists"), so after any dependency-graph
-          # or profile change every tag build restores a stale seed and runs
-          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
-          # program; rc.378-380 built ~14 min against it while three green
-          # same-day rehearsals refreshed nothing). A `key:` input does NOT
-          # fix this — Swatinem IGNORES it when shared-key is set (proven on
-          # run 31903646429: the merge carrying `key:` still computed the
-          # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
-          # restore, so the restore MISSES and this action's post-job save
-          # lands unconditionally with this run's fresh content under the
-          # same stable key tag builds restore.
 
       - name: Install system deps
         # libvpx for the `vp9-444` feature; pkg-config for the
@@ -1798,6 +1602,18 @@ jobs:
             ${{ steps.pkg.outputs.artifact }}
             ${{ steps.pkg.outputs.artifact }}.sha256
           retention-days: 30
+
+      - name: Save cargo seed (new lockfile generation)
+        # always(): preserves cache-on-failure semantics -- a rehearsal
+        # that builds and then dies later must still seed (the 07-28
+        # incident). Non-tag only: tag-ref saves are unrestorable dead
+        # weight. A same-lockfile twin save loses the reservation and
+        # warns -- harmless.
+        if: always() && github.ref_type != 'tag'
+        continue-on-error: true
+        uses: ./.github/actions/seed-cache-save
+        with:
+          shared-key: agent-macos
 
   # ---------------------------------------------------------------------------
   # 4. Publish — only on tag push (or dispatch with publish_release=true).
