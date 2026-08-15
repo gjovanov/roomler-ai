@@ -111,7 +111,10 @@ jobs:
           # non-tag runs (dispatch rehearsals on master) save.
           save-if: ${{ github.ref_type != 'tag' }}
       - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
+        # Idempotent: the seed caches (#488) can restore ~/.cargo/bin with
+        # the tool present; a plain install hard-errors on it (rc.383's
+        # agent release died on exactly this).
+        run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
       - name: Build roomler-tunnel (release)
         run: cargo build -p roomler-tunnel --release
       - name: Strip binary
