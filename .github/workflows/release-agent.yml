@@ -953,20 +953,20 @@ jobs:
           # 36 -> 30 MB, keeping the same ~5 MB of headroom over the baseline
           # that the P4b guard had.
           # Baseline PINNED from the P3e Phase-2 rehearsal (run 31869144675,
-          # 2026-08-15): both flavours measured 20.3 MB (ffmpeg codec+format
-          # trim + codegen-units=1). A baseline left above the real value is
+          # 2026-08-15, lever-B rehearsal 31877551270): both flavours measured
+          # 13.13 MB (minimal vendored FFmpeg). A baseline left above the real value is
           # exactly the silent failure this guard exists to catch — it would
           # swallow a multi-MB regression as "within budget".
-          $p4bBaseline = 20.3
+          $p4bBaseline = 13.13
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
           Write-Host "::notice::baseline = $p4bBaseline MB; delta = $([math]::Round($deltaMB, 2)) MB"
-          if ($maxMsi -gt 25) {
-            Write-Host "::error::MSI exceeds the 25 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
+          if ($maxMsi -gt 18) {
+            Write-Host "::error::MSI exceeds the 18 MB hard ceiling ($([math]::Round($maxMsi, 2)) MB). Investigate unintended payload growth (unstripped FFmpeg, extra DLLs, debug info, or a full CLI binary back in the TunnelExe component)."
             exit 1
           } elseif ($deltaMB -gt 2) {
-            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the 25 MB ceiling). Re-baseline deliberately or investigate."
+            Write-Host "::warning::MSI is $([math]::Round($deltaMB, 2)) MB over the baseline (still under the 18 MB ceiling). Re-baseline deliberately or investigate."
           } else {
             Write-Host "::notice::MSI within the P4b size budget."
           }
