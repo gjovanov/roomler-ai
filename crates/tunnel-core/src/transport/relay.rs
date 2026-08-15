@@ -392,13 +392,42 @@ pub async fn allocate_turn_relay(
     password: String,
     realm: String,
 ) -> anyhow::Result<TurnRelayConn> {
+    allocate_turn_relay_from(turn_server, username, password, realm, None).await
+}
+
+/// [`allocate_turn_relay`] with an explicit underlay egress: `Some((ip,
+/// ifindex))` binds the TURN client socket to that source IP (and pins
+/// `IP_UNICAST_IF` to the interface when the index is known) instead of
+/// `UNSPECIFIED`. This is the corp-VPN rescue: on a host whose default
+/// route was captured by a full-tunnel VPN, an unbound underlay
+/// source-selects the VPN adapter and the allocate dies in the tunnel —
+/// while the overlay's direct socks, bound to the physical NIC, reach
+/// the SAME coturn host fine. Field 2026-08-15 CORPLAP-2: srflx `cone via
+/// 5.9.157.221:3478` from the bound direct sock, warm TURN/UDP allocate
+/// to 5.9.157.221 "all attempted candidates failed" from the unbound
+/// one — same machine, same minute.
+pub async fn allocate_turn_relay_from(
+    turn_server: SocketAddr,
+    username: String,
+    password: String,
+    realm: String,
+    egress: Option<(Ipv4Addr, Option<u32>)>,
+) -> anyhow::Result<TurnRelayConn> {
     use anyhow::Context as _;
 
     // The underlay socket the TURN *client* uses to reach coturn. quinn
     // never sees this — it sends/receives through the relayed conn.
-    let underlay_sock = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+    let bind_ip = egress.map(|(ip, _)| ip).unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let underlay_sock = tokio::net::UdpSocket::bind((bind_ip, 0))
         .await
-        .context("bind TURN client underlay socket")?;
+        .with_context(|| format!("bind TURN client underlay socket to {bind_ip}"))?;
+    // Source-IP binding alone is the rc.143 half; when the caller knows the
+    // interface, add the rc.144 `IP_UNICAST_IF` pin (Windows; no-op elsewhere)
+    // — same two-part recipe the direct socks use to escape a captured route.
+    #[cfg(feature = "overlay-l3")]
+    if let Some((_, Some(ifindex))) = egress {
+        crate::overlay::direct::force_egress_interface(&underlay_sock, ifindex);
+    }
     // VPN-bypass: pin the coturn underlay's egress to the physical uplink so
     // TURN traffic leaves the real NIC instead of a full-tunnel corp VPN's
     // captured default — pinned HERE, the only moment before the socket is
@@ -407,7 +436,9 @@ pub async fn allocate_turn_relay(
     // compiles; `force_egress_interface` is itself a no-op off Windows / the
     // gate is off unless `OVERLAY_VPN_BYPASS` + an uplink ifindex are set.
     #[cfg(feature = "overlay-l3")]
-    if let Some(ix) = crate::overlay::direct::vpn_bypass_ifindex() {
+    if egress.is_none()
+        && let Some(ix) = crate::overlay::direct::vpn_bypass_ifindex()
+    {
         crate::overlay::direct::force_egress_interface(&underlay_sock, ix);
         tracing::info!(ifindex = ix, %turn_server, "overlay: VPN-bypass — coturn underlay egress pinned to the physical uplink");
     }
@@ -654,6 +685,44 @@ pub async fn allocate_relay_from_ice_tiered(
                 }
                 Ok(Err(e)) => tracing::warn!(%server, %e, "UDP TURN allocate failed; trying next"),
                 Err(_) => tracing::warn!(%server, "UDP TURN allocate timed out; trying next"),
+            }
+            // Corp-VPN rescue: the unbound attempt source-selects a captured
+            // default route into the tunnel, where UDP dies — retry ONCE
+            // bound to the first non-VPN uplink (the deny-listed LAN gather
+            // the direct socks bind), which escapes the capture on a
+            // strong-host stack. Strictly additive: runs only after the
+            // unbound attempt already failed, costs ≤ one more
+            // UDP_ALLOC_TIMEOUT, and hosts without overlay-l3 (or with an
+            // empty gather, e.g. a WSL-mirrored guest) skip it entirely.
+            #[cfg(feature = "overlay-l3")]
+            if let Some((ip, ifindex)) = crate::overlay::direct::first_non_vpn_uplink() {
+                tracing::info!(
+                    %server, %ip, ?ifindex,
+                    "UDP TURN allocate: retrying pinned to the physical uplink (corp-VPN rescue)"
+                );
+                match tokio::time::timeout(
+                    UDP_ALLOC_TIMEOUT,
+                    allocate_turn_relay_from(
+                        resolved,
+                        username.to_string(),
+                        credential.to_string(),
+                        DEFAULT_TURN_REALM.to_string(),
+                        Some((ip, ifindex)),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(relay)) => {
+                        tracing::info!(%server, %ip, "TURN relay allocated (tier2-udp, pinned egress)");
+                        return Ok(relay);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(%server, %ip, %e, "pinned UDP TURN allocate failed; trying next")
+                    }
+                    Err(_) => {
+                        tracing::warn!(%server, %ip, "pinned UDP TURN allocate timed out; trying next")
+                    }
+                }
             }
         }
     }
@@ -1106,6 +1175,30 @@ mod turn_tests {
         .await
         .expect("in-process turn server");
         (server, turn_addr)
+    }
+
+    /// Corp-VPN rescue contract: an explicit egress binds the TURN client
+    /// underlay to that source (here loopback, so the in-process server
+    /// sees the client from 127.0.0.1) and the allocation still completes
+    /// end-to-end. On a captured-default host the same mechanism swaps the
+    /// VPN-selected source for the physical NIC's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pinned_egress_allocates_from_the_requested_source() {
+        let (_server, turn_addr) = loopback_turn_server().await;
+        let relay = allocate_turn_relay_from(
+            turn_addr,
+            USER.into(),
+            PASS.into(),
+            REALM.into(),
+            Some((Ipv4Addr::LOCALHOST, None)),
+        )
+        .await
+        .expect("pinned TURN allocate");
+        let relayed = relay.local_addr().expect("relayed addr");
+        assert!(
+            relayed.ip().is_loopback(),
+            "allocation completed via the pinned source: {relayed}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
