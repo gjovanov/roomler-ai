@@ -261,6 +261,11 @@ pub struct RelayCoordinator {
     /// `pending`/`allocated` so [`forget`](Self::forget) prunes it and
     /// [`is_tracking`](Self::is_tracking) sees it.
     dialing: HashMap<ObjectId, PeerConfig>,
+    /// W6 phase-2 — the coturn worker IP set (full A-record resolve of the
+    /// STUN hosts, fed once by the runtime after the first netmap). The
+    /// single-relay dialer uses it to positively identify the anchor's
+    /// relayed address `R`; empty = resolution unavailable → legacy pick.
+    coturn_ips: Vec<IpAddr>,
     /// Phase D (DERP) — both-UDP-blocked links awaiting their symmetric DERP
     /// carrier. We hold NO coturn allocation and make NO server round-trip (both
     /// ends dial the `/derp` WS); each becomes a [`DerpConn`] carrier built off
@@ -387,6 +392,7 @@ impl RelayCoordinator {
             allocated: HashMap::new(),
             advertised: HashMap::new(),
             lan_endpoints,
+            coturn_ips: Vec::new(),
             my_public_key,
             // rc.276 — forced-TLS vetoes single-relay locally too (paired
             // with the join-time `supports_relay_single` veto so both ends'
@@ -1165,20 +1171,22 @@ impl RelayCoordinator {
         Some(link)
     }
 
+    /// W6 phase-2 — feed the coturn worker IP set (runtime resolves it once
+    /// after the first netmap; see `resolve_stun_worker_ips`).
+    pub fn set_coturn_ips(&mut self, ips: Vec<IpAddr>) {
+        self.coturn_ips = ips;
+    }
+
     /// Phase D DIALER build: we hold NO allocation. Bind a fresh raw socket,
     /// wrap it as a [`UdpRelayConn`](crate::transport::relay::UdpRelayConn), and
-    /// dial the anchor's advertised relay `R` — its single public, non-LAN
-    /// endpoint (srflx lives in a separate bucket, so the public entry in
-    /// `endpoints` IS `R`). `install_ready` then sends the `\x00` that opens our
-    /// NAT toward `R` and QUIC-connects (`am_server = false` by pubkey). `None`
-    /// until the anchor advertises `R` (retry next netmap).
+    /// dial the anchor's advertised relay `R` — positively identified as a
+    /// public endpoint ON A COTURN WORKER (see
+    /// [`pick_anchor_relay_endpoint`]). `install_ready` then sends the `\x00`
+    /// that opens our NAT toward `R` and QUIC-connects (`am_server = false`
+    /// by pubkey). `None` until the anchor advertises `R` (retry next netmap).
     fn try_build_dialer(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let peer = self.dialing.get(node_id)?;
-        let r: SocketAddr = peer
-            .endpoints
-            .iter()
-            .filter_map(|e| e.parse().ok())
-            .find(|s: &SocketAddr| !is_lan_addr(s.ip()))?;
+        let r: SocketAddr = pick_anchor_relay_endpoint(&peer.endpoints, &self.coturn_ips, node_id)?;
         // Fresh raw socket, NO TURN allocation. Bind via std (sync) then adopt
         // into the tokio reactor without awaiting, so this stays on the sync
         // build path (`maybe_complete` is not async).
@@ -1337,6 +1345,51 @@ async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
     pick
 }
 
+/// W6 phase-2 VERDICT fix — positively identify the anchor's relayed
+/// address `R` among its advertised endpoints. The old pick ("first
+/// public, non-LAN entry") assumed the LAN + srflx buckets kept
+/// `endpoints` down to `[LAN…, R]` — but a NAT-less anchor's (cluster
+/// hosts) "LAN" candidates ARE public host addresses, so the dialer
+/// QUIC-connected at the anchor's PLANE socket where no QUIC server
+/// listens. Field 2026-08-15, rc.365 perm-instrumentation: every failing
+/// dial showed `dst=<host-ip>:43648` (the peer's DIRECT sock, not a
+/// coturn allocation) with `perm=0ms rx=0` on both sides; the raw
+/// fallback only "worked" because raw WG at a host's direct sock is
+/// still valid WG — an accidental direct path wearing a relay label.
+///
+/// With the coturn worker IPs known, `R` must be ON one. An EMPTY
+/// `coturn_ips` (resolution unavailable) falls back to the legacy pick —
+/// better a possibly-wrong dial than no relay tier at all.
+fn pick_anchor_relay_endpoint(
+    endpoints: &[String],
+    coturn_ips: &[IpAddr],
+    node_id: &ObjectId,
+) -> Option<SocketAddr> {
+    let parsed: Vec<SocketAddr> = endpoints
+        .iter()
+        .filter_map(|e| e.parse().ok())
+        .filter(|s: &SocketAddr| !is_lan_addr(s.ip()))
+        .collect();
+    if coturn_ips.is_empty() {
+        return parsed.first().copied();
+    }
+    let r = parsed
+        .iter()
+        .find(|s| coturn_ips.contains(&s.ip()))
+        .copied();
+    if r.is_none() && !parsed.is_empty() {
+        // The anchor's relay advert is missing (rejoin wiped it) or stale —
+        // WITHHOLD rather than dial its host address as if it were coturn.
+        debug!(
+            peer = %node_id,
+            rejected = ?parsed,
+            "overlay relay: dialer — peer advertises public endpoints but none on a \
+             known coturn worker; withholding until its relay advert lands"
+        );
+    }
+    r
+}
+
 /// W6 phase-2 — the dialer's OTHER public srflx addresses (distinct IPs,
 /// `primary` excluded, LAN skipped, capped at 3) the anchor must ALSO open
 /// coturn permissions for. Permissions are IP-scoped, so one entry per IP
@@ -1392,6 +1445,42 @@ mod tests {
         assert_eq!(
             extra_srflx_permission_targets(&many, "198.51.100.1".parse().unwrap()).len(),
             3
+        );
+    }
+
+    /// W6 phase-2 VERDICT lock — the dialer must dial the anchor's COTURN
+    /// endpoint, never its public HOST address: a NAT-less anchor (cluster
+    /// host) advertises its own public direct sock among `endpoints`, and
+    /// dialing that was the rx=0 QUIC rendezvous bug (perm fine, nobody
+    /// listening). Missing relay advert ⇒ WITHHOLD, not guess; unresolved
+    /// worker set ⇒ legacy first-public pick.
+    #[test]
+    fn dialer_picks_r_on_a_coturn_worker_never_the_anchors_host_address() {
+        let nid = ObjectId::new();
+        let coturn: Vec<IpAddr> = vec![
+            "5.9.157.221".parse().unwrap(),
+            "94.130.141.74".parse().unwrap(),
+        ];
+        // The field shape: host public address FIRST, real R after.
+        let eps = vec![
+            "192.168.68.1:43648".to_string(),  // LAN — skipped
+            "94.130.141.98:43648".to_string(), // the anchor's HOST addr — NOT R
+            "5.9.157.221:11885".to_string(),   // the coturn allocation — R
+        ];
+        assert_eq!(
+            pick_anchor_relay_endpoint(&eps, &coturn, &nid),
+            Some("5.9.157.221:11885".parse().unwrap())
+        );
+
+        // No entry on a worker ⇒ withhold (retry next netmap).
+        let hostonly = vec!["94.130.141.98:43648".to_string()];
+        assert_eq!(pick_anchor_relay_endpoint(&hostonly, &coturn, &nid), None);
+
+        // Worker set unresolved ⇒ legacy first-public pick (never brick the
+        // relay tier on a DNS failure).
+        assert_eq!(
+            pick_anchor_relay_endpoint(&hostonly, &[], &nid),
+            Some("94.130.141.98:43648".parse().unwrap())
         );
     }
 
