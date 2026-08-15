@@ -393,6 +393,17 @@ jobs:
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
 
+      # Distro-agnostic path for hosts with no dpkg/apt — see
+      # docs/linux-self-update.md. Free here: the payload is already staged
+      # for cargo-deb, so this is a tar over the same tree.
+      - name: Stage the universal tarball
+        id: tar
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          scripts/stage-linux-tarball.sh "$version" x86_64-unknown-linux-gnu
+          echo "artifact=roomler-agent-${version}-x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -400,6 +411,8 @@ jobs:
           path: |
             ${{ steps.pack.outputs.artifact }}
             ${{ steps.pack.outputs.artifact }}.sha256
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
 
   # ---------------------------------------------------------------------------
@@ -509,6 +522,16 @@ jobs:
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
           echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
 
+      # Same universal path as the x86_64 lane. This is the one that unblocks
+      # the Fedora Asahi field host: aarch64 AND no dpkg.
+      - name: Stage the universal tarball
+        id: tar
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          scripts/stage-linux-tarball.sh "$version" aarch64-unknown-linux-gnu
+          echo "artifact=roomler-agent-${version}-aarch64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -516,6 +539,8 @@ jobs:
           path: |
             ${{ steps.pack.outputs.artifact }}
             ${{ steps.pack.outputs.artifact }}.sha256
+            ${{ steps.tar.outputs.artifact }}
+            ${{ steps.tar.outputs.artifact }}.sha256
           retention-days: 30
 
   # ---------------------------------------------------------------------------
@@ -1602,7 +1627,10 @@ jobs:
           # `windows-msi` carries the two agent MSIs; `windows-companions`
           # carries the desktop EXE; flatten is extension-based
           # so both artifact dirs (+ all .sha256 files) land unchanged.
-          find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.exe' -o -name '*.sha256' \) \
+          # `.tar.gz` is the universal Linux installer (docs/linux-self-update.md);
+          # it must be listed here or the artifact is silently dropped from the
+          # Release and every non-Debian host keeps skipping its updates.
+          find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.sha256' \) \
             -exec mv {} release/ \;
           ls -la release/
 

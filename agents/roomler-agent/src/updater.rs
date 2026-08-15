@@ -445,16 +445,81 @@ pub fn pick_asset_for_unix(assets: &[GithubAsset]) -> Option<&GithubAsset> {
     } else {
         &[]
     };
-    for a in assets {
-        let lower = a.name.to_lowercase();
-        if linux && lower.ends_with(".deb") && arch_tokens.iter().any(|t| lower.contains(t)) {
-            return Some(a);
-        }
-        if mac && lower.ends_with(".pkg") {
-            return Some(a);
-        }
+    if mac {
+        return assets
+            .iter()
+            .find(|a| a.name.to_lowercase().ends_with(".pkg"));
     }
-    None
+    if !linux {
+        return None;
+    }
+    pick_linux_asset(assets, arch_tokens, host_has_debian_tooling())
+}
+
+/// Is there anything on this host that can install a `.deb`?
+///
+/// Probes for the TOOL rather than reading `/etc/os-release`, because the
+/// question that decides the download is "can the install actually run",
+/// and a distro ID is only a proxy for it (a Debian derivative with dpkg
+/// removed, or a Fedora box with dpkg added, both answer correctly here).
+#[cfg(any(not(target_os = "windows"), test))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn host_has_debian_tooling() -> bool {
+    ["dpkg", "apt-get"].iter().any(|bin| {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+            .unwrap_or(false)
+    })
+}
+
+/// Choose the Linux asset: the right ARCH always, and the format this host
+/// can actually install.
+///
+/// A `.deb` is preferred where dpkg/apt exist so the distro's package
+/// manager stays the source of truth; everywhere else the self-contained
+/// tarball is the only installable form. Falling back to the tarball when
+/// a Debian host's `.deb` is missing keeps an absent artifact from becoming
+/// a dead end. See `docs/linux-self-update.md`.
+#[cfg(any(not(target_os = "windows"), test))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn pick_linux_asset<'a>(
+    assets: &'a [GithubAsset],
+    arch_tokens: &[&str],
+    debian_tooling: bool,
+) -> Option<&'a GithubAsset> {
+    let for_arch = |suffix: &str| {
+        assets.iter().find(|a| {
+            let lower = a.name.to_lowercase();
+            lower.ends_with(suffix) && arch_tokens.iter().any(|t| lower.contains(t))
+        })
+    };
+    let deb = for_arch(".deb");
+    let tar = for_arch(".tar.gz");
+    let picked = if debian_tooling {
+        deb.or(tar)
+    } else {
+        // No dpkg/apt: a .deb here would download and then fail to install,
+        // which is how `Update all` looked like a silent no-op on a Fedora
+        // host (2026-08-15).
+        tar
+    };
+    match picked {
+        Some(a) => tracing::debug!(
+            asset = %a.name,
+            debian_tooling,
+            deb_available = deb.is_some(),
+            tar_available = tar.is_some(),
+            "update: picked Linux asset"
+        ),
+        None => tracing::warn!(
+            debian_tooling,
+            deb_available = deb.is_some(),
+            tar_available = tar.is_some(),
+            "update: no installable Linux asset for this host — \
+             a .deb needs dpkg/apt, otherwise a .tar.gz is required"
+        ),
+    }
+    picked
 }
 
 /// Fetch the list of releases. Uses the roomler-ai backend proxy by
@@ -1140,6 +1205,155 @@ fn linux_install_candidates(euid: u32, path: &str) -> Vec<(&'static str, Vec<Str
 /// Every candidate failing is a hard `Err`, so `run_periodic`'s existing
 /// "installer spawn failed; will retry next cycle" branch keeps the
 /// daemon ALIVE rather than exiting into a pointless restart.
+/// The payload members a tarball MUST carry, relative to its prefix dir.
+/// Asserted before anything installed is touched — a truncated download that
+/// cleared the size floor must not half-install a host.
+#[cfg(target_os = "linux")]
+const TARBALL_REQUIRED: &[&str] = &["usr/bin/roomlerd", "usr/bin/roomler"];
+
+/// Units ship in the tarball but are only written when ABSENT. An upgrade
+/// must never revert a unit the operator edited — the field host carries a
+/// hand-written unit with `ROOMLER_AGENT_VIRTUAL_DESKTOP=1`, and silently
+/// reverting that would be a data-loss-class bug. A package manager does not
+/// clobber modified conffiles either.
+#[cfg(target_os = "linux")]
+const TARBALL_INSTALL_IF_ABSENT: &[&str] = &[
+    "usr/lib/systemd/system/roomlerd.service",
+    "usr/lib/systemd/user/roomler.service",
+    "usr/share/doc/roomler-agent/README.Debian",
+];
+
+/// Install the universal tarball — the path for hosts with no dpkg/apt.
+///
+/// Extract to a staging dir, verify the payload, then move each file into
+/// place. Replacing a RUNNING executable is safe on Linux when done by
+/// rename-over: the running process keeps its inode and only new execs see
+/// the new file. That is what dpkg does, and why the .deb path has always
+/// been able to replace a live `/usr/bin/roomlerd`.
+///
+/// Returns a pid to match `run_linux_install_candidates`' contract; the work
+/// is synchronous, so it reports our own.
+#[cfg(target_os = "linux")]
+fn install_tarball_linux(euid: u32, tarball: &std::path::Path) -> Result<u32> {
+    use std::path::Path;
+
+    if euid != 0 {
+        // Unlike the .deb path there is no pkexec/sudo helper to delegate to:
+        // extracting into /usr needs the privilege directly. Say so plainly
+        // rather than failing deep inside a copy.
+        bail!(
+            "the tarball install needs root (euid {euid}); run the agent as a \
+             system service, or install {} manually",
+            tarball.display()
+        );
+    }
+
+    let stage = tarball.with_extension("stage");
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).context("creating the staging dir")?;
+
+    let st = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball)
+        .arg("-C")
+        .arg(&stage)
+        .status()
+        .context("spawning tar (is it installed?)")?;
+    if !st.success() {
+        bail!(
+            "tar exited {:?} extracting {}",
+            st.code(),
+            tarball.display()
+        );
+    }
+
+    // The archive carries a single versioned prefix dir.
+    let prefix = std::fs::read_dir(&stage)
+        .context("reading the staging dir")?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .with_context(|| format!("{} contained no payload dir", tarball.display()))?;
+
+    for rel in TARBALL_REQUIRED {
+        let src = prefix.join(rel);
+        if !src.is_file() {
+            bail!(
+                "tarball is missing {rel} — refusing to install a partial payload \
+                 from {}",
+                tarball.display()
+            );
+        }
+    }
+
+    let place = |rel: &str, only_if_absent: bool| -> Result<bool> {
+        let src = prefix.join(rel);
+        if !src.is_file() {
+            return Ok(false);
+        }
+        let dst = Path::new("/").join(rel);
+        if only_if_absent && dst.exists() {
+            tracing::info!(path = %dst.display(), "update: keeping the existing file");
+            return Ok(false);
+        }
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // Stage beside the target so the rename is same-filesystem (atomic),
+        // then swap. Copy-then-rename, never write-in-place: a partial write
+        // over a live binary would brick the host.
+        let tmp = dst.with_extension("new");
+        std::fs::copy(&src, &tmp).with_context(|| format!("copying {rel}"))?;
+        let mode = std::fs::metadata(&src)?.permissions();
+        std::fs::set_permissions(&tmp, mode).with_context(|| format!("chmod {rel}"))?;
+        // Keep the outgoing binary for the rollback path.
+        if dst.exists() && rel.starts_with("usr/bin/") {
+            let _ = std::fs::rename(&dst, dst.with_extension("prev"));
+        }
+        std::fs::rename(&tmp, &dst).with_context(|| format!("installing {rel}"))?;
+        Ok(true)
+    };
+
+    let mut installed = 0usize;
+    for rel in TARBALL_REQUIRED {
+        if place(rel, false)? {
+            installed += 1;
+        }
+    }
+    // Bundled libs are discovered, not enumerated: the set differs per arch
+    // (FFmpeg + libvpx on x86_64, libvpx alone on aarch64) and shrinks as
+    // linkage is trimmed.
+    let libdir = prefix.join("usr/lib/roomler-agent");
+    if libdir.is_dir() {
+        for entry in std::fs::read_dir(&libdir).context("reading the bundled libs")? {
+            let entry = entry?;
+            if entry.path().is_file() {
+                let rel = format!(
+                    "usr/lib/roomler-agent/{}",
+                    entry.file_name().to_string_lossy()
+                );
+                if place(&rel, false)? {
+                    installed += 1;
+                }
+            }
+        }
+    }
+    for rel in TARBALL_INSTALL_IF_ABSENT {
+        if place(rel, true)? {
+            installed += 1;
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&stage);
+    tracing::info!(
+        installed,
+        tarball = %tarball.display(),
+        "update install: tarball installed"
+    );
+    Ok(std::process::id())
+}
+
 #[cfg(target_os = "linux")]
 fn run_linux_install_candidates(euid: u32, path: &str) -> Result<u32> {
     let mut attempts: Vec<String> = Vec::new();
@@ -1188,7 +1402,11 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         let path_str = installer_path.to_string_lossy().into_owned();
         // SAFETY: `geteuid` is always-succeeding and takes no arguments.
         let euid = unsafe { libc::geteuid() };
-        run_linux_install_candidates(euid, &path_str)
+        if path_str.ends_with(".tar.gz") {
+            install_tarball_linux(euid, installer_path)
+        } else {
+            run_linux_install_candidates(euid, &path_str)
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -1840,6 +2058,24 @@ mod tests {
                 size: 2346,
                 digest: None,
             },
+            // Both Linux FORMATS too. `pick_asset_for_platform` consults the
+            // host for dpkg/apt, so a .deb-only fixture makes this test pass
+            // on Debian CI and fail on a Fedora box — an environment-dependent
+            // test, which is how the arch assumption above hid for so long.
+            // Carrying both keeps the assertion about the PLATFORM, not about
+            // whatever package manager the runner happens to have.
+            GithubAsset {
+                name: "roomler-agent-0.1.36-x86_64-unknown-linux-gnu.tar.gz".into(),
+                browser_download_url: "https://example.invalid/foo.tgz".into(),
+                size: 2347,
+                digest: None,
+            },
+            GithubAsset {
+                name: "roomler-agent-0.1.36-aarch64-unknown-linux-gnu.tar.gz".into(),
+                browser_download_url: "https://example.invalid/foo-arm64.tgz".into(),
+                size: 2348,
+                digest: None,
+            },
             GithubAsset {
                 name: "roomler-agent-0.1.36-x86_64-apple-darwin.pkg".into(),
                 browser_download_url: "https://example.invalid/foo.pkg".into(),
@@ -1854,7 +2090,12 @@ mod tests {
         assert!(name.ends_with(".msi"));
         #[cfg(target_os = "linux")]
         {
-            assert!(name.ends_with(".deb"));
+            // Either Linux format is correct — which one depends on whether
+            // THIS host can run dpkg, which is not what this test is about.
+            assert!(
+                name.ends_with(".deb") || name.ends_with(".tar.gz"),
+                "linux host took {name}"
+            );
             // …and the one built for THIS arch, never the sibling.
             #[cfg(target_arch = "x86_64")]
             assert!(!name.contains("aarch64"), "x86_64 host picked {name}");
@@ -1989,13 +2230,19 @@ mod tests {
             size: 1,
             digest: None,
         };
-        // arm64 deliberately FIRST, so a naive picker would take it.
+        // arm64 deliberately FIRST, so a naive picker would take it. Both
+        // FORMATS are present so the fixture is installable whether or not
+        // this host has dpkg — `pick_asset_for_unix` probes for it, and a
+        // .deb-only fixture would make the test's outcome depend on the
+        // runner's distro instead of on the arch logic under test.
         let assets = vec![
             mk("roomler-agent-0.3.0-rc.366-aarch64-unknown-linux-gnu.deb"),
+            mk("roomler-agent-0.3.0-rc.366-aarch64-unknown-linux-gnu.tar.gz"),
             mk("roomler-agent-0.3.0-rc.366-x86_64-unknown-linux-gnu.deb"),
+            mk("roomler-agent-0.3.0-rc.366-x86_64-unknown-linux-gnu.tar.gz"),
         ];
         let name = &pick_asset_for_unix(&assets)
-            .expect("a Linux deb must match")
+            .expect("a Linux asset must match")
             .name;
         #[cfg(target_arch = "x86_64")]
         assert!(name.contains("x86_64"), "x86_64 agent took {name}");
@@ -2017,6 +2264,84 @@ mod tests {
             digest: None,
         }];
         assert!(pick_asset_for_unix(&assets).is_none());
+    }
+
+    /// The format preference matrix. `.deb` where dpkg/apt exist so the
+    /// distro's package manager stays the source of truth; the tarball
+    /// everywhere else, because a .deb there downloads and then fails to
+    /// install — exactly how `Update all` looked like a silent no-op on the
+    /// Fedora field host.
+    #[test]
+    fn pick_linux_asset_prefers_the_installable_format() {
+        let mk = |name: &str| GithubAsset {
+            name: name.into(),
+            browser_download_url: "https://example.invalid/x".into(),
+            size: 1,
+            digest: None,
+        };
+        let both = vec![
+            mk("roomler-agent-0.3.0-x86_64-unknown-linux-gnu.deb"),
+            mk("roomler-agent-0.3.0-x86_64-unknown-linux-gnu.tar.gz"),
+        ];
+        let x86 = &["x86_64", "amd64"][..];
+
+        let debian = pick_linux_asset(&both, x86, true).expect("deb host picks something");
+        assert!(
+            debian.name.ends_with(".deb"),
+            "debian host took {}",
+            debian.name
+        );
+
+        let other = pick_linux_asset(&both, x86, false).expect("non-deb host picks something");
+        assert!(
+            other.name.ends_with(".tar.gz"),
+            "fedora-like host took {}",
+            other.name
+        );
+
+        // A Debian host whose .deb is missing still updates via the tarball
+        // rather than treating an absent artifact as a dead end.
+        let tar_only = vec![mk("roomler-agent-0.3.0-x86_64-unknown-linux-gnu.tar.gz")];
+        assert!(
+            pick_linux_asset(&tar_only, x86, true)
+                .expect("falls back")
+                .name
+                .ends_with(".tar.gz")
+        );
+
+        // …but a host with no dpkg and only a .deb published must SKIP, not
+        // download something it cannot install.
+        let deb_only = vec![mk("roomler-agent-0.3.0-x86_64-unknown-linux-gnu.deb")];
+        assert!(pick_linux_asset(&deb_only, x86, false).is_none());
+    }
+
+    /// Format preference must never override architecture: a tarball for the
+    /// wrong arch is as unusable as a .deb for the wrong arch.
+    #[test]
+    fn pick_linux_asset_never_crosses_arch_for_either_format() {
+        let mk = |name: &str| GithubAsset {
+            name: name.into(),
+            browser_download_url: "https://example.invalid/x".into(),
+            size: 1,
+            digest: None,
+        };
+        // Wrong arch listed FIRST for both formats.
+        let assets = vec![
+            mk("roomler-agent-0.3.0-aarch64-unknown-linux-gnu.tar.gz"),
+            mk("roomler-agent-0.3.0-aarch64-unknown-linux-gnu.deb"),
+            mk("roomler-agent-0.3.0-x86_64-unknown-linux-gnu.tar.gz"),
+            mk("roomler-agent-0.3.0-x86_64-unknown-linux-gnu.deb"),
+        ];
+        let x86 = &["x86_64", "amd64"][..];
+        for tooling in [true, false] {
+            let got = pick_linux_asset(&assets, x86, tooling).expect("a pick");
+            assert!(got.name.contains("x86_64"), "x86_64 host took {}", got.name);
+        }
+        let arm = &["aarch64", "arm64"][..];
+        for tooling in [true, false] {
+            let got = pick_linux_asset(&assets, arm, tooling).expect("a pick");
+            assert!(got.name.contains("aarch64"), "arm64 host took {}", got.name);
+        }
     }
 
     #[test]
