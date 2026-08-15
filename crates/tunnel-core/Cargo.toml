@@ -12,7 +12,9 @@ path = "src/lib.rs"
 # Shared protocol types (rc:tunnel.* will land in remote_control's
 # ClientMsg/ServerMsg enum in T2; tunnel-core re-exports the subset
 # it cares about so callers have one import).
-roomler-ai-remote-control = { path = "../remote_control" }
+# default-features = false drops the `server` half (Mongo audit DAO + Hub) —
+# this crate only needs the wire/model/permission surface (P3e Phase 3).
+roomler-ai-remote-control = { path = "../remote_control", default-features = false }
 # The LocalAPI protocol, re-exported from lib.rs as `tunnel_core::localapi`
 # (P3e lever E — it lives in a leaf crate so thin clients can speak it without
 # compiling this crate's data plane).
