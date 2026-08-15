@@ -18,6 +18,11 @@ path = "src/main.rs"
 
 [dependencies]
 
+[target.'cfg(unix)'.dependencies]
+# signal()/SIG_IGN/SIG_DFL for the Ctrl-C wrapper convention (parent ignores,
+# child resets in pre_exec). Ubiquitous, no build cost.
+libc = "0.2"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # SetConsoleCtrlHandler only. Bindings-only crate, already compiled by the
 # agent in every Windows build, so this costs no extra build time.

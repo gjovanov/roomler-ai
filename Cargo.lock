@@ -7493,6 +7493,7 @@ dependencies = [
 name = "roomler-cli-shim"
 version = "0.3.0-rc.367"
 dependencies = [
+ "libc",
  "windows-sys 0.59.0",
 ]
 
