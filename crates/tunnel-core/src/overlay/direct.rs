@@ -1184,6 +1184,41 @@ pub async fn resolve_stun_targets(stun_urls: &[String], exclude: &[Ipv4Addr]) ->
     out
 }
 
+/// W6 phase-2 — EVERY distinct coturn worker IP behind the STUN urls: the
+/// full A-record set, uncapped (unlike [`resolve_stun_targets`]'s ≤3
+/// probing vantages, and with no self-exclusion — a co-located worker is
+/// still a valid relay for OTHER pairs). The single-relay DIALER uses it
+/// to positively identify the anchor's relayed address `R` among
+/// advertised endpoints; an incomplete set would withhold legitimate
+/// relays, so completeness beats spread here.
+pub async fn resolve_stun_worker_ips(stun_urls: &[String]) -> Vec<std::net::IpAddr> {
+    let mut out: Vec<std::net::IpAddr> = Vec::new();
+    for url in stun_urls {
+        if let Some(sa) = parse_stun_url(url) {
+            if !out.contains(&sa.ip()) {
+                out.push(sa.ip());
+            }
+            continue;
+        }
+        let s = url.trim();
+        let s = s
+            .strip_prefix("stun:")
+            .or_else(|| s.strip_prefix("stuns:"))
+            .or_else(|| s.strip_prefix("turn:"))
+            .or_else(|| s.strip_prefix("turns:"))
+            .unwrap_or(s);
+        let hostport = s.split(['?', '#']).next().unwrap_or(s);
+        if let Ok(addrs) = lookup_host(hostport).await {
+            for a in addrs.filter(SocketAddr::is_ipv4) {
+                if !out.contains(&a.ip()) {
+                    out.push(a.ip());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A1 — classify a NAT from ≥2 observed mappings of ONE local socket toward
 /// distinct vantages: ANY pairwise difference ⇒ endpoint-dependent mapping
 /// (`"symmetric"` — peers cannot punch the advertised port); all equal ⇒
