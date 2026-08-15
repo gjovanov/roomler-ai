@@ -138,6 +138,11 @@ enum RelayStrategy {
 }
 
 /// A peer link whose carrier is ready to install.
+///
+/// `Clone` (W6 phase 3): the raw-first QUIC upgrade installs the raw
+/// carrier immediately and hands a clone to the background rendezvous —
+/// every field is a handle/value (`Arc`s share the same conn/carrier).
+#[derive(Clone)]
 pub struct ReadyLink {
     pub node_id: ObjectId,
     pub public_key: [u8; 32],
