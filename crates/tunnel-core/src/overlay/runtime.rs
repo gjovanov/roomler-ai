@@ -3048,9 +3048,6 @@ impl OverlayRuntime {
                                         warn!("overlay warm relay: grant carried no UDP turn urls; skipping");
                                     } else {
                                         let expiry = super::warm_relay::ephemeral_cred_expiry_s(&user);
-                                        let probe_dst = srflx_advertised
-                                            .first()
-                                            .and_then(|e| e.parse().ok());
                                         let tx = warm_tx.clone();
                                         tokio::spawn(async move {
                                             let msg = match crate::transport::relay::allocate_relay_from_ice_tiered(
@@ -3066,7 +3063,6 @@ impl OverlayRuntime {
                                                             conn,
                                                             relayed,
                                                             cred_expiry_epoch_s: expiry,
-                                                            probe_dst,
                                                         },
                                                         Err(e) => super::warm_relay::WarmMsg::EstablishFailed(
                                                             format!("relayed addr unreadable: {e}"),
