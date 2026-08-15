@@ -35,11 +35,11 @@ on:
 
 permissions:
   contents: write
-  # For the "Refresh the cache seed" steps: `gh cache delete` needs
-  # actions:write. Deleting the flat seed between restore and save is what
-  # lets every green rehearsal actually refresh cache CONTENT — Swatinem's
-  # shared-key is immutable and skip-saves otherwise (2026-08-15 incident:
-  # an Aug-9 seed survived the whole P3e program).
+  # actions:write is for the `reseed` job's workflow_dispatch. (The #485
+  # "delete BEFORE restore" seed steps are gone: cache keys now carry a
+  # per-Cargo.lock suffix, so saves always land under a fresh key and
+  # restores prefix-fall-back to the newest generation — no absent-key
+  # window, no forced-cold rehearsals.)
   actions: write
 
 # P3e Phase 2: single-codegen-unit release artifacts. Set as WORKFLOW env
@@ -190,26 +190,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-linux-Linux-x64" --repo "${{ github.repository }}" || true
-
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache *save* (which
         # runs as a post-job step) can't sink an otherwise-green
@@ -223,6 +203,14 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: agent-linux
+          # Unique key per Cargo.lock generation (rust-cache's restore
+          # falls back to the shared-key prefix, picking the NEWEST older
+          # generation). Saves therefore ALWAYS land — GH cache
+          # immutability never bites — so the delete-before-restore dance
+          # (#485) is gone: no absent-key window for a tag to race into
+          # (rc.382), no forced-cold rehearsals, old generations age out
+          # via the janitor's idle sweep.
+          key: lock-${{ hashFiles('**/Cargo.lock') }}
           # Tag-ref cache saves can never be restored by a future tag run
           # (GH cache isolation: own ref or default branch only) — they
           # were just piling ~0.5 GB of dead weight per tag against the
@@ -510,32 +498,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-linux-arm64-Linux-arm64" --repo "${{ github.repository }}" || true
-
       - name: Cache cargo
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: '. -> target'
           shared-key: agent-linux-arm64
+          # Unique key per Cargo.lock generation — see the agent-linux
+          # block for the full rationale (kills the #485 delete dance).
+          key: lock-${{ hashFiles('**/Cargo.lock') }}
           save-if: ${{ github.ref_type != 'tag' }}
           cache-on-failure: true
           add-rust-environment-hash-key: false
@@ -857,26 +828,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-windows-vp9-444-Windows_NT-x64" --repo "${{ github.repository }}" || true
-
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache *save* (which
         # runs as a post-job step) can't sink an otherwise-green
@@ -890,6 +841,9 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: agent-windows-vp9-444
+          # Unique key per Cargo.lock generation — see the agent-linux
+          # block for the full rationale (kills the #485 delete dance).
+          key: lock-${{ hashFiles('**/Cargo.lock') }}
           # Tag-ref cache saves can never be restored by a future tag run
           # (GH cache isolation: own ref or default branch only). Only
           # non-tag runs (workflow_dispatch rehearsals on master) save —
@@ -1316,26 +1270,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
-
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache save can't sink an
         # otherwise-green build (same rationale as the sibling jobs).
@@ -1350,6 +1284,9 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: installer-smoke-windows
+          # Unique key per Cargo.lock generation — see the agent-linux
+          # block for the full rationale (kills the #485 delete dance).
+          key: lock-${{ hashFiles('**/Cargo.lock') }}
           save-if: ${{ github.ref_type != 'tag' }}
           # cache-on-failure: a seed rehearsal that compiles everything but
           # dies in a LATER step must still save its caches — 2026-07-28 a
@@ -1496,26 +1433,6 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Refresh the cache seed (delete BEFORE restore)
-        # Deleting the flat key BEFORE the restore makes this run's restore
-        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
-        # green non-tag run repopulates the seed with fresh content. The
-        # earlier delete-AFTER-restore variant had two proven holes
-        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
-        # post-save when the restore was an exact hit ("Cache up-to-date"),
-        # and two concurrent rehearsals (seed-release-caches dispatched a
-        # twin 7 s after a manual one) could delete+skip in an interleaving
-        # that left the key ABSENT for the next tag. Delete-before-restore
-        # is race-proof for freshness: worst case both runs build cold and
-        # the last save wins. Cost: rehearsals always build cold — which is
-        # exactly the freshest possible seed; tag runs never delete.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-macos-Darwin-arm64" --repo "${{ github.repository }}" || true
-
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache *save* (which
         # runs as a post-job step) can't sink an otherwise-green
@@ -1529,6 +1446,9 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: agent-macos
+          # Unique key per Cargo.lock generation — see the agent-linux
+          # block for the full rationale (kills the #485 delete dance).
+          key: lock-${{ hashFiles('**/Cargo.lock') }}
           # Tag-ref cache saves can never be restored by a future tag run
           # (GH cache isolation: own ref or default branch only). Only
           # non-tag runs (workflow_dispatch rehearsals on master) save —
