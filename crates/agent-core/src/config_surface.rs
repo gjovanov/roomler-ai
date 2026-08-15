@@ -156,6 +156,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "C4 stage 1: keep one standing warm TURN/UDP allocation (established while UDP works) alive across VPN transitions — measurement-only, nothing routes over it yet. Built-in default: off.",
     ),
     (
+        "overlay_quic_async",
+        "tribool",
+        "Raw-first QUIC-over-TURN upgrade: commit the raw relay immediately, rendezvous in the background (90s window), swap in on success. Off restores the blocking 8s pre-install window. Built-in default: on.",
+    ),
+    (
         "overlay_pathmon",
         "string",
         "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
@@ -419,6 +424,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_srflx_seek" => cfg.overlay_srflx_seek.map(fmt_bool),
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
         "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
+        "overlay_quic_async" => cfg.overlay_quic_async.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
         "overlay_rpf" => cfg.overlay_rpf.clone(),
@@ -529,6 +535,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_srflx_seek" => cfg.overlay_srflx_seek = parse_tribool(value)?,
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
         "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
+        "overlay_quic_async" => cfg.overlay_quic_async = parse_tribool(value)?,
         "overlay_pathmon" => {
             cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -1062,6 +1069,27 @@ mod tests {
             crate::config::env_bridge_bools(&cfg)
                 .iter()
                 .any(|(k, _)| *k == "OVERLAY_WARM_RELAY"),
+            "key must be bridged to the daemon's env"
+        );
+    }
+
+    /// W6 phase 3 — the raw-first QUIC upgrade kill switch: tribool,
+    /// default ON, bridged to the daemon env.
+    #[test]
+    fn overlay_quic_async_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            cfg.overlay_quic_async, None,
+            "built-in default is ON via env fallback"
+        );
+        apply(&mut cfg, "overlay_quic_async", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_quic_async, Some(false));
+        apply(&mut cfg, "overlay_quic_async", None).unwrap();
+        assert_eq!(cfg.overlay_quic_async, None, "clear → built-in default");
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(k, _)| *k == "OVERLAY_QUIC_ASYNC"),
             "key must be bridged to the daemon's env"
         );
     }
