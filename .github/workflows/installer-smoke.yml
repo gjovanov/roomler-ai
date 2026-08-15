@@ -45,6 +45,12 @@ jobs:
         with:
           workspaces: '. -> target'
           shared-key: installer-smoke-windows
+          # Kept in LOCKSTEP with release-agent.yml's companions block (it
+          # restores this same shared key): the lockfile-hash key component
+          # lets a save land after every dependency-graph change instead of
+          # skip-saving against an immutable flat key — see the release
+          # workflow's cache comments for the field incident.
+          key: lock-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install WiX Toolset v3 + cargo-wix
         shell: pwsh
