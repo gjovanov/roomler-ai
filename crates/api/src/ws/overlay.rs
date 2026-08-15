@@ -162,14 +162,21 @@ async fn handle_overlay_warm_relay_request(state: &AppState, ident: NodeIdentity
     };
     let Some(self_id) = self_node.id else { return };
     let warm_key = self_id.to_hex();
-    let ice_servers = overlay_ice_servers(
+    // C4 stage 1.5 — long-lived creds: the cred timestamp bounds the
+    // allocation's TOTAL life (refreshes re-authenticate with the same
+    // username), and the warm allocation's whole point is surviving a
+    // weekend into Monday's VPN connect. 72 h; the agent re-requests and
+    // re-establishes fresh whenever it expires while UDP works.
+    const WARM_CRED_TTL_SECS: u32 = 72 * 3600;
+    let ice_servers = overlay_ice_servers_with_ttl(
         state,
         &warm_key,
         self_node.relay_home.as_deref(),
         self_node.relay_home.as_deref(),
+        Some(WARM_CRED_TTL_SECS),
     )
     .await;
-    debug!(node = %self_id, "overlay relay: warm-allocation creds granted");
+    debug!(node = %self_id, "overlay relay: warm-allocation creds granted (72h)");
     send_to_node(
         state,
         &self_node,
@@ -1809,14 +1816,28 @@ async fn overlay_ice_servers(
     home_a: Option<&str>,
     home_b: Option<&str>,
 ) -> Vec<IceServer> {
+    overlay_ice_servers_with_ttl(state, pair_key, home_a, home_b, None).await
+}
+
+/// C4 stage 1.5 — [`overlay_ice_servers`] with an optional credential-TTL
+/// override. The WARM grant passes a long TTL (the cred timestamp bounds
+/// the allocation's total life; the 600 s pair TTL killed every warm
+/// allocation at the 10-minute mark); pair grants keep the config TTL.
+async fn overlay_ice_servers_with_ttl(
+    state: &AppState,
+    pair_key: &str,
+    home_a: Option<&str>,
+    home_b: Option<&str>,
+    ttl_override: Option<u32>,
+) -> Vec<IceServer> {
     let region = sticky_pair_region(&state.turn_map, &state.relay_load, pair_key, home_a, home_b);
     if region.is_some() {
         crate::cluster::metrics::bump(&crate::cluster::metrics::RELAY_REGION_PICK_TOTAL);
     }
     let Some(turn_cfg) = state.turn_map.cfg_for(region.as_deref()) else {
-        return turn_creds::ice_servers_for(pair_key, None);
+        return turn_creds::ice_servers_for_with_ttl(pair_key, None, ttl_override);
     };
-    let servers = turn_creds::ice_servers_for(pair_key, Some(turn_cfg));
+    let servers = turn_creds::ice_servers_for_with_ttl(pair_key, Some(turn_cfg), ttl_override);
     let Some((host, port)) = turn_cfg
         .urls
         .first()

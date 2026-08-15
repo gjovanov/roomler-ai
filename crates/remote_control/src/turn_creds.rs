@@ -42,11 +42,22 @@ pub struct TurnConfig {
 
 impl TurnConfig {
     pub fn issue(&self, user_id: &str) -> IceServer {
+        self.issue_with_ttl(user_id, self.ttl_secs)
+    }
+
+    /// C4 stage 1.5 — like [`Self::issue`] but with an explicit credential
+    /// TTL. The WARM allocation grant mints long-lived creds (the cred
+    /// timestamp bounds the allocation's TOTAL life — refreshes
+    /// re-authenticate with the same username, so a 600 s pair-grant TTL
+    /// killed every warm allocation at the 10-minute mark; field
+    /// 2026-08-15, the first status line: `creds 600s left`). Pair grants
+    /// keep the short config TTL.
+    pub fn issue_with_ttl(&self, user_id: &str, ttl_secs: u32) -> IceServer {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let expiry = now_secs + self.ttl_secs as u64;
+        let expiry = now_secs + ttl_secs as u64;
         let username = format!("{expiry}:{user_id}");
 
         let mut mac = HmacSha1::new_from_slice(self.shared_secret.as_bytes())
@@ -312,13 +323,26 @@ pub fn select_pair_region(
 /// Convenience: also include public STUN servers so trickle ICE has something
 /// to work with even before TURN auth completes.
 pub fn ice_servers_for(user_id: &str, turn: Option<&TurnConfig>) -> Vec<IceServer> {
+    ice_servers_for_with_ttl(user_id, turn, None)
+}
+
+/// C4 stage 1.5 — [`ice_servers_for`] with an optional credential-TTL
+/// override (see [`TurnConfig::issue_with_ttl`]). `None` = the config TTL.
+pub fn ice_servers_for_with_ttl(
+    user_id: &str,
+    turn: Option<&TurnConfig>,
+    ttl_override: Option<u32>,
+) -> Vec<IceServer> {
     let mut out = vec![IceServer {
         urls: vec!["stun:stun.l.google.com:19302".into()],
         username: None,
         credential: None,
     }];
     if let Some(t) = turn {
-        out.push(t.issue(user_id));
+        out.push(match ttl_override {
+            Some(ttl) => t.issue_with_ttl(user_id, ttl),
+            None => t.issue(user_id),
+        });
     }
     out
 }
