@@ -1384,6 +1384,14 @@ pub fn srflx_punch_worth_trying(mine: Option<&str>, peer: Option<&str>) -> bool 
 /// same-site pair). Saves the futile 12 s attempt + its probe noise on every
 /// re-upgrade tick. A same-IP pair WITHOUT a usable LAN candidate still tries
 /// — on an isolated segment the hairpin may be all there is. Pure.
+///
+/// `peer_has_lan_candidate` is a USABILITY verdict, not mere presence: the
+/// caller (`resolve_direct_candidates`) passes `false` once the LAN tier has
+/// accumulated `LAN_DEAD_STRIKES` consecutive probe failures — an AP with
+/// client isolation (2026-08-15 field: raw same-subnet UDP + ICMP dead both
+/// directions while candidates stayed advertised, and mesh-node roaming made
+/// it flap) otherwise turns this gate into a permanent relay-lock for
+/// same-NAT pairs.
 pub fn srflx_hairpin_pointless(
     my_srflx: Option<&str>,
     peer_srflx: &[String],
