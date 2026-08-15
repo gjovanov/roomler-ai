@@ -43,6 +43,22 @@ coturn dependency (dies on UDP-blocked / TLS-inspecting corp nets), and — for
 the exit-node feature — a cross-NAT **hairpin** that never carried in the field.
 Getting off the relay is the whole point.
 
+```mermaid
+flowchart TB
+    START["peer appears in netmap"] --> LAN{"shares one of<br/>our /24s?"}
+    LAN -->|yes| LOK["LAN direct<br/>(interface socket)"]
+    LAN -->|no| PUB{"peer NIC holds<br/>a public IP?<br/>(flag: off)"}
+    PUB -->|yes| POK["direct-to-public<br/>(unbound egress socket)"]
+    PUB -->|no| SRFLX{"both NAT'd,<br/>not both symmetric?"}
+    SRFLX -->|yes| CPUNCH["srflx hole-punch<br/>(the punch socket)"]
+    SRFLX -->|"both symmetric"| REL{"≥1 side<br/>UDP-capable?"}
+    CPUNCH -->|"punch fails"| REL
+    REL -->|yes| SINGLE["single-relay:<br/>ONE coturn allocation,<br/>QUIC-over-TURN"]
+    REL -->|"both UDP-blocked"| DERP["DERP: /derp WSS :443,<br/>pubkey-addressed raw WG"]
+    SINGLE -.->|fallback| BOTH["both-allocate relay"]
+    LOK & POK & CPUNCH -->|"established"| MBB["stay; upgrade probes may<br/>promote a better tier later<br/>(make-before-break)"]
+```
+
 ## What each direct tier needs
 
 - **LAN direct** — the peer advertised an `ip:port` sharing one of our /24s.
@@ -74,7 +90,27 @@ ICE agent:
    ends don't need a shared clock — first attempts are naturally near-
    synchronous, and the periodic re-upgrade tick (below) closes any larger skew.
 
-So Phase C is **not** a rendezvous protocol. It's five concrete pieces:
+So Phase C is **not** a rendezvous protocol. In sequence form:
+
+```mermaid
+sequenceDiagram
+    participant A as Node A (behind NAT-A)
+    participant S as Server (netmap fan-out)
+    participant B as Node B (behind NAT-B)
+
+    A->>S: rc:overlay.srflx {ip:port seen by STUN, from the punch socket}
+    B->>S: rc:overlay.srflx {…}
+    S-->>A: netmap_delta: B's srflx endpoint
+    S-->>B: netmap_delta: A's srflx endpoint
+    par both dial from their punch socket
+        A->>B: WG handshake INITs (retransmit ~5 s for ~90 s)
+        B->>A: WG handshake INITs
+    end
+    Note over A,B: first packets open each NAT's outbound mapping —<br/>crossing INITs complete the punch (WG itself IS the punch burst)
+    A-->>B: direct carrier established (srflx tier)
+```
+
+It's five concrete pieces:
 
 ### 1. Dial from the socket that owns the advertised srflx ("the punch socket")
 
