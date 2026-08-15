@@ -1,11 +1,15 @@
-# Operator checklist — verifying SystemContext works on rc.52+
+# Operator checklist — verifying SystemContext (pre-logon control) on a Windows host
 
 How to confirm a perMachine + SystemContext host can be remote-controlled
-**pre-logon** (at the Windows logon / lock screen with no user signed in)
-— the headline feature that rc.51 + rc.52 fix.
+**pre-logon** (at the Windows logon / lock screen with no user signed in).
+The fixes this verifies landed in rc.51/rc.52 — any current release includes
+them; the per-step "rc.52" anchors below identify *which* behaviour is being
+checked, not a version you should install. The easiest way to set up such a
+host today is the `roomler-setup` wizard's **Daemon — system** role
+([installation.md](installation.md)).
 
 This procedure assumes you have remote-shell access to the controlled
-host (e.g. CORPLAP-2). All PowerShell snippets must run from an
+host (a field host). All PowerShell snippets must run from an
 **elevated** prompt (Run as administrator).
 
 ---
@@ -84,7 +88,7 @@ enrollment for that host:
 & "C:\Program Files\roomler-agent\roomler-agent.exe" enroll `
     --server https://roomler.ai `
     --token <FRESH-ENROLLMENT-TOKEN> `
-    --name CORPLAP-2 `
+    --name <HOST-NAME> `
     --machine-global
 ```
 
@@ -216,6 +220,6 @@ Any of these means rc.52 hasn't actually fixed this host:
 - A non-admin local user can read `config.toml` (token leak — step 3
   ACL is missing).
 - `machine_id` differs from the server's stored row for this agent
-  (run `roomler-agent --config C:\ProgramData\roomler\roomler-agent\config.toml`
+  (run `roomlerd --config C:\ProgramData\roomler\roomler-agent\config.toml`
   through any inspect path, OR compare the server-side `agents`
   document `machine_id` field).
