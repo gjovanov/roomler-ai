@@ -56,7 +56,16 @@ jobs:
           cd C:\vcpkg
           git fetch origin
           git reset --hard $baseline
-          if (-not (Test-Path .\vcpkg.exe)) { .\bootstrap-vcpkg.bat -disableMetrics }
+          # ALWAYS re-bootstrap after the reset: the runner's preinstalled
+          # vcpkg.exe tracks the CURRENT registry and refuses the year-old
+          # baseline tree ("document schema version 1 is not supported" +
+          # baseline.json resolution failures — hit 2026-08-15 when the
+          # runner image's tool moved past what the old keep-if-present
+          # check tolerated). bootstrap-vcpkg.bat fetches the tool version
+          # this tree's scripts/vcpkg-tools.json pins, so tool and tree
+          # always agree.
+          Remove-Item .\vcpkg.exe -Force -ErrorAction SilentlyContinue
+          .\bootstrap-vcpkg.bat -disableMetrics
           .\vcpkg.exe version
 
           # ── Overlay port: baseline ffmpeg + our configure-option injection ──
