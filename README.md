@@ -1,146 +1,174 @@
-# Roomler2
+# Roomler AI
 
-Real-time communication and collaboration platform with multi-tenancy, hierarchical rooms (text + voice/video), chat, video conferencing (mediasoup WebRTC SFU), file sharing, cloud storage integrations, and AI-powered document recognition.
+**One platform, three products:** a real-time **collaboration suite** (chat + video
+conferencing), a browser-based **remote desktop** for every machine you enroll
+(TeamViewer / RustDesk class), and a WireGuard **overlay network with tunnels**
+(Tailscale / ngrok class) — all sharing one server, one identity model, one admin UI,
+and one tiny native daemon per machine.
 
 <a href="roomler-intro.mp4">
   <img src="https://img.shields.io/badge/%E2%96%B6%20Watch-Intro%20Video%20(2%3A24)-009688?style=for-the-badge" alt="Watch Intro Video" />
 </a>
 
-> **Intro Video**: See the full product walkthrough in [`roomler-intro.mp4`](roomler-intro.mp4) — registration, workspace creation, chat, video calls, and more in under 3 minutes.
+> [`roomler-intro.mp4`](roomler-intro.mp4) walks through the collaboration pillar —
+> registration, workspaces, chat, video calls — in under 3 minutes.
 
-## Features
+## The big picture
 
-| Category | Feature | Status |
-|----------|---------|--------|
-| **Multi-Tenancy** | Organizations with plans (Free/Pro/Business/Enterprise) | :white_check_mark: |
-| | Roles & permissions (Owner, Admin, Moderator, Member) with 24-bit bitfield | :white_check_mark: |
-| | Role CRUD, assignment, default role seeding | :white_check_mark: |
-| | Invite system (shareable links, email invites, batch invites) | :white_check_mark: |
-| | User profiles (bio, avatar, presence, timezone, locale) | :white_check_mark: |
-| | OAuth login (Google, Facebook, GitHub, LinkedIn, Microsoft) | :white_check_mark: |
-| **Rooms** | Unified rooms with hierarchy (text + voice/video) | :white_check_mark: |
-| | Parent/child room tree, explore & member management | :white_check_mark: |
-| | In-room call start/join with real-time notifications | :white_check_mark: |
-| **Real-Time Chat** | Threaded messages with replies | :white_check_mark: |
-| | Reactions (unicode + custom emoji) | :white_check_mark: |
-| | @mentions with autocomplete (TipTap) | :white_check_mark: |
-| | Embeds, attachments, pinning | :white_check_mark: |
-| | Typing indicators & presence | :white_check_mark: |
-| **Notifications** | @mention notifications (real-time via WebSocket) | :white_check_mark: |
-| | Notification bell with unread count badge | :white_check_mark: |
-| | Mark read / mark all read | :white_check_mark: |
-| **Video Conferencing** | mediasoup WebRTC SFU (per-room calls) | :white_check_mark: |
-| | Start/join calls from room chat or dashboard | :white_check_mark: |
-| | Multiple producers/consumers per participant | :white_check_mark: |
-| | Recordings & in-call chat | :white_check_mark: |
-| **File Management** | Versioned uploads, multipart upload | :white_check_mark: |
-| | Cloud sync (Google Drive, OneDrive, Dropbox) | :white_check_mark: |
-| | AI document recognition (Claude API) | :white_check_mark: |
-| **Export** | Conversation export to XLSX | :white_check_mark: |
-| | PDF export (custom raw PDF 1.4 generator) | :white_check_mark: |
-| | Background task processing | :white_check_mark: |
-| **Search** | Global full-text search (Ctrl+K) across messages, rooms, people | :white_check_mark: |
-| | MongoDB text indexes for fast search | :white_check_mark: |
-| **WebSocket** | Live presence & typing indicators | :white_check_mark: |
-| | Real-time message delivery (Redis Pub/Sub for multi-instance) | :white_check_mark: |
-| | Media signaling (join/produce/consume) | :white_check_mark: |
-| **Frontend** | Vue 3 + Vuetify 3 SPA | :white_check_mark: |
-| | 12 Pinia stores, 19 views | :white_check_mark: |
-| | Light/Dark theme toggle with localStorage persistence | :white_check_mark: |
-| | mediasoup-client composable + VideoTile | :white_check_mark: |
-| | Vitest unit tests + Playwright E2E | :white_check_mark: |
+```mermaid
+flowchart LR
+    subgraph you["🧑 You"]
+        B["Browser<br/>chat · calls · remote desktop<br/>· admin · observability"]
+        T["roomler CLI<br/>forwards · SOCKS5 · exec"]
+    end
 
-## Tech Stack
+    subgraph cloud["☁️ roomler.ai — coordination, not data"]
+        S["API + signalling<br/>auth · enrollment · consent<br/>ACL policy · audit"]
+        M["mediasoup SFU<br/>(conference media)"]
+        R["TURN + DERP relays<br/>(fallback paths — ciphertext only)"]
+    end
+
+    subgraph fleet["🖥️ Your machines — each runs the roomlerd daemon"]
+        A1["Office / home PC"]
+        A2["Headless cloud server"]
+        A3["GPU workstation"]
+    end
+
+    B -->|"sign in · policy · consent"| S
+    T -->|"authenticate · ACL check"| S
+    B <-->|"WebRTC (SFU):<br/>team video calls"| M
+    A1 -.->|"always-on control link<br/>(outbound WSS)"| S
+    A2 -.-> S
+    A3 -.-> S
+
+    B <==>|"WebRTC P2P, E2E-encrypted:<br/>screen · input · clipboard<br/>· files · apps · audio"| A1
+    T <==>|"QUIC / WebRTC tunnels:<br/>TCP forward · SOCKS5"| A2
+    A2 <-.->|"WireGuard overlay mesh:<br/>stable private IPs + MagicDNS,<br/>LAN-direct when possible"| A3
+
+    B <-.->|"no direct path? relayed —<br/>still end-to-end encrypted"| R
+    R <-.-> A1
+```
+
+Solid arrows are the **control plane** (login, policy, session setup). Thick double
+arrows are **your data** — end-to-end encrypted, flowing directly between your device
+and your machine whenever a direct path exists. The server introduces the two ends and
+enforces policy; it never sees pixels, keystrokes, tunneled payloads, or overlay
+plaintext. When no direct path can be punched, TURN/DERP relays forward ciphertext
+they cannot read.
+
+## Three products in one platform
+
+### 💬 Collaboration — chat, rooms, video conferencing
+
+| | |
+|---|---|
+| **Rooms & chat** | Hierarchical room tree (text + voice/video), threaded messages, reactions, custom emoji, @mentions (TipTap editor), pins, embeds, typing indicators, presence |
+| **Video conferencing** | [mediasoup](https://mediasoup.org/) WebRTC SFU, per-room calls, multiple producers/consumers, in-call chat, recordings |
+| **Multi-tenancy** | Organizations with plans + Stripe billing, 24-bit-bitfield roles & permissions, invite links / email / batch invites, OAuth (Google, Facebook, GitHub, LinkedIn, Microsoft) |
+| **Files** | Versioned + multipart uploads (S3/MinIO), cloud sync (Google Drive, OneDrive, Dropbox), AI document recognition (Claude vision) |
+| **Search & export** | Global full-text search (Ctrl+K), XLSX + PDF conversation export, background task pipeline |
+| **Notifications** | Real-time WebSocket + Web Push (VAPID), unread counts, mark-read flows |
+
+### 🖥️ Remote desktop — any enrolled machine, from a browser tab
+
+| | |
+|---|---|
+| **Viewer** | Plain browser tab — nothing to install on the viewing side. Classic `<video>` or low-latency WebCodecs canvas paths (bypasses Chrome's ~80 ms jitter buffer) |
+| **Codecs** | H.264, HEVC, AV1, VP9 4:4:4 — hardware-encoded when the GPU allows (NVENC / Quick Sync / AMF / Media Foundation), with probe-and-rollback cascade and software fallback. See [`docs/encoders.md`](docs/encoders.md) |
+| **Input & UX** | Full keyboard/mouse with keyboard-lock + Ctrl-Alt-Del, multi-monitor, resolution/scale control, remote cursor, clipboard sync (text/HTML/image), resumable file transfer, remote-apps menu (list / focus / launch, tmux re-attach), optional remote audio |
+| **Unattended access** | Runs as a service, survives logout, controls the lock screen / UAC / pre-logon on Windows (SystemContext), virtual desktops for headless Linux servers |
+| **Security** | Consent-gated + audit-logged sessions, tenant-scoped agent identity, E2E-encrypted WebRTC — the server relays only signalling |
+
+### 🌐 Overlay network & tunnels — your machines, one private network
+
+| | |
+|---|---|
+| **WireGuard mesh** | Every node gets a stable private IP (CGNAT `100.64.0.0/10`) + a MagicDNS name. Carriers auto-negotiate: LAN-direct → public-direct → NAT hole-punch → TURN relay (QUIC-upgraded) → DERP over :443 — it works even from strict corporate networks. See [`docs/overlay-communication.md`](docs/overlay-communication.md) |
+| **Tunnels** | `roomler forward` (any `host:port` an agent can reach becomes a local port), `roomler socks5` (per-agent or whole-fleet mesh proxy, TCP + UDP), declared routes supervised by the daemon |
+| **Exit nodes** | Route a client's entire internet egress (v4+v6, DNS included) through a chosen mesh peer — with a never-self-wedge safety model |
+| **Multi-org** | One daemon can join several organizations at once, with per-org WireGuard keys and disjoint address blocks |
+| **Policy & audit** | Default-deny tunnel ACLs, overlay ACLs (`off`/`warn`/`enforce`), subnet-route + exit-node approval in the admin UI, audit trail per flow |
+| **Fleet operations** | `roomler exec` remote command execution (four independent default-deny gates), device console, live observability: mesh graph, per-carrier stats, relay usage |
+
+## Tech stack
 
 | Layer | Technology |
 |-------|-----------|
-| **Backend** | Rust (edition 2024), Axum 0.8, Tokio |
-| **Frontend** | Vue 3, Vuetify 3, Pinia, Vue Router, vue-i18n |
-| **Database** | MongoDB 7 (mongodb 3.2 driver) |
-| **WebRTC** | mediasoup 0.20 (SFU), mediasoup-client 3.7 |
-| **Auth** | JWT (argon2 hashing), httpOnly cookies, OAuth 2.0 |
-| **AI** | Claude API (document recognition) |
-| **Cloud** | Google Drive, OneDrive, Dropbox (OAuth2 + async_trait) |
-| **Testing** | 135 Rust integration tests, 24 Playwright E2E specs, 215 Vitest unit tests |
-| **Infrastructure** | Docker Compose (MongoDB, Redis, MinIO, Coturn) |
+| **Backend** | Rust (edition 2024), Axum 0.8, Tokio, MongoDB 7, Redis (multi-pod fan-out) |
+| **Conference media** | mediasoup 0.20 SFU + mediasoup-client |
+| **Remote desktop** | webrtc-rs (P2P, vendored forks for H.265 payloading + TURNS/TCP), OpenH264, Media Foundation, FFmpeg (NVENC/QSV/AMF), libvpx VP9 4:4:4, WebCodecs viewer |
+| **Overlay / tunnels** | boringtun (WireGuard), quinn (QUIC), smoltcp userspace netstack, Wintun / tun / utun, coturn + standalone DERP relays |
+| **Native apps** | `roomlerd` daemon (Rust), `roomler` CLI, `roomler-desktop` tray companion (Tauri 2), `roomler-setup` install wizard (Tauri 2) |
+| **Frontend** | Vue 3, Vuetify 3, Pinia, TipTap v3, d3 (observability) |
+| **Auth** | JWT (6 audience-checked token types), Argon2, OAuth 2.0 |
+| **Infrastructure** | Docker multi-stage image (nginx + API), docker-compose dev stack (MongoDB, Redis, MinIO, coturn), Kubernetes-ready |
 
-## Architecture
+## Quick start
 
-```mermaid
-graph TB
-    subgraph Client["Browser"]
-        UI["Vue 3 + Vuetify 3 SPA<br/>Pinia (12 stores) · mediasoup-client 3.7<br/>:5000"]
-    end
-
-    subgraph Server["Rust / Axum 0.8"]
-        REST["REST Routes<br/>18 modules"]
-        WS["WebSocket Handler<br/>Presence · Typing · Signaling"]
-        AUTH["Auth Middleware<br/>JWT · OAuth 2.0 · argon2"]
-        SVC["Services Layer<br/>DAOs · Auth · Export · Background Tasks"]
-        MEDIA["mediasoup 0.20 SFU<br/>WorkerPool · RoomManager<br/>Router / Transport / Producer / Consumer"]
-    end
-
-    subgraph External["External Services"]
-        CLOUD["Cloud Storage<br/>Google Drive · OneDrive · Dropbox"]
-        AI["Claude API<br/>Document Recognition"]
-        OAUTH["OAuth Providers<br/>Google · Facebook · GitHub<br/>LinkedIn · Microsoft"]
-    end
-
-    DB[("MongoDB 7<br/>18 collections")]
-
-    UI -->|"REST / HTTP"| REST
-    UI -->|"WebSocket"| WS
-    UI -->|"WebRTC"| MEDIA
-    AUTH --> REST
-    AUTH --> WS
-    REST --> SVC
-    WS --> SVC
-    WS --> MEDIA
-    SVC --> DB
-    SVC --> CLOUD
-    SVC --> AI
-    AUTH --> OAUTH
-
-    style UI fill:#1565C0,color:#fff
-    style REST fill:#0D47A1,color:#fff
-    style WS fill:#0D47A1,color:#fff
-    style AUTH fill:#4A148C,color:#fff
-    style SVC fill:#00695C,color:#fff
-    style MEDIA fill:#E65100,color:#fff
-    style DB fill:#2E7D32,color:#fff
-    style CLOUD fill:#37474F,color:#fff
-    style AI fill:#37474F,color:#fff
-    style OAUTH fill:#37474F,color:#fff
-```
-
-## Quick Start
+### Run the platform (development)
 
 ```bash
-# 1. Start infrastructure
-docker-compose up -d    # MongoDB, Redis, MinIO, Coturn
+# 1. Infrastructure
+docker compose up -d          # MongoDB :27019, Redis :6379, MinIO :9000, coturn
 
-# 2. Configure
-cp .env.example .env    # Edit with your settings
+# 2. Backend
+cargo run --bin roomler-ai-api    # API on :3000
 
-# 3. Run backend
-cargo build && cargo run   # API at http://localhost:3000
-
-# 4. Run frontend
-cd ui && bun install && bun run dev   # UI at http://localhost:5173
+# 3. Frontend
+cd ui && bun install && bun run dev   # SPA on :5000
 ```
+
+### Add a machine to your fleet
+
+Mint an enrollment token in the admin UI (**Admin → Agents → Enroll**), then on the
+machine:
+
+```bash
+# Linux / macOS — daemon (remote desktop + tunnels + overlay)
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon --token <enrollment-jwt>
+
+# Windows (PowerShell)
+irm https://roomler.ai/api/setup/install.ps1 | iex
+```
+
+Prefer a GUI? Download the **roomler-setup** wizard from the admin UI — one installer
+for every role (Windows service / per-user / tunnel-only) on every OS. Details, MSI
+flavours, and service modes: [`docs/installation.md`](docs/installation.md).
+
+### Reach it
+
+- **Remote desktop**: open the machine from the web app and click *Connect*.
+- **Tunnel**: `roomler forward --agent <name> --local 127.0.0.1:5432 --remote db:5432`
+- **Overlay**: `roomler ping <name>` — every node has a stable IP and MagicDNS name.
+
+## Platform support
+
+| Component | Windows | Linux | macOS |
+|---|---|---|---|
+| **`roomlerd` daemon** (desktop + tunnel exit + overlay node) | x64 — MSI (per-user / per-machine), signed | x86_64 + arm64 — `.deb` / tarball, systemd | arm64 — `.pkg`, LaunchAgent |
+| **`roomler` CLI** (tunnel client) | x64 zip | x86_64 tarball + `.deb` | universal tarball |
+| **`roomler-setup` wizard** | x64 (signed) | x86_64 | universal |
+| **`roomler-desktop` companion** (tray, consent, tunnels UI) | ✅ | — | — |
+| **Viewer / web app** | any modern browser; WebCodecs low-latency paths are Chrome-first | | |
+
+All release artifacts ship with SHA-256 sidecars, GPG signatures, and SLSA build
+provenance (`gh attestation verify --repo gjovanov/roomler-ai`).
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Architecture](docs/architecture.md) | System design, crate graph, request flow |
-| [Data Model](docs/data-model.md) | All 18 entities, ER diagram, indexes |
-| [API Reference](docs/api.md) | REST endpoints, request/response schemas |
-| [Features](docs/FEATURES.md) | Detailed feature descriptions (theming, mentions, roles, profiles, etc.) |
-| [Frontend](docs/ui.md) | Routes, components, Pinia stores |
-| [Real-Time](docs/real-time.md) | WebSocket protocol, presence, media signaling |
-| [Testing](docs/testing.md) | Integration tests, Vitest unit tests, Playwright E2E specs |
-| [Deployment](docs/deployment.md) | Docker Compose, environment variables |
+**[→ Full documentation index](docs/README.md)**
+
+| Start with | |
+|---|---|
+| [Architecture](docs/architecture.md) | The whole system: control plane vs three data planes, crate map, deployment |
+| [Agent & Tunnel overview](docs/agent-tunnel-architecture.md) | The remote-access stack in five minutes, for users and operators |
+| [Use cases](docs/use-cases.md) | What people build with it — from team chat to AI-agent fleets |
+| [Installation](docs/installation.md) | Every install path on every platform, enrollment, self-update |
+| [Remote control](docs/remote-control.md) | Full remote-desktop design: protocol, security, latency budget |
+| [Encoders](docs/encoders.md) | Codec × platform matrix, hardware cascade, rate control |
+| [Overlay communication](docs/overlay-communication.md) | Every carrier path, inside and outside a corporate VPN |
+| [Tunnels](docs/tunnels.md) | Forwards, SOCKS5, declared routes, QUIC-over-TURN |
+| [API reference](docs/api.md) | Every HTTP route + the WebSocket surfaces |
 
 ## License
 

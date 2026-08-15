@@ -1,229 +1,181 @@
-# Real-Time
+# Real-Time Protocols
 
-Roomler2 uses WebSocket for real-time features: presence updates, typing indicators, and server-pushed events.
+The server exposes two upgrade endpoints. `/ws` multiplexes three client roles over
+one handshake; `/derp` is a purpose-built relay for overlay pairs whose UDP is
+blocked in both directions. *As of 0.3.0-rc.381.*
 
-## Connection Flow
+```mermaid
+flowchart TB
+    subgraph endpoints["wss endpoints"]
+        WS["/ws?token=…&role=…"]
+        DERP["/derp?token=…"]
+    end
 
-```
-Browser                                     Axum Server
-  │                                              │
-  │  GET /ws?token=<JWT>                         │
-  ├─────────────────────────────────────────────►│
-  │                                              │
-  │  (Server verifies JWT, extracts user_id)     │
-  │                                              │
-  │  101 Switching Protocols                     │
-  │◄─────────────────────────────────────────────┤
-  │                                              │
-  │  { "type": "connected",                      │
-  │    "user_id": "6..." }                       │
-  │◄─────────────────────────────────────────────┤
-  │                                              │
-  │  ─── bidirectional messages ───              │
-  │                                              │
-```
+    U["Browser (user)"] -->|"no role / role=user<br/>Access JWT"| WS
+    A["roomlerd (agent)"] -->|"role=agent<br/>Agent JWT"| WS
+    T["roomler CLI"] -->|"role=tunnel-client<br/>TunnelClient JWT"| WS
+    A2["roomlerd (UDP-blocked)"] -->|"Agent JWT"| DERP
 
-1. Client opens WebSocket to `/ws?token=<JWT>` (JWT is passed as query parameter since WS handshake cannot use cookies/headers)
-2. Server verifies the JWT before accepting the upgrade
-3. On success, connection is registered in `WsStorage` under the user's ID
-4. Server sends a `connected` confirmation message
-5. Bidirectional message exchange begins
-
-## Message Types
-
-### Server → Client
-
-| Type | Payload | Description |
-|------|---------|-------------|
-| `connected` | `{ user_id }` | Connection established confirmation |
-| `pong` | `{}` | Response to client ping |
-| `typing:start` | `{ room_id, user_id }` | User started typing in room |
-| `typing:stop` | `{ room_id, user_id }` | User stopped typing in room |
-| `presence:update` | `{ user_id, presence }` | User presence changed |
-| `room:call_started` | `{ room_id, room_name, started_by }` | A call was started in a room |
-| `room:call_updated` | `{ room_id, participant_count, conference_status }` | Call participant count changed |
-| `room:call_ended` | `{ room_id }` | Call ended in a room |
-| `call:message:create` | `{ room_id, message }` | New in-call chat message |
-
-### Client → Server
-
-| Type | Payload | Description |
-|------|---------|-------------|
-| `ping` | `{}` | Application-level keepalive |
-| `typing:start` | `{ room_id }` | Notify room members of typing |
-| `typing:stop` | `{ room_id }` | Notify room members typing stopped |
-| `presence:update` | `{ presence }` | Update own presence status |
-
-All messages are JSON:
-
-```json
-{
-  "type": "typing:start",
-  "data": {
-    "room_id": "6..."
-  }
-}
+    WS --> H["ws/handler.rs<br/>role → claim validator"]
+    H --> UP["user plane<br/>chat · presence · media"]
+    H --> RC["rc:* plane<br/>remote control · tunnels · overlay · rpc"]
+    DERP --> DR["pubkey-addressed frame relay<br/>tenant-isolated, opaque WG bytes"]
 ```
 
-## WsStorage
+Each role is validated against its own JWT audience — a user token cannot open an
+agent socket and vice-versa. An optional `tid=<tenant-hex>` query parameter lets the
+front load balancer hash tenant-affine connections onto one pod; tokens must match
+the claimed tenant (membership-checked for users).
 
-`WsStorage` tracks all active WebSocket connections with dual indexing:
+Delivery across pods: WS sessions are pod-local; chat, presence, and notification
+events fan out through Redis pub/sub so every pod pushes to its own sockets.
 
-- **`connections`**: `DashMap<ObjectId, Vec<WsSender>>` -- user-level (for user-targeted broadcasts)
-- **`connection_map`**: `DashMap<String, (ObjectId, WsSender)>` -- connection-level (for connection-targeted sends)
+## User plane (browser)
 
-Each user can have **multiple connections** (multiple browser tabs, devices). Each connection gets a unique `connection_id` (UUID) generated server-side when the WebSocket connects.
+JSON messages, `{"type": "...", ...}`.
 
-```rust
-pub struct WsStorage {
-    connections: DashMap<ObjectId, Vec<WsSender>>,
-    connection_map: DashMap<String, (ObjectId, WsSender)>,
-}
+**Client → server**
+
+| Type | Purpose |
+|---|---|
+| `media:join` / `media:leave` | Enter/exit a room call (mediasoup) |
+| `media:produce` / `media:consume` | Publish / subscribe a track |
+| `media:connect_transport` | DTLS-connect a transport |
+| `media:producer_close` | Stop publishing |
+| `media:play_audio` / `media:stop_audio` | Bot/audio playback control |
+| `presence:update` | Presence state |
+| `ping` | Keepalive |
+
+**Server → client** (consumed by `ui/src/stores/ws.ts`)
+
+| Event | Purpose |
+|---|---|
+| `message:create` / `update` / `delete` / `reaction` | Live chat |
+| `call:message:create` | In-call chat |
+| `room:call_started` / `call_ended` / `call_updated` | Call presence on the room list |
+| `typing:start` | Typing indicators |
+| `notification:new` / `notification:unread_count` | Notification bell |
+| `task:update` | Background-task progress |
+
+The mediasoup signalling (`media:*`) carries router RTP capabilities, transport
+parameters, and producer/consumer ids — the SFU forwards RTP between participants
+without decoding it.
+
+## The `rc:*` plane (agents, tunnel clients, controllers)
+
+Defined in `crates/remote_control/src/signaling.rs` (`ClientMsg` / `ServerMsg`,
+~60 wire tags). Serialization is **wire-locked by tests**: tags are pinned,
+ObjectIds serialize as raw hex, `Permissions` as pipe-separated names. Renaming a
+tag is a deliberate wire break.
+
+| Family | Tags | Purpose |
+|---|---|---|
+| Agent lifecycle | `rc:agent.hello` · `rc:agent.heartbeat` · `rc:agent.update` · `rc:agent.join_org` · `rc:goodbye` | Hello carries caps (codecs, transports, rpc), displays, advertised routes; heartbeat every 30 s; `goodbye` carries a close reason (deleted / replaced / policy) |
+| Remote-desktop session | `rc:session.request` · `rc:session.created` · `rc:request` · `rc:ready` · `rc:terminate` · `rc:session.stats` · `rc:error` | Session state machine between controller, server, agent |
+| SDP / ICE | `rc:sdp.offer` · `rc:sdp.answer` · `rc:ice` | WebRTC negotiation relayed through the server |
+| Consent | `rc:consent` | Owner consent decision (pairs with the HTTP capability URLs) |
+| Keepalive | `rc:ping` / `rc:pong` | Application-level liveness |
+| Tunnel session | `rc:tunnel.hello` · `.open` · `.opened` · `.terminate` · `.revoked` | Client ⇄ agent tunnel establishment (`open_nonce` correlates concurrent opens) |
+| Tunnel TCP flows | `rc:tunnel.tcp.request` → `.forward` → `.accept`/`.reject` · `.half_close` · `.closed` | Per-flow lifecycle |
+| Tunnel UDP flows | `rc:tunnel.udp.request` → `.forward` → `.accept`/`.reject` · `.closed` | SOCKS5 UDP ASSOCIATE flows |
+| Tunnel carriers | `rc:tunnel.sdp.offer`/`.answer` · `.ice` · `.quic.setup`/`.ready`/`.candidate` | WebRTC-DC and QUIC data-plane negotiation |
+| Overlay | `rc:overlay.join` · `.endpoints` · `.srflx` · `.leave` · `.relay_request` → `.netmap` · `.netmap_delta` · `.relay_grant` · `.force_derp` · `.warm_relay_request`/`.warm_relay_grant` | Mesh membership, endpoint discovery, relay coordination |
+| Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
+| Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
+
+### Remote-desktop session setup
+
+```mermaid
+sequenceDiagram
+    participant C as Controller (browser /ws user)
+    participant S as Server (Hub)
+    participant A as Agent (/ws role=agent)
+
+    C->>S: rc:session.request {agent_id}
+    S->>A: rc:request {session, controller, permissions}
+    A->>A: consent (auto-grant or LocalAPI/tray prompt, 30 s timeout)
+    A->>S: rc:ready
+    S->>C: rc:session.created
+    C->>S: rc:sdp.offer
+    S->>A: rc:sdp.offer
+    A->>S: rc:sdp.answer
+    S->>C: rc:sdp.answer
+    C-->>S: rc:ice (trickle, both directions)
+    S-->>A: rc:ice
+    Note over C,A: DTLS/SRTP established — video, input,<br/>clipboard, files, apps ride P2P from here
+    C->>S: rc:terminate (or agent/server side)
 ```
 
-Key operations:
-- `add(user_id, connection_id, sender)` -- register a new connection (both indexes)
-- `remove(user_id, connection_id, sender)` -- unregister using Arc pointer equality + connection_id
-- `get_senders(user_id)` -- get all senders for a user (for user-level broadcasts)
-- `get_sender_by_connection(connection_id)` -- get sender for a specific connection (for media signaling responses)
-- `all_user_ids()` -- list all connected users
-- `connection_count()` -- total active connections across all users
+Once the P2P link is up, everything else is **DataChannel traffic that never
+touches the server**: input events, clipboard chunks, file transfers, the apps
+menu, cursor shapes, decoder statistics (`rc:decodestat` feedback that drives the
+agent's rate control), and — on the DC render paths — the video bitstream itself.
 
-## Dispatcher
+### Tunnel flow open
 
-The dispatcher sends messages at three levels:
+```mermaid
+sequenceDiagram
+    participant T as roomler CLI
+    participant S as Server (policy)
+    participant A as Agent (exit)
 
-- **`send_to_user(ws_storage, user_id, message)`** -- send to ALL connections of a specific user
-- **`send_to_connection(ws_storage, connection_id, message)`** -- send to ONE specific connection (used for media signaling responses like `router_capabilities`, `transport_created`, `produce_result`, `consumer_created`)
-- **`broadcast(ws_storage, user_ids, message)`** -- send to all connections of multiple users
-
-### Broadcast Scoping
-
-| Event | Recipients | Targeting |
-|-------|-----------|-----------|
-| `typing:start` / `typing:stop` | All members of the room **except** the sender | User-level |
-| `presence:update` | All connected users | User-level |
-| `pong` | Only the sender | User-level |
-| `message:create` | All members of the room **except** the sender | User-level |
-| `room:call_started` | All members of the room | User-level |
-| `room:call_updated` | All members of the room | User-level |
-| `room:call_ended` | All members of the room | User-level |
-| `call:message:create` | All members of the room | User-level |
-| `media:router_capabilities` | Only the requesting connection | Connection-level |
-| `media:transport_created` | Only the requesting connection | Connection-level |
-| `media:produce_result` | Only the producing connection | Connection-level |
-| `media:consumer_created` | Only the consuming connection | Connection-level |
-| `media:new_producer` | All participants except the producer | User-level |
-| `media:peer_left` | All remaining participants | User-level |
-| `media:producer_closed` | All participants except the producer | User-level |
-
-For typing indicators, the server looks up room member IDs and broadcasts to all room members except the typing user. For presence, the update goes to all connected users. For message creation, the sender is excluded from broadcast to prevent duplicate display (the sender already has the message from the HTTP response).
-
-## Presence
-
-Users have one of five presence states:
-
-| State | Description |
-|-------|-------------|
-| `online` | Actively connected and interacting |
-| `idle` | Connected but inactive |
-| `dnd` | Do not disturb (suppresses notifications) |
-| `offline` | Not connected (default) |
-| `invisible` | Connected but appears offline to others |
-
-Presence is updated via the WebSocket `presence:update` message and broadcast to all connected users.
-
-## Protocol-Level Ping/Pong
-
-In addition to application-level `ping`/`pong` messages, the server handles WebSocket protocol-level `Ping` frames by responding with `Pong` frames automatically. This keeps the connection alive at the transport layer.
-
-## mediasoup SFU Integration
-
-Roomler2 uses mediasoup as an SFU (Selective Forwarding Unit) for WebRTC video/audio conferencing.
-
-### Configuration
-
-```
-ROOMLER__MEDIASOUP__NUM_WORKERS=2        # mediasoup worker processes
-ROOMLER__MEDIASOUP__LISTEN_IP=0.0.0.0    # bind address
-ROOMLER__MEDIASOUP__ANNOUNCED_IP=1.2.3.4 # public IP (for NAT traversal)
-ROOMLER__MEDIASOUP__RTC_MIN_PORT=40000   # UDP port range start
-ROOMLER__MEDIASOUP__RTC_MAX_PORT=49999   # UDP port range end
+    T->>S: rc:tunnel.hello
+    T->>S: rc:tunnel.open {agent_id, open_nonce}
+    S->>S: ACL policy evaluate (default-deny)
+    S->>A: rc:tunnel.open
+    A->>S: rc:tunnel.opened
+    S->>T: rc:tunnel.opened {session_id}
+    par data plane
+        T->>S: rc:tunnel.quic.ready + .candidate
+        S->>A: rc:tunnel.quic.setup
+        A-->>T: QUIC (direct → TURN-relayed → TURNS/TCP :443)
+    end
+    T->>S: rc:tunnel.tcp.request {dst}
+    S->>A: rc:tunnel.tcp.forward
+    A->>A: agent-local ACL + dial dst
+    A->>S: rc:tunnel.tcp.accept
+    S->>T: rc:tunnel.tcp.accept
+    Note over T,A: flow bytes ride the QUIC/DC data plane
 ```
 
-### Architecture
+### Overlay join
 
-```
-WorkerPool (round-robin N mediasoup workers)
-  └── RoomManager
-        ├── rooms: DashMap<ObjectId, MediaRoom>
-        │     └── MediaRoom
-        │           ├── router: Router
-        │           └── participants: DashMap<String, ParticipantMedia>
-        │                 └── ParticipantMedia
-        │                       ├── user_id: ObjectId
-        │                       ├── send_transport: WebRtcTransport
-        │                       ├── recv_transport: WebRtcTransport
-        │                       ├── producers: Vec<Producer>
-        │                       └── consumers: Vec<Consumer>
-        └── connection_rooms: DashMap<String, ObjectId>
-```
+```mermaid
+sequenceDiagram
+    participant N as Node (roomlerd / CLI)
+    participant S as Server (IPAM + netmap)
+    participant P as Peers
 
-### Connection ID Architecture
-
-Participants are keyed by **connection_id** (UUID per WebSocket connection), not by user_id. This enables:
-
-- **Multi-tab/device support**: The same user can join from multiple tabs without state overwriting
-- **Independent state**: Each connection has its own transports, producers, and consumers
-- **Proper cleanup**: Closing one connection doesn't destroy another's media state
-
-The server generates a unique `connection_id` for each WebSocket connection at connect time and uses it for all room_manager operations.
-
-### Media Signaling Flow
-
-```
-Browser                             Server (Axum + mediasoup)
-  │                                       │
-  │  HTTP POST /room/{id}/call/start      │  (creates Router)
-  │  HTTP POST /room/{id}/call/join       │  (DB participant record)
-  │                                       │
-  │  WS: media:join {room_id}             │
-  ├──────────────────────────────────────►│
-  │                                       │  create_transports(room, user, connection_id)
-  │  WS: media:router_capabilities        │  (connection-targeted)
-  │◄──────────────────────────────────────┤
-  │  WS: media:transport_created          │  (connection-targeted)
-  │◄──────────────────────────────────────┤
-  │  WS: media:new_producer (existing)    │  (for each existing producer)
-  │◄──────────────────────────────────────┤
-  │                                       │
-  │  WS: media:connect_transport          │  (DTLS handshake)
-  ├──────────────────────────────────────►│
-  │                                       │
-  │  WS: media:produce {kind, rtp_params} │
-  ├──────────────────────────────────────►│
-  │  WS: media:produce_result {id}        │  (connection-targeted)
-  │◄──────────────────────────────────────┤
-  │                                       │  broadcast media:new_producer to peers
-  │                                       │
-  │  WS: media:consume {producer_id}      │
-  ├──────────────────────────────────────►│
-  │  WS: media:consumer_created           │  (connection-targeted)
-  │◄──────────────────────────────────────┤
-  │                                       │
-  │  WS: media:leave                      │
-  ├──────────────────────────────────────►│  close_participant(room, connection_id)
-  │                                       │  broadcast media:peer_left to peers
+    N->>S: rc:overlay.join {wg_pubkey, advertised_routes}
+    S->>S: lease overlay IP (pool-first, then cursor)
+    S->>N: rc:overlay.netmap {self, peers, cidr, magic_dns}
+    S->>P: rc:overlay.netmap_delta {adds}
+    N->>S: rc:overlay.endpoints {lan, public} + rc:overlay.srflx
+    S->>P: rc:overlay.netmap_delta (endpoint refresh)
+    Note over N,P: carriers negotiate per peer:<br/>LAN → public → srflx punch → relay → DERP
+    N->>S: rc:overlay.relay_request (only if needed)
+    S->>N: rc:overlay.relay_grant {worker, creds}
 ```
 
-### Key Design Decisions
+## DERP
 
-1. **Connection-targeted vs user-targeted sends**: Media signaling responses (capabilities, transports, produce results) are sent to the specific connection via `send_to_connection()`. Peer notifications (new_producer, peer_left) are broadcast to all participants via user_ids.
+`GET /derp?token=<agent-jwt>` upgrades to a minimal frame relay for overlay pairs
+where **both** sides are UDP-blocked:
 
-2. **Sender exclusion**: Message broadcasts exclude the sender's user_id to prevent duplicates. The frontend also has dedup (checking by message ID) as a safety net.
+- Frames are `[dst_pubkey(32) || payload]` client→server, rewritten to
+  `[src_pubkey(32) || payload]` on delivery.
+- Hard tenant/network isolation; the payload is WireGuard ciphertext the relay
+  cannot read.
+- Standalone regional PoPs (`crates/derp-relay`) run the same protocol DB-free,
+  authenticated by Ed25519 tickets minted over `rc:relay.derp_ticket_request`.
 
-3. **HTTP leave cleanup** (2026-08-04): `call/join` and `call/leave` accept an optional `connection_id` (from the WS `connected` frame) — the leave then closes ONLY that connection's media + session (`close_participant_of_user()`, ownership-checked), so the same user's other browsers keep their call. Without a connection_id the legacy `close_participant_by_user()` close-all path runs (mixed-version fallback). `participant_count` counts DISTINCT USERS and is decremented only when the user's last session closes; the WS disconnect path finalizes the DB session the same way (count + auto-end + `room:call_updated`/`room:call_ended` broadcasts).
+## Connection hygiene
 
-4. **Race condition mitigation**: The frontend registers `media:new_producer` handlers BEFORE sending `media:join`, and buffers any producer messages that arrive before transports are ready.
-
-TURN server (Coturn) is configured for NAT traversal via `ROOMLER__TURN__URL`, `ROOMLER__TURN__USERNAME`, `ROOMLER__TURN__PASSWORD`.
+- Agents keep one outbound WSS control link: WS ping every 25 s,
+  `rc:agent.heartbeat` every 30 s, exponential reconnect capped at 60 s; a 401 on
+  upgrade is fatal (re-enroll).
+- Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
+  this heals half-open sockets that TLS-inspecting middleboxes keep artificially
+  alive.
+- `rc:goodbye` close reasons distinguish *replaced by newer connection* (benign
+  restart) from *deleted / policy-rejected* (stop retrying).

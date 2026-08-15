@@ -138,7 +138,7 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
     "proto-ipv4",
     # Dual-stack: terminate the derived overlay IPv6 ULA in userspace too. On
     # `medium-ip` there is no NDP/RA (no L2), so v6 is addressing + ICMPv6 only.
-    # Inert until a node assigns a v6 address (see docs/netstack-ipv6-plan.md).
+    # Inert until a node assigns a v6 address (see docs/overlay-communication.md).
     "proto-ipv6",
     "socket-tcp",
     "socket-udp",

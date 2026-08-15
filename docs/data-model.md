@@ -1,442 +1,127 @@
 # Data Model
 
-Roomler2 uses MongoDB with 18 collections. All models use `ObjectId` for `_id` and include `created_at` / `updated_at` timestamps.
+MongoDB (native Rust driver, BSON documents, no ORM). *As of 0.3.0-rc.381* the
+server maintains indexes on **39 collections plus 8 stats-rollup collections**
+(`crates/db/src/indexes.rs` is the authoritative list; models live in
+`crates/db/src/models/` and — for the fleet subsystem — `crates/remote_control/src/models.rs`).
 
-## ER Diagram
+Everything is scoped by `tenant_id` (multi-tenancy) except the global registries
+called out below.
+
+## Collaboration core
 
 ```mermaid
 erDiagram
-    User ||--o{ TenantMember : "belongs to"
-    Tenant ||--o{ TenantMember : "has"
-    Tenant ||--o{ Role : "defines"
-    Tenant ||--o{ Room : "contains"
-    Tenant ||--o{ Invite : "issues"
-    Tenant ||--o{ AuditLog : "tracks"
-    Tenant ||--o{ CustomEmoji : "owns"
-    TenantMember }o--o{ Role : "assigned"
-    Room ||--o{ RoomMember : "has"
-    Room ||--o{ Message : "contains"
-    Room ||--o{ CallChatMessage : "has in-call chat"
-    Room o|--o| Room : "parent_id"
-    User ||--o{ RoomMember : "joins"
-    Message ||--o{ Reaction : "receives"
-    Message o|--o| Message : "thread_id"
-    Room ||--o{ Recording : "produces"
-    Tenant ||--o{ File : "stores"
-    Tenant ||--o{ BackgroundTask : "runs"
-    User ||--o{ Notification : "receives"
+    tenants ||--o{ tenant_members : "has members"
+    users ||--o{ tenant_members : "joins"
+    tenants ||--o{ roles : defines
+    roles ||--o{ tenant_members : "assigned to"
+    tenants ||--o{ rooms : contains
+    rooms ||--o{ rooms : "parent/child"
+    rooms ||--o{ room_members : has
+    rooms ||--o{ messages : holds
+    messages ||--o{ messages : "thread replies"
+    messages ||--o{ reactions : receives
+    rooms ||--o{ recordings : records
+    rooms ||--o{ call_sessions : hosts
+    tenants ||--o{ files : stores
+    tenants ||--o{ invites : issues
+    tenants ||--o{ background_tasks : runs
+    users ||--o{ notifications : receives
+    users ||--o{ push_subscriptions : registers
+    tenants ||--o{ custom_emojis : defines
 ```
 
-## Entities
+| Collection | Purpose · key fields / indexes |
+|---|---|
+| `tenants` | Organizations. Unique `slug`; `owner_id`; plan + Stripe linkage |
+| `users` | Accounts. Unique `email`, `username`; text index on `display_name`+`username` |
+| `tenant_members` | Membership + role assignment. Unique `(tenant_id, user_id)` |
+| `roles` | 24-bit permission bitfield. Unique `(tenant_id, name)`, ordered by `position` |
+| `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags` |
+| `room_members` | Per-room membership |
+| `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content` |
+| `reactions` | Unicode + custom-emoji reactions, keyed by `message_id` |
+| `recordings` | Call recordings; storage provider `S3`/`MinIO`/`Local` |
+| `call_sessions` | Call lifecycle rows (90 d TTL on `started_at`) |
+| `call_chat_messages` | In-call chat (no secondary indexes) |
+| `files` | Versioned uploads; uploader, room linkage |
+| `invites` | Shareable/email/batch invites; unique `code` |
+| `custom_emojis` | Tenant emoji sets |
+| `notifications` | @mention & system notifications; `is_read` |
+| `push_subscriptions` | Web-push endpoints (VAPID) |
+| `background_tasks` | Export/processing pipeline; TTL-expired |
+| `activation_codes` | Email activation; TTL on `expires_at` |
+| `stripe_events` | Stripe webhook dedupe/audit |
+| `consent_requests` | Remote-session owner-consent capability tokens |
+| `used_tokens` | Single-use JWT `jti` burn list (1 h TTL) |
 
-### User
+## Fleet: agents, remote desktop, tunnels, overlay
 
-Collection: `users`
+```mermaid
+erDiagram
+    tenants ||--o{ agents : enrolls
+    agents ||--o{ remote_sessions : serves
+    remote_sessions ||--o{ remote_audit : logs
+    agents ||--o{ agent_crashes : reports
+    agents ||--o{ agent_logs : uploads
+    agents ||--o{ exec_audit : "exec attempts"
+    tenants ||--o{ tunnel_clients : enrolls
+    tenants ||--o{ tunnel_policies : "default-deny ACL"
+    tunnel_clients ||--o{ tunnel_audit : "flow log"
+    agents ||--o{ tunnel_audit : "exit side"
+    tenants ||--|| overlay_networks : "one mesh (IPAM)"
+    overlay_networks ||--o{ overlay_nodes : leases
+    agents ||--o| overlay_nodes : "joins as"
+    tunnel_clients ||--o| overlay_nodes : "joins as"
+    tenants ||--o{ overlay_policies : "L3 ACL"
+    overlay_blocks ||--o{ overlay_networks : "carves blocks (global)"
+```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `email` | String | Unique |
-| `username` | String | Unique |
-| `display_name` | String | Display name |
-| `avatar` | Option\<String\> | Avatar URL |
-| `password_hash` | Option\<String\> | Argon2 hash (omitted in serialization) |
-| `status` | UserStatusInfo | Custom status text + emoji + expiry |
-| `presence` | Presence | `online`, `idle`, `dnd`, `offline`, `invisible` |
-| `locale` | String | Default: `en-US` |
-| `timezone` | String | Default: `UTC` |
-| `is_verified` | bool | Email verification |
-| `is_mfa_enabled` | bool | MFA flag |
-| `last_active_at` | Option\<DateTime\> | Last activity |
-| `oauth_providers` | Vec\<OAuthProvider\> | OAuth connections (provider, provider_id, tokens) |
-| `notification_preferences` | NotificationPrefs | email, push, desktop, mute_all |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-| `deleted_at` | Option\<DateTime\> | Soft delete |
+| Collection | Purpose · key fields / indexes |
+|---|---|
+| `agents` | One row per enrolled machine: name, os, version, caps (codecs/transports/rpc), exec policy, status. **Unique `(tenant_id, machine_id)`** — re-enrollment reuses the row |
+| `remote_sessions` | Remote-desktop sessions: agent, controller user, state machine, stats. 90 d TTL |
+| `remote_audit` | Per-session audit events (connect, consent, input, terminate). 90 d TTL |
+| `consent_requests` | Pending owner-consent decisions (capability token = the auth) |
+| `agent_crashes` | Crash-report ingest. 90 d TTL on `reported_at` |
+| `agent_logs` | Centralized log batches (agent + browser ingest). **7 d TTL**, text index on `lines.msg` |
+| `exec_audit` | Fleet-RPC attempt log — every exec **including refusals**. 90 d TTL |
+| `tunnel_clients` | Enrolled `roomler` CLI identities (`owner_user_id`) |
+| `tunnel_policies` | Default-deny tunnel ACL: subject × target × destination (`dst_host`) |
+| `tunnel_audit` | One row per tunnel flow (`tunnel_session_id`). 90 d TTL |
+| `overlay_networks` | **One per tenant** — the mesh IPAM row: CIDR (default carved from `100.64.0.0/10`), monotonic `next_host` cursor + `free_hosts` recycle pool, MagicDNS domain, ACL mode (`off`/`warn`/`enforce`) |
+| `overlay_nodes` | Mesh membership: overlay IP, WG pubkey, advertised + approved routes, exit-node flag. Unique `(tenant_id, machine_id)` and `(tenant_id, network_id, overlay_ip)`; **partial-unique `name`** (MagicDNS) scoped to live rows — nodes are *tombstoned*, not deleted, so a released address/name can be re-issued while history is kept |
+| `overlay_policies` | Overlay L3 ACL rules (compiled into per-node netmaps under `enforce`) |
+| `overlay_blocks` | **Global** (not tenant-scoped) registry of disjoint `/22` address blocks for multi-org; slot-unique, freed blocks quarantined |
 
-### Tenant
+## Observability & analytics
 
-Collection: `tenants`
+Raw event streams with short TTLs, rolled up hourly/daily by an in-server task
+(`$merge` on `_id`, whole-bucket replace).
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `name` | String | Organization name |
-| `slug` | String | Unique URL slug |
-| `description` | Option\<String\> | |
-| `icon` | Option\<String\> | |
-| `owner_id` | ObjectId | Creator user |
-| `plan` | Plan | `free`, `pro`, `business`, `enterprise` |
-| `features` | Vec\<String\> | Enabled feature flags |
-| `settings` | TenantSettings | locale, notifications, MFA, guest access, max_members, file_upload_limit |
-| `billing` | Option\<BillingInfo\> | customer_id, subscription_id, period_end |
-| `integrations` | Option\<IntegrationSettings\> | Google Drive, OneDrive, Dropbox OAuth credentials |
-| `is_archived` | bool | |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-| `deleted_at` | Option\<DateTime\> | Soft delete |
+| Collection | TTL | Purpose |
+|---|---|---|
+| `stats_relay` · `stats_machine` · `stats_mesh` · `stats_events` · `stats_call` · `stats_call_user` | 7 d | Raw series: relay load (by region), per-machine, mesh edges, platform events, calls, per-user call usage |
+| `stats_relay_1h` · `stats_machine_1h` · `stats_call_1h` · `stats_call_user_1h` | 90 d | Hourly rollups |
+| `stats_relay_1d` · `stats_machine_1d` · `stats_call_1d` · `stats_call_user_1d` | 730 d | Daily rollups |
+| `page_views` | 7 d | SPA route-change beacons (paths normalized server-side) |
+| `ws_sessions` | 7 d | WebSocket session bookkeeping |
 
-### TenantMember
+## Index & retention summary
 
-Collection: `tenant_members`
+| Guarantee | Where |
+|---|---|
+| Unique identity | `users.email`, `users.username`, `tenants.slug`, `(tenant_id, user_id)` membership, `(tenant_id, machine_id)` on `agents` **and** `overlay_nodes`, `(tenant_id, network_id, overlay_ip)`, partial-unique live `overlay_nodes.name`, `overlay_blocks.slot`, sparse-unique `rooms.meeting_code` |
+| Full-text search | `messages.content` · `rooms.{name,purpose,tags}` · `users.{display_name,username}` · `agent_logs.lines.msg` |
+| TTL retention | 90 d: `remote_sessions`, `remote_audit`, `tunnel_audit`, `exec_audit`, `agent_crashes`, `call_sessions`, hourly rollups · 7 d: `agent_logs`, raw stats, `page_views`, `ws_sessions` · 730 d: daily rollups · 1 h: `used_tokens` · on-expiry: `activation_codes`, `background_tasks` |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `user_id` | ObjectId | |
-| `nickname` | Option\<String\> | Tenant-specific nickname |
-| `role_ids` | Vec\<ObjectId\> | Assigned roles |
-| `joined_at` | DateTime | |
-| `is_pending` | bool | Pending acceptance |
-| `is_muted` | bool | |
-| `notification_override` | Option\<NotificationLevel\> | `all`, `mentions`, `nothing` |
-| `invited_by` | Option\<ObjectId\> | |
-| `last_seen_at` | Option\<DateTime\> | |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
+Two patterns worth knowing when touching this layer:
 
-### Role
-
-Collection: `roles`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `name` | String | Unique per tenant |
-| `description` | Option\<String\> | |
-| `color` | Option\<u32\> | Display color |
-| `position` | u32 | Sort order |
-| `permissions` | u64 | Bitfield (24 flags, see [Use Cases](use-cases.md)) |
-| `is_default` | bool | Auto-assigned to new members |
-| `is_managed` | bool | System-managed, cannot be deleted |
-| `is_mentionable` | bool | Can be @mentioned |
-| `is_hoisted` | bool | Displayed separately in member list |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-
-### Room
-
-Collection: `rooms`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `parent_id` | Option\<ObjectId\> | Parent room (for hierarchy) |
-| `name` | String | |
-| `path` | String | Unique per tenant (dot-notation hierarchy path) |
-| `emoji` | Option\<String\> | Room emoji icon |
-| `topic` | Option\<TopicInfo\> | Topic text, set_by, set_at |
-| `purpose` | Option\<String\> | |
-| `icon` | Option\<String\> | |
-| `position` | u32 | Sort order within parent |
-| `is_open` | bool | Publicly joinable (default false) |
-| `is_archived` | bool | |
-| `is_read_only` | bool | |
-| `is_default` | bool | Auto-join for new members |
-| `permission_overwrites` | Vec\<PermissionOverwrite\> | Per-role or per-user allow/deny overrides |
-| `tags` | Vec\<String\> | |
-| `media_settings` | Option\<MediaSettings\> | bitrate, user_limit, video_quality -- presence means voice/video capable |
-| `conference_settings` | Option\<ConferenceSettings\> | Call scheduling, passcode, waiting room, recurrence |
-| `conference_status` | Option\<ConferenceStatus\> | `scheduled`, `in_progress`, `ended`, `cancelled` |
-| `meeting_code` | Option\<String\> | |
-| `join_url` | Option\<String\> | |
-| `organizer_id` | Option\<ObjectId\> | Call organizer |
-| `co_organizer_ids` | Vec\<ObjectId\> | |
-| `creator_id` | ObjectId | Room creator |
-| `last_message_id` | Option\<ObjectId\> | |
-| `last_activity_at` | Option\<DateTime\> | |
-| `member_count` | u32 | |
-| `message_count` | u64 | |
-| `participant_count` | u32 | Live call participants |
-| `peak_participant_count` | u32 | |
-| `actual_start_time` | Option\<DateTime\> | |
-| `actual_end_time` | Option\<DateTime\> | |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-| `deleted_at` | Option\<DateTime\> | Soft delete |
-
-### RoomMember
-
-Collection: `room_members`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `room_id` | ObjectId | |
-| `user_id` | Option\<ObjectId\> | None for external guests |
-| `display_name` | Option\<String\> | |
-| `email` | Option\<String\> | |
-| `is_external` | bool | External guest flag |
-| `role` | Option\<ParticipantRole\> | `organizer`, `co_organizer`, `presenter`, `attendee` (only for active call participants) |
-| `sessions` | Vec\<ParticipantSession\> | Call join/leave timestamps per device |
-| `joined_at` | DateTime | |
-| `last_read_message_id` | Option\<ObjectId\> | Last message the user has read |
-| `last_read_at` | Option\<DateTime\> | |
-| `unread_count` | u32 | |
-| `mention_count` | u32 | |
-| `notification_override` | Option\<NotificationLevel\> | |
-| `is_muted` | bool | |
-| `is_pinned` | bool | Pinned in sidebar |
-| `is_video_on` | bool | Live media state |
-| `is_screen_sharing` | bool | |
-| `is_hand_raised` | bool | |
-| `total_duration` | u32 | Seconds in calls |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-
-### Message
-
-Collection: `messages`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `room_id` | ObjectId | |
-| `thread_id` | Option\<ObjectId\> | Parent message (if reply in thread) |
-| `is_thread_root` | bool | Whether this message started a thread |
-| `thread_metadata` | Option\<ThreadMetadata\> | reply_count, last_reply_at, participant_ids, is_locked, is_archived |
-| `author_id` | ObjectId | |
-| `author_type` | AuthorType | `user`, `bot`, `webhook`, `system` |
-| `content` | String | |
-| `content_type` | ContentType | `text`, `markdown`, `rich_text` |
-| `message_type` | MessageType | `default`, `system_join`, `system_leave`, `system_pin`, `call`, `reply` |
-| `embeds` | Vec\<Embed\> | URL previews, rich embeds |
-| `attachments` | Vec\<MessageAttachment\> | file_id, filename, content_type, size, url |
-| `mentions` | Mentions | users, roles, channels, everyone, here |
-| `reaction_summary` | Vec\<ReactionSummary\> | emoji + count aggregation |
-| `referenced_message_id` | Option\<ObjectId\> | Quoted/replied message |
-| `is_pinned` | bool | |
-| `is_edited` | bool | |
-| `edited_at` | Option\<DateTime\> | |
-| `nonce` | Option\<String\> | Client deduplication |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-| `deleted_at` | Option\<DateTime\> | Soft delete |
-
-### Reaction
-
-Collection: `reactions`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `room_id` | ObjectId | |
-| `message_id` | ObjectId | |
-| `user_id` | ObjectId | |
-| `emoji` | EmojiRef | emoji_type (`unicode` / `custom`), value, custom_emoji_id |
-| `created_at` | DateTime | |
-
-### Recording
-
-Collection: `recordings`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `room_id` | ObjectId | |
-| `recording_type` | RecordingType | `video`, `audio`, `screen_share`, `chat_log` |
-| `status` | RecordingStatus | `processing`, `available`, `failed`, `deleted` |
-| `file` | StorageFile | provider, bucket, key, url, content_type, size, duration, resolution |
-| `started_at` | DateTime | |
-| `ended_at` | DateTime | |
-| `visibility` | Visibility | `private`, `members`, `organization` |
-| `allow_download` | bool | Default: true |
-| `expires_at` | Option\<DateTime\> | |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-| `deleted_at` | Option\<DateTime\> | Soft delete |
-
-### CallChatMessage
-
-Collection: `call_chat_messages`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `room_id` | ObjectId | |
-| `author_id` | ObjectId | |
-| `display_name` | String | |
-| `content` | String | |
-| `created_at` | DateTime | |
-
-### File
-
-Collection: `files`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `uploaded_by` | ObjectId | |
-| `context` | FileContext | context_type (message/document/profile/room), entity_id, room_id |
-| `filename` | String | |
-| `display_name` | Option\<String\> | |
-| `description` | Option\<String\> | |
-| `storage_provider` | StorageProvider | `s3`, `minio`, `local` |
-| `storage_bucket` | String | |
-| `storage_key` | String | |
-| `url` | String | |
-| `content_type` | String | MIME type |
-| `size` | u64 | Bytes |
-| `checksum` | Option\<String\> | |
-| `dimensions` | Option\<Dimensions\> | width, height (images/videos) |
-| `duration` | Option\<u32\> | Seconds (audio/video) |
-| `thumbnails` | Vec\<Thumbnail\> | size, url, width, height |
-| `version` | u32 | Default: 1 |
-| `previous_version_id` | Option\<ObjectId\> | Version chain |
-| `is_current_version` | bool | Default: true |
-| `external_source` | Option\<ExternalSource\> | provider (google_drive/onedrive/dropbox), external_id, external_url, sync_status |
-| `scan_status` | ScanStatus | `pending`, `clean`, `malware`, `skipped` |
-| `visibility` | Visibility | `private`, `members`, `organization` |
-| `recognized_content` | Option\<RecognizedContent\> | raw_text, structured_data, document_type, confidence, processed_at |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-| `deleted_at` | Option\<DateTime\> | Soft delete |
-
-### Invite
-
-Collection: `invites`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `room_id` | Option\<ObjectId\> | Room-scoped invite |
-| `code` | String | Unique invite code |
-| `inviter_id` | ObjectId | |
-| `target_email` | Option\<String\> | Specific recipient |
-| `target_user_id` | Option\<ObjectId\> | |
-| `max_uses` | Option\<u32\> | |
-| `use_count` | u32 | |
-| `expires_at` | Option\<DateTime\> | |
-| `assign_role_ids` | Vec\<ObjectId\> | Roles to assign on acceptance |
-| `status` | InviteStatus | `active`, `expired`, `revoked`, `exhausted` |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-
-### BackgroundTask
-
-Collection: `background_tasks`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `user_id` | ObjectId | |
-| `task_type` | String | |
-| `category` | TaskCategory | `recording`, `export`, `import`, `recognition` |
-| `status` | TaskStatus | `pending`, `processing`, `completed`, `failed`, `expired` |
-| `params` | JSON | Task-specific parameters |
-| `logs` | Vec\<String\> | Execution logs |
-| `progress` | u8 | 0-100 |
-| `file_path` | Option\<String\> | Output file path |
-| `file_name` | Option\<String\> | Output file name |
-| `error` | Option\<String\> | Error message if failed |
-| `started_at` | Option\<DateTime\> | |
-| `completed_at` | Option\<DateTime\> | |
-| `expires_at` | DateTime | |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-
-### AuditLog
-
-Collection: `audit_logs`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `actor_id` | Option\<ObjectId\> | Who performed the action |
-| `actor_type` | ActorType | `user`, `bot`, `system`, `webhook` |
-| `action` | String | e.g. `room.create`, `message.delete` |
-| `target_type` | String | e.g. `room`, `message` |
-| `target_id` | Option\<ObjectId\> | |
-| `changes` | Vec\<AuditChange\> | field, old_value, new_value |
-| `metadata` | AuditMetadata | ip, user_agent, reason |
-| `created_at` | DateTime | |
-
-### Notification
-
-Collection: `notifications`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `user_id` | ObjectId | Recipient |
-| `notification_type` | NotificationType | `message`, `mention`, `reaction`, `invite`, `call`, `task_complete` |
-| `title` | String | |
-| `body` | String | |
-| `link` | Option\<String\> | Deep link |
-| `source` | NotificationSource | entity_type, entity_id, actor_id |
-| `is_read` | bool | |
-| `read_at` | Option\<DateTime\> | |
-| `created_at` | DateTime | |
-
-### CustomEmoji
-
-Collection: `custom_emojis`
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `_id` | ObjectId | Primary key |
-| `tenant_id` | ObjectId | |
-| `name` | String | Unique per tenant |
-| `image_url` | String | |
-| `is_animated` | bool | |
-| `creator_id` | ObjectId | |
-| `allowed_role_ids` | Option\<Vec\<ObjectId\>\> | Restrict to specific roles |
-| `created_at` | DateTime | |
-| `updated_at` | DateTime | |
-
-## Indexes
-
-| Collection | Keys | Unique |
-|------------|------|--------|
-| `tenants` | `{ slug: 1 }` | Yes |
-| `tenants` | `{ owner_id: 1 }` | No |
-| `users` | `{ email: 1 }` | Yes |
-| `users` | `{ username: 1 }` | Yes |
-| `tenant_members` | `{ tenant_id: 1, user_id: 1 }` | Yes |
-| `tenant_members` | `{ user_id: 1 }` | No |
-| `roles` | `{ tenant_id: 1, name: 1 }` | Yes |
-| `roles` | `{ tenant_id: 1, position: 1 }` | No |
-| `rooms` | `{ tenant_id: 1, parent_id: 1, position: 1 }` | No |
-| `rooms` | `{ tenant_id: 1, path: 1 }` | Yes |
-| `rooms` | `{ tenant_id: 1, name: 1 }` | No |
-| `rooms` | `{ tenant_id: 1, is_default: 1 }` | No |
-| `rooms` | `{ meeting_code: 1 }` | Yes |
-| `rooms` | `{ tenant_id: 1, conference_status: 1 }` | No |
-| `rooms` | `{ organizer_id: 1 }` | No |
-| `room_members` | `{ room_id: 1, user_id: 1 }` | Yes |
-| `room_members` | `{ user_id: 1, tenant_id: 1 }` | No |
-| `messages` | `{ room_id: 1, created_at: -1 }` | No |
-| `messages` | `{ thread_id: 1, created_at: 1 }` | No |
-| `messages` | `{ tenant_id: 1, author_id: 1, created_at: -1 }` | No |
-| `messages` | `{ room_id: 1, is_pinned: 1 }` | No |
-| `messages` | `{ mentions.users: 1 }` | No |
-| `reactions` | `{ message_id: 1, emoji.value: 1, user_id: 1 }` | Yes |
-| `call_chat_messages` | `{ room_id: 1, created_at: 1 }` | No |
-| `recordings` | `{ room_id: 1, recording_type: 1 }` | No |
-| `recordings` | `{ tenant_id: 1, status: 1 }` | No |
-| `files` | `{ tenant_id: 1, context.context_type: 1, context.entity_id: 1 }` | No |
-| `files` | `{ tenant_id: 1, uploaded_by: 1, created_at: -1 }` | No |
-| `files` | `{ tenant_id: 1, context.room_id: 1, created_at: -1 }` | No |
-| `files` | `{ external_source.provider: 1, external_source.external_id: 1 }` | No |
-| `invites` | `{ code: 1 }` | Yes |
-| `invites` | `{ tenant_id: 1, status: 1 }` | No |
-| `background_tasks` | `{ tenant_id: 1, user_id: 1, status: 1 }` | No |
-| `audit_logs` | `{ tenant_id: 1, created_at: -1 }` | No |
-| `audit_logs` | `{ tenant_id: 1, action: 1, created_at: -1 }` | No |
-| `audit_logs` | `{ tenant_id: 1, actor_id: 1, created_at: -1 }` | No |
-| `notifications` | `{ user_id: 1, is_read: 1, created_at: -1 }` | No |
-| `notifications` | `{ tenant_id: 1, user_id: 1 }` | No |
-| `custom_emojis` | `{ tenant_id: 1, name: 1 }` | Yes |
+- **Tombstones over deletes** in `overlay_nodes`: release paths CAS a tombstone
+  *first* (the CAS win is the release token), then return the host number to the
+  pool, then fan `netmap_delta{removes}` — that order is load-bearing; see the
+  address-lease section of [overlay-communication.md](overlay-communication.md).
+- **Hand-built updates must name every field** — the DAO layer builds `doc!{}`
+  updates explicitly, so adding a model field means adding it to the DAO update or
+  it silently never persists.

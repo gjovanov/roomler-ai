@@ -1,7 +1,7 @@
 //! VP9 profile 1 (8-bit 4:4:4) software encoder via libvpx.
 //!
 //! This is the encoder side of Phase Y (VP9 4:4:4 over RTCDataChannel),
-//! see `docs/vp9-444-plan.md`. Sits alongside the existing MF + openh264
+//! see `docs/encoders.md`. Sits alongside the existing MF + openh264
 //! cascade — the agent's caps probe decides which to advertise based on
 //! browser support + host CPU budget. Output frames are length-prefixed
 //! and shipped over a `video-bytes` DataChannel rather than a WebRTC
@@ -27,7 +27,7 @@
 //! Bound directly against `env_libvpx_sys` (raw FFI). The `vpx-encode`
 //! 0.6 wrapper hardcoded `VPX_IMG_FMT_I420` in encode() and exposed no
 //! `g_profile` setter, so profile-1 output was unreachable through it
-//! — see Y.runtime-encoder in `docs/vp9-444-plan.md`. Talking to libvpx
+//! — see the libvpx-FFI appendix in `docs/encoders.md`. Talking to libvpx
 //! directly costs ~150 LOC of unsafe but lets us configure profile + I444
 //! input + zero look-ahead + screen-content tuning, all of which matter
 //! for correctness here.
