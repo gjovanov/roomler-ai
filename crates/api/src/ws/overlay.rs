@@ -141,8 +141,41 @@ pub async fn relay_overlay_msg_from_node(
             .await;
             None
         }
+        ClientMsg::OverlayWarmRelayRequest {} => {
+            handle_overlay_warm_relay_request(state, ident).await;
+            None
+        }
         other => Some(other),
     }
+}
+
+/// C4 stage 1 — pair-less coturn creds for the node's standing WARM
+/// allocation (`docs/overlay-warm-relay.md`). Creds are keyed by the node's
+/// own id (no pair exists yet), and the grant confers NO reach: coturn
+/// permissions toward peers are opened at pairing time, and pairing still
+/// goes through the ACL-checked `relay_request` path. Request-driven only —
+/// never pushed — so it needs no hello capability flag.
+async fn handle_overlay_warm_relay_request(state: &AppState, ident: NodeIdentity) {
+    let Some(self_node) = current_node(state, ident).await else {
+        debug!(?ident, "overlay.warm_relay_request before join; ignoring");
+        return;
+    };
+    let Some(self_id) = self_node.id else { return };
+    let warm_key = self_id.to_hex();
+    let ice_servers = overlay_ice_servers(
+        state,
+        &warm_key,
+        self_node.relay_home.as_deref(),
+        self_node.relay_home.as_deref(),
+    )
+    .await;
+    debug!(node = %self_id, "overlay relay: warm-allocation creds granted");
+    send_to_node(
+        state,
+        &self_node,
+        ServerMsg::OverlayWarmRelayGrant { ice_servers },
+    )
+    .await;
 }
 
 /// Join: IPAM (allocate or rehydrate) → persist → full netmap to the
