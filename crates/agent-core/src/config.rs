@@ -158,6 +158,13 @@ pub struct AgentConfig {
     /// on success (`ROOMLER_NODE_OVERLAY_QUIC_ASYNC`). Built-in default: on.
     #[serde(default)]
     pub overlay_quic_async: Option<bool>,
+    /// Track A stage 1 — spawn the session-independent network daemon
+    /// (`roomlerd netd`) as a SECOND supervisor child. SCAFFOLD ONLY for
+    /// now: netd heartbeats and hosts nothing; the network plane still
+    /// lives in the session worker. Read by the SUPERVISOR at service
+    /// start (change needs a service restart). Built-in default: off.
+    #[serde(default)]
+    pub overlay_netd: Option<bool>,
     /// Overlay PathMonitor engagement (`ROOMLER_NODE_OVERLAY_PATHMON`):
     /// `on` (authoritative — the built-in default since PR-D's two green
     /// soaks) | `shadow` (fed + compared, legacy decides — the per-host
@@ -1154,6 +1161,7 @@ pub fn test_fixture() -> AgentConfig {
         ws_replaced_exit: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
+        overlay_netd: None,
         overlay_pathmon: None,
         overlay_route_events: None,
         overlay_route_tick_secs: None,
