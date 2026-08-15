@@ -72,6 +72,25 @@ const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
 /// alive link (3 missed RTOs) and leaves 75 s of watchdog headroom.
 const WS_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Hard bound on one session's `get_stats()` read in the heartbeat arm.
+/// webrtc-rs stats await internal ICE locks; on a peer whose network was
+/// just captured (corp-VPN connect mid-RC-session) those locks are held by
+/// tasks retransmitting into the void, and the await blocks for MINUTES —
+/// field CORPLAP-1 2026-08-15, FOUR `stalled=signaling=9xs` process deaths
+/// in one day (09:48, 13:42, 18:22, 19:13), the last two AFTER the WS
+/// writes were bounded: the freeze was never only the socket. Telemetry is
+/// decorative — a wedged peer forfeits its stats round, the loop moves on.
+const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
+
+/// Hard bound on one peer's `pc.close()` during connection teardown — the
+/// same webrtc-internals hang class as [`SESSION_STATS_BUDGET`], on the
+/// paths that run BEFORE the reconnect can start (`close_all_peers` &c.).
+/// Bounding it is safe: the P6 session-scoped teardown (arbiter dereg,
+/// display-match release) runs in `AgentPeer`'s Drop on every path, so an
+/// expired close forfeits only the polite goodbye to a peer that is
+/// unreachable anyway.
+const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
+
 /// A5 — minimum wall-vs-monotonic skew that reads as suspend/resume at a
 /// keepalive tick (mirrors the overlay runtime's `RESUME_SKEW_THRESHOLD`).
 /// Below this it's scheduler jitter; above it the host slept and the WS is
@@ -1068,7 +1087,20 @@ async fn connect_once(
                 // server folds these into `remote_sessions.stats`, which
                 // recorded zeros for every session before this.
                 for (session_id, peer) in peers.iter() {
-                    let t = peer.telemetry().await;
+                    let t = match tokio::time::timeout(SESSION_STATS_BUDGET, peer.telemetry())
+                        .await
+                    {
+                        Ok(t) => t,
+                        Err(_elapsed) => {
+                            warn!(
+                                %session_id,
+                                "session telemetry timed out — skipping its stats this \
+                                 round (wedged ICE after a network transition?)"
+                            );
+                            watchdog::tick(ctx.pump);
+                            continue;
+                        }
+                    };
                     let msg = ClientMsg::SessionStats {
                         session_id: session_id.to_hex(),
                         bytes_sent: t.bytes_sent,
@@ -1110,7 +1142,7 @@ async fn connect_once(
                 // handler is idempotent, so the echo re-running is safe.
                 info!(session_id = %sid, "viewee requested disconnect via overlay badge");
                 if let Some(peer) = peers.remove(&sid) {
-                    peer.close().await;
+                    let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
                 }
                 pending_codecs.remove(&sid);
                 pending_transports.remove(&sid);
@@ -1462,7 +1494,7 @@ async fn handle_server_msg(
             // exists (controller retry?), close it first so the browser sees
             // a clean answer.
             if let Some(old) = peers.remove(&session_id) {
-                old.close().await;
+                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, old.close()).await;
             }
 
             // Read back the codec picked by `rc:session.request`. If
@@ -1538,7 +1570,7 @@ async fn handle_server_msg(
                 Ok(s) => s,
                 Err(e) => {
                     warn!(%session_id, chain = ?e, "handle_offer failed; terminating");
-                    peer.close().await;
+                    let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
                     let _ = send_msg(
                         ws,
                         &ClientMsg::Terminate {
@@ -1583,7 +1615,7 @@ async fn handle_server_msg(
         ServerMsg::Terminate { session_id, reason } => {
             info!(%session_id, ?reason, "session terminated by server");
             if let Some(peer) = peers.remove(&session_id) {
-                peer.close().await;
+                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
             }
             // 2026-07-27 — last session gone → release the GPU-clock pin
             // (Drop resets the locked clocks).
@@ -1988,7 +2020,7 @@ async fn handle_server_msg(
         ServerMsg::TunnelTerminate { session_id, reason } => {
             info!(%session_id, ?reason, "rc:tunnel.terminate — closing peer");
             if let Some(peer) = tunnel_peers.remove(&session_id) {
-                peer.close().await;
+                let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
             }
             // The session may instead be on the QUIC data plane.
             // `AgentQuicPeer::close` is synchronous (aborts the accept
@@ -2259,7 +2291,19 @@ async fn close_all_peers(
     let count = peers.len();
     for (session_id, peer) in peers.drain() {
         indicator.hide_session(session_id.to_hex());
-        peer.close().await;
+        // Bounded ([`PEER_CLOSE_BUDGET`]): `pc.close()` hangs on webrtc
+        // internals when the network was captured mid-session — the
+        // stalled=signaling suicide class. Dropping `peer` right after
+        // runs the P6 Drop teardown either way.
+        if tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close())
+            .await
+            .is_err()
+        {
+            warn!(
+                session = %session_id,
+                "peer close timed out — dropping it (P6 Drop teardown still runs)"
+            );
+        }
     }
     info!(
         count,
@@ -2278,7 +2322,9 @@ async fn close_all_tunnel_peers(
     }
     let count = tunnel_peers.len();
     for (_, peer) in tunnel_peers.drain() {
-        peer.close().await;
+        // Same bound as `close_all_peers` — a webrtc close on a captured
+        // network must not stall the signaling loop into the watchdog.
+        let _ = tokio::time::timeout(PEER_CLOSE_BUDGET, peer.close()).await;
     }
     info!(count, "torn down agent tunnel peers on ws disconnect");
 }
