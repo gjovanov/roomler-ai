@@ -22,11 +22,10 @@ path = "src/lib.rs"
 # the overlay features, for minting a WireGuard identity at org-append time.
 [dependencies]
 # Rule shapes (DestinationRule/HostPattern/PortRange) + dst_matches for the
-# forward ACL, and OsKind for enrollment. NB this drags the mongodb driver —
-# pre-split the tray compiled it too (same crate, same route), so it is not a
-# regression; trimming remote_control behind a `server` feature is the
-# follow-up that would drop it from all agent-side binaries.
-roomler-ai-remote-control = { path = "../remote_control" }
+# forward ACL, and OsKind for enrollment. default-features = false drops the
+# `server` half (Mongo audit DAO + Hub) — P3e Phase 3 closed the "this drags
+# the mongodb driver" caveat that used to live here.
+roomler-ai-remote-control = { path = "../remote_control", default-features = false }
 # RouteDescriptor/FlowKind (the `[[tunnel_routes]]` config shape) and
 # ConfigEntry (the config surface's wire type). Leaf protocol crate.
 roomler-localapi = { path = "../localapi" }

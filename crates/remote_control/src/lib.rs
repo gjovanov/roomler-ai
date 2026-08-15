@@ -21,10 +21,19 @@
 //! bridge for N-watcher sessions lives in a sibling crate (`sfu`) and is
 //! invoked via a trait object passed into [`hub::Hub::new`].
 
+// P3e Phase 3: `audit` (the Mongo-backed DAO) and `hub` (the server-side
+// session hub, whose constructor takes an AuditSink) are SERVER-only — no
+// agent-side crate names either — and they are the only production code in
+// this crate that touches the mongodb driver. Gating them keeps the driver
+// (and ~40 transitive crates) out of every agent/CLI/tray/derp-relay binary;
+// `server` is a default feature, so api/services/tests are unchanged, and
+// agent-side consumers opt out with `default-features = false`.
+#[cfg(feature = "server")]
 pub mod audit;
 pub mod consent;
 pub mod derp_ticket;
 pub mod error;
+#[cfg(feature = "server")]
 pub mod hub;
 pub mod models;
 pub mod permissions;
@@ -36,6 +45,7 @@ pub mod turn_url;
 pub mod worker_pick;
 
 pub use error::{Error, Result};
+#[cfg(feature = "server")]
 pub use hub::Hub;
 pub use models::{Agent, AgentStatus, RemoteSession, SessionPhase};
 pub use permissions::Permissions;
