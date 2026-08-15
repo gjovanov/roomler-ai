@@ -2350,6 +2350,7 @@ impl OverlayRuntime {
                 candidates: shared.candidates.clone(),
                 stun_server: shared.stun_server.map(|s| s.to_string()),
                 nat: shared.my_nat.clone(),
+                via_public_dial: shared.via_public_dial,
                 error: shared.error.clone(),
             });
             if !shared.candidates.is_empty() {
@@ -2409,6 +2410,7 @@ impl OverlayRuntime {
                         candidates: Vec::new(),
                         stun_server: Some(stun_server.to_string()),
                         nat: None,
+                        via_public_dial: false,
                         error: Some(format!(
                             "STUN yielded no public candidate from {stun_server} \
                              ({} socket(s) probed)",
@@ -2445,6 +2447,7 @@ impl OverlayRuntime {
                         candidates: candidates.clone(),
                         stun_server: Some(stun_server.to_string()),
                         nat: my_nat.clone(),
+                        via_public_dial: false,
                         error: None,
                     });
                     info!(?candidates, ?my_nat, %stun_server, "overlay: advertising srflx candidates (NAT-traversal Phase B/C)");
@@ -2471,6 +2474,7 @@ impl OverlayRuntime {
                     candidates: Vec::new(),
                     stun_server: None,
                     nat: None,
+                    via_public_dial: false,
                     error: Some(format!("no resolvable STUN server among {stun_urls:?}")),
                 });
             }

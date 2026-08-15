@@ -1169,6 +1169,19 @@ pub fn warm_relay_enabled() -> bool {
     crate::env::flag("OVERLAY_WARM_RELAY", false)
 }
 
+/// R2 (corp-laptop program) — rescue the srflx gather via the wildcard
+/// PUBLIC-DIAL socket when every LAN-bound vantage yields nothing
+/// (`ROOMLER_NODE_OVERLAY_VPN_VANTAGE`; default **ON**). A full-tunnel
+/// endpoint VPN (field 2026-08-15: clk00017265, Cisco AnyConnect with
+/// local-LAN access disabled) filters the physical NICs BOTH directions
+/// while the tunnel itself passes UDP — so the LAN-bound socks are dead but
+/// the UNSPECIFIED-bound public dialer (routed via the captured default =
+/// the tunnel) can still reach STUN. It is queried only after every LAN
+/// vantage came up empty, so healthy hosts are byte-identical.
+pub fn vpn_vantage_enabled() -> bool {
+    crate::env::flag("OVERLAY_VPN_VANTAGE", true)
+}
+
 /// W6 phase 3 — raw-first QUIC-over-TURN upgrade
 /// (`ROOMLER_NODE_OVERLAY_QUIC_ASYNC`; default **ON**): commit the raw
 /// relay carrier immediately and run the QUIC rendezvous in the
