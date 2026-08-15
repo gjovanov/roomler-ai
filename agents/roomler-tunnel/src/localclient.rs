@@ -961,8 +961,15 @@ fn print_status(s: &NodeStatus) {
                     Some(e) => format!(", creds {e}s left"),
                     None => String::new(),
                 };
+                // C4 stage 2 — say which transport the leg rides: `tls`
+                // is the strict-corp flavor that survives a VPN capture.
+                let flavor = w
+                    .flavor
+                    .as_deref()
+                    .map(|f| format!("{f}, "))
+                    .unwrap_or_default();
                 println!(
-                    "  warm relay  {} (age {}s, {probe}{expiry})",
+                    "  warm relay  {} ({flavor}age {}s, {probe}{expiry})",
                     w.relayed.as_deref().unwrap_or("?"),
                     w.age_s.unwrap_or(0)
                 );
