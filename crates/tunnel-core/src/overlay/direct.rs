@@ -1262,8 +1262,21 @@ pub async fn resolve_stun_targets(stun_urls: &[String], exclude: &[Ipv4Addr]) ->
     if let Some(&first) = all.first() {
         out.push(first);
         // A1 — pick up to two more vantages by topological spread: a /16 no
-        // picked vantage sits in, else an unpicked IP, else any distinct
-        // endpoint (diff port).
+        // picked vantage sits in, else an unpicked IP. DISTINCT IPs ONLY —
+        // the old last-resort "any distinct endpoint (diff port)" pick is
+        // gone. Two ports on ONE server are worthless for typing (same NAT
+        // path — they can never disagree about OUR mapping honestly) and
+        // actively poisonous with coturn behind DNAT: field 2026-08-15/16,
+        // the cluster's udp/443 alias DNATs onto the SAME VM tuple as
+        // :3478, so a socket that queries both gets a conntrack reply-tuple
+        // CLASH and nf_nat is FORCED to rewrite the second flow's source
+        // port — the #487 typing line caught it red-handed
+        // (`5.9.157.221:3478=>…:43680` vs `5.9.157.221:443=>…:30151`) and
+        // every public-IP cluster node classified "symmetric", vetoing the
+        // srflx tier fleet-wide against them. Fewer than 2 distinct IPs ⇒
+        // shorter list; `classify_nat_mappings` treats <2 mappings as
+        // unknown, which stays optimistic (punch still attempted) — the
+        // honest verdict when there is only one vantage worth asking.
         let slash16 = |a: &SocketAddr| match a {
             SocketAddr::V4(v) => {
                 let o = v.ip().octets();
@@ -1278,8 +1291,7 @@ pub async fn resolve_stun_targets(stun_urls: &[String], exclude: &[Ipv4Addr]) ->
                 .or_else(|| {
                     all.iter()
                         .find(|a| !out.contains(a) && out.iter().all(|o| a.ip() != o.ip()))
-                })
-                .or_else(|| all.iter().find(|a| !out.contains(a)));
+                });
             match pick {
                 Some(&p) => out.push(p),
                 None => break,
@@ -2336,7 +2348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_stun_targets_prefers_distinct_ips_else_ports() {
+    async fn resolve_stun_targets_requires_distinct_ips() {
         // Two IP-literal URLs on distinct IPs → both returned (strongest probe).
         let t = resolve_stun_targets(
             &[
@@ -2348,7 +2360,13 @@ mod tests {
         .await;
         assert_eq!(t.len(), 2);
         assert_ne!(t[0].ip(), t[1].ip());
-        // Same IP, two ports → distinct-port fallback (still two targets).
+        // Same IP, two ports → ONE target only. Two ports on one server share
+        // the NAT path (can never honestly disagree about our mapping) and
+        // with the cluster's :443→:3478 DNAT alias the two flows COLLIDE in
+        // conntrack, forcing a source-port rewrite on the second — the false
+        // "symmetric" that vetoed the srflx tier fleet-wide (2026-08-15/16;
+        // caught by the #487 typing line). The classifier abstains below two
+        // mappings, which is the honest outcome for a one-IP vantage set.
         let t2 = resolve_stun_targets(
             &[
                 "stun:5.9.157.221:3478".to_string(),
@@ -2357,9 +2375,24 @@ mod tests {
             &[],
         )
         .await;
-        assert_eq!(t2.len(), 2);
-        assert_eq!(t2[0].ip(), t2[1].ip());
-        assert_ne!(t2[0].port(), t2[1].port());
+        assert_eq!(
+            t2.len(),
+            1,
+            "same-IP port variants must not be typing vantages"
+        );
+        // Port variants still lose to a genuine second IP: variants of the
+        // first IP never crowd out the distinct-IP pick.
+        let t2b = resolve_stun_targets(
+            &[
+                "stun:5.9.157.221:3478".to_string(),
+                "stun:5.9.157.221:443".to_string(),
+                "stun:94.130.141.98:3478".to_string(),
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(t2b.len(), 2);
+        assert_ne!(t2b[0].ip(), t2b[1].ip());
         // A single target → len 1 (the caller can't classify).
         assert_eq!(
             resolve_stun_targets(&["stun:5.9.157.221:3478".to_string()], &[])
