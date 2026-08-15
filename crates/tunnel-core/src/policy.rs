@@ -947,6 +947,7 @@ mod tests {
             status,
             last_seen_at: DateTime::now(),
             last_presence: None,
+            warm_relay_endpoint: None,
             displays: vec![],
             capabilities: AgentCaps::default(),
             access_policy: Default::default(),

@@ -426,6 +426,14 @@ pub struct Agent {
     /// live hub + Redis directory + heartbeat derivation).
     #[serde(default)]
     pub last_presence: Option<String>,
+    /// C4 stage 2 — the agent's standing warm TURN allocation's relayed
+    /// transport address (`worker-ip:port`), refreshed by every heartbeat
+    /// while a leg is live and `$unset` while none is. Stored PAIR-LESS so
+    /// a peer whose pair to this agent died can be handed a dial target
+    /// without a coordination round-trip through this agent's (possibly
+    /// captured) control WS. `None` on pre-stage-2 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_relay_endpoint: Option<String>,
     #[serde(default)]
     pub displays: Vec<DisplayInfo>,
     #[serde(default)]
