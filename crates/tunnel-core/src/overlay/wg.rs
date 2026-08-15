@@ -70,6 +70,18 @@ pub const WG_OVERHEAD: usize = 32;
 /// split and re-request). Bounded so a dead relay still falls back promptly.
 pub const QUIC_BUILD_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// W6 phase 3 — the BACKGROUND rendezvous window for the raw-first QUIC
+/// upgrade. Long enough that two unsynchronized ~60 s retry clocks MUST
+/// overlap: the server side holds one continuous `accept()` for the whole
+/// window while the client side retries `connect()` attempts inside it.
+/// The pair is never dark during this — its raw carrier committed first.
+pub const QUIC_UPGRADE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Gap between client-side connect attempts inside
+/// [`QUIC_UPGRADE_DEADLINE`] (each attempt itself runs up to
+/// [`QUIC_BUILD_TIMEOUT`], so the cycle is ~12 s).
+pub const QUIC_UPGRADE_RETRY_GAP: Duration = Duration::from_secs(4);
+
 /// Opt-in gate for the QUIC-over-TURN carrier (`ROOMLER_NODE_OVERLAY_QUIC`;
 /// legacy `ROOMLER_AGENT_OVERLAY_QUIC` still honoured — see
 /// [`crate::env::node_env`]). **Default OFF** — the raw relay is the proven
