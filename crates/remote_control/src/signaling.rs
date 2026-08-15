@@ -250,6 +250,15 @@ pub enum ClientMsg {
         /// `ServerMsg` a caller awaits).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         srflx_count: Option<u8>,
+        /// C4 stage 2 — the live warm TURN allocation's relayed transport
+        /// address (`worker-ip:port`), when one is standing. The server
+        /// stores it pair-less so a PEER whose pair to this node just died
+        /// can dial the relayed address immediately — no coordination
+        /// round-trip through this node's (possibly captured) control WS.
+        /// `None` = no live leg, or a pre-stage-2 agent. Additive
+        /// agent→server like `srflx_count`, so no capability flag.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warm_relay: Option<String>,
     },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
@@ -2091,14 +2100,16 @@ mod tests {
             active_sessions: 2,
             sys: None,
             srflx_count: Some(2),
+            warm_relay: Some("5.9.157.221:12586".into()),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.heartbeat""#));
         assert!(s.contains(r#""rss_mb":142"#));
         assert!(s.contains(r#""cpu_pct":3.25"#));
         assert!(s.contains(r#""active_sessions":2"#));
+        assert!(s.contains(r#""warm_relay":"5.9.157.221:12586""#));
         // v1 shape stays byte-identical: `sys: None` must not serialize.
-        assert!(!s.contains("sys"));
+        assert!(!s.contains(r#""sys""#));
 
         let back: ClientMsg = serde_json::from_str(&s).unwrap();
         match back {
@@ -2108,15 +2119,28 @@ mod tests {
                 active_sessions,
                 sys,
                 srflx_count,
+                warm_relay,
             } => {
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
                 assert!(sys.is_none());
                 assert_eq!(srflx_count, Some(2));
+                assert_eq!(warm_relay.as_deref(), Some("5.9.157.221:12586"));
             }
             other => panic!("wrong variant: {other:?}"),
         }
+        // A stage-1 agent omits the field — decodes as None, and a
+        // warm-less stage-2 agent's None must not serialize at all.
+        let stage1 = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":1}"#;
+        let back: ClientMsg = serde_json::from_str(stage1).unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::AgentHeartbeat {
+                warm_relay: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2177,6 +2201,7 @@ mod tests {
             // The value that matters operationally: a measured ZERO must be
             // distinguishable on the wire from an agent that doesn't report.
             srflx_count: Some(0),
+            warm_relay: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(

@@ -434,18 +434,25 @@ pub async fn handle_agent_socket(
                                 active_sessions,
                                 sys,
                                 srflx_count,
+                                warm_relay,
                                 ..
                             } = &parsed
                             {
-                                Some((*active_sessions, sys.clone(), *srflx_count))
+                                Some((*active_sessions, sys.clone(), *srflx_count, warm_relay.clone()))
                             } else {
                                 None
                             };
                             if let Err(e) = state.rc_hub.dispatch(&ctx, parsed) {
                                 warn!(%agent_id, %e, "rc:* dispatch failed (agent)");
                             }
-                            if let Some((active_sessions, sys, srflx_count)) = heartbeat_sessions {
-                                if let Err(e) = state.agents.touch_heartbeat(agent_id).await {
+                            if let Some((active_sessions, sys, srflx_count, warm_relay)) =
+                                heartbeat_sessions
+                            {
+                                if let Err(e) = state
+                                    .agents
+                                    .touch_heartbeat(agent_id, warm_relay.as_deref())
+                                    .await
+                                {
                                     warn!(%agent_id, %e, "agent touch_heartbeat failed");
                                 }
                                 if state.settings.stats.enabled {

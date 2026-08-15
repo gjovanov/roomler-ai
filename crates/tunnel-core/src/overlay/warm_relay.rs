@@ -1,10 +1,13 @@
-//! C4 stage 1 — the warm TURN/UDP allocation: loop-side state + pure
-//! helpers. **Measurement-only**: nothing routes over the allocation yet;
-//! the point of this stage is to make one sentence readable from `roomler
-//! status` after a VPN transition — "the allocation survived" (probes keep
-//! succeeding over the grandfathered flow) or "it didn't" (and why). The
-//! rendezvous use (stage 2) and same-socket cred re-allocation come only
-//! after that evidence. Design: `docs/overlay-warm-relay.md`.
+//! C4 — the warm TURN allocation: loop-side state + pure helpers.
+//! Stage 1 made the leg's survival across a VPN transition READABLE
+//! (probes over the grandfathered flow). Stage 2 PR-A adds the flavor
+//! ladder ([`WarmFlavor`]: UDP where it can work, TURNS/TCP:443 on
+//! strict-corp hosts where fresh UDP is provably dead — a leg that
+//! SURVIVES a capture) and advertises the live relayed address to the
+//! server pair-less, so PR-B's peers can dial it the moment their pair
+//! dies without a coordination round-trip through the captured host's
+//! control WS. Nothing routes over the leg until PR-B.
+//! Design: `docs/overlay-warm-relay.md`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +28,28 @@ pub(crate) const REQUEST_SPACING: Duration = Duration::from_secs(300);
 /// notice death promptly.
 pub(crate) const PROBE_SPACING: Duration = Duration::from_secs(60);
 
+/// Which transport the warm leg rides. Stage 2 (PR-A): UDP is still
+/// preferred — the corp-VPN flow-grandfathering measurement (stage 1's
+/// whole point) only exists on a UDP leg — but a strict-corp host whose
+/// fresh UDP is dead on every path (field CORPLAP-1: CP desktop policy
+/// blocks ALL fresh outbound UDP incl. 443) gets a TURNS/TCP:443 leg
+/// instead: it rides the same middlebox TLS path the control WS does and
+/// SURVIVES a VPN capture, which is exactly what a standing failover leg
+/// is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WarmFlavor {
+    Udp,
+    Tls,
+}
+
+/// Consecutive UDP establish failures before the ladder falls back to the
+/// TLS flavor.
+pub(crate) const UDP_FLAVOR_STRIKES: u8 = 2;
+
+/// Once on TLS, every Nth establishment attempt re-tries UDP so a network
+/// that regains UDP upgrades back to the measurable flavor.
+pub(crate) const RETRY_UDP_EVERY: u8 = 4;
+
 /// Async outcomes flowing back into the runtime loop from spawned work.
 pub(crate) enum WarmMsg {
     Established {
@@ -33,8 +58,12 @@ pub(crate) enum WarmMsg {
         relayed: SocketAddr,
         /// From the ephemeral username's timestamp prefix, when parseable.
         cred_expiry_epoch_s: Option<u64>,
+        flavor: WarmFlavor,
     },
-    EstablishFailed(String),
+    EstablishFailed {
+        flavor: WarmFlavor,
+        error: String,
+    },
     ProbeOk,
     ProbeFailed(String),
 }
@@ -69,6 +98,12 @@ pub(crate) struct WarmRelay {
     last_request: Option<Instant>,
     detail: Option<String>,
     lost: bool,
+    /// Flavor of the live (or last-established) leg.
+    flavor: Option<WarmFlavor>,
+    /// Consecutive UDP establish failures — the flavor-ladder input.
+    udp_establish_failures: u8,
+    /// Total establishment attempts, for the periodic UDP re-try cadence.
+    establish_attempts: u8,
     /// One INFO per grandfather episode (probe OK while srflx is NONE) —
     /// reset when the allocation is re-established.
     pub(crate) grandfather_logged: bool,
@@ -80,8 +115,10 @@ impl WarmRelay {
     }
 
     /// Time to (re)request creds? Only when nothing is live and the last
-    /// request is old enough — the caller additionally gates on srflx
-    /// being non-empty (proof UDP egress works right now).
+    /// request is old enough. (Stage 2: the caller no longer gates on
+    /// srflx — a strict-corp host with srflx permanently empty is exactly
+    /// the host that needs the TLS-flavored leg; the srflx evidence feeds
+    /// [`Self::next_flavor`] instead.)
     pub(crate) fn request_due(&self, now: Instant) -> bool {
         !self.is_live()
             && self
@@ -124,12 +161,41 @@ impl WarmRelay {
         self.probe_in_flight = true;
     }
 
+    /// Which flavor the NEXT establishment attempt should use.
+    ///
+    /// `udp_provably_dead` = the caller's live evidence that fresh UDP
+    /// cannot work right now (srflx currently empty — every vantage
+    /// including the public-dial fallback timed out). With it true there
+    /// is no point burning an attempt on a UDP allocate; the TLS leg is
+    /// the one that can exist. Otherwise UDP leads until
+    /// [`UDP_FLAVOR_STRIKES`] consecutive failures, after which TLS takes
+    /// over with a UDP re-try every [`RETRY_UDP_EVERY`]th attempt (a
+    /// network that regains UDP upgrades back to the measurable flavor).
+    pub(crate) fn next_flavor(&self, udp_provably_dead: bool) -> WarmFlavor {
+        if udp_provably_dead {
+            return WarmFlavor::Tls;
+        }
+        if self.udp_establish_failures < UDP_FLAVOR_STRIKES {
+            return WarmFlavor::Udp;
+        }
+        if self
+            .establish_attempts
+            .wrapping_add(1)
+            .is_multiple_of(RETRY_UDP_EVERY)
+        {
+            WarmFlavor::Udp
+        } else {
+            WarmFlavor::Tls
+        }
+    }
+
     pub(crate) fn apply(&mut self, msg: WarmMsg, now: Instant) -> WarmTransition {
         match msg {
             WarmMsg::Established {
                 conn,
                 relayed,
                 cred_expiry_epoch_s,
+                flavor,
             } => {
                 self.conn = Some(conn);
                 self.relayed = Some(relayed);
@@ -140,10 +206,20 @@ impl WarmRelay {
                 self.detail = None;
                 self.lost = false;
                 self.grandfather_logged = false;
+                self.flavor = Some(flavor);
+                self.establish_attempts = self.establish_attempts.wrapping_add(1);
+                if flavor == WarmFlavor::Udp {
+                    // A working UDP leg resets the ladder — UDP leads again.
+                    self.udp_establish_failures = 0;
+                }
                 WarmTransition::Established
             }
-            WarmMsg::EstablishFailed(e) => {
-                self.detail = Some(e);
+            WarmMsg::EstablishFailed { flavor, error } => {
+                self.detail = Some(error);
+                self.establish_attempts = self.establish_attempts.wrapping_add(1);
+                if flavor == WarmFlavor::Udp {
+                    self.udp_establish_failures = self.udp_establish_failures.saturating_add(1);
+                }
                 WarmTransition::EstablishFailed
             }
             WarmMsg::ProbeOk => {
@@ -190,6 +266,13 @@ impl WarmRelay {
             }
             .to_string(),
             relayed: self.relayed.map(|r| r.to_string()),
+            flavor: self.flavor.filter(|_| self.is_live()).map(|f| {
+                match f {
+                    WarmFlavor::Udp => "udp",
+                    WarmFlavor::Tls => "tls",
+                }
+                .to_string()
+            }),
             age_s: self
                 .established
                 .filter(|_| self.is_live())
@@ -230,6 +313,83 @@ mod tests {
     use super::*;
     use std::io;
 
+    /// C4 stage 2 — the flavor ladder: UDP leads (the grandfather-
+    /// measurable leg), live srflx-emptiness short-circuits to TLS, two
+    /// consecutive UDP establish failures fall back to TLS with a UDP
+    /// re-try every [`RETRY_UDP_EVERY`]th attempt, and a UDP success
+    /// resets the ladder.
+    #[test]
+    fn flavor_ladder_udp_first_tls_fallback_periodic_retry() {
+        let now = Instant::now();
+        let mut w = WarmRelay::default();
+        assert_eq!(
+            w.next_flavor(false),
+            WarmFlavor::Udp,
+            "fresh state leads UDP"
+        );
+        assert_eq!(
+            w.next_flavor(true),
+            WarmFlavor::Tls,
+            "srflx empty right now: no point burning a UDP attempt"
+        );
+        w.apply(
+            WarmMsg::EstablishFailed {
+                flavor: WarmFlavor::Udp,
+                error: "t".into(),
+            },
+            now,
+        );
+        assert_eq!(
+            w.next_flavor(false),
+            WarmFlavor::Udp,
+            "one strike still leads UDP"
+        );
+        w.apply(
+            WarmMsg::EstablishFailed {
+                flavor: WarmFlavor::Udp,
+                error: "t".into(),
+            },
+            now,
+        );
+        assert_eq!(
+            w.next_flavor(false),
+            WarmFlavor::Tls,
+            "two strikes fall back to TLS"
+        );
+        w.apply(
+            WarmMsg::EstablishFailed {
+                flavor: WarmFlavor::Tls,
+                error: "t".into(),
+            },
+            now,
+        );
+        assert_eq!(
+            w.next_flavor(false),
+            WarmFlavor::Udp,
+            "every 4th attempt re-tries UDP"
+        );
+        let t = w.apply(
+            WarmMsg::Established {
+                conn: Arc::new(NopConn),
+                relayed: "5.9.157.221:12795".parse().unwrap(),
+                cred_expiry_epoch_s: None,
+                flavor: WarmFlavor::Udp,
+            },
+            now,
+        );
+        assert_eq!(t, WarmTransition::Established);
+        assert_eq!(
+            w.next_flavor(false),
+            WarmFlavor::Udp,
+            "a UDP success resets the ladder"
+        );
+        assert_eq!(
+            w.status(now).flavor.as_deref(),
+            Some("udp"),
+            "the live flavor is surfaced"
+        );
+    }
+
     struct NopConn;
     #[async_trait::async_trait]
     impl RelayConn for NopConn {
@@ -251,6 +411,7 @@ mod tests {
                 conn: Arc::new(NopConn),
                 relayed: "5.9.157.221:12795".parse().unwrap(),
                 cred_expiry_epoch_s: Some(u64::MAX / 2),
+                flavor: WarmFlavor::Udp,
             },
             now,
         );
