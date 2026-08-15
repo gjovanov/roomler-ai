@@ -158,3 +158,108 @@ jobs:
           Write-Host "zip: $([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB  sha256=$hash"
           gh release upload vendored-ffmpeg-8.1.2 $zip "$zip.sha256" --repo "${{ github.repository }}" --clobber
           Write-Host "uploaded $(Split-Path $zip -Leaf) to vendored-ffmpeg-8.1.2"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # P3e: the Linux twin of the minimal build. The old linux64 asset was a
+  # RE-UPLOADED BtbN prebuilt (full-featured: every codec + kvazaar + vaapi,
+  # none of which the agent's cascade can dispatch — HEVC_ENCODER_NAMES is
+  # locked to hevc_nvenc/hevc_qsv/hevc_amf by a unit test). This job builds
+  # from source with the SAME component trim as the Windows overlay port and
+  # uploads `…-shared-minimal.tar.xz` next to the old asset; release-agent's
+  # Linux fetch flips one filename (rollback = flip it back). ubuntu-22.04
+  # keeps the glibc 2.34 floor the .deb documents.
+  # ────────────────────────────────────────────────────────────────────────
+  build-linux-minimal:
+    name: from-source minimal FFmpeg (linux64 shared, LGPL) + upload
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Build minimal FFmpeg (shared, encoders-only)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y nasm pkg-config cmake
+          # nvenc: header-only SDK, versioned; 12.1 supports Blackwell-era
+          # drivers while keeping the driver floor reasonable.
+          git clone --depth 1 --branch n12.1.14.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
+          make -C /tmp/nvh install PREFIX=/usr/local
+          # qsv: Intel oneVPL dispatcher (thin; the runtime comes from the
+          # host's intel-media stack). ffmpeg wants libvpl >= 2.6.
+          git clone --depth 1 --branch v2.10.2 https://github.com/intel/libvpl.git /tmp/vpl
+          cmake -S /tmp/vpl -B /tmp/vpl/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build /tmp/vpl/build -j"$(nproc)"
+          sudo cmake --install /tmp/vpl/build --prefix /usr/local
+          # amf: header-only.
+          git clone --depth 1 --branch v1.4.34 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git /tmp/amf
+          sudo mkdir -p /usr/local/include/AMF
+          sudo cp -r /tmp/amf/amf/public/include/* /usr/local/include/AMF/
+          sudo ldconfig
+
+          curl -sL -o /tmp/ffmpeg.tar.gz https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n8.1.2.tar.gz
+          mkdir -p /tmp/ffsrc && tar xf /tmp/ffmpeg.tar.gz -C /tmp/ffsrc --strip-components=1
+          cd /tmp/ffsrc
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}
+          # Same trim as the Windows overlay port: --disable-everything wipes
+          # every component; the explicit enables restore exactly the ten HW
+          # encoders the agent dispatches. Library-level: avformat kept
+          # (ffmpeg-next's `format` feature probes its .pc; rc.71),
+          # swresample kept (avcodec requires it); avdevice/avfilter/swscale
+          # dropped. --disable-autodetect keeps host libs out so the result
+          # is reproducible and dependency-clean (nvenc/vpl/amf explicit).
+          ./configure --prefix=/opt/ffout \
+            --enable-shared --disable-static --disable-programs --disable-doc \
+            --disable-autodetect \
+            --disable-everything --disable-network --disable-protocols \
+            --disable-devices --disable-filters --disable-bsfs --disable-parsers \
+            --disable-demuxers --disable-muxers --disable-decoders \
+            --disable-encoders --disable-hwaccels \
+            --disable-avdevice --disable-avfilter --disable-swscale --disable-postproc \
+            --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc,h264_qsv,hevc_qsv,av1_qsv,vp9_qsv,h264_amf,hevc_amf,av1_amf \
+            --enable-nvenc --enable-libvpl --enable-amf
+          make -j"$(nproc)"
+          sudo make install
+          echo "=== installed libs ==="
+          ls -la /opt/ffout/lib/ | grep -E "\.so"
+
+      - name: Verify the trim (runtime probe — the version script hides ff_* symbols)
+        run: |
+          set -euo pipefail
+          cat > /tmp/probe.c <<'EOC'
+          #include <libavcodec/avcodec.h>
+          #include <stdio.h>
+          #include <string.h>
+          int main(void) {
+            const char *want[] = {"h264_nvenc","hevc_nvenc","av1_nvenc","h264_qsv","hevc_qsv",
+                                  "av1_qsv","vp9_qsv","h264_amf","hevc_amf","av1_amf"};
+            for (unsigned i = 0; i < sizeof(want)/sizeof(*want); i++) {
+              if (!avcodec_find_encoder_by_name(want[i])) { fprintf(stderr, "MISSING encoder %s\n", want[i]); return 1; }
+            }
+            if (avcodec_find_decoder_by_name("h264")) { fprintf(stderr, "h264 DECODER present — trim did not take\n"); return 1; }
+            if (avcodec_find_encoder_by_name("libkvazaar")) { fprintf(stderr, "libkvazaar present — trim did not take\n"); return 1; }
+            printf("probe OK: 10 encoders present, registry trimmed\n");
+            return 0;
+          }
+          EOC
+          gcc /tmp/probe.c -o /tmp/probe \
+            -I/opt/ffout/include -L/opt/ffout/lib -lavcodec -lavutil
+          LD_LIBRARY_PATH=/opt/ffout/lib /tmp/probe
+          # LGPL-clean + no unexpected external deps beyond glibc/vpl.
+          ldd /opt/ffout/lib/libavcodec.so | grep -E "x264|x265" && { echo "::error::GPL lib linked"; exit 1; } || true
+          du -sh /opt/ffout/lib | cut -f1
+
+      - name: Package + upload the minimal shared tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Top-level dir so release-agent's `--strip-components=1` extract
+          # keeps working; the fetch step sed-rewrites the .pc prefixes.
+          staging=/tmp/stage/ffmpeg-minimal
+          mkdir -p "$staging"
+          cp -a /opt/ffout/lib /opt/ffout/include "$staging/"
+          tar cJf /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz -C /tmp/stage ffmpeg-minimal
+          sha256sum /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz | tee /tmp/min.sha256
+          ls -la /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz
+          gh release upload vendored-ffmpeg-8.1.2 \
+            /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz \
+            --repo "${{ github.repository }}" --clobber
