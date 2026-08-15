@@ -504,7 +504,7 @@ impl AgentPeer {
         let priority = Arc::new(std::sync::atomic::AtomicU8::new(
             crate::encode::priority::BALANCED,
         ));
-        // Phase Y.3 (docs/vp9-444-plan.md). When the browser opens a
+        // Phase Y.3 (docs/encoders.md). When the browser opens a
         // `video-bytes` data channel — only happens when both sides
         // negotiated `data-channel-vp9-444` transport in caps — we
         // stash the DC handle here so the media pump can write
@@ -1640,7 +1640,7 @@ fn addr_is_overlay_range(addr: &str) -> bool {
 /// alternate fast-path that builds a libvpx Vp9Encoder, length-prefixes
 /// each encoded frame, and writes them into the `video-bytes`
 /// RTCDataChannel that the controller opened (see peer.rs line ~494
-/// `on_data_channel` arm and `docs/vp9-444-plan.md` for the wire
+/// `on_data_channel` arm and `docs/encoders.md` for the wire
 /// format). The webrtc track stays bound but receives no samples in
 /// that mode — the browser side renders from the worker-decoded
 /// canvas instead of `<video>`.
@@ -5030,7 +5030,7 @@ fn attach_input_handler(
             // SE_TCB privilege, so SendInput CAN reach Winlogon's
             // input desktop. This is the "drive lock screen
             // remotely" path documented in
-            // `docs/remote-control-m3-elevated-switching.md`
+            // `docs/remote-control.md (§19 appendix)`
             // Change C ("refine the suppression policy under
             // SystemContext").
             if !sys_ctx_worker

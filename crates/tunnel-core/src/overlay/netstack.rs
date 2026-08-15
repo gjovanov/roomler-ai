@@ -1150,7 +1150,7 @@ impl Netstack {
     /// Dual-stack: the iface also gets this node's *derived* overlay IPv6
     /// ([`derive_overlay_v6`]) on the ULA `/96`, so a v6 peer address routes and
     /// answers ICMPv6 with no server allocation — inert until a surface targets
-    /// it (see `docs/netstack-ipv6-plan.md`).
+    /// it (see `docs/overlay-communication.md`).
     pub fn start(self_ip: Ipv4Addr, prefix: u8, mtu: u16) -> Self {
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let (in_tx, in_rx) = mpsc::unbounded_channel();

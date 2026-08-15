@@ -106,7 +106,7 @@ sequenceDiagram
         A->>B: WG handshake INITs (retransmit ~5 s for ~90 s)
         B->>A: WG handshake INITs
     end
-    Note over A,B: first packets open each NAT's outbound mapping;<br/>crossing INITs complete the punch — WG itself IS the punch burst
+    Note over A,B: first packets open each NAT's outbound mapping —<br/>crossing INITs complete the punch (WG itself IS the punch burst)
     A-->>B: direct carrier established (srflx tier)
 ```
 

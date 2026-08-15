@@ -113,7 +113,7 @@ openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 
 # VP9 4:4:4 encoder via libvpx. Feature-gated `vp9-444` because the
 # build pulls in C compilation of libvpx (~30 s first build) and a
-# small bindgen layer. See docs/vp9-444-plan.md for why we pick VP9
+# small bindgen layer. See docs/encoders.md for why we pick VP9
 # profile 1 over AV1/HEVC for screen-content 4:4:4.
 #
 # We bind env-libvpx-sys directly rather than going through the
@@ -363,7 +363,7 @@ mf-encoder = ["dep:windows"]
 # `mf-encoder`.
 wgc-capture = ["dep:windows"]
 # Enables the libvpx VP9 4:4:4 software encoder for the
-# DataChannel-bypass video transport (docs/vp9-444-plan.md). Pulls
+# DataChannel-bypass video transport (docs/encoders.md). Pulls
 # in a C build of libvpx and the dcv_color_primitives SIMD colour
 # converter. ~30 s extra cold build, ~10 s incremental.
 vp9-444 = ["dep:env-libvpx-sys", "dep:dcv-color-primitives"]
@@ -434,7 +434,7 @@ synthetic-frame-source = []
 # with `hevc_qsv` / `vp9_qsv` symbols reachable. MSI size delta is
 # measured; >+8 MB compressed = HARD STOP and re-plan.
 #
-# Phased rollout documented in `docs/hevc-dc-plan.md`.
+# Phased rollout documented in `docs/encoders.md`.
 # rc.75 hotfix: ffmpeg-encoder needs dcv_color_primitives for BGRA→NV12.
 # Previously only `vp9-444` pulled the dep in, so the CI link-verify test
 # step that runs with `--features ffmpeg-encoder` alone hit
