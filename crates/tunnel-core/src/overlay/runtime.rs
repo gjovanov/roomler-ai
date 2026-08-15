@@ -1964,21 +1964,31 @@ impl OverlayRuntime {
             // Pass our LAN endpoints so the relay-endpoint trickle re-includes
             // them (the server replaces, so they'd otherwise be clobbered —
             // rc.135). Empty when the direct path is off.
-            CarrierMode::Relay => Some(RelayCoordinator::new(
-                self.outbound.clone(),
-                self.keypair.public.to_bytes(),
-                // Phase D — we can be the raw-UDP single-relay DIALER only if our
-                // own srflx gather succeeded (proof raw UDP to coturn works). A
-                // UDP-blocked host gathered none ⇒ it can only be the ANCHOR
-                // (TURNS/TCP allocation). The peer's equivalent is read off the
-                // netmap's `srflx_endpoints`, so the role choice is symmetric.
-                !srflx_advertised.is_empty(),
-                direct_ctx
-                    .as_ref()
-                    .map(|c| c.endpoints.clone())
-                    .unwrap_or_default(),
-                derp_mux,
-            )),
+            CarrierMode::Relay => {
+                let mut r = RelayCoordinator::new(
+                    self.outbound.clone(),
+                    self.keypair.public.to_bytes(),
+                    // Phase D — we can be the raw-UDP single-relay DIALER only if our
+                    // own srflx gather succeeded (proof raw UDP to coturn works). A
+                    // UDP-blocked host gathered none ⇒ it can only be the ANCHOR
+                    // (TURNS/TCP allocation). The peer's equivalent is read off the
+                    // netmap's `srflx_endpoints`, so the role choice is symmetric.
+                    !srflx_advertised.is_empty(),
+                    direct_ctx
+                        .as_ref()
+                        .map(|c| c.endpoints.clone())
+                        .unwrap_or_default(),
+                    derp_mux,
+                );
+                // W6 phase-2 — the full coturn worker IP set (uncapped
+                // A-record resolve of the STUN hosts): the single-relay
+                // dialer positively identifies the anchor's relayed address
+                // with it; a NAT-less anchor's host addresses are public too,
+                // and dialing one was the rx=0 QUIC rendezvous bug. One
+                // resolve at startup; empty (DNS failure) = legacy pick.
+                r.set_coturn_ips(direct::resolve_stun_worker_ips(&network.stun_urls).await);
+                Some(r)
+            }
             CarrierMode::Direct(_) => None,
         };
         // rc.211 — off-loop relay carrier builds (see `RelayBuildQueue`).
