@@ -237,10 +237,16 @@ jobs:
           # FFmpeg 6.1, but `ffmpeg-next = 8.1` needs 8.x.
           gh release download vendored-ffmpeg-8.1.2 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-8.1.2-linux64-lgpl-shared.tar.xz' \
+            --pattern 'ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz' \
             --dir /tmp/ffdl
+          # P3e lever B (Linux twin): the MINIMAL from-source build — the ten
+          # HW encoders + their parsers, nothing else (whole lib dir 2.5 MB
+          # vs ~50 MB of libav* in the old BtbN re-upload; the agent's
+          # cascade is locked to nvenc/qsv/amf by a unit test, so kvazaar/
+          # vaapi/every-decoder were unreachable). Vendor job's runtime probe
+          # asserts the encoder set; rollback = drop the `-minimal` suffix.
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-8.1.2-linux64-lgpl-shared.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
           # it to our extract path so pkg-config emits correct -L/-I flags.
@@ -341,7 +347,16 @@ jobs:
             soname=$(patchelf --print-soname "$real")
             [ -f "$dst/$soname" ] || echo "skipping unreferenced vendored lib: $soname"
           done
-          [ "$copied" -ge 3 ] || { echo "::error::only $copied vendored FFmpeg libs matched — expected at least avcodec/avformat/avutil; the keep-set derivation is broken"; exit 1; }
+          # Floor = avcodec + avutil. With the MINIMAL vendored build the
+          # linker's --as-needed drops even avformat AND swresample from
+          # DT_NEEDED (the trimmed avcodec's pulled code never calls them;
+          # .pc Requires is a link-time statement, not a runtime one) — the
+          # first minimal rehearsal proved copied=2 is the correct steady
+          # state, and the earlier ">= 3" guard encoded the FULL build's
+          # linkage as law. Correctness is owned by the stock-24.04 load
+          # check below; this guard only catches a broken derivation (0-1
+          # matches = ldd/soname parsing went wrong).
+          [ "$copied" -ge 2 ] || { echo "::error::only $copied vendored FFmpeg libs matched — expected at least avcodec+avutil; the keep-set derivation is broken"; exit 1; }
           # The agent binary ITSELF dynamically links libvpx.so.7 (the `vp9-444`
           # VP9 software encoder — env-libvpx-sys links this build runner's
           # libvpx-dev, which is 1.12 / libvpx.so.7 on ubuntu-22.04). Stock
