@@ -64,7 +64,18 @@ pub const DIRECT_PORT_BAND: u16 = 8;
 /// the SAME port (no SO_REUSEADDR — its Windows UDP semantics allow unsafe
 /// double delivery), so it needs its own band, far enough away that a LAN
 /// walk can never run into it.
-pub const PUBLIC_DIAL_PORT_OFFSET: u16 = 32;
+///
+/// 128 (was 32, 2026-08-15): the agent now DERIVES its default base from
+/// the machine id — 16 slots of stride 8 spanning `43648..=43768` — so two
+/// nodes behind ONE NAT pick distinct stable ports by construction (the
+/// household-siblings collision: only one host's external 43648 could be
+/// destination-independent; the other's srflx went per-destination and
+/// every inbound punch landed on the sibling). The old +32 put slot 0's
+/// public band INSIDE slot 4's direct band; +128 lands every public band
+/// in `43776..43903`, disjoint from all 16 direct bands and from each
+/// other. Public-dial flows are cold in the field (rx=0 on every host
+/// inspected), so the one-time port move on upgrade costs nothing.
+pub const PUBLIC_DIAL_PORT_OFFSET: u16 = 128;
 
 /// The stable-port candidates for one socket, in a FIXED order: the same
 /// host re-binds the same port after a restart as long as availability is
