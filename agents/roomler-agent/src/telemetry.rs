@@ -246,6 +246,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            warm_relay: None,
             direct_socks: Vec::new(),
         };
         let out = s.sample(&view, (0, 0));
@@ -281,6 +282,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            warm_relay: None,
             direct_socks: Vec::new(),
         };
         let out = s.sample(&view, (0, 0));
@@ -316,6 +318,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            warm_relay: None,
             direct_socks: Vec::new(),
         };
         let out = s.sample(&view, (0, 0));
@@ -355,6 +358,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            warm_relay: None,
             direct_socks: Vec::new(),
         };
         let out = s.sample(&view, (0, 0));

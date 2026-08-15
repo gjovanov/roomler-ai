@@ -841,6 +841,17 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         derp_mux_failed: bool,
     },
+
+    /// C4 stage 1 — pair-less coturn credentials for the node's standing
+    /// WARM allocation (one TURN/UDP allocation established while UDP
+    /// works and kept alive so corp-VPN flow-grandfathering preserves a
+    /// UDP relay leg — see `docs/overlay-warm-relay.md`). Request-driven,
+    /// so no hello capability flag is needed: an agent that predates the
+    /// feature never sends this, and therefore never sees the grant.
+    /// The grant itself confers no reach — per-peer permissions still go
+    /// through the ACL-checked `rc:overlay.relay_request` at pairing time.
+    #[serde(rename = "rc:overlay.warm_relay_request")]
+    OverlayWarmRelayRequest {},
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1412,6 +1423,15 @@ pub enum ServerMsg {
         peer_node_id: ObjectId,
         pair_key: String,
     },
+
+    /// C4 stage 1 — reply to `rc:overlay.warm_relay_request`: ephemeral
+    /// coturn creds keyed by the requesting node itself (no pair). The
+    /// agent allocates over TURN/UDP and keeps the allocation alive; cred
+    /// expiry is derivable client-side from the ephemeral username's
+    /// timestamp prefix. Only ever sent in reply, never pushed — that is
+    /// what exempts it from the hello-capability-flag rule.
+    #[serde(rename = "rc:overlay.warm_relay_grant")]
+    OverlayWarmRelayGrant { ice_servers: Vec<IceServer> },
 
     /// P7 (corp-DERP fallback) — the server observed sustained TURN-relay
     /// churn for this pair (repeated grant→re-request cycles: a corp
@@ -3375,6 +3395,29 @@ mod tests {
             !serde_json::to_string(&none_nat).unwrap().contains("nat"),
             "a None nat must be omitted on the wire"
         );
+    }
+
+    /// C4 stage 1 — the warm-relay request/grant pair's wire tags are
+    /// LOCKED (request-driven, so no hello capability flag exists to catch
+    /// a tag drift — the tag itself is the contract).
+    #[test]
+    fn warm_relay_wire_roundtrip() {
+        let m = ClientMsg::OverlayWarmRelayRequest {};
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains("\"rc:overlay.warm_relay_request\""), "{s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::OverlayWarmRelayRequest {} => {}
+            other => panic!("roundtrip mismatch: {other:?}"),
+        }
+        let g = ServerMsg::OverlayWarmRelayGrant {
+            ice_servers: vec![],
+        };
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(s.contains("\"rc:overlay.warm_relay_grant\""), "{s}");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayWarmRelayGrant { ice_servers } => assert!(ice_servers.is_empty()),
+            other => panic!("roundtrip mismatch: {other:?}"),
+        }
     }
 
     #[test]
