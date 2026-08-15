@@ -401,7 +401,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          scripts/stage-linux-tarball.sh "$version" x86_64-unknown-linux-gnu
+          sh scripts/stage-linux-tarball.sh "$version" x86_64-unknown-linux-gnu
           echo "artifact=roomler-agent-${version}-x86_64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
@@ -529,7 +529,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          scripts/stage-linux-tarball.sh "$version" aarch64-unknown-linux-gnu
+          sh scripts/stage-linux-tarball.sh "$version" aarch64-unknown-linux-gnu
           echo "artifact=roomler-agent-${version}-aarch64-unknown-linux-gnu.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
