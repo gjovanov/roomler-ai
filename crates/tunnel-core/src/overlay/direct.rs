@@ -65,26 +65,50 @@ pub const DIRECT_PORT_BAND: u16 = 8;
 /// double delivery), so it needs its own band, far enough away that a LAN
 /// walk can never run into it.
 ///
-/// 128 (was 32, 2026-08-15): the agent now DERIVES its default base from
-/// the machine id — 16 slots of stride 8 spanning `43648..=43768` — so two
-/// nodes behind ONE NAT pick distinct stable ports by construction (the
-/// household-siblings collision: only one host's external 43648 could be
-/// destination-independent; the other's srflx went per-destination and
-/// every inbound punch landed on the sibling). The old +32 put slot 0's
-/// public band INSIDE slot 4's direct band; +128 lands every public band
-/// in `43776..43903`, disjoint from all 16 direct bands and from each
-/// other. Public-dial flows are cold in the field (rx=0 on every host
-/// inspected), so the one-time port move on upgrade costs nothing.
-pub const PUBLIC_DIAL_PORT_OFFSET: u16 = 128;
+/// 256 (was 32, then 128, 2026-08-15): the agent DERIVES its default base
+/// from the machine id — 32 slots of stride 8 spanning `43648..=43896` —
+/// so two nodes behind ONE NAT pick distinct stable ports by construction
+/// (the household-siblings collision: only one host's external 43648
+/// could be destination-independent; the other's srflx went
+/// per-destination and every inbound punch landed on the sibling). The
+/// offset must clear the WHOLE derived direct region: +256 lands every
+/// public band in `43904..44159`, disjoint from all 32 direct bands and
+/// from each other. Public-dial flows are cold in the field (rx=0 on
+/// every host inspected), so the one-time port move on upgrade costs
+/// nothing.
+pub const PUBLIC_DIAL_PORT_OFFSET: u16 = 256;
+
+/// Fallback jump when a base's ENTIRE walk band is locally unbindable
+/// (a Hyper-V/WSL dynamic reservation swallowing all 8 ports — the zones
+/// MOVE between boots): before surrendering to ephemeral ports (which
+/// forfeits 5-tuple stability), [`direct_port_candidates`] retries the
+/// same walk in a SECOND region at `base + 512`. The jump clears the
+/// whole primary layout (direct `43648..43903` + public `43904..44159`),
+/// landing band-2 direct in `44160..44415` and its public twin in
+/// `44416..44671` — all still under the ~49152 dynamic-range floor and
+/// far above the measured 41000-41800 reservation cluster. Siblings stay
+/// de-conflicted in band 2 because the slot offset is preserved.
+pub const SECOND_BAND_OFFSET: u16 = 512;
 
 /// The stable-port candidates for one socket, in a FIXED order: the same
 /// host re-binds the same port after a restart as long as availability is
 /// unchanged — which is the whole point (a reproducible UDP 5-tuple that a
 /// stateful corp firewall keeps treating as the flow it already
 /// grandfathered). `base == 0` yields nothing (ephemeral opt-out).
+///
+/// Walks the primary band, then the SAME walk in the second derived
+/// region (`base + `[`SECOND_BAND_OFFSET`]) — a dynamic Hyper-V/WSL
+/// reservation that swallows the whole primary band costs a region jump,
+/// not the stable-port feature. Fixed order both times, so band-2 binds
+/// are just as reproducible across restarts.
 pub fn direct_port_candidates(base: u16) -> impl Iterator<Item = u16> + Clone {
     let n = if base == 0 { 0 } else { DIRECT_PORT_BAND };
-    (0..n).filter_map(move |i| base.checked_add(i))
+    (0..n)
+        .filter_map(move |i| base.checked_add(i))
+        .chain((0..n).filter_map(move |i| {
+            base.checked_add(SECOND_BAND_OFFSET)
+                .and_then(|b| b.checked_add(i))
+        }))
 }
 
 /// Stable UDP port for the overlay's direct sockets
@@ -122,7 +146,8 @@ pub fn direct_port() -> u16 {
 /// Largest accepted `overlay_direct_port` base — the whole public-dial band
 /// must still fit under 65535. Mirrored by the agent's config-surface
 /// validation.
-pub const MAX_DIRECT_PORT_BASE: u16 = u16::MAX - PUBLIC_DIAL_PORT_OFFSET - DIRECT_PORT_BAND;
+pub const MAX_DIRECT_PORT_BASE: u16 =
+    u16::MAX - SECOND_BAND_OFFSET - PUBLIC_DIAL_PORT_OFFSET - DIRECT_PORT_BAND;
 
 /// Enumerate this node's usable LAN IPv4 addresses across **all** interfaces,
 /// so a multi-homed host advertises every LAN endpoint and a peer matches
@@ -1514,6 +1539,26 @@ mod tests {
         }
     }
 
+    /// Band-2 fallback: the candidate walk covers the primary band, then
+    /// the SAME walk at `base + SECOND_BAND_OFFSET` — a Hyper-V/WSL
+    /// reservation swallowing all 8 primary ports costs a region jump,
+    /// not the stable-port feature. Fixed order, so band-2 binds are just
+    /// as reproducible across restarts; `0` stays the ephemeral opt-out.
+    #[test]
+    fn candidates_walk_the_primary_band_then_the_second_region() {
+        let got: Vec<u16> = direct_port_candidates(43648).collect();
+        let mut expect: Vec<u16> = (43648..43656).collect();
+        expect.extend(44160..44168);
+        assert_eq!(got, expect);
+        assert_eq!(
+            direct_port_candidates(0).count(),
+            0,
+            "ephemeral opt-out yields nothing"
+        );
+        // Near the top of u16 the chain must saturate, never wrap.
+        assert!(direct_port_candidates(u16::MAX - 4).all(|p| p >= u16::MAX - 4));
+    }
+
     /// rc.307 — stable direct-port resolution: unset → the built-in default;
     /// a number → itself; `0` → ephemeral opt-out; 65535 (would overflow the
     /// public dialer's `port+1`) and garbage → the default, NEVER silently
@@ -1566,9 +1611,21 @@ mod tests {
     #[test]
     fn direct_port_candidates_walk_in_fixed_order() {
         let c: Vec<u16> = direct_port_candidates(43648).collect();
-        assert_eq!(c.len(), DIRECT_PORT_BAND as usize);
+        // Two bands now: the primary walk, then the SAME walk at
+        // base+SECOND_BAND_OFFSET (see candidates_walk_the_primary_band…).
+        assert_eq!(c.len(), 2 * DIRECT_PORT_BAND as usize);
         assert_eq!(c[0], 43648, "the base must be tried FIRST (stability)");
-        assert!(c.windows(2).all(|w| w[1] == w[0] + 1), "consecutive: {c:?}");
+        assert!(
+            c[..DIRECT_PORT_BAND as usize]
+                .windows(2)
+                .all(|w| w[1] == w[0] + 1),
+            "primary band consecutive: {c:?}"
+        );
+        assert_eq!(
+            c[DIRECT_PORT_BAND as usize],
+            43648 + SECOND_BAND_OFFSET,
+            "band 2 starts at the derived jump"
+        );
         assert_eq!(
             direct_port_candidates(43648).collect::<Vec<_>>(),
             c,
@@ -1579,7 +1636,8 @@ mod tests {
             0,
             "0 = ephemeral opt-out: no stable candidates"
         );
-        // Never overflows off the end of the port space.
+        // Never overflows off the end of the port space (band 2 saturates
+        // away entirely up here).
         assert!(direct_port_candidates(u16::MAX).all(|p| p >= u16::MAX - DIRECT_PORT_BAND));
     }
 
