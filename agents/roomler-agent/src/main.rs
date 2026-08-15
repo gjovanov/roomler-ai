@@ -1577,6 +1577,18 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 fallbacks.insert(suffix.to_string(), v.to_string());
             }
         }
+        // Sibling-safe stable-port default (2026-08-15: both household
+        // laptops pinned the fleet-wide 43648 behind ONE Fritz!Box — the
+        // loser's srflx went per-destination and every inbound punch hit
+        // the sibling ⇒ relay-locked pairs). Applied ONLY when the
+        // operator left the key unset; like every bridge entry this is a
+        // FALLBACK — an explicit config value or a real env var wins.
+        if cfg.overlay_direct_port.is_none() {
+            fallbacks.insert(
+                "OVERLAY_DIRECT_PORT".to_string(),
+                config::derived_default_direct_port(&cfg.machine_id).to_string(),
+            );
+        }
         // PR-D — overlay_pathmon is multi-state (on|shadow|off), so it rides
         // the fallback map as a string, not the bool pairs above.
         if let Some(mode) = &cfg.overlay_pathmon {
