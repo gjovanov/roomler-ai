@@ -183,10 +183,25 @@ audiopus = { version = "0.3.0-rc.0", optional = true }
 # codec/packet/packet.rs reference libavformat symbols that aren't
 # gated by the codec feature. Switched to defaults (codec + format +
 # filter + device + sw-scaling + sw-resampling) AND extended the vcpkg
-# manifest with avformat/avfilter/avdevice to match. MSI larger than
-# the original +6 MB estimate; future RC can narrow once feature
-# gating is fixed upstream.
-ffmpeg-next = { version = "8.1", optional = true }
+# manifest with avformat/avfilter/avdevice to match.
+#
+# P3e lever A (rc.368): narrowed to `codec + format` — the rc.71 breakage
+# was codec-ALONE; keeping `format` satisfies interrupt.rs/packet.rs, and
+# nothing in `src/encode/ffmpeg/` touches filter/device/scaling/resampling
+# APIs (it uses codec, frame, Dictionary, and format::Pixel — which is the
+# avutil pixel enum, not avformat). The bytes were measured with MSVC link
+# stubs against the vendored static tree: `ffmpeg_next::init()` with the
+# device feature calls `avdevice_register_all()`, dragging avfilter
+# (3.48 MiB) + avformat's demuxer table (2.23) + avdevice + swscale into
+# the EXE for a total 23.07 MiB, vs 16.24 with registration gated off —
+# a −6.8 MiB delta for identical encoder behaviour (init() is
+# feature-gated internally: no device/filter feature = no registration
+# call). The vendored FFmpeg zip still SHIPS all the .lib files; the
+# linker just stops being told to pull the registries in.
+ffmpeg-next = { version = "8.1", optional = true, default-features = false, features = [
+    "codec",
+    "format",
+] }
 
 # Cross-platform text clipboard (Win32 / X11 / macOS). Feature-gated
 # behind `clipboard` so builds without the clipboard DC handler
@@ -516,15 +531,19 @@ replaces = "roomler-tunnel"
 assets = [
     # P3d Slice B: installed binary is `roomlerd` (the [[bin]] output name).
     ["target/release/roomlerd", "usr/bin/", "755"],
-    # The `roomler` CLI (the [[bin]] output of the roomler-tunnel package).
+    # The `roomler` command (P3e Phase 2: now the ~300 KB roomler-cli-shim,
+    # installed under the user-facing name — it re-execs `roomlerd cli`, the
+    # same lever-D mechanics as the Windows MSIs since rc.365).
     #
-    # It was MISSING from this list, so every .deb upgrade replaced the daemon
-    # and left whatever CLI the host happened to have. Field-caught 2026-08-06:
-    # zeus and mars were running a **rc.205 CLI from Jul 22** against an rc.311
-    # daemon — `roomler config set` did not exist (it is the documented way to
-    # set agent config), and `roomler peers --json` silently misrendered fields
-    # the newer daemon had added. The Windows MSI has always shipped both.
-    ["target/release/roomler", "usr/bin/", "755"],
+    # History that shapes this entry: `roomler` was MISSING from this list, so
+    # every .deb upgrade replaced the daemon and left whatever CLI the host
+    # happened to have. Field-caught 2026-08-06: zeus and mars ran a rc.205
+    # CLI from Jul 22 against an rc.311 daemon — `roomler config set` did not
+    # exist and `roomler peers --json` silently misrendered newer fields. The
+    # shim RETIRES that failure class structurally: the command surface lives
+    # inside roomlerd, so it can never version-skew from the daemon again
+    # (a stale shim is harmless — it's a version-agnostic re-exec).
+    ["target/release/roomler-shim", "usr/bin/roomler", "755"],
     # Bundled FFmpeg 8.1.2 (LGPL) for the ffmpeg-encoder HEVC backend. Populated
     # by the "Bundle FFmpeg" CI step (SONAME-named real files, $ORIGIN RPATH) so
     # the .deb is self-contained — stock Ubuntu ships an ABI-incompatible FFmpeg
