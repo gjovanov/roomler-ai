@@ -182,7 +182,7 @@ jobs:
           # nvenc: header-only SDK, versioned; 12.1 supports Blackwell-era
           # drivers while keeping the driver floor reasonable.
           git clone --depth 1 --branch n12.1.14.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
-          make -C /tmp/nvh install PREFIX=/usr/local
+          sudo make -C /tmp/nvh install PREFIX=/usr/local
           # qsv: Intel oneVPL dispatcher (thin; the runtime comes from the
           # host's intel-media stack). ffmpeg wants libvpl >= 2.6.
           git clone --depth 1 --branch v2.10.2 https://github.com/intel/libvpl.git /tmp/vpl
