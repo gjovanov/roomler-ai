@@ -455,6 +455,17 @@ pub async fn handle_agent_socket(
                                 {
                                     warn!(%agent_id, %e, "agent touch_heartbeat failed");
                                 }
+                                // C4 stage 2 (PR-B) — mirror the warm leg onto
+                                // the overlay-node row: the netmap is built
+                                // from overlay_nodes, so only THIS write puts
+                                // the pair-less dial target in front of peers.
+                                if let Err(e) = state
+                                    .overlay_nodes
+                                    .set_warm_relay_for_agent(agent_id, warm_relay.as_deref())
+                                    .await
+                                {
+                                    warn!(%agent_id, %e, "overlay-node warm-relay mirror failed");
+                                }
                                 if state.settings.stats.enabled {
                                     let unix = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)

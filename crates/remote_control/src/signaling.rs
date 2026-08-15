@@ -3544,6 +3544,7 @@ mod tests {
                 srflx_endpoints: vec!["198.51.100.7:41820".into()],
                 srflx_nat: Some("cone".into()),
                 relay_home: None,
+                warm_relay_endpoint: None,
                 reachable: true,
                 supports_quic: true,
                 supports_relay_single: true,

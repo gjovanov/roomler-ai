@@ -90,6 +90,9 @@ impl OverlayNodeDao {
             // Phase C — NAT type is unknown until the node probes + trickles it.
             srflx_nat: None,
             relay_home: None,
+            // C4 stage 2 (PR-B) — no warm leg until the node's runtime
+            // establishes one and its heartbeats mirror it here.
+            warm_relay_endpoint: None,
             supports_quic,
             supports_relay_single,
             supports_derp,
@@ -166,6 +169,10 @@ impl OverlayNodeDao {
                         // $set (a prior session's NAT type is meaningless after
                         // a roam); the node re-probes + re-trickles it.
                         "srflx_nat": bson::Bson::Null,
+                        // C4 stage 2 (PR-B) — clear the stale warm-leg address
+                        // for the same reason: a restarted runtime holds no
+                        // allocation; its heartbeats re-mirror a fresh one.
+                        "warm_relay_endpoint": bson::Bson::Null,
                         // rc.142 — refresh the QUIC capability on each re-join
                         // (an operator may flip ROOMLER_AGENT_OVERLAY_QUIC).
                         "supports_quic": supports_quic,
@@ -309,6 +316,35 @@ impl OverlayNodeDao {
                 } },
             )
             .await
+    }
+
+    /// C4 stage 2 (PR-B) — mirror an agent's STANDING warm-leg relayed address
+    /// onto its live overlay-node row(s), where the netmap builder reads it
+    /// (the netmap is built from OVERLAY_NODES, not agents — PR-A's
+    /// `agents.warm_relay_endpoint` write alone never reaches a peer).
+    /// `$unset` while no leg is live so a stale address can never be served
+    /// as a dial target. Called per heartbeat alongside `touch_heartbeat`.
+    pub async fn set_warm_relay_for_agent(
+        &self,
+        agent_id: ObjectId,
+        warm_relay: Option<&str>,
+    ) -> DaoResult<u64> {
+        let filter = doc! {
+            "node_ref.kind": "agent",
+            "node_ref.id": agent_id,
+            "deleted_at": bson::Bson::Null,
+        };
+        let update = match warm_relay {
+            Some(ep) => doc! { "$set": {
+                "warm_relay_endpoint": ep,
+                "updated_at": DateTime::now(),
+            } },
+            None => doc! {
+                "$set": { "updated_at": DateTime::now() },
+                "$unset": { "warm_relay_endpoint": "" },
+            },
+        };
+        self.base.update_many(filter, update).await
     }
 
     pub async fn update_srflx_endpoints(
