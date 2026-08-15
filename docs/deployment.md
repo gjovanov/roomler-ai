@@ -1,158 +1,117 @@
 # Deployment
 
-## Docker Compose Services
+Deploying the Roomler server and its supporting infrastructure. The native fleet
+(agents, CLI, wizard) is *not* part of the server image — it ships through GitHub
+Releases and the server's installer proxies ([installation.md](installation.md)).
+*As of 0.3.0-rc.381.*
 
-The `docker-compose.yml` provides all infrastructure dependencies:
+## Topology
 
-| Service | Image | Ports | Purpose |
-|---------|-------|-------|---------|
-| Mongo | `mongo:7` | 27019 | Primary database |
-| Redis | `redis:7-alpine` | 6379 | Cache and pub/sub |
-| MinIO | `minio/minio:latest` | 9000 (API), 9001 (Console) | S3-compatible object storage |
-| Coturn | `coturn/coturn:latest` | host network | TURN server for NAT traversal |
+```mermaid
+flowchart TB
+    LB["front reverse proxy / LB<br/>TLS · consistent-hash on tenant id"]
+    subgraph pod["API pod (1..N replicas)"]
+        NG["nginx — SPA files ·<br/>/api /ws /derp proxy · security headers"]
+        BIN["roomler-ai-api (Rust)<br/>REST · WS · mediasoup workers"]
+    end
+    MONGO[("MongoDB")]
+    REDIS[("Redis — pub/sub fan-out<br/>+ online registry")]
+    MINIO[("MinIO / S3")]
+    COTURN["coturn (TURN/STUN)"]
+    DERP["derp-relay PoPs<br/>(standalone, DB-free, per region)"]
 
-### Starting Infrastructure
-
-```bash
-docker-compose up -d
+    LB --> NG --> BIN
+    BIN --- MONGO & REDIS & MINIO
+    BIN -.->|"mints ephemeral creds"| COTURN
+    BIN -.->|"Ed25519 tickets"| DERP
 ```
 
-### Default Credentials
+## The server image
 
-| Service | Username | Password |
-|---------|----------|----------|
-| Mongo | `roomler` | `roomler_pass` |
-| MinIO | `minioadmin` | `minioadmin` |
+One multi-stage `Dockerfile`:
 
-## Environment Variables
+1. `rust:1.88-bookworm` — builds `roomler-ai-api`
+2. `oven/bun:1` — builds the Vue SPA
+3. `debian:trixie-slim` — runtime: **nginx + the binary in one image**, SPA at
+   `/var/www/roomler-ai`, nginx config from `files/nginx-pod.conf` (SPA fallback,
+   API/WS proxy, security headers incl. HSTS + CSP), `EXPOSE 80`
 
-All configuration is via environment variables prefixed with `ROOMLER__` using `__` as the separator.
-
-### Application
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__APP__HOST` | `0.0.0.0` | Bind address |
-| `ROOMLER__APP__PORT` | `3000` | HTTP port |
-
-### Database
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__DATABASE__URL` | `mongodb://localhost:27019` | MongoDB connection string |
-| `ROOMLER__DATABASE__NAME` | `roomler-ai` | Database name |
-
-### JWT
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__JWT__SECRET` | `change-me-in-production` | JWT signing secret |
-| `ROOMLER__JWT__ACCESS_TOKEN_TTL_SECS` | `604800` | Access token TTL (7 days) |
-| `ROOMLER__JWT__REFRESH_TOKEN_TTL_SECS` | `2592000` | Refresh token TTL (30 days) |
-| `ROOMLER__JWT__ISSUER` | `roomler-ai` | JWT issuer claim |
-
-### Redis
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__REDIS__URL` | `redis://127.0.0.1:6379` | Redis connection URL |
-
-### S3 / MinIO
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__S3__ENDPOINT` | `http://localhost:9000` | S3 endpoint |
-| `ROOMLER__S3__ACCESS_KEY` | `minioadmin` | Access key |
-| `ROOMLER__S3__SECRET_KEY` | `minioadmin` | Secret key |
-| `ROOMLER__S3__BUCKET` | `roomler-ai` | Bucket name |
-| `ROOMLER__S3__REGION` | `us-east-1` | Region |
-
-### mediasoup (Phase 5)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__MEDIASOUP__NUM_WORKERS` | `2` | Worker process count |
-| `ROOMLER__MEDIASOUP__LISTEN_IP` | `0.0.0.0` | Bind address |
-| `ROOMLER__MEDIASOUP__ANNOUNCED_IP` | `127.0.0.1` | Public IP for ICE |
-| `ROOMLER__MEDIASOUP__RTC_MIN_PORT` | `40000` | RTC UDP port range start |
-| `ROOMLER__MEDIASOUP__RTC_MAX_PORT` | `49999` | RTC UDP port range end |
-
-### TURN Server
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__TURN__URL` | _(none)_ | TURN server URL |
-| `ROOMLER__TURN__USERNAME` | _(none)_ | TURN username |
-| `ROOMLER__TURN__PASSWORD` | _(none)_ | TURN password |
-
-### Claude API (AI)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ROOMLER__CLAUDE__API_KEY` | _(none)_ | Claude API key for document recognition |
-| `ROOMLER__CLAUDE__MODEL` | `claude-sonnet-4-5-20250929` | Model ID |
-| `ROOMLER__CLAUDE__MAX_TOKENS` | `4096` | Max response tokens |
-
-## Configuration Loading
-
-Settings are loaded in priority order (later sources override earlier):
-
-1. `config/default.toml` (optional)
-2. `config/local.toml` (optional, gitignored)
-3. Environment variables (`ROOMLER__` prefix, `__` separator)
-4. Hardcoded defaults in `Settings::load()`
-
-The `config` crate handles merging. The separator `__` maps to nested config keys:
-- `ROOMLER__JWT__SECRET` → `jwt.secret`
-- `ROOMLER__DATABASE__URL` → `database.url`
-
-## Production Build
-
-### Backend
+## Development stack
 
 ```bash
-cargo build --release
-# Binary at target/release/roomler-ai
+docker compose up -d
 ```
 
-### Frontend
+| Service | Port | Purpose |
+|---|---|---|
+| `mongo:7` | 27019→27017 | database (dev credentials in the compose file) |
+| `redis:7-alpine` | 6379 | pub/sub + presence |
+| `minio/minio` | 9000 (API) / 9001 (console) | S3-compatible file storage |
+| `coturn/coturn` | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
 
-```bash
-cd ui
-bun run build
-# Output in ui/dist/
-```
+Then `cargo run --bin roomler-ai-api` (API :3000) and `cd ui && bun run dev`
+(SPA :5000, proxying `/api` + `/ws` to :5001).
 
-The backend can serve the built frontend by setting `ROOMLER__APP__STATIC_DIR=ui/dist`.
+## Configuration
 
-## Tenant Plans
+Everything is env-configurable with the `ROOMLER__` prefix (double underscore =
+nesting), loaded via the `config` crate. The ones that matter first:
 
-| Plan | Max Members (default) | File Upload Limit (default) |
-|------|----------------------|---------------------------|
-| Free | 100 | 10 MB |
-| Pro | 100 | 10 MB |
-| Business | 100 | 10 MB |
-| Enterprise | 100 | 10 MB |
+| Variable | Purpose |
+|---|---|
+| `ROOMLER__DATABASE__URL` | MongoDB connection string |
+| `ROOMLER__JWT__SECRET` | **Must be set in production** — with `ROOMLER__APP__ENVIRONMENT=production` the server refuses to boot on the default |
+| `ROOMLER__APP__FRONTEND_URL` | Public origin (also the CORS default — unset `cors_origins` allows only this origin) |
+| `ROOMLER__APP__CORS_ORIGINS` | Explicit allow-list; `"*"` = deliberate permissive mode (warns) |
+| `ROOMLER__TURN__SHARED_SECRET` | coturn REST-auth secret (never committed) |
+| `ROOMLER__MEDIASOUP__ANNOUNCED_IP_MAP` | `<node_ip>=<public_ip>,…` — per-pod announced IP resolution for multi-node clusters |
+| `ROOMLER__STRIPE__*` / `ROOMLER__CLAUDE__*` / `ROOMLER__S3__*` / SMTP / OAuth | Integrations |
 
-Limits are configurable per-tenant via `TenantSettings`. Plan-based differentiation is intended to be configured by the operator.
+Rate limiting (per-IP governor + per-account brute-force gate) and JWT TTLs are
+also settings — see `crates/config/src/settings.rs` for the full surface.
 
-## Health Check
+## Health & probes
 
-```bash
-curl http://localhost:3000/health
-# {"status":"ok","version":"0.1.0"}
-```
+| Endpoint | Meaning |
+|---|---|
+| `GET /health` | Liveness/startup — cheap process-alive 200 (never flaps on dependency blips) |
+| `GET /health/ready` | Readiness — Mongo ping + Redis round-trip + a live pub/sub subscription; 503 with per-check detail otherwise |
 
-## Kubernetes Deployment
+## Scaling beyond one pod
 
-Roomler2 is deployed to Kubernetes at https://roomler.ai using the `roomler-deploy` Ansible project. The K8s cluster consists of:
+The multi-pod design is settled and documented in
+[multi-pod-scale-out.md](multi-pod-scale-out.md). The short version:
 
-- 1 master node + 2 worker nodes
-- TURN server (coturn) for WebRTC NAT traversal
-- MongoDB, Redis, MinIO running as K8s services
+- WS sessions, the rc/tunnel hubs, DERP sockets, and mediasoup rooms are
+  **pod-local**; chat/notifications/presence fan out via Redis.
+- The front LB keeps a tenant's users, agents, and rooms on one pod with a
+  **consistent hash on the tenant id** (`/ws` and `/derp` accept a `tid=` hint);
+  plain HTTP keeps per-request failover.
+- Startup maintenance is leader-gated behind a Mongo lease; the online registry
+  (Redis) backs offline push/email dedupe.
 
-See the `roomler-deploy` repository for Ansible playbooks and Helm charts.
+## Relay infrastructure
 
-## Future Infrastructure
+- **coturn** — TURN/STUN for remote-desktop and tunnel fallback paths. The server
+  mints ephemeral HMAC credentials (`/api/turn/credentials`); multi-region
+  topology is served from `/api/relay/regions`.
+- **DERP PoPs** — `cargo build -p derp-relay` produces the standalone regional
+  relay: DB-free, no JWT secret, authenticates agents by server-minted Ed25519
+  tickets. One small VM per region is enough; it forwards WireGuard ciphertext it
+  cannot read.
 
-- **Horizontal scaling** -- Redis pub/sub for cross-instance WebSocket broadcasting
+## Release pipelines (native fleet)
+
+Tag-triggered GitHub workflows build, sign, and publish the native artifacts;
+the server proxies the downloads and gets a cache-bust ping
+(`POST /api/releases/refresh`) on publish:
+
+| Workflow | Tag | Artifacts |
+|---|---|---|
+| `release-agent.yml` | `agent-v*` | Windows MSIs (perUser + perMachine) + `roomler-desktop` companion; Linux `.deb`/tarball (x86_64 **and** aarch64); macOS `.pkg` (arm64) |
+| `release-tunnel.yml` | `tunnel-v*` | `roomler` CLI: Windows zip, Linux tarball + `.deb`, macOS universal tarball |
+| `release-setup.yml` | `setup-v*` | The install wizard: Linux/macOS tarballs, signed Windows EXE zip |
+
+All assets carry `.sha256`, GPG `.asc`, and SLSA provenance; releases are
+published non-prerelease so `/releases/latest` stays resolvable for the fleet's
+auto-updaters.

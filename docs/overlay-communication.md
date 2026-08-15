@@ -107,6 +107,23 @@ The IPv6 address is **derived**, never allocated: `derive_overlay_v6` embeds the
 v4 in the low 32 bits of the pinned ULA `fd72:6f6f:6d6c::/96`. There is one
 allocator, and freeing the v4 frees both.
 
+Consequences of derivation (from the shipped dual-stack work; the historical
+plan doc is retired):
+
+- **No per-peer v6 routing state anywhere**: the router *unmaps* a derived-ULA
+  destination back to its embedded v4 at packet-extraction time
+  (`Router::dst_of_ip_packet`) and routes on the existing v4 table.
+- **No wire/DB `overlay_ip6` field** — it would only be a consistency liability;
+  every consumer (LocalAPI `status`/`peers`, the tray, the admin nodes table via
+  a TS mirror of the derivation) computes it locally.
+- **MagicDNS answers AAAA** with the derived v6 by default;
+  `ROOMLER_AGENT_DNS_AAAA=0` reverts to A-only — the mixed-fleet escape hatch,
+  since a pre-v6 peer's OS doesn't own its derived address and v6 toward it
+  blackholes (happy-eyeballs apps fall back on their own).
+- `roomler ping <name> -6` resolves a peer's derived v6; the netstack SOCKS
+  front accepts genuine ATYP=IPv6 targets when they are derived-ULA (v4-mapped
+  unwraps; any other v6 is host-unreachable by design).
+
 **Removal releases the lease.** All three removal paths — `DELETE …/agent/{id}`,
 `DELETE …/overlay-node/{id}` (admin evict), `DELETE …/tunnel-client/{id}` — go
 through one writer, and the order is load-bearing:
