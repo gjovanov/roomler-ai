@@ -216,6 +216,7 @@ jobs:
             --disable-avdevice --disable-avfilter --disable-swscale \
             --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc,h264_qsv,hevc_qsv,av1_qsv,vp9_qsv,h264_amf,hevc_amf,av1_amf \
             --enable-nvenc --enable-ffnvcodec --enable-cuda --enable-libvpl --enable-amf \
+            --enable-parser=h264,hevc,av1 \
             || { echo "=== configure failed; last errors in config.log ==="; grep -n -B 25 "^ERROR:" ffbuild/config.log | tail -80; grep -nE "error:" ffbuild/config.log | tail -10; exit 1; }
           make -j"$(nproc)"
           sudo make install
