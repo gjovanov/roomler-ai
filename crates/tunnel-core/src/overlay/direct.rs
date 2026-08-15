@@ -1099,6 +1099,18 @@ pub fn warm_relay_enabled() -> bool {
     crate::env::flag("OVERLAY_WARM_RELAY", false)
 }
 
+/// W6 phase 3 — raw-first QUIC-over-TURN upgrade
+/// (`ROOMLER_NODE_OVERLAY_QUIC_ASYNC`; default **ON**): commit the raw
+/// relay carrier immediately and run the QUIC rendezvous in the
+/// background with a 90 s window, swapping in on success. OFF restores
+/// the blocking 8 s pre-install window (the pair is dark for the whole
+/// window on a dead-carrier rebuild, and two UNSYNCHRONIZED 8 s windows
+/// on ~60 s retry clocks overlap ~11-25% of the time — field 2026-08-15:
+/// 22/201 carrier-ups on a VPN host).
+pub fn quic_async_enabled() -> bool {
+    crate::env::flag("OVERLAY_QUIC_ASYNC", true)
+}
+
 /// Auth-first type-1 routing on a MULTI-ORG carrier plane
 /// (`ROOMLER_NODE_OVERLAY_INIT_AUTH_FIRST`, legacy `ROOMLER_AGENT_…`; default
 /// **ON**): with more than one engine attached, an inbound handshake
