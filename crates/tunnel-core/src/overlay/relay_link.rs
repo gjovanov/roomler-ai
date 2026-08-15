@@ -918,6 +918,20 @@ impl RelayCoordinator {
             }
             RelayStrategy::SingleRelay(true) | RelayStrategy::BothAllocate => {}
         }
+        // U1 — attach the refresh evidence + the sticky mux-failure flag.
+        let (current_kind, reason) = match refresh {
+            Some((kind, reason)) => (
+                kind.map(|k| {
+                    match k {
+                        RelayKind::Turn => "turn",
+                        RelayKind::Derp => "derp",
+                    }
+                    .to_string()
+                }),
+                Some(reason.to_string()),
+            ),
+            None => (None, None),
+        };
         // C4 stage 2 (PR-B) — single-relay ANCHOR with a live warm leg: commit
         // the standing allocation NOW instead of the request→grant→allocate
         // round-trips (each of which can take seconds — or forever, when this
@@ -931,6 +945,26 @@ impl RelayCoordinator {
             && self.warm_committed.is_none()
             && let Some(conn) = self.warm_leg.clone()
         {
+            // PR-B2 (field 2026-08-16, pc55331↔clk) — the server must still
+            // SEE this establishment: P7's force-DERP escalation counts relay
+            // requests, and a fast path that skips the wire made a churning
+            // pair (dialer whose corp egress drops raw UDP to ephemeral relay
+            // ports — it can never reach ANY anchor R) invisible, so it
+            // looped on the broken tier forever instead of being pinned to
+            // DERP. Fire-and-forget: the commit below never waits on the
+            // grant, which arrives for a peer that never enters `pending`
+            // and is dropped by `grant_accept` harmlessly. A failed send
+            // (detached WS — the VPN-capture case) changes nothing: the leg
+            // works without the server.
+            let _ = self
+                .outbound
+                .send(ClientMsg::OverlayRelayRequest {
+                    peer_node_id: node_id,
+                    current_kind,
+                    reason,
+                    derp_mux_failed: self.derp_mux_failed,
+                })
+                .await;
             self.roles.insert(node_id, strat);
             if let Ok(own) = conn.local_addr() {
                 info!(peer = %node_id, %own,
@@ -951,20 +985,6 @@ impl RelayCoordinator {
             self.warm_committed = Some(node_id);
             return;
         }
-        // U1 — attach the refresh evidence + the sticky mux-failure flag.
-        let (current_kind, reason) = match refresh {
-            Some((kind, reason)) => (
-                kind.map(|k| {
-                    match k {
-                        RelayKind::Turn => "turn",
-                        RelayKind::Derp => "derp",
-                    }
-                    .to_string()
-                }),
-                Some(reason.to_string()),
-            ),
-            None => (None, None),
-        };
         if self
             .outbound
             .send(ClientMsg::OverlayRelayRequest {
@@ -1802,12 +1822,23 @@ mod tests {
         };
         coord.request(node, peer.clone()).await;
         assert!(coord.is_tracking(&node));
-        // The ONLY wire traffic is the endpoints trickle advertising the leg.
+        // PR-B2 — the wire still carries the request (P7's churn counter
+        // feeds on it), but purely as a NOTIFY: the commit never waits on a
+        // grant, and a late grant hits a peer that never entered `pending`.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node
+        ));
         let Ok(ClientMsg::OverlayEndpoints { candidates }) = rx.try_recv() else {
             panic!("expected the endpoints trickle carrying the warm leg");
         };
         assert!(candidates.contains(&"5.9.157.221:12795".to_string()));
-        assert!(rx.try_recv().is_err(), "no request round-trip");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            coord.grant_accept(node, vec![], "pk".into()).is_none(),
+            "a late grant for a fast-committed peer is dropped harmlessly"
+        );
+        // The no-round-trip proof: the link builds with NO grant ever accepted.
         let link = coord
             .maybe_complete(node, &peer)
             .expect("anchor link ready");
@@ -1833,10 +1864,21 @@ mod tests {
         coord.request(node3, peer.clone()).await;
         assert!(coord.is_tracking(&node3));
         assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node3
+            ),
+            "each re-commit notifies the server (P7 churn visibility)"
+        );
+        assert!(
             matches!(rx.try_recv(), Ok(ClientMsg::OverlayEndpoints { .. })),
             "fast re-commit trickles the leg again"
         );
-        assert!(rx.try_recv().is_err(), "no request round-trip on re-commit");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            coord.maybe_complete(node3, &peer).is_some(),
+            "re-commit builds without any grant"
+        );
 
         // A LOST leg closes the fast path.
         coord.forget(&node3);
