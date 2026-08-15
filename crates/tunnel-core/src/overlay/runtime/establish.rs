@@ -1991,7 +1991,23 @@ impl OverlayRuntime {
             let min_datagram = self.mtu as usize + WG_OVERHEAD;
             let epoch = relay_bq.stamp(link.node_id);
             let tx = relay_bq.tx.clone();
+            // W6 phase 3 — RAW-FIRST (default): commit the already-built raw
+            // carrier NOW and run the rendezvous in the background with the
+            // 90 s window. Field 2026-08-15 (CORPLAP-1 on VPN): health-sweep
+            // REBUILDS are not netmap-synchronized, so two independent 8 s
+            // windows on ~60 s retry clocks overlapped ~11% of the time
+            // (22/201 carrier-ups) — and the pair sat DARK for the whole
+            // window on every dead-carrier rebuild. Raw-first removes the
+            // dark window; the upgrade commits through the normal BuiltRelay
+            // path, whose epoch guard drops it if a direct promotion (or any
+            // newer build) landed meanwhile.
+            let raw_first = super::super::direct::quic_async_enabled();
+            let bg_link = link.clone();
+            if raw_first {
+                self.install_built(wg, by_node, tun, link, None).await;
+            }
             tokio::spawn(async move {
+                let link = bg_link;
                 // W6 phase-2 — the ANCHOR permits EVERY distinct public srflx
                 // IP the dialer advertises (permissions are IP-scoped): a
                 // multi-homed dialer's raw dial socket picks its source by
@@ -2003,36 +2019,96 @@ impl OverlayRuntime {
                     let _ = crate::overlay::wg::assert_relay_permission(&conn, *t, "anchor-extra")
                         .await;
                 }
-                let quic = match Carrier::quic_relay(
-                    conn.clone(),
-                    dst,
-                    am_server,
-                    min_datagram,
-                    QUIC_BUILD_TIMEOUT,
-                )
-                .await
-                {
-                    Ok(q) => {
-                        info!(peer = %link.node_id, %dst, am_server, "overlay: QUIC-over-TURN carrier up");
-                        Some(q)
+                let quic = if raw_first {
+                    // The SERVER holds one continuous accept for the whole
+                    // window; the CLIENT retries connect attempts inside it,
+                    // so any single overlap suffices.
+                    let deadline = tokio::time::Instant::now() + QUIC_UPGRADE_DEADLINE;
+                    let mut last_err: Option<anyhow::Error> = None;
+                    loop {
+                        let window = if am_server {
+                            deadline.saturating_duration_since(tokio::time::Instant::now())
+                        } else {
+                            QUIC_BUILD_TIMEOUT
+                        };
+                        if window.is_zero() {
+                            break None;
+                        }
+                        match Carrier::quic_relay(
+                            conn.clone(),
+                            dst,
+                            am_server,
+                            min_datagram,
+                            window,
+                        )
+                        .await
+                        {
+                            Ok(q) => {
+                                info!(peer = %link.node_id, %dst, am_server,
+                                      "overlay: QUIC-over-TURN carrier up (background upgrade)");
+                                break Some(q);
+                            }
+                            Err(e) => last_err = Some(e),
+                        }
+                        if tokio::time::Instant::now() + QUIC_BUILD_TIMEOUT + QUIC_UPGRADE_RETRY_GAP
+                            > deadline
+                        {
+                            break None;
+                        }
+                        tokio::time::sleep(QUIC_UPGRADE_RETRY_GAP).await;
                     }
-                    Err(e) => {
-                        // For a single-relay link the raw fallback only carries
-                        // for cone-ish dialers (port-preserving mapping); a
-                        // symmetric dialer stays dark until the health sweep
-                        // re-coordinates.
-                        warn!(peer = %link.node_id, %e, single_relay = ?link.single_relay, am_server,
-                              "overlay: QUIC carrier build failed; using raw relay");
-                        // Permission bootstrap for the raw fallback (the QUIC
-                        // attempt sent its own, but re-assert — it's 1 byte).
-                        // W6 phase-2: measured — if THIS one succeeds after the
-                        // build's failed, the failed permission explains rx=0.
-                        let _ =
-                            crate::overlay::wg::assert_relay_permission(&conn, dst, "raw-fallback")
-                                .await;
+                    .or_else(|| {
+                        // Raw is ALREADY live — this is a missed upgrade, not
+                        // a fallback: one line at the end of the window, with
+                        // the last attempt's rendezvous diagnostics.
+                        info!(peer = %link.node_id, single_relay = ?link.single_relay, am_server,
+                              e = %last_err.map(|e| e.to_string()).unwrap_or_default(),
+                              "overlay: QUIC upgrade did not rendezvous within the window — staying on raw relay");
                         None
+                    })
+                } else {
+                    // Legacy (OVERLAY_QUIC_ASYNC=off): one blocking-window
+                    // attempt, raw committed only afterwards.
+                    match Carrier::quic_relay(
+                        conn.clone(),
+                        dst,
+                        am_server,
+                        min_datagram,
+                        QUIC_BUILD_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(q) => {
+                            info!(peer = %link.node_id, %dst, am_server, "overlay: QUIC-over-TURN carrier up");
+                            Some(q)
+                        }
+                        Err(e) => {
+                            // For a single-relay link the raw fallback only carries
+                            // for cone-ish dialers (port-preserving mapping); a
+                            // symmetric dialer stays dark until the health sweep
+                            // re-coordinates.
+                            warn!(peer = %link.node_id, %e, single_relay = ?link.single_relay, am_server,
+                                  "overlay: QUIC carrier build failed; using raw relay");
+                            // Permission bootstrap for the raw fallback (the QUIC
+                            // attempt sent its own, but re-assert — it's 1 byte).
+                            // W6 phase-2: measured — if THIS one succeeds after the
+                            // build's failed, the failed permission explains rx=0.
+                            let _ = crate::overlay::wg::assert_relay_permission(
+                                &conn,
+                                dst,
+                                "raw-fallback",
+                            )
+                            .await;
+                            None
+                        }
                     }
                 };
+                // Raw-first: only a SUCCESSFUL upgrade needs a commit — the
+                // raw carrier is already installed, and re-sending it would
+                // re-install (re-handshake) the peer for nothing.
+                if raw_first && quic.is_none() {
+                    return;
+                }
                 // Receiver dropped ⇒ runtime exited; the build is moot.
                 let _ = tx.send(BuiltRelay { epoch, link, quic }).await;
             });
