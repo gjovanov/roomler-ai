@@ -1148,6 +1148,10 @@ pub struct SrflxShared {
     /// owns its NAT mapping (peers' srflx are dialed FROM this socket).
     pub punch: Option<(String, Arc<UdpSocket>)>,
     pub my_nat: Option<String>,
+    /// R2 — the advertised mapping came from the wildcard PUBLIC-DIAL socket
+    /// (full-tunnel VPN egress rescue): every LAN-bound vantage was dead and
+    /// the captured default route answered. Punches ride the tunnel path.
+    pub via_public_dial: bool,
     /// What the LocalAPI shows when the tier is off/empty this run.
     pub error: Option<String>,
     pub generation: u64,
@@ -1280,6 +1284,45 @@ impl CarrierPlane {
             })
             .await
             .unwrap_or_default();
+            // R2 — full-tunnel rescue: every LAN-bound sock came up empty for
+            // this vantage. The UNSPECIFIED public dialer egresses via the
+            // captured default route (the tunnel), which on AnyConnect-class
+            // hosts is the ONLY path that passes UDP (field CORPLAP-3
+            // 2026-08-15: physical NICs filtered both directions, tunnel UDP
+            // fine — srflx sat at NONE because nothing ever asked the one
+            // socket that could answer). Outside the per-server budget above
+            // so a multi-dead-sock host still reaches it; bounded by the
+            // query's own retry ceiling. Healthy hosts never get here.
+            if pairs.is_empty()
+                && direct::vpn_vantage_enabled()
+                && let Some(p) = v.public_sock.as_ref()
+            {
+                match crate::transport::stun::srflx_query_via_sink(
+                    p,
+                    rx,
+                    server,
+                    super::runtime::SRFLX_ATTEMPT_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(SocketAddr::V4(s)) if direct::is_public_v4(*s.ip()) => {
+                        info!(
+                            mapped = %s,
+                            %server,
+                            "carrier plane: srflx RESCUED via the public-dial socket — every \
+                             LAN vantage was dead but the default-route (VPN) path answers"
+                        );
+                        out.via_public_dial = true;
+                        pairs.push((SocketAddr::V4(s).to_string(), p.clone()));
+                    }
+                    Ok(other) => {
+                        debug!(%other, "carrier plane: public-dial srflx not public — skipping")
+                    }
+                    Err(e) => {
+                        debug!(%e, "carrier plane: public-dial srflx query failed")
+                    }
+                }
+            }
             if !pairs.is_empty() {
                 break;
             }
@@ -1318,9 +1361,14 @@ impl CarrierPlane {
                 );
             }
             out.error = Some(format!(
-                "STUN yielded no public candidate ({} vantage(s), {} socket(s) probed)",
+                "STUN yielded no public candidate ({} vantage(s), {} socket(s) probed{})",
                 tried,
-                v.socks.len()
+                v.socks.len(),
+                if direct::vpn_vantage_enabled() && v.public_sock.is_some() {
+                    " + public-dial fallback"
+                } else {
+                    ""
+                }
             ));
             return out;
         }
@@ -1778,6 +1826,83 @@ mod tests {
             poke_floor_wait(Some(Duration::from_secs(31))),
             Duration::ZERO,
             "past the floor a poke walks immediately"
+        );
+    }
+
+    /// R2 — full-tunnel rescue: when every LAN-bound vantage is dead but the
+    /// wildcard public-dial socket (which the OS routes via the captured
+    /// default = the VPN tunnel) can reach STUN, the gather promotes ITS
+    /// mapping instead of reporting NONE, and attributes it. Field
+    /// CORPLAP-3 2026-08-15: AnyConnect filtered the physical NICs both
+    /// directions while the CORP3 tunnel passed UDP fine — srflx sat at NONE
+    /// purely because the gather never asked the one socket that could
+    /// answer. The fake STUN server here ignores the "LAN" sock (the
+    /// filtered NIC) and answers only the public dialer, with a fabricated
+    /// PUBLIC mapping (the real reply would carry a loopback address, which
+    /// the gather rightly refuses to advertise).
+    #[tokio::test]
+    async fn gather_rescues_srflx_via_the_public_dial_socket() {
+        let plane = CarrierPlane::new();
+        let lan = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let public = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let public_port = public.local_addr().unwrap().port();
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = server.recv_from(&mut buf).await else {
+                    break;
+                };
+                if from.port() != public_port || n < 20 {
+                    continue; // the "LAN" vantage stays dead
+                }
+                let txn: [u8; 12] = buf[8..20].try_into().unwrap();
+                let magic = 0x2112A442u32.to_be_bytes();
+                let ip = Ipv4Addr::new(203, 0, 113, 7).octets();
+                let mut resp = Vec::with_capacity(32);
+                resp.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Success
+                resp.extend_from_slice(&12u16.to_be_bytes());
+                resp.extend_from_slice(&magic);
+                resp.extend_from_slice(&txn);
+                resp.extend_from_slice(&0x0020u16.to_be_bytes()); // XOR-MAPPED-ADDRESS
+                resp.extend_from_slice(&8u16.to_be_bytes());
+                resp.push(0);
+                resp.push(1); // family: IPv4
+                resp.extend_from_slice(&(4242u16 ^ 0x2112).to_be_bytes());
+                resp.extend_from_slice(&[
+                    ip[0] ^ magic[0],
+                    ip[1] ^ magic[1],
+                    ip[2] ^ magic[2],
+                    ip[3] ^ magic[3],
+                ]);
+                let _ = server.send_to(&resp, from).await;
+            }
+        });
+        let t_lan = plane.adopt_socket(lan.clone());
+        let t_pub = plane.adopt_socket(public.clone());
+        {
+            let mut st = plane.lock();
+            st.binds = Some(PlaneBinds {
+                socks: vec![(Ipv4Addr::new(127, 0, 0, 1), lan)],
+                public_sock: Some(public.clone()),
+                endpoints: vec!["127.0.0.1:0".into()],
+                my_ips: Vec::new(),
+                tasks: vec![t_lan, t_pub],
+                stats: Vec::new(),
+            });
+        }
+        let mut rx = plane.take_stun_events().unwrap();
+        let shared = plane
+            .gather_via_sink(&[format!("stun:{server_addr}")], &mut rx, false)
+            .await;
+        assert!(shared.via_public_dial, "the rescue must be attributed");
+        assert_eq!(shared.candidates, vec!["203.0.113.7:4242".to_string()]);
+        let (_, punch) = shared.punch.expect("punch pair");
+        assert_eq!(
+            punch.local_addr().unwrap().port(),
+            public_port,
+            "the punch must ride the public-dial socket"
         );
     }
 
