@@ -477,6 +477,22 @@ pub(crate) fn should_poke(
         && (since_last_rx > POKE_SILENCE_AFTER || since_proof > POKE_PROOF_AFTER)
 }
 
+/// Net-change acceleration — should a FORCED revalidation poke arm for this
+/// carrier right now, given an OS route/iface event just fired? Same
+/// contract as [`should_poke`] minus the silence/proof waits: the event IS
+/// the suspicion. Field 2026-08-15 pc50045: a Check Point connect killed
+/// every UDP flow within seconds (REKEY_TIMEOUT at +1 s), but the first
+/// pair failover took ~92 s — the poke sat behind `POKE_SILENCE_AFTER`
+/// (30 s) plus the passive rx-stale race. Arming on the event collapses
+/// detection to ~poke deadline + one sweep tick, and stays honest: an
+/// answered poke clears with zero side effects, so a benign event (Wi-Fi
+/// roam, VPN disconnect) costs one handshake round per pair, nothing more.
+/// Established carriers only — an Installing carrier already has the
+/// handshake-deadline reaper.
+pub(crate) fn should_poke_on_netchange(handshake_done: bool, poke_pending: bool) -> bool {
+    handshake_done && !poke_pending
+}
+
 /// A make-before-break shadow probe's verdict (pre-P2: the two branch
 /// conditions inline in `sweep_upgrade_probes`). A probe has a disjoint input
 /// set from an installed carrier (no stats, no hard-dead, no rx-staleness —
@@ -969,6 +985,21 @@ mod tests {
 
     /// Stage 2 — the arming matrix: silence and stale-proof each trigger;
     /// a pending poke, a missing handshake, or fresh evidence suppress.
+    /// Net-change forced pokes: established + no in-flight poke arms;
+    /// pre-handshake carriers and pending pokes never double-arm. The
+    /// silence/proof waits are deliberately absent — the OS event is the
+    /// suspicion (pc50045 2026-08-15: 92 s failover waiting out the gates).
+    #[test]
+    fn should_poke_on_netchange_matrix() {
+        assert!(should_poke_on_netchange(true, false));
+        assert!(!should_poke_on_netchange(false, false), "pre-handshake");
+        assert!(
+            !should_poke_on_netchange(true, true),
+            "poke already pending"
+        );
+        assert!(!should_poke_on_netchange(false, true));
+    }
+
     #[test]
     fn should_poke_matrix() {
         let s = Duration::from_secs;
