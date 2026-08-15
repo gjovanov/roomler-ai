@@ -20,7 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 # Shared protocol types (ClientMsg, ServerMsg, etc.)
-roomler-ai-remote-control = { path = "../../crates/remote_control" }
+# default-features = false drops the `server` half (Mongo audit DAO + Hub) —
+# agent-side code only needs the wire/model/permission surface (P3e Phase 3).
+roomler-ai-remote-control = { path = "../../crates/remote_control", default-features = false }
 # P3e lever E — the daemon-free building blocks (config, enrollment, machine,
 # logging, sentinels, ACL, apps-config shapes) live in agent-core so the
 # desktop companion can link them without this crate's data plane. lib.rs

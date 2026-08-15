@@ -23,9 +23,20 @@ sha1.workspace = true
 base64.workspace = true
 jsonwebtoken.workspace = true
 ring = "0.17"
-mongodb.workspace = true
+# Optional since P3e Phase 3: only the `server`-gated audit/hub modules (and
+# the Error::Mongo variant) touch the driver. Agent-side consumers set
+# `default-features = false` and drop ~40 transitive crates per binary.
+mongodb = { workspace = true, optional = true }
 bson.workspace = true
 bitflags = { workspace = true, features = ["serde"] }
+
+[features]
+# The server half of this crate: the Mongo audit DAO + the session Hub.
+# Default-ON so api/services/tests (and any consumer that doesn't opt out)
+# keep compiling unchanged; the wire types, models, permissions, signaling,
+# consent, TURN creds and worker_pick are always available.
+default = ["server"]
+server = ["dep:mongodb"]
 
 [dev-dependencies]
 tokio-test.workspace = true

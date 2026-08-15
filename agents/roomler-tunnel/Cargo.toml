@@ -20,7 +20,9 @@ path = "src/main.rs"
 # Shared transport, signalling, ACL, forwarding pump
 roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
 # Shared wire types (rc:tunnel.* lands here in T2)
-roomler-ai-remote-control = { path = "../../crates/remote_control" }
+# default-features = false drops the `server` half (Mongo audit DAO + Hub) —
+# agent-side code only needs the wire/model/permission surface (P3e Phase 3).
+roomler-ai-remote-control = { path = "../../crates/remote_control", default-features = false }
 
 # Async + networking
 tokio = { workspace = true }
@@ -76,6 +78,11 @@ rand = { workspace = true }
 # dep (vendored webrtc-data pulls it in), so adding it as a direct
 # dep is zero extra build cost.
 socket2 = "0.5"
+
+# SIGPIPE reset at the CLI entry (cli::run_from) so `roomler … | head` dies
+# quietly on EPIPE instead of panicking — Rust starts with SIGPIPE ignored.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
