@@ -257,6 +257,11 @@ pub struct SrflxStatus {
     /// `None` = unclassified (the punch is still attempted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nat: Option<String>,
+    /// R2 — the mapping was gathered via the wildcard public-dial socket
+    /// (full-tunnel VPN egress rescue: every LAN-bound vantage was dead and
+    /// the captured default route answered). Punches ride the tunnel path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub via_public_dial: bool,
     /// Why the gather produced nothing, when it produced nothing. `None` on
     /// success. Rendered verbatim by `roomler status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1903,6 +1908,7 @@ mod tests {
                 config_path: None,
                 dns: None,
                 srflx: None,
+                warm_relay: None,
                 orgs: Vec::new(),
                 mux_nat_rewrites: None,
                 mux_nat_restores: None,

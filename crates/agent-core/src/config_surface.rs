@@ -161,6 +161,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Raw-first QUIC-over-TURN upgrade: commit the raw relay immediately, rendezvous in the background (90s window), swap in on success. Off restores the blocking 8s pre-install window. Built-in default: on.",
     ),
     (
+        "overlay_vpn_vantage",
+        "tribool",
+        "R2: srflx gather falls back to the wildcard public-dial socket when every LAN-bound vantage is dead (full-tunnel VPN rescue — on AnyConnect-class clients the tunnel is the only path that passes UDP). Built-in default: on.",
+    ),
+    (
         "overlay_netd",
         "tribool",
         "Track A stage 1 (SCAFFOLD): spawn the session-independent network daemon (roomlerd netd) as a second supervisor child. netd hosts nothing yet; flag read at service start. Built-in default: off.",
@@ -430,6 +435,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
         "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
         "overlay_quic_async" => cfg.overlay_quic_async.map(fmt_bool),
+        "overlay_vpn_vantage" => cfg.overlay_vpn_vantage.map(fmt_bool),
         "overlay_netd" => cfg.overlay_netd.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
@@ -542,6 +548,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
         "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
         "overlay_quic_async" => cfg.overlay_quic_async = parse_tribool(value)?,
+        "overlay_vpn_vantage" => cfg.overlay_vpn_vantage = parse_tribool(value)?,
         "overlay_netd" => cfg.overlay_netd = parse_tribool(value)?,
         "overlay_pathmon" => {
             cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1076,6 +1083,24 @@ mod tests {
             crate::config::env_bridge_bools(&cfg)
                 .iter()
                 .any(|(k, _)| *k == "OVERLAY_WARM_RELAY"),
+            "key must be bridged to the daemon's env"
+        );
+    }
+
+    /// R2 — the public-dial srflx fallback key: tribool, default None
+    /// (daemon built-in ON), bridged to the daemon env.
+    #[test]
+    fn overlay_vpn_vantage_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.overlay_vpn_vantage, None, "unset → daemon default (on)");
+        apply(&mut cfg, "overlay_vpn_vantage", Some("off")).unwrap();
+        assert_eq!(cfg.overlay_vpn_vantage, Some(false));
+        apply(&mut cfg, "overlay_vpn_vantage", None).unwrap();
+        assert_eq!(cfg.overlay_vpn_vantage, None, "clear → built-in default");
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(k, _)| *k == "OVERLAY_VPN_VANTAGE"),
             "key must be bridged to the daemon's env"
         );
     }
