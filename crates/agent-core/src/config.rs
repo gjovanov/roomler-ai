@@ -275,16 +275,24 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_route_metric0: Option<bool>,
     /// Stable UDP port for the overlay's direct sockets
-    /// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`). Built-in default: **43648**
-    /// (per-interface LAN sockets; the public/srflx dialer takes base+32; a
-    /// swallowed base walks an 8-port band);
-    /// `0` = ephemeral ports (the pre-rc.307 behavior). Rationale: stateful
-    /// corp firewalls (Check Point) grandfather UDP flows that predate the
+    /// (`ROOMLER_NODE_OVERLAY_DIRECT_PORT`). Built-in default: **derived
+    /// per machine** — `43648 + (fnv1a(machine_id) % 16) × 8` (see
+    /// [`derived_default_direct_port`]) — so two nodes behind ONE NAT pick
+    /// distinct stable ports by construction (2026-08-15: both household
+    /// laptops pinned the old fleet-wide 43648 behind one Fritz!Box; only
+    /// one could hold a destination-independent external mapping, the
+    /// other's srflx went per-destination and every inbound punch landed
+    /// on the sibling ⇒ relay-locked pairs). Per-interface LAN sockets
+    /// bind the base; the public/srflx dialer takes base+128; a swallowed
+    /// base walks an 8-port band. Explicit value = pinned (set 43648 to
+    /// restore the old fleet-wide constant); `0` = ephemeral ports (the
+    /// pre-rc.307 behavior). Rationale for stability: stateful corp
+    /// firewalls (Check Point) grandfather UDP flows that predate the
     /// VPN's session table — with a stable port a rebuilt carrier (agent
     /// update, control-WS reconnect) reproduces the SAME 5-tuple and keeps
     /// riding the grandfathered session instead of relay-locking until the
-    /// next VPN-off window (CORPLAP-1, 2026-08-05). A bind conflict falls back
-    /// to an ephemeral port with a WARN, restoring the old behavior.
+    /// next VPN-off window (CORPLAP-1, 2026-08-05). A bind conflict falls
+    /// back to an ephemeral port with a WARN, restoring the old behavior.
     #[serde(default)]
     pub overlay_direct_port: Option<u32>,
     /// Loopback-TURN corp-relay for co-located controllers
@@ -1231,6 +1239,72 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
+/// Sibling-safe derived default for `overlay_direct_port` — constants
+/// mirror tunnel-core's `direct.rs` layout (locked by an agent-crate test;
+/// agent-core's tunnel-core dependency is optional, so no direct import):
+/// 16 slots of stride 8 span bases `43648..=43768` (each slot's 8-port
+/// bind-walk band stays disjoint from its neighbours'), and the
+/// public-dial twin at base+128 lands every public band in
+/// `43776..43903`, disjoint from all direct bands.
+pub const DERIVED_PORT_BASE: u32 = 43648;
+pub const DERIVED_PORT_SLOTS: u32 = 16;
+pub const DERIVED_PORT_STRIDE: u32 = 8;
+
+/// The machine's derived stable direct port: `base + (fnv1a-64(machine_id)
+/// % slots) × stride`. FNV-1a is hand-rolled so the value can NEVER move
+/// between releases (a moved port churns every grandfathered corp-firewall
+/// flow once) — no hasher-crate upgrade may change it, and the test below
+/// pins concrete outputs. Applied by the env bridge ONLY when the operator
+/// left `overlay_direct_port` unset; an explicit value or a real env var
+/// always wins.
+pub fn derived_default_direct_port(machine_id: &str) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in machine_id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    DERIVED_PORT_BASE + (h % u64::from(DERIVED_PORT_SLOTS)) as u32 * DERIVED_PORT_STRIDE
+}
+
+#[cfg(test)]
+mod derived_port_tests {
+    use super::*;
+
+    /// The derived port is a RELEASE-STABLE function of the machine id:
+    /// concrete outputs are pinned so no refactor (hasher swap, slot
+    /// arithmetic change) can silently move the fleet's stable ports and
+    /// churn every grandfathered corp-firewall flow at once.
+    #[test]
+    fn derived_port_is_stable_in_range_and_spreads_siblings() {
+        for id in ["", "a", "machine-1", "5C-80-B6-AA-BB-CC", "CORPLAP-1-mid"] {
+            let p = derived_default_direct_port(id);
+            assert_eq!(p, derived_default_direct_port(id), "stable per id");
+            assert!(
+                (DERIVED_PORT_BASE
+                    ..=DERIVED_PORT_BASE + (DERIVED_PORT_SLOTS - 1) * DERIVED_PORT_STRIDE)
+                    .contains(&p),
+                "in band: {p}"
+            );
+            assert_eq!(
+                (p - DERIVED_PORT_BASE) % DERIVED_PORT_STRIDE,
+                0,
+                "on a slot: {p}"
+            );
+        }
+        // Pinned concrete outputs (FNV-1a 64, offset basis 0xcbf29ce484222325,
+        // prime 0x100000001b3): a change here IS the fleet-port migration.
+        assert_eq!(derived_default_direct_port(""), 43688);
+        assert_eq!(
+            derived_default_direct_port("machine-1"),
+            derived_default_direct_port("machine-1")
+        );
+        // Distinct ids usually land on distinct slots — the sibling case.
+        let a = derived_default_direct_port("laptop-A");
+        let b = derived_default_direct_port("laptop-B");
+        assert_ne!(a, b, "the sample sibling pair must de-conflict");
+    }
+}
+
 pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 36] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
