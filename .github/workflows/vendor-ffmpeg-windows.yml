@@ -259,6 +259,17 @@ jobs:
           staging=/tmp/stage/ffmpeg-minimal
           mkdir -p "$staging"
           cp -a /opt/ffout/lib /opt/ffout/include "$staging/"
+          # libvpl.so.2 is a DT_NEEDED of the minimal avcodec (qsv) and was
+          # BUILT here into /usr/local — the runtime probe above resolves it
+          # from the build host, but a stock target box has no libvpl at all
+          # (rehearsal-proven: the 24.04 load check died on exactly this).
+          # Staging it next to the FFmpeg libs lets release-agent's
+          # ldd-fixpoint bundler pick it up like any other vendored lib.
+          find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name 'libvpl.so*' -exec cp -a {} "$staging/lib/" \; 2>/dev/null || true
+          ls "$staging/lib/" | grep -q "libvpl.so.2" || { echo "::error::libvpl runtime not staged — the .deb would fail to load on stock hosts"; exit 1; }
+          # Belt-and-braces: every DT_NEEDED of the staged avcodec must
+          # resolve from the staging dir or glibc-family alone.
+          LD_LIBRARY_PATH="$staging/lib" ldd "$staging"/lib/libavcodec.so | grep "not found" && { echo "::error::unresolvable DT_NEEDED in staged libavcodec"; exit 1; } || true
           tar cJf /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz -C /tmp/stage ffmpeg-minimal
           sha256sum /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz | tee /tmp/min.sha256
           ls -la /tmp/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz
