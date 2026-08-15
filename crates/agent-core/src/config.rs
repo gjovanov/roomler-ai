@@ -158,6 +158,13 @@ pub struct AgentConfig {
     /// on success (`ROOMLER_NODE_OVERLAY_QUIC_ASYNC`). Built-in default: on.
     #[serde(default)]
     pub overlay_quic_async: Option<bool>,
+    /// R2 — srflx gather falls back to the wildcard public-dial socket when
+    /// every LAN-bound vantage is dead (full-tunnel VPN rescue: AnyConnect-
+    /// class clients filter the physical NICs while the tunnel passes UDP;
+    /// field CORPLAP-3 2026-08-15). Built-in default: on
+    /// (`ROOMLER_NODE_OVERLAY_VPN_VANTAGE`).
+    #[serde(default)]
+    pub overlay_vpn_vantage: Option<bool>,
     /// Track A stage 1 — spawn the session-independent network daemon
     /// (`roomlerd netd`) as a SECOND supervisor child. SCAFFOLD ONLY for
     /// now: netd heartbeats and hosts nothing; the network plane still
@@ -1169,6 +1176,7 @@ pub fn test_fixture() -> AgentConfig {
         ws_replaced_exit: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
+        overlay_vpn_vantage: None,
         overlay_netd: None,
         overlay_pathmon: None,
         overlay_route_events: None,
@@ -1307,7 +1315,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 36] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 37] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1325,6 +1333,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 36]
         ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
         ("OVERLAY_WARM_RELAY", cfg.overlay_warm_relay),
         ("OVERLAY_QUIC_ASYNC", cfg.overlay_quic_async),
+        ("OVERLAY_VPN_VANTAGE", cfg.overlay_vpn_vantage),
         ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
         ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
         ("OVERLAY_MUX_NAT", cfg.overlay_mux_nat),
