@@ -56,6 +56,22 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// frames RECEIVED, not frames sent.
 const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
 
+/// Hard bound on a single WS frame WRITE on the established connection.
+/// Every select arm awaits its sends inline, so one wedged `ws.send`
+/// freezes the whole loop: no arm runs, no `watchdog::tick`, and at 90 s
+/// the process watchdog kills the worker. Field case PC50045 2026-08-15
+/// 13:42:47Z — a corp-VPN connect captured the default route mid-flight,
+/// the kernel kept retransmitting the WS TCP stream into the void, the
+/// loop froze on a send and `stalled=signaling=92s` turned a routing
+/// blip into a process death: full overlay teardown, warm relay
+/// allocations lost, >2 min blackout. A send that can't complete in 15 s
+/// IS a dead connection — surface it as `ConnectError::Transient` and
+/// let the reconnect ladder cycle the WS (the persistent overlay runtime
+/// rides through WS reconnects untouched; the `SignalingPumpGuard`
+/// disarms the stall budget during backoff). 15 s tolerates a slow-but-
+/// alive link (3 missed RTOs) and leaves 75 s of watchdog headroom.
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// A5 — minimum wall-vs-monotonic skew that reads as suspend/resume at a
 /// keepalive tick (mirrors the overlay runtime's `RESUME_SKEW_THRESHOLD`).
 /// Below this it's scheduler jitter; above it the host slept and the WS is
@@ -937,7 +953,7 @@ async fn connect_once(
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
-                    let _ = ws.send(Message::Close(None)).await;
+                    let _ = send_frame(&mut ws, Message::Close(None)).await;
                     return Ok(());
                 }
             }
@@ -997,12 +1013,12 @@ async fn connect_once(
                         last_rx.elapsed().as_secs()
                     )));
                 }
-                if let Err(e) = ws.send(Message::Ping(Vec::new().into())).await {
+                if let Err(e) = send_frame(&mut ws, Message::Ping(Vec::new().into())).await {
                     warn!(%e, "keepalive ping failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
-                    return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws ping")));
+                    return Err(ConnectError::Transient(e.context("ws ping")));
                 }
                 // Liveness: a successful keepalive proves the WS pump
                 // is healthy even during long quiet periods between
@@ -1074,7 +1090,16 @@ async fn connect_once(
             }
             Some(outbound_msg) = outbound_rx.recv() => {
                 if let Err(e) = send_msg(&mut ws, &outbound_msg).await {
-                    warn!(%e, "failed to flush peer-originated message");
+                    // A failed control-WS write means the connection is
+                    // done — warn-and-continue only deferred the cycle to
+                    // the RX deadline (~80 s of dead air), and a WEDGED
+                    // send never surfaces on the read side at all. Same
+                    // teardown as every other fatal arm.
+                    warn!(%e, "failed to flush peer-originated message — will reconnect");
+                    close_all_peers(&mut peers, &indicator).await;
+                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    return Err(ConnectError::Transient(e.context("outbound flush")));
                 }
                 watchdog::tick(ctx.pump);
             }
@@ -1160,7 +1185,13 @@ async fn connect_once(
                 }
                 Some(Ok(Message::Ping(data))) => {
                     last_rx = std::time::Instant::now();
-                    let _ = ws.send(Message::Pong(data)).await;
+                    if let Err(e) = send_frame(&mut ws, Message::Pong(data)).await {
+                        warn!(%e, "pong reply failed — will reconnect");
+                        close_all_peers(&mut peers, &indicator).await;
+                        close_all_tunnel_peers(&mut tunnel_peers).await;
+                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                        return Err(ConnectError::Transient(e.context("ws pong")));
+                    }
                     watchdog::tick(ctx.pump);
                 }
                 Some(Ok(Message::Close(_))) | None => {
@@ -2273,15 +2304,28 @@ async fn close_all_tunnel_quic_peers(
     info!(count, "torn down agent QUIC tunnel peers on ws disconnect");
 }
 
-async fn send_msg(
-    ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    msg: &ClientMsg,
-) -> Result<()> {
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Single choke point for every frame written to the control WS, bounded
+/// by `WS_SEND_TIMEOUT` (see its doc for the field failure this exists
+/// for). A timeout is reported as an ordinary send error so every caller
+/// takes its existing failed-send path — which for all of them means
+/// cycling the connection. Cancelling a tungstenite send mid-flush is
+/// safe here because no caller reuses the stream after an error.
+async fn send_frame(ws: &mut Ws, frame: Message) -> Result<()> {
+    match tokio::time::timeout(WS_SEND_TIMEOUT, ws.send(frame)).await {
+        Ok(res) => res.context("ws send"),
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "ws send wedged for {} s (route captured mid-flight?) — cycling the connection",
+            WS_SEND_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn send_msg(ws: &mut Ws, msg: &ClientMsg) -> Result<()> {
     let json = serde_json::to_string(msg).context("serialising ClientMsg")?;
-    ws.send(Message::text(json)).await.context("ws send")?;
-    Ok(())
+    send_frame(ws, Message::text(json)).await
 }
 
 fn detect_os() -> OsKind {
@@ -2397,6 +2441,29 @@ mod tests {
             WS_CONNECT_TIMEOUT >= Duration::from_secs(10),
             "WS_CONNECT_TIMEOUT must give legitimate handshakes room; \
              current={WS_CONNECT_TIMEOUT:?}"
+        );
+    }
+
+    #[test]
+    fn ws_send_timeout_fits_inside_the_watchdog_budget() {
+        // The signaling pump's stall threshold is 90 s (main.rs
+        // registration). The worst un-ticked dwell in one select arm is
+        // TWO bounded sends back-to-back (heartbeat + first session-stats
+        // frame — the stats loop breaks on its first error), so
+        // 2×WS_SEND_TIMEOUT must leave the watchdog real headroom, or
+        // the PC50045 2026-08-15 failure comes back: wedged send →
+        // stalled=signaling → exit(2) → full overlay teardown on a mere
+        // VPN route capture. The lower bound keeps a slow-but-alive
+        // link (a few missed RTOs) from being cycled spuriously.
+        assert!(
+            WS_SEND_TIMEOUT >= Duration::from_secs(5),
+            "WS_SEND_TIMEOUT too aggressive — would cycle slow-but-alive \
+             links; current={WS_SEND_TIMEOUT:?}"
+        );
+        assert!(
+            2 * WS_SEND_TIMEOUT <= Duration::from_secs(45),
+            "2×WS_SEND_TIMEOUT must stay well inside the 90 s signaling \
+             stall budget; current={WS_SEND_TIMEOUT:?}"
         );
     }
 
