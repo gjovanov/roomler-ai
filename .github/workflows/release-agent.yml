@@ -35,6 +35,12 @@ on:
 
 permissions:
   contents: write
+  # For the "Refresh the cache seed" steps: `gh cache delete` needs
+  # actions:write. Deleting the flat seed between restore and save is what
+  # lets every green rehearsal actually refresh cache CONTENT — Swatinem's
+  # shared-key is immutable and skip-saves otherwise (2026-08-15 incident:
+  # an Aug-9 seed survived the whole P3e program).
+  actions: write
 
 # P3e Phase 2: single-codegen-unit release artifacts. Set as WORKFLOW env
 # (cargo reads CARGO_PROFILE_RELEASE_* like a Cargo.toml [profile.release]
@@ -220,19 +226,34 @@ jobs:
           # lockfile hash, the env hash only ever ADDED instability; a
           # stale-toolchain restore just makes cargo rebuild what differs.
           add-rust-environment-hash-key: false
-          # P3e cache-staleness fix (2026-08-15): WITHOUT this, shared-key mode
-          # yields a FULLY FLAT, IMMUTABLE key — the first save wins forever,
-          # rehearsals skip-save ("cache already exists"), and after any
-          # dependency-graph or profile change every tag build restores a
-          # stale seed and runs semi-cold until the janitor's 7-day age
-          # refresh (field-proven: the Aug-9 seed survived the ENTIRE P3e
+          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
+          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
+          # skip-save ("cache already exists"), so after any dependency-graph
+          # or profile change every tag build restores a stale seed and runs
+          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
           # program; rc.378-380 built ~14 min against it while three green
-          # rehearsals failed to refresh anything). The lockfile hash makes
-          # each graph change mint a NEW key so the next rehearsal's save
-          # succeeds; restore prefix-falls-back to the newest older seed, so
-          # partial warmth is preserved and the rc.282 env-hash-lottery fix
-          # above is untouched.
-          key: lock-${{ hashFiles('**/Cargo.lock') }}
+          # same-day rehearsals refreshed nothing). A `key:` input does NOT
+          # fix this — Swatinem IGNORES it when shared-key is set (proven on
+          # run 31903646429: the merge carrying `key:` still computed the
+          # bare flat key). The working fix is the "Refresh the cache seed"
+          # step right below: on non-tag runs it DELETES the flat key after
+          # restore, so this action's post-job save lands with this run's
+          # fresh content under the same stable key tag builds restore.
+
+      - name: Refresh the cache seed (non-tag runs only)
+        # Deleting the flat key AFTER restore means this run still starts
+        # warm, and the Swatinem post-job save then LANDS (the key no longer
+        # exists) with this run's fresh content — every green rehearsal now
+        # refreshes the seed instead of skip-saving. Tag runs never delete
+        # (their save is already gated off), so the only cold-tag window is
+        # a tag restoring between a rehearsal's delete and its save —
+        # bounded by one rehearsal duration and self-healing.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-linux-Linux-x64" --repo "${{ github.repository }}" || true
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -492,19 +513,34 @@ jobs:
           save-if: ${{ github.ref_type != 'tag' }}
           cache-on-failure: true
           add-rust-environment-hash-key: false
-          # P3e cache-staleness fix (2026-08-15): WITHOUT this, shared-key mode
-          # yields a FULLY FLAT, IMMUTABLE key — the first save wins forever,
-          # rehearsals skip-save ("cache already exists"), and after any
-          # dependency-graph or profile change every tag build restores a
-          # stale seed and runs semi-cold until the janitor's 7-day age
-          # refresh (field-proven: the Aug-9 seed survived the ENTIRE P3e
+          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
+          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
+          # skip-save ("cache already exists"), so after any dependency-graph
+          # or profile change every tag build restores a stale seed and runs
+          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
           # program; rc.378-380 built ~14 min against it while three green
-          # rehearsals failed to refresh anything). The lockfile hash makes
-          # each graph change mint a NEW key so the next rehearsal's save
-          # succeeds; restore prefix-falls-back to the newest older seed, so
-          # partial warmth is preserved and the rc.282 env-hash-lottery fix
-          # above is untouched.
-          key: lock-${{ hashFiles('**/Cargo.lock') }}
+          # same-day rehearsals refreshed nothing). A `key:` input does NOT
+          # fix this — Swatinem IGNORES it when shared-key is set (proven on
+          # run 31903646429: the merge carrying `key:` still computed the
+          # bare flat key). The working fix is the "Refresh the cache seed"
+          # step right below: on non-tag runs it DELETES the flat key after
+          # restore, so this action's post-job save lands with this run's
+          # fresh content under the same stable key tag builds restore.
+
+      - name: Refresh the cache seed (non-tag runs only)
+        # Deleting the flat key AFTER restore means this run still starts
+        # warm, and the Swatinem post-job save then LANDS (the key no longer
+        # exists) with this run's fresh content — every green rehearsal now
+        # refreshes the seed instead of skip-saving. Tag runs never delete
+        # (their save is already gated off), so the only cold-tag window is
+        # a tag restoring between a rehearsal's delete and its save —
+        # bounded by one rehearsal duration and self-healing.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-linux-arm64-Linux-arm64" --repo "${{ github.repository }}" || true
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -843,19 +879,34 @@ jobs:
           # lockfile hash, the env hash only ever ADDED instability; a
           # stale-toolchain restore just makes cargo rebuild what differs.
           add-rust-environment-hash-key: false
-          # P3e cache-staleness fix (2026-08-15): WITHOUT this, shared-key mode
-          # yields a FULLY FLAT, IMMUTABLE key — the first save wins forever,
-          # rehearsals skip-save ("cache already exists"), and after any
-          # dependency-graph or profile change every tag build restores a
-          # stale seed and runs semi-cold until the janitor's 7-day age
-          # refresh (field-proven: the Aug-9 seed survived the ENTIRE P3e
+          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
+          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
+          # skip-save ("cache already exists"), so after any dependency-graph
+          # or profile change every tag build restores a stale seed and runs
+          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
           # program; rc.378-380 built ~14 min against it while three green
-          # rehearsals failed to refresh anything). The lockfile hash makes
-          # each graph change mint a NEW key so the next rehearsal's save
-          # succeeds; restore prefix-falls-back to the newest older seed, so
-          # partial warmth is preserved and the rc.282 env-hash-lottery fix
-          # above is untouched.
-          key: lock-${{ hashFiles('**/Cargo.lock') }}
+          # same-day rehearsals refreshed nothing). A `key:` input does NOT
+          # fix this — Swatinem IGNORES it when shared-key is set (proven on
+          # run 31903646429: the merge carrying `key:` still computed the
+          # bare flat key). The working fix is the "Refresh the cache seed"
+          # step right below: on non-tag runs it DELETES the flat key after
+          # restore, so this action's post-job save lands with this run's
+          # fresh content under the same stable key tag builds restore.
+
+      - name: Refresh the cache seed (non-tag runs only)
+        # Deleting the flat key AFTER restore means this run still starts
+        # warm, and the Swatinem post-job save then LANDS (the key no longer
+        # exists) with this run's fresh content — every green rehearsal now
+        # refreshes the seed instead of skip-saving. Tag runs never delete
+        # (their save is already gated off), so the only cold-tag window is
+        # a tag restoring between a rehearsal's delete and its save —
+        # bounded by one rehearsal duration and self-healing.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-windows-vp9-444-Windows_NT-x64" --repo "${{ github.repository }}" || true
 
       - name: Install WiX Toolset v3
         shell: pwsh
@@ -1278,19 +1329,34 @@ jobs:
           # lockfile hash, the env hash only ever ADDED instability; a
           # stale-toolchain restore just makes cargo rebuild what differs.
           add-rust-environment-hash-key: false
-          # P3e cache-staleness fix (2026-08-15): WITHOUT this, shared-key mode
-          # yields a FULLY FLAT, IMMUTABLE key — the first save wins forever,
-          # rehearsals skip-save ("cache already exists"), and after any
-          # dependency-graph or profile change every tag build restores a
-          # stale seed and runs semi-cold until the janitor's 7-day age
-          # refresh (field-proven: the Aug-9 seed survived the ENTIRE P3e
+          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
+          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
+          # skip-save ("cache already exists"), so after any dependency-graph
+          # or profile change every tag build restores a stale seed and runs
+          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
           # program; rc.378-380 built ~14 min against it while three green
-          # rehearsals failed to refresh anything). The lockfile hash makes
-          # each graph change mint a NEW key so the next rehearsal's save
-          # succeeds; restore prefix-falls-back to the newest older seed, so
-          # partial warmth is preserved and the rc.282 env-hash-lottery fix
-          # above is untouched.
-          key: lock-${{ hashFiles('**/Cargo.lock') }}
+          # same-day rehearsals refreshed nothing). A `key:` input does NOT
+          # fix this — Swatinem IGNORES it when shared-key is set (proven on
+          # run 31903646429: the merge carrying `key:` still computed the
+          # bare flat key). The working fix is the "Refresh the cache seed"
+          # step right below: on non-tag runs it DELETES the flat key after
+          # restore, so this action's post-job save lands with this run's
+          # fresh content under the same stable key tag builds restore.
+
+      - name: Refresh the cache seed (non-tag runs only)
+        # Deleting the flat key AFTER restore means this run still starts
+        # warm, and the Swatinem post-job save then LANDS (the key no longer
+        # exists) with this run's fresh content — every green rehearsal now
+        # refreshes the seed instead of skip-saving. Tag runs never delete
+        # (their save is already gated off), so the only cold-tag window is
+        # a tag restoring between a rehearsal's delete and its save —
+        # bounded by one rehearsal duration and self-healing.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
 
       # rc.18: the Tauri tray companion. Tray's Cargo.toml uses
       # `frontendDist: "../src/front"` pointing at static HTML/CSS/JS —
@@ -1440,19 +1506,34 @@ jobs:
           # lockfile hash, the env hash only ever ADDED instability; a
           # stale-toolchain restore just makes cargo rebuild what differs.
           add-rust-environment-hash-key: false
-          # P3e cache-staleness fix (2026-08-15): WITHOUT this, shared-key mode
-          # yields a FULLY FLAT, IMMUTABLE key — the first save wins forever,
-          # rehearsals skip-save ("cache already exists"), and after any
-          # dependency-graph or profile change every tag build restores a
-          # stale seed and runs semi-cold until the janitor's 7-day age
-          # refresh (field-proven: the Aug-9 seed survived the ENTIRE P3e
+          # Cache-staleness note (2026-08-15): shared-key mode yields a FULLY
+          # FLAT, IMMUTABLE key — the first save wins forever and rehearsals
+          # skip-save ("cache already exists"), so after any dependency-graph
+          # or profile change every tag build restores a stale seed and runs
+          # semi-cold (field-proven: an Aug-9 seed survived the entire P3e
           # program; rc.378-380 built ~14 min against it while three green
-          # rehearsals failed to refresh anything). The lockfile hash makes
-          # each graph change mint a NEW key so the next rehearsal's save
-          # succeeds; restore prefix-falls-back to the newest older seed, so
-          # partial warmth is preserved and the rc.282 env-hash-lottery fix
-          # above is untouched.
-          key: lock-${{ hashFiles('**/Cargo.lock') }}
+          # same-day rehearsals refreshed nothing). A `key:` input does NOT
+          # fix this — Swatinem IGNORES it when shared-key is set (proven on
+          # run 31903646429: the merge carrying `key:` still computed the
+          # bare flat key). The working fix is the "Refresh the cache seed"
+          # step right below: on non-tag runs it DELETES the flat key after
+          # restore, so this action's post-job save lands with this run's
+          # fresh content under the same stable key tag builds restore.
+
+      - name: Refresh the cache seed (non-tag runs only)
+        # Deleting the flat key AFTER restore means this run still starts
+        # warm, and the Swatinem post-job save then LANDS (the key no longer
+        # exists) with this run's fresh content — every green rehearsal now
+        # refreshes the seed instead of skip-saving. Tag runs never delete
+        # (their save is already gated off), so the only cold-tag window is
+        # a tag restoring between a rehearsal's delete and its save —
+        # bounded by one rehearsal duration and self-healing.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-macos-Darwin-arm64" --repo "${{ github.repository }}" || true
 
       - name: Install system deps
         # libvpx for the `vp9-444` feature; pkg-config for the
