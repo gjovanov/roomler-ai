@@ -32,6 +32,12 @@ on:
 permissions:
   contents: write
 
+# P3e Phase 2: single-codegen-unit release artifacts — same rationale and
+# measurements as release-agent.yml's env block (CLI 21.29 -> 15.53 MiB,
+# -27.1%; LTO loses to this on both axes here, don't "upgrade" it).
+env:
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+
 jobs:
   # ---------------------------------------------------------------------------
   # 0. Validate version matches Cargo.toml
