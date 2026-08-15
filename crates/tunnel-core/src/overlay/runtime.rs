@@ -2734,6 +2734,12 @@ impl OverlayRuntime {
                                 "overlay warm relay: LOST — will re-establish when UDP egress returns"
                             );
                         }
+                        super::warm_relay::WarmTransition::ProbeMissed => {
+                            info!(
+                                detail = warm.status(now).detail.as_deref().unwrap_or("?"),
+                                "overlay warm relay: probe missed once — tolerating (2-strike rule)"
+                            );
+                        }
                         super::warm_relay::WarmTransition::ProbeOk => {}
                     }
                     if probe_ok && srflx_advertised.is_empty() && !warm.grandfather_logged {
