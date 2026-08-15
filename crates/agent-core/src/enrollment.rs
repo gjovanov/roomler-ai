@@ -99,6 +99,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ws_replaced_exit: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
+        overlay_netd: None,
         overlay_pathmon: None,
         overlay_route_events: None,
         overlay_route_tick_secs: None,
