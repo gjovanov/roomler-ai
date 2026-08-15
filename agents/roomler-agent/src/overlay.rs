@@ -978,6 +978,29 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
     None
 }
 
+/// The derived-port layout is split across two crates (agent-core computes,
+/// tunnel-core binds) with NO direct dependency — this lock keeps the two
+/// halves arithmetically consistent, or the sibling de-confliction silently
+/// re-collides.
+#[cfg(test)]
+mod derived_port_layout_lock {
+    #[test]
+    fn agent_core_layout_matches_tunnel_core() {
+        use roomler_agent_core::config as c;
+        use tunnel_core::overlay::direct as d;
+        assert_eq!(c::DERIVED_PORT_BASE, u32::from(d::DEFAULT_DIRECT_PORT));
+        assert_eq!(c::DERIVED_PORT_STRIDE, u32::from(d::DIRECT_PORT_BAND));
+        // Every derived slot's WALK band must end before the public-dial
+        // offset begins, and the highest base must clear the global cap.
+        assert!(
+            c::DERIVED_PORT_SLOTS * c::DERIVED_PORT_STRIDE <= u32::from(d::PUBLIC_DIAL_PORT_OFFSET),
+            "a derived direct band would overlap another slot's public band"
+        );
+        let max_base = c::DERIVED_PORT_BASE + (c::DERIVED_PORT_SLOTS - 1) * c::DERIVED_PORT_STRIDE;
+        assert!(max_base <= u32::from(d::MAX_DIRECT_PORT_BASE));
+    }
+}
+
 #[cfg(test)]
 mod ifname_tests {
     use super::per_org_ifname;
