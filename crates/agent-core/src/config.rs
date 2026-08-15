@@ -1242,12 +1242,14 @@ pub fn test_fixture() -> AgentConfig {
 /// Sibling-safe derived default for `overlay_direct_port` — constants
 /// mirror tunnel-core's `direct.rs` layout (locked by an agent-crate test;
 /// agent-core's tunnel-core dependency is optional, so no direct import):
-/// 16 slots of stride 8 span bases `43648..=43768` (each slot's 8-port
+/// 32 slots of stride 8 span bases `43648..=43896` (each slot's 8-port
 /// bind-walk band stays disjoint from its neighbours'), and the
-/// public-dial twin at base+128 lands every public band in
-/// `43776..43903`, disjoint from all direct bands.
+/// public-dial twin at base+256 lands every public band in
+/// `43904..44159`, disjoint from all direct bands. A locally swallowed
+/// band falls back to the SECOND derived region at base+512 before
+/// giving up to ephemeral (see tunnel-core `SECOND_BAND_OFFSET`).
 pub const DERIVED_PORT_BASE: u32 = 43648;
-pub const DERIVED_PORT_SLOTS: u32 = 16;
+pub const DERIVED_PORT_SLOTS: u32 = 32;
 pub const DERIVED_PORT_STRIDE: u32 = 8;
 
 /// The machine's derived stable direct port: `base + (fnv1a-64(machine_id)
