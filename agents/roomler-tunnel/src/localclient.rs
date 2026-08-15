@@ -933,7 +933,17 @@ fn print_status(s: &NodeStatus) {
                 .as_deref()
                 .map(|s| format!(" via {s}"))
                 .unwrap_or_default();
-            println!("  srflx       {} ({nat}{via})", srflx.candidates.join(", "));
+            // R2 — say WHICH path owns the mapping: a public-dial rescue means
+            // every LAN vantage was dead and punches ride the VPN-tunnel path.
+            let vantage = if srflx.via_public_dial {
+                ", public-dial vantage"
+            } else {
+                ""
+            };
+            println!(
+                "  srflx       {} ({nat}{via}{vantage})",
+                srflx.candidates.join(", ")
+            );
         }
     }
 
