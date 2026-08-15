@@ -190,6 +190,26 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Refresh the cache seed (delete BEFORE restore)
+        # Deleting the flat key BEFORE the restore makes this run's restore
+        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
+        # green non-tag run repopulates the seed with fresh content. The
+        # earlier delete-AFTER-restore variant had two proven holes
+        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
+        # post-save when the restore was an exact hit ("Cache up-to-date"),
+        # and two concurrent rehearsals (seed-release-caches dispatched a
+        # twin 7 s after a manual one) could delete+skip in an interleaving
+        # that left the key ABSENT for the next tag. Delete-before-restore
+        # is race-proof for freshness: worst case both runs build cold and
+        # the last save wins. Cost: rehearsals always build cold — which is
+        # exactly the freshest possible seed; tag runs never delete.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-linux-Linux-x64" --repo "${{ github.repository }}" || true
+
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache *save* (which
         # runs as a post-job step) can't sink an otherwise-green
@@ -236,24 +256,10 @@ jobs:
           # fix this — Swatinem IGNORES it when shared-key is set (proven on
           # run 31903646429: the merge carrying `key:` still computed the
           # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right below: on non-tag runs it DELETES the flat key after
-          # restore, so this action's post-job save lands with this run's
-          # fresh content under the same stable key tag builds restore.
-
-      - name: Refresh the cache seed (non-tag runs only)
-        # Deleting the flat key AFTER restore means this run still starts
-        # warm, and the Swatinem post-job save then LANDS (the key no longer
-        # exists) with this run's fresh content — every green rehearsal now
-        # refreshes the seed instead of skip-saving. Tag runs never delete
-        # (their save is already gated off), so the only cold-tag window is
-        # a tag restoring between a rehearsal's delete and its save —
-        # bounded by one rehearsal duration and self-healing.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-linux-Linux-x64" --repo "${{ github.repository }}" || true
+          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
+          # restore, so the restore MISSES and this action's post-job save
+          # lands unconditionally with this run's fresh content under the
+          # same stable key tag builds restore.
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -504,6 +510,26 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Refresh the cache seed (delete BEFORE restore)
+        # Deleting the flat key BEFORE the restore makes this run's restore
+        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
+        # green non-tag run repopulates the seed with fresh content. The
+        # earlier delete-AFTER-restore variant had two proven holes
+        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
+        # post-save when the restore was an exact hit ("Cache up-to-date"),
+        # and two concurrent rehearsals (seed-release-caches dispatched a
+        # twin 7 s after a manual one) could delete+skip in an interleaving
+        # that left the key ABSENT for the next tag. Delete-before-restore
+        # is race-proof for freshness: worst case both runs build cold and
+        # the last save wins. Cost: rehearsals always build cold — which is
+        # exactly the freshest possible seed; tag runs never delete.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-linux-arm64-Linux-arm64" --repo "${{ github.repository }}" || true
+
       - name: Cache cargo
         continue-on-error: true
         uses: Swatinem/rust-cache@v2
@@ -523,24 +549,10 @@ jobs:
           # fix this — Swatinem IGNORES it when shared-key is set (proven on
           # run 31903646429: the merge carrying `key:` still computed the
           # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right below: on non-tag runs it DELETES the flat key after
-          # restore, so this action's post-job save lands with this run's
-          # fresh content under the same stable key tag builds restore.
-
-      - name: Refresh the cache seed (non-tag runs only)
-        # Deleting the flat key AFTER restore means this run still starts
-        # warm, and the Swatinem post-job save then LANDS (the key no longer
-        # exists) with this run's fresh content — every green rehearsal now
-        # refreshes the seed instead of skip-saving. Tag runs never delete
-        # (their save is already gated off), so the only cold-tag window is
-        # a tag restoring between a rehearsal's delete and its save —
-        # bounded by one rehearsal duration and self-healing.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-linux-arm64-Linux-arm64" --repo "${{ github.repository }}" || true
+          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
+          # restore, so the restore MISSES and this action's post-job save
+          # lands unconditionally with this run's fresh content under the
+          # same stable key tag builds restore.
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
@@ -845,6 +857,26 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Refresh the cache seed (delete BEFORE restore)
+        # Deleting the flat key BEFORE the restore makes this run's restore
+        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
+        # green non-tag run repopulates the seed with fresh content. The
+        # earlier delete-AFTER-restore variant had two proven holes
+        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
+        # post-save when the restore was an exact hit ("Cache up-to-date"),
+        # and two concurrent rehearsals (seed-release-caches dispatched a
+        # twin 7 s after a manual one) could delete+skip in an interleaving
+        # that left the key ABSENT for the next tag. Delete-before-restore
+        # is race-proof for freshness: worst case both runs build cold and
+        # the last save wins. Cost: rehearsals always build cold — which is
+        # exactly the freshest possible seed; tag runs never delete.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-windows-vp9-444-Windows_NT-x64" --repo "${{ github.repository }}" || true
+
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache *save* (which
         # runs as a post-job step) can't sink an otherwise-green
@@ -889,24 +921,10 @@ jobs:
           # fix this — Swatinem IGNORES it when shared-key is set (proven on
           # run 31903646429: the merge carrying `key:` still computed the
           # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right below: on non-tag runs it DELETES the flat key after
-          # restore, so this action's post-job save lands with this run's
-          # fresh content under the same stable key tag builds restore.
-
-      - name: Refresh the cache seed (non-tag runs only)
-        # Deleting the flat key AFTER restore means this run still starts
-        # warm, and the Swatinem post-job save then LANDS (the key no longer
-        # exists) with this run's fresh content — every green rehearsal now
-        # refreshes the seed instead of skip-saving. Tag runs never delete
-        # (their save is already gated off), so the only cold-tag window is
-        # a tag restoring between a rehearsal's delete and its save —
-        # bounded by one rehearsal duration and self-healing.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-windows-vp9-444-Windows_NT-x64" --repo "${{ github.repository }}" || true
+          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
+          # restore, so the restore MISSES and this action's post-job save
+          # lands unconditionally with this run's fresh content under the
+          # same stable key tag builds restore.
 
       - name: Install WiX Toolset v3
         shell: pwsh
@@ -1298,6 +1316,26 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
+      - name: Refresh the cache seed (delete BEFORE restore)
+        # Deleting the flat key BEFORE the restore makes this run's restore
+        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
+        # green non-tag run repopulates the seed with fresh content. The
+        # earlier delete-AFTER-restore variant had two proven holes
+        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
+        # post-save when the restore was an exact hit ("Cache up-to-date"),
+        # and two concurrent rehearsals (seed-release-caches dispatched a
+        # twin 7 s after a manual one) could delete+skip in an interleaving
+        # that left the key ABSENT for the next tag. Delete-before-restore
+        # is race-proof for freshness: worst case both runs build cold and
+        # the last save wins. Cost: rehearsals always build cold — which is
+        # exactly the freshest possible seed; tag runs never delete.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
+
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache save can't sink an
         # otherwise-green build (same rationale as the sibling jobs).
@@ -1339,24 +1377,10 @@ jobs:
           # fix this — Swatinem IGNORES it when shared-key is set (proven on
           # run 31903646429: the merge carrying `key:` still computed the
           # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right below: on non-tag runs it DELETES the flat key after
-          # restore, so this action's post-job save lands with this run's
-          # fresh content under the same stable key tag builds restore.
-
-      - name: Refresh the cache seed (non-tag runs only)
-        # Deleting the flat key AFTER restore means this run still starts
-        # warm, and the Swatinem post-job save then LANDS (the key no longer
-        # exists) with this run's fresh content — every green rehearsal now
-        # refreshes the seed instead of skip-saving. Tag runs never delete
-        # (their save is already gated off), so the only cold-tag window is
-        # a tag restoring between a rehearsal's delete and its save —
-        # bounded by one rehearsal duration and self-healing.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-installer-smoke-windows-Windows_NT-x64" --repo "${{ github.repository }}" || true
+          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
+          # restore, so the restore MISSES and this action's post-job save
+          # lands unconditionally with this run's fresh content under the
+          # same stable key tag builds restore.
 
       # rc.18: the Tauri tray companion. Tray's Cargo.toml uses
       # `frontendDist: "../src/front"` pointing at static HTML/CSS/JS —
@@ -1472,6 +1496,26 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      - name: Refresh the cache seed (delete BEFORE restore)
+        # Deleting the flat key BEFORE the restore makes this run's restore
+        # MISS, and rust-cache saves UNCONDITIONALLY on a miss — so every
+        # green non-tag run repopulates the seed with fresh content. The
+        # earlier delete-AFTER-restore variant had two proven holes
+        # (2026-08-15, runs 31904848770/31904853884): rust-cache SKIPS its
+        # post-save when the restore was an exact hit ("Cache up-to-date"),
+        # and two concurrent rehearsals (seed-release-caches dispatched a
+        # twin 7 s after a manual one) could delete+skip in an interleaving
+        # that left the key ABSENT for the next tag. Delete-before-restore
+        # is race-proof for freshness: worst case both runs build cold and
+        # the last save wins. Cost: rehearsals always build cold — which is
+        # exactly the freshest possible seed; tag runs never delete.
+        if: ${{ github.ref_type != 'tag' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "v0-rust-agent-macos-Darwin-arm64" --repo "${{ github.repository }}" || true
+
       - name: Cache cargo
         # `continue-on-error: true` so a flaky cache *save* (which
         # runs as a post-job step) can't sink an otherwise-green
@@ -1516,24 +1560,10 @@ jobs:
           # fix this — Swatinem IGNORES it when shared-key is set (proven on
           # run 31903646429: the merge carrying `key:` still computed the
           # bare flat key). The working fix is the "Refresh the cache seed"
-          # step right below: on non-tag runs it DELETES the flat key after
-          # restore, so this action's post-job save lands with this run's
-          # fresh content under the same stable key tag builds restore.
-
-      - name: Refresh the cache seed (non-tag runs only)
-        # Deleting the flat key AFTER restore means this run still starts
-        # warm, and the Swatinem post-job save then LANDS (the key no longer
-        # exists) with this run's fresh content — every green rehearsal now
-        # refreshes the seed instead of skip-saving. Tag runs never delete
-        # (their save is already gated off), so the only cold-tag window is
-        # a tag restoring between a rehearsal's delete and its save —
-        # bounded by one rehearsal duration and self-healing.
-        if: ${{ github.ref_type != 'tag' }}
-        continue-on-error: true
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh cache delete "v0-rust-agent-macos-Darwin-arm64" --repo "${{ github.repository }}" || true
+          # step right ABOVE: on non-tag runs it deletes the flat key BEFORE
+          # restore, so the restore MISSES and this action's post-job save
+          # lands unconditionally with this run's fresh content under the
+          # same stable key tag builds restore.
 
       - name: Install system deps
         # libvpx for the `vp9-444` feature; pkg-config for the
