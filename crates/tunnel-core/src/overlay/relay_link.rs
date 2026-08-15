@@ -353,6 +353,23 @@ pub struct RelayCoordinator {
     /// only does when the PEER is also flagged), `relay_strategy()` returns
     /// that verdict verbatim instead of deriving locally.
     server_strategy: bool,
+    /// C4 stage 2 (PR-B) — the STANDING warm TURN allocation, mirrored here
+    /// by the runtime's warm arm ([`set_warm_leg`](Self::set_warm_leg)) while
+    /// the leg is live. A single-relay ANCHOR [`request`](Self::request)
+    /// commits it instantly — no request/grant/allocate round-trips — which is
+    /// the whole point of keeping the leg warm: the pair fails over in the
+    /// time it takes the peer to dial, not the time three round-trips take
+    /// through a possibly-captured control WS.
+    warm_leg: Option<Arc<dyn RelayConn>>,
+    /// C4 stage 2 (PR-B) — which pair currently OWNS the warm leg. SINGLE-PAIR
+    /// by design: a [`Carrier::relay`] spawns a reader that `recv_from`s the
+    /// conn, so two pairs sharing one allocation would steal each other's
+    /// datagrams (per-peer readers decap against their own Tunn — no demux).
+    /// Cleared by [`forget`](Self::forget) (the leg, if still alive, is free
+    /// for the next commit) and by `set_warm_leg(None)` (the leg died).
+    /// Sharing one allocation across pairs needs a DERP-style inbound demux —
+    /// that's PR-C, not this.
+    warm_committed: Option<ObjectId>,
 }
 
 /// Hash of everything `relay_strategy` reads about a pair, other than the
@@ -421,7 +438,21 @@ impl RelayCoordinator {
             refresh_ctx: HashMap::new(),
             derp_mux_failed: false,
             server_strategy: super::direct::server_relay_strategy_enabled(),
+            warm_leg: None,
+            warm_committed: None,
         }
+    }
+
+    /// C4 stage 2 (PR-B) — mirror the warm leg's lifecycle from the runtime's
+    /// warm arm: `Some(conn)` on ESTABLISHED, `None` on LOST. Losing the leg
+    /// also releases the single-pair commit — the committed pair's carrier
+    /// holds its own `Arc` clone and dies on its own terms (health sweep),
+    /// but a DEAD leg must never be fast-committed to the next pair.
+    pub fn set_warm_leg(&mut self, conn: Option<Arc<dyn RelayConn>>) {
+        if conn.is_none() {
+            self.warm_committed = None;
+        }
+        self.warm_leg = conn;
     }
 
     /// R2 — replace the LAN endpoints after a direct-plane rebuild. These
@@ -887,6 +918,39 @@ impl RelayCoordinator {
             }
             RelayStrategy::SingleRelay(true) | RelayStrategy::BothAllocate => {}
         }
+        // C4 stage 2 (PR-B) — single-relay ANCHOR with a live warm leg: commit
+        // the standing allocation NOW instead of the request→grant→allocate
+        // round-trips (each of which can take seconds — or forever, when this
+        // host's control WS is what a VPN capture just killed). Anchor-only:
+        // the anchor's `try_build` dials the peer's srflx, so the leg's worker
+        // never has to match a pair-key pin (both-allocate's `try_build`
+        // requires the peer's allocation on OUR worker, and the warm leg is
+        // deliberately un-pinned — fast-committing it there would withhold
+        // forever). Single-pair gate per the `warm_committed` field doc.
+        if strat == RelayStrategy::SingleRelay(true)
+            && self.warm_committed.is_none()
+            && let Some(conn) = self.warm_leg.clone()
+        {
+            self.roles.insert(node_id, strat);
+            if let Ok(own) = conn.local_addr() {
+                info!(peer = %node_id, %own,
+                      "overlay relay: warm leg committed as the anchor allocation (no round-trips)");
+                self.advertised.insert(node_id, own.to_string());
+                let _ = self
+                    .outbound
+                    .send(ClientMsg::OverlayEndpoints {
+                        candidates: self.all_endpoints(),
+                    })
+                    .await;
+            }
+            // Straight into `allocated` — NOT via `commit_alloc`, whose
+            // `try_build` would hand the ReadyLink back to US; every call
+            // site follows `request` with `maybe_complete`, which builds
+            // from `allocated` and installs it.
+            self.allocated.insert(node_id, Allocated { conn, peer });
+            self.warm_committed = Some(node_id);
+            return;
+        }
         // U1 — attach the refresh evidence + the sticky mux-failure flag.
         let (current_kind, reason) = match refresh {
             Some((kind, reason)) => (
@@ -1191,7 +1255,12 @@ impl RelayCoordinator {
     /// by pubkey). `None` until the anchor advertises `R` (retry next netmap).
     fn try_build_dialer(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let peer = self.dialing.get(node_id)?;
-        let r: SocketAddr = pick_anchor_relay_endpoint(&peer.endpoints, &self.coturn_ips, node_id)?;
+        let r: SocketAddr = pick_anchor_relay_endpoint(
+            &peer.endpoints,
+            peer.warm_relay_endpoint.as_deref(),
+            &self.coturn_ips,
+            node_id,
+        )?;
         // Fresh raw socket, NO TURN allocation. Bind via std (sync) then adopt
         // into the tokio reactor without awaiting, so this stays on the sync
         // build path (`maybe_complete` is not async).
@@ -1282,6 +1351,15 @@ impl RelayCoordinator {
         self.dialing.remove(node_id);
         self.derping.remove(node_id);
         self.roles.remove(node_id);
+        // C4 stage 2 (PR-B) — release the single-pair warm commit. If the leg
+        // itself is still alive (its probes decide that, not this pair's
+        // fate), the very next `request` for this — or any — anchor pair
+        // fast-commits it again: exactly the instant re-establishment the
+        // standing leg exists for. A leg that actually died goes LOST on the
+        // probe path and `set_warm_leg(None)` closes the fast path.
+        if self.warm_committed == Some(*node_id) {
+            self.warm_committed = None;
+        }
     }
 }
 
@@ -1365,8 +1443,18 @@ async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
 /// With the coturn worker IPs known, `R` must be ON one. An EMPTY
 /// `coturn_ips` (resolution unavailable) falls back to the legacy pick —
 /// better a possibly-wrong dial than no relay tier at all.
+///
+/// C4 stage 2 (PR-B) — `warm` is the anchor's STANDING warm-leg address from
+/// the netmap (heartbeat-refreshed, pair-less). When the per-pair advert
+/// hasn't landed — or never will, because the anchor's control WS is what
+/// just died — the dialer dials the warm leg instead of withholding. Held to
+/// the SAME coturn-worker validation as the advert (a coturn-co-located
+/// host's own address must not pass as a "relay"), and only trusted when the
+/// worker set is actually known: with `coturn_ips` unresolved the warm claim
+/// is unverifiable, and the legacy first-public pick has already returned.
 fn pick_anchor_relay_endpoint(
     endpoints: &[String],
+    warm: Option<&str>,
     coturn_ips: &[IpAddr],
     node_id: &ObjectId,
 ) -> Option<SocketAddr> {
@@ -1382,7 +1470,18 @@ fn pick_anchor_relay_endpoint(
         .iter()
         .find(|s| coturn_ips.contains(&s.ip()))
         .copied();
-    if r.is_none() && !parsed.is_empty() {
+    if r.is_some() {
+        return r;
+    }
+    if let Some(w) = warm
+        .and_then(|w| w.parse::<SocketAddr>().ok())
+        .filter(|s| coturn_ips.contains(&s.ip()))
+    {
+        info!(peer = %node_id, warm = %w,
+              "overlay relay: dialer — per-pair relay advert absent; dialing the anchor's warm leg");
+        return Some(w);
+    }
+    if !parsed.is_empty() {
         // The anchor's relay advert is missing (rejoin wiped it) or stale —
         // WITHHOLD rather than dial its host address as if it were coturn.
         debug!(
@@ -1392,7 +1491,7 @@ fn pick_anchor_relay_endpoint(
              known coturn worker; withholding until its relay advert lands"
         );
     }
-    r
+    None
 }
 
 /// W6 phase-2 — the dialer's OTHER public srflx addresses (distinct IPs,
@@ -1473,18 +1572,67 @@ mod tests {
             "5.9.157.221:11885".to_string(),   // the coturn allocation — R
         ];
         assert_eq!(
-            pick_anchor_relay_endpoint(&eps, &coturn, &nid),
+            pick_anchor_relay_endpoint(&eps, None, &coturn, &nid),
             Some("5.9.157.221:11885".parse().unwrap())
         );
 
         // No entry on a worker ⇒ withhold (retry next netmap).
         let hostonly = vec!["94.130.141.98:43648".to_string()];
-        assert_eq!(pick_anchor_relay_endpoint(&hostonly, &coturn, &nid), None);
+        assert_eq!(
+            pick_anchor_relay_endpoint(&hostonly, None, &coturn, &nid),
+            None
+        );
 
         // Worker set unresolved ⇒ legacy first-public pick (never brick the
         // relay tier on a DNS failure).
         assert_eq!(
-            pick_anchor_relay_endpoint(&hostonly, &[], &nid),
+            pick_anchor_relay_endpoint(&hostonly, None, &[], &nid),
+            Some("94.130.141.98:43648".parse().unwrap())
+        );
+    }
+
+    /// C4 stage 2 (PR-B) — the dialer falls back to the anchor's heartbeat-
+    /// advertised WARM leg when the per-pair advert is absent, under the same
+    /// coturn-worker validation: a warm claim off a worker (a coturn-
+    /// co-located host's own address, a spoof, a stale row) is rejected, the
+    /// per-pair advert still wins when present, and an unresolved worker set
+    /// never consults the warm claim at all (unverifiable).
+    #[test]
+    fn dialer_falls_back_to_the_warm_leg_only_when_validated() {
+        let nid = ObjectId::new();
+        let coturn: Vec<IpAddr> = vec![
+            "5.9.157.221".parse().unwrap(),
+            "94.130.141.74".parse().unwrap(),
+        ];
+        let hostonly = vec!["94.130.141.98:43648".to_string()];
+
+        // Advert absent + warm on a worker ⇒ dial the warm leg.
+        assert_eq!(
+            pick_anchor_relay_endpoint(&hostonly, Some("5.9.157.221:11764"), &coturn, &nid),
+            Some("5.9.157.221:11764".parse().unwrap())
+        );
+        // Warm NOT on a worker (co-located host / spoof) ⇒ withhold.
+        assert_eq!(
+            pick_anchor_relay_endpoint(&hostonly, Some("94.130.141.98:12000"), &coturn, &nid),
+            None
+        );
+        // Garbage warm ⇒ withhold.
+        assert_eq!(
+            pick_anchor_relay_endpoint(&hostonly, Some("not-an-addr"), &coturn, &nid),
+            None
+        );
+        // Per-pair advert present ⇒ it wins over the warm claim.
+        let with_advert = vec![
+            "94.130.141.98:43648".to_string(),
+            "94.130.141.74:11223".to_string(),
+        ];
+        assert_eq!(
+            pick_anchor_relay_endpoint(&with_advert, Some("5.9.157.221:11764"), &coturn, &nid),
+            Some("94.130.141.74:11223".parse().unwrap())
+        );
+        // Worker set unresolved ⇒ legacy pick, warm never consulted.
+        assert_eq!(
+            pick_anchor_relay_endpoint(&hostonly, Some("5.9.157.221:11764"), &[], &nid),
             Some("94.130.141.98:43648".parse().unwrap())
         );
     }
@@ -1523,6 +1671,7 @@ mod tests {
             supports_overlay_echo: false,
             relay_strategy: None,
             relay_home: None,
+            warm_relay_endpoint: None,
         }
     }
 
@@ -1610,6 +1759,94 @@ mod tests {
             Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node
         ));
         assert!(rx.try_recv().is_err()); // only one request sent
+    }
+
+    /// C4 stage 2 (PR-B) — a fixed-address stand-in for the warm leg's
+    /// [`RelayConn`]; `local_addr` is the allocation's relayed address.
+    struct WarmTestConn;
+    #[async_trait::async_trait]
+    impl RelayConn for WarmTestConn {
+        async fn send_to(&self, buf: &[u8], _dst: SocketAddr) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok("5.9.157.221:12795".parse().unwrap())
+        }
+    }
+
+    /// C4 stage 2 (PR-B) — a live warm leg makes the single-relay ANCHOR
+    /// request commit instantly: no `OverlayRelayRequest` round-trip, the
+    /// leg's relayed address advertised as this pair's relay, and
+    /// `maybe_complete` builds the anchor link off it. SINGLE-PAIR: a second
+    /// anchor pair while the leg is committed takes today's request path;
+    /// `forget` releases the commit (still-live leg re-commits for the next
+    /// pair — the standing failover this exists for); a LOST leg closes the
+    /// fast path entirely.
+    #[tokio::test]
+    async fn warm_leg_fast_commits_the_single_relay_anchor() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // We are UDP-BLOCKED (the strict-corp anchor case), single-relay on.
+        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], None);
+        coord.single_relay = true;
+        coord.set_warm_leg(Some(Arc::new(WarmTestConn)));
+        let node = ObjectId::new();
+        // Peer: UDP-capable + single-relay ⇒ we ANCHOR.
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        coord.request(node, peer.clone()).await;
+        assert!(coord.is_tracking(&node));
+        // The ONLY wire traffic is the endpoints trickle advertising the leg.
+        let Ok(ClientMsg::OverlayEndpoints { candidates }) = rx.try_recv() else {
+            panic!("expected the endpoints trickle carrying the warm leg");
+        };
+        assert!(candidates.contains(&"5.9.157.221:12795".to_string()));
+        assert!(rx.try_recv().is_err(), "no request round-trip");
+        let link = coord
+            .maybe_complete(node, &peer)
+            .expect("anchor link ready");
+        assert_eq!(link.single_relay, Some(true));
+        assert_eq!(link.relay_kind, RelayKind::Turn);
+        assert_eq!(
+            link.relay_parts.as_ref().unwrap().1,
+            "203.0.113.9:40000".parse().unwrap(),
+            "anchor dials the dialer's srflx for the IP-only permit"
+        );
+
+        // SINGLE-PAIR: a second anchor pair goes down today's request path.
+        let node2 = ObjectId::new();
+        coord.request(node2, peer.clone()).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node2
+        ));
+
+        // `forget` releases the commit — the still-live leg re-commits.
+        coord.forget(&node);
+        let node3 = ObjectId::new();
+        coord.request(node3, peer.clone()).await;
+        assert!(coord.is_tracking(&node3));
+        assert!(
+            matches!(rx.try_recv(), Ok(ClientMsg::OverlayEndpoints { .. })),
+            "fast re-commit trickles the leg again"
+        );
+        assert!(rx.try_recv().is_err(), "no request round-trip on re-commit");
+
+        // A LOST leg closes the fast path.
+        coord.forget(&node3);
+        coord.set_warm_leg(None);
+        let node4 = ObjectId::new();
+        coord.request(node4, peer).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node4
+        ));
     }
 
     #[test]

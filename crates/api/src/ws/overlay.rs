@@ -1717,6 +1717,11 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // futile both-symmetric punch (VERBATIM, like srflx_endpoints).
         srflx_nat: node.srflx_nat.clone(),
         relay_home: node.relay_home.clone(),
+        // C4 stage 2 (PR-B) — surface the node's standing warm-leg address
+        // (heartbeat-mirrored) so a single-relay dialer can dial this anchor
+        // the moment its pair dies, without waiting for the per-pair relay
+        // advert to crawl through a possibly-captured control WS.
+        warm_relay_endpoint: node.warm_relay_endpoint.clone(),
         reachable,
         supports_quic: node.supports_quic,
         // Phase D — surface the node's single-relay capability so a peer only
@@ -2058,6 +2063,7 @@ mod tests {
             srflx_endpoints: vec!["5.6.7.8:5678".into()],
             srflx_nat: Some("cone".into()),
             relay_home: None,
+            warm_relay_endpoint: None,
             supports_quic: true,
             supports_relay_single: true,
             supports_derp: true,
