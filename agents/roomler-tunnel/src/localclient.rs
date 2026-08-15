@@ -937,6 +937,33 @@ fn print_status(s: &NodeStatus) {
         }
     }
 
+    // C4 stage 1 — the warm TURN/UDP allocation. The line the Monday-morning
+    // VPN check reads: "live" with a fresh probe while srflx is NONE means
+    // the relay flow was grandfathered across the VPN connect.
+    if let Some(w) = &s.warm_relay {
+        match w.state.as_str() {
+            "live" => {
+                let probe = match w.last_probe_ok_s {
+                    Some(a) => format!("probe ok {a}s ago"),
+                    None => "probe pending".to_string(),
+                };
+                let expiry = match w.cred_expiry_in_s {
+                    Some(e) => format!(", creds {e}s left"),
+                    None => String::new(),
+                };
+                println!(
+                    "  warm relay  {} (age {}s, {probe}{expiry})",
+                    w.relayed.as_deref().unwrap_or("?"),
+                    w.age_s.unwrap_or(0)
+                );
+            }
+            other => {
+                let why = w.detail.as_deref().unwrap_or("not yet established");
+                println!("  warm relay  {other} ({why})");
+            }
+        }
+    }
+
     // PR-B1 — per-bound-direct-socket receive liveness: a socket with rx=0 /
     // a growing last_rx age while its endpoint is advertised is a dead reader
     // (the 2026-08-10 wedge: bound, advertised, Recv-Q pegged, never read).

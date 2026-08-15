@@ -335,6 +335,8 @@ impl LocalApiState for DaemonState {
             // NAT-traversal — the srflx gather outcome. Empty candidates means
             // this node can't hole-punch and reads as UDP-blocked to every peer.
             srflx: self.overlay.borrow().srflx.clone(),
+            // C4 stage 1 — the warm TURN/UDP allocation's state.
+            warm_relay: self.overlay.borrow().warm_relay.clone(),
             // Multi-org P1 — one row per enrollment; empty (and omitted on
             // the wire) for a single-org daemon or a state built without
             // the registry.
@@ -1069,6 +1071,7 @@ mod tests {
             exit_node: None,
             dns: None,
             srflx: None,
+            warm_relay: None,
             direct_socks: Vec::new(),
         }
     }

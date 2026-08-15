@@ -1089,6 +1089,16 @@ pub fn srflx_seek_enabled() -> bool {
     crate::env::flag("OVERLAY_SRFLX_SEEK", true)
 }
 
+/// C4 stage 1 — the standing warm TURN/UDP allocation
+/// (`ROOMLER_NODE_OVERLAY_WARM_RELAY`; default **OFF**): established
+/// whenever the srflx tier proves UDP egress works, kept alive so
+/// corp-VPN flow-grandfathering preserves a UDP relay leg across a VPN
+/// connect. Measurement-only in stage 1 — nothing routes over it; see
+/// `docs/overlay-warm-relay.md`.
+pub fn warm_relay_enabled() -> bool {
+    crate::env::flag("OVERLAY_WARM_RELAY", false)
+}
+
 /// Auth-first type-1 routing on a MULTI-ORG carrier plane
 /// (`ROOMLER_NODE_OVERLAY_INIT_AUTH_FIRST`, legacy `ROOMLER_AGENT_…`; default
 /// **ON**): with more than one engine attached, an inbound handshake
