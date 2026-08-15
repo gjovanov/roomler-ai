@@ -2543,6 +2543,7 @@ mod tests {
             supports_overlay_echo: false,
             relay_strategy: None,
             relay_home: None,
+            warm_relay_endpoint: None,
         }
     }
 
