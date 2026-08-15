@@ -996,6 +996,15 @@ mod derived_port_layout_lock {
             c::DERIVED_PORT_SLOTS * c::DERIVED_PORT_STRIDE <= u32::from(d::PUBLIC_DIAL_PORT_OFFSET),
             "a derived direct band would overlap another slot's public band"
         );
+        // The band-2 jump must clear the WHOLE primary layout (direct
+        // region + public region), or band-2 direct binds would land
+        // inside primary public bands.
+        assert!(
+            u32::from(d::SECOND_BAND_OFFSET)
+                >= u32::from(d::PUBLIC_DIAL_PORT_OFFSET)
+                    + c::DERIVED_PORT_SLOTS * c::DERIVED_PORT_STRIDE,
+            "band 2 would overlap the primary public region"
+        );
         let max_base = c::DERIVED_PORT_BASE + (c::DERIVED_PORT_SLOTS - 1) * c::DERIVED_PORT_STRIDE;
         assert!(max_base <= u32::from(d::MAX_DIRECT_PORT_BASE));
     }

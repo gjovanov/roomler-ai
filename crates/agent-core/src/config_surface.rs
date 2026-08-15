@@ -27,7 +27,7 @@ use roomler_localapi::ConfigEntry;
 /// Duplicated rather than imported because `tunnel_core::overlay` lives
 /// behind the `overlay` CARGO FEATURE and this surface must compile in every
 /// feature combination. Source of truth is `direct.rs`; keep in sync.
-const MAX_OVERLAY_DIRECT_PORT_BASE: u32 = 65_399;
+const MAX_OVERLAY_DIRECT_PORT_BASE: u32 = 64_759;
 
 /// `(key, kind, description)` for the whole surface, in display order.
 /// `kind` is the client-side editor hint contract — see [`ConfigEntry`].
@@ -207,7 +207,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_direct_port",
         "number",
-        "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+128). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band (Hyper-V/WSL reserve invisible pools). 0 = ephemeral ports. Built-in default: DERIVED per machine (43648 + machine-id-hash slot, 43648..43768) so siblings behind one NAT never collide; set 43648 explicitly to pin the old fleet-wide constant. Env: ROOMLER_NODE_OVERLAY_DIRECT_PORT.",
+        "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+256). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band, then the same walk at base+512 (Hyper-V/WSL reserve invisible pools that move between boots). 0 = ephemeral ports. Built-in default: DERIVED per machine (43648 + machine-id-hash slot, 43648..43896) so siblings behind one NAT never collide; set 43648 explicitly to pin the old fleet-wide constant. Env: ROOMLER_NODE_OVERLAY_DIRECT_PORT.",
     ),
     (
         "shared_encoder",
