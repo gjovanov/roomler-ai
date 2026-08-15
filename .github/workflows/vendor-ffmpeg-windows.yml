@@ -190,7 +190,7 @@ jobs:
           cmake --build /tmp/vpl/build -j"$(nproc)"
           sudo cmake --install /tmp/vpl/build --prefix /usr/local
           # amf: header-only.
-          git clone --depth 1 --branch v1.4.34 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git /tmp/amf
+          git clone --depth 1 --branch v1.4.36 https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git /tmp/amf
           sudo mkdir -p /usr/local/include/AMF
           sudo cp -r /tmp/amf/amf/public/include/* /usr/local/include/AMF/
           sudo ldconfig
@@ -216,7 +216,7 @@ jobs:
             --disable-avdevice --disable-avfilter --disable-swscale \
             --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc,h264_qsv,hevc_qsv,av1_qsv,vp9_qsv,h264_amf,hevc_amf,av1_amf \
             --enable-nvenc --enable-libvpl --enable-amf \
-            || { echo "=== configure failed; ffnvcodec section of config.log ==="; grep -n -B 3 -A 30 "ffnvcodec" ffbuild/config.log | tail -120; echo "=== pc sanity ==="; pkg-config --modversion ffnvcodec || true; pkg-config --cflags ffnvcodec || true; ls -la /usr/local/lib/pkgconfig/ || true; exit 1; }
+            || { echo "=== configure failed; last errors in config.log ==="; grep -n -B 25 "^ERROR:" ffbuild/config.log | tail -80; grep -nE "error:" ffbuild/config.log | tail -10; exit 1; }
           make -j"$(nproc)"
           sudo make install
           echo "=== installed libs ==="
