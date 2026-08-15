@@ -46,6 +46,10 @@ pub(crate) enum WarmTransition {
     Established,
     EstablishFailed,
     ProbeOk,
+    /// One probe failed but the 2-strike rule is tolerating it (field
+    /// 2026-08-15, pc55331 on VPN: a single lost CreatePermission round
+    /// trip cycled a healthy allocation at 09:52Z).
+    ProbeMissed,
     Lost,
 }
 
@@ -59,6 +63,9 @@ pub(crate) struct WarmRelay {
     probe_seq: u8,
     last_probe_ok: Option<Instant>,
     probe_in_flight: bool,
+    /// Consecutive failed probes; LOST only at 2 (one lost round trip on
+    /// a corp path must not cycle a healthy allocation).
+    probe_fail_streak: u8,
     last_request: Option<Instant>,
     detail: Option<String>,
     lost: bool,
@@ -142,14 +149,24 @@ impl WarmRelay {
             WarmMsg::ProbeOk => {
                 self.probe_in_flight = false;
                 self.last_probe_ok = Some(now);
+                self.probe_fail_streak = 0;
                 WarmTransition::ProbeOk
             }
             WarmMsg::ProbeFailed(e) => {
-                // A failed permission assert through the allocation means
-                // coturn no longer honours it (expiry, worker restart, or
+                self.probe_in_flight = false;
+                self.probe_fail_streak = self.probe_fail_streak.saturating_add(1);
+                if self.probe_fail_streak < 2 {
+                    // 2-strike rule: one lost round trip on a corp path is
+                    // not death; the next probe (≤ PROBE_SPACING away)
+                    // decides. `last_probe_ok` is NOT advanced, so the
+                    // retry is due on the next tick.
+                    self.detail = Some(e);
+                    return WarmTransition::ProbeMissed;
+                }
+                // Two consecutive failed permission asserts: coturn no
+                // longer honours the allocation (expiry, worker restart, or
                 // the client leg's flow died). Drop the conn — holding it
                 // would keep `is_live` true and starve re-establishment.
-                self.probe_in_flight = false;
                 self.conn = None;
                 self.lost = true;
                 self.detail = Some(e);
@@ -257,6 +274,27 @@ mod tests {
         assert!(!w.probe_due(now), "just probed — not due again yet");
         assert!(w.probe_due(now + PROBE_SPACING));
 
+        w.note_probe_started();
+        assert_eq!(
+            w.apply(WarmMsg::ProbeFailed("transient".into()), now),
+            WarmTransition::ProbeMissed,
+            "one failed probe is tolerated (2-strike rule)"
+        );
+        assert!(w.is_live(), "still live after a single miss");
+        assert!(
+            w.probe_due(now + PROBE_SPACING),
+            "the retry stays scheduled — a miss never advances last_probe_ok"
+        );
+        // An OK in between resets the streak: the next single failure is
+        // again only a miss.
+        w.note_probe_started();
+        assert_eq!(w.apply(WarmMsg::ProbeOk, now), WarmTransition::ProbeOk);
+        w.note_probe_started();
+        assert_eq!(
+            w.apply(WarmMsg::ProbeFailed("transient".into()), now),
+            WarmTransition::ProbeMissed
+        );
+        // Second consecutive failure ⇒ LOST.
         w.note_probe_started();
         assert_eq!(
             w.apply(WarmMsg::ProbeFailed("437 allocation gone".into()), now),
