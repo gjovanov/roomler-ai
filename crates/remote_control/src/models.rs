@@ -1398,6 +1398,15 @@ pub struct OverlayNode {
     /// Preferred relay region/home, if any (Phase 5 multi-relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
+    /// C4 stage 2 (PR-B) — the node's STANDING warm TURN allocation's relayed
+    /// address (`worker-ip:port`), mirrored from its agent's heartbeats while
+    /// a leg is live (`$unset` while none is). The netmap builder reads THIS
+    /// row — not the agents collection — so the field must live here to reach
+    /// `NetmapPeer.warm_relay_endpoint`, where a single-relay dialer uses it
+    /// as the pair-less dial fallback. Cleared on rejoin like `srflx_*`: a
+    /// restarted runtime holds no leg until its warm arm re-establishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_relay_endpoint: Option<String>,
     /// rc.142 — the node advertised (on JOIN) that it can carry WG over a
     /// QUIC-over-TURN relay carrier. Echoed per-peer in the netmap so QUIC is
     /// only attempted when both ends support it (no silent QUIC/raw split).

@@ -1736,6 +1736,15 @@ pub struct NetmapPeer {
     pub srflx_nat: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
+    /// C4 stage 2 — this peer's STANDING warm TURN allocation's relayed
+    /// address (`worker-ip:port`), refreshed by its heartbeats while a leg
+    /// is live. A dialer whose pair to this peer died can dial it
+    /// IMMEDIATELY (validated against the coturn worker set like any
+    /// anchor advert) — no waiting for the peer's per-pair relay
+    /// advertisement to crawl through a possibly-captured control WS.
+    /// `None` from a pre-stage-2 server or while the peer holds no leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_relay_endpoint: Option<String>,
     pub reachable: bool,
     /// rc.142 — this peer advertised it can carry WG over a QUIC-over-TURN
     /// relay carrier. A node only attempts the QUIC upgrade with a peer when
@@ -3535,6 +3544,7 @@ mod tests {
                 srflx_endpoints: vec!["198.51.100.7:41820".into()],
                 srflx_nat: Some("cone".into()),
                 relay_home: None,
+                warm_relay_endpoint: None,
                 reachable: true,
                 supports_quic: true,
                 supports_relay_single: true,
