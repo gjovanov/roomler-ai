@@ -403,6 +403,122 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # 1b. Linux aarch64 — the same .deb for arm64 hosts.
+  #
+  # Why this exists: without an arm64 asset the updater's asset picker finds
+  # no match and every check ends "no installer asset for this platform", so
+  # `Update all` from the web UI is a permanent no-op on an arm64 box. Field
+  # case 2026-08-15 on a Fedora Asahi Remix host (Apple M2) that meshes and
+  # screen-shares fine but could never self-update.
+  #
+  # Deliberately WITHOUT `ffmpeg-encoder`: the vendored FFmpeg 8.1.2 tree is
+  # published for linux64/macos-arm64 only, there is no linux-arm64 build to
+  # fetch, and the backend it feeds dispatches to nvenc/qsv/amf — none of
+  # which exist on the Apple-silicon and Ampere hosts this targets. Dropping
+  # it also keeps this lane on the P3e size trajectory (no 20 MB of FFmpeg in
+  # a package whose encoders would all fail to init). Video on arm64 is
+  # openh264 (SW H.264) + libvpx VP9-444, both field-verified.
+  # ---------------------------------------------------------------------------
+  build-linux-arm64:
+    name: Build .deb (Linux aarch64)
+    needs: validate-version
+    # 22.04 for the same glibc reason as the x86_64 lane: build on the OLDEST
+    # supported base so the binary loads on 22.04 AND 24.04.
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
+            cmake libclang-dev pkg-config \
+            libvpx-dev \
+            libasound2-dev \
+            patchelf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: agent-linux-arm64
+          save-if: ${{ github.ref_type != 'tag' }}
+          cache-on-failure: true
+          add-rust-environment-hash-key: false
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build agent (release, full + vp9-444, no ffmpeg-encoder)
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack"
+
+      - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
+        run: |
+          set -euo pipefail
+          cargo build -p roomler-cli-shim --release
+          test -f target/release/roomler-shim || { echo "::error::roomler-shim not produced — the cargo-deb assets entry would fail"; exit 1; }
+
+      - name: Bundle libvpx into the .deb (self-contained, RPATH)
+        run: |
+          set -euo pipefail
+          # Same ABI trap as the x86_64 lane: the agent links this runner's
+          # libvpx-dev (1.12 / libvpx.so.7 on 22.04) and stock 24.04 ships only
+          # libvpx.so.9, so without carrying it the .deb installs cleanly and
+          # then aborts at load. The cargo-deb assets glob is
+          # `vendor-ffmpeg/*.so.*` — CI-populated and shared with the x86_64
+          # lane's FFmpeg bundle; here it carries libvpx alone.
+          dst=agents/roomler-agent/vendor-ffmpeg
+          rm -rf "$dst" && mkdir -p "$dst"
+          vpx7=$(readlink -f /usr/lib/aarch64-linux-gnu/libvpx.so.7)
+          cp "$vpx7" "$dst/libvpx.so.7"
+          [ -f "$dst/libvpx.so.7" ] || { echo "::error::libvpx.so.7 not bundled — agent aborts at load on 24.04"; exit 1; }
+          for lib in "$dst"/*.so.*; do patchelf --set-rpath '$ORIGIN' "$lib"; done
+          patchelf --set-rpath '/usr/lib/roomler-agent' target/release/roomlerd
+          echo "bundled: $(ls "$dst" | tr '\n' ' ')"
+          echo "binary RUNPATH -> $(patchelf --print-rpath target/release/roomlerd)"
+
+      - name: Verify the bundled agent loads on stock Ubuntu 24.04 (arm64)
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" ubuntu:24.04 bash -euc '
+            apt-get update -qq
+            apt-get install -y -qq libxcb1 libxcb-shm0 libxcb-randr0 libasound2t64 >/dev/null
+            LD_LIBRARY_PATH=/w/agents/roomler-agent/vendor-ffmpeg /w/target/release/roomlerd --version'
+
+      - name: Build .deb
+        working-directory: agents/roomler-agent
+        run: cargo deb --no-build --no-strip
+
+      - name: Rename + checksum
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          src=$(ls target/debian/roomler-agent_*_arm64.deb | head -n1)
+          dst="roomler-agent-${version}-aarch64-unknown-linux-gnu.deb"
+          mv "$src" "$dst"
+          sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
+          echo "artifact=${dst}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb-arm64
+          path: |
+            ${{ steps.pack.outputs.artifact }}
+            ${{ steps.pack.outputs.artifact }}.sha256
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
   # 2. Windows — MSI via cargo-wix. Unsigned unless WIN_CODESIGN_PFX_BASE64
   #    secret is present.
   # ---------------------------------------------------------------------------
@@ -1468,7 +1584,7 @@ jobs:
   release:
     name: Publish GitHub Release
     if: needs.validate-version.outputs.is_release == 'true'
-    needs: [validate-version, build-linux, build-windows, build-windows-companions, build-macos]
+    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1524,10 +1640,11 @@ jobs:
       always() &&
       needs.validate-version.outputs.is_release == 'false' &&
       (needs.build-linux.result == 'failure' ||
+       needs.build-linux-arm64.result == 'failure' ||
        needs.build-windows.result == 'failure' ||
        needs.build-windows-companions.result == 'failure' ||
        needs.build-macos.result == 'failure')
-    needs: [validate-version, build-linux, build-windows, build-windows-companions, build-macos]
+    needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos]
     runs-on: ubuntu-latest
     permissions:
       issues: write
