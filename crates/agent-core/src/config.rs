@@ -140,6 +140,13 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_SRFLX_SEEK`). Built-in default: on.
     #[serde(default)]
     pub overlay_srflx_seek: Option<bool>,
+    /// W4(d) — restore the LEGACY ReplacedByNewer escalation (3 displacements
+    /// in the window ⇒ sentinel + process exit). Built-in default: OFF —
+    /// displacement storms on TLS-inspected paths are zombie half-open
+    /// WSes, and exiting tore down the whole overlay for an event that
+    /// needed none of it (`ROOMLER_AGENT_WS_REPLACED_EXIT`).
+    #[serde(default)]
+    pub ws_replaced_exit: Option<bool>,
     /// Overlay PathMonitor engagement (`ROOMLER_NODE_OVERLAY_PATHMON`):
     /// `on` (authoritative — the built-in default since PR-D's two green
     /// soaks) | `shadow` (fed + compared, legacy decides — the per-host
@@ -1133,6 +1140,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_wsl_mirrored_guard: None,
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
+        ws_replaced_exit: None,
         overlay_pathmon: None,
         overlay_route_events: None,
         overlay_route_tick_secs: None,
@@ -1202,7 +1210,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 33] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 34] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1217,6 +1225,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 33]
         ("OVERLAY_WSL_MIRRORED_GUARD", cfg.overlay_wsl_mirrored_guard),
         ("OVERLAY_INIT_AUTH_FIRST", cfg.overlay_init_auth_first),
         ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
+        ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
         ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
         ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
         ("OVERLAY_MUX_NAT", cfg.overlay_mux_nat),
