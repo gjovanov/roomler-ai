@@ -237,10 +237,16 @@ jobs:
           # FFmpeg 6.1, but `ffmpeg-next = 8.1` needs 8.x.
           gh release download vendored-ffmpeg-8.1.2 \
             --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-8.1.2-linux64-lgpl-shared.tar.xz' \
+            --pattern 'ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz' \
             --dir /tmp/ffdl
+          # P3e lever B (Linux twin): the MINIMAL from-source build — the ten
+          # HW encoders + their parsers, nothing else (whole lib dir 2.5 MB
+          # vs ~50 MB of libav* in the old BtbN re-upload; the agent's
+          # cascade is locked to nvenc/qsv/amf by a unit test, so kvazaar/
+          # vaapi/every-decoder were unreachable). Vendor job's runtime probe
+          # asserts the encoder set; rollback = drop the `-minimal` suffix.
           sudo mkdir -p /opt/roomler-ffmpeg
-          sudo tar xf /tmp/ffdl/ffmpeg-8.1.2-linux64-lgpl-shared.tar.xz \
+          sudo tar xf /tmp/ffdl/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz \
             -C /opt/roomler-ffmpeg --strip-components=1
           # BtbN's pkgconfig files hardcode the build-machine prefix; rewrite
           # it to our extract path so pkg-config emits correct -L/-I flags.
