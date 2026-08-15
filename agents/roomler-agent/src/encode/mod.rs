@@ -34,7 +34,7 @@ pub mod mf;
 // every release build with the feature flipped on or off behaves
 // identically. The CI plumbing that links stripped FFmpeg + libmfx is
 // rc.65; the actual encoder backend is rc.66. See
-// `docs/hevc-dc-plan.md` (rc.64) for the phased rollout.
+// `docs/encoders.md` (rc.64) for the phased rollout.
 #[cfg(feature = "ffmpeg-encoder")]
 pub mod ffmpeg;
 
@@ -362,7 +362,7 @@ pub trait VideoEncoder: Send {
     /// VideoToolbox attachments) should give those regions a low
     /// (high-quality) QP and the unchanged macroblocks a high
     /// (low-bitrate) QP. The single biggest efficiency lever for
-    /// desktop content per `docs/streaming-options.md` §5.1 — typical
+    /// desktop content (see `docs/encoders.md`) — typical
     /// idle desktops drop 5-10× in bandwidth at the same perceived
     /// quality. `frame_dims` is the encode resolution (post-downscale)
     /// so backends can clip rects to the encoder grid.

@@ -159,7 +159,7 @@ enum Command {
         timeout_ms: u32,
     },
     /// M3 A1 derisking probes (Pre-flight #2/#3/#5 from
-    /// `docs/plans/m3-a1.md` / memory `project_m3_a1_*.md`). Three
+    /// `docs/remote-control.md` §19). Three
     /// modes:
     ///   - `winlogon-token`: confirm OpenProcessToken(winlogon.exe) +
     ///     CreateProcessAsUserW spawns SYSTEM-in-active-session child.

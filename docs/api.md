@@ -1,258 +1,255 @@
 # API Reference
 
-Base URL: `http://localhost:3000`
+Every HTTP endpoint the server exposes, grouped the way `build_router`
+(`crates/api/src/lib.rs`) composes them. *As of 0.3.0-rc.381 the surface is ~165
+endpoints across 38 route modules.* Request/response schemas are shown for the key
+flows; for everything else the handler modules in `crates/api/src/routes/` are the
+source of truth.
 
-All API routes are nested under `/api`. Authentication is via JWT in an httpOnly cookie (`access_token`) or an `Authorization: Bearer <token>` header.
+- **Base URL**: `https://roomler.ai` (or your deployment). All JSON.
+- **IDs** are MongoDB ObjectIds serialized as 24-char hex strings.
+- **Errors** are JSON with an HTTP status; 404 is also used to *hide* resources the
+  caller may not see (platform-admin routes).
 
-## Auth Routes
+## Authentication
 
-No tenant prefix. No authentication required for register/login.
+JWT bearer tokens (`Authorization: Bearer <jwt>`), Argon2 password hashing. Six
+audience-checked token types — a token of one audience is rejected everywhere else:
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/auth/register` | No | Register a new user |
-| POST | `/api/auth/login` | No | Login by username or email |
-| POST | `/api/auth/logout` | No | Clear auth cookie |
-| POST | `/api/auth/refresh` | No | Refresh access token |
-| GET | `/api/auth/me` | Yes | Get current user profile |
-| PUT | `/api/auth/me` | Yes | Update current user profile |
+| Token | Audience | Lifetime | Held by |
+|---|---|---|---|
+| `Access` | user routes + `/ws` (user role) | 7 d (config) | browser |
+| `Refresh` | `POST /api/auth/refresh` only | 30 d (config) | browser |
+| `Enrollment` | `POST /api/agent/enroll` | 10 min, single-use (`jti`) | pasted into installer |
+| `Agent` | `/ws?role=agent`, agent ingest routes, `/derp` | long-lived | `roomlerd` config |
+| `TunnelEnrollment` | `POST /api/tunnel-client/enroll` | 10 min, single-use | pasted into CLI |
+| `TunnelClient` | `/ws?role=tunnel-client`, tunnel routes | long-lived | `roomler` CLI config |
 
-### POST `/api/auth/register`
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant S as API
 
-```json
-// Request
-{
-  "email": "user@example.com",
-  "username": "user1",
-  "display_name": "User One",
-  "password": "secret",
-  "tenant_name": "My Org",      // optional: creates a default tenant
-  "tenant_slug": "my-org"       // optional: required if tenant_name is set
-}
-
-// Response (201 Created)
-{
-  "access_token": "eyJ...",
-  "refresh_token": "eyJ...",
-  "expires_in": 3600,
-  "user": {
-    "id": "6...",
-    "email": "user@example.com",
-    "username": "user1",
-    "display_name": "User One",
-    "avatar": null
-  }
-}
+    B->>S: POST /api/auth/login {email|username, password}
+    S-->>B: {access_token, refresh_token, user}
+    B->>S: GET /api/... (Authorization: Bearer access)
+    Note over B,S: access token expires
+    B->>S: POST /api/auth/refresh {refresh_token}
+    S-->>B: {access_token, refresh_token}
 ```
 
-Sets httpOnly cookie: `access_token=<JWT>; HttpOnly; Path=/; SameSite=Lax`
+Device enrollment is a two-step exchange — an admin mints a short-lived token, the
+installer trades it for the device's long-lived credential:
 
-### POST `/api/auth/login`
+```mermaid
+sequenceDiagram
+    participant A as Admin (browser)
+    participant S as API
+    participant D as New machine (roomlerd)
 
-```json
-// Request (either username or email required)
-{
-  "username": "user1",
-  "password": "secret"
-}
-
-// Response (200 OK) — same shape as register
+    A->>S: POST /api/tenant/{tid}/agent/enroll-token
+    S-->>A: {enrollment_token, expires_in: 600, jti}
+    A-->>D: token handed to installer / wizard
+    D->>S: POST /api/agent/enroll {enrollment_token, machine_id, machine_name, os, agent_version}
+    S-->>D: {agent_id, tenant_id, agent_token}
+    D->>S: GET /ws?role=agent&token=<agent_token>  (always-on control link)
 ```
 
-### POST `/api/auth/refresh`
+`machine_id` is a stable hardware-derived hash, unique per `(tenant_id, machine_id)`
+— re-enrolling a known machine reuses its row. The tunnel-client flow is identical
+in shape (`…/tunnel-client/enroll-token` → `POST /api/tunnel-client/enroll` →
+`{tunnel_client_token}`), with a distinct audience so a leaked agent token can't
+impersonate a client or vice-versa.
 
-```json
-// Request
-{
-  "refresh_token": "eyJ..."
-}
+### Rate limiting
 
-// Response (200 OK) — same shape as register
-```
+Everything under `/api` sits behind a per-client-IP governor (trusted-proxy-aware —
+it will not believe a client-supplied `X-Forwarded-For`). `POST /api/auth/login` and
+`/register` carry an additional per-(IP, account) brute-force gate. `/health`,
+`/ws`, `/derp`, and the Stripe webhook are deliberately outside the governor.
 
-## Tenant Routes
+## Public routes (no user JWT)
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant` | Yes | List tenants for current user |
-| POST | `/api/tenant` | Yes | Create a new tenant |
-| GET | `/api/tenant/{tenant_id}` | Yes | Get tenant details |
+Auth, where present, is in-handler (enrollment tokens, agent/tunnel bearer tokens,
+capability URLs, webhook signatures).
 
-## Member Routes
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/auth/register` | Create account (+ optionally a tenant, or accept `invite_code`) |
+| POST | `/api/auth/login` | Password login (`email` or `username`) |
+| POST | `/api/auth/logout` | Invalidate session |
+| POST | `/api/auth/refresh` | Rotate the access token |
+| POST | `/api/auth/activate` | Redeem an email activation code |
+| GET/PUT | `/api/auth/me` | Current user (read / update) |
+| GET | `/api/oauth/{provider}` | OAuth redirect (google, facebook, github, linkedin, microsoft) |
+| GET | `/api/oauth/callback/{provider}` | OAuth callback |
+| GET | `/api/invite/{code}` | Public invite info |
+| POST | `/api/invite/{code}/accept` | Accept an invite (authed) |
+| GET | `/api/stripe/plans` | Plan catalogue |
+| POST | `/api/stripe/checkout` · `/portal` | Stripe checkout / customer portal |
+| POST | `/api/stripe/webhook` | Stripe events (HMAC-signed; un-governed) |
+| POST | `/api/agent/enroll` | Exchange enrollment token → agent credential |
+| GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy) |
+| GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
+| POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler) |
+| POST | `/api/consent/{token}/approve` · `/deny` | Owner-consent capability URLs (token **is** the auth, single-use) |
+| POST | `/api/tunnel-client/enroll` | Exchange tunnel enrollment token → client credential |
+| GET | `/api/tunnel-client/agents` | Reachable agents (TunnelClient bearer) |
+| GET | `/api/tunnel/latest-release` · `/installer/{platform}` (+`/health`) | Tunnel-CLI release manifest + artifact proxy |
+| GET | `/api/setup/latest-release` · `/{platform}` (+`/health`) | `roomler-setup` wizard manifest + artifact proxy |
+| GET | `/api/setup/install.sh` · `/install.ps1` | Terminal installers (served from the binary, curl-able) |
+| POST | `/api/releases/refresh` | CI cache-bust after a release is published (bearer; fans out to all pods) |
+| GET | `/api/turn/credentials` | Ephemeral TURN credentials (user-scoped) |
+| GET | `/api/relay/regions` | Multi-region relay PoP topology (read-only) |
+| POST | `/api/log/browser` | Browser console-log batch ingest (user JWT + explicit `tenant_id`) |
+| GET | `/api/cluster/status` | Per-pod identity, counters, gauges |
+| POST | `/api/stats/pageview` | SPA route-change beacon (authed, paths normalized) |
+| GET | `/health` | Liveness — cheap process-alive 200 |
+| GET | `/health/ready` | Readiness — Mongo ping + Redis round-trip + live subscription |
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/member` | Yes | List members of a tenant |
+### User-scoped (access JWT, no tenant prefix)
 
-## Room Routes
+| Method | Path | Purpose |
+|---|---|---|
+| PUT | `/api/user/me` | Update profile |
+| GET | `/api/user/unread-summary` | Cross-tenant unread counters |
+| GET | `/api/user/{user_id}` | Public profile |
+| GET | `/api/giphy/search` · `/trending` | Giphy proxy |
+| GET | `/api/push/config` | VAPID public key |
+| POST | `/api/push/subscribe` · `/unsubscribe` | Web-push subscription |
+| GET | `/api/notification` · `/unread` · `/unread-count` | Notification feeds |
+| PUT | `/api/notification/{id}/read` | Mark one read |
+| POST | `/api/notification/read-all` | Mark all read |
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/room` | Yes | List rooms the user has joined |
-| POST | `/api/tenant/{tenant_id}/room` | Yes | Create a new room |
-| GET | `/api/tenant/{tenant_id}/room/explore` | Yes | Browse all public rooms |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}` | Yes | Get room details |
-| PUT | `/api/tenant/{tenant_id}/room/{room_id}` | Yes | Update a room |
-| DELETE | `/api/tenant/{tenant_id}/room/{room_id}` | Yes | Delete a room |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/join` | Yes | Join a room |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/leave` | Yes | Leave a room |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/member` | Yes | List room members |
+### Platform-admin (`platform_admins` ObjectId allowlist; 404 on miss)
 
-### Room Call Routes
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/admin/stats/relay/current` · `/relay/history` | Relay (TURN/DERP) load, live + series |
+| GET | `/api/admin/stats/orgs` · `/users` · `/machines` · `/calls` | Platform-wide inventories |
+| GET | `/api/admin/stats/usage` · `/usage/{user_id}` | Per-user usage across every org |
+| POST | `/api/admin/overlay-block/reclaim` | Reclaim quarantined overlay address blocks (dry-run by default) |
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/start` | Yes | Start a call in a room |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/join` | Yes | Join an active call |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/leave` | Yes | Leave a call |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/end` | Yes | End a call |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/call/participant` | Yes | List call participants |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/call/message` | Yes | List in-call chat messages |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/call/message` | Yes | Send an in-call chat message |
+## Tenant-scoped routes — `/api/tenant/{tenant_id}/…`
 
-## Message Routes
+Caller must be a member of the tenant; write operations check the caller's role
+permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-system)).
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/message` | Yes | List messages (paginated) |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/message` | Yes | Send a message |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/message/pin` | Yes | List pinned messages |
-| PUT | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}` | Yes | Edit a message |
-| DELETE | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}` | Yes | Delete a message |
-| PUT | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/pin` | Yes | Toggle pin on a message |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/thread` | Yes | Get thread replies |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/reaction` | Yes | Add a reaction |
-| DELETE | `/api/tenant/{tenant_id}/room/{room_id}/message/{message_id}/reaction/{emoji}` | Yes | Remove a reaction |
+### Organization
 
-## Invite Routes
+| Method | Path | Purpose |
+|---|---|---|
+| GET/POST | `/api/tenant` | List my tenants / create one |
+| GET | `/api/tenant/{tid}` | Tenant detail |
+| POST | `…/archive` · `…/unarchive` | Owner-only; archiving revokes every device enrollment and releases the mesh |
+| GET | `…/member` · POST `…/member` | List / add members |
+| GET | `…/member/me` | My membership + permissions |
+| GET/POST | `…/role` | List / create roles |
+| PUT/DELETE | `…/role/{role_id}` | Update / delete a role |
+| POST/DELETE | `…/role/{role_id}/assign/{user_id}` | Assign / unassign |
+| GET/POST | `…/invite` | List / create invites |
+| POST | `…/invite/batch` | Batch email invites |
+| DELETE | `…/invite/{invite_id}` | Revoke |
+| GET | `…/search?q=` | Full-text search: messages, rooms, people |
 
-### Public
+### Rooms, chat, calls
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/invite/{code}` | Optional | Get invite info (tenant name, inviter, validity) |
-| POST | `/api/invite/{code}/accept` | Yes | Accept an invite and join the tenant |
+| Method | Path | Purpose |
+|---|---|---|
+| GET/POST | `…/room` | List / create rooms (hierarchical: `parent_id`, `path`) |
+| GET | `…/room/explore` | Discoverable rooms |
+| GET/PUT/DELETE | `…/room/{rid}` | Room CRUD |
+| POST | `…/room/{rid}/join` · `/leave` | Membership |
+| GET | `…/room/{rid}/member` | Room members |
+| POST | `…/room/{rid}/call/start` · `/join` · `/leave` · `/end` | Call lifecycle (mediasoup) |
+| GET | `…/room/{rid}/call/participant` | Live participants |
+| GET/POST | `…/room/{rid}/message` | Paginated history / send |
+| GET | `…/message/pin` | Pinned messages |
+| PUT/DELETE | `…/message/{mid}` | Edit / delete |
+| PUT | `…/message/{mid}/pin` | Toggle pin |
+| GET | `…/message/{mid}/thread` | Thread replies |
+| POST | `…/message/{mid}/reaction` | Add reaction |
+| DELETE | `…/message/{mid}/reaction/{emoji}` | Remove reaction |
+| POST | `…/message/read` · `/read-all` | Read markers |
+| GET | `…/message/unread-count` | Unread count |
+| GET/POST | `…/room/{rid}/recording` | List / create recordings |
+| DELETE | `…/recording/{rec_id}` | Delete recording |
 
-### Tenant-Scoped (require INVITE_MEMBERS permission)
+### Files, tasks, export
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/invite` | Yes | List tenant invites (paginated) |
-| POST | `/api/tenant/{tenant_id}/invite` | Yes | Create a single invite |
-| POST | `/api/tenant/{tenant_id}/invite/batch` | Yes | Create multiple invites at once (max 50) |
-| DELETE | `/api/tenant/{tenant_id}/invite/{invite_id}` | Yes | Revoke an invite |
-| POST | `/api/tenant/{tenant_id}/member` | Yes | Directly add a user as member |
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `…/room/{rid}/file` · POST `…/file/upload` | Room-scoped files (100 MB limit) |
+| GET/POST | `…/file` · `…/file/upload` | Tenant file library |
+| GET | `…/file/{fid}` · `/download` | Metadata / streamed download |
+| DELETE | `…/file/{fid}` | Delete |
+| POST | `…/file/{fid}/recognize` | AI document recognition (Claude vision) |
+| GET | `…/task` · `…/task/{tid}` · `/download` | Background tasks + results |
+| POST | `…/export/conversation` | XLSX export |
+| POST | `…/export/conversation-pdf` | PDF export |
 
-### POST `/api/tenant/{tenant_id}/invite/batch`
+### Fleet — agents & remote sessions
 
-```json
-// Request
-{
-  "invites": [
-    {
-      "target_email": "alice@example.com",
-      "expires_in_hours": 168,
-      "assign_role_ids": ["role_id_1"]
-    },
-    {
-      "target_email": "bob@example.com",
-      "assign_role_ids": ["role_id_2"]
-    }
-  ]
-}
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `…/agent` | List enrolled devices (status, caps, overlay info) |
+| POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use) |
+| POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device) |
+| POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
+| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release) |
+| GET | `…/agent/{aid}/crash` | Crash reports |
+| POST/GET | `…/agent/{aid}/logs` | Log batch ingest (agent JWT) / admin listing |
+| POST | `…/agent/exec` · `…/agent/{aid}/exec` | Fleet RPC: run a command (fleet sweep / one device) — see [fleet-rpc.md](fleet-rpc.md) |
+| POST | `…/agent/{aid}/exec/{request_id}/cancel` | Cancel a running exec |
+| PUT | `…/agent/{aid}/exec-policy` | Per-device exec gate (a management act, separate from the exec power) |
+| GET | `…/exec-audit` | Org-wide exec attempt log (every refusal included) |
+| GET/PUT | `…/exec-settings` | Org exec kill-switch (gate 1 of 4) |
+| GET | `…/session/{sid}` | Remote-desktop session detail |
+| POST | `…/session/{sid}/terminate` | Force-terminate |
+| GET | `…/session/{sid}/audit` | Session audit trail |
 
-// Response (201 Created)
-{
-  "results": [
-    { "invite": { "id": "...", "code": "...", ... }, "target_email": "alice@example.com" },
-    { "invite": { "id": "...", "code": "...", ... }, "target_email": "bob@example.com" }
-  ],
-  "created": 2,
-  "failed": 0
-}
-```
+Exec body (`POST …/exec`): `{shell?: "pwsh"|"powershell"|"cmd"|"bash"|"sh", command,
+timeout_ms?, max_output_bytes?}` — clamped server-side; output is secret-redacted
+before it leaves the host.
 
-## Role Routes
+### Tunnels
 
-Tenant-scoped, require MANAGE_ROLES permission for write operations.
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `…/tunnel-client` | List enrolled tunnel clients |
+| POST | `…/tunnel-client/enroll-token` | Mint a tunnel enrollment token |
+| DELETE | `…/tunnel-client/{cid}` | Revoke a client |
+| GET/POST | `…/tunnel-policy` | List / create ACL policies (default-deny) |
+| GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD |
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/role` | Yes | List all roles for a tenant |
-| POST | `/api/tenant/{tenant_id}/role` | Yes | Create a custom role |
-| PUT | `/api/tenant/{tenant_id}/role/{role_id}` | Yes | Update a role |
-| DELETE | `/api/tenant/{tenant_id}/role/{role_id}` | Yes | Delete a role (not default/managed) |
-| POST | `/api/tenant/{tenant_id}/role/{role_id}/assign/{user_id}` | Yes | Assign role to user |
-| DELETE | `/api/tenant/{tenant_id}/role/{role_id}/assign/{user_id}` | Yes | Remove role from user |
+### Overlay network
 
-Default roles seeded on tenant creation: Owner, Admin, Moderator, Member. Permissions use a 24-bit bitfield.
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `…/overlay-node` | Mesh nodes with advertised + approved routes |
+| PUT | `…/overlay-node/{nid}/approved-routes` | `{approved_routes: ["10.0.0.0/24", …]}` — approve subnet-router routes (the data-plane signal) |
+| PUT | `…/overlay-node/{nid}/exit-node` | `{enabled: bool}` — designate an exit node (also adds `/0` to approved routes) |
+| DELETE | `…/overlay-node/{nid}` | Evict from the mesh + release the address back to the pool |
+| GET/POST | `…/overlay-acl` | Overlay L3 ACL policies |
+| GET/PUT | `…/overlay-acl/mode` | Tenant posture: `off` (default) \| `warn` \| `enforce` |
+| GET/PUT/DELETE | `…/overlay-acl/{pid}` | ACL policy CRUD |
+| GET/PUT | `…/magic-dns` | Tenant MagicDNS domain + upstream resolvers |
+| GET | `…/overlay-block` | The tenant's overlay address block |
+| POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |
 
-## User Profile Routes
+### Observability
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/user/{user_id}` | Yes | Get user's public profile |
-| PUT | `/api/user/me` | Yes | Update own profile (display_name, bio, avatar, locale, timezone) |
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `…/stats/overview` | Tenant overview (member-visible) |
+| GET | `…/stats/mesh` | Mesh graph edges + carrier types |
+| GET | `…/stats/machines` · `/calls` · `/tunnels` | Per-domain series (MANAGE_AGENTS) |
+| GET | `…/stats/usage` · `/usage/{user_id}` | Usage (own row self-service; others need MANAGE_AGENTS) |
 
-## Notification Routes
+## Non-HTTP surfaces
 
-User-scoped, no tenant prefix.
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/notification` | Yes | List notifications (paginated) |
-| GET | `/api/notification/unread` | Yes | List unread notifications |
-| GET | `/api/notification/unread-count` | Yes | Get unread notification count |
-| PUT | `/api/notification/{notification_id}/read` | Yes | Mark a notification as read |
-| POST | `/api/notification/read-all` | Yes | Mark all notifications as read |
-
-Notifications are created automatically when users are @mentioned in messages. They are also delivered in real-time via WebSocket (`notification:new` and `notification:unread_count` message types).
-
-## Recording Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/recording` | Yes | List recordings |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/recording` | Yes | Create a recording |
-| DELETE | `/api/tenant/{tenant_id}/room/{room_id}/recording/{recording_id}` | Yes | Delete a recording |
-
-## File Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/tenant/{tenant_id}/file/upload` | Yes | Upload a file |
-| GET | `/api/tenant/{tenant_id}/file/{file_id}` | Yes | Get file metadata |
-| GET | `/api/tenant/{tenant_id}/file/{file_id}/download` | Yes | Download a file |
-| DELETE | `/api/tenant/{tenant_id}/file/{file_id}` | Yes | Delete a file |
-| POST | `/api/tenant/{tenant_id}/file/{file_id}/recognize` | Yes | AI document recognition (Claude API) |
-| GET | `/api/tenant/{tenant_id}/room/{room_id}/file` | Yes | List files in a room |
-| POST | `/api/tenant/{tenant_id}/room/{room_id}/file/upload` | Yes | Upload a file to a room |
-
-## Background Task Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/tenant/{tenant_id}/task` | Yes | List background tasks |
-| GET | `/api/tenant/{tenant_id}/task/{task_id}` | Yes | Get task status |
-| GET | `/api/tenant/{tenant_id}/task/{task_id}/download` | Yes | Download task output file |
-
-## Export Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/tenant/{tenant_id}/export/conversation` | Yes | Export conversation to XLSX |
-| POST | `/api/tenant/{tenant_id}/export/conversation-pdf` | Yes | Export conversation to PDF (via Claude API) |
-
-## WebSocket
-
-| Path | Auth | Description |
-|------|------|-------------|
-| `/ws?token=<JWT>` | Yes (via query param) | WebSocket connection |
-
-JWT is passed as a query parameter since WebSocket connections cannot use cookies or headers for the initial handshake. See [Real-Time](real-time.md) for protocol details.
-
-## Health Check
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/health` | No | Health check (returns `{ "status": "ok", "version": "0.1.0" }`) |
+| Surface | Where documented |
+|---|---|
+| `/ws` — user, agent, and tunnel-client roles; chat/presence/media signalling + the whole `rc:*` protocol | [real-time.md](real-time.md) |
+| `/derp` — pubkey-addressed relay for UDP-blocked overlay pairs | [real-time.md](real-time.md#derp) |
+| LocalAPI — on-host named pipe / unix socket used by `roomler`, `roomler-desktop` | [tunnels.md](tunnels.md#localapi) |

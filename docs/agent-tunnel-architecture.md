@@ -75,11 +75,15 @@ encrypted relay used only when no direct path can be punched.
   agent can reach ("the DB behind the office firewall").
 - `socks5` — a local SOCKS5 proxy that exits through one agent, or through the whole
   fleet in mesh mode; point any app or browser at it.
-- **Overlay mesh** (optional): your machines get stable private IPs and DNS-style names,
+- **Overlay mesh** (optional): your machines get stable private IPs and MagicDNS names,
   talk directly over the LAN when they can, and relay only when they must
-  (`status` / `peers` / `ping` show what's live).
-- QUIC data plane with WebRTC fallback, climbing direct → TURN/UDP → TLS over TCP 443 —
-  it works even from strict corporate networks.
+  (`status` / `peers` / `ping` show what's live). A machine can even belong to
+  **several organizations at once** ([multi-org.md](multi-org.md)).
+- QUIC data plane with WebRTC fallback, climbing direct → TURN/UDP → TLS over TCP 443,
+  plus regional DERP relays as the everything-blocked fallback — it works even from
+  strict corporate networks.
+- `roomler exec` runs commands on trusted fleet devices through four independent
+  default-deny gates with a full audit trail ([fleet-rpc.md](fleet-rpc.md)).
 - Everything is gated by **default-deny ACL policies** managed in the admin UI, with an
   audit row per session.
 
@@ -128,10 +132,14 @@ them — is exactly the harness autonomous AI agents need:
 
 ## Learn more
 
+- [`README.md`](README.md) — the full documentation index.
 - [`remote-control.md`](remote-control.md) — full remote-desktop design: protocol, data
-  model, security, latency budget.
+  model, security, latency budget; [`encoders.md`](encoders.md) for the codec pipeline.
+- [`tunnels.md`](tunnels.md) — tunnel concepts: flow types, transports, policy, LocalAPI.
 - [`tunnel-install.md`](tunnel-install.md) — step-by-step tunnel install, enrollment, and
   corporate-network testing guide.
+- [`overlay-communication.md`](overlay-communication.md) — every overlay carrier path,
+  inside and outside a corporate VPN.
 - [`overlay-exit-nodes.md`](overlay-exit-nodes.md) — Tailscale-style exit nodes: route a
   client's whole internet egress (v4+v6) through a mesh peer, with the self-wedge safety
   model, DNS-leak steering, and crash-safety.
