@@ -181,7 +181,7 @@ jobs:
           sudo apt-get install -y nasm pkg-config cmake
           # nvenc: header-only SDK, versioned; 12.1 supports Blackwell-era
           # drivers while keeping the driver floor reasonable.
-          git clone --depth 1 --branch n12.1.14.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
+          git clone --depth 1 --branch n13.1.15.0 https://github.com/FFmpeg/nv-codec-headers.git /tmp/nvh
           sudo make -C /tmp/nvh install PREFIX=/usr/local
           # qsv: Intel oneVPL dispatcher (thin; the runtime comes from the
           # host's intel-media stack). ffmpeg wants libvpl >= 2.6.
@@ -215,7 +215,8 @@ jobs:
             --disable-encoders --disable-hwaccels \
             --disable-avdevice --disable-avfilter --disable-swscale \
             --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc,h264_qsv,hevc_qsv,av1_qsv,vp9_qsv,h264_amf,hevc_amf,av1_amf \
-            --enable-nvenc --enable-libvpl --enable-amf
+            --enable-nvenc --enable-libvpl --enable-amf \
+            || { echo "=== configure failed; config.log tail ==="; tail -60 ffbuild/config.log; exit 1; }
           make -j"$(nproc)"
           sudo make install
           echo "=== installed libs ==="
