@@ -881,6 +881,127 @@ struct ActiveWorker {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Track A stage 1 — the SECOND supervisor child: `roomlerd netd`.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Truthiness for the `ROOMLER_AGENT_OVERLAY_NETD` env lever (pure; tested).
+fn netd_flag_truthy(v: &str) -> bool {
+    let t = v.trim();
+    t.eq_ignore_ascii_case("1")
+        || t.eq_ignore_ascii_case("true")
+        || t.eq_ignore_ascii_case("yes")
+        || t.eq_ignore_ascii_case("on")
+}
+
+/// Track A stage 1 — is the netd scaffold enabled? Env lever first
+/// (`ROOMLER_AGENT_OVERLAY_NETD`), else the MACHINE-GLOBAL config's
+/// `overlay_netd` (the supervisor is LocalSystem; per-user enrollments
+/// keep today's single-child topology until a later stage). Read ONCE at
+/// service start — changing it needs a service restart, by design: the
+/// two-child topology must never flip mid-run.
+fn netd_enabled() -> bool {
+    if let Ok(v) = std::env::var("ROOMLER_AGENT_OVERLAY_NETD") {
+        return netd_flag_truthy(&v);
+    }
+    let p = crate::config::machine_global_config_path();
+    crate::config::load(&p)
+        .ok()
+        .and_then(|c| c.overlay_netd)
+        .unwrap_or(false)
+}
+
+/// The netd child: session 0 (a plain std spawn inherits the supervisor's
+/// own LocalSystem session), with its own respawn ladder — a netd crash
+/// must never touch the session worker's ladder, and vice versa.
+///
+/// SCAFFOLD ONLY: netd hosts nothing yet. This exists so the two-child
+/// supervisor machinery (spawn / ladder / healthy-uptime reset / shutdown
+/// ordering) soaks in the field before the network plane moves into it
+/// (`docs/overlay-session-proof.md` §6 stage 1).
+struct NetdChild {
+    child: Option<std::process::Child>,
+    spawned_at: Option<Instant>,
+    consecutive_failures: u32,
+    respawn_at: Option<Instant>,
+}
+
+impl NetdChild {
+    fn new() -> Self {
+        Self {
+            child: None,
+            spawned_at: None,
+            consecutive_failures: 0,
+            respawn_at: None,
+        }
+    }
+
+    /// One poll-loop tick: reap a dead netd (ladder, with the same
+    /// healthy-uptime reset rule as the worker), (re)spawn when due.
+    fn tick(&mut self, exe: &Path) {
+        if let Some(c) = self.child.as_mut() {
+            match c.try_wait() {
+                Ok(None) => return, // healthy
+                Ok(Some(status)) => {
+                    let uptime = self
+                        .spawned_at
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::ZERO);
+                    self.consecutive_failures = if uptime >= HEALTHY_UPTIME_THRESHOLD {
+                        1
+                    } else {
+                        self.consecutive_failures.saturating_add(1)
+                    };
+                    tracing::warn!(
+                        code = status.code().unwrap_or(-1),
+                        uptime_s = uptime.as_secs(),
+                        failures = self.consecutive_failures,
+                        "supervisor: netd exited; ladder respawn"
+                    );
+                    self.respawn_at =
+                        Some(Instant::now() + next_backoff(self.consecutive_failures));
+                    self.child = None;
+                    self.spawned_at = None;
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "supervisor: netd try_wait failed");
+                    return;
+                }
+            }
+        }
+        if let Some(at) = self.respawn_at
+            && Instant::now() < at
+        {
+            return;
+        }
+        self.respawn_at = None;
+        match std::process::Command::new(exe).arg("netd").spawn() {
+            Ok(c) => {
+                tracing::info!(
+                    pid = c.id(),
+                    "supervisor: netd child spawned (Track A scaffold)"
+                );
+                self.child = Some(c);
+                self.spawned_at = Some(Instant::now());
+            }
+            Err(e) => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                self.respawn_at = Some(Instant::now() + next_backoff(self.consecutive_failures));
+                tracing::warn!(%e, failures = self.consecutive_failures,
+                    "supervisor: netd spawn failed; backing off");
+            }
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            tracing::info!(pid = c.id(), "supervisor: terminating netd on shutdown");
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Supervisor main loop. Called from `service_main_inner`.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -917,6 +1038,15 @@ pub fn run(
     // rc.51: the worker handle + its session/context/spawn-time, one
     // Option so they can never desync (see `ActiveWorker`).
     let mut current: Option<ActiveWorker> = None;
+    // Track A stage 1 — the OPTIONAL second child (`roomlerd netd`),
+    // gated on `overlay_netd` at service start. `None` = today's
+    // single-child topology, bit-for-bit.
+    let mut netd: Option<NetdChild> = netd_enabled().then(NetdChild::new);
+    if netd.is_some() {
+        tracing::info!(
+            "supervisor: Track A netd scaffold ENABLED — running the two-child topology"
+        );
+    }
     // Last observed keep_stream_alive value. Used to log only on
     // transitions instead of every poll iteration — the supervisor
     // checks the marker every POLL_INTERVAL (500 ms), which would
@@ -984,7 +1114,19 @@ pub fn run(
                     );
                 }
             }
+            // Track A — netd goes down LAST (once it hosts the network
+            // plane, the worker must lose its transport only after it has
+            // been told to stop; the scaffold already exercises the order).
+            if let Some(n) = netd.as_mut() {
+                n.shutdown();
+            }
             return Ok(());
+        }
+
+        // Track A stage 1 — the netd child's own reap/ladder/respawn,
+        // fully independent of the session worker's.
+        if let Some(n) = netd.as_mut() {
+            n.tick(&worker_exe);
         }
 
         // Reap a finished worker.
@@ -1418,6 +1560,18 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Track A stage 1 — the env lever's truthiness (the config path is
+    /// exercised in the field; this pins the emergency override parse).
+    #[test]
+    fn netd_env_lever_truthiness() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(netd_flag_truthy(v), "{v:?} must enable");
+        }
+        for v in ["0", "false", "off", "", "banana"] {
+            assert!(!netd_flag_truthy(v), "{v:?} must disable");
+        }
+    }
 
     #[test]
     fn elevate_flag_defaults_on_with_explicit_kill_switch() {
