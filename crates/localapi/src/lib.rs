@@ -122,6 +122,11 @@ pub struct NodeStatus {
     /// reads it as UDP-blocked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srflx: Option<SrflxStatus>,
+    /// C4 stage 1 — the standing warm TURN/UDP allocation's state, copied
+    /// verbatim from [`OverlayView::warm_relay`]. `None` from a daemon that
+    /// predates the feature or has `overlay_warm_relay` off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_relay: Option<WarmRelayStatus>,
     /// Multi-org P1 — one row per enrollment (the primary first, then each
     /// `[[orgs]]` entry). Empty from a pre-multi-org daemon and omitted by a
     /// single-org one; the top-level scalar fields (`node_id` / `tenant_id`
@@ -263,6 +268,37 @@ impl SrflxStatus {
     pub fn is_healthy(&self) -> bool {
         !self.candidates.is_empty()
     }
+}
+
+/// C4 stage 1 — the standing warm TURN/UDP allocation (measurement-only:
+/// nothing routes over it yet). Exists so a VPN transition's effect on the
+/// grandfathered relay flow is READABLE — "the allocation survived the VPN
+/// connect" must be a status line, not log archaeology.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WarmRelayStatus {
+    /// `live` | `none` | `lost`. `none` = never established this run (or
+    /// re-establish pending); `lost` = it existed and a probe/allocation
+    /// failure ended it (see `detail`).
+    pub state: String,
+    /// The allocation's relayed transport address (`worker-ip:port`) —
+    /// the future rendezvous `R`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayed: Option<String>,
+    /// Seconds since the allocation was established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_s: Option<u64>,
+    /// Seconds until the ephemeral credentials expire (negative = past
+    /// due; stage 1 re-establishes fresh rather than re-allocating on the
+    /// same socket, so expiry on a UDP-blocked network means `lost`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cred_expiry_in_s: Option<i64>,
+    /// Seconds since the last successful liveness probe (a 1-byte
+    /// permission assert through the allocation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_ok_s: Option<u64>,
+    /// Why `none`/`lost`, when known. Rendered verbatim by `roomler status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A peer device as this node currently sees it.
@@ -825,6 +861,10 @@ pub struct OverlayView {
     /// on every gather (success or failure). The daemon copies it verbatim
     /// into [`NodeStatus::srflx`]. `None` before the first gather.
     pub srflx: Option<SrflxStatus>,
+    /// C4 stage 1 — the warm TURN/UDP allocation's state, filled by the
+    /// overlay runtime on every view publish when `overlay_warm_relay` is
+    /// on. The daemon copies it verbatim into [`NodeStatus::warm_relay`].
+    pub warm_relay: Option<WarmRelayStatus>,
     /// PR-B1 — per-bound-direct-socket receive liveness, filled by the overlay
     /// runtime on every view publish (plane stats when the shared carrier
     /// plane is on, per-device demux stats otherwise). The daemon copies it

@@ -1301,7 +1301,7 @@ fn is_lan_addr(ip: IpAddr) -> bool {
 
 /// Pull `(urls, username, credential)` out of the first ICE server that
 /// carries REST-API short-lived TURN creds (the coturn entry).
-fn turn_creds(ice_servers: &[IceServer]) -> Option<(Vec<String>, String, String)> {
+pub(crate) fn turn_creds(ice_servers: &[IceServer]) -> Option<(Vec<String>, String, String)> {
     ice_servers.iter().find_map(|s| {
         let user = s.username.clone()?;
         let cred = s.credential.clone()?;
