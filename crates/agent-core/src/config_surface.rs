@@ -161,6 +161,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Raw-first QUIC-over-TURN upgrade: commit the raw relay immediately, rendezvous in the background (90s window), swap in on success. Off restores the blocking 8s pre-install window. Built-in default: on.",
     ),
     (
+        "overlay_netd",
+        "tribool",
+        "Track A stage 1 (SCAFFOLD): spawn the session-independent network daemon (roomlerd netd) as a second supervisor child. netd hosts nothing yet; flag read at service start. Built-in default: off.",
+    ),
+    (
         "overlay_pathmon",
         "string",
         "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
@@ -425,6 +430,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
         "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
         "overlay_quic_async" => cfg.overlay_quic_async.map(fmt_bool),
+        "overlay_netd" => cfg.overlay_netd.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
         "overlay_rpf" => cfg.overlay_rpf.clone(),
@@ -536,6 +542,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
         "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
         "overlay_quic_async" => cfg.overlay_quic_async = parse_tribool(value)?,
+        "overlay_netd" => cfg.overlay_netd = parse_tribool(value)?,
         "overlay_pathmon" => {
             cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -1092,6 +1099,19 @@ mod tests {
                 .any(|(k, _)| *k == "OVERLAY_QUIC_ASYNC"),
             "key must be bridged to the daemon's env"
         );
+    }
+
+    /// Track A stage 1 — the netd scaffold key: tribool, default OFF,
+    /// supervisor-scoped (deliberately NOT env-bridged — the worker's
+    /// runtime never reads it).
+    #[test]
+    fn overlay_netd_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.overlay_netd, None, "built-in default is OFF");
+        apply(&mut cfg, "overlay_netd", Some("on")).unwrap();
+        assert_eq!(cfg.overlay_netd, Some(true));
+        apply(&mut cfg, "overlay_netd", None).unwrap();
+        assert_eq!(cfg.overlay_netd, None, "clear → built-in default");
     }
 
     /// The auth-first type-1 routing key set/echo/clear (per the

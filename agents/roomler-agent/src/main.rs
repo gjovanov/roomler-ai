@@ -285,6 +285,12 @@ enum Command {
     /// `ImagePath` argv.
     #[command(hide = true, name = "service-run")]
     ServiceRun,
+    /// Track A stage 1 — the session-independent network daemon,
+    /// SCAFFOLD stage: hosts nothing, heartbeats, exits on terminate.
+    /// Spawned by the SCM supervisor as a SECOND child when
+    /// `overlay_netd` is on; never invoked by operators directly.
+    #[command(hide = true)]
+    Netd,
     /// Enable SystemContext mode on a perMachine install. Writes
     /// `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` into the `RoomlerAgentService`
     /// SCM `Environment` REG_MULTI_SZ block and restarts the service so
@@ -664,6 +670,11 @@ async fn main() -> Result<()> {
         if matches!(cli.command, Some(Command::ServiceRun)) {
             logging::set_service_logging(logging::ServiceLogRole::Host);
         }
+        // Track A — netd is a LocalSystem session-0 child like the host;
+        // its own basename keeps three concurrent SYSTEM logs apart.
+        if matches!(cli.command, Some(Command::Netd)) {
+            logging::set_service_logging(logging::ServiceLogRole::Netd);
+        }
         #[cfg(feature = "system-context")]
         if matches!(cli.command, Some(Command::Run { .. }) | None) {
             use roomler_agent::system_context::worker_role;
@@ -778,6 +789,7 @@ async fn main() -> Result<()> {
         Command::PeerPresenceStatus => peer_presence_status_cmd(),
         Command::Service { action } => service_cmd(action).await,
         Command::ServiceRun => service_run_cmd().await,
+        Command::Netd => netd_cmd().await,
         Command::CleanupLegacyInstall {
             target_flavour,
             dry_run,
@@ -2884,6 +2896,30 @@ async fn service_run_cmd() -> Result<()> {
 #[cfg(not(target_os = "windows"))]
 async fn service_run_cmd() -> Result<()> {
     bail!("`service-run` is Windows-only — invoked by the SCM, not directly by operators.");
+}
+
+/// Track A stage 1 — the session-independent network daemon, SCAFFOLD
+/// stage: hosts nothing, heartbeats, exits cleanly on Ctrl-C/terminate.
+/// Exists so the two-child supervisor machinery (spawn / independent
+/// ladder / shutdown ordering) soaks in the field before the overlay
+/// runtime moves into this process (`docs/overlay-session-proof.md` §6).
+async fn netd_cmd() -> Result<()> {
+    tracing::info!(
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        "netd scaffold alive — Track A stage 1 (no network plane hosted yet)"
+    );
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+    tick.tick().await; // the interval's immediate first tick
+    loop {
+        tokio::select! {
+            _ = tick.tick() => tracing::debug!("netd scaffold heartbeat"),
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("netd: terminate signal — exiting cleanly");
+                return Ok(());
+            }
+        }
+    }
 }
 
 async fn self_update_cmd(check_only: bool) -> Result<()> {
