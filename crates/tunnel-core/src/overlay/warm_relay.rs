@@ -33,10 +33,6 @@ pub(crate) enum WarmMsg {
         relayed: SocketAddr,
         /// From the ephemeral username's timestamp prefix, when parseable.
         cred_expiry_epoch_s: Option<u64>,
-        /// Where liveness probes send their 1-byte permission assert —
-        /// our own srflx at establish time (a real, harmless address that
-        /// stays valid as a PERMISSION target even after srflx goes NONE).
-        probe_dst: Option<SocketAddr>,
     },
     EstablishFailed(String),
     ProbeOk,
@@ -59,7 +55,8 @@ pub(crate) struct WarmRelay {
     relayed: Option<SocketAddr>,
     established: Option<Instant>,
     cred_expiry_epoch_s: Option<u64>,
-    probe_dst: Option<SocketAddr>,
+    /// Rotates the probe's permission target (see [`Self::probe_parts`]).
+    probe_seq: u8,
     last_probe_ok: Option<Instant>,
     probe_in_flight: bool,
     last_request: Option<Instant>,
@@ -97,10 +94,23 @@ impl WarmRelay {
                 .is_none_or(|t| now.duration_since(t) >= PROBE_SPACING)
     }
 
-    /// The handles a spawned probe needs; `None` when not live or the
-    /// establish-time srflx was unknown (nothing safe to assert toward).
-    pub(crate) fn probe_parts(&self) -> Option<(Arc<dyn RelayConn>, SocketAddr)> {
-        Some((self.conn.clone()?, self.probe_dst?))
+    /// The handles a spawned probe needs; `None` when not live.
+    ///
+    /// The probe target ROTATES through TEST-NET-3 (`203.0.113.1..=254`,
+    /// never routed — the 1-byte stray goes to a blackhole): a permission
+    /// the client has ALREADY established is cached, so `send_to` toward a
+    /// repeated address is enqueue-only on a UDP leg and its `Ok` proves
+    /// nothing about the allocation. A NEW address per probe forces a
+    /// fresh authenticated CreatePermission round trip — coturn answering
+    /// it IS the liveness proof (field 2026-08-15: `creds -180s` with
+    /// `probe ok` — the fixed-target probe kept "succeeding" against an
+    /// allocation whose credentials had already lapsed).
+    pub(crate) fn probe_parts(&mut self) -> Option<(Arc<dyn RelayConn>, SocketAddr)> {
+        let conn = self.conn.clone()?;
+        self.probe_seq = self.probe_seq.wrapping_add(1);
+        let last_octet = 1 + (self.probe_seq % 254);
+        let dst = SocketAddr::from(([203, 0, 113, last_octet], 9));
+        Some((conn, dst))
     }
 
     pub(crate) fn note_probe_started(&mut self) {
@@ -113,13 +123,11 @@ impl WarmRelay {
                 conn,
                 relayed,
                 cred_expiry_epoch_s,
-                probe_dst,
             } => {
                 self.conn = Some(conn);
                 self.relayed = Some(relayed);
                 self.established = Some(now);
                 self.cred_expiry_epoch_s = cred_expiry_epoch_s;
-                self.probe_dst = probe_dst;
                 self.last_probe_ok = None;
                 self.probe_in_flight = false;
                 self.detail = None;
@@ -226,7 +234,6 @@ mod tests {
                 conn: Arc::new(NopConn),
                 relayed: "5.9.157.221:12795".parse().unwrap(),
                 cred_expiry_epoch_s: Some(u64::MAX / 2),
-                probe_dst: Some("37.63.112.129:43648".parse().unwrap()),
             },
             now,
         );
