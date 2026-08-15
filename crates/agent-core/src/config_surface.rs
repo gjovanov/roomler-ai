@@ -151,6 +151,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "LEGACY ReplacedByNewer escalation: exit the process after 3 displacements in the window instead of backing off in-process. Built-in default: off (W4d — zombie-WS storms must not tear down the overlay).",
     ),
     (
+        "overlay_warm_relay",
+        "tribool",
+        "C4 stage 1: keep one standing warm TURN/UDP allocation (established while UDP works) alive across VPN transitions — measurement-only, nothing routes over it yet. Built-in default: off.",
+    ),
+    (
         "overlay_pathmon",
         "string",
         "Overlay PathMonitor mode: on (authoritative — built-in default) | shadow (compare-only revert rail) | off. Env: ROOMLER_NODE_OVERLAY_PATHMON.",
@@ -413,6 +418,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_init_auth_first" => cfg.overlay_init_auth_first.map(fmt_bool),
         "overlay_srflx_seek" => cfg.overlay_srflx_seek.map(fmt_bool),
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
+        "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
         "overlay_pathmon" => cfg.overlay_pathmon.clone(),
         "overlay_demote" => cfg.overlay_demote.clone(),
         "overlay_rpf" => cfg.overlay_rpf.clone(),
@@ -522,6 +528,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_init_auth_first" => cfg.overlay_init_auth_first = parse_tribool(value)?,
         "overlay_srflx_seek" => cfg.overlay_srflx_seek = parse_tribool(value)?,
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
+        "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
         "overlay_pathmon" => {
             cfg.overlay_pathmon = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,
@@ -1037,6 +1044,24 @@ mod tests {
             crate::config::env_bridge_bools(&cfg)
                 .iter()
                 .any(|(k, _)| *k == "WS_REPLACED_EXIT"),
+            "key must be bridged to the daemon's env"
+        );
+    }
+
+    /// C4 stage 1 — the warm-relay opt-in key: tribool, default OFF,
+    /// bridged to the daemon env.
+    #[test]
+    fn overlay_warm_relay_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.overlay_warm_relay, None, "built-in default is OFF");
+        apply(&mut cfg, "overlay_warm_relay", Some("on")).unwrap();
+        assert_eq!(cfg.overlay_warm_relay, Some(true));
+        apply(&mut cfg, "overlay_warm_relay", None).unwrap();
+        assert_eq!(cfg.overlay_warm_relay, None, "clear → built-in default");
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(k, _)| *k == "OVERLAY_WARM_RELAY"),
             "key must be bridged to the daemon's env"
         );
     }

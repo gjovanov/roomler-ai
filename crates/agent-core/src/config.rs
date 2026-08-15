@@ -147,6 +147,12 @@ pub struct AgentConfig {
     /// needed none of it (`ROOMLER_AGENT_WS_REPLACED_EXIT`).
     #[serde(default)]
     pub ws_replaced_exit: Option<bool>,
+    /// C4 stage 1 — the standing warm TURN/UDP allocation, established
+    /// while UDP works and kept alive so corp-VPN flow-grandfathering
+    /// preserves a UDP relay leg across a VPN connect. Measurement-only
+    /// in stage 1 (`ROOMLER_AGENT_OVERLAY_WARM_RELAY`). Built-in default: off.
+    #[serde(default)]
+    pub overlay_warm_relay: Option<bool>,
     /// Overlay PathMonitor engagement (`ROOMLER_NODE_OVERLAY_PATHMON`):
     /// `on` (authoritative — the built-in default since PR-D's two green
     /// soaks) | `shadow` (fed + compared, legacy decides — the per-host
@@ -1141,6 +1147,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        overlay_warm_relay: None,
         overlay_pathmon: None,
         overlay_route_events: None,
         overlay_route_tick_secs: None,
@@ -1210,7 +1217,7 @@ pub fn test_fixture() -> AgentConfig {
 /// `main.rs` — a key added to the surface but missed there silently didn't
 /// bridge (`roomler config set` wrote TOML the daemon then ignored).
 /// Suffixes are the `ROOMLER_NODE_…` env suffixes (uppercase surface key).
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 34] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 35] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1226,6 +1233,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 34]
         ("OVERLAY_INIT_AUTH_FIRST", cfg.overlay_init_auth_first),
         ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
         ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
+        ("OVERLAY_WARM_RELAY", cfg.overlay_warm_relay),
         ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
         ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
         ("OVERLAY_MUX_NAT", cfg.overlay_mux_nat),
