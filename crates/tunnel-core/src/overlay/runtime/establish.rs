@@ -245,6 +245,7 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
+        force_poke: bool,
     ) {
         let now = Instant::now();
         // P3 PR-A — the shadow monitor consumes the same env read the legacy
@@ -395,15 +396,33 @@ impl OverlayRuntime {
                 let since_proof = wg
                     .peer_initiator_hs_age(&e.pubkey)
                     .map_or(e.since.elapsed(), |age| age.min(e.since.elapsed()));
-                if should_poke(handshake_done, false, since_last_rx, since_proof)
+                // Net-change acceleration — an OS addr/iface event this tick
+                // is itself the suspicion: skip the silence/proof waits and
+                // revalidate every established DIRECT carrier NOW. A healthy
+                // carrier answers within a handshake round; a captured-route
+                // casualty dies at the tier's handshake deadline instead of
+                // ~90 s later (pc50045 CP-connect, 2026-08-15). Relay
+                // carriers are exempt — they ride TCP/TLS and have their own
+                // refresh logic.
+                let forced =
+                    force_poke && e.is_direct && should_poke_on_netchange(handshake_done, false);
+                if (forced || should_poke(handshake_done, false, since_last_rx, since_proof))
                     && wg.poke_handshake(&e.pubkey)
                 {
                     e.last_poke_at = Some(now);
-                    debug!(
-                        peer = %nid, tier = ?e.tier,
-                        silent_s = since_last_rx.as_secs(), proof_age_s = since_proof.as_secs(),
-                        "overlay: revalidating carrier (forced rekey poke)"
-                    );
+                    if forced {
+                        info!(
+                            peer = %nid, tier = ?e.tier,
+                            silent_s = since_last_rx.as_secs(),
+                            "overlay: net-change — revalidating direct carrier now (forced rekey poke)"
+                        );
+                    } else {
+                        debug!(
+                            peer = %nid, tier = ?e.tier,
+                            silent_s = since_last_rx.as_secs(), proof_age_s = since_proof.as_secs(),
+                            "overlay: revalidating carrier (forced rekey poke)"
+                        );
+                    }
                 }
             }
         }
