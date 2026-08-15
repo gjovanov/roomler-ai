@@ -1376,11 +1376,19 @@ impl CarrierPlane {
         // mapping mismatch classifies symmetric (one dead vantage tolerated).
         // Shared classifier with the per-runtime `probe_nat_type` twin.
         // (The list was already resolved above — reuse it.)
+        // Typing evidence — keep the raw (vantage ⇒ mapping) pairs for the
+        // gather line below. Field 2026-08-15: all three cluster nodes
+        // (public-IP, no NAT) flipped cone→symmetric at the rc.379 boot and
+        // a fresh-socket manual probe minutes later showed identity mappings
+        // from every vantage — the verdict alone was uninvestigable because
+        // the mappings that produced it were never logged. Cost: one short
+        // Vec per gather (gathers are rare: boot/rebuild/regather).
+        let mut typing: Vec<String> = Vec::new();
         let my_nat = if targets.len() >= 2 {
             let punch_sock = pairs[0].1.clone();
             let mut mappings: Vec<SocketAddr> = Vec::with_capacity(targets.len());
             for t in &targets {
-                if let Ok(m) = crate::transport::stun::srflx_query_via_sink(
+                match crate::transport::stun::srflx_query_via_sink(
                     &punch_sock,
                     rx,
                     *t,
@@ -1388,7 +1396,11 @@ impl CarrierPlane {
                 )
                 .await
                 {
-                    mappings.push(m);
+                    Ok(m) => {
+                        typing.push(format!("{t}=>{m}"));
+                        mappings.push(m);
+                    }
+                    Err(_) => typing.push(format!("{t}=>FAIL")),
                 }
             }
             direct::classify_nat_mappings(&mappings).map(str::to_string)
@@ -1401,6 +1413,7 @@ impl CarrierPlane {
         info!(
             candidates = ?out.candidates,
             my_nat = ?out.my_nat,
+            typing = ?typing,
             server = ?out.stun_server,
             "carrier plane: srflx gathered ONCE for every attached org"
         );
