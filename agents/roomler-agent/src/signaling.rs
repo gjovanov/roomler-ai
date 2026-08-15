@@ -106,8 +106,20 @@ const WS_PONG_RTT_DEGRADED: Duration = Duration::from_secs(20);
 
 /// Consecutive degraded pongs before the WS is cycled — one slow pong can
 /// be a scheduler/GC blip; two spaced a keepalive interval apart is a path
-/// verdict. Worst-case detection ≈ 2 × 25 s keepalive + the RTT itself.
+/// verdict. A ping whose pong hasn't arrived within
+/// [`WS_PONG_RTT_DEGRADED`] by the next keepalive check counts as a strike
+/// too — waiting for the late pong itself made each verdict cost a full
+/// zombie round-trip (field 2026-08-15: 41 s RTT ⇒ conviction at ~90 s;
+/// with missing-pong strikes + [`WS_PING_RETRY_ACCEL`] it lands ≈ 50-65 s,
+/// and the relay rebuild escapes the zombie one round-trip sooner).
 const WS_PONG_RTT_STRIKES: u32 = 2;
+
+/// After the FIRST strike the keepalive re-arms at this interval instead of
+/// the normal 25 s, so the confirming verdict lands quickly. Only the
+/// cadence accelerates — the [`WS_PONG_RTT_DEGRADED`] deadline per ping is
+/// unchanged, so a healthy-but-jittery link still gets its full window to
+/// answer before the second strike.
+const WS_PING_RETRY_ACCEL: Duration = Duration::from_secs(10);
 
 /// A5 — minimum wall-vs-monotonic skew that reads as suspend/resume at a
 /// keepalive tick (mirrors the overlay runtime's `RESUME_SKEW_THRESHOLD`).
@@ -975,6 +987,12 @@ async fn connect_once(
     // their payload; the echoed pong yields an exact application-level RTT.
     let ws_epoch = std::time::Instant::now();
     let mut slow_pongs: u32 = 0;
+    // Send time of the newest keepalive ping still awaiting its pong.
+    // `None` once any stamped pong arrives (the RTT verdict then comes from
+    // the stamp itself). Checked at each keepalive tick: still outstanding
+    // past the degradation bound = a strike WITHOUT waiting for the late
+    // pong to crawl back.
+    let mut outstanding_ping: Option<std::time::Instant> = None;
 
     // A5 — resume detection. Every timer here runs on the MONOTONIC clock,
     // which excludes suspend on Windows/Linux — so after a sleep the RX
@@ -1054,14 +1072,55 @@ async fn connect_once(
                         last_rx.elapsed().as_secs()
                     )));
                 }
-                if let Err(e) =
-                    send_frame(&mut ws, Message::Ping(ping_payload(ws_epoch).into())).await
-                {
-                    warn!(%e, "keepalive ping failed — will reconnect");
-                    close_all_peers(&mut peers, &indicator).await;
-                    close_all_tunnel_peers(&mut tunnel_peers).await;
-                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
-                    return Err(ConnectError::Transient(e.context("ws ping")));
+                // Missing-pong strike: a ping still unanswered past the
+                // degradation bound is the SAME verdict as a late pong,
+                // available one zombie round-trip sooner (field: 41 s RTT
+                // priced conviction at ~90 s when every verdict waited for
+                // its pong to crawl back). A ping still WITHIN its window
+                // rides — sending a replacement would reset its clock and
+                // the deadline could never accrue under the accelerated
+                // cadence.
+                let send_fresh_ping = match outstanding_ping {
+                    Some(sent) if sent.elapsed() >= WS_PONG_RTT_DEGRADED => {
+                        slow_pongs += 1;
+                        warn!(
+                            unanswered_s = sent.elapsed().as_secs(),
+                            strikes = slow_pongs,
+                            "control WS keepalive ping unanswered past the degradation bound"
+                        );
+                        if slow_pongs >= WS_PONG_RTT_STRIKES {
+                            close_all_peers(&mut peers, &indicator).await;
+                            close_all_tunnel_peers(&mut tunnel_peers).await;
+                            close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                            return Err(ConnectError::Transient(anyhow::anyhow!(
+                                "control WS degraded: keepalive ping unanswered for {} s \
+                                 ({} strikes) — cycling to a fresh connection",
+                                sent.elapsed().as_secs(),
+                                slow_pongs
+                            )));
+                        }
+                        true
+                    }
+                    Some(_) => false, // in flight and inside its window
+                    None => true,
+                };
+                if send_fresh_ping {
+                    if let Err(e) =
+                        send_frame(&mut ws, Message::Ping(ping_payload(ws_epoch).into())).await
+                    {
+                        warn!(%e, "keepalive ping failed — will reconnect");
+                        close_all_peers(&mut peers, &indicator).await;
+                        close_all_tunnel_peers(&mut tunnel_peers).await;
+                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                        return Err(ConnectError::Transient(e.context("ws ping")));
+                    }
+                    outstanding_ping = Some(std::time::Instant::now());
+                }
+                if slow_pongs > 0 {
+                    // One strike in: check again quickly instead of waiting
+                    // out the full keepalive interval (only the CADENCE
+                    // accelerates; each ping keeps its full window).
+                    keepalive.reset_after(WS_PING_RETRY_ACCEL);
                 }
                 // Liveness: a successful keepalive proves the WS pump
                 // is healthy even during long quiet periods between
@@ -1265,6 +1324,7 @@ async fn connect_once(
                 }
                 Some(Ok(Message::Pong(payload))) => {
                     last_rx = std::time::Instant::now();
+                    outstanding_ping = None;
                     // Zombie-slow WS detector (see [`WS_PONG_RTT_DEGRADED`]):
                     // a pong echoing one of OUR stamped pings measures the
                     // true application round trip. Two consecutive verdicts
