@@ -75,6 +75,10 @@ pub enum ServiceLogRole {
     Host,
     /// The SystemContext (LocalSystem) worker.
     Worker,
+    /// Track A — the session-independent network daemon (`roomlerd netd`,
+    /// session 0). Own basename: up to THREE SYSTEM processes may log at
+    /// once (host + worker + netd).
+    Netd,
 }
 
 static SERVICE_ROLE: OnceLock<ServiceLogRole> = OnceLock::new();
@@ -91,6 +95,7 @@ pub fn set_service_logging(role: ServiceLogRole) {
 fn log_basename() -> &'static str {
     match SERVICE_ROLE.get() {
         Some(ServiceLogRole::Host) => "roomlerd-service.log",
+        Some(ServiceLogRole::Netd) => "roomlerd-netd.log",
         _ => "roomlerd.log",
     }
 }
