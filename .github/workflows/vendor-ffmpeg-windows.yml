@@ -213,7 +213,7 @@ jobs:
             --disable-devices --disable-filters --disable-bsfs --disable-parsers \
             --disable-demuxers --disable-muxers --disable-decoders \
             --disable-encoders --disable-hwaccels \
-            --disable-avdevice --disable-avfilter --disable-swscale --disable-postproc \
+            --disable-avdevice --disable-avfilter --disable-swscale \
             --enable-encoder=h264_nvenc,hevc_nvenc,av1_nvenc,h264_qsv,hevc_qsv,av1_qsv,vp9_qsv,h264_amf,hevc_amf,av1_amf \
             --enable-nvenc --enable-libvpl --enable-amf
           make -j"$(nproc)"
