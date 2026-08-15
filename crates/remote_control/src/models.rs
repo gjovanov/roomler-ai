@@ -51,7 +51,7 @@ pub struct AgentCaps {
     /// (8-bit 4:4:4) frames over an RTCDataChannel named
     /// `video-bytes`. Bypasses the browser's WebRTC video pipeline
     /// which enforces 4:2:0 across every codec. See
-    /// `docs/vp9-444-plan.md` for the rationale and the wire
+    /// `docs/encoders.md` for the rationale and the wire
     /// format spec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transports: Vec<String>,

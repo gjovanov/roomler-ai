@@ -17,12 +17,14 @@
 - Multi-monitor, clipboard, file transfer, and a "view-only" guest mode out of the box.
 - Audit everything (session start/stop, input events optional, file transfers, clipboard direction).
 
-**Non-goals (v1)**
+**Non-goals (v1)** — *historical; most of these have since shipped.* SYSTEM-context
+control (lock screen, UAC, pre-logon) landed as the Windows SystemContext service
+(§19, [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md)); boot-time
+access follows from the service modes; headless Linux hosts get a **virtual
+desktop** created by the agent. Still true today:
 
-- Headless/SYSTEM-level UAC elevation prompts on Windows. v1 runs in the user session only.
-- Wake-on-LAN / boot-time access. The agent comes up with the user session.
 - Mobile agents (iOS/Android as the controlled device). Mobile as controller is fine — it's just a browser.
-- Rendering an X11 server's login greeter on Linux. Wayland-first, X11-fallback, both inside an active session.
+- Rendering an X11 login greeter on Linux (the virtual-desktop path sidesteps it).
 
 ## 2. Where this fits in the existing stack
 
@@ -46,6 +48,48 @@ The only genuinely new component is the **native agent** (a separate Rust binary
 > **See also — the L3 overlay & its Windows firewall override.** The `overlay-l3` feature evolves the tunnel into a Tailscale-style per-tenant WireGuard+DERP mesh (Wintun NIC `roomler`, overlay IPs `100.64.0.0/10`). On a GPO-locked Windows host the corporate Defender Firewall drops unsolicited inbound on the overlay adapter; the agent overrides this by programming the Windows Filtering Platform directly (a LUID-scoped, high-weight hard-permit sublayer) from its LocalSystem service. Design, limits (callout/IPsec), and the `ROOMLER_AGENT_WFP_PERMIT` disable: [`docs/overlay-wfp.md`](./overlay-wfp.md).
 
 ## 3. High-level topology
+
+At a glance — session establishment and where the data actually flows:
+
+```mermaid
+sequenceDiagram
+    participant C as Controller (browser)
+    participant S as roomler.ai (signalling)
+    participant A as roomlerd (controlled host)
+
+    C->>S: rc:session.request {agent_id}
+    S->>A: rc:request (permissions, controller)
+    A->>A: consent — auto-grant, tray prompt, or 30 s deny
+    A->>S: rc:ready
+    S->>C: rc:session.created
+    C->>S: rc:sdp.offer
+    S->>A: rc:sdp.offer
+    A->>S: rc:sdp.answer + rc:ice ⇄
+    S->>C: rc:sdp.answer + rc:ice ⇄
+    Note over C,A: ICE: P2P if possible, else TURN (UDP → TLS/TCP :443)
+    C-->>A: DTLS-SRTP + SCTP established
+    Note over C,A: video (RTP or DataChannel) · input · clipboard ·<br/>files · apps · cursor · stats — all P2P, E2E-encrypted
+```
+
+```mermaid
+flowchart LR
+    subgraph B["Controller (browser)"]
+        V["render: video / WebCodecs canvas"]
+        DCs["DCs: input · control · clipboard ·<br/>files · cursor · video-DC"]
+    end
+    subgraph H["Controlled host (roomlerd)"]
+        CAP["capture (WGC/DXGI/scrap/GDI)"]
+        ENC["encoder cascade → encoders.md"]
+        INJ["input injection (enigo / SystemContext)"]
+    end
+    SRV["roomler.ai — signalling + consent + audit only"]
+    B <-. "rc:* over /ws" .-> SRV <-. "rc:* over /ws" .-> H
+    B <==>|"WebRTC P2P (TURN fallback)"| H
+    CAP --> ENC --> V
+    DCs --> INJ
+```
+
+The original wire-level view:
 
 ```
   ┌──────────────────────────┐                                     ┌────────────────────────────┐
@@ -498,7 +542,7 @@ Reuse the existing 114 Rust integration test conventions plus Playwright E2E spe
 - **Loss simulation**: `tc netem` in the test container to add 100 ms RTT, 2% loss, and verify the input/control DC behave correctly.
 - **Multi-watcher SFU bridge**: spin up 3 mediasoup consumers against one agent producer, verify CPU stays bounded.
 
-## 14. Rollout plan (suggested phases)
+## 14. Rollout plan (historical — the original phasing, long since shipped)
 
 | Phase | Scope | Calendar guess (solo) |
 |---|---|---|
@@ -516,9 +560,14 @@ That's ~16 weeks for a properly hardened v1, which is in the right ballpark for 
 - **Tauri for the tray, not Electron** — keeps the agent under 20 MB and the dependency tree close to the rest of your stack.
 - **`enigo` as default, OS-specific only when needed** — same calculus RustDesk made; enigo handles 90% well, the remaining 10% (Wayland, IME, UIPI) needs direct backends.
 - **One unified room kind, not a separate "remote" service** — keeps notifications, RBAC, presence, chat, and recording free. The cost is one new `RoomKind::RemoteControl` variant and the discipline to keep `remote_control` crate's surface narrow.
-- **No SOCKS-style port forwarding in v1** — RustDesk has it; it's a security minefield and 90% of users don't need it. Add later if there's demand.
+- **No SOCKS-style port forwarding in v1** — RustDesk has it; it's a security minefield and 90% of users don't need it. Add later if there's demand. *(Later arrived: forwards + SOCKS5 shipped as the policy-gated tunnel subsystem — [tunnels.md](tunnels.md).)*
 
-## 16. Open questions
+## 16. Open questions (historical — all since resolved)
+
+*Answers, with hindsight: (1) headless agents shipped — the Windows service +
+SystemContext and Linux virtual desktops; (2) still a UX call, plumbing exists;
+(3) recordings stayed on MinIO; (4) mobile controller ships with an on-screen
+keyboard component.*
 
 1. Do you want to allow **headless agents** (no logged-in user, e.g., a server in a rack)? That requires a system service, which is a much bigger blast radius. Recommend deferring past v1.
 2. Should an in-progress remote control session be **shareable into a roomler call** as a screen share automatically? The plumbing supports it; it's a UX call.
@@ -526,6 +575,11 @@ That's ~16 weeks for a properly hardened v1, which is in the right ballpark for 
 4. **Mobile controller** keyboard UX is genuinely hard (no physical keys, lots of host-OS shortcuts to send). v1 should be view + tap-to-click only on mobile, full input on desktop browsers.
 
 ## 17. Hardware encoder backends
+
+> **Current reference: [encoders.md](encoders.md)** — the codec × platform matrix,
+> selection cascade, rate control, and capture backends as they ship today. This
+> section remains as the engineering record (probe designs, per-vendor failure
+> modes) behind that summary.
 
 ### Current state (0.1.25)
 
@@ -697,7 +751,7 @@ Deferred per platform:
   end-to-end — removes the 900 MB/s of memory bandwidth we push
   at native 4K today.
 
-## 18. Viewer controls + codec negotiation + DC handlers (0.1.32 → 0.1.35)
+## 18. Appendix — viewer controls + codec negotiation + DC handlers (0.1.32 → 0.1.35, historical)
 
 Post-Phase-3 the subsystem grew three feature families. Commit-by-commit
 detail is in `git log`. Summary:
@@ -962,7 +1016,7 @@ Root cause of that specific 7-fps case: NVENC Blackwell
 fps comfortably at that size. Proper fix deferred to Tier 1C.3
 (GPU-side scale via `VideoProcessorMFT`).
 
-## 19. Resilience cycle (0.1.50 → 0.1.54)
+## 19. Appendix — resilience cycle (0.1.50 → 0.1.54, historical; SystemContext follow-ons shipped through rc.26)
 
 Multi-release hardening of the agent's lifecycle: persistent
 diagnostics, OS-supervisor parity across Win/Linux/macOS, integrity-
@@ -1320,23 +1374,10 @@ is impossible. Operators install the MSI normally, then run
 `roomler-agent service install --as-service` from an elevated
 PowerShell. Future per-machine MSI flavour can revisit.
 
-### 19.8.5 Pending — picked up in next session
+### 19.8.5 Where the cycle ended
 
-- **M3 (pre-logon SYSTEM-context capture)**: when no console session
-  has a logged-in user yet, the service itself runs capture + input
-  inline under SYSTEM rather than spawning a worker. Tightened
-  capability surface: capture + input only, no clipboard / file-
-  transfer / audio. Hand-off when a user logs in: tear down the
-  SYSTEM-context capture, spawn a user-context worker via the M2
-  supervisor path. Risky — needs hands-on Win11 testing of WGC
-  capture from session 0 against the lock screen.
-- **M5 (verification on a real Win11 install)**: test M1 + M2 on
-  neo16: `service install --as-service` from elevated
-  PowerShell, observe the `roomler-svc-supervisor` thread spawning
-  a worker in the active session, lock screen + verify the worker
-  is gone, unlock + verify it respawns.
-- **Per-machine MSI flavour** (the M4-fix-up): a separate WiX file
-  `wix/main-permachine.wxs` with `InstallScope='perMachine'`,
-  RegisterService deferred-non-impersonated custom action. Builds a
-  separate `.msi` artifact in the release workflow alongside the
-  perUser one.
+Everything queued at the end of this cycle subsequently shipped: M3 pre-logon
+SystemContext capture (rc.1–rc.7, hardened through rc.26 behind
+`ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`), M5 field verification, and the perMachine
+MSI flavour (`wix-perMachine/`). The operator-facing verification procedure lives
+in [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md).

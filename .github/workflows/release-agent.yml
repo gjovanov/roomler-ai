@@ -245,7 +245,7 @@ jobs:
       - name: Build agent (release, full + vp9-444 + vp9-444-bindgen)
         # `vp9-444` adds the libvpx VP9 profile-1 (8-bit 4:4:4) software
         # encoder for the DataChannel-bypass video transport (Phase Y in
-        # docs/vp9-444-plan.md). Browser viewers that flip the
+        # docs/encoders.md). Browser viewers that flip the
         # "Crystal-clear (VP9 4:4:4)" toolbar toggle expect this on the
         # other end.
         # `vp9-444-bindgen` enables `env-libvpx-sys/generate` so bindgen

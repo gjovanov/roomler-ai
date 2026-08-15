@@ -1,217 +1,142 @@
 # Frontend
 
-The frontend is a Vue 3 single-page application using Vuetify 3, Pinia, and Vue Router.
-
-## Page Map
+Vue 3 + Vuetify 3 SPA — Vite 7, TypeScript, Pinia (setup-store pattern),
+vue-router, vue-i18n (wired, but English-only today). *As of 0.3.0-rc.381.*
+Plugin order in `main.ts`: i18n → vuetify → pinia → router.
 
 ```mermaid
-graph TD
-    Landing["/landing — LandingView"]
-    Login["/login — LoginView"]
-    Register["/register — RegisterView"]
-    OAuthCb["/oauth/callback — OAuthCallbackView"]
-    InviteLand["/invite/:code — InviteLandingView"]
-    Dashboard["/ — DashboardView"]
-    TenantDash["/tenant/:tenantId — TenantDashboard"]
-    Chat["/tenant/:tenantId/room/:roomId — ChatView"]
-    Call["/tenant/:tenantId/room/:roomId/call — ConferenceView"]
-    Rooms["/tenant/:tenantId/rooms — RoomList"]
-    Explore["/tenant/:tenantId/explore — ExploreView"]
-    Files["/tenant/:tenantId/files — FilesBrowser"]
-    Invites["/tenant/:tenantId/invites — InviteManageView"]
-    Admin["/tenant/:tenantId/admin — AdminPanel"]
-    Billing["/tenant/:tenantId/billing — BillingView"]
-    ProfileView["/profile/:userId — ProfileView"]
-    ProfileEdit["/profile/edit — ProfileEditView"]
+flowchart LR
+    subgraph views["Views (ui/src/views/)"]
+        L["LandingView · auth/ · legal/"]
+        CORE["dashboard/ · rooms/ · chat/<br/>conference/ · files/ · invite/<br/>profile/ · billing/"]
+        FLEET["devices/ · remote/<br/>network/ · observability/<br/>analytics/ · admin/"]
+    end
 
-    Landing --> Login
-    Landing --> Register
-    Login --> Dashboard
-    Register --> Dashboard
-    OAuthCb --> Dashboard
-    InviteLand --> Dashboard
-    Dashboard --> TenantDash
-    TenantDash --> Chat
-    TenantDash --> Rooms
-    TenantDash --> Explore
-    TenantDash --> Files
-    Chat --> Call
-    TenantDash --> Invites
-    TenantDash --> Admin
-    TenantDash --> Billing
-    Dashboard --> ProfileView
-    Dashboard --> ProfileEdit
+    subgraph state["Pinia stores (20)"]
+        S1["auth · tenant · rooms ·<br/>messages · conference · files ·<br/>invite · members · role ·<br/>notification · tasks · user · ws"]
+        S2["agents · tunnelClients ·<br/>tunnelPolicies · overlayRoutes ·<br/>overlayAcl · orgBadges · stats"]
+    end
+
+    subgraph rt["Real-time & media"]
+        WS["useWebSocket → /ws"]
+        MS["mediasoup-client<br/>(conference)"]
+        RC["useRemoteControl<br/>(remote desktop viewer)"]
+        WK["decode workers<br/>webcodecs · hevc · vp9-444"]
+    end
+
+    views --> state
+    CORE --> WS & MS
+    FLEET --> RC --> WK
+    state --> WS
 ```
-
-## Routes
-
-| Path | Name | Component | Auth | Description |
-|------|------|-----------|------|-------------|
-| `/landing` | `landing` | `LandingView` | Guest | Landing page |
-| `/pricing` | `pricing` | `LandingView` | Guest | Pricing (same component) |
-| `/login` | `login` | `LoginView` | Guest | Login page |
-| `/register` | `register` | `RegisterView` | Guest | Registration page |
-| `/oauth/callback` | `oauth-callback` | `OAuthCallbackView` | Guest | OAuth callback handler |
-| `/invite/:code` | `invite` | `InviteLandingView` | — | Invite landing page |
-| `/` | `dashboard` | `DashboardView` | Yes | Global dashboard (tenant list) |
-| `/tenant/:tenantId` | `tenant-dashboard` | `TenantDashboard` | Yes | Tenant-specific dashboard |
-| `/tenant/:tenantId/room/:roomId` | `room-chat` | `ChatView` | Yes | Room chat view |
-| `/tenant/:tenantId/room/:roomId/call` | `room-call` | `ConferenceView` | Yes | Video call in room |
-| `/tenant/:tenantId/rooms` | `rooms` | `RoomList` | Yes | Room browser |
-| `/tenant/:tenantId/explore` | `explore` | `ExploreView` | Yes | Explore public rooms |
-| `/tenant/:tenantId/files` | `files` | `FilesBrowser` | Yes | File manager |
-| `/tenant/:tenantId/invites` | `invites` | `InviteManageView` | Yes | Manage invites |
-| `/tenant/:tenantId/admin` | `admin` | `AdminPanel` | Yes | Tenant admin panel |
-| `/tenant/:tenantId/billing` | `billing` | `BillingView` | Yes | Billing & subscription |
-| `/profile/edit` | `profile-edit` | `ProfileEditView` | Yes | Edit own profile |
-| `/profile/:userId` | `profile` | `ProfileView` | Yes | View user profile |
-
-Auth guard: authenticated routes redirect to `/landing` if no `access_token` in localStorage. Guest routes redirect to `/` if token exists.
-
-## Layout
-
-All authenticated routes are wrapped in `AppLayout.vue`, which provides:
-- Navigation sidebar (room tree, tenant selector)
-- Top toolbar
-- Main content area
 
 ## Views
 
-### Auth
+| Area | Views | Notes |
+|---|---|---|
+| Marketing / auth | `LandingView`, `auth/{Login,Register,OAuthCallback}View`, `legal/{Terms,PrivacyPolicy}View` | |
+| Collaboration | `dashboard/{DashboardView,TenantDashboard}`, `rooms/{RoomList,ExploreView}`, `chat/ChatView`, `conference/ConferenceView`, `files/FilesBrowser`, `invite/{InviteLanding,InviteManage}View`, `profile/{Profile,ProfileEdit}View`, `billing/BillingView` | `ChatView`/`ConferenceView` own their layout (no `v-container`) |
+| Fleet | `devices/DevicesView` (enrolled machines), `remote/RemoteControl` (the viewer), `remote/ConsentView`, `network/NetworkPanel` (overlay mesh), `observability/ObservabilityView`, `analytics/AnalyticsView`, `admin/AdminPanel` | |
+| Fallback | `NotFoundView` | |
 
-| View | File | Description |
-|------|------|-------------|
-| LoginView | `views/auth/LoginView.vue` | Username/email + password login |
-| RegisterView | `views/auth/RegisterView.vue` | Registration with optional tenant creation |
+## Stores (20)
 
-### Dashboard
+`auth` · `tenant` · `user` · `rooms` · `messages` · `conference` · `files` ·
+`invite` · `members` · `role` · `notification` · `tasks` · `ws` — the
+collaboration core — plus the fleet set: `agents`, `tunnelClients`,
+`tunnelPolicies`, `overlayRoutes`, `overlayAcl`, `orgBadges` (multi-org
+indicators), `stats` (observability series).
 
-| View | File | Description |
-|------|------|-------------|
-| DashboardView | `views/dashboard/DashboardView.vue` | Lists all tenants the user belongs to |
-| TenantDashboard | `views/dashboard/TenantDashboard.vue` | Stats and quick actions for a tenant |
+## Composables (13)
 
-### Chat
+| Composable | Purpose |
+|---|---|
+| `useAuth` | Session + token lifecycle |
+| `useWebSocket` | The `/ws` connection + event dispatch into stores |
+| `useRemoteControl` | The entire remote-desktop viewer engine (below) |
+| `useConferenceLayout` / `useActiveSpeaker` / `useAudioPlayback` / `usePictureInPicture` | Conference UX |
+| `useMarkdown` | markdown-it + DOMPurify rendering |
+| `usePush` | Web-push subscribe/unsubscribe |
+| `usePageViews` | SPA route-change beacon (`/api/stats/pageview`) |
+| `usePolling` | Shared polling helper |
+| `useSnackbar` / `useValidation` | UX utilities |
 
-| View | File | Description |
-|------|------|-------------|
-| ChatView | `views/chat/ChatView.vue` | Message list, input, threads, Start Call / Join Call button |
+## The remote-desktop viewer (`useRemoteControl.ts`)
 
-### Rooms
+The largest module in the frontend — the browser side of the pipeline documented in
+[encoders.md](encoders.md).
 
-| View | File | Description |
-|------|------|-------------|
-| RoomList | `views/rooms/RoomList.vue` | Browse joined rooms, create rooms with parent selector |
-| ExploreView | `views/rooms/ExploreView.vue` | Discover and join public rooms |
+**Render paths** (user-switchable, persisted, feature-probed):
 
-### Conference
+```mermaid
+flowchart TB
+    IN["incoming session"] --> Q{"transport ×<br/>codec support probes"}
+    Q -->|default| V["&lt;video&gt; element<br/>RTP → Chrome jitter buffer (~80 ms floor)"]
+    Q -->|"WebCodecs path"| W["RTCRtpScriptTransform →<br/>VideoDecoder → OffscreenCanvas"]
+    Q -->|"DC H.264 / DC HEVC"| DC["reliable DataChannel bitstream →<br/>worker decode → canvas"]
+    Q -->|"VP9 4:4:4"| VP["DataChannel → rc-vp9-444-worker<br/>(chroma-full screen content)"]
+    W & DC & VP --> HUD["per-hop stats: fwd · decode · paint<br/>(rc-hop-stats, opt-in diag HUD)"]
+```
 
-| View | File | Description |
-|------|------|-------------|
-| ConferenceView | `views/conference/ConferenceView.vue` | Video call in a room (start/join from chat or dashboard) |
+- **Decode workers** (`ui/src/workers/`): `rc-webcodecs-worker`, `rc-hevc-worker`,
+  `rc-vp9-444-worker`, with `rc-hop-stats` shared hop-timing instrumentation.
+- **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
+  detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
+  hardware decode* both hold.
+- **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
+  keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
+  its frame-skip rate control), agent-local loopback-TURN probe for fast relayed
+  paths on the same LAN.
+- **Input**: HID-mapped keyboard (keyboard-lock, Ctrl-Alt-Del / SAS chord),
+  letterboxed + direct coordinate normalization, multi-monitor layout + display
+  match, resolution/scale control.
+- **Clipboard bridge**: text / HTML / image / native formats, chunked over a DC,
+  hash + echo-gate dedupe, auto-sync on focus; optional local-agent loopback
+  bridge for full-fidelity RTF.
+- **File transfer**: chunked uploads/downloads, folder download (streamed zip),
+  resumable, cancellable.
+- **Remote apps**: list / focus / launch on the controlled host.
+- **Diagnostics**: stats polling, jank detector, long-task observer, inbound-RTP
+  diagnostics, agent-log fetch — surfaced in an opt-in HUD.
+- **Resilience**: reconnect with backoff, decode-pressure shedding.
 
-### Files
+## Observability components
 
-| View | File | Description |
-|------|------|-------------|
-| FilesBrowser | `views/files/FilesBrowser.vue` | Upload, browse, download files |
+`ui/src/components/stats/`: `MeshGraph` (d3 force graph of overlay edges +
+carrier types), `TimeSeriesChart`, `UptimeStrip`, `UsagePanel`, `UsageTable`,
+`UsageTimeline`, `RangePicker` — fed by the `stats` store from
+`/api/tenant/{tid}/stats/*` and `/api/admin/stats/*`.
 
-### Profile
+## Admin components (`ui/src/components/admin/`)
 
-| View | File | Description |
-|------|------|-------------|
-| ProfileView | `views/profile/ProfileView.vue` | View any user's profile (avatar, bio, presence) |
-| ProfileEditView | `views/profile/ProfileEditView.vue` | Edit own profile (display_name, bio, avatar, locale, timezone) |
+`AgentsSection` (device management: caps chips, exec policy, join-org, update) ·
+`AgentCrashesDialog` · `AgentLogsDialog` · `DeviceConsoleDialog` (fleet-RPC exec) ·
+`ExecAuditSection` · `ExecPolicyDialog` · `AclSection` + `OverlayAclSection`
+(overlay L3 ACL + mode) · `OverlaySubnetRoutesSection` (approved routes / exit
+nodes) · `MagicDnsSection` · `TunnelPoliciesSection` · `MembersSection` ·
+`RolesSection` · `SettingsSection`.
 
-### Invites
+## Everything else
 
-| View | File | Description |
-|------|------|-------------|
-| InviteLandingView | `views/invite/InviteLandingView.vue` | Public invite acceptance page |
-| InviteManageView | `views/invite/InviteManageView.vue` | Manage tenant invites (single + batch) |
+- **Chat**: TipTap v3 editor (markdown, mentions, emoji via emoji-mart, Giphy
+  picker), threads, reactions, pins.
+- **Conference**: mediasoup-client composables + `VideoTile`, layout modes,
+  active-speaker tracking, PiP.
+- **Theming**: Vuetify light/dark with localStorage persistence.
+- **API client**: `ui/src/api/client.ts` — token injection + refresh handling.
+- **Dev proxy**: Vite proxies `/api` + `/ws` to `http://localhost:5001`.
 
-### Billing
-
-| View | File | Description |
-|------|------|-------------|
-| BillingView | `views/billing/BillingView.vue` | Stripe billing & subscription management |
-
-### Admin
-
-| View | File | Description |
-|------|------|-------------|
-| AdminPanel | `views/admin/AdminPanel.vue` | Tenant settings, roles, members |
-
-## Components
-
-| Component | File | Description |
-|-----------|------|-------------|
-| AppLayout | `components/layout/AppLayout.vue` | Main layout wrapper (sidebar + toolbar + call notification snackbar) |
-| MessageBubble | `components/chat/MessageBubble.vue` | Single message display with reactions, attachments |
-| MessageEditor | `components/chat/MessageEditor.vue` | Rich message input with emoji/GIF pickers |
-| EmojiPicker | `components/chat/EmojiPicker.vue` | Emoji picker component |
-| GiphyPicker | `components/chat/GiphyPicker.vue` | GIF picker (Giphy integration) |
-| RoomTreeItem | `components/rooms/RoomTreeItem.vue` | Recursive tree node for room hierarchy with context menu and call indicator |
-| VideoTile | `components/conference/VideoTile.vue` | Video participant tile in call view |
-| LayoutSwitcher | `components/conference/LayoutSwitcher.vue` | Conference layout mode switcher |
-| ConferenceFilesPanel | `components/conference/ConferenceFilesPanel.vue` | File sharing panel in calls |
-| MentionList | `components/chat/MentionList.vue` | @mention autocomplete suggestion dropdown |
-| NotificationPanel | `components/layout/NotificationPanel.vue` | Notification dropdown panel in app bar |
-| RoomMemberList | `components/rooms/RoomMemberList.vue` | Room member list with role badges |
-| RoleAssignDialog | `components/rooms/RoleAssignDialog.vue` | Dialog to assign/change roles |
-| BatchInviteDialog | `components/invite/BatchInviteDialog.vue` | Batch invite dialog (multi-email + role) |
-| ConfirmDialog | `components/common/ConfirmDialog.vue` | Reusable confirmation dialog |
-
-## Pinia Stores
-
-12 stores manage the application state:
-
-| Store | File | State | Key Actions |
-|-------|------|-------|-------------|
-| `auth` | `stores/auth.ts` | User profile, tokens | `login`, `register`, `logout`, `refresh`, `fetchMe` |
-| `tenant` | `stores/tenant.ts` | Tenant list, current tenant | `fetchTenants`, `createTenant`, `setCurrentTenant` |
-| `rooms` | `stores/rooms.ts` | Room list, current room | `fetchRooms`, `createRoom`, `joinRoom`, `leaveRoom`, `explore` |
-| `messages` | `stores/messages.ts` | Message list, threads | `fetchMessages`, `sendMessage` (with mentions), `editMessage`, `deleteMessage`, `togglePin` |
-| `files` | `stores/files.ts` | File list | `uploadFile`, `fetchFiles`, `deleteFile`, `recognizeFile` |
-| `invite` | `stores/invite.ts` | Invite list | `listInvites`, `createInvite`, `batchCreateInvites`, `revokeInvite`, `acceptInvite` |
-| `notification` | `stores/notification.ts` | Notifications, unread count | `fetchNotifications`, `fetchUnreadCount`, `markRead`, `markAllRead` |
-| `role` | `stores/role.ts` | Role list | `fetchRoles`, `createRole`, `updateRole`, `deleteRole`, `assignRole`, `unassignRole` |
-| `user` | `stores/user.ts` | User profile | `fetchProfile`, `updateProfile` |
-| `tasks` | `stores/tasks.ts` | Background task list | `fetchTasks`, `pollTask`, `downloadTaskOutput` |
-| `ws` | `stores/ws.ts` | WebSocket connection state | `connect`, `disconnect`, `send`, handlers for room:call_*, notification:* events |
-
-## Composables
-
-| Composable | File | Description |
-|------------|------|-------------|
-| `useAuth` | `composables/useAuth.ts` | Auth state and guards for components |
-| `useWebSocket` | `composables/useWebSocket.ts` | WebSocket lifecycle management |
-| `useMediasoup` | `composables/useMediasoup.ts` | mediasoup-client WebRTC device management |
-| `useConferenceLayout` | `composables/useConferenceLayout.ts` | Conference view layout modes |
-| `useActiveSpeaker` | `composables/useActiveSpeaker.ts` | Active speaker detection |
-| `usePictureInPicture` | `composables/usePictureInPicture.ts` | Picture-in-picture video support |
-| `useMarkdown` | `composables/useMarkdown.ts` | Markdown rendering |
-| `useAudioPlayback` | `composables/useAudioPlayback.ts` | Audio playback for recordings |
-
-## Build
+## Build & test
 
 ```bash
 cd ui
-bun install
-bun run dev       # Development server (Vite)
-bun run build     # Production build (vue-tsc + vite build)
-bun run preview   # Preview production build
+bun run dev            # Vite dev server :5000
+bun run build          # vue-tsc --noEmit + production build
+bun run test:unit      # Vitest (jsdom)
+bun run e2e            # Playwright (32 spec files)
 ```
 
-## Testing
-
-```bash
-cd ui
-bun run test:unit          # Vitest unit tests
-bun run test:unit:watch    # Watch mode
-bun run test:unit:coverage # Coverage report (v8)
-bun run e2e                # Playwright E2E tests
-bun run e2e:ui             # Playwright UI mode
-```
-
-Unit test config: `vitest.config.ts` (jsdom environment, @vue/test-utils, `@` alias to `src/`).
+Test layout: unit specs in `ui/src/__tests__/` (stores, composables — including
+the `rc:*` ws channel and `useRemoteControl` HID/button-mapping locks), E2E specs
+in `ui/e2e/` with fixtures in `ui/e2e/fixtures/test-helpers.ts` — see
+[testing.md](testing.md).

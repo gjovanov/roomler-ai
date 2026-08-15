@@ -68,7 +68,7 @@ ship a slightly larger upstream port than to drop AMF support).
 
 ## References
 
-- Pre-flight HEVC WebCodecs spike: `docs/hevc-webcodecs-spike.html`
+- Pre-flight HEVC WebCodecs spike: the retired `docs/hevc-webcodecs-spike.html` (git history)
 - Plan critique + decisions: memory entry `project_hevc_webcodecs_go.md`
 - RustDesk's equivalent (their `hwcodec` private repo vendors a similar
   stripped FFmpeg): https://github.com/rustdesk-org/hwcodec
