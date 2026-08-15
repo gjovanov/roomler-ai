@@ -131,7 +131,7 @@ mod win {
     /// Field repro on the field-test host between rc.7 (verified working) and
     /// rc.21: mouse stopped responding when the operator hovered
     /// an elevated pwsh window. See
-    /// `docs/remote-control-m3-elevated-switching.md` for the
+    /// `docs/remote-control.md (§19 appendix)` for the
     /// bisect plan + alternatives (Change B = bind every tokio
     /// worker; Change C = refine suppression policy under
     /// SystemContext) if this fix alone proves insufficient.
@@ -152,7 +152,7 @@ mod win {
                 // which queries the OS for the actual desktop
                 // identity behind the handle. (RustDesk's
                 // `inputDesktopSelected` uses the same pattern —
-                // see docs/remote-control-m3-elevated-switching.md.)
+                // see docs/remote-control.md (§19 appendix).)
                 match desktop::desktop_name_of(d.raw()) {
                     Ok(name) => {
                         let state = classify(true, &name);
