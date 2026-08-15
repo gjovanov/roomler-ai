@@ -7570,6 +7570,7 @@ dependencies = [
  "futures",
  "hex",
  "ipnet",
+ "libc",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "roomler-ai-remote-control",

@@ -307,10 +307,41 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y patchelf
           dst=agents/roomler-agent/vendor-ffmpeg
           rm -rf "$dst" && mkdir -p "$dst"
+          # P3e Phase 3: bundle ONLY the vendored libs the binary actually
+          # references. Before the ffmpeg codec+format trim the binary linked
+          # all seven libav* and the blanket copy was accurate; post-trim it
+          # links avcodec/avformat/avutil/swresample only, and blindly copying
+          # the rest (avfilter alone is ~18 MB of .so) kept the .deb at
+          # ~56 MiB for dead weight. `ldd` lists the TRANSITIVE closure, so
+          # deriving the keep-set from it stays correct if linkage changes
+          # again — a lib that stops being referenced silently drops out, and
+          # one that starts being referenced is caught by the empty-copy guard
+          # + the stock-24.04 load check below.
+          # Pass 1: the binary's own DT_NEEDED (ldd prints the SONAME in $1
+          # even for not-yet-findable libs). Passes 2..n: each copied lib's
+          # OWN needs — ldd cannot traverse INTO a lib it can't find, so
+          # vendored-lib -> vendored-lib edges (e.g. avformat -> swresample)
+          # need the fixpoint. Converges in 2 passes today; capped at 5.
+          needed=$(ldd target/release/roomlerd | awk '{print $1}')
+          for _pass in 1 2 3 4 5; do
+            grew=0
+            for real in $(find /opt/roomler-ffmpeg/lib -maxdepth 1 -type f -name 'lib*.so.*'); do
+              soname=$(patchelf --print-soname "$real")
+              [ -f "$dst/$soname" ] && continue
+              if echo "$needed" | grep -qx "$soname"; then
+                cp "$real" "$dst/$soname"
+                grew=1
+              fi
+            done
+            [ "$grew" = "1" ] || break
+            needed=$(printf '%s\n' "$needed"; for l in "$dst"/lib*.so.*; do patchelf --print-needed "$l"; done)
+          done
+          copied=$(ls "$dst" | wc -l)
           for real in $(find /opt/roomler-ffmpeg/lib -maxdepth 1 -type f -name 'lib*.so.*'); do
             soname=$(patchelf --print-soname "$real")
-            cp "$real" "$dst/$soname"
+            [ -f "$dst/$soname" ] || echo "skipping unreferenced vendored lib: $soname"
           done
+          [ "$copied" -ge 3 ] || { echo "::error::only $copied vendored FFmpeg libs matched — expected at least avcodec/avformat/avutil; the keep-set derivation is broken"; exit 1; }
           # The agent binary ITSELF dynamically links libvpx.so.7 (the `vp9-444`
           # VP9 software encoder — env-libvpx-sys links this build runner's
           # libvpx-dev, which is 1.12 / libvpx.so.7 on ubuntu-22.04). Stock

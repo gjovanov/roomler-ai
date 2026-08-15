@@ -430,6 +430,17 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    // Rust starts with SIGPIPE ignored, so `roomler peers | head` PANICS with
+    // "failed printing to stdout: Broken pipe" the moment `head` closes the
+    // pipe (field-hit on mars, rc.368, via `roomlerd cli`). Restore the
+    // normal Unix CLI contract — die quietly on EPIPE — for BOTH callers:
+    // this entry is only ever a CLI invocation (the daemon's `run` path never
+    // comes through here), so the process-wide reset is exactly scoped.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
