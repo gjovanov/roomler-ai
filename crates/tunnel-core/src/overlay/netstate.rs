@@ -43,6 +43,23 @@ pub(crate) fn netmon_enabled() -> bool {
     crate::env::flag("OVERLAY_NETMON", true)
 }
 
+/// Minimum spacing between event-driven route re-assert waves (consumed by
+/// the runtime's net-change arm; formerly `route_events`').
+pub(crate) const ROUTE_WAVE_MIN_INTERVAL: Duration = Duration::from_secs(3);
+
+/// `ROOMLER_NODE_OVERLAY_ROUTE_EVENTS` — the legacy per-runtime consumer
+/// kill-switch, still honored (default ON; `0`/`false`/`off` = the runtime
+/// ignores net deltas and keeps the 2 s tick-only route guard, the pre-P4
+/// behaviour). The subsystem-wide switch is [`netmon_enabled`].
+pub(crate) fn route_events_enabled() -> bool {
+    !matches!(
+        crate::env::node_env("OVERLAY_ROUTE_EVENTS")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
 /// Debounce window: further raw signals inside this quiet period are
 /// absorbed into one delta (`ROOMLER_NODE_OVERLAY_NETMON_DEBOUNCE_MS`).
 fn debounce() -> Duration {
@@ -75,7 +92,7 @@ pub(crate) enum RawSignal {
 /// name-only classification, which is exactly why severity keys on
 /// default-route movement instead.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct IfaceSnap {
+pub struct IfaceSnap {
     pub v4: Vec<std::net::Ipv4Addr>,
     pub v6_count: usize,
     pub vpn_class: bool,
@@ -87,21 +104,21 @@ pub(crate) struct IfaceSnap {
 /// `/0` (Check Point injects `/1`s and supernets; our exits install `/1`s),
 /// but the lookup sees through all of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DefaultRoute {
+pub struct DefaultRoute {
     /// Interface identity: ifindex (Windows) or device name (Unix) as text.
     pub ifref: String,
     pub gateway: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct NetSnapshot {
+pub struct NetSnapshot {
     pub ifaces: BTreeMap<String, IfaceSnap>,
     pub default_v4: Option<DefaultRoute>,
     pub default_v6: Option<DefaultRoute>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Severity {
+pub enum Severity {
     /// The network materially moved: the effective default route changed
     /// identity, or addresses vanished (a socket bound to one is now dead).
     Major,
@@ -120,7 +137,7 @@ pub(crate) enum Severity {
 /// snapshot-invisible change. Severity-driven subscribers (PR-2) filter on
 /// `material`/`severity`; churn-driven ones (route guard) act on every delta.
 #[derive(Debug, Clone)]
-pub(crate) struct NetDelta {
+pub struct NetDelta {
     #[allow(dead_code)] // consumed by the PR-2 severity-driven subscribers
     pub severity: Severity,
     #[allow(dead_code)] // consumed by the PR-2 severity-driven subscribers
@@ -200,17 +217,17 @@ pub(crate) fn diff(
 /// A subscriber's view: the latest snapshot (always readable) + the delta
 /// wake-up stream. On `broadcast::error::RecvError::Lagged`, reconcile from
 /// [`Self::snapshot`] — state is never lost, only wake-ups.
-pub(crate) struct NetstateHandle {
+pub struct NetstateHandle {
     snap_rx: watch::Receiver<Arc<NetSnapshot>>,
     deltas: broadcast::Sender<NetDelta>,
 }
 
 impl NetstateHandle {
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<NetDelta> {
+    pub fn subscribe(&self) -> broadcast::Receiver<NetDelta> {
         self.deltas.subscribe()
     }
     #[allow(dead_code)] // consumed by the PR-2 subscribers
-    pub(crate) fn snapshot(&self) -> Arc<NetSnapshot> {
+    pub fn snapshot(&self) -> Arc<NetSnapshot> {
         self.snap_rx.borrow().clone()
     }
 }
@@ -218,7 +235,7 @@ impl NetstateHandle {
 /// The process-wide instance, spawned lazily on first call (needs a tokio
 /// context). `None` = disabled by config or the OS backend failed to
 /// register — subscribers keep their timer fallbacks.
-pub(crate) fn handle() -> Option<&'static NetstateHandle> {
+pub fn handle() -> Option<&'static NetstateHandle> {
     static INSTANCE: OnceLock<Option<NetstateHandle>> = OnceLock::new();
     INSTANCE.get_or_init(spawn).as_ref()
 }
@@ -322,7 +339,7 @@ async fn monitor(
 
 /// Sample the CURRENT network state. Interfaces via `if_addrs` (portable);
 /// effective default routes via a route lookup per family.
-pub(crate) fn sample_snapshot() -> NetSnapshot {
+pub fn sample_snapshot() -> NetSnapshot {
     let mut ifaces: BTreeMap<String, IfaceSnap> = BTreeMap::new();
     if let Ok(addrs) = if_addrs::get_if_addrs() {
         for a in addrs {
