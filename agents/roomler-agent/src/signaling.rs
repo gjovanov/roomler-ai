@@ -147,8 +147,7 @@ async fn next_major_netchange(rx: &mut Option<NetDeltaRx>) -> String {
     {
         use tokio::sync::broadcast::error::RecvError;
         use tunnel_core::overlay::netstate::Severity;
-        loop {
-            let Some(r) = rx.as_mut() else { break };
+        while let Some(r) = rx.as_mut() {
             match r.recv().await {
                 Ok(d) if d.material && d.severity == Severity::Major => return d.summary,
                 Ok(_) | Err(RecvError::Lagged(_)) => continue,
