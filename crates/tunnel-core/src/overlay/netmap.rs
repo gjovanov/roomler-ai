@@ -42,6 +42,12 @@ pub struct PeerConfig {
     /// or `None` when unknown. The runtime skips the srflx punch only when BOTH
     /// this peer and we are `"symmetric"`; any other combination attempts.
     pub srflx_nat: Option<String>,
+    /// Dialer honesty — whether this peer can raw-UDP-dial arbitrary
+    /// relay-band ports (the single-relay DIALER's job). `Some(false)` = it
+    /// proved it can't; `None` = pre-honesty peer, in which case BOTH ends
+    /// keep the legacy srflx-only role inputs (field presence is the
+    /// capability gate — a mixed-version pair can never split roles).
+    pub udp_dialer_ok: Option<bool>,
     /// rc.142 — the peer advertised it can carry WG over QUIC-over-TURN. The
     /// runtime only attempts the QUIC relay carrier when this is set (both
     /// ends must agree, else the pair falls back to raw relay).
@@ -103,6 +109,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         lan_endpoints: peer.lan_endpoints.clone(),
         srflx_endpoints: peer.srflx_endpoints.clone(),
         srflx_nat: peer.srflx_nat.clone(),
+        udp_dialer_ok: peer.udp_dialer_ok,
         supports_quic: peer.supports_quic,
         supports_relay_single: peer.supports_relay_single,
         supports_derp: peer.supports_derp,
@@ -130,6 +137,7 @@ mod tests {
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
             srflx_nat: None,
+            udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable,
