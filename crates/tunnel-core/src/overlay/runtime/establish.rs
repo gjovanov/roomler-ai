@@ -534,9 +534,12 @@ impl OverlayRuntime {
                 relay_refresh_cooldown.insert(nid, now + RELAY_REFRESH_COOLDOWN);
                 // P2 — relay side: HardDead > RxStale > else ("one-way" covers
                 // both OneWay and a relay HandshakeDeadline, as pre-P2).
+                // The kind rides every conviction line (field 2026-08-16: a
+                // dead DERP carrier convicted under "stale coturn port?" and
+                // sent the diagnosis hunting through coturn for hours).
                 if reason == DeathReason::HardDead {
                     warn!(
-                        peer = %nid,
+                        peer = %nid, kind = ?e.relay_kind,
                         "overlay: relay carrier send hard-errored (TURNS/TCP reset / QUIC-over-TURN lost) — re-allocating"
                     );
                 } else if reason == DeathReason::RekeyUnanswered {
@@ -548,7 +551,7 @@ impl OverlayRuntime {
                     // rx moving (the one-way class no passive rule can see;
                     // field 2026-08-08, CORPLAP-1→neo16 via a raw-dialed srflx).
                     warn!(
-                        peer = %nid,
+                        peer = %nid, kind = ?e.relay_kind,
                         "overlay: relay carrier failed active revalidation (forced rekey unanswered — one-way or dead allocation) — re-allocating"
                     );
                 } else if reason == DeathReason::RxStale {
@@ -556,12 +559,12 @@ impl OverlayRuntime {
                     // send-error to trip `hard_dead` (silently-dropped coturn
                     // allocation / a dead worker the send path can't detect).
                     warn!(
-                        peer = %nid,
+                        peer = %nid, kind = ?e.relay_kind,
                         "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — coturn allocation dropped?) — re-allocating"
                     );
                 } else {
                     warn!(
-                        peer = %nid,
+                        peer = %nid, kind = ?e.relay_kind,
                         "overlay: relay carrier one-way (stale coturn port?) — re-allocating"
                     );
                 }

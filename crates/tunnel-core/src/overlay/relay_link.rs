@@ -1398,6 +1398,19 @@ impl RelayCoordinator {
     fn try_build_derp(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let peer = self.derping.get(node_id)?.clone();
         let mux = self.mux_for(node_id)?;
+        // Field 2026-08-15/16 (CORPLAP-1 under a Check Point capture): the mux
+        // Arc EXISTS while its `/derp` WS is down and slowly reconnecting
+        // through the throttled TLS path — and a carrier built over it is born
+        // dead, convicts as "one-way" on the next sweep, and rebuilds every
+        // ~60 s for as long as the WS stays down (with force-DERP pins active,
+        // that loop was the multi-minute blackhole). WITHHOLD instead: the
+        // pair stays tracked in `derping`, and the install_peers walk (netmap
+        // + the 30 s reupgrade tick) builds it the moment the mux is back.
+        if !mux.is_alive() {
+            debug!(peer = %node_id,
+                   "overlay relay: DERP mux down (reconnecting) — withholding the DERP link");
+            return None;
+        }
         let derp_conn = mux.conn_for(peer.public_key);
         // A stable synthetic peer addr (the DERP carrier is pubkey-addressed and
         // discards this `dst`; it exists only so the carrier has a consistent
@@ -2675,6 +2688,42 @@ mod tests {
             mk(true, false, Some(mux)).relay_strategy(&test_nid(), &peer(true, true)),
             RelayStrategy::SingleRelay(true)
         );
+    }
+
+    /// Field 2026-08-15/16 — a DERP link must never be built over a mux whose
+    /// WS is down (the Arc exists while it reconnects through a throttled corp
+    /// TLS path): the carrier would be born dead and churn the pair every
+    /// sweep for as long as the reconnect takes — with force-DERP pins active
+    /// that loop was a multi-minute blackhole. WITHHOLD while down (pair stays
+    /// tracked); build the moment it's back.
+    #[tokio::test]
+    async fn derp_build_withholds_while_the_mux_is_down() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([0x00u8; 32]).0;
+        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux.clone()));
+        coord.single_relay = true;
+        coord.derp = true;
+        let node = ObjectId::new();
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec![],
+            ..base_peer()
+        };
+        mux.mark_down();
+        coord.request(node, peer.clone()).await;
+        assert!(coord.is_tracking(&node), "pair is tracked while withheld");
+        assert!(
+            coord.maybe_complete(node, &peer).is_none(),
+            "no carrier over a down mux"
+        );
+        assert!(coord.is_tracking(&node), "withheld, not forgotten");
+        mux.mark_up();
+        let link = coord
+            .maybe_complete(node, &peer)
+            .expect("builds the moment the mux is back");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
     }
 
     #[tokio::test]
