@@ -58,8 +58,11 @@ mid-2026 — re-quote at signup.
 5. **Verify from anywhere** — one line per advertised transport variant
    (STUN on udp/3478 + udp/443-DNAT + tcp/3478, STUN-over-TLS on 5349 and on
    443 through the SNI split, derp healthz). With `TURN_SECRET_FILE` set it
-   also performs full TURN **Allocates** over udp/443 and TLS/443 — the only
-   check that catches static-auth-secret drift and relay-address misconfig:
+   also performs full TURN **Allocates** over udp/443 and TLS/443 (catches
+   static-auth-secret drift and relay-address misconfig) plus a **relay-echo**
+   — a udp/443 and a tls/443 allocation exchanging real bytes both ways —
+   which catches allocate-succeeds-data-vanishes regressions like the
+   missing-`relay-ip` loopback blackhole:
    ```bash
    TURN_SECRET_FILE=~/coturn.auth python3 scripts/relay-pop/healthcheck.py \
      us-east=coturn-us-east.roomler.ai:3478,derp-us-east.roomler.ai
