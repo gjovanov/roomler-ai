@@ -12,8 +12,9 @@
 //!   beyond the tiny detail string, exactly the discipline `route_events`
 //!   established. Windows = the three IP-Helper registrations
 //!   (`NotifyRouteChange2` / `NotifyUnicastIpAddressChange` /
-//!   `NotifyIpInterfaceChange`), registered ONCE per process. Non-Windows =
-//!   `ip -o monitor route` (route class only; full parity is PR-3).
+//!   `NotifyIpInterfaceChange`), registered ONCE per process. Linux =
+//!   `ip -o monitor route addr link` (all three classes); macOS =
+//!   `route -n monitor` (the PF_ROUTE socket's line-per-message view).
 //! * **Monitor** debounces bursts (a Check Point connect injects dozens of
 //!   routes in one gulp), samples a [`NetSnapshot`], diffs it against the
 //!   previous one, and publishes a [`NetDelta`] with a severity verdict.
@@ -402,23 +403,31 @@ pub fn sample_snapshot() -> NetSnapshot {
     }
     NetSnapshot {
         ifaces,
-        default_v4: default_route_v4(),
-        default_v6: None, // v6 lookup lands with the PR-3 platform pass
+        default_v4: default_route(false),
+        default_v6: default_route(true),
     }
 }
 
 #[cfg(windows)]
-fn default_route_v4() -> Option<DefaultRoute> {
+fn default_route(v6: bool) -> Option<DefaultRoute> {
     use windows_sys::Win32::Foundation::NO_ERROR;
     use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute2, MIB_IPFORWARD_ROW2};
-    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_INET};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
     // SAFETY: zeroed in/out structs + the documented GetBestRoute2 call
-    // shape; the row is only read on NO_ERROR. Destination is a fixed public
-    // anycast address — the lookup never sends a packet.
+    // shape; the row is only read on NO_ERROR. Destinations are fixed public
+    // anycast addresses — the lookup never sends a packet.
     unsafe {
         let mut dest: SOCKADDR_INET = core::mem::zeroed();
-        dest.Ipv4.sin_family = AF_INET;
-        dest.Ipv4.sin_addr.S_un.S_addr = u32::from(std::net::Ipv4Addr::new(8, 8, 8, 8)).to_be();
+        if v6 {
+            dest.Ipv6.sin6_family = AF_INET6;
+            dest.Ipv6.sin6_addr.u.Byte = "2001:4860:4860::8888"
+                .parse::<std::net::Ipv6Addr>()
+                .ok()?
+                .octets();
+        } else {
+            dest.Ipv4.sin_family = AF_INET;
+            dest.Ipv4.sin_addr.S_un.S_addr = u32::from(std::net::Ipv4Addr::new(8, 8, 8, 8)).to_be();
+        }
         let mut row: MIB_IPFORWARD_ROW2 = core::mem::zeroed();
         let mut src: SOCKADDR_INET = core::mem::zeroed();
         if GetBestRoute2(
@@ -433,12 +442,17 @@ fn default_route_v4() -> Option<DefaultRoute> {
         {
             return None;
         }
-        let gw = if row.NextHop.si_family == AF_INET {
-            let o = row.NextHop.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes();
-            let ip = std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3]);
-            (!ip.is_unspecified()).then_some(IpAddr::V4(ip))
-        } else {
-            None
+        let gw = match row.NextHop.si_family {
+            f if f == AF_INET => {
+                let o = row.NextHop.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes();
+                let ip = std::net::Ipv4Addr::new(o[0], o[1], o[2], o[3]);
+                (!ip.is_unspecified()).then_some(IpAddr::V4(ip))
+            }
+            f if f == AF_INET6 => {
+                let ip = std::net::Ipv6Addr::from(row.NextHop.Ipv6.sin6_addr.u.Byte);
+                (!ip.is_unspecified()).then_some(IpAddr::V6(ip))
+            }
+            _ => None,
         };
         Some(DefaultRoute {
             ifref: row.InterfaceIndex.to_string(),
@@ -448,13 +462,16 @@ fn default_route_v4() -> Option<DefaultRoute> {
 }
 
 #[cfg(target_os = "linux")]
-fn default_route_v4() -> Option<DefaultRoute> {
-    // One-shot lookup, matching the existing shelled-`ip` style. Cheap and
-    // dependency-free; the rtnetlink upgrade is the PR-3 platform pass.
-    let out = std::process::Command::new("ip")
-        .args(["-o", "route", "get", "8.8.8.8"])
-        .output()
-        .ok()?;
+fn default_route(v6: bool) -> Option<DefaultRoute> {
+    // One-shot lookup, matching the existing shelled-`ip` style: cheap,
+    // dependency-free, and correct through policy routing.
+    let mut cmd = std::process::Command::new("ip");
+    if v6 {
+        cmd.args(["-6", "-o", "route", "get", "2001:4860:4860::8888"]);
+    } else {
+        cmd.args(["-o", "route", "get", "8.8.8.8"]);
+    }
+    let out = cmd.output().ok()?;
     let line = String::from_utf8_lossy(&out.stdout);
     let mut toks = line.split_whitespace().peekable();
     let (mut dev, mut via) = (None, None);
@@ -471,9 +488,36 @@ fn default_route_v4() -> Option<DefaultRoute> {
     })
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
-fn default_route_v4() -> Option<DefaultRoute> {
-    None // macOS lands with the PR-3 platform pass (PF_ROUTE)
+#[cfg(target_os = "macos")]
+fn default_route(v6: bool) -> Option<DefaultRoute> {
+    // `route -n get` — the BSD twin of `ip route get`; multi-line
+    // `key: value` output ("interface: en0" / "gateway: 192.168.68.1").
+    let mut cmd = std::process::Command::new("route");
+    if v6 {
+        cmd.args(["-n", "get", "-inet6", "2001:4860:4860::8888"]);
+    } else {
+        cmd.args(["-n", "get", "8.8.8.8"]);
+    }
+    let out = cmd.output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut ifname, mut gw) = (None, None);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("interface:") {
+            ifname = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("gateway:") {
+            gw = v.trim().parse::<IpAddr>().ok();
+        }
+    }
+    ifname.map(|d| DefaultRoute {
+        ifref: d,
+        gateway: gw,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn default_route(_v6: bool) -> Option<DefaultRoute> {
+    None
 }
 
 /// The OS raw-signal backends — the `route_events` registrations, moved here
@@ -642,11 +686,48 @@ mod backend {
             reader: tokio::task::JoinHandle<()>,
         }
 
+        /// PR-3 — classify a monitor line. Linux `ip -o monitor route addr
+        /// link` labels sections `[ROUTE]`/`[ADDR]`/`[LINK]` when watching
+        /// multiple objects; macOS `route -n monitor` prints RTM message
+        /// names (`RTM_NEWADDR`, `RTM_IFINFO`, …). Unrecognized ⇒ Route —
+        /// the snapshot diff carries the real information either way.
+        fn classify(line: &str) -> RawSignal {
+            if line.contains("[ADDR]")
+                || line.contains("RTM_NEWADDR")
+                || line.contains("RTM_DELADDR")
+            {
+                RawSignal::Addr
+            } else if line.contains("[LINK]")
+                || line.contains("RTM_IFINFO")
+                || line.contains("RTM_IFANNOUNCE")
+            {
+                RawSignal::Iface
+            } else {
+                RawSignal::Route
+            }
+        }
+
         pub(in super::super) fn spawn(
             tx: UnboundedSender<(RawSignal, String)>,
         ) -> Option<BackendGuard> {
-            let mut child = tokio::process::Command::new("ip")
-                .args(["-o", "monitor", "route"])
+            // PR-3 — full class coverage: routes + addresses + links on
+            // Linux (`notify_regather` and the LAN-set rebuild key on the
+            // addr/iface classes, which the route-only child never fired);
+            // `route -n monitor` on macOS (PF_ROUTE's socket, one line per
+            // kernel routing message).
+            #[cfg(target_os = "macos")]
+            let mut cmd = {
+                let mut c = tokio::process::Command::new("route");
+                c.args(["-n", "monitor"]);
+                c
+            };
+            #[cfg(not(target_os = "macos"))]
+            let mut cmd = {
+                let mut c = tokio::process::Command::new("ip");
+                c.args(["-o", "monitor", "route", "addr", "link"]);
+                c
+            };
+            let mut child = cmd
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -657,7 +738,7 @@ mod backend {
             let reader = tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send((RawSignal::Route, line)).is_err() {
+                    if tx.send((classify(&line), line)).is_err() {
                         break;
                     }
                 }
