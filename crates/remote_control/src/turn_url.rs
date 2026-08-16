@@ -35,8 +35,11 @@ pub struct VariantCaps {
     /// (upstream NOT_PLANNED, webrtc-rs/webrtc#690); browsers use it.
     #[serde(default = "d_true")]
     pub tls_443_udp: bool,
-    /// `turns:host:443?transport=tcp`. Browser corp-escape; on regional PoPs
-    /// TCP/443 belongs to the DERP relay (SNI-routed), so this is off there.
+    /// `turns:host:443?transport=tcp`. Corp-escape over TLS. Regional PoPs
+    /// serve it too — their nginx SNI-splits TCP/443 between the coturn name
+    /// (passthrough to the TLS listener) and the DERP name — so this stays on
+    /// everywhere; PoPs disable only `tls_443_udp` (DTLS, structurally dead
+    /// behind the plain-3478 UDP/443 DNAT).
     #[serde(default = "d_true")]
     pub tls_443_tcp: bool,
 }
