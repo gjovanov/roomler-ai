@@ -1930,14 +1930,27 @@ impl OverlayRuntime {
         });
 
         let mut fallback = tokio::time::interval(FALLBACK_TICK);
-        // P4 — event-driven route guard: subscribe to OS route-table changes
-        // (NotifyRouteChange2 / `ip monitor route`) so an erased route is
-        // re-asserted within milliseconds instead of at the next blind tick.
-        // `None` (env-disabled / platform-unavailable) = pre-P4 behaviour
-        // exactly. Waves are rate-limited: our own re-asserts feed the
-        // subscription back (see `route_events` module doc).
-        let mut route_watch = super::route_events::spawn_route_watch();
+        // netstate PR-2 — subscribe to the process-wide network monitor
+        // (typed deltas replace the P4 string feed; ONE OS registration per
+        // process, see `netstate`). `None` (either kill-switch off /
+        // platform-unavailable) = tick-only, the pre-P4 behaviour exactly.
+        // Immaterial deltas still arrive (an erased peer /32 is
+        // snapshot-invisible), so the route-guard erase contract holds; the
+        // MAJOR fast lane below is what turns a VPN transition from
+        // flag-parking into an inline forced sweep.
+        let mut net_watch = if super::netstate::route_events_enabled() {
+            super::netstate::handle().map(|h| h.subscribe())
+        } else {
+            debug!("overlay: net-change consumer disabled (OVERLAY_ROUTE_EVENTS=0)");
+            None
+        };
         let mut last_route_wave: Option<Instant> = None;
+        // netstate PR-2 — after a MAJOR change's inline forced sweep, walk
+        // install_peers on EVERY fallback tick inside this window (instead of
+        // the ~30 s reupgrade cadence) so re-selection lands right behind the
+        // poke verdicts' handshake deadlines (~12-30 s), not half a minute
+        // later.
+        let mut fast_reupgrade_until: Option<Instant> = None;
         // Net-change poke acceleration — one-shot flag set by the addr/iface
         // route-event arm, consumed by the next fallback sweep: every
         // established DIRECT carrier gets a forced revalidation poke, so a
@@ -1954,13 +1967,13 @@ impl OverlayRuntime {
         // watch dies mid-session (the event arm's `None` leg) — it is the
         // 2 s war cadence.
         let route_cadence = route_guard_cadence(
-            route_watch.is_some(),
+            net_watch.is_some(),
             crate::env::node_env("OVERLAY_ROUTE_TICK_SECS"),
         );
         let mut route_guard = tokio::time::interval(route_cadence);
         route_guard.tick().await;
         info!(
-            events = route_watch.is_some(),
+            events = net_watch.is_some(),
             tick_secs = route_cadence.as_secs(),
             "overlay: route guard armed"
         );
@@ -2427,13 +2440,20 @@ impl OverlayRuntime {
                     // (a) retries a direct tier whose cooldown lapsed and (b)
                     // drives Phase C punch convergence at large install skew.
                     reupgrade_ticks = reupgrade_ticks.wrapping_add(1);
-                    if reupgrade_ticks.is_multiple_of(REUPGRADE_EVERY_N_TICKS) {
+                    // netstate PR-2 — inside the post-Major fast window, walk
+                    // EVERY tick so re-selection lands right behind the forced
+                    // sweep's handshake verdicts instead of at the 30 s cadence.
+                    let fast_walk = fast_reupgrade_until.is_some_and(|t| Instant::now() < t);
+                    if fast_reupgrade_until.is_some() && !fast_walk {
+                        fast_reupgrade_until = None;
+                    }
+                    if fast_walk || reupgrade_ticks.is_multiple_of(REUPGRADE_EVERY_N_TICKS) {
                         let peers: Vec<NetmapPeer> = current_peers.values().cloned().collect();
                         let t0 = Instant::now();
                         self.install_peers(
                             &mut wg, &mut by_node, &mut relay, &tun,
                             &peers, direct_ctx.as_ref(), &mut upgrade_probes,
-                            &mut relay_bq, "reupgrade",
+                            &mut relay_bq, if fast_walk { "net-change-walk" } else { "reupgrade" },
                         ).await;
                         warn_if_slow("install_peers(reupgrade)", t0);
                     }
@@ -2519,50 +2539,38 @@ impl OverlayRuntime {
                 // ROUTE_WAVE_MIN_INTERVAL — the demoted 30 s heartbeat never
                 // carries it. Inert (`pending`) when the subscription is
                 // off/unavailable.
-                maybe_route_evt = async {
-                    match route_watch.as_mut() {
-                        Some(w) => w.recv().await,
-                        None => std::future::pending::<Option<String>>().await,
+                net_evt = async {
+                    match net_watch.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
                     }
                 } => {
-                    match maybe_route_evt {
-                        Some(first) => {
-                            let burst = route_watch.as_mut().map(|w| w.drain()).unwrap_or(0);
-                            // R3 — an ADDRESS/INTERFACE-tagged event (N4) is
-                            // the roam signal. Debounced behind the same wave
-                            // interval, then gated on the ONLY thing that
-                            // justifies a plane rebuild: the sorted LAN IP
-                            // SET actually changed (the fingerprint's own
-                            // rule — IPs, never ifindexes, which Windows
-                            // renumbers without addresses changing). Routes
-                            // alone never trigger: a filter-only VPN changes
-                            // no addresses, and Stage 2's poke owns that
-                            // class.
-                            if first.starts_with("addr") || first.starts_with("iface") {
+                    match net_evt {
+                        Ok(delta) => {
+                            // R3 — an ADDRESS/INTERFACE-classed burst (N4) is
+                            // the roam signal: gate on the ONLY thing that
+                            // justifies a plane rebuild — the sorted LAN IP
+                            // SET actually changed (IPs, never ifindexes,
+                            // which Windows renumbers without addresses
+                            // changing). Route-only bursts never trigger: a
+                            // filter-only VPN changes no addresses, and the
+                            // Major fast lane below owns that class.
+                            if delta.saw_addr_signal || delta.saw_iface_signal {
                                 let check_due = last_netcheck.is_none_or(|t| {
-                                    t.elapsed() >= super::route_events::ROUTE_WAVE_MIN_INTERVAL
+                                    t.elapsed() >= super::netstate::ROUTE_WAVE_MIN_INTERVAL
                                 });
                                 if check_due && pending_rebuild.is_none() {
                                     last_netcheck = Some(Instant::now());
                                     // W5(c) — poke the plane srflx task
-                                    // UNCONDITIONALLY on an addr/iface event:
-                                    // a corp-VPN connect changes NAT reality
-                                    // without touching the LAN-IP set (the
-                                    // VPN adapter is deny-listed from the
-                                    // gather), so the net-change rebuild
-                                    // below never fires for it — and before
-                                    // W5, a NONE stayed NONE forever. Notify
+                                    // UNCONDITIONALLY: a corp-VPN connect
+                                    // changes NAT reality without touching the
+                                    // LAN-IP set (the VPN adapter is
+                                    // deny-listed from the gather). Notify
                                     // coalesces; SEEKING re-gathers now,
                                     // ESTABLISHED re-verifies the mapping.
                                     if let Some(plane) = &self.carrier_plane {
                                         plane.notify_regather();
                                     }
-                                    // Net-change poke acceleration — the event
-                                    // is the suspicion: the next sweep force-
-                                    // revalidates every established direct
-                                    // carrier (answered pokes clear free; a
-                                    // captured-route casualty dies at its
-                                    // handshake deadline, not ~90 s later).
                                     if direct::netchange_poke_enabled() {
                                         netchange_poke_due = true;
                                     }
@@ -2586,14 +2594,48 @@ impl OverlayRuntime {
                                     }
                                 }
                             }
+                            // netstate PR-2 — the MAJOR fast lane: the network
+                            // materially moved (default route changed identity
+                            // or addresses vanished). Don't park flags for the
+                            // next 5 s tick — the E1 lab measured that parking
+                            // as pure loss on a 28-50 s conn-side outage:
+                            //   1. stale path evidence dies now (the old
+                            //      network's scores/penalties/stickies mean
+                            //      nothing on the new one),
+                            //   2. every established carrier gets its forced
+                            //      revalidation NOW (casualties die at their
+                            //      handshake deadlines, ~12-30 s),
+                            //   3. re-selection walks EVERY tick for the next
+                            //      25 s so the verdicts are acted on as they
+                            //      land, not at the ~30 s reupgrade cadence.
+                            if delta.material
+                                && delta.severity == super::netstate::Severity::Major
+                                && direct::netchange_poke_enabled()
+                            {
+                                self.shadow(|s| s.mon.on_network_changed());
+                                netchange_poke_due = false; // consumed inline
+                                let t0 = Instant::now();
+                                self.sweep_carrier_health(
+                                    &mut wg, &mut by_node, &mut relay, &tun,
+                                    &mut relay_refresh_cooldown, &current_peers,
+                                    true,
+                                ).await;
+                                warn_if_slow("sweep_carrier_health(net-change)", t0);
+                                fast_reupgrade_until =
+                                    Some(Instant::now() + Duration::from_secs(25));
+                            }
+                            // The route wave rides EVERY delta — including
+                            // immaterial ones (an erased peer /32 is
+                            // snapshot-invisible; that wake-up is the whole
+                            // P4 erase contract).
                             let due = last_route_wave
-                                .is_none_or(|t| t.elapsed() >= super::route_events::ROUTE_WAVE_MIN_INTERVAL);
+                                .is_none_or(|t| t.elapsed() >= super::netstate::ROUTE_WAVE_MIN_INTERVAL);
                             if due {
                                 last_route_wave = Some(Instant::now());
-                                let first_short: String = first.chars().take(120).collect();
+                                let summary_short: String = delta.summary.chars().take(120).collect();
                                 info!(
-                                    events = burst + 1, first = %first_short,
-                                    "overlay: route-table change — re-asserting peer routes now (P4 event-driven; heartbeat tick is the backstop)"
+                                    material = delta.material, first = %summary_short,
+                                    "overlay: network change — re-asserting peer routes now (netstate event-driven; heartbeat tick is the backstop)"
                                 );
                                 if let Ok(guard) = route_reassert_lock.clone().try_lock_owned() {
                                     let tun2 = tun.clone();
@@ -2615,7 +2657,7 @@ impl OverlayRuntime {
                                     for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
                                         tun.add_cidr_route(cidr).await.ok();
                                     }
-                                    warn_if_slow("arm:route_events(exit /1)", t0);
+                                    warn_if_slow("arm:net_events(exit /1)", t0);
                                 }
                                 // The heartbeat counts from the last wave.
                                 route_guard.reset();
@@ -2623,28 +2665,41 @@ impl OverlayRuntime {
                                 // Trailing edge: pull the next tick to the due
                                 // boundary so an erase inside the quiet window
                                 // waits ≤ ROUTE_WAVE_MIN_INTERVAL, not a full
-                                // heartbeat. Idempotent re-adds don't notify
-                                // (field: waves run ~6-40/h, not at echo
-                                // cadence), so a no-op wave settles silent.
+                                // heartbeat.
                                 let elapsed = last_route_wave
                                     .map(|t| t.elapsed())
                                     .unwrap_or_default();
                                 route_guard.reset_after(
-                                    super::route_events::ROUTE_WAVE_MIN_INTERVAL
+                                    super::netstate::ROUTE_WAVE_MIN_INTERVAL
                                         .saturating_sub(elapsed),
                                 );
                             }
                         }
-                        None => {
-                            // Post-demotion this is operational, not cosmetic:
-                            // the 30 s heartbeat must not keep running as the
-                            // only guard. Restore the 2 s war cadence; the
-                            // fresh interval fires immediately → one prompt
-                            // catch-up wave.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                            // Only possible if THIS loop stalled behind 16+
+                            // deltas. State was never lost (the snapshot has
+                            // it) — reconcile conservatively: regather, arm
+                            // the poke, and let the wave/tick machinery catch
+                            // up on the next delta or heartbeat.
+                            warn!(missed, "overlay: net-change deltas lagged — reconciling from snapshot");
+                            if let Some(plane) = &self.carrier_plane {
+                                plane.notify_regather();
+                            }
+                            if direct::netchange_poke_enabled() {
+                                netchange_poke_due = true;
+                            }
+                            fast_reupgrade_until =
+                                Some(Instant::now() + Duration::from_secs(25));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // The monitor stopped (backend died). The 30 s
+                            // heartbeat must not stay the only guard: restore
+                            // the 2 s war cadence; the fresh interval fires
+                            // immediately → one prompt catch-up wave.
                             warn!(
-                                "overlay: route-event subscription ended — restoring the 2 s route-guard tick"
+                                "overlay: netstate feed ended — restoring the 2 s route-guard tick"
                             );
-                            route_watch = None;
+                            net_watch = None;
                             route_guard = tokio::time::interval(ROUTE_GUARD_TICK);
                         }
                     }
