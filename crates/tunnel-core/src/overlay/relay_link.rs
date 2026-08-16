@@ -815,14 +815,22 @@ impl RelayCoordinator {
                 (false, false) => {} // neither can raw-UDP-dial → try DERP below
             }
         }
-        // DERP — the ONLY tier that serves a both-UDP-blocked pair (honest
-        // inputs: a host that can't dial the relay band and a peer in the
-        // same shape have no raw-UDP dialer between them).
+        // DERP — the ONLY tier that serves a both-UDP-blocked pair. Keyed on
+        // the RAW srflx signals, NOT the honesty-adjusted ones: the lazy
+        // `/derp` mux opens only when a node's own srflx gather is empty, so
+        // "srflx-empty on both ends" is the exact condition under which both
+        // ends hold muxes and compute Derp symmetrically. Routing a LATCHED
+        // (srflx-present) host here split strategies in the rc.393 storm —
+        // the latched end has no mux ⇒ it fell to BothAllocate while its
+        // mux-holding peer parked in `derping` ⇒ deadlocked "blocked" pairs.
+        // A latched host doesn't need DERP anyway: both-allocate rides its
+        // client→:3478 socket, which is precisely what still works on such
+        // egresses.
         if self.derp
             && self.mux_for(node_id).is_some()
             && peer.supports_derp
-            && !my_udp_ok
-            && !peer_udp_ok
+            && !self.my_udp_relay_ok
+            && peer.srflx_endpoints.is_empty()
         {
             return RelayStrategy::Derp;
         }
