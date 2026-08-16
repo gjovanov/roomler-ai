@@ -275,6 +275,14 @@ pub struct RelayCoordinator {
     /// PEER's equivalent is read symmetrically off the netmap as
     /// `!peer.srflx_endpoints.is_empty()`, so both ends compute the same role.
     my_udp_relay_ok: bool,
+    /// Dialer honesty — mirror of [`super::dialer::udp_dialer_ok`], synced by
+    /// the runtime at sweep time (kept as a field so the role logic stays
+    /// static-free and unit-testable). `false` = this HOST proved its raw
+    /// dials toward relay-band ports never land (corp egress whitelists
+    /// STUN:3478 but drops the relay band) — it can still ANCHOR, exactly
+    /// like a udp-blocked host, and the role split treats it as such against
+    /// honesty-capable peers.
+    my_udp_dialer_ok: bool,
     /// Phase D — v1 single-relay DIALER links awaiting the anchor's advertised
     /// relay `R`. We hold NO allocation for these (the anchor owns the sole
     /// relay); each becomes a raw [`UdpRelayConn`](crate::transport::relay::UdpRelayConn)
@@ -409,11 +417,16 @@ pub struct RelayCoordinator {
 /// into "something changed". Only meaningful within one process lifetime —
 /// `DefaultHasher` is not stable across runs — which is all the coordinator's
 /// in-memory maps live for anyway.
-fn strategy_fingerprint(my_udp_relay_ok: bool, peer: &PeerConfig) -> u64 {
+fn strategy_fingerprint(my_udp_relay_ok: bool, my_udp_dialer_ok: bool, peer: &PeerConfig) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     my_udp_relay_ok.hash(&mut h);
+    // Dialer honesty — both halves are strategy inputs, so a latch flip (or
+    // a peer's honest re-advert) must read as "something changed" and
+    // re-establish the pair on the corrected roles.
+    my_udp_dialer_ok.hash(&mut h);
+    peer.udp_dialer_ok.hash(&mut h);
     peer.supports_relay_single.hash(&mut h);
     peer.supports_derp.hash(&mut h);
     // Order-independent: the netmap does not promise a stable ordering, and a
@@ -452,6 +465,7 @@ impl RelayCoordinator {
             single_relay: super::direct::relay_single_enabled()
                 && !super::direct::relay_tls_forced(),
             my_udp_relay_ok,
+            my_udp_dialer_ok: super::dialer::udp_dialer_ok(),
             dialing: HashMap::new(),
             derping: HashMap::new(),
             derp: super::direct::derp_enabled(),
@@ -511,6 +525,30 @@ impl RelayCoordinator {
             );
         }
         self.my_udp_relay_ok = ok;
+    }
+
+    /// Dialer honesty — sync the host-wide latch ([`super::dialer`]) into
+    /// this org's role inputs. Called by the runtime at sweep time; kept a
+    /// plain setter so role tests drive it directly without the static.
+    pub fn set_udp_dialer_ok(&mut self, ok: bool) {
+        if self.my_udp_dialer_ok != ok {
+            info!(
+                was = self.my_udp_dialer_ok,
+                now = ok,
+                "overlay relay: own dialer capability changed — relay roles recompute on the next cycle"
+            );
+        }
+        self.my_udp_dialer_ok = ok;
+    }
+
+    /// Whether the tracked strategy for `node_id` was single-relay with US
+    /// as the raw-UDP DIALER — the role whose failure is dialer-honesty
+    /// evidence (an anchor-role death says nothing about our egress).
+    pub fn was_dialer_for(&self, node_id: &ObjectId) -> bool {
+        matches!(
+            self.roles.get(node_id),
+            Some(RelayStrategy::SingleRelay(false))
+        )
     }
 
     /// U1 — stamp the one-shot evidence for `node_id`'s NEXT relay request:
@@ -755,9 +793,17 @@ impl RelayCoordinator {
                 RelayStrategyWire::BothAllocate => RelayStrategy::BothAllocate,
             };
         }
-        let peer_udp_ok = !peer.srflx_endpoints.is_empty();
+        // Dialer honesty — a srflx candidate only proves UDP to a WELL-KNOWN
+        // port; the DIALER role needs raw UDP to the coturn relay band. Fold
+        // the honest verdicts in, gated on the PEER carrying the field at
+        // all (`None` = pre-honesty peer ⇒ BOTH ends keep the legacy
+        // srflx-only inputs, so a mixed-version pair can never split roles —
+        // field presence is the capability signal).
+        let honest = peer.udp_dialer_ok.is_some();
+        let my_udp_ok = self.my_udp_relay_ok && (self.my_udp_dialer_ok || !honest);
+        let peer_udp_ok = !peer.srflx_endpoints.is_empty() && peer.udp_dialer_ok.unwrap_or(true);
         if self.single_relay && peer.supports_relay_single {
-            match (self.my_udp_relay_ok, peer_udp_ok) {
+            match (my_udp_ok, peer_udp_ok) {
                 (true, false) => return RelayStrategy::SingleRelay(false), // peer blocked → it anchors, we dial
                 (false, true) => return RelayStrategy::SingleRelay(true), // we're blocked → we anchor
                 (true, true) => {
@@ -766,11 +812,13 @@ impl RelayCoordinator {
                 (false, false) => {} // neither can raw-UDP-dial → try DERP below
             }
         }
-        // DERP — the ONLY tier that serves a both-UDP-blocked pair.
+        // DERP — the ONLY tier that serves a both-UDP-blocked pair (honest
+        // inputs: a host that can't dial the relay band and a peer in the
+        // same shape have no raw-UDP dialer between them).
         if self.derp
             && self.mux_for(node_id).is_some()
             && peer.supports_derp
-            && !self.my_udp_relay_ok
+            && !my_udp_ok
             && !peer_udp_ok
         {
             return RelayStrategy::Derp;
@@ -820,7 +868,7 @@ impl RelayCoordinator {
         // on a timer alone is a guess: if nothing about the pair has changed,
         // the attempt can only fail again and cost the carrier a second
         // disturbance. So a peer with strikes must show NEW EVIDENCE.
-        let fp = strategy_fingerprint(self.my_udp_relay_ok, peer);
+        let fp = strategy_fingerprint(self.my_udp_relay_ok, self.my_udp_dialer_ok, peer);
         let evidence_changed = self
             .derp_regrade_inputs
             .get(node_id)
@@ -1777,6 +1825,7 @@ mod tests {
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
             srflx_nat: None,
+            udp_dialer_ok: None,
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
@@ -2236,6 +2285,88 @@ mod tests {
             coord(small, false).single_relay_role(&test_nid(), &peer(large, true, true));
         assert_eq!(a_ok_dialer, Some(false));
         assert_eq!(b_blocked_anchor, Some(true));
+    }
+
+    /// Dialer honesty (field 2026-08-16, CORPLAP-3): a srflx candidate only
+    /// proves UDP to a well-known port — a host whose raw dials toward the
+    /// coturn relay band never land must ANCHOR, and the verdict only applies
+    /// when the peer carries the honesty field at all (mixed-version pairs
+    /// must keep legacy inputs on BOTH ends, or roles split).
+    #[tokio::test]
+    async fn dialer_honesty_flips_roles_only_against_honesty_capable_peers() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (small, large) = ([0x01u8; 32], [0xFFu8; 32]);
+        let honest_peer = |pk: [u8; 32], dialer_ok: Option<bool>| PeerConfig {
+            public_key: pk,
+            supports_relay_single: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            udp_dialer_ok: dialer_ok,
+            ..base_peer()
+        };
+        let coord = |pk: [u8; 32]| {
+            let mut c = RelayCoordinator::new(tx.clone(), pk, true, vec![], None);
+            c.single_relay = true;
+            c
+        };
+
+        // Baseline: larger pubkey + both udp-ok ⇒ WE dial (legacy tie-break),
+        // whether the peer is honesty-capable or not.
+        assert_eq!(
+            coord(large).single_relay_role(&test_nid(), &honest_peer(small, Some(true))),
+            Some(false)
+        );
+
+        // The CORPLAP-3 fix: we latched not-dialer-capable ⇒ we ANCHOR against an
+        // honesty-capable peer, pubkey order be damned.
+        let mut latched = coord(large);
+        latched.set_udp_dialer_ok(false);
+        assert_eq!(
+            latched.single_relay_role(&test_nid(), &honest_peer(small, Some(true))),
+            Some(true),
+            "latched host must anchor against an honesty-capable peer"
+        );
+
+        // Mixed-version safety: same latch, but the peer predates the field
+        // (`None`) ⇒ BOTH ends must keep the legacy inputs ⇒ we still dial.
+        assert_eq!(
+            latched.single_relay_role(&test_nid(), &honest_peer(small, None)),
+            Some(false),
+            "against a pre-honesty peer the latch must NOT apply (role-split hazard)"
+        );
+
+        // The mirror: the PEER declared not-dialer-capable ⇒ it anchors, we
+        // dial — even though its srflx bucket is non-empty.
+        assert_eq!(
+            coord(small).single_relay_role(&test_nid(), &honest_peer(large, Some(false))),
+            Some(false),
+            "we dial toward a peer that can't dial"
+        );
+        assert_eq!(
+            coord(large).single_relay_role(&test_nid(), &honest_peer(small, Some(false))),
+            Some(false),
+            "pubkey order must not matter: the capable side always dials"
+        );
+
+        // Both latched ⇒ no raw-UDP dialer exists ⇒ not single-relay
+        // (falls through to DERP/both-allocate).
+        let mut both = coord(small);
+        both.set_udp_dialer_ok(false);
+        assert_eq!(
+            both.single_relay_role(&test_nid(), &honest_peer(large, Some(false))),
+            None
+        );
+
+        // The latch is strategy-input material: flipping it must change the
+        // fingerprint so tracked pairs re-establish on the corrected roles.
+        let p = honest_peer(small, Some(true));
+        assert_ne!(
+            strategy_fingerprint(true, true, &p),
+            strategy_fingerprint(true, false, &p)
+        );
+        assert_ne!(
+            strategy_fingerprint(true, true, &p),
+            strategy_fingerprint(true, true, &honest_peer(small, Some(false)))
+        );
     }
 
     #[tokio::test]
