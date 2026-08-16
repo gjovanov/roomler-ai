@@ -94,6 +94,15 @@ const DERP_SEND_QUEUE: usize = 256;
 /// comfortably ≥ `mtu + WG_OVERHEAD + 32`.
 const DERP_MAX_FRAME: usize = 2048;
 
+/// Server→client keepalive Ping cadence on every `/derp` connection. Must sit
+/// WELL inside the shortest idle timeout on the path — HAProxy fronts the
+/// pods with `timeout client/server 300s` and NO `timeout tunnel`, so an
+/// idle standby link dies at 300 s without this (field 2026-08-16: the
+/// synchronized 21:55:37Z disconnect wave one idle window after post-roll
+/// traffic settled). 30 s matches the control-WS keepalive convention and
+/// gives 10× headroom.
+const DERP_KEEPALIVE: Duration = Duration::from_secs(30);
+
 /// Lifetime counters for the two forward-path drop classes. A missing dst is
 /// byte-identical to peer-offline from the sender's side, so the count is the
 /// ONLY server-side evidence of a one-way DERP pair (the split-brain class).
@@ -277,11 +286,37 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
     super::derp_cluster::on_derp_register(&state, network_id, &self_pubkey, agent_id).await;
     info!(%agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey), "derp: node registered");
 
-    // Write task: drain outbound frames → WS binary.
+    // Write task: drain outbound frames → WS binary, interleaved with a
+    // server-side keepalive Ping. A DERP link whose pairs are all parked on
+    // better carriers goes COMPLETELY quiet (it exists as standby), and
+    // neither side pinged — so the HAProxy hop in front of the pods
+    // (timeout client/server 300 s, no `timeout tunnel`) reaped every idle
+    // link 5 minutes after its last frame. Field 2026-08-16 21:55:37Z: a
+    // synchronized disconnect wave across BOTH pods + networks exactly one
+    // idle window after the post-roll rebuild traffic settled, then 1-4 min
+    // re-register gaps during which every frame toward the absent peer hit
+    // `derp_miss_total` — the rolling one-way-DERP windows task #15 chased
+    // as a split-brain. Pinging from the SERVER fixes every fleet version
+    // at once (tungstenite clients auto-pong, which also refreshes the
+    // client→server direction through the proxy).
     let mut write = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if ws_tx.send(Message::Binary(frame.into())).await.is_err() {
-                break;
+        let mut ping = tokio::time::interval(DERP_KEEPALIVE);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                frame = out_rx.recv() => match frame {
+                    Some(frame) => {
+                        if ws_tx.send(Message::Binary(frame.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = ping.tick() => {
+                    if ws_tx.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         let _ = ws_tx.close().await;
