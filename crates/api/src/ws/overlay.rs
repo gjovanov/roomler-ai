@@ -114,8 +114,12 @@ pub async fn relay_overlay_msg_from_node(
             handle_overlay_endpoints(state, ident, candidates).await;
             None
         }
-        ClientMsg::OverlaySrflx { candidates, nat } => {
-            handle_overlay_srflx(state, ident, candidates, nat).await;
+        ClientMsg::OverlaySrflx {
+            candidates,
+            nat,
+            udp_dialer_ok,
+        } => {
+            handle_overlay_srflx(state, ident, candidates, nat, udp_dialer_ok).await;
             None
         }
         ClientMsg::OverlayLeave {} => {
@@ -519,15 +523,24 @@ async fn handle_overlay_srflx(
     ident: NodeIdentity,
     candidates: Vec<String>,
     nat: Option<String>,
+    udp_dialer_ok: Option<bool>,
 ) {
     let Some(self_node) = current_node(state, ident).await else {
         debug!(?ident, "overlay.srflx before join; ignoring");
         return;
     };
     let Some(self_id) = self_node.id else { return };
+    // Dialer honesty — a latch flip is rare, role-flipping evidence; make it
+    // greppable on the server the moment it lands.
+    if udp_dialer_ok == Some(false) && self_node.udp_dialer_ok != Some(false) {
+        tracing::info!(
+            %self_id, node = %self_node.name,
+            "overlay.srflx: node declared NOT dialer-capable (raw dials to relay-band ports don't land) — its pairs anchor from here"
+        );
+    }
     if let Err(e) = state
         .overlay_nodes
-        .update_srflx_endpoints(self_id, &candidates, nat.as_deref())
+        .update_srflx_endpoints(self_id, &candidates, nat.as_deref(), udp_dialer_ok)
         .await
     {
         warn!(%self_id, %e, "overlay.srflx: update failed");
@@ -537,6 +550,7 @@ async fn handle_overlay_srflx(
     let mut updated = self_node;
     updated.srflx_endpoints = candidates;
     updated.srflx_nat = nat;
+    updated.udp_dialer_ok = udp_dialer_ok;
     let epoch = next_epoch();
     fan_upsert_shaped(state, &updated, epoch, true).await;
 }
@@ -1588,11 +1602,29 @@ fn verdict_from_nodes(
         pinned,
         recipient.supports_derp && peer.supports_derp,
         recipient.supports_relay_single && peer.supports_relay_single,
-        !recipient.srflx_endpoints.is_empty(),
-        !peer.srflx_endpoints.is_empty(),
+        effective_udp_ok(
+            !recipient.srflx_endpoints.is_empty(),
+            recipient.udp_dialer_ok,
+            peer.udp_dialer_ok,
+        ),
+        effective_udp_ok(
+            !peer.srflx_endpoints.is_empty(),
+            peer.udp_dialer_ok,
+            recipient.udp_dialer_ok,
+        ),
         &my_pk,
         &peer_pk,
     ))
+}
+
+/// Dialer honesty — one side's effective UDP-capability for the role split.
+/// Mirrors the client's rule in `tunnel_core::overlay::relay_link` exactly:
+/// a `Some(false)` verdict (this host proved its raw dials to relay-band
+/// ports don't land) counts ONLY when the OTHER end carries the field too
+/// (`None` = pre-honesty agent ⇒ both ends keep the legacy srflx-only
+/// inputs, so a mixed-version pair can never split roles).
+fn effective_udp_ok(srflx_ok: bool, own_flag: Option<bool>, other_flag: Option<bool>) -> bool {
+    srflx_ok && (own_flag.unwrap_or(true) || other_flag.is_none())
 }
 
 /// U2 — the PURE relay-tier decision (the pin + capability lookups resolved
@@ -1719,6 +1751,9 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // Phase C — surface the node's probed NAT type so a dialer can skip a
         // futile both-symmetric punch (VERBATIM, like srflx_endpoints).
         srflx_nat: node.srflx_nat.clone(),
+        // Dialer honesty — surface the node's raw-dial verdict VERBATIM
+        // (`None` = pre-honesty agent; peers then keep legacy role inputs).
+        udp_dialer_ok: node.udp_dialer_ok,
         relay_home: node.relay_home.clone(),
         // C4 stage 2 (PR-B) — surface the node's standing warm-leg address
         // (heartbeat-mirrored) so a single-relay dialer can dial this anchor
@@ -2065,6 +2100,7 @@ mod tests {
             lan_endpoints: vec!["192.168.1.5:41641".into()],
             srflx_endpoints: vec!["5.6.7.8:5678".into()],
             srflx_nat: Some("cone".into()),
+            udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,
             supports_quic: true,
@@ -2119,6 +2155,28 @@ mod tests {
         let b = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
         assert_eq!(pair_key(a, b), pair_key(b, a));
         assert!(pair_key(a, b).contains(&a.to_hex()));
+    }
+
+    /// Dialer honesty — the effective-UDP input rule must mirror the client's
+    /// (`tunnel_core::overlay::relay_link::relay_strategy`) exactly: a
+    /// `Some(false)` verdict counts only when the OTHER end carries the field
+    /// (`None` = pre-honesty agent ⇒ legacy srflx-only inputs on both ends).
+    #[test]
+    fn effective_udp_ok_mirrors_the_client_honesty_rule() {
+        // Legacy everywhere: no flags ⇒ srflx alone decides.
+        assert!(effective_udp_ok(true, None, None));
+        assert!(!effective_udp_ok(false, None, None));
+        // Latched host vs honesty-capable other ⇒ NOT udp-capable (anchors).
+        assert!(!effective_udp_ok(true, Some(false), Some(true)));
+        assert!(!effective_udp_ok(true, Some(false), Some(false)));
+        // Latched host vs PRE-honesty other ⇒ legacy (a mixed pair must not
+        // split roles).
+        assert!(effective_udp_ok(true, Some(false), None));
+        // A healthy new host is unaffected in every mix.
+        assert!(effective_udp_ok(true, Some(true), Some(false)));
+        assert!(effective_udp_ok(true, Some(true), None));
+        // srflx gates everything, flags or not.
+        assert!(!effective_udp_ok(false, Some(true), Some(true)));
     }
 
     /// U2 — the PARITY LOCK: the server's pure verdict core must reproduce the
