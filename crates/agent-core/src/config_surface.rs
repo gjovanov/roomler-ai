@@ -196,6 +196,19 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Route-guard blind-tick seconds while the route-event subscription is live (2-300; 2 = pre-demotion war cadence). Built-in default: 30. Always 2 s without a live subscription.",
     ),
     (
+        "overlay_netmon",
+        "tribool",
+        "netstate - the process-wide network monitor: ONE OS change subscription, typed \
+         snapshots/deltas, non-blocking fan-out (the route-event feed and the PR-2 \
+         reaction fast lanes ride it). Built-in default: on.",
+    ),
+    (
+        "overlay_netmon_debounce_ms",
+        "number",
+        "netstate - debounce window in ms coalescing OS signal bursts (a VPN connect \
+         injects dozens of routes) into one delta (100-5000). Built-in default: 750.",
+    ),
+    (
         "netstack_socks_port",
         "number",
         "Multi-org: the loopback SOCKS5 port serving THIS org's userspace netstack \
@@ -442,6 +455,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_rpf" => cfg.overlay_rpf.clone(),
         "overlay_route_events" => cfg.overlay_route_events.map(fmt_bool),
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
+        "overlay_netmon" => cfg.overlay_netmon.map(fmt_bool),
+        "overlay_netmon_debounce_ms" => cfg.overlay_netmon_debounce_ms.map(|v| v.to_string()),
         "netstack_socks_port" => cfg.netstack_socks_port.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
         "overlay_direct_port" => cfg.overlay_direct_port.map(|v| v.to_string()),
@@ -598,6 +613,23 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         return Err("overlay_route_tick_secs must be between 2 and 300".into());
                     }
                     Some(s)
+                }
+            }
+        }
+        "overlay_netmon" => cfg.overlay_netmon = parse_tribool(value)?,
+        "overlay_netmon_debounce_ms" => {
+            cfg.overlay_netmon_debounce_ms = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let ms: u32 = v.parse().map_err(|_| {
+                        format!("overlay_netmon_debounce_ms must be a number (got {v:?})")
+                    })?;
+                    if !(100..=5000).contains(&ms) {
+                        return Err(
+                            "overlay_netmon_debounce_ms must be between 100 and 5000".into()
+                        );
+                    }
+                    Some(ms)
                 }
             }
         }
