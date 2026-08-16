@@ -450,6 +450,9 @@ impl RelayCoordinator {
         lan_endpoints: Vec<String>,
         derp_mux: Option<Arc<DerpMux>>,
     ) -> Self {
+        // Dialer honesty — arm the process-wide start-grace clock (idempotent;
+        // every org runtime constructs a coordinator at startup).
+        super::dialer::touch_start();
         Self {
             outbound: outbound.into(),
             warned_detached: false,
