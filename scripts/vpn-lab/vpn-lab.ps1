@@ -22,7 +22,7 @@
 
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('status', 'connect', 'disconnect', 'cycle', 'selftest')]
+    [ValidateSet('status', 'connect', 'disconnect', 'cycle', 'selftest', 'restore')]
     [string]$Cmd,
     [int]$Count = 1,
     [int]$HoldSec = 180,
@@ -57,7 +57,11 @@ function Get-TracState {
 function Read-Creds {
     $c = Get-Content $CredFile
     if ($c.Count -lt 2) { throw "cred file malformed ($($c.Count) lines)" }
-    @{ User = $c[0].Trim(); Pass = $c[1].Trim() }
+    # Lines may carry a label prefix ("un: …" / "pw: …") — strip it. E1's
+    # first connect sent the label as part of the username and the gateway
+    # answered "falscher Benutzername" (fail-fast caught it; zero retries).
+    $strip = { param($l) ($l -replace '^\s*(un|user|username|pw|pass|password)\s*:\s*', '').Trim() }
+    @{ User = & $strip $c[0]; Pass = & $strip $c[1] }
 }
 
 function Assert-Enabled {
@@ -137,9 +141,11 @@ function Connect-Vpn {
     # the run dir for transition forensics — trac never echoes the password.
     $out = & $Trac connect -u $cred.User -p $cred.Pass 2>&1 | Out-String
     $out | Add-Content -Path (Join-Path $RunDir 'trac-connect.log')
-    if ($out -match 'authentication|credential|password|denied') {
-        Mark 'CONNECT_AUTH_SUSPECT_ABORT'
-        throw 'auth-suspect connect failure — aborting the whole run (no retry, ever)'
+    # Match actual FAILURE phrases only (German + English gateways) — benign
+    # progress lines like "Authentication done" appear on every success.
+    if ($out -match 'Zugriff verweigert|falscher Benutzername|falsches Passwort|Access denied|wrong user|wrong password') {
+        Mark 'CONNECT_AUTH_REJECTED_ABORT'
+        throw 'gateway rejected the credentials — aborting the whole run (no retry, ever)'
     }
     $deadline = (Get-Date).AddSeconds(90)
     while ((Get-Date) -lt $deadline) {
@@ -241,9 +247,20 @@ switch ($Cmd) {
                 Disconnect-Vpn
             }
             Disarm-Failsafe
+            # E1 lesson: the interesting overlay churn FOLLOWS the last
+            # transition — keep the samplers alive for a post window.
+            Mark 'POST_WINDOW_START'
+            Start-Sleep -Seconds 90
             $jobs | Stop-Job -ErrorAction SilentlyContinue
             $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
             Mark 'RUN_END'
         }
+    }
+    'restore' {
+        # Put the VPN back how the operator had it (Connected) after an
+        # experiment — a plain connect with NO failsafe (a delayed forced
+        # disconnect on the operator's working session would be sabotage).
+        New-Item -ItemType Directory -Path $RunDir -Force | Out-Null
+        Connect-Vpn
     }
 }

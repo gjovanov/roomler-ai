@@ -32,8 +32,9 @@ psexec "\$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoPr
 Register-ScheduledTask -TaskName 'roomler-vpnlab-run' -Action \$a -Trigger \$t -User 'SYSTEM' -RunLevel Highest -Force | Out-Null;
 Start-ScheduledTask -TaskName 'roomler-vpnlab-run'; 'LAUNCHED $RUNID'" 60000
 
-# Total = optional normalize (disc+rest) + N*(connect~30s+hold+disc~15s+rest) + slack
-TOTAL=$(( REST + COUNT * (HOLD + REST + 60) + 120 ))
+# Total = optional normalize (disc+rest) + N*(connect~30s+hold+disc~15s+rest)
+# + the 90 s post-transition sampler window + slack
+TOTAL=$(( REST + COUNT * (HOLD + REST + 60) + 240 ))
 echo "== local measurement for ${TOTAL}s → $OUT =="
 "$(dirname "$0")/vpn-lab-neo16.sh" "$OUT" "$TOTAL" &
 LOCAL_PID=$!
