@@ -47,7 +47,7 @@ psexec "Get-Content '$RD\\events.csv' -ErrorAction SilentlyContinue" 60000 > "$O
 for t in 100_65_4_2 100_65_0_6; do
   psexec "Get-Content '$RD\\ping-$t.csv' -ErrorAction SilentlyContinue" 90000 > "$OUT/pc-ping-$t.csv"
 done
-psexec "Get-Content '$RD\\roomler-samples.txt' -ErrorAction SilentlyContinue | Select-String -Pattern '=== |version|srflx|warm|pc50045|org:' | ForEach-Object { \$_.Line }" 90000 > "$OUT/pc-roomler-samples.txt"
+psexec "Get-Content '$RD\\roomler-samples.txt' -ErrorAction SilentlyContinue | Select-String -Pattern '=== |version|srflx|warm|neo16|org:' | ForEach-Object { \$_.Line }" 90000 > "$OUT/pc-roomler-samples.txt"
 psexec "Get-Content '$RD\\trac-connect.log' -ErrorAction SilentlyContinue" 60000 > "$OUT/pc-trac.log"
 
 echo "== outage windows (>=3 s consecutive loss) =="
