@@ -74,6 +74,23 @@ fn debounce() -> Duration {
 /// window so a delta lands at least this often while churn is ongoing.
 const DEBOUNCE_CAP: Duration = Duration::from_secs(3);
 
+/// Flap damping (field 2026-08-16 19:00Z, pc50045 IN-VPN): Check Point and
+/// our own route-guard waves fight over the routing table, so the effective
+/// default-route identity FLAPS (ifindex 26↔17, 134 raw signals in one
+/// burst) — and every flip published a fresh MAJOR. Each Major fires the
+/// heavy lanes (WS probe, path-evidence reset, forced sweep), so the flap
+/// became a WS-cycling storm: reattach every 1-3 min, netmap/grant
+/// starvation, every pair "blocked". At most one material MAJOR is
+/// published per this window; flips inside it are demoted to Minor —
+/// subscribers still get the wake-up (route wave, snapshot refresh), but
+/// the heavy lanes fire once per real transition, not once per flap.
+const MAJOR_PUBLISH_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// Pure decision for the demotion above (unit-tested).
+fn major_cooldown_active(since_last_major: Option<Duration>) -> bool {
+    since_last_major.is_some_and(|d| d < MAJOR_PUBLISH_COOLDOWN)
+}
+
 /// Raw change classes from the OS backend. Deliberately coarse — the
 /// snapshot diff carries the real information; these only (a) label the
 /// burst and (b) preserve the legacy `route_events` string classes for the
@@ -309,6 +326,7 @@ async fn monitor(
     mut prev: Arc<NetSnapshot>,
 ) {
     let quiet = debounce();
+    let mut last_major_pub: Option<tokio::time::Instant> = None;
     loop {
         let Some((first, _detail)) = raw_rx.recv().await else {
             warn!(
@@ -339,7 +357,16 @@ async fn monitor(
         }
         let next = Arc::new(sample_snapshot());
         match diff(&prev, &next, saw_addr, saw_iface) {
-            Some(delta) => {
+            Some(mut delta) => {
+                // Flap damping — see MAJOR_PUBLISH_COOLDOWN. Demotion keeps
+                // the wake-up flowing; only the heavy lanes are spared.
+                if delta.material
+                    && delta.severity == Severity::Major
+                    && major_cooldown_active(last_major_pub.map(|t| t.elapsed()))
+                {
+                    delta.severity = Severity::Minor;
+                    delta.summary = format!("{} [major demoted: flap cooldown]", delta.summary);
+                }
                 info!(
                     severity = ?delta.severity,
                     absorbed,
@@ -347,6 +374,7 @@ async fn monitor(
                     "netstate: network changed"
                 );
                 if delta.material && delta.severity == Severity::Major {
+                    last_major_pub = Some(tokio::time::Instant::now());
                     stamp_major();
                 }
                 let _ = snap_tx.send(next.clone());
@@ -704,6 +732,18 @@ mod tests {
             }),
             default_v6: None,
         }
+    }
+
+    /// Flap damping — one material Major per cooldown window; inside it the
+    /// heavy lanes must not refire (field: the CP route-flap probe storm).
+    #[test]
+    fn major_cooldown_demotes_flaps() {
+        assert!(!major_cooldown_active(None), "first Major always publishes");
+        assert!(major_cooldown_active(Some(Duration::from_secs(30))));
+        assert!(
+            !major_cooldown_active(Some(MAJOR_PUBLISH_COOLDOWN)),
+            "cooldown elapsed — next Major publishes"
+        );
     }
 
     /// The severity contract: default-route movement or vanished addresses

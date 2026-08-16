@@ -122,13 +122,18 @@ const WS_PONG_RTT_STRIKES: u32 = 2;
 const WS_PING_RETRY_ACCEL: Duration = Duration::from_secs(10);
 
 /// netstate PR-2 — a MAJOR network change (default route moved / addresses
-/// vanished) probes the control WS IMMEDIATELY: one ping, this deadline,
-/// single strike. The steady-state 2×20 s patience exists for jitter on a
-/// stable path; the network just moved under the socket, and a WS that
-/// died in the transition otherwise gets trusted for another 45-90 s
-/// (field 2026-08-16: the whole grants/netmap plane stalled behind it).
-/// A healthy WS answers in well under this and nothing else changes.
-const WS_NETCHANGE_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+/// vanished) probes the control WS immediately: a ping with this deadline,
+/// [`WS_NETCHANGE_PROBE_STRIKES`] chances. The first cut (5 s, single
+/// strike) cycled WORKING sockets all over an in-VPN host: under Check
+/// Point throttle a healthy WS legitimately answers in 6-15 s, and the
+/// route-flap storm re-fired the probe every couple of minutes — reattach
+/// loops, netmap/grant starvation, every pair "blocked" (field 2026-08-16
+/// 19:0xZ). 2×10 s convicts a genuinely dead socket in ≤20 s — still 2-4×
+/// faster than the organic path — while a slow-but-alive one survives.
+const WS_NETCHANGE_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Missed probe windows before the WS is cycled (see above).
+const WS_NETCHANGE_PROBE_STRIKES: u8 = 2;
 
 /// netstate PR-2 — the delta receiver, feature-shaped: the overlay builds
 /// subscribe to the process-wide monitor; a no-overlay build has no
@@ -1073,14 +1078,14 @@ async fn connect_once(
     let mut skew_mono = std::time::Instant::now();
 
     // netstate PR-2 — probe-then-cycle on Major network changes. `Some` =
-    // a probe ping is out with its 5 s deadline; verdict at the next
-    // keepalive tick (pulled forward to the deadline).
+    // a probe ping is out: (window start, missed windows so far); verdict
+    // at the next keepalive tick (pulled forward to the deadline).
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     let mut net_rx: Option<NetDeltaRx> =
         tunnel_core::overlay::netstate::handle().map(|h| h.subscribe());
     #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
     let mut net_rx: Option<NetDeltaRx> = None;
-    let mut netchange_probe: Option<std::time::Instant> = None;
+    let mut netchange_probe: Option<(std::time::Instant, u8)> = None;
 
     loop {
         tokio::select! {
@@ -1157,21 +1162,44 @@ async fn connect_once(
                 // cycle NOW, single strike — the network moved under the
                 // socket and every second of blind trust stalls the whole
                 // grants/netmap plane behind a dead WS.
-                if let Some(probed) = netchange_probe {
+                if let Some((probed, misses)) = netchange_probe {
                     if outstanding_ping.is_none() || last_rx.elapsed() < probed.elapsed() {
                         netchange_probe = None;
                     } else if probed.elapsed() >= WS_NETCHANGE_PROBE_DEADLINE {
+                        let misses = misses + 1;
+                        if misses >= WS_NETCHANGE_PROBE_STRIKES {
+                            warn!(
+                                unanswered_s = probed.elapsed().as_secs(),
+                                misses,
+                                "control WS unresponsive after a MAJOR network change — cycling now"
+                            );
+                            close_all_peers(&mut peers, &indicator).await;
+                            close_all_tunnel_peers(&mut tunnel_peers).await;
+                            close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                            return Err(ConnectError::Transient(anyhow::anyhow!(
+                                "net-change probe: {} windows of {} s unanswered after a \
+                                 Major network change",
+                                misses,
+                                WS_NETCHANGE_PROBE_DEADLINE.as_secs()
+                            )));
+                        }
+                        // One more chance: a throttled-but-alive corp path
+                        // legitimately answers slower than one window.
                         warn!(
                             unanswered_s = probed.elapsed().as_secs(),
-                            "control WS unresponsive after a MAJOR network change — cycling now"
+                            "net-change probe window missed once — re-probing (2-strike rule)"
                         );
-                        close_all_peers(&mut peers, &indicator).await;
-                        close_all_tunnel_peers(&mut tunnel_peers).await;
-                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
-                        return Err(ConnectError::Transient(anyhow::anyhow!(
-                            "net-change probe: no answer within {} s of a Major network change",
-                            WS_NETCHANGE_PROBE_DEADLINE.as_secs()
-                        )));
+                        if let Err(e) =
+                            send_frame(&mut ws, Message::Ping(ping_payload(ws_epoch).into())).await
+                        {
+                            warn!(%e, "net-change re-probe ping failed — reconnecting");
+                            close_all_peers(&mut peers, &indicator).await;
+                            close_all_tunnel_peers(&mut tunnel_peers).await;
+                            close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                            return Err(ConnectError::Transient(e.context("net-change re-probe")));
+                        }
+                        netchange_probe = Some((std::time::Instant::now(), misses));
+                        keepalive.reset_after(WS_NETCHANGE_PROBE_DEADLINE);
                     }
                 }
                 // Missing-pong strike: a ping still unanswered past the
@@ -1253,7 +1281,7 @@ async fn connect_once(
                     if outstanding_ping.is_none() {
                         outstanding_ping = Some(std::time::Instant::now());
                     }
-                    netchange_probe = Some(std::time::Instant::now());
+                    netchange_probe = Some((std::time::Instant::now(), 0));
                     keepalive.reset_after(WS_NETCHANGE_PROBE_DEADLINE);
                 }
             }
