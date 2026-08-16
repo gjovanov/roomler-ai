@@ -437,6 +437,24 @@ pub async fn run(
     // LocalAPI shares the SAME instance and its live `pending` set. Lives across
     // reconnects, so a sentinel dropped while the WS was down is still honoured.
     let mut backoff = Duration::from_secs(1);
+    // netstate PR-2b — a MAJOR network change during a reconnect backoff
+    // cuts the wait and resets the ladder: the transition that killed this
+    // WS has ended (or moved again), and an exponential grown to 60 s while
+    // the corp path blackholed fresh TLS must not ALSO delay the recovery
+    // attempt. Field 2026-08-16, org{label=jovanov}: the WS spent most of a
+    // 5-minute captive window parked in backoff — no WS ⇒ no grants, no
+    // netmap, no honored pins ⇒ the org's entire overlay sat dark until the
+    // ladder happened to line up with a reconnectable path.
+    let mut ladder_net_rx: Option<NetDeltaRx> = {
+        #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+        {
+            tunnel_core::overlay::netstate::handle().map(|h| h.subscribe())
+        }
+        #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+        {
+            None
+        }
+    };
     let mut auth_failures: u32 = 0;
     // rc.53: rolling window of recent `ReplacedByNewerConnection`
     // events. Three within 5 min escalates from "back off 60 s and
@@ -662,12 +680,20 @@ pub async fn run(
                 let cause = error_chain(e.as_ref());
                 warn!(error = %e, %cause, "signaling connect failed; backing off");
                 tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {},
+                    _ = tokio::time::sleep(backoff) => {
+                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                    },
+                    // netstate PR-2b — the network moved: retry NOW with a
+                    // reset ladder instead of waiting out a backoff sized
+                    // for the network that no longer exists.
+                    _ = next_major_netchange(&mut ladder_net_rx) => {
+                        info!("network changed during reconnect backoff — retrying immediately");
+                        backoff = Duration::from_secs(1);
+                    },
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() { return Ok(()); }
                     },
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(60));
             }
         }
     }
