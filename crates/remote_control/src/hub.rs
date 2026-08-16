@@ -347,6 +347,38 @@ impl Hub {
             drop(prev);
         }
         info!("agent {} online", agent_id);
+        // Task #8 — agent-authoritative session resync. An ACTIVE session
+        // cannot survive the agent's control-WS death: every agent-side
+        // connection-teardown path closes its peers, and the fresh
+        // connection starts with none — so any Active row still pinned to
+        // this agent is a ZOMBIE whose Terminate was lost with the dying WS
+        // (field 2026-08-15 pc50045: red frame held, capacity held, the
+        // controller's live tab retried into AgentBusy until a host-side
+        // click). Reap now: `terminate` notifies the possibly-still-live
+        // controller tab (its UI unblocks and may auto-reconnect), frees
+        // the capacity slot, and re-sends Terminate over THIS fresh agent
+        // connection, clearing a leaked indicator/peer. Mid-setup phases
+        // (AwaitingConsent / Negotiating) are deliberately spared — they
+        // legitimately span a WS flap and the consent re-push below plus
+        // the negotiating reaper own their lifecycle.
+        let zombies: Vec<ObjectId> = self
+            .inner
+            .sessions
+            .iter()
+            .filter(|e| {
+                let s = e.value().lock();
+                s.agent_id == agent_id && s.phase == SessionPhase::Active
+            })
+            .map(|e| *e.key())
+            .collect();
+        for session_id in zombies {
+            warn!(
+                %agent_id, %session_id,
+                "agent re-registered with a stale ACTIVE session — reaping the zombie \
+                 (its Terminate died with the previous control WS)"
+            );
+            let _ = self.terminate(session_id, EndReason::AgentDisconnect);
+        }
         // Re-push any consent-pending Request to the fresh connection: an
         // agent whose control WS flapped between the Request and its
         // `rc:consent` reply lost the exchange (2026-08-05 pc50045 — three
@@ -1517,6 +1549,104 @@ mod tests {
         let db = client.database("rc_test");
         let (audit, _h) = AuditSink::spawn(db);
         Hub::new(audit, None)
+    }
+
+    /// Task #8 — agent-authoritative resync: an ACTIVE session still pinned
+    /// to a (re)registering agent is a zombie (its Terminate died with the
+    /// old control WS) and is reaped — the controller's live tab is
+    /// notified (UI unblocks), capacity frees, and the FRESH agent
+    /// connection gets the Terminate (clears a leaked indicator/peer).
+    /// Mid-setup sessions (consent pending) legitimately span a WS flap and
+    /// are spared for the consent re-push + negotiating reaper to own.
+    #[tokio::test]
+    async fn reregister_reaps_active_zombies_but_spares_midsetup() {
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let tenant = ObjectId::new();
+        let owner = ObjectId::new();
+        let (_atx, _cancel, _arx) =
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
+
+        // Session A → Active (the zombie-to-be).
+        let (ctl_a, mut ctl_a_rx) = mpsc::channel(8);
+        let sid_a = hub
+            .create_session(
+                agent_id,
+                owner,
+                "Goran".into(),
+                ctl_a,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        hub.deliver_consent(sid_a, true).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        hub.with_session(sid_a, |s| s.transition(SessionPhase::Active))
+            .unwrap();
+
+        // Session B → stays AwaitingConsent (mid-setup, must survive).
+        let (ctl_b, mut ctl_b_rx) = mpsc::channel(8);
+        let sid_b = hub
+            .create_session(
+                agent_id,
+                owner,
+                "Goran".into(),
+                ctl_b,
+                Permissions::default(),
+                Vec::new(),
+                None,
+                None,
+                false,
+                ConsentMode::Prompt,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // The agent's control WS died and reconnected: re-register.
+        let (_atx2, _cancel2, mut arx2) =
+            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
+
+        let mut a_ctl_terminated = false;
+        while let Ok(m) = ctl_a_rx.try_recv() {
+            if matches!(
+                m,
+                ServerMsg::Terminate { session_id, reason: EndReason::AgentDisconnect }
+                    if session_id == sid_a
+            ) {
+                a_ctl_terminated = true;
+            }
+        }
+        assert!(
+            a_ctl_terminated,
+            "active zombie's controller must be notified so its UI unblocks"
+        );
+        let mut a_agent_told = false;
+        while let Ok(m) = arx2.try_recv() {
+            if matches!(m, ServerMsg::Terminate { session_id, .. } if session_id == sid_a) {
+                a_agent_told = true;
+            }
+        }
+        assert!(
+            a_agent_told,
+            "the FRESH agent connection must get the Terminate (clears a leaked indicator)"
+        );
+        while let Ok(m) = ctl_b_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::Terminate { session_id, .. } if session_id == sid_b),
+                "mid-setup session must survive the flap"
+            );
+        }
     }
 
     #[tokio::test]
