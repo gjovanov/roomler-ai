@@ -55,9 +55,13 @@ mid-2026 — re-quote at signup.
 4. **Provision**: `bash /opt/relay-pop/provision.sh` (idempotent — installs
    docker, sysctls, the UDP/443 DNAT, issues the LE cert via acme.sh
    standalone :80, renders configs, starts the compose stack).
-5. **Verify from anywhere**:
+5. **Verify from anywhere** — one line per advertised transport variant
+   (STUN on udp/3478 + udp/443-DNAT + tcp/3478, STUN-over-TLS on 5349 and on
+   443 through the SNI split, derp healthz). With `TURN_SECRET_FILE` set it
+   also performs full TURN **Allocates** over udp/443 and TLS/443 — the only
+   check that catches static-auth-secret drift and relay-address misconfig:
    ```bash
-   python3 scripts/relay-pop/healthcheck.py \
+   TURN_SECRET_FILE=~/coturn.auth python3 scripts/relay-pop/healthcheck.py \
      us-east=coturn-us-east.roomler.ai:3478,derp-us-east.roomler.ai
    ```
 6. **Register the region** — append to `ROOMLER__RELAY__REGIONS` in the prod
@@ -66,11 +70,14 @@ mid-2026 — re-quote at signup.
    {"id":"us-east",
     "turn_url":"turn:coturn-us-east.roomler.ai:3478",
     "derp_url":"wss://derp-us-east.roomler.ai/derp",
-    "caps":{"tls_443_tcp":false}}
+    "caps":{"tls_443_udp":false}}
    ```
-   `tls_443_tcp: false` because TCP/443's TLS is SNI-routed: the coturn name
-   still serves `turns:` on 443 via passthrough — set it `true` only after
-   verifying `turns:coturn-{r}.roomler.ai:443?transport=tcp` end-to-end.
+   `tls_443_udp: false` because that variant is DTLS and structurally dead
+   here: the UDP/443 DNAT lands on coturn's **plain** 3478 listener (webrtc-rs
+   drops the URL anyway; browsers would burn an allocate timeout on it). The
+   other :443 caps stay on — `udp_443` rides the DNAT and `tls_443_tcp` rides
+   the nginx SNI passthrough to coturn's TLS listener; both field-verified
+   allocate-level on all four phase-1 PoPs (2026-08-17).
    Requires `ROOMLER__RELAY__REGIONS_ENABLED=true` and (for DERP)
    `ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY`
    (`openssl genpkey -algorithm ed25519 -outform DER | base64 -w0`).
@@ -80,10 +87,17 @@ mid-2026 — re-quote at signup.
 
 ## Health cron (mars)
 
+`TURN_SECRET_FILE` points at the fleet truth file so every run exercises real
+Allocates; the trailing-comma `eu-central` row (no PoP DERP) keeps the fleet
+coturn's own :443 DNAT under the same watch:
+
 ```cron
-*/15 * * * * python3 /opt/roomler/relay-pop/healthcheck.py \
+*/15 * * * * TURN_SECRET_FILE=/home/gjovanov/coturn.auth \
+  python3 /opt/roomler/relay-pop/healthcheck.py \
   us-east=coturn-us-east.roomler.ai:3478,derp-us-east.roomler.ai \
-  ... >> ~/relay-pop-health.log 2>&1 || <alert: gh issue / mail>
+  ... \
+  eu-central=coturn.roomler.ai:3478, \
+  >> ~/relay-pop-health.log 2>&1 || <alert: gh issue / mail>
 ```
 
 ## Rollback

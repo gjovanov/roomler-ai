@@ -1494,11 +1494,14 @@ mod turn_tests {
     }
 
     /// LIVE Tier-2: UDP relay against the production coturn cluster.
+    /// `ROOMLER_TEST_TURN_UDP_PORT=443` points it at the udp/443 DNAT
+    /// (the corp-escape tier the fleet + relay PoPs expose) instead of 3478.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST + ROOMLER_TEST_TURN_SECRET"]
     async fn relay_against_real_coturn_udp() {
+        let port = std::env::var("ROOMLER_TEST_TURN_UDP_PORT").unwrap_or_else(|_| "3478".into());
         let Some((urls, user, cred)) =
-            live_coturn_creds(|h| vec![format!("turn:{h}:3478?transport=udp")])
+            live_coturn_creds(|h| vec![format!("turn:{h}:{port}?transport=udp")])
         else {
             eprintln!("SKIP relay_against_real_coturn_udp: env unset");
             return;
