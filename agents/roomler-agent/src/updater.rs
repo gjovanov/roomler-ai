@@ -81,6 +81,20 @@ pub const TRANSFER_DEFER_RECHECK: Duration = Duration::from_secs(3600);
 /// 24h interval elapsed); 7 at 24h = ~7 days.
 pub const MAX_CONSECUTIVE_DEFERS: u32 = 7;
 
+/// R5b — the network moved within this window ⇒ defer the periodic
+/// update. An install restarts the daemon, which forfeits every
+/// ESTABLISHED (grandfathered) flow — and on a corp path that
+/// blackholes fresh TLS, a restart adjacent to a VPN transition locks
+/// the machine out until the next transition (field 2026-08-16: both
+/// control WSs RST at capture; only established flows rode through).
+pub const NET_TRANSITION_WINDOW: Duration = Duration::from_secs(600);
+
+/// R5b — short-cycle recheck while net-transition-deferred (the
+/// transition settles in minutes, unlike an operator's upload session).
+/// With the shared MAX_CONSECUTIVE_DEFERS cap the worst added delay is
+/// ~14 min before the update forces through.
+pub const NET_DEFER_RECHECK: Duration = Duration::from_secs(120);
+
 /// rc.19: gating decision for the periodic loop given the current
 /// active-transfer count and consecutive-defer counter. Pure helper
 /// so the gating logic is unit-testable without spinning the full
@@ -97,15 +111,30 @@ pub enum DeferDecision {
 }
 
 /// Decide whether to gate the update check this cycle. Returns
-/// `Proceed` when no transfers are active OR the consecutive-defer
-/// limit has been reached. Pure / no I/O — tested directly.
-pub fn decide_defer(active: usize, consecutive_defers: u32) -> DeferDecision {
-    if active == 0 {
+/// `Proceed` when nothing gates (no transfers active, no fresh network
+/// transition) OR the consecutive-defer limit has been reached. Pure /
+/// no I/O — tested directly.
+pub fn decide_defer(active: usize, net_transition: bool, consecutive_defers: u32) -> DeferDecision {
+    if active == 0 && !net_transition {
         DeferDecision::Proceed
     } else if consecutive_defers >= MAX_CONSECUTIVE_DEFERS {
         DeferDecision::ForceAfterDefers
     } else {
         DeferDecision::DeferOnce
+    }
+}
+
+/// R5b — did a material MAJOR network change land inside
+/// [`NET_TRANSITION_WINDOW`]? Feature-shaped: no-overlay builds have no
+/// netstate and never defer on this input.
+fn net_transition_recent() -> bool {
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    {
+        tunnel_core::overlay::netstate::last_major_within(NET_TRANSITION_WINDOW)
+    }
+    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+    {
+        false
     }
 }
 
@@ -1670,6 +1699,9 @@ pub async fn run_periodic(
 ) {
     let mut first = true;
     let mut consecutive_defers: u32 = 0;
+    // The recheck the LAST defer chose (fast for a net transition, the
+    // hour for transfers); `None` = full periodic interval.
+    let mut defer_recheck: Option<Duration> = None;
     loop {
         if *shutdown.borrow() {
             return;
@@ -1695,15 +1727,11 @@ pub async fn run_periodic(
                 "auto-updater: at-startup check suppressed by recent-install cooldown"
             );
         }
-        // Last-iteration's defer (if any) shortens the sleep to
-        // TRANSFER_DEFER_RECHECK so an install fires soon after the
-        // operator's upload completes, instead of waiting the full
-        // 24h again.
-        let next_interval = if consecutive_defers > 0 {
-            TRANSFER_DEFER_RECHECK
-        } else {
-            interval
-        };
+        // Last-iteration's defer (if any) shortens the sleep — the hour
+        // for transfers, [`NET_DEFER_RECHECK`] for a network transition —
+        // so the install fires soon after the gate clears instead of
+        // waiting the full periodic interval again.
+        let next_interval = defer_recheck.take().unwrap_or(interval);
         let mut forced: Option<Option<String>> = None;
         if !first || skip_first_check {
             tokio::select! {
@@ -1759,14 +1787,24 @@ pub async fn run_periodic(
         // times in a row (security-vs-uptime trade-off documented in
         // the rc.19 plan M3 fix).
         let active = crate::files::active_transfer_count();
-        match decide_defer(active, consecutive_defers) {
+        let net_transition = net_transition_recent();
+        match decide_defer(active, net_transition, consecutive_defers) {
             DeferDecision::DeferOnce => {
                 consecutive_defers = consecutive_defers.saturating_add(1);
+                // R5b — a transition defer rechecks fast (the network
+                // settles in minutes); a transfer defer keeps its hour.
+                let recheck = if net_transition && active == 0 {
+                    NET_DEFER_RECHECK
+                } else {
+                    TRANSFER_DEFER_RECHECK
+                };
+                defer_recheck = Some(recheck);
                 tracing::info!(
                     active,
+                    net_transition,
                     consecutive_defers,
-                    next_check_secs = TRANSFER_DEFER_RECHECK.as_secs(),
-                    "auto-updater: deferring — transfers in flight"
+                    next_check_secs = recheck.as_secs(),
+                    "auto-updater: deferring — transfers in flight or the network just moved"
                 );
                 continue;
             }
@@ -2751,28 +2789,44 @@ mod tests {
 
     #[test]
     fn decide_defer_proceeds_with_no_active_transfers() {
-        assert_eq!(decide_defer(0, 0), DeferDecision::Proceed);
+        assert_eq!(decide_defer(0, false, 0), DeferDecision::Proceed);
         // Defers counter is irrelevant when active=0 — the gate
         // resets at every Proceed.
-        assert_eq!(decide_defer(0, 5), DeferDecision::Proceed);
+        assert_eq!(decide_defer(0, false, 5), DeferDecision::Proceed);
     }
 
     #[test]
     fn decide_defer_defers_when_active_and_under_limit() {
-        assert_eq!(decide_defer(1, 0), DeferDecision::DeferOnce);
-        assert_eq!(decide_defer(3, 6), DeferDecision::DeferOnce);
+        assert_eq!(decide_defer(1, false, 0), DeferDecision::DeferOnce);
+        assert_eq!(decide_defer(3, false, 6), DeferDecision::DeferOnce);
+    }
+
+    /// R5b — a fresh network transition gates exactly like an active
+    /// transfer: an install restart adjacent to a VPN capture forfeits
+    /// every grandfathered flow (field 2026-08-16), so the cycle defers
+    /// (fast recheck) until the window passes or the defer cap forces it.
+    #[test]
+    fn decide_defer_defers_on_a_fresh_network_transition() {
+        assert_eq!(decide_defer(0, true, 0), DeferDecision::DeferOnce);
+        assert_eq!(decide_defer(0, true, 6), DeferDecision::DeferOnce);
+        assert_eq!(
+            decide_defer(0, true, MAX_CONSECUTIVE_DEFERS),
+            DeferDecision::ForceAfterDefers
+        );
+        // Both gates at once still just defers once per cycle.
+        assert_eq!(decide_defer(2, true, 0), DeferDecision::DeferOnce);
     }
 
     #[test]
     fn decide_defer_forces_at_max_defers() {
         // Exactly at MAX_CONSECUTIVE_DEFERS should force.
         assert_eq!(
-            decide_defer(1, MAX_CONSECUTIVE_DEFERS),
+            decide_defer(1, false, MAX_CONSECUTIVE_DEFERS),
             DeferDecision::ForceAfterDefers
         );
         // And anything above it.
         assert_eq!(
-            decide_defer(99, MAX_CONSECUTIVE_DEFERS + 50),
+            decide_defer(99, true, MAX_CONSECUTIVE_DEFERS + 50),
             DeferDecision::ForceAfterDefers
         );
     }
