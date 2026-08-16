@@ -92,6 +92,22 @@ const REGRADE_OVERRULE_WINDOW: Duration = Duration::from_secs(600);
 /// (the far side's firewall, a coturn fix) — one cheap probe a day.
 const REGRADE_EVIDENCE_CEILING: Duration = Duration::from_secs(86_400);
 
+/// Unresponsive-peer re-request ladder: consecutive relay deaths 1-2 keep
+/// today's immediate re-request (ordinary transients — coturn blip, worker
+/// roll — must stay snappy); from the 3rd the peer has been dark for ≥ two
+/// full relay-handshake deadlines and each further attempt is deferred,
+/// doubling from 60 s to the 5-min cap. Steady-state against a sleeping
+/// peer: ~12 allocations/h instead of ~60 — below the server's TURN-churn
+/// escalation, so no force-DERP pin forms to slow the peer's eventual wake.
+pub(crate) fn relay_death_backoff(streak: u32) -> Option<Duration> {
+    if streak < 3 {
+        return None;
+    }
+    let base = Duration::from_secs(60);
+    let cap = Duration::from_secs(300);
+    Some(cap.min(base * 2u32.saturating_pow(streak - 3)))
+}
+
 const REGRADE_BACKOFF: [Duration; 4] = [
     Duration::from_secs(2_400),  // 40 min — clears the 30-min pin with margin
     Duration::from_secs(7_200),  // 2 h
@@ -340,6 +356,20 @@ pub struct RelayCoordinator {
     /// the health sweep's teardown just before its re-request; consumed on
     /// send so a later fresh establishment doesn't replay stale evidence.
     refresh_ctx: HashMap<ObjectId, (Option<RelayKind>, &'static str)>,
+    /// Unresponsive-peer re-request backoff — consecutive relay-carrier
+    /// deaths for a peer with NO intervening completed handshake, plus the
+    /// instant our OWN next `request` for it is allowed. Field 2026-08-15:
+    /// mars ground a fresh allocation + 89 s QUIC rendezvous window against
+    /// SLEEPING pc50045 (zombie server registration) every ~45-90 s all
+    /// evening — the reap→re-request loop has no memory, and the resulting
+    /// TURN churn kept re-triggering the server's 30-min force-DERP pins,
+    /// which then delayed direct upgrades after the peer WOKE. Deferral is
+    /// safe for wake latency: relay pairing is server-coordinated two-sided,
+    /// so the waking peer's own request installs the pair regardless of our
+    /// hold (grants bypass `request`). Streak cleared by the sweep when a
+    /// relay carrier for the peer completes a handshake. Entries for peers
+    /// that never return leak ~32 bytes each — bounded by fleet size.
+    death_streaks: HashMap<ObjectId, (u32, Instant)>,
     /// U1 — STICKY: a `/derp` mux open was ATTEMPTED and failed (the
     /// [`force_derp`](Self::force_derp) veto fired with no mux to bind).
     /// Reported on every relay request so the server stops choosing/holding
@@ -436,6 +466,7 @@ impl RelayCoordinator {
             derp_regrade_inputs: HashMap::new(),
             derp_regrade_fired_at: HashMap::new(),
             refresh_ctx: HashMap::new(),
+            death_streaks: HashMap::new(),
             derp_mux_failed: false,
             server_strategy: super::direct::server_relay_strategy_enabled(),
             warm_leg: None,
@@ -492,6 +523,25 @@ impl RelayCoordinator {
         reason: &'static str,
     ) {
         self.refresh_ctx.insert(node_id, (kind, reason));
+        // Unresponsive-peer backoff — every relay death without an
+        // intervening completed handshake escalates the streak; from the
+        // 3rd, our OWN next `request` is deferred (see `death_streaks`).
+        let now = Instant::now();
+        let entry = self.death_streaks.entry(node_id).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        if let Some(hold) = relay_death_backoff(entry.0) {
+            entry.1 = now + hold;
+            info!(
+                peer = %node_id, streak = entry.0, hold_s = hold.as_secs(),
+                "overlay relay: peer unresponsive across consecutive relay deaths — deferring our re-request (their own request still pairs us instantly)"
+            );
+        }
+    }
+
+    /// Unresponsive-peer backoff — a relay carrier for `node_id` completed a
+    /// handshake: the peer is provably alive, forget the death streak.
+    pub fn clear_death_streak(&mut self, node_id: &ObjectId) {
+        self.death_streaks.remove(node_id);
     }
 
     /// P7 — does this coordinator hold a live `/derp` mux? The runtime checks
@@ -893,6 +943,20 @@ impl RelayCoordinator {
     ///   creds + the `pair_key`.
     pub async fn request(&mut self, node_id: ObjectId, peer: PeerConfig) {
         if self.is_tracking(&node_id) {
+            return;
+        }
+        // Unresponsive-peer backoff — held peers are skipped (the refresh
+        // evidence stays stashed for the eventual real request). Only OUR
+        // initiations defer; a server-pushed grant for a peer-initiated pair
+        // never passes through here, so a waking peer pairs immediately.
+        if let Some((streak, until)) = self.death_streaks.get(&node_id)
+            && relay_death_backoff(*streak).is_some()
+            && *until > Instant::now()
+        {
+            debug!(
+                peer = %node_id, streak,
+                "overlay relay: re-request held (unresponsive-peer backoff)"
+            );
             return;
         }
         // U1 — consume the one-shot refresh evidence UNCONDITIONALLY (the
@@ -1779,6 +1843,57 @@ mod tests {
             Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node
         ));
         assert!(rx.try_recv().is_err()); // only one request sent
+    }
+
+    /// Unresponsive-peer backoff ladder: deaths 1-2 re-request immediately
+    /// (transients stay snappy), the 3rd defers 60 s, doubling to the 5-min
+    /// cap — the mars-vs-sleeping-pc50045 grind (one allocation + QUIC
+    /// window every ~45-90 s for HOURS, feeding the server's force-DERP
+    /// pins) becomes ~12 attempts/h.
+    #[test]
+    fn relay_death_backoff_ladder() {
+        assert_eq!(relay_death_backoff(0), None);
+        assert_eq!(relay_death_backoff(1), None);
+        assert_eq!(relay_death_backoff(2), None);
+        assert_eq!(relay_death_backoff(3), Some(Duration::from_secs(60)));
+        assert_eq!(relay_death_backoff(4), Some(Duration::from_secs(120)));
+        assert_eq!(relay_death_backoff(5), Some(Duration::from_secs(240)));
+        assert_eq!(
+            relay_death_backoff(6),
+            Some(Duration::from_secs(300)),
+            "cap"
+        );
+        assert_eq!(
+            relay_death_backoff(60),
+            Some(Duration::from_secs(300)),
+            "cap holds"
+        );
+    }
+
+    /// Unresponsive-peer backoff behaviour: three consecutive death notes
+    /// hold our own `request` (peer stays untracked, nothing on the wire);
+    /// `clear_death_streak` (the sweep's completed-handshake signal) restores
+    /// immediate re-requests. Grants never pass through `request`, so the
+    /// held state cannot strand a peer-initiated pairing.
+    #[tokio::test]
+    async fn request_backs_off_after_consecutive_relay_deaths_and_clears() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
+        let node = ObjectId::new();
+        for _ in 0..3 {
+            coord.note_refresh_context(node, None, "handshake-deadline");
+        }
+        coord.request(node, base_peer()).await;
+        assert!(!coord.is_tracking(&node), "3rd-death re-request is held");
+        assert!(rx.try_recv().is_err(), "nothing sent while held");
+
+        coord.clear_death_streak(&node);
+        coord.request(node, base_peer()).await;
+        assert!(coord.is_tracking(&node), "cleared streak requests again");
+        assert!(matches!(
+            rx.recv().await,
+            Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node
+        ));
     }
 
     /// C4 stage 2 (PR-B) — a fixed-address stand-in for the warm leg's
