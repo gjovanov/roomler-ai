@@ -16,8 +16,17 @@ min-port=${TURN_MIN_PORT}
 max-port=${TURN_MAX_PORT}
 # NAT'd providers: external-ip maps the relayed addresses correctly.
 ${EXTERNAL_IP_LINE}
-# A PoP relays media only — no loopback/multicast peers, no cli.
-no-loopback-peers
+# Bind every allocation's relay socket to this address EXPLICITLY. Without it
+# coturn derives the relay bind from the listener the CLIENT arrived on — a
+# TLS/443 client proxied in by the SNI-split nginx arrives from 127.0.0.1, so
+# its relay socket silently binds loopback while the ADVERTISED relay address
+# stays public: the Allocate succeeds and every relayed byte then vanishes.
+# Field-diagnosed 2026-08-17 on eu-north (tcpdump: relayed frames leaving with
+# src=127.0.0.1). The relay-echo row in healthcheck.py guards this class.
+relay-ip=${RELAY_IP}
+# A PoP relays media only — no multicast peers, no cli. (Loopback peers are
+# deny-by-default in modern coturn; the old `no-loopback-peers` option is gone
+# and only triggers a "Bad configuration format" boot warning.)
 no-multicast-peers
 no-cli
 # Allocation/session gauges for the derp-relay /stats endpoint (the API's
