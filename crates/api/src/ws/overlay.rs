@@ -1612,6 +1612,8 @@ fn verdict_from_nodes(
             peer.udp_dialer_ok,
             recipient.udp_dialer_ok,
         ),
+        !recipient.srflx_endpoints.is_empty(),
+        !peer.srflx_endpoints.is_empty(),
         &my_pk,
         &peer_pk,
     ))
@@ -1641,6 +1643,8 @@ fn relay_verdict_core(
     both_single: bool,
     my_udp_ok: bool,
     peer_udp_ok: bool,
+    my_srflx_ok: bool,
+    peer_srflx_ok: bool,
     my_pk: &[u8],
     peer_pk: &[u8],
 ) -> RelayStrategyWire {
@@ -1661,7 +1665,11 @@ fn relay_verdict_core(
             (false, false) => {} // neither can raw-dial → DERP below
         }
     }
-    if both_derp && !my_udp_ok && !peer_udp_ok {
+    // DERP keyed on the RAW srflx signals (the client rule verbatim): the
+    // lazy `/derp` mux only exists on srflx-empty nodes, so an honesty-
+    // latched (srflx-present) host must land BothAllocate — its
+    // client→:3478 allocation socket is exactly what still works there.
+    if both_derp && !my_srflx_ok && !peer_srflx_ok {
         return RelayStrategyWire::Derp;
     }
     RelayStrategyWire::BothAllocate
@@ -2188,7 +2196,21 @@ mod tests {
         use RelayStrategyWire::*;
         let lo = [1u8; 32]; // smaller raw pubkey
         let hi = [9u8; 32];
-        let core = relay_verdict_core;
+        // Legacy rows (no honesty latch): effective == raw srflx.
+        let core =
+            |pinned, both_derp, both_single, my_udp, peer_udp, a: &[u8; 32], b: &[u8; 32]| {
+                relay_verdict_core(
+                    pinned,
+                    both_derp,
+                    both_single,
+                    my_udp,
+                    peer_udp,
+                    my_udp,
+                    peer_udp,
+                    a,
+                    b,
+                )
+            };
         // Pin wins over everything.
         assert_eq!(core(true, false, true, true, true, &lo, &hi), Derp);
         assert_eq!(core(true, false, false, false, false, &lo, &hi), Derp);
@@ -2223,6 +2245,27 @@ mod tests {
         assert_eq!(
             core(false, false, false, true, false, &lo, &hi),
             BothAllocate
+        );
+
+        // Honesty rows (rc.393 storm lock): a LATCHED host has effective
+        // udp=false but raw srflx=true — it must anchor in single-relay,
+        // and a both-latched pair must land BothAllocate, NEVER Derp (the
+        // lazy /derp mux only exists on srflx-EMPTY nodes; stamping Derp
+        // deadlocked exactly the pairs the storm blocked).
+        assert_eq!(
+            relay_verdict_core(false, true, true, false, true, true, true, &hi, &lo),
+            SingleRelayAnchor,
+            "latched (srflx-present) host anchors regardless of pubkey"
+        );
+        assert_eq!(
+            relay_verdict_core(false, true, true, false, false, true, true, &lo, &hi),
+            BothAllocate,
+            "both-latched srflx-present pair must NOT be stamped Derp"
+        );
+        assert_eq!(
+            relay_verdict_core(false, true, true, false, false, true, false, &lo, &hi),
+            BothAllocate,
+            "latched host vs genuinely udp-blocked peer: mixed srflx ⇒ both-allocate"
         );
     }
 
