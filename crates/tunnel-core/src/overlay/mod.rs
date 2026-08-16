@@ -28,6 +28,7 @@ pub mod bridge;
 /// socket set for EVERY org engine, inbound demultiplexed by WireGuard
 /// receiver index (initiations by per-engine static-key trial).
 pub mod carrier_plane;
+pub mod dialer;
 pub mod direct;
 pub mod disco;
 pub mod dns;
