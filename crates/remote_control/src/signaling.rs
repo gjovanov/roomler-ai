@@ -805,11 +805,20 @@ pub enum ClientMsg {
     /// ("unknown"). The server stores it alongside the srflx so peers can skip a
     /// futile punch when BOTH ends are symmetric. Optional + omitted-when-None ⇒
     /// a pre-Phase-C agent (rc.199, sends only `candidates`) still parses.
+    ///
+    /// `udp_dialer_ok` (dialer honesty, 2026-08-16) — whether this node can
+    /// raw-UDP-dial arbitrary high ports (relay band), as opposed to merely
+    /// having reached a well-known STUN port. New agents ALWAYS send
+    /// `Some(_)` — field presence is the capability signal (an old server
+    /// ignores it; an old agent omits it and every pair against it keeps
+    /// the legacy srflx-only role inputs).
     #[serde(rename = "rc:overlay.srflx")]
     OverlaySrflx {
         candidates: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nat: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp_dialer_ok: Option<bool>,
     },
 
     /// Node leaves the overlay (graceful). Server marks it offline and
@@ -1734,6 +1743,20 @@ pub struct NetmapPeer {
     /// pre-Phase-C server/peer stays "unknown" (attempted, never skipped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srflx_nat: Option<String>,
+    /// Dialer honesty (field 2026-08-16, CORPLAP-3) — can this peer
+    /// raw-UDP-dial ARBITRARY high ports (the single-relay DIALER's job:
+    /// its raw socket sends straight to a coturn relay-band port)? A srflx
+    /// candidate only proves UDP to WELL-KNOWN ports (a corp egress that
+    /// whitelists STUN:3478 still drops the ~10-13k relay band), so
+    /// srflx-presence alone mis-assigns such hosts the dialer role and the
+    /// pair dies undialed. `Some(false)` = the peer PROVED it can't (its
+    /// dialer-role relay carriers convicted against ≥2 distinct peers);
+    /// `Some(true)` = no such evidence; `None` = pre-honesty peer — both
+    /// ends then keep the legacy srflx-only inputs, so a mixed-version
+    /// pair can never split roles (presence of the field IS the
+    /// capability signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_dialer_ok: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
     /// C4 stage 2 — this peer's STANDING warm TURN allocation's relayed
@@ -3397,13 +3420,16 @@ mod tests {
         let e = ClientMsg::OverlaySrflx {
             candidates: vec!["198.51.100.7:41820".into()],
             nat: Some("cone".into()),
+            udp_dialer_ok: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""t":"rc:overlay.srflx""#));
         assert!(s.contains(r#""candidates":["198.51.100.7:41820"]"#));
         assert!(s.contains(r#""nat":"cone""#));
         match serde_json::from_str::<ClientMsg>(&s).unwrap() {
-            ClientMsg::OverlaySrflx { candidates, nat } => {
+            ClientMsg::OverlaySrflx {
+                candidates, nat, ..
+            } => {
                 assert_eq!(candidates, vec!["198.51.100.7:41820".to_string()]);
                 assert_eq!(nat.as_deref(), Some("cone"));
             }
@@ -3415,7 +3441,9 @@ mod tests {
         // OMITTED on the wire (skip_serializing_if).
         let legacy = r#"{"t":"rc:overlay.srflx","candidates":["1.2.3.4:5"]}"#;
         match serde_json::from_str::<ClientMsg>(legacy).unwrap() {
-            ClientMsg::OverlaySrflx { candidates, nat } => {
+            ClientMsg::OverlaySrflx {
+                candidates, nat, ..
+            } => {
                 assert_eq!(candidates, vec!["1.2.3.4:5".to_string()]);
                 assert_eq!(nat, None);
             }
@@ -3424,6 +3452,7 @@ mod tests {
         let none_nat = ClientMsg::OverlaySrflx {
             candidates: vec!["1.2.3.4:5".into()],
             nat: None,
+            udp_dialer_ok: None,
         };
         assert!(
             !serde_json::to_string(&none_nat).unwrap().contains("nat"),
@@ -3543,6 +3572,7 @@ mod tests {
                 lan_endpoints: vec!["203.0.113.9:51820".into()],
                 srflx_endpoints: vec!["198.51.100.7:41820".into()],
                 srflx_nat: Some("cone".into()),
+                udp_dialer_ok: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 reachable: true,
@@ -3730,6 +3760,53 @@ mod tests {
         let s2 = serde_json::to_string(&p2).unwrap();
         assert!(s2.contains(r#""srflx_endpoints":["198.51.100.7:41820"]"#));
         assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+    }
+
+    /// Dialer honesty — `udp_dialer_ok` back-compat, BOTH directions: a
+    /// pre-honesty server/peer omits it → `None` (legacy role inputs on both
+    /// ends); `None` is OMITTED on the wire (an old shape stays byte-stable);
+    /// `Some(_)` round-trips — its PRESENCE is the capability signal.
+    #[test]
+    fn netmap_peer_and_srflx_msg_udp_dialer_ok_default_skip_and_roundtrip() {
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert_eq!(p.udp_dialer_ok, None);
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(
+            !s.contains("udp_dialer_ok"),
+            "absent verdict must be omitted on the wire: {s}"
+        );
+        let mut p2 = p.clone();
+        p2.udp_dialer_ok = Some(false);
+        let s2 = serde_json::to_string(&p2).unwrap();
+        assert!(s2.contains(r#""udp_dialer_ok":false"#));
+        assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+
+        // The srflx trickle: an OLD agent's message (no field) parses to
+        // `None`; a NEW agent's `Some(_)` round-trips.
+        let old = r#"{"t":"rc:overlay.srflx","candidates":["1.2.3.4:5"],"nat":"cone"}"#;
+        match serde_json::from_str::<ClientMsg>(old).unwrap() {
+            ClientMsg::OverlaySrflx { udp_dialer_ok, .. } => assert_eq!(udp_dialer_ok, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let new = ClientMsg::OverlaySrflx {
+            candidates: vec!["1.2.3.4:5".into()],
+            nat: Some("symmetric".into()),
+            udp_dialer_ok: Some(false),
+        };
+        let wire = serde_json::to_string(&new).unwrap();
+        assert!(wire.contains(r#""udp_dialer_ok":false"#));
+        match serde_json::from_str::<ClientMsg>(&wire).unwrap() {
+            ClientMsg::OverlaySrflx { udp_dialer_ok, .. } => {
+                assert_eq!(udp_dialer_ok, Some(false));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     /// Phase C — `srflx_nat` back-compat: a pre-Phase-C server/peer omits it →

@@ -89,6 +89,7 @@ impl OverlayNodeDao {
             srflx_endpoints: Vec::new(),
             // Phase C — NAT type is unknown until the node probes + trickles it.
             srflx_nat: None,
+            udp_dialer_ok: None,
             relay_home: None,
             // C4 stage 2 (PR-B) — no warm leg until the node's runtime
             // establishes one and its heartbeats mirror it here.
@@ -169,6 +170,10 @@ impl OverlayNodeDao {
                         // $set (a prior session's NAT type is meaningless after
                         // a roam); the node re-probes + re-trickles it.
                         "srflx_nat": bson::Bson::Null,
+                        // Dialer honesty — clear with the srflx bucket: the
+                        // restarted runtime re-earns the verdict (and its
+                        // first srflx trickle re-declares it).
+                        "udp_dialer_ok": bson::Bson::Null,
                         // C4 stage 2 (PR-B) — clear the stale warm-leg address
                         // for the same reason: a restarted runtime holds no
                         // allocation; its heartbeats re-mirror a fresh one.
@@ -352,6 +357,7 @@ impl OverlayNodeDao {
         node_id: ObjectId,
         srflx_endpoints: &[String],
         nat: Option<&str>,
+        udp_dialer_ok: Option<bool>,
     ) -> DaoResult<bool> {
         self.base
             .update_by_id(
@@ -359,6 +365,10 @@ impl OverlayNodeDao {
                 doc! { "$set": {
                     "srflx_endpoints": srflx_endpoints,
                     "srflx_nat": nat.map(|s| s.to_string()),
+                    // Dialer honesty — set EXPLICITLY (None ⇒ Bson::Null ⇒
+                    // "pre-honesty agent"), never omitted: a hand-built doc
+                    // silently drops absent fields.
+                    "udp_dialer_ok": udp_dialer_ok,
                     "last_seen_at": DateTime::now(),
                     "updated_at": DateTime::now(),
                 } },
