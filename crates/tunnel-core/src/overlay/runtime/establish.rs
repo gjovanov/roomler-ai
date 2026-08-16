@@ -575,13 +575,20 @@ impl OverlayRuntime {
             if let (Some(coord), Some(np)) = (relay.as_mut(), current_peers.get(&nid))
                 && let Some(cfg) = peer_config_from_netmap(np)
             {
-                // Dialer honesty — a TURN conviction while WE were the raw-UDP
-                // DIALER is evidence about OUR egress (the dial toward the
-                // anchor's relay-band port never landed). Book it host-wide;
-                // two distinct peers latch not-dialer-capable, the mirror sync
-                // below flips this org's role inputs the same cycle, and the
-                // periodic srflx advert carries the verdict to peers + server.
-                if e.relay_kind == Some(crate::overlay::relay_link::RelayKind::Turn)
+                // Dialer honesty — a NEVER-HANDSHOOK death of a TURN carrier
+                // while WE were the raw-UDP DIALER is evidence about OUR
+                // egress (the dial toward the anchor's relay-band port never
+                // landed). ONLY that class books: a worked-then-died link
+                // (RxStale/OneWay/RekeyUnanswered/HardDead) is the peer's or
+                // the allocation's death — booking those latched half the
+                // fleet during the rc.393 rolling update, when every restart
+                // wave killed working links everywhere. Two distinct peers
+                // latch not-dialer-capable (dialer.rs adds start-grace and
+                // recency guards on top), the mirror sync below flips this
+                // org's role inputs the same cycle, and the periodic srflx
+                // advert carries the verdict to peers + server.
+                if reason == DeathReason::HandshakeDeadline
+                    && e.relay_kind == Some(crate::overlay::relay_link::RelayKind::Turn)
                     && coord.was_dialer_for(&nid)
                 {
                     crate::overlay::dialer::note_dialer_conviction(nid);
