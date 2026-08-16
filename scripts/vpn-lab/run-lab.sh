@@ -22,9 +22,11 @@ psexec() { # run an encoded PS command on pc50045, CLIXML noise stripped
 }
 
 echo "== deploy ($BRANCH) =="
+# Best-effort: an IN-VPN laptop reaches github via the corp egress (usually
+# blocked), and the on-box copy is normally already current — warn and continue.
 psexec "New-Item -ItemType Directory -Path 'C:\ProgramData\roomler\vpnlab' -Force | Out-Null;
-Invoke-WebRequest -UseBasicParsing -Uri '$RAW' -OutFile 'C:\ProgramData\roomler\vpnlab\vpn-lab.ps1';
-(Get-Item 'C:\ProgramData\roomler\vpnlab\vpn-lab.ps1').Length" 90000
+try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 -Uri '$RAW' -OutFile 'C:\ProgramData\roomler\vpnlab\vpn-lab.ps1' } catch { \"deploy fetch failed (\$(\$_.Exception.Message)) — using the existing copy\" };
+(Get-Item 'C:\ProgramData\roomler\vpnlab\vpn-lab.ps1' -ErrorAction SilentlyContinue).Length" 120000 || echo "deploy step unreachable — continuing with the existing on-box copy"
 
 echo "== launch detached run $RUNID =="
 psexec "\$a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\roomler\vpnlab\vpn-lab.ps1 -Cmd cycle -Count $COUNT -HoldSec $HOLD -RestSec $REST -RunId $RUNID';
