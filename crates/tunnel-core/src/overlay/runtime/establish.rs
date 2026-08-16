@@ -402,6 +402,15 @@ impl OverlayRuntime {
             );
             // rc.276 diagnostics — mirror the latch for the peers debug view.
             e.hs_done = handshake_done;
+            // Unresponsive-peer backoff — a relay carrier that completed its
+            // handshake proves the peer alive: forget its death streak so
+            // future re-requests are immediate again.
+            if !e.is_direct
+                && handshake_done
+                && let Some(c) = relay.as_mut()
+            {
+                c.clear_death_streak(nid);
+            }
             // PR-E — the strike-clear (CC1: the carrier's OWN tier only)
             // lives in the monitor now (`on_healthy_rx`, fed just above).
             if let Some(reason) = v.death {
