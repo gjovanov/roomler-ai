@@ -694,6 +694,16 @@ impl PathMonitor {
         }
     }
 
+    /// netstate PR-2 — a MAJOR network change (default route moved /
+    /// addresses vanished): every score, penalty, and sticky suppression was
+    /// earned on the OLD network and is stale evidence on the new one — the
+    /// same disposition as resume-from-suspend, because it is the same event
+    /// from the path's point of view (the world moved while we watched).
+    /// Probe bookkeeping KEPT (in-flight probes settle via their own sweep).
+    pub(crate) fn on_network_changed(&mut self) {
+        self.on_resume();
+    }
+
     /// The peer left the netmap.
     pub(crate) fn on_peer_removed(&mut self, peer: &ObjectId) {
         if let Some(p) = self.peers.remove(peer)

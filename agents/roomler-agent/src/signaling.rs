@@ -121,6 +121,48 @@ const WS_PONG_RTT_STRIKES: u32 = 2;
 /// answer before the second strike.
 const WS_PING_RETRY_ACCEL: Duration = Duration::from_secs(10);
 
+/// netstate PR-2 — a MAJOR network change (default route moved / addresses
+/// vanished) probes the control WS IMMEDIATELY: one ping, this deadline,
+/// single strike. The steady-state 2×20 s patience exists for jitter on a
+/// stable path; the network just moved under the socket, and a WS that
+/// died in the transition otherwise gets trusted for another 45-90 s
+/// (field 2026-08-16: the whole grants/netmap plane stalled behind it).
+/// A healthy WS answers in well under this and nothing else changes.
+const WS_NETCHANGE_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// netstate PR-2 — the delta receiver, feature-shaped: the overlay builds
+/// subscribe to the process-wide monitor; a no-overlay build has no
+/// subsystem and the arm pends forever.
+#[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+type NetDeltaRx = tokio::sync::broadcast::Receiver<tunnel_core::overlay::netstate::NetDelta>;
+#[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+type NetDeltaRx = std::convert::Infallible;
+
+/// Yield the summary of the next MATERIAL+MAJOR network delta; pend forever
+/// with no subscription (or after the monitor closes). Minor/immaterial
+/// deltas and `Lagged` are absorbed here — the probe is strictly for "the
+/// network moved" moments. Cancel-safe (broadcast `recv` is cancel-safe).
+async fn next_major_netchange(rx: &mut Option<NetDeltaRx>) -> String {
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    {
+        use tokio::sync::broadcast::error::RecvError;
+        use tunnel_core::overlay::netstate::Severity;
+        while let Some(r) = rx.as_mut() {
+            match r.recv().await {
+                Ok(d) if d.material && d.severity == Severity::Major => return d.summary,
+                Ok(_) | Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => {
+                    *rx = None;
+                    break;
+                }
+            }
+        }
+    }
+    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+    let _ = rx;
+    std::future::pending().await
+}
+
 /// A5 — minimum wall-vs-monotonic skew that reads as suspend/resume at a
 /// keepalive tick (mirrors the overlay runtime's `RESUME_SKEW_THRESHOLD`).
 /// Below this it's scheduler jitter; above it the host slept and the WS is
@@ -1004,6 +1046,16 @@ async fn connect_once(
     let mut skew_wall = std::time::SystemTime::now();
     let mut skew_mono = std::time::Instant::now();
 
+    // netstate PR-2 — probe-then-cycle on Major network changes. `Some` =
+    // a probe ping is out with its 5 s deadline; verdict at the next
+    // keepalive tick (pulled forward to the deadline).
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    let mut net_rx: Option<NetDeltaRx> =
+        tunnel_core::overlay::netstate::handle().map(|h| h.subscribe());
+    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+    let mut net_rx: Option<NetDeltaRx> = None;
+    let mut netchange_probe: Option<std::time::Instant> = None;
+
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -1072,6 +1124,30 @@ async fn connect_once(
                         last_rx.elapsed().as_secs()
                     )));
                 }
+                // netstate PR-2 — the net-change probe verdict. Answered =
+                // its pong cleared `outstanding_ping`, or ANY frame arrived
+                // after the probe went out (both prove the socket survived
+                // the transition). Unanswered past the tight deadline =
+                // cycle NOW, single strike — the network moved under the
+                // socket and every second of blind trust stalls the whole
+                // grants/netmap plane behind a dead WS.
+                if let Some(probed) = netchange_probe {
+                    if outstanding_ping.is_none() || last_rx.elapsed() < probed.elapsed() {
+                        netchange_probe = None;
+                    } else if probed.elapsed() >= WS_NETCHANGE_PROBE_DEADLINE {
+                        warn!(
+                            unanswered_s = probed.elapsed().as_secs(),
+                            "control WS unresponsive after a MAJOR network change — cycling now"
+                        );
+                        close_all_peers(&mut peers, &indicator).await;
+                        close_all_tunnel_peers(&mut tunnel_peers).await;
+                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                        return Err(ConnectError::Transient(anyhow::anyhow!(
+                            "net-change probe: no answer within {} s of a Major network change",
+                            WS_NETCHANGE_PROBE_DEADLINE.as_secs()
+                        )));
+                    }
+                }
                 // Missing-pong strike: a ping still unanswered past the
                 // degradation bound is the SAME verdict as a late pong,
                 // available one zombie round-trip sooner (field: 41 s RTT
@@ -1121,12 +1197,39 @@ async fn connect_once(
                     // out the full keepalive interval (only the CADENCE
                     // accelerates; each ping keeps its full window).
                     keepalive.reset_after(WS_PING_RETRY_ACCEL);
+                } else if netchange_probe.is_some() {
+                    // A probe is out: pull the next tick to its deadline.
+                    keepalive.reset_after(WS_NETCHANGE_PROBE_DEADLINE);
                 }
                 // Liveness: a successful keepalive proves the WS pump
                 // is healthy even during long quiet periods between
                 // sessions. Without this tick the watchdog would flag
                 // a stall after 90 s of no inbound traffic.
                 watchdog::tick(ctx.pump);
+            }
+            summary = next_major_netchange(&mut net_rx) => {
+                // netstate PR-2 — the network materially moved. Probe the
+                // WS immediately (one ping, 5 s verdict at the pulled-
+                // forward keepalive tick) instead of trusting a socket the
+                // transition may have killed for another 45-90 s. A probe
+                // already in flight rides — its verdict covers this change.
+                if netchange_probe.is_none() {
+                    info!(change = %summary, "MAJOR network change — probing the control WS now");
+                    if let Err(e) =
+                        send_frame(&mut ws, Message::Ping(ping_payload(ws_epoch).into())).await
+                    {
+                        warn!(%e, "net-change probe ping failed — reconnecting");
+                        close_all_peers(&mut peers, &indicator).await;
+                        close_all_tunnel_peers(&mut tunnel_peers).await;
+                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                        return Err(ConnectError::Transient(e.context("net-change probe ping")));
+                    }
+                    if outstanding_ping.is_none() {
+                        outstanding_ping = Some(std::time::Instant::now());
+                    }
+                    netchange_probe = Some(std::time::Instant::now());
+                    keepalive.reset_after(WS_NETCHANGE_PROBE_DEADLINE);
+                }
             }
             _ = heartbeat.tick() => {
                 // Wave 3 — tunnel volume the server cannot see for itself
