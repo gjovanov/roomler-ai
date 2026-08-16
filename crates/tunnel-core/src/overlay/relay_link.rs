@@ -1403,11 +1403,20 @@ impl RelayCoordinator {
     /// by pubkey). `None` until the anchor advertises `R` (retry next netmap).
     fn try_build_dialer(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let peer = self.dialing.get(node_id)?;
+        // Rotation index over an ambiguous multi-R advert = the #496 relay
+        // death streak: each failed cycle walks to the next candidate; a
+        // completed handshake clears the streak and pins the working R.
+        let rotate = self
+            .death_streaks
+            .get(node_id)
+            .map(|(s, _)| *s as usize)
+            .unwrap_or(0);
         let r: SocketAddr = pick_anchor_relay_endpoint(
             &peer.endpoints,
             peer.warm_relay_endpoint.as_deref(),
             &self.coturn_ips,
             node_id,
+            rotate,
         )?;
         // Fresh raw socket, NO TURN allocation. Bind via std (sync) then adopt
         // into the tokio reactor without awaiting, so this stays on the sync
@@ -1613,11 +1622,26 @@ async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
 /// host's own address must not pass as a "relay"), and only trusted when the
 /// worker set is actually known: with `coturn_ips` unresolved the warm claim
 /// is unverifiable, and the legacy first-public pick has already returned.
+/// `rotate` — the pick index over the coturn-matching entries, fed from the
+/// #496 per-peer relay-death streak. An anchor serving SEVERAL single-relay
+/// pairs advertises ALL its pair allocations in ONE flat `endpoints` list
+/// (nothing on the wire says which R belongs to which pair), so a fixed
+/// "first coturn match" sent EVERY dialer to the SAME R: the one pair owning
+/// it worked, every other dialer hit an allocation holding no permission for
+/// it — silently dropped by coturn, one-way, convicted, rebuilt to the same
+/// wrong R forever. Field 2026-08-17 ~00:45Z: CORPLAP-1 (anchor on VPN)
+/// advertised two pair-Rs; jupiter AND zeus both dialed the same one and
+/// both looped one-way at ~50 s/cycle — the persistent `blocked` set.
+/// Rotating by the death streak makes each failing dialer walk the
+/// candidates; the correct R completes a handshake, which CLEARS the streak
+/// (#496's contract), pinning the pick there. Streak 0 (healthy / first
+/// attempt) keeps today's first-match behaviour.
 fn pick_anchor_relay_endpoint(
     endpoints: &[String],
     warm: Option<&str>,
     coturn_ips: &[IpAddr],
     node_id: &ObjectId,
+    rotate: usize,
 ) -> Option<SocketAddr> {
     let parsed: Vec<SocketAddr> = endpoints
         .iter()
@@ -1627,12 +1651,21 @@ fn pick_anchor_relay_endpoint(
     if coturn_ips.is_empty() {
         return parsed.first().copied();
     }
-    let r = parsed
+    let matches: Vec<SocketAddr> = parsed
         .iter()
-        .find(|s| coturn_ips.contains(&s.ip()))
-        .copied();
-    if r.is_some() {
-        return r;
+        .filter(|s| coturn_ips.contains(&s.ip()))
+        .copied()
+        .collect();
+    if !matches.is_empty() {
+        let idx = rotate % matches.len();
+        if matches.len() > 1 {
+            info!(
+                peer = %node_id, r = %matches[idx], idx, of = matches.len(), rotate,
+                "overlay relay: dialer — anchor advertises MULTIPLE relay allocations \
+                 (flat list, pair-ownership unknown); picking by death-streak rotation"
+            );
+        }
+        return Some(matches[idx]);
     }
     if let Some(w) = warm
         .and_then(|w| w.parse::<SocketAddr>().ok())
@@ -1733,21 +1766,21 @@ mod tests {
             "5.9.157.221:11885".to_string(),   // the coturn allocation — R
         ];
         assert_eq!(
-            pick_anchor_relay_endpoint(&eps, None, &coturn, &nid),
+            pick_anchor_relay_endpoint(&eps, None, &coturn, &nid, 0),
             Some("5.9.157.221:11885".parse().unwrap())
         );
 
         // No entry on a worker ⇒ withhold (retry next netmap).
         let hostonly = vec!["94.130.141.98:43648".to_string()];
         assert_eq!(
-            pick_anchor_relay_endpoint(&hostonly, None, &coturn, &nid),
+            pick_anchor_relay_endpoint(&hostonly, None, &coturn, &nid, 0),
             None
         );
 
         // Worker set unresolved ⇒ legacy first-public pick (never brick the
         // relay tier on a DNS failure).
         assert_eq!(
-            pick_anchor_relay_endpoint(&hostonly, None, &[], &nid),
+            pick_anchor_relay_endpoint(&hostonly, None, &[], &nid, 0),
             Some("94.130.141.98:43648".parse().unwrap())
         );
     }
@@ -1769,17 +1802,17 @@ mod tests {
 
         // Advert absent + warm on a worker ⇒ dial the warm leg.
         assert_eq!(
-            pick_anchor_relay_endpoint(&hostonly, Some("5.9.157.221:11764"), &coturn, &nid),
+            pick_anchor_relay_endpoint(&hostonly, Some("5.9.157.221:11764"), &coturn, &nid, 0),
             Some("5.9.157.221:11764".parse().unwrap())
         );
         // Warm NOT on a worker (co-located host / spoof) ⇒ withhold.
         assert_eq!(
-            pick_anchor_relay_endpoint(&hostonly, Some("94.130.141.98:12000"), &coturn, &nid),
+            pick_anchor_relay_endpoint(&hostonly, Some("94.130.141.98:12000"), &coturn, &nid, 0),
             None
         );
         // Garbage warm ⇒ withhold.
         assert_eq!(
-            pick_anchor_relay_endpoint(&hostonly, Some("not-an-addr"), &coturn, &nid),
+            pick_anchor_relay_endpoint(&hostonly, Some("not-an-addr"), &coturn, &nid, 0),
             None
         );
         // Per-pair advert present ⇒ it wins over the warm claim.
@@ -1788,13 +1821,59 @@ mod tests {
             "94.130.141.74:11223".to_string(),
         ];
         assert_eq!(
-            pick_anchor_relay_endpoint(&with_advert, Some("5.9.157.221:11764"), &coturn, &nid),
+            pick_anchor_relay_endpoint(&with_advert, Some("5.9.157.221:11764"), &coturn, &nid, 0),
             Some("94.130.141.74:11223".parse().unwrap())
         );
         // Worker set unresolved ⇒ legacy pick, warm never consulted.
         assert_eq!(
-            pick_anchor_relay_endpoint(&hostonly, Some("5.9.157.221:11764"), &[], &nid),
+            pick_anchor_relay_endpoint(&hostonly, Some("5.9.157.221:11764"), &[], &nid, 0),
             Some("94.130.141.98:43648".parse().unwrap())
+        );
+    }
+
+    /// Multi-R ambiguity — an anchor serving several single-relay pairs
+    /// advertises ALL its pair allocations in one flat list, and nothing on
+    /// the wire says which R belongs to which pair. A fixed first-match sent
+    /// every dialer to the same R (field 2026-08-17: jupiter AND zeus both
+    /// one-way-looping on CORPLAP-1's first R at ~50 s/cycle — the persistent
+    /// `blocked` set). The death-streak rotation walks the candidates; the
+    /// working R clears the streak (#496) and the pick pins there.
+    #[test]
+    fn dialer_rotates_across_multiple_advertised_relays_by_death_streak() {
+        let nid = ObjectId::new();
+        let coturn: Vec<IpAddr> = vec![
+            "5.9.157.221".parse().unwrap(),
+            "94.130.141.74".parse().unwrap(),
+            "5.9.157.226".parse().unwrap(),
+        ];
+        // The live CORPLAP-1 shape: LAN + two pair-Rs on different workers.
+        let eps = vec![
+            "192.168.68.106:43650".to_string(), // LAN — skipped
+            "94.130.141.74:11259".to_string(),  // pair-R #1
+            "5.9.157.226:10821".to_string(),    // pair-R #2
+        ];
+        let r1: SocketAddr = "94.130.141.74:11259".parse().unwrap();
+        let r2: SocketAddr = "5.9.157.226:10821".parse().unwrap();
+        // Streak 0 (first attempt / healthy) = today's first-match.
+        assert_eq!(
+            pick_anchor_relay_endpoint(&eps, None, &coturn, &nid, 0),
+            Some(r1)
+        );
+        // Each relay death rotates to the next candidate…
+        assert_eq!(
+            pick_anchor_relay_endpoint(&eps, None, &coturn, &nid, 1),
+            Some(r2)
+        );
+        // …and wraps.
+        assert_eq!(
+            pick_anchor_relay_endpoint(&eps, None, &coturn, &nid, 2),
+            Some(r1)
+        );
+        // A single candidate is immune to rotation (any streak).
+        let one = vec!["5.9.157.221:11885".to_string()];
+        assert_eq!(
+            pick_anchor_relay_endpoint(&one, None, &coturn, &nid, 7),
+            Some("5.9.157.221:11885".parse().unwrap())
         );
     }
 
