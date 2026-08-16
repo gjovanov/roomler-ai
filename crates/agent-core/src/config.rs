@@ -190,6 +190,16 @@ pub struct AgentConfig {
     /// is always 2 s regardless of this key.
     #[serde(default)]
     pub overlay_route_tick_secs: Option<u32>,
+    /// netstate — the process-wide network monitor (ONE OS change
+    /// subscription, typed snapshots/deltas, non-blocking fan-out)
+    /// (`ROOMLER_NODE_OVERLAY_NETMON`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_netmon: Option<bool>,
+    /// netstate — debounce window in ms for coalescing OS signal bursts
+    /// into one delta (`ROOMLER_NODE_OVERLAY_NETMON_DEBOUNCE_MS`, 100–5000).
+    /// Built-in default: 750.
+    #[serde(default)]
+    pub overlay_netmon_debounce_ms: Option<u32>,
     /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
     /// the corp-VPN field probe (`ROOMLER_NODE_OVERLAY_RELAY_TLS`).
     /// Built-in default: off.
@@ -1181,6 +1191,8 @@ pub fn test_fixture() -> AgentConfig {
         overlay_pathmon: None,
         overlay_route_events: None,
         overlay_route_tick_secs: None,
+        overlay_netmon: None,
+        overlay_netmon_debounce_ms: None,
         overlay_relay_tls: None,
         overlay_mux_nat: None,
         overlay_shared_carrier: None,
@@ -1315,7 +1327,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 37] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 38] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1335,6 +1347,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 37]
         ("OVERLAY_QUIC_ASYNC", cfg.overlay_quic_async),
         ("OVERLAY_VPN_VANTAGE", cfg.overlay_vpn_vantage),
         ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
+        ("OVERLAY_NETMON", cfg.overlay_netmon),
         ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
         ("OVERLAY_MUX_NAT", cfg.overlay_mux_nat),
         ("OVERLAY_SHARED_CARRIER", cfg.overlay_shared_carrier),
