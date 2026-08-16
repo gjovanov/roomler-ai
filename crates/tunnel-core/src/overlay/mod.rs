@@ -46,10 +46,12 @@ pub mod netstack;
 /// OS-free path. Feature `overlay-netstack`.
 #[cfg(feature = "overlay-netstack")]
 pub mod netstack_socks;
-pub(crate) mod netstate;
+/// netstate — the process-wide network-state monitor (ONE OS change
+/// subscription, typed snapshots/deltas, non-blocking fan-out). Public: the
+/// agent's signaling loop subscribes for its probe-then-cycle arm.
+pub mod netstate;
 pub(crate) mod path;
 pub mod relay_link;
-pub(crate) mod route_events;
 pub mod router;
 pub mod runtime;
 pub mod tun;
