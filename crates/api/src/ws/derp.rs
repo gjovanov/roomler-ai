@@ -53,9 +53,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::derp_acl::DerpAclCache;
 use super::handler::WsParams;
@@ -91,6 +93,82 @@ const DERP_SEND_QUEUE: usize = 256;
 /// carrier's `MAX_DATAGRAM` with headroom for the 32-byte pubkey prefix and is
 /// comfortably ≥ `mtu + WG_OVERHEAD + 32`.
 const DERP_MAX_FRAME: usize = 2048;
+
+/// Lifetime counters for the two forward-path drop classes. A missing dst is
+/// byte-identical to peer-offline from the sender's side, so the count is the
+/// ONLY server-side evidence of a one-way DERP pair (the split-brain class).
+static DERP_MISS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DERP_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Per-(network, dst) pacing for the drop evidence lines — WG retries at
+/// handshake rate (~every 5 s per pair), so an unpaced log would emit
+/// hundreds of identical lines per dead pair per minute.
+static MISS_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
+static FULL_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// First 8 hex chars of a pubkey — enough to correlate registration,
+/// forward-drop, and client-side lines without dumping whole keys.
+pub fn pk8(pk: &DerpPubKey) -> String {
+    pk.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// `true` once per [`DROP_LOG_INTERVAL`] per key — books the emission slot.
+fn drop_log_due(map: &DashMap<DerpKey, Instant>, key: DerpKey) -> bool {
+    // Opportunistic sweep so dead pairs don't accrete on a long-lived pod.
+    if map.len() > 4096 {
+        map.retain(|_, at| at.elapsed() < DROP_LOG_INTERVAL);
+    }
+    let due = map
+        .get(&key)
+        .map(|at| at.elapsed() >= DROP_LOG_INTERVAL)
+        .unwrap_or(true);
+    if due {
+        map.insert(key, Instant::now());
+    }
+    due
+}
+
+/// Minute-cadence census of this pod's DERP registry: per-network entry
+/// counts, plus the two lifetime drop counters. One greppable line per pod
+/// per minute while anything is registered (and one final line on the
+/// transition to empty) — the ground truth the split-brain diagnosis
+/// compares against clients' "connected + registered" claims.
+pub fn spawn_registry_census(state: &crate::state::AppState) {
+    let reg = state.derp_registry.clone();
+    let pod = state.pod.pod_id.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_summary = String::new();
+        loop {
+            tick.tick().await;
+            let mut per_net: std::collections::BTreeMap<String, usize> = Default::default();
+            for e in reg.iter() {
+                *per_net.entry(e.key().0.to_hex()).or_default() += 1;
+            }
+            let summary = per_net
+                .iter()
+                .map(|(n, c)| format!("{n}={c}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // Quiet only while empty AND already reported empty.
+            if summary.is_empty() && last_summary.is_empty() {
+                continue;
+            }
+            info!(
+                %pod,
+                entries = reg.len(),
+                networks = per_net.len(),
+                %summary,
+                derp_miss_total = DERP_MISS_TOTAL.load(Ordering::Relaxed),
+                derp_full_total = DERP_FULL_TOTAL.load(Ordering::Relaxed),
+                "derp registry census"
+            );
+            last_summary = summary;
+        }
+    });
+}
 
 /// `GET /derp?token=<agent-jwt>` — upgrade to the DERP relay WS. Agent-only,
 /// same audience as `/ws?role=agent`.
@@ -137,14 +215,21 @@ pub async fn derp_upgrade(
 /// socket closes.
 async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: ObjectId) {
     // Resolve this agent's overlay node → its network + its stored pubkey.
+    // Refusals log at INFO: the client marks its mux "up" after merely
+    // SENDING the registration frame, so a silent server-side refusal is a
+    // both-ends-look-healthy dark window (the split-brain class).
     let node = match current_node(&state, NodeIdentity::Agent(agent_id)).await {
         Some(n) => n,
         None => {
-            debug!(%agent_id, "derp: no overlay node for agent; closing");
+            info!(%agent_id, "derp: registration REFUSED — no overlay node for agent; closing");
             return;
         }
     };
     let network_id = node.network_id;
+    let node_hex = node
+        .id
+        .map(|i| i.to_hex())
+        .unwrap_or_else(|| "-".to_string());
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -158,12 +243,17 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
             k
         }
         _ => {
-            debug!(%agent_id, "derp: bad or absent registration frame; closing");
+            info!(%agent_id, node = %node_hex, "derp: registration REFUSED — bad or absent registration frame; closing");
             return;
         }
     };
     if BASE64.encode(self_pubkey) != node.wg_public_key {
-        warn!(%agent_id, "derp: registration pubkey != node's wg_public_key; refusing");
+        warn!(
+            %agent_id, %network_id, node = %node_hex,
+            got = %pk8(&self_pubkey),
+            stored = %node.wg_public_key.chars().take(8).collect::<String>(),
+            "derp: registration REFUSED — pubkey != node's wg_public_key (stale node row or key rotation race)"
+        );
         return;
     }
 
@@ -174,13 +264,18 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
     // old entry would otherwise black-hole inbound frames). The old socket's
     // read loop keeps working as a SENDER until it notices its own close; only
     // inbound routing moves to the new connection.
-    state.derp_registry.insert(key, out_tx.clone());
+    if state.derp_registry.insert(key, out_tx.clone()).is_some() {
+        info!(
+            %agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey),
+            "derp: re-registration displaced a live socket (reconnect churn — old flow was still parked)"
+        );
+    }
     // C-5 — cancel handle (rehome close) + directory record + one
     // convergence sweep over this network's registrations.
     let cancel = Arc::new(tokio::sync::Notify::new());
     state.derp_cancels.insert(key, cancel.clone());
     super::derp_cluster::on_derp_register(&state, network_id, &self_pubkey, agent_id).await;
-    info!(%agent_id, %network_id, "derp: node registered");
+    info!(%agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey), "derp: node registered");
 
     // Write task: drain outbound frames → WS binary.
     let mut write = tokio::spawn(async move {
@@ -234,7 +329,7 @@ async fn handle_derp_socket(state: AppState, socket: WebSocket, agent_id: Object
         super::derp_cluster::on_derp_teardown(&state, network_id, &self_pubkey).await;
     }
     write.abort();
-    info!(%agent_id, %network_id, "derp: node disconnected");
+    info!(%agent_id, %network_id, node = %node_hex, pk = %pk8(&self_pubkey), "derp: node disconnected");
 }
 
 /// Parse `[dst_pubkey(32) || payload]` sent by `src_pubkey`, and forward
@@ -271,10 +366,10 @@ fn forward_frame(
     {
         // Rate-limited by the tenant's own churn, not per frame: a denied
         // pair retries on the WG handshake timer (~5 s), not per packet.
-        debug!(
+        info!(
             %network_id,
-            src = %BASE64.encode(src_pubkey),
-            dst = %BASE64.encode(dst),
+            src = %pk8(src_pubkey),
+            dst = %pk8(&dst),
             "derp: dropped a frame the overlay ACL denies"
         );
         return;
@@ -284,14 +379,40 @@ fn forward_frame(
     // across the (non-blocking) try_send.
     let sender = match registry.get(&(network_id, dst)) {
         Some(r) => r.clone(),
-        None => return, // dst offline or not in this network
+        None => {
+            // dst offline or not registered on THIS pod. Indistinguishable
+            // from peer-offline at the sender, so this paced line + counter
+            // is the only server-side evidence of a one-way DERP pair.
+            let total = DERP_MISS_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+            if drop_log_due(&MISS_LOG_AT, (network_id, dst)) {
+                info!(
+                    %network_id,
+                    src = %pk8(src_pubkey),
+                    dst = %pk8(&dst),
+                    derp_miss_total = total,
+                    "derp: dropped a frame for an unregistered dst (peer offline, or registered on another pod/relay)"
+                );
+            }
+            return;
+        }
     };
 
     let mut out = Vec::with_capacity(32 + payload.len());
     out.extend_from_slice(src_pubkey);
     out.extend_from_slice(payload);
     // Bounded, non-blocking: drop on overflow (loss-tolerant carrier).
-    let _ = sender.try_send(out);
+    if sender.try_send(out).is_err() {
+        let total = DERP_FULL_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if drop_log_due(&FULL_LOG_AT, (network_id, dst)) {
+            warn!(
+                %network_id,
+                src = %pk8(src_pubkey),
+                dst = %pk8(&dst),
+                derp_full_total = total,
+                "derp: dropped a frame on a full destination queue (slow or half-open consumer)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

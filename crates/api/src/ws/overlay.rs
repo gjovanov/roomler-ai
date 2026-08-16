@@ -663,27 +663,6 @@ async fn handle_overlay_relay_request(
         && peer.supports_forced_derp
         && peer.supports_derp;
     if pair_supports_forced_derp && note_relay_request(state, &pair_key) {
-        tracing::info!(
-            %pair_key, requester = %self_id, peer = %peer_node_id,
-            replacing = evidence.current_kind.as_deref().unwrap_or("-"),
-            reason = evidence.reason.as_deref().unwrap_or("-"),
-            "overlay relay: TURN churn threshold — escalating pair to forced DERP"
-        );
-        // U1 — a mid-pin re-push must carry the REMAINING TTL, not restart
-        // the clock: the escalation path re-pushed the full window on every
-        // mid-pin re-request while the server's own `forced_until` stood
-        // still, so the two ends' pins ratcheted apart (the join re-push
-        // already used remaining; now both do). A FRESH escalation just set
-        // `forced_until = now + FORCED_DERP_TTL`, so the same read yields
-        // the full window there.
-        let ttl_ms = state
-            .relay_pair_churn
-            .get(&pair_key)
-            .and_then(|pc| pc.forced_until)
-            .map(|until| until.saturating_duration_since(Instant::now()))
-            .filter(|d| !d.is_zero())
-            .unwrap_or(FORCED_DERP_TTL)
-            .as_millis() as u64;
         // Multi-region DERP: pick the pair's regional relay from the same
         // sticky region the TURN grants use (symmetric — the server computes
         // once and pushes the SAME url to both ends); store it on the churn
@@ -703,6 +682,28 @@ async fn handle_overlay_relay_request(
                 .find(|s| s.id == region)
                 .and_then(|s| s.derp_url.clone())
         });
+        tracing::info!(
+            %pair_key, requester = %self_id, peer = %peer_node_id,
+            replacing = evidence.current_kind.as_deref().unwrap_or("-"),
+            reason = evidence.reason.as_deref().unwrap_or("-"),
+            relay = derp_url.as_deref().unwrap_or("central"),
+            "overlay relay: TURN churn threshold — escalating pair to forced DERP"
+        );
+        // U1 — a mid-pin re-push must carry the REMAINING TTL, not restart
+        // the clock: the escalation path re-pushed the full window on every
+        // mid-pin re-request while the server's own `forced_until` stood
+        // still, so the two ends' pins ratcheted apart (the join re-push
+        // already used remaining; now both do). A FRESH escalation just set
+        // `forced_until = now + FORCED_DERP_TTL`, so the same read yields
+        // the full window there.
+        let ttl_ms = state
+            .relay_pair_churn
+            .get(&pair_key)
+            .and_then(|pc| pc.forced_until)
+            .map(|until| until.saturating_duration_since(Instant::now()))
+            .filter(|d| !d.is_zero())
+            .unwrap_or(FORCED_DERP_TTL)
+            .as_millis() as u64;
         if let Some(mut pc) = state.relay_pair_churn.get_mut(&pair_key) {
             pc.forced_derp_url = derp_url.clone();
         }
@@ -743,9 +744,10 @@ async fn handle_overlay_relay_request(
 
     // U1 — the evidence line for grants (the escalation path logs its own):
     // a died-carrier refresh names what died and why; a fresh establishment
-    // carries neither.
+    // carries neither. INFO because a died-DERP re-grant is exactly the
+    // one-way-loop evidence the split-brain diagnosis greps for.
     if evidence.current_kind.is_some() || evidence.reason.is_some() {
-        debug!(
+        tracing::info!(
             %pair_key, requester = %self_id,
             replacing = evidence.current_kind.as_deref().unwrap_or("-"),
             reason = evidence.reason.as_deref().unwrap_or("-"),
@@ -952,6 +954,7 @@ async fn repush_forced_pairs_on_join(state: &AppState, node: &OverlayNode) {
         .collect();
     for (peer_id, ttl_ms, derp_url) in peers {
         tracing::info!(node = %self_id, peer = %peer_id, ttl_ms,
+            relay = derp_url.as_deref().unwrap_or("central"),
             "overlay relay: re-pushing forced-DERP pin on rejoin");
         send_to_node(
             state,
