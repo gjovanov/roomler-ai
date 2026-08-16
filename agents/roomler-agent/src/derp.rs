@@ -29,8 +29,15 @@ use tunnel_core::transport::derp::DerpMux;
 /// Hard upper bound on a single `/derp` connect attempt (mirrors the control
 /// WS's `WS_CONNECT_TIMEOUT`): a hung TLS handshake must not stall the backoff.
 const DERP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Reconnect backoff ceiling.
-const DERP_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Reconnect backoff ceiling. Deliberately LOW: the `/derp` WS is the relay
+/// FLOOR — with a force-DERP pin active the pinned pair has no other tier, and
+/// (post-#497) its build is withheld for exactly as long as this mux is down.
+/// At the old 60 s ceiling a VPN capture pushed attempts to ~90 s spacing
+/// (30 s connect timeout + 60 s backoff), so the floor could lag the network's
+/// recovery by minutes (field 2026-08-16: multi-minute dark windows on pinned
+/// pairs through a Check Point cycle). One TLS dial per 10 s while the path is
+/// actually broken is noise; a fast floor restoration is the whole point.
+const DERP_BACKOFF_MAX: Duration = Duration::from_secs(10);
 /// Keepalive Ping cadence on the established `/derp` WS. An idle DERP socket
 /// is legitimately silent (frames only flow while a both-UDP-blocked pair is
 /// relaying), so WITHOUT our own pings the RX deadline below would false-fire
