@@ -67,16 +67,29 @@ fi
 # ── render configs ───────────────────────────────────────────────────────────
 if [ -n "${PRIVATE_IP:-}" ]; then
   export EXTERNAL_IP_LINE="external-ip=${PUBLIC_IP}/${PRIVATE_IP}"
+  export RELAY_IP="${PRIVATE_IP}"
 else
   export EXTERNAL_IP_LINE="# external-ip not needed (public IP bound directly)"
+  export RELAY_IP="${PUBLIC_IP}"
 fi
-envsubst < "$POP/turnserver.conf.tpl" > "$POP/turnserver.conf"
+envsubst < "$POP/turnserver.conf.tpl" > "$POP/turnserver.conf.new"
+if cmp -s "$POP/turnserver.conf.new" "$POP/turnserver.conf" 2>/dev/null; then
+  rm -f "$POP/turnserver.conf.new"
+else
+  mv "$POP/turnserver.conf.new" "$POP/turnserver.conf"
+  COTURN_CONF_CHANGED=1
+fi
 envsubst '${REGION} ${COTURN_HOST} ${DERP_HOST}' \
   < "$POP/nginx-pop.conf.tpl" > "$POP/nginx-pop.conf"
 
 # ── start / refresh the stack ────────────────────────────────────────────────
 cd "$POP"
 docker compose -f docker-compose.pop.yml up -d
+# `up -d` won't bounce coturn for a changed bind-mounted config — do it
+# explicitly, but only when the rendered config actually changed.
+if [ -n "${COTURN_CONF_CHANGED:-}" ]; then
+  docker compose -f docker-compose.pop.yml restart coturn
+fi
 docker compose -f docker-compose.pop.yml ps
 
 echo "== done. Verify from anywhere:"
