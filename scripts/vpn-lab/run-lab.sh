@@ -44,13 +44,17 @@ sleep "$TOTAL"
 wait "$LOCAL_PID" || true
 
 echo "== collect from CORPLAP-1 =="
+# Each pull is best-effort: the laptop's control WS is often still recovering
+# right after a run (that recovery IS part of what the run measures) — a
+# failed pull must not abort the local analysis. Re-collect later via the
+# same Get-Content calls; the run dir persists on the box.
 RD="C:\\ProgramData\\roomler\\vpnlab\\run-$RUNID"
-psexec "Get-Content '$RD\\events.csv' -ErrorAction SilentlyContinue" 60000 > "$OUT/pc-events.csv"
+psexec "Get-Content '$RD\\events.csv' -ErrorAction SilentlyContinue" 60000 > "$OUT/pc-events.csv" || true
 for t in 100_65_4_2 100_65_0_6; do
-  psexec "Get-Content '$RD\\ping-$t.csv' -ErrorAction SilentlyContinue" 90000 > "$OUT/pc-ping-$t.csv"
+  psexec "Get-Content '$RD\\ping-$t.csv' -ErrorAction SilentlyContinue" 90000 > "$OUT/pc-ping-$t.csv" || true
 done
-psexec "Get-Content '$RD\\roomler-samples.txt' -ErrorAction SilentlyContinue | Select-String -Pattern '=== |version|srflx|warm|neo16|org:' | ForEach-Object { \$_.Line }" 90000 > "$OUT/pc-roomler-samples.txt"
-psexec "Get-Content '$RD\\trac-connect.log' -ErrorAction SilentlyContinue" 60000 > "$OUT/pc-trac.log"
+psexec "Get-Content '$RD\\roomler-samples.txt' -ErrorAction SilentlyContinue | Select-String -Pattern '=== |version|srflx|warm|neo16|org:' | ForEach-Object { \$_.Line }" 90000 > "$OUT/pc-roomler-samples.txt" || true
+psexec "Get-Content '$RD\\trac-connect.log' -ErrorAction SilentlyContinue" 60000 > "$OUT/pc-trac.log" || true
 
 echo "== outage windows (>=3 s consecutive loss) =="
 for f in "$OUT"/pc-ping-*.csv "$OUT"/ping-*.csv; do
