@@ -1606,6 +1606,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         if let Some(secs) = cfg.overlay_route_tick_secs {
             fallbacks.insert("OVERLAY_ROUTE_TICK_SECS".to_string(), secs.to_string());
         }
+        // netstate — numeric debounce override, same string ride.
+        if let Some(ms) = cfg.overlay_netmon_debounce_ms {
+            fallbacks.insert("OVERLAY_NETMON_DEBOUNCE_MS".to_string(), ms.to_string());
+        }
         if !fallbacks.is_empty() {
             tracing::info!(keys = ?fallbacks.keys().collect::<Vec<_>>(),
                 "config-backed env fallbacks registered");
