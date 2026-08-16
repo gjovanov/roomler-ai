@@ -883,12 +883,25 @@ impl AgentPeer {
                                 elapsed_s = started.elapsed().as_secs(),
                                 "session watchdog: peer never became (or stopped being) usable — terminating stuck session"
                             );
-                            let _ = tx_watch
+                            // Task #8 — the send fails when the control WS
+                            // this channel belonged to already died (per-
+                            // connection channel). NEVER silent: the hub
+                            // misses this Terminate and the session row
+                            // zombifies until the register_agent resync
+                            // reaps it on the next reconnect.
+                            if let Err(e) = tx_watch
                                 .send(ClientMsg::Terminate {
                                     session_id,
                                     reason: roomler_ai_remote_control::models::EndReason::Error,
                                 })
-                                .await;
+                                .await
+                            {
+                                warn!(
+                                    session = %session_id, %e,
+                                    "session watchdog: Terminate undeliverable (control WS gone) — \
+                                     the hub reaps this session at the next agent register"
+                                );
+                            }
                             let _ = pc.close().await;
                             return;
                         }
