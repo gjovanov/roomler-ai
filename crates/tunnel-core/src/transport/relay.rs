@@ -1494,11 +1494,14 @@ mod turn_tests {
     }
 
     /// LIVE Tier-2: UDP relay against the production coturn cluster.
+    /// `ROOMLER_TEST_TURN_UDP_PORT=443` points it at the udp/443 DNAT
+    /// (the corp-escape tier the fleet + relay PoPs expose) instead of 3478.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "hits live coturn; set ROOMLER_TEST_TURN_HOST + ROOMLER_TEST_TURN_SECRET"]
     async fn relay_against_real_coturn_udp() {
+        let port = std::env::var("ROOMLER_TEST_TURN_UDP_PORT").unwrap_or_else(|_| "3478".into());
         let Some((urls, user, cred)) =
-            live_coturn_creds(|h| vec![format!("turn:{h}:3478?transport=udp")])
+            live_coturn_creds(|h| vec![format!("turn:{h}:{port}?transport=udp")])
         else {
             eprintln!("SKIP relay_against_real_coturn_udp: env unset");
             return;
@@ -1509,11 +1512,14 @@ mod turn_tests {
     /// LIVE Tier-3: TURNS/TCP relay (TLS over TCP/443 — the UDP-blocked-net
     /// path). The url list has no `turn:…udp` entry, so
     /// `allocate_relay_from_ice` falls through to the TURNS/TCP tier.
+    /// `ROOMLER_TEST_TURN_TLS_PORT=5349` targets coturn's own TLS listener
+    /// directly — isolates a PoP's nginx SNI hop from coturn itself.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "hits live coturn over TLS/TCP; set ROOMLER_TEST_TURN_HOST + ROOMLER_TEST_TURN_SECRET"]
     async fn relay_against_real_coturn_turns_tcp() {
+        let port = std::env::var("ROOMLER_TEST_TURN_TLS_PORT").unwrap_or_else(|_| "443".into());
         let Some((urls, user, cred)) =
-            live_coturn_creds(|h| vec![format!("turns:{h}:443?transport=tcp")])
+            live_coturn_creds(|h| vec![format!("turns:{h}:{port}?transport=tcp")])
         else {
             eprintln!("SKIP relay_against_real_coturn_turns_tcp: env unset");
             return;
