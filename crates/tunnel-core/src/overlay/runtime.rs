@@ -834,6 +834,7 @@ async fn run_srflx_keepalive(
                     // Re-send our NAT type with every advert so the server
                     // never clears it.
                     nat: nat.clone(),
+                    udp_dialer_ok: Some(crate::overlay::dialer::udp_dialer_ok()),
                 })
                 .await
                 .is_err();
@@ -968,6 +969,9 @@ fn spawn_plane_srflx_forwarder(
                 .send(ClientMsg::OverlaySrflx {
                     candidates: s.candidates,
                     nat: s.my_nat,
+                    // Read at SEND time so a mid-life latch flip rides the
+                    // next periodic re-advert without any extra plumbing.
+                    udp_dialer_ok: Some(crate::overlay::dialer::udp_dialer_ok()),
                 })
                 .await;
             debug!(self_v4 = %label, trigger, candidates = n, ok = sent.is_ok(),
@@ -2612,6 +2616,16 @@ impl OverlayRuntime {
                                 && delta.severity == super::netstate::Severity::Major
                                 && direct::netchange_poke_enabled()
                             {
+                                // Dialer honesty — a new network is a new
+                                // egress policy: drop the not-dialer-capable
+                                // latch and re-earn it (worst case one more
+                                // failed dialer cycle). The sweep below syncs
+                                // the coordinator mirror; the periodic srflx
+                                // advert re-publishes the reset verdict.
+                                super::dialer::reset_on_network_change();
+                                if let Some(coord) = relay.as_mut() {
+                                    coord.set_udp_dialer_ok(super::dialer::udp_dialer_ok());
+                                }
                                 self.shadow(|s| s.mon.on_network_changed());
                                 netchange_poke_due = false; // consumed inline
                                 let t0 = Instant::now();
@@ -2952,6 +2966,7 @@ impl OverlayRuntime {
                                 .send(ClientMsg::OverlaySrflx {
                                     candidates: srflx_advertised.clone(),
                                     nat: srflx_my_nat.clone(),
+                                    udp_dialer_ok: Some(super::dialer::udp_dialer_ok()),
                                 })
                                 .await;
                         }
@@ -3686,6 +3701,7 @@ mod tests {
             lan_endpoints: lan.iter().map(|s| s.to_string()).collect(),
             srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
             srflx_nat: None,
+            udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -5347,7 +5363,9 @@ mod tests {
             .expect("expected a re-trickle")
             .expect("channel closed");
         match msg {
-            ClientMsg::OverlaySrflx { candidates, nat } => {
+            ClientMsg::OverlaySrflx {
+                candidates, nat, ..
+            } => {
                 assert_eq!(candidates, vec!["203.0.113.7:2222".to_string()]);
                 // The NAT type rides every re-trickle (mapping changed, class
                 // didn't) so the server never clears it.
@@ -5460,7 +5478,9 @@ mod tests {
             .expect("expected the advert restore after reattach")
             .expect("channel closed");
         match msg {
-            ClientMsg::OverlaySrflx { candidates, nat } => {
+            ClientMsg::OverlaySrflx {
+                candidates, nat, ..
+            } => {
                 assert_eq!(candidates, vec!["203.0.113.7:2222".to_string()]);
                 assert_eq!(nat.as_deref(), Some("cone"));
             }
@@ -5489,6 +5509,7 @@ mod tests {
                 lan_endpoints: vec![],
                 srflx_endpoints: vec![],
                 srflx_nat: None,
+                udp_dialer_ok: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
                 reachable,
@@ -5731,6 +5752,7 @@ mod tests {
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
             srflx_nat: None,
+            udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -6287,6 +6309,7 @@ mod tests {
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
             srflx_nat: None,
+            udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
@@ -6458,6 +6481,7 @@ mod tests {
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
             srflx_nat: None,
+            udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,
             reachable: true,
