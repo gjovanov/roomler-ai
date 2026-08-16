@@ -575,6 +575,18 @@ impl OverlayRuntime {
             if let (Some(coord), Some(np)) = (relay.as_mut(), current_peers.get(&nid))
                 && let Some(cfg) = peer_config_from_netmap(np)
             {
+                // Dialer honesty — a TURN conviction while WE were the raw-UDP
+                // DIALER is evidence about OUR egress (the dial toward the
+                // anchor's relay-band port never landed). Book it host-wide;
+                // two distinct peers latch not-dialer-capable, the mirror sync
+                // below flips this org's role inputs the same cycle, and the
+                // periodic srflx advert carries the verdict to peers + server.
+                if e.relay_kind == Some(crate::overlay::relay_link::RelayKind::Turn)
+                    && coord.was_dialer_for(&nid)
+                {
+                    crate::overlay::dialer::note_dialer_conviction(nid);
+                }
+                coord.set_udp_dialer_ok(crate::overlay::dialer::udp_dialer_ok());
                 if !tier.is_direct() {
                     coord.forget(&nid);
                 }
@@ -2393,6 +2405,7 @@ impl OverlayRuntime {
                     .send(ClientMsg::OverlaySrflx {
                         candidates: shared.candidates.clone(),
                         nat: shared.my_nat.clone(),
+                        udp_dialer_ok: Some(crate::overlay::dialer::udp_dialer_ok()),
                     })
                     .await;
             }
@@ -2490,6 +2503,7 @@ impl OverlayRuntime {
                         .send(ClientMsg::OverlaySrflx {
                             candidates,
                             nat: my_nat,
+                            udp_dialer_ok: Some(crate::overlay::dialer::udp_dialer_ok()),
                         })
                         .await;
                 }
@@ -2548,6 +2562,7 @@ mod tests {
             lan_endpoints: lan.iter().map(|s| s.to_string()).collect(),
             srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
             srflx_nat: nat.map(|s| s.to_string()),
+            udp_dialer_ok: None,
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
