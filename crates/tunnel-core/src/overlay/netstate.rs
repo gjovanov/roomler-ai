@@ -214,6 +214,41 @@ pub(crate) fn diff(
     })
 }
 
+/// Millis-since-[`mono_base`] of the last MATERIAL+MAJOR delta; 0 = never.
+/// A plain atomic (not part of the handle) so non-subscribers — the
+/// self-updater's defer gate — can ask "did the network just move?" without
+/// holding a broadcast receiver.
+static LAST_MAJOR_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn mono_base() -> std::time::Instant {
+    static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+    *BASE.get_or_init(std::time::Instant::now)
+}
+
+fn stamp_major() {
+    let ms = mono_base().elapsed().as_millis() as u64;
+    // ms == 0 only within the first millisecond of process life; saturate to
+    // 1 so "never" (0) stays unambiguous.
+    LAST_MAJOR_MS.store(ms.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `true` when a material MAJOR network change was published within
+/// `window`. R5b consumer: the self-updater defers a daemon restart while a
+/// transition is fresh — a restart there forfeits every ESTABLISHED
+/// (grandfathered) flow and, on a corp path that blackholes fresh TLS, locks
+/// the machine out until the next transition (field 2026-08-16). `false`
+/// when netstate is off or no Major was ever seen.
+pub fn last_major_within(window: Duration) -> bool {
+    let ms = LAST_MAJOR_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms == 0 {
+        return false;
+    }
+    mono_base()
+        .elapsed()
+        .saturating_sub(Duration::from_millis(ms))
+        < window
+}
+
 /// A subscriber's view: the latest snapshot (always readable) + the delta
 /// wake-up stream. On `broadcast::error::RecvError::Lagged`, reconcile from
 /// [`Self::snapshot`] — state is never lost, only wake-ups.
@@ -311,6 +346,9 @@ async fn monitor(
                     %delta.summary,
                     "netstate: network changed"
                 );
+                if delta.material && delta.severity == Severity::Major {
+                    stamp_major();
+                }
                 let _ = snap_tx.send(next.clone());
                 let _ = delta_tx.send(delta); // no receivers = fine
             }
