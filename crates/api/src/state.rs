@@ -860,6 +860,8 @@ impl AppState {
         crate::ws::media_cluster::wire_media_cluster(&state);
         // C-5 — derp rehome: the owner-side close handler.
         crate::ws::derp_cluster::wire_derp_cluster(&state);
+        // Split-brain observability: the per-pod DERP registry census.
+        crate::ws::derp::spawn_registry_census(&state);
         // PR-2 — cross-pod rc signalling relay: owner-side rc.cmd /
         // rc.conn_closed / rc.conn_alive + the proxy janitor sweep.
         crate::ws::rc_relay::wire_rc_relay(&state);

@@ -615,7 +615,18 @@ impl RelayCoordinator {
             Some(u) if self.regional_muxes.contains_key(u) => {
                 self.forced_urls.insert(node_id, u.to_string());
             }
-            _ => {
+            // Degrading to central is only safe when the PEER degrades too —
+            // if it honors the regional URL the two ends register on
+            // DIFFERENT relays and the pair one-ways. Loud, so a split pin
+            // is attributable from either end's log.
+            Some(u) => {
+                warn!(
+                    peer = %node_id, url = %u,
+                    "overlay relay: force-derp pin names a regional relay we have no mux for — degrading to central (pair may one-way if the peer honors it)"
+                );
+                self.forced_urls.remove(&node_id);
+            }
+            None => {
                 self.forced_urls.remove(&node_id);
             }
         }
@@ -638,6 +649,11 @@ impl RelayCoordinator {
         self.forced_urls.retain(|n, _| live.contains_key(n));
         info!(
             peer = %node_id, ttl_s = ttl.as_secs(),
+            relay = %self
+                .forced_urls
+                .get(&node_id)
+                .map(String::as_str)
+                .unwrap_or("central"),
             "overlay relay: pair force-pinned to DERP (server escalation — TURN churn)"
         );
         // If this pin lands right after WE moved the pair off DERP, the churn
