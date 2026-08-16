@@ -46,6 +46,7 @@ pub mod netstack;
 /// OS-free path. Feature `overlay-netstack`.
 #[cfg(feature = "overlay-netstack")]
 pub mod netstack_socks;
+pub(crate) mod netstate;
 pub(crate) mod path;
 pub mod relay_link;
 pub(crate) mod route_events;
