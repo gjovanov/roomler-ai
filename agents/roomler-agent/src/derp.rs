@@ -86,6 +86,7 @@ pub fn spawn(
     let reg_frame = mux.registration_frame();
     let weak = Arc::downgrade(mux);
     tokio::spawn(run(
+        "central".to_string(),
         Box::new(move || Some(full_url.clone())),
         reg_frame,
         weak,
@@ -105,10 +106,19 @@ pub fn spawn_regional(
     outbound_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let base = derp_url.to_string();
+    // Host part only — the ticket query string must never reach a log line.
+    let label = derp_url
+        .trim_start_matches("wss://")
+        .trim_start_matches("ws://")
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(derp_url)
+        .to_string();
     let tid = crate::signaling::urlencode(tenant_id);
     let reg_frame = mux.registration_frame();
     let weak = Arc::downgrade(mux);
     tokio::spawn(run(
+        label,
         Box::new(move || {
             let ticket = ticket_slot
                 .lock()
@@ -128,6 +138,7 @@ pub fn spawn_regional(
 }
 
 async fn run(
+    relay: String,
     url_for_attempt: Box<dyn Fn() -> Option<String> + Send>,
     reg_frame: Vec<u8>,
     mux: Weak<DerpMux>,
@@ -137,13 +148,13 @@ async fn run(
     loop {
         // The mux is gone (runtime torn down) ⇒ stop reconnecting.
         if mux.upgrade().is_none() {
-            debug!("overlay derp: mux dropped; stopping /derp WS owner");
+            debug!(%relay, "overlay derp: mux dropped; stopping /derp WS owner");
             return;
         }
         // Regional relays: no admission ticket cached yet — back off and
         // retry (the signaling loop fills the slot within seconds).
         let Some(url) = url_for_attempt() else {
-            debug!("overlay derp: no admission ticket yet; delaying connect");
+            debug!(%relay, "overlay derp: no admission ticket yet; delaying connect");
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(DERP_BACKOFF_MAX);
             continue;
@@ -158,7 +169,7 @@ async fn run(
                     .await
                     .is_err()
                 {
-                    warn!("overlay derp: registration send failed; reconnecting");
+                    warn!(%relay, "overlay derp: registration send failed; reconnecting");
                     if let Some(m) = mux.upgrade() {
                         m.mark_down();
                     }
@@ -170,7 +181,7 @@ async fn run(
                 } else {
                     return;
                 }
-                info!("overlay derp: /derp WS connected + registered");
+                info!(%relay, "overlay derp: /derp WS connected + registered");
 
                 let mut keepalive = tokio::time::interval(DERP_KEEPALIVE);
                 keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -192,6 +203,7 @@ async fn run(
                             skew_mono = std::time::Instant::now();
                             if wall_gap > mono_gap + std::time::Duration::from_secs(120) {
                                 warn!(
+                                    %relay,
                                     napped_s = (wall_gap - mono_gap).as_secs(),
                                     "overlay derp: suspend/resume detected — cycling the /derp WS"
                                 );
@@ -199,13 +211,14 @@ async fn run(
                             }
                             if last_rx.elapsed() > DERP_RX_DEADLINE {
                                 warn!(
+                                    %relay,
                                     silent_s = last_rx.elapsed().as_secs(),
                                     "overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting"
                                 );
                                 break;
                             }
                             if tx.send(Message::Ping(Vec::new().into())).await.is_err() {
-                                warn!("overlay derp: keepalive ping failed; reconnecting");
+                                warn!(%relay, "overlay derp: keepalive ping failed; reconnecting");
                                 break;
                             }
                         }
@@ -219,7 +232,7 @@ async fn run(
                             // All senders gone ⇒ the mux + every DerpConn dropped
                             // (runtime torn down): we're done for good.
                             None => {
-                                debug!("overlay derp: outbound closed; /derp WS owner exiting");
+                                debug!(%relay, "overlay derp: outbound closed; /derp WS owner exiting");
                                 return;
                             }
                         },
@@ -248,10 +261,10 @@ async fn run(
                 if let Some(m) = mux.upgrade() {
                     m.mark_down();
                 }
-                warn!("overlay derp: /derp WS closed; reconnecting");
+                warn!(%relay, "overlay derp: /derp WS closed; reconnecting");
             }
-            Ok(Err(e)) => warn!(%e, "overlay derp: /derp connect failed"),
-            Err(_) => warn!("overlay derp: /derp connect timed out"),
+            Ok(Err(e)) => warn!(%relay, %e, "overlay derp: /derp connect failed"),
+            Err(_) => warn!(%relay, "overlay derp: /derp connect timed out"),
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(DERP_BACKOFF_MAX);
