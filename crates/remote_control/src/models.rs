@@ -1395,6 +1395,14 @@ pub struct OverlayNode {
     /// class is meaningless after a roam (A8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srflx_nat: Option<String>,
+    /// Dialer honesty (2026-08-16) — whether this node can raw-UDP-dial
+    /// arbitrary relay-band ports (the single-relay DIALER's job), trickled
+    /// with `rc:overlay.srflx` and surfaced as `NetmapPeer.udp_dialer_ok`.
+    /// `Some(false)` = proved it can't (dialer-role convictions against ≥2
+    /// distinct peers); `None` = pre-honesty agent (legacy role inputs).
+    /// Reset on each (re)join with `srflx_endpoints`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_dialer_ok: Option<bool>,
     /// Preferred relay region/home, if any (Phase 5 multi-relay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_home: Option<String>,
