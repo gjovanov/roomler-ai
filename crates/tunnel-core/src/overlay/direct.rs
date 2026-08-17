@@ -835,21 +835,19 @@ pub fn server_relay_strategy_enabled() -> bool {
 
 /// Phase A (overlay v3) — DERP always-on floor: open this node's central
 /// `/derp` mux at startup UNCONDITIONALLY (not just when the srflx gather
-/// came up empty), advertise `supports_derp_floor`, and (in A2) install the
+/// came up empty), advertise `supports_derp_floor`, and (A2) install the
 /// DERP carrier as every fresh pair's floor while better tiers upgrade over
 /// it MBB-style. `ROOMLER_NODE_OVERLAY_DERP_FLOOR`, config-surface key
-/// `overlay_derp_floor`. **Default-OFF** (the U2 rollout polarity): soak
-/// per-host, then fleet. The floor is additionally gated per-pair on the
-/// PEER advertising the capability — a pre-floor peer whose srflx gather
-/// succeeded holds no mux and never registers, so a floor toward it would
-/// blackhole.
+/// `overlay_derp_floor`. **Default-ON since rc.400** (neo16+clk soak
+/// 08-17: floor pairs carried straight through clk's latch re-earn windows
+/// — the class that used to block ~2 min per 30 — and the rc.398 post-roll
+/// carrier-less wedge is structurally impossible with a floor); explicit
+/// `false` is the per-host off-switch. The floor is additionally gated
+/// per-pair on the PEER advertising the capability — a pre-floor peer
+/// whose srflx gather succeeded holds no mux and never registers, so a
+/// floor toward it would blackhole.
 pub fn derp_floor_enabled() -> bool {
-    matches!(
-        crate::env::node_env("OVERLAY_DERP_FLOOR")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
+    crate::env::flag("OVERLAY_DERP_FLOOR", true)
 }
 
 /// Phase D — should this node GATHER + ADVERTISE its own srflx candidates? True
