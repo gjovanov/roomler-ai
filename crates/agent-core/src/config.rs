@@ -112,9 +112,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub overlay_server_relay_strategy: Option<bool>,
     /// Phase A (overlay v3) — DERP always-on floor: open the central `/derp`
-    /// mux at startup unconditionally and advertise `supports_derp_floor`
-    /// (`ROOMLER_NODE_OVERLAY_DERP_FLOOR`). Built-in default: **off** (soaks
-    /// per-host before fleet-wide).
+    /// mux at startup unconditionally, advertise `supports_derp_floor`, and
+    /// floor fresh pairs at birth (`ROOMLER_NODE_OVERLAY_DERP_FLOOR`).
+    /// Built-in default: **on** since rc.400 (soak-proven); explicit `false`
+    /// is the per-host off-switch.
     #[serde(default)]
     pub overlay_derp_floor: Option<bool>,
     /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
