@@ -1395,6 +1395,17 @@ pub struct OverlayNode {
     /// class is meaningless after a roam (A8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srflx_nat: Option<String>,
+    /// Phase B (overlay v3) — the node's MEASURED capability vector
+    /// (`rc:overlay.netcheck`), surfaced as `NetmapPeer.caps` behind the
+    /// freshness gate on [`Self::caps_measured_at`]. Reset on re-join with
+    /// the srflx bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<crate::signaling::CapVectorWire>,
+    /// Receipt stamp for [`Self::caps`] — the freshness gate's input
+    /// (vectors older than 3× the measurement cadence are surfaced as
+    /// absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps_measured_at: Option<bson::DateTime>,
     /// Dialer honesty (2026-08-16) — whether this node can raw-UDP-dial
     /// arbitrary relay-band ports (the single-relay DIALER's job), trickled
     /// with `rc:overlay.srflx` and surfaced as `NetmapPeer.udp_dialer_ok`.
