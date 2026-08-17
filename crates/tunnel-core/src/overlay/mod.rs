@@ -35,6 +35,7 @@ pub mod dns;
 pub mod ingress;
 pub(crate) mod lifecycle;
 pub mod nat;
+pub mod netcheck;
 pub mod netmap;
 /// Userspace TCP/IP stack (smoltcp) presented as a [`tun::TunIo`] — the
 /// OS-free twin of [`tun::SystemTun`]. Feature `overlay-netstack`.
