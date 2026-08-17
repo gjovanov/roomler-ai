@@ -109,7 +109,7 @@ static RUNTIME_SLOTS: std::sync::Mutex<std::collections::BTreeMap<String, Runtim
 /// Multi-org v2 — the ONE process-wide shared carrier plane every org's
 /// engine attaches to when `overlay_shared_carrier` is on (one stable
 /// direct-socket set for the whole daemon; receiver-index demux). Created on
-/// first use, process-lifetime — like [`SHARED_MUX`], the plane must outlive
+/// first use, process-lifetime — the plane must outlive
 /// any single org's session churn.
 static SHARED_PLANE: std::sync::Mutex<
     Option<std::sync::Arc<tunnel_core::overlay::carrier_plane::CarrierPlane>>,
@@ -250,15 +250,11 @@ pub async fn maybe_start(
         }
         // Multi-org v2 — per-org adapters: each org gets its OWN device
         // (own address space, own route domain; one address per adapter, so
-        // OS source selection is trivially correct and the mux NAT /
-        // SkipAsSource compensations never engage). Default ON since rc.339
-        // (4-host field soak); explicit `false` falls back to the shared-TUN
-        // mux until the compensation stack is deleted.
-        if tunnel_core::env::flag("OVERLAY_TUN_PER_ORG", true) {
-            per_org_systun_factory(cfg.tenant_id.clone(), !cfg.derived_org)?
-        } else {
-            mux_systun_factory(cfg.tenant_id.clone())?
-        }
+        // OS source selection is trivially correct). THE path since rc.339's
+        // 4-host field soak; W7c (overlay v3) deleted the shared-TUN mux +
+        // compensation stack it superseded after the ≥7-day fleet-zero
+        // counter gate (mux_nat_rewrites / restores / skip_as_source_flips).
+        per_org_systun_factory(cfg.tenant_id.clone(), !cfg.derived_org)?
     } else {
         match netstack_socks_port(cfg) {
             // Give the netstack SOCKS front a live mesh view so it can resolve
@@ -500,21 +496,8 @@ fn systun_tun_factory() -> Option<TunFactory> {
     None
 }
 
-/// Multi-org P2c — the process-wide shared device + its [`TunMux`], for the
-/// mux factory below. The FIRST org to establish creates the device with its
-/// own `(ip, netmask, mtu)` (exactly what `SystemTun::up` always took); every
-/// later org rides the same device with its own address added. Rebuilt from
-/// scratch when the device dies (`is_alive` false) — the stale mux's reader
-/// has EOF'd every old port by then, so each org's runtime rebuilds its
-/// session and re-registers on the fresh one.
-#[cfg(feature = "overlay-l3")]
-#[allow(clippy::type_complexity)]
-static SHARED_MUX: std::sync::Mutex<
-    Option<(Arc<SystemTun>, Arc<tunnel_core::overlay::tun_mux::TunMux>)>,
-> = std::sync::Mutex::new(None);
-
-/// Multi-org — release everything process-wide an org held: its shared-TUN
-/// port + address, and the netstack surface if it owned that.
+/// Multi-org — release everything process-wide an org held: its per-org TUN
+/// device claim, and the netstack surface if it owned that.
 ///
 /// Called when an org's supervised loop ENDS for good (disabled, removed,
 /// terminal error) — until now the address stayed up until the daemon
@@ -524,24 +507,9 @@ static SHARED_MUX: std::sync::Mutex<
 /// No-op for anything the org never claimed (single-org daemons never
 /// register), so it is safe to call unconditionally on teardown.
 pub fn release_org(org_key: &str) {
-    release_shared_tun(org_key);
     release_per_org_tun(org_key);
     release_netstack(org_key);
 }
-
-#[cfg(feature = "overlay-l3")]
-fn release_shared_tun(org_key: &str) {
-    let shared = SHARED_MUX.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((dev, mux)) = shared.as_ref() else {
-        return;
-    };
-    if let Some((addr, prefix)) = mux.deregister(org_key) {
-        dev.del_address_sync(addr, prefix);
-        info!(org = %org_key, %addr, "overlay: released the org's shared-TUN claim");
-    }
-}
-#[cfg(not(feature = "overlay-l3"))]
-fn release_shared_tun(_org_key: &str) {}
 
 /// Hand this org's loopback SOCKS port back when its loop ends, so an org
 /// configured onto the same port can take it on its next reconnect instead
@@ -564,81 +532,6 @@ fn release_netstack(org_key: &str) {
 }
 #[cfg(not(feature = "overlay-netstack"))]
 fn release_netstack(_org_key: &str) {}
-
-/// Multi-org P2c — per-org TUN factory over the ONE shared device.
-///
-/// Differences from [`systun_tun_factory`], all deliberate:
-/// * the device is ALWAYS process-lifetime (the mux and its reader pump are
-///   shared state; the `overlay_tun_persist` kill-switch does not apply);
-/// * a registration can be REFUSED (`AddrInUse`) when another org already
-///   claims the same block — the two-un-migrated-tenants case. The runtime
-///   treats that like any TUN bring-up failure: this org's session aborts
-///   and retries on its next reconnect, while the OTHER orgs' meshes stay
-///   up. The fix is renumbering one tenant (docs/multi-org.md §4.3).
-#[cfg(feature = "overlay-l3")]
-fn mux_systun_factory(org_key: String) -> Option<TunFactory> {
-    use tunnel_core::overlay::tun_mux::TunMux;
-    Some(Box::new(move |ip, nm, mtu| {
-        let mut shared = SHARED_MUX.lock().unwrap();
-        let (dev, mux, fresh) = match shared.as_ref() {
-            Some((dev, mux)) if dev.is_alive() && mux.is_alive() => {
-                (dev.clone(), mux.clone(), false)
-            }
-            _ => {
-                // Dead or first use: release the old device BEFORE the new
-                // create (frees the adapter's device-install lock; the
-                // retry inside `up` covers the release latency).
-                *shared = None;
-                let dev = Arc::new(SystemTun::up(ip, nm, mtu)?);
-                let mux = TunMux::new(dev.clone() as Arc<dyn TunIo>);
-                *shared = Some((dev.clone(), mux.clone()));
-                info!("overlay: shared multi-org TUN device created");
-                (dev, mux, true)
-            }
-        };
-        // Claim the block FIRST. A REFUSED registration (another org already
-        // holds this block) must not leave an address on the adapter — field
-        // 2026-08-05 left three of them behind across the fleet, addresses
-        // nothing answered on, which is exactly the litter that makes a
-        // later diagnosis lie.
-        let port = mux.register(&org_key, ip, nm)?;
-        // Then the org's own address — for EVERY org, the device's creator
-        // included.
-        //
-        // The creator used to be skipped on the theory that `SystemTun::up`
-        // had already assigned its address. That holds only when `up`
-        // actually creates the adapter. Field 2026-08-07, PC50045: the
-        // adapter survives a process restart (stable Wintun GUID, by
-        // design), so `up` REUSED it and left the previous incarnation's
-        // address in place — the creating org logged "TUN up self_v4=
-        // 100.65.0.5" while the interface still held only 100.64.0.28, and
-        // nothing ever answered on 100.65.0.5. Which org got skipped was
-        // decided by registration order, i.e. by a race.
-        //
-        // `add_address_sync` is idempotent, so doing it unconditionally
-        // costs one netsh/ip round-trip per org per connect and makes the
-        // result independent of who arrived first.
-        let _ = fresh;
-        let prefix = u32::from(nm).count_ones() as u8;
-        if let Err(e) = dev.add_address_sync(ip, prefix) {
-            // Roll the claim back — a block held by an org with no
-            // address to receive on would refuse every later joiner.
-            if let Some((addr, plen)) = mux.deregister(&org_key) {
-                dev.del_address_sync(addr, plen);
-            }
-            return Err(e);
-        }
-        Ok(port as Arc<dyn TunIo>)
-    }))
-}
-#[cfg(not(feature = "overlay-l3"))]
-fn mux_systun_factory(_org_key: String) -> Option<TunFactory> {
-    warn!(
-        "overlay: overlay_multi_org requires an `overlay-l3` build (the shared \
-         OS TUN); not joining"
-    );
-    None
-}
 
 /// Multi-org v2 — per-org TUN devices, keyed by tenant. Same process-lifetime
 /// reuse contract as [`SYSTUN_CACHE`] (incl. the `overlay_tun_persist` kill
@@ -1144,108 +1037,5 @@ mod netstack_claim_tests {
 
         release_netstack("org-a");
         release_netstack("org-c");
-    }
-}
-
-/// Multi-org P2c — the shared-TUN factory against REAL kernel networking.
-///
-/// [`tunnel_core::overlay::tun_mux`]'s own tests cover the bookkeeping with a
-/// fake device. What they cannot cover is the half that touches the OS: that
-/// a REFUSED registration leaves no address behind on the adapter, that a
-/// disjoint block really does get its address, and that releasing an org
-/// really does take it off again. That half was unit-locked but never run
-/// against a kernel (docs/multi-org.md §12) because reproducing it in the
-/// field needs a third organization — and there is no way to retire a
-/// throwaway org afterwards.
-///
-/// A real `tun` device costs nothing to create, so the OS half runs here
-/// instead: same factory, same `SystemTun`, same `ip addr` calls, real
-/// kernel. It needs CAP_NET_ADMIN, so it is opt-in via
-/// `ROOMLER_TUN_KERNEL_TEST=1` (set in the CI job that runs as root) and
-/// skips silently otherwise — including on every developer machine.
-#[cfg(all(test, feature = "overlay-l3"))]
-mod tun_kernel_tests {
-    use super::{mux_systun_factory, release_org};
-    use std::net::Ipv4Addr;
-
-    const MASK_22: Ipv4Addr = Ipv4Addr::new(255, 255, 252, 0);
-
-    /// Addresses the kernel currently has on the overlay device.
-    fn addrs() -> String {
-        let out = std::process::Command::new("ip")
-            .args(["-4", "addr", "show", "dev", "roomler0"])
-            .output()
-            .expect("ip addr show");
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    }
-
-    #[tokio::test]
-    async fn refused_registration_leaves_no_address_on_the_adapter() {
-        // Compiled everywhere on purpose — gating the MODULE on
-        // `target_os = "linux"` meant no developer machine ever type-checked
-        // it, and the first compile error surfaced in CI. The body is
-        // Linux-shaped (`ip`, `roomler0`), so the platform check is a runtime
-        // skip instead.
-        if !cfg!(target_os = "linux") {
-            eprintln!("skipping: Linux-only (uses `ip` against the roomler0 device)");
-            return;
-        }
-        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
-            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs CAP_NET_ADMIN)");
-            return;
-        }
-
-        // Org A creates the device and takes 100.65.0.0/22.
-        let a = mux_systun_factory("kernel-org-a".into()).expect("factory");
-        let _port_a = a(Ipv4Addr::new(100, 65, 0, 5), MASK_22, 1280).expect("org A joins");
-        assert!(
-            addrs().contains("100.65.0.5"),
-            "org A's address must be on the device:\n{}",
-            addrs()
-        );
-
-        // Org B asks for an address inside THE SAME block — the
-        // two-un-migrated-tenants case. The mux refuses, and the refusal has
-        // to be clean: an address left behind here is one nothing answers
-        // on, which is exactly what makes a later diagnosis lie.
-        let b = mux_systun_factory("kernel-org-b".into()).expect("factory");
-        // `expect_err` is out: the Ok side is `Arc<dyn TunIo>`, which has no
-        // `Debug`.
-        let Err(err) = b(Ipv4Addr::new(100, 65, 1, 9), MASK_22, 1280) else {
-            panic!("an overlapping block must be refused");
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
-        let after = addrs();
-        assert!(
-            !after.contains("100.65.1.9"),
-            "a refused org must leave NO address behind:\n{after}"
-        );
-        assert!(
-            after.contains("100.65.0.5"),
-            "org A keeps its mesh:\n{after}"
-        );
-
-        // A disjoint block is accepted and really does land on the adapter.
-        let c = mux_systun_factory("kernel-org-c".into()).expect("factory");
-        let _port_c = c(Ipv4Addr::new(100, 66, 0, 7), MASK_22, 1280).expect("org C joins");
-        assert!(
-            addrs().contains("100.66.0.7"),
-            "org C's address must be on the device:\n{}",
-            addrs()
-        );
-
-        // …and releasing that org takes it back off (the litter fix).
-        release_org("kernel-org-c");
-        let after = addrs();
-        assert!(
-            !after.contains("100.66.0.7"),
-            "a released org's address must be gone:\n{after}"
-        );
-        assert!(
-            after.contains("100.65.0.5"),
-            "and only that org's — A is untouched:\n{after}"
-        );
-
-        release_org("kernel-org-a");
     }
 }
