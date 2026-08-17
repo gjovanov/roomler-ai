@@ -48,6 +48,14 @@ pub struct PeerConfig {
     /// keep the legacy srflx-only role inputs (field presence is the
     /// capability gate — a mixed-version pair can never split roles).
     pub udp_dialer_ok: Option<bool>,
+    /// B3 — the peer's MEASURED relay-band verdict (netcheck's
+    /// `relay_band_udp`, probed over the exact single-relay dial path),
+    /// surfaced only while the server's freshness gate holds (≤3× the
+    /// 20-min cadence). When BOTH ends carry the measured bit it supersedes
+    /// the srflx/latch-derived role inputs; `None` = pre-vector peer or
+    /// stale vector ⇒ legacy rules on both ends (field presence is the
+    /// symmetry gate, exactly like `udp_dialer_ok`).
+    pub relay_band_udp: Option<bool>,
     /// rc.142 — the peer advertised it can carry WG over QUIC-over-TURN. The
     /// runtime only attempts the QUIC relay carrier when this is set (both
     /// ends must agree, else the pair falls back to raw relay).
@@ -114,6 +122,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         srflx_endpoints: peer.srflx_endpoints.clone(),
         srflx_nat: peer.srflx_nat.clone(),
         udp_dialer_ok: peer.udp_dialer_ok,
+        relay_band_udp: peer.caps.as_ref().and_then(|c| c.relay_band_udp),
         supports_quic: peer.supports_quic,
         supports_relay_single: peer.supports_relay_single,
         supports_derp: peer.supports_derp,
@@ -168,6 +177,25 @@ mod tests {
         assert_eq!(cfg.public_key, kp.public.to_bytes());
         assert_eq!(cfg.overlay_ip, Ipv4Addr::new(100, 64, 0, 5));
         assert_eq!(cfg.endpoints.len(), 1);
+    }
+
+    /// B3 — the measured relay-band bit rides `NetmapPeer.caps` (already
+    /// freshness-gated by the server) into `PeerConfig.relay_band_udp`;
+    /// absent caps ⇒ `None` ⇒ legacy role inputs.
+    #[test]
+    fn maps_measured_relay_band_from_caps() {
+        let kp = WgKeypair::generate();
+        let mut p = netmap_peer(&kp.public_base64(), "100.64.0.5", true);
+        assert_eq!(peer_config_from_netmap(&p).unwrap().relay_band_udp, None);
+        p.caps = Some(roomler_ai_remote_control::signaling::CapVectorWire {
+            stun_udp: true,
+            relay_band_udp: Some(false),
+            derp_ws_ok: true,
+        });
+        assert_eq!(
+            peer_config_from_netmap(&p).unwrap().relay_band_udp,
+            Some(false)
+        );
     }
 
     #[test]
