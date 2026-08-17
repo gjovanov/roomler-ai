@@ -48,6 +48,7 @@
 //! new egress policy — the host re-earns the verdict either way.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
@@ -100,9 +101,34 @@ pub fn touch_start() {
     }
 }
 
+/// B3 — a conviction is (also) a DETECTOR: it requests an immediate
+/// netcheck re-measure, so the MEASURED relay-band verdict replaces the
+/// inference as fast as one probe cycle. Collapses to one pending request
+/// however many convictions land in a burst; the runtime drains it on its
+/// tick.
+static PROBE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Drain the pending re-probe request (one-shot, runtime tick).
+pub fn take_probe_request() -> bool {
+    PROBE_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
 /// Current verdict: `true` until proven otherwise (or the proof expired).
 pub fn udp_dialer_ok() -> bool {
     udp_dialer_ok_at(&mut lock(), Instant::now())
+}
+
+/// B3 — the bit ADVERTISED on the srflx trickle (`udp_dialer_ok` wire
+/// field): the MEASURED relay-band verdict when a fresh netcheck vector
+/// carries one, else the conviction latch. Pre-vector peers keep reading
+/// this field, so the latch stays live as the mixed-fleet noise filter;
+/// once a measurement exists it is strictly stronger (probed over the
+/// exact dial path) and wins.
+pub fn advertised_dialer_ok() -> bool {
+    match super::netcheck::current_fresh().and_then(|v| v.relay_band_udp) {
+        Some(measured) => measured,
+        None => udp_dialer_ok(),
+    }
 }
 
 fn udp_dialer_ok_at(s: &mut DialerState, now: Instant) -> bool {
@@ -123,6 +149,11 @@ fn udp_dialer_ok_at(s: &mut DialerState, now: Instant) -> bool {
 /// The CALLER filters on death class — only a never-handshook
 /// (`DeathReason::HandshakeDeadline`) dialer-role TURN death is evidence.
 pub fn note_dialer_conviction(peer: ObjectId) -> bool {
+    // B3 — every genuine dialer-role handshake death (the caller already
+    // filtered the class) requests a re-measure, even inside the guards:
+    // the probe is cheap, and a MEASURED verdict superseding the inference
+    // is the whole point of the demotion.
+    PROBE_REQUESTED.store(true, Ordering::Relaxed);
     note_dialer_conviction_at(&mut lock(), peer, Instant::now())
 }
 
