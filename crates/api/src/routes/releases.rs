@@ -128,20 +128,9 @@ impl ReleasesCache {
         let mut last_err: Option<String> = None;
         for attempt in 1..=EXPECT_TAG_ATTEMPTS {
             match fetch_releases().await {
-                Ok(releases) => {
-                    let newest = NewestTags::from_releases(&releases);
-                    let satisfied = expect_tag
+                Ok(mut releases) => {
+                    let mut satisfied = expect_tag
                         .is_none_or(|tag| releases.iter().any(|r| !r.draft && r.tag_name == tag));
-                    self.store(releases).await;
-                    if satisfied {
-                        return PodRefresh {
-                            pod_id: pod_id.to_string(),
-                            ok: true,
-                            attempts: attempt,
-                            newest,
-                            error: None,
-                        };
-                    }
                     // GitHub's LIST endpoint lags its by-tag endpoint after
                     // API incidents (field 2026-08-17: `/releases` returned
                     // `[]` for 45+ min while `/releases/tags/agent-v0.3.0-
@@ -151,31 +140,33 @@ impl ReleasesCache {
                     // NAMED the tag it expects, fetch it directly and merge
                     // it into the payload — the cache then serves it and the
                     // roll proceeds.
-                    if let Some(tag) = expect_tag {
+                    if !satisfied && let Some(tag) = expect_tag {
                         match fetch_release_by_tag(tag).await {
                             Ok(r) if !r.draft => {
                                 tracing::info!(
                                     %tag,
                                     "releases refresh: list endpoint lagging — recovered the expected tag via the by-tag endpoint"
                                 );
-                                let mut merged = releases.clone();
-                                merged.retain(|x| x.tag_name != r.tag_name);
-                                merged.insert(0, r);
-                                let newest = NewestTags::from_releases(&merged);
-                                self.store(merged).await;
-                                return PodRefresh {
-                                    pod_id: pod_id.to_string(),
-                                    ok: true,
-                                    attempts: attempt,
-                                    newest,
-                                    error: None,
-                                };
+                                releases.retain(|x| x.tag_name != r.tag_name);
+                                releases.insert(0, r);
+                                satisfied = true;
                             }
                             Ok(_) => {}
                             Err(e) => {
                                 tracing::debug!(%tag, %e, "releases refresh: by-tag fallback failed too");
                             }
                         }
+                    }
+                    let newest = NewestTags::from_releases(&releases);
+                    self.store(releases).await;
+                    if satisfied {
+                        return PodRefresh {
+                            pod_id: pod_id.to_string(),
+                            ok: true,
+                            attempts: attempt,
+                            newest,
+                            error: None,
+                        };
                     }
                     last_err = Some(format!(
                         "{} not visible upstream yet",
