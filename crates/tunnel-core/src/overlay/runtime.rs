@@ -3228,6 +3228,7 @@ impl OverlayRuntime {
                                 .map(|a| a.ip())
                                 .collect();
                             let creds = super::relay_link::turn_creds(&ice_servers);
+                            let advert_tx = self.outbound.clone();
                             tokio::spawn(async move {
                                 let alloc = match (&creds, stun_udp) {
                                     (Some((urls, user, cred)), true) => {
@@ -3255,6 +3256,20 @@ impl OverlayRuntime {
                                     stun_udp, nat, derp_ws_ok, alloc, own_ips,
                                 )
                                 .await;
+                                // B2 — advertise the fresh vector; the server
+                                // stamps receipt time and surfaces it behind
+                                // the freshness gate.
+                                if let Some((v, _age)) = super::netcheck::current() {
+                                    let _ = advert_tx
+                                        .send(ClientMsg::OverlayNetcheck {
+                                            caps: roomler_ai_remote_control::signaling::CapVectorWire {
+                                                stun_udp: v.stun_udp,
+                                                relay_band_udp: v.relay_band_udp,
+                                                derp_ws_ok: v.derp_ws_ok,
+                                            },
+                                        })
+                                        .await;
+                                }
                             });
                         }
                         if warm_enabled && !warm.is_live() {
@@ -3801,6 +3816,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            caps: None,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
@@ -5610,6 +5626,7 @@ mod tests {
                 supports_derp: false,
                 supports_forced_derp: false,
                 supports_derp_floor: false,
+                caps: None,
                 supports_overlay_echo: false,
                 relay_strategy: None,
                 routes: vec![],
@@ -5854,6 +5871,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            caps: None,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
@@ -6412,6 +6430,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            caps: None,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes,
@@ -6585,6 +6604,7 @@ mod tests {
             supports_derp: false,
             supports_forced_derp: false,
             supports_derp_floor: false,
+            caps: None,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
