@@ -308,10 +308,25 @@ pub struct RelayCoordinator {
     /// [`derp_mux`](Self::derp_mux) the moment the peer is tracked. Keyed like
     /// `dialing` so `forget`/`is_tracking` see it.
     derping: HashMap<ObjectId, PeerConfig>,
+    /// Phase A2 (overlay v3) — peers whose INSTALLED carrier is the DERP
+    /// FLOOR: built at birth (both ends `supports_derp_floor`, mux alive)
+    /// while the better-tier coordination runs in parallel. Deliberately
+    /// OUTSIDE the role maps and [`is_tracking`](Self::is_tracking): the
+    /// floor is not a strategy outcome, so `maybe_complete`'s strategy-flip
+    /// recompute never touches it, and the caller's `!is_tracking` path
+    /// still fires the parallel TURN `request`. Cleared when any
+    /// coordinator-built link supersedes the floor (`try_build*` hooks) or
+    /// the peer is forgotten.
+    floored: HashMap<ObjectId, PeerConfig>,
     /// Phase D — our end of the DERP opt-in ([`derp_enabled`](super::direct::derp_enabled),
     /// default-OFF). A link goes DERP only when this is set, the peer advertises
     /// `supports_derp`, both ends are UDP-blocked, AND `derp_mux` is present.
     derp: bool,
+    /// Phase A2 — our `overlay_derp_floor` opt-in
+    /// ([`derp_floor_enabled`](super::direct::derp_floor_enabled),
+    /// default-OFF), read once at construction like its siblings so the
+    /// role/floor logic stays env-free and unit-testable.
+    derp_floor: bool,
     /// Phase D — this node's single `/derp` WS demux, if the DERP tier is on and
     /// the WS is up. `try_build_derp` vends a per-peer [`DerpConn`] from it.
     /// `None` disables DERP (falls through to both-allocate).
@@ -478,7 +493,9 @@ impl RelayCoordinator {
             my_udp_dialer_ok: super::dialer::udp_dialer_ok(),
             dialing: HashMap::new(),
             derping: HashMap::new(),
+            floored: HashMap::new(),
             derp: super::direct::derp_enabled(),
+            derp_floor: super::direct::derp_floor_enabled(),
             derp_mux,
             roles: HashMap::new(),
             forced_derp_until: HashMap::new(),
@@ -571,9 +588,22 @@ impl RelayCoordinator {
         reason: &'static str,
     ) {
         self.refresh_ctx.insert(node_id, (kind, reason));
-        // Unresponsive-peer backoff — every relay death without an
+        // Unresponsive-peer backoff — every RELAY death without an
         // intervening completed handshake escalates the streak; from the
         // 3rd, our OWN next `request` is deferred (see `death_streaks`).
+        //
+        // RELAY deaths only (`kind.is_some()`): the first cut booked EVERY
+        // death, and a direct-tier failure loop (a srflx punch dying at its
+        // 12 s deadline every ~65 s walk) then re-armed the 300 s hold
+        // faster than it could expire — the relay re-request starved
+        // FOREVER while the pair sat carrier-less (field 2026-08-17,
+        // rc.398 post-roll: clk/pc50045 pairs wedged fleet-wide once the
+        // storm-era force-DERP pins expired and stopped masking it). A
+        // direct-tier death says nothing about grinding allocations —
+        // #496's whole point — so it must not feed this streak.
+        if kind.is_none() {
+            return;
+        }
         let now = Instant::now();
         let entry = self.death_streaks.entry(node_id).or_insert((0, now));
         entry.0 = entry.0.saturating_add(1);
@@ -1419,6 +1449,9 @@ impl RelayCoordinator {
             subnets: a.peer.subnets.clone(),
         };
         self.allocated.remove(node_id);
+        // A2 — a TURN link supersedes the birth floor (install_ready replaces
+        // the carrier; this clears the bookkeeping with it).
+        self.floored.remove(node_id);
         info!(peer = %node_id, %dst, single_relay = single_anchor,
               extra_perms = link.extra_permission_targets.len(),
               "overlay relay: link ready");
@@ -1493,6 +1526,8 @@ impl RelayCoordinator {
             subnets: peer.subnets.clone(),
         };
         self.dialing.remove(node_id);
+        // A2 — a dialer link supersedes the birth floor.
+        self.floored.remove(node_id);
         info!(peer = %node_id, %r, ?src_ip,
               "overlay relay: single-relay dialer link ready (raw → anchor R)");
         Some(link)
@@ -1541,8 +1576,67 @@ impl RelayCoordinator {
             subnets: peer.subnets.clone(),
         };
         self.derping.remove(node_id);
+        // A strategy-owned DERP link supersedes any floor bookkeeping.
+        self.floored.remove(node_id);
         info!(peer = %node_id, "overlay relay: DERP link ready (raw WG over /derp)");
         Some(link)
+    }
+
+    /// Phase A2 (overlay v3) — build the DERP FLOOR for a fresh pair: an
+    /// immediately-installable derp carrier so "reachable but carrier-less"
+    /// can't exist wherever wss:/derp works, while the better-tier
+    /// coordination runs in parallel and replaces it MBB-ishly via the
+    /// normal `install_ready` path.
+    ///
+    /// Gates, all required: our `overlay_derp_floor` flag; our DERP opt-in;
+    /// the PEER advertising BOTH `supports_derp` and `supports_derp_floor`
+    /// (a pre-floor peer whose srflx gather succeeded holds no mux and never
+    /// registers — a floor toward it would blackhole); a central mux that is
+    /// present AND `is_alive()` (the #497 born-dead rule). A withheld floor
+    /// returns `None` and the caller falls through to the existing fresh
+    /// ladder unchanged — TURNS:443 and wss:/derp are different transports
+    /// and corp middleboxes split them, so pair formation must never couple
+    /// to `/derp` health.
+    pub fn build_floor(&mut self, node_id: ObjectId, peer: &PeerConfig) -> Option<ReadyLink> {
+        if !self.derp_floor || !self.derp || !peer.supports_derp || !peer.supports_derp_floor {
+            return None;
+        }
+        let mux = self.mux_for(&node_id)?;
+        if !mux.is_alive() {
+            debug!(peer = %node_id, "overlay relay: floor withheld — /derp WS down; fresh ladder proceeds");
+            return None;
+        }
+        let derp_conn = mux.conn_for(peer.public_key);
+        let dst = derp_conn.synth_peer();
+        let conn: Arc<dyn RelayConn> = Arc::new(derp_conn);
+        let carrier = Carrier::relay(conn.clone(), dst);
+        let link = ReadyLink {
+            node_id,
+            public_key: peer.public_key,
+            overlay_ip: peer.overlay_ip,
+            carrier,
+            relay_parts: Some((conn, dst)),
+            extra_permission_targets: Vec::new(),
+            supports_quic: false,
+            single_relay: None,
+            relay_kind: RelayKind::Derp,
+            subnets: peer.subnets.clone(),
+        };
+        self.floored.insert(node_id, peer.clone());
+        info!(peer = %node_id, "overlay relay: DERP floor installed at birth (better tiers coordinate in parallel)");
+        Some(link)
+    }
+
+    /// Phase A2 — is this peer's installed carrier the birth floor?
+    pub fn is_floored(&self, node_id: &ObjectId) -> bool {
+        self.floored.contains_key(node_id)
+    }
+
+    /// Phase A2 — would the pair's computed strategy be DERP anyway? The
+    /// floor block skips the parallel TURN `request` for such pairs — the
+    /// floor IS their carrier, and a request would double-build it.
+    pub fn strategy_is_derp(&self, node_id: &ObjectId, peer: &PeerConfig) -> bool {
+        matches!(self.relay_strategy(node_id, peer), RelayStrategy::Derp)
     }
 
     /// Drop all state for a peer (it left the netmap), including the relay
@@ -1557,6 +1651,7 @@ impl RelayCoordinator {
         self.advertised.remove(node_id);
         self.dialing.remove(node_id);
         self.derping.remove(node_id);
+        self.floored.remove(node_id);
         self.roles.remove(node_id);
         // C4 stage 2 (PR-B) — release the single-pair warm commit. If the leg
         // itself is still alive (its probes decide that, not this pair's
@@ -1946,6 +2041,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_derp_floor: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             relay_home: None,
@@ -2074,11 +2170,30 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
         let node = ObjectId::new();
-        for _ in 0..3 {
+        // rc.398 regression lock: DIRECT-tier deaths (kind=None) must NOT
+        // feed the streak — a dead srflx punch looping its 12 s deadline
+        // re-armed the 300 s hold faster than expiry and starved the relay
+        // re-request forever (the post-roll carrier-less wedge).
+        for _ in 0..5 {
             coord.note_refresh_context(node, None, "handshake-deadline");
         }
         coord.request(node, base_peer()).await;
-        assert!(!coord.is_tracking(&node), "3rd-death re-request is held");
+        assert!(
+            coord.is_tracking(&node),
+            "direct-tier deaths never defer the relay request"
+        );
+        coord.forget(&node);
+        assert!(rx.try_recv().is_ok(), "the request went out");
+
+        // RELAY deaths (kind=Some) book as before: 3rd holds.
+        for _ in 0..3 {
+            coord.note_refresh_context(node, Some(RelayKind::Turn), "handshake-deadline");
+        }
+        coord.request(node, base_peer()).await;
+        assert!(
+            !coord.is_tracking(&node),
+            "3rd relay-death re-request is held"
+        );
         assert!(rx.try_recv().is_err(), "nothing sent while held");
 
         coord.clear_death_streak(&node);
@@ -2987,6 +3102,86 @@ mod tests {
             .maybe_complete(node, &peer)
             .expect("builds the moment the mux is back");
         assert_eq!(link.relay_kind, RelayKind::Derp);
+    }
+
+    /// Phase A2 — the floor lifecycle: installs at birth for a both-capable
+    /// pair on a live mux; withheld when the mux is down or the peer lacks
+    /// the capability (caller falls through); superseded by a TURN build;
+    /// OUTSIDE `is_tracking` so the strategy machinery never touches it;
+    /// rebuildable after death+forget.
+    #[tokio::test]
+    async fn floor_installs_withholds_supersedes_and_survives_strategy_paths() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([0x00u8; 32]).0;
+        let mut coord = RelayCoordinator::new(tx, [0x00u8; 32], true, vec![], Some(mux.clone()));
+        coord.single_relay = true;
+        coord.derp = true;
+        coord.derp_floor = true;
+        let node = ObjectId::new();
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            supports_derp_floor: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+
+        // (2) withheld while the mux WS is down — the caller's ladder runs.
+        mux.mark_down();
+        assert!(coord.build_floor(node, &peer).is_none());
+        assert!(!coord.is_floored(&node));
+        mux.mark_up();
+
+        // (3) a peer without the floor capability never floors.
+        let pre_floor = PeerConfig {
+            supports_derp_floor: false,
+            ..peer.clone()
+        };
+        assert!(coord.build_floor(node, &pre_floor).is_none());
+
+        // (1) both-capable + live mux ⇒ immediate derp link, tracked as
+        // floored but NOT as strategy state.
+        let link = coord.build_floor(node, &peer).expect("floor installs");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert_eq!(link.single_relay, None, "the floor is symmetric");
+        assert!(coord.is_floored(&node));
+        assert!(
+            !coord.is_tracking(&node),
+            "floored ≠ tracking — the parallel TURN request path stays open"
+        );
+
+        // (5) a strategy recompute (srflx trickle) for an untracked node is
+        // a no-op — the floor survives maybe_complete untouched.
+        assert!(coord.maybe_complete(node, &peer).is_none());
+        assert!(coord.is_floored(&node));
+
+        // This pair is single-relay (both udp-ok) — the floor block would
+        // fire the parallel request.
+        assert!(!coord.strategy_is_derp(&node, &peer));
+
+        // (4) the parallel TURN coordination completing supersedes the
+        // floor: the warm fast-commit (we anchor — smaller pubkey, both
+        // udp-ok) puts the pair in `allocated`, and try_build yields TURN.
+        coord.set_warm_leg(Some(Arc::new(WarmTestConn)));
+        coord.request(node, peer.clone()).await;
+        if let Some(turn) = coord.maybe_complete(node, &peer) {
+            assert_eq!(turn.relay_kind, RelayKind::Turn);
+            assert!(
+                !coord.is_floored(&node),
+                "a TURN link must clear the floor bookkeeping"
+            );
+        } else {
+            // No warm-commit shape in this fixture — supersede via the
+            // explicit hook instead.
+            coord.forget(&node);
+            assert!(!coord.is_floored(&node));
+        }
+
+        // (6) after death+forget the floor rebuilds without a round-trip.
+        coord.forget(&node);
+        assert!(coord.build_floor(node, &peer).is_some());
+        assert!(coord.is_floored(&node));
     }
 
     #[tokio::test]
