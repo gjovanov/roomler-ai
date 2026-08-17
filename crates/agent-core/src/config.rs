@@ -111,6 +111,12 @@ pub struct AgentConfig {
     /// (the U2 program soaks per-host before fleet-wide).
     #[serde(default)]
     pub overlay_server_relay_strategy: Option<bool>,
+    /// Phase A (overlay v3) — DERP always-on floor: open the central `/derp`
+    /// mux at startup unconditionally and advertise `supports_derp_floor`
+    /// (`ROOMLER_NODE_OVERLAY_DERP_FLOOR`). Built-in default: **off** (soaks
+    /// per-host before fleet-wide).
+    #[serde(default)]
+    pub overlay_derp_floor: Option<bool>,
     /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
     /// Built-in default: on.
     #[serde(default)]
@@ -1178,6 +1184,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_direct: None,
         overlay_derp: None,
         overlay_server_relay_strategy: None,
+        overlay_derp_floor: None,
         overlay_mbb: None,
         overlay_lan_iface_filter: None,
         overlay_wsl_mirrored_guard: None,
@@ -1327,7 +1334,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 38] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 39] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1337,6 +1344,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 38]
             "OVERLAY_SERVER_RELAY_STRATEGY",
             cfg.overlay_server_relay_strategy,
         ),
+        ("OVERLAY_DERP_FLOOR", cfg.overlay_derp_floor),
         ("OVERLAY_MBB", cfg.overlay_mbb),
         ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
         ("OVERLAY_WSL_MIRRORED_GUARD", cfg.overlay_wsl_mirrored_guard),

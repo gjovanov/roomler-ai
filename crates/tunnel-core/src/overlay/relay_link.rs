@@ -92,6 +92,13 @@ const REGRADE_OVERRULE_WINDOW: Duration = Duration::from_secs(600);
 /// (the far side's firewall, a coturn fix) — one cheap probe a day.
 const REGRADE_EVIDENCE_CEILING: Duration = Duration::from_secs(86_400);
 
+/// Phase A1 — how long the central `/derp` WS must be continuously DOWN
+/// before relay-request evidence reports `derp_mux_failed`. Above the
+/// reconnect backoff ceiling (10 s) with margin, so an ordinary blip never
+/// clears a server force-DERP pin; a genuine sustained outage (corp
+/// middlebox eating wss:/derp while TURNS works) reports within a minute.
+const DERP_WS_DOWN_EVIDENCE: Duration = Duration::from_secs(60);
+
 /// Unresponsive-peer re-request ladder: consecutive relay deaths 1-2 keep
 /// today's immediate re-request (ordinary transients — coturn blip, worker
 /// roll — must stay snappy); from the 3rd the peer has been dark for ≥ two
@@ -603,6 +610,25 @@ impl RelayCoordinator {
         self.derp_mux_failed = false;
     }
 
+    /// Phase A1 — the DERP-failure evidence that rides every relay request
+    /// (`OverlayRelayRequest.derp_mux_failed`). Two producers:
+    /// * the sticky open-failure latch (`derp_mux_failed` — a force-derp push
+    ///   arrived with NO mux Arc; pre-floor this was the only signal), and
+    /// * a SUSTAINED central-WS outage (`down_for() >= DERP_WS_DOWN_EVIDENCE`)
+    ///   — with the permanent floor mux the Arc always exists, so Arc absence
+    ///   alone would never fire again and the server's U1 silent-veto healer
+    ///   would go blind for the WSS-down-while-control-WS-works class
+    ///   (pc50045, Check Point). The hysteresis keeps a reconnect blip from
+    ///   clearing force-DERP pins.
+    fn derp_evidence_failed(&self) -> bool {
+        self.derp_mux_failed
+            || self
+                .derp_mux
+                .as_ref()
+                .and_then(|m| m.down_for())
+                .is_some_and(|d| d >= DERP_WS_DOWN_EVIDENCE)
+    }
+
     /// Multi-region DERP — is a mux for this regional `derp_url` already open?
     pub fn has_regional_mux(&self, url: &str) -> bool {
         self.regional_muxes.contains_key(url)
@@ -1101,7 +1127,7 @@ impl RelayCoordinator {
                     peer_node_id: node_id,
                     current_kind,
                     reason,
-                    derp_mux_failed: self.derp_mux_failed,
+                    derp_mux_failed: self.derp_evidence_failed(),
                 })
                 .await;
             self.roles.insert(node_id, strat);
@@ -1130,7 +1156,7 @@ impl RelayCoordinator {
                 peer_node_id: node_id,
                 current_kind,
                 reason,
-                derp_mux_failed: self.derp_mux_failed,
+                derp_mux_failed: self.derp_evidence_failed(),
             })
             .await
             .is_err()

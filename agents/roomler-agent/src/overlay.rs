@@ -278,11 +278,12 @@ pub async fn maybe_start(
     };
 
     // Phase D (DERP) — when enabled, provide a factory that opens the persistent
-    // `/derp` WS. The runtime calls it LAZILY — only if THIS node is UDP-blocked
-    // (its srflx gather found nothing) — so a UDP-capable node (which can never
-    // be in a both-UDP-blocked pair) never holds an idle `/derp` WS. When
-    // called, it builds the demux, opens the WS (both peers dial OUT over
-    // TCP/TLS-443), and returns the mux. Default-ON since rc.203.
+    // `/derp` WS. The runtime calls it lazily when THIS node is UDP-blocked
+    // (its srflx gather found nothing) — and, Phase A (overlay v3), also
+    // unconditionally when `overlay_derp_floor` is on (the always-on floor:
+    // every floor-capable node stays registered so pairs can be floored at
+    // birth). When called, it builds the demux, opens the WS (both peers dial
+    // OUT over TCP/TLS-443), and returns the mux. Default-ON since rc.203.
     let derp_factory: Option<DerpMuxFactory> = if tunnel_core::overlay::direct::derp_enabled() {
         let ws_url = cfg.ws_url();
         let token = cfg.agent_token.clone();
@@ -291,7 +292,7 @@ pub async fn maybe_start(
         Some(Box::new(move || {
             let (mux, outbound_rx) = tunnel_core::transport::derp::DerpMux::new(pubkey);
             crate::derp::spawn(&ws_url, &token, &tenant, &mux, outbound_rx);
-            info!("overlay derp: /derp carrier opened (node UDP-blocked; both-UDP-blocked tier)");
+            info!("overlay derp: /derp carrier opened (UDP-blocked tier, or the always-on floor)");
             mux
         }))
     } else {
