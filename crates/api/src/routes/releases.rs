@@ -128,10 +128,36 @@ impl ReleasesCache {
         let mut last_err: Option<String> = None;
         for attempt in 1..=EXPECT_TAG_ATTEMPTS {
             match fetch_releases().await {
-                Ok(releases) => {
-                    let newest = NewestTags::from_releases(&releases);
-                    let satisfied = expect_tag
+                Ok(mut releases) => {
+                    let mut satisfied = expect_tag
                         .is_none_or(|tag| releases.iter().any(|r| !r.draft && r.tag_name == tag));
+                    // GitHub's LIST endpoint lags its by-tag endpoint after
+                    // API incidents (field 2026-08-17: `/releases` returned
+                    // `[]` for 45+ min while `/releases/tags/agent-v0.3.0-
+                    // rc.400` and `/releases/latest` served the published
+                    // release — the whole fleet's update path stalled on an
+                    // index that nothing we run depends on). When the caller
+                    // NAMED the tag it expects, fetch it directly and merge
+                    // it into the payload — the cache then serves it and the
+                    // roll proceeds.
+                    if !satisfied && let Some(tag) = expect_tag {
+                        match fetch_release_by_tag(tag).await {
+                            Ok(r) if !r.draft => {
+                                tracing::info!(
+                                    %tag,
+                                    "releases refresh: list endpoint lagging — recovered the expected tag via the by-tag endpoint"
+                                );
+                                releases.retain(|x| x.tag_name != r.tag_name);
+                                releases.insert(0, r);
+                                satisfied = true;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!(%tag, %e, "releases refresh: by-tag fallback failed too");
+                            }
+                        }
+                    }
+                    let newest = NewestTags::from_releases(&releases);
                     self.store(releases).await;
                     if satisfied {
                         return PodRefresh {
@@ -184,6 +210,26 @@ pub async fn cached(state: &AppState) -> Result<Vec<AgentRelease>, ApiError> {
         .releases_cache
         .get(Duration::from_secs(state.settings.releases.cache_ttl_secs))
         .await
+}
+
+/// One release by exact tag — GitHub's by-tag endpoint stays consistent
+/// through the list-index lag its `/releases` endpoint exhibits after API
+/// incidents (see the fallback in [`ReleasesCache::force_refresh`]).
+async fn fetch_release_by_tag(tag: &str) -> anyhow::Result<AgentRelease> {
+    let url = format!("https://api.github.com/repos/{RELEASES_REPO}/releases/tags/{tag}");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("roomler-ai-api/", env!("CARGO_PKG_VERSION")))
+        .timeout(FETCH_TIMEOUT)
+        .build()?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub returned {}", resp.status());
+    }
+    Ok(resp.json::<AgentRelease>().await?)
 }
 
 async fn fetch_releases() -> anyhow::Result<Vec<AgentRelease>> {
