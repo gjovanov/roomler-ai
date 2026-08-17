@@ -123,7 +123,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_derp_floor",
         "tribool",
-        "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session and advertise the capability. Built-in default: off.",
+        "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session, advertise the capability, and floor fresh pairs at birth. Built-in default: on since rc.400.",
     ),
     (
         "overlay_mbb",
