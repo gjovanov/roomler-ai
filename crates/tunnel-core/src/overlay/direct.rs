@@ -1355,6 +1355,46 @@ pub async fn resolve_stun_worker_ips(stun_urls: &[String]) -> Vec<std::net::IpAd
     out
 }
 
+/// W5(b) — drop typing vantages that ARE this host. A cluster node
+/// co-hosting a coturn/PoP STUNs itself through the kernel hairpin, whose
+/// observed mapping differs from the NIC-path mappings — and ANY pairwise
+/// mismatch classifies "symmetric". Field 2026-08-15: all three cluster
+/// nodes (public-IP, NO NAT) flipped cone→symmetric at the rc.379 boot from
+/// exactly this. The own-IP set comes from `if_addrs` at call time (typing
+/// runs only at boot/rebuild/regather). Pure core; the callers pass the
+/// live set via [`exclude_self_vantages`].
+pub fn exclude_vantages_in(
+    targets: &[SocketAddr],
+    own: &std::collections::HashSet<std::net::IpAddr>,
+) -> Vec<SocketAddr> {
+    let (kept, dropped): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        targets.iter().partition(|t| !own.contains(&t.ip()));
+    if !dropped.is_empty() {
+        tracing::info!(
+            ?dropped,
+            kept = kept.len(),
+            "NAT typing: excluded self-hosted vantages (hairpin mappings fake symmetric)"
+        );
+    }
+    kept
+}
+
+/// [`exclude_vantages_in`] against this host's live interface addresses.
+/// Loopback stays OUT of the own-set: the hairpin problem is the host's
+/// routable IPs (a co-hosted PoP), and loopback vantages only exist in
+/// tests' local responders.
+pub fn exclude_self_vantages(targets: &[SocketAddr]) -> Vec<SocketAddr> {
+    let own: std::collections::HashSet<std::net::IpAddr> = if_addrs::get_if_addrs()
+        .map(|v| {
+            v.into_iter()
+                .map(|i| i.ip())
+                .filter(|ip| !ip.is_loopback())
+                .collect()
+        })
+        .unwrap_or_default();
+    exclude_vantages_in(targets, &own)
+}
+
 /// A1 — classify a NAT from ≥2 observed mappings of ONE local socket toward
 /// distinct vantages: ANY pairwise difference ⇒ endpoint-dependent mapping
 /// (`"symmetric"` — peers cannot punch the advertised port); all equal ⇒
@@ -1387,11 +1427,14 @@ pub async fn probe_nat_type(
     targets: &[SocketAddr],
     attempt_timeout: Duration,
 ) -> Option<&'static str> {
+    // W5(b) — self-hosted vantages produce hairpin mappings that fake
+    // "symmetric" on NAT-less hosts; typing must never consult them.
+    let targets = exclude_self_vantages(targets);
     if targets.len() < 2 {
         return None;
     }
     let mut mappings: Vec<SocketAddr> = Vec::with_capacity(targets.len());
-    for t in targets {
+    for t in &targets {
         if let Ok(m) = crate::transport::stun::srflx_query(sock, *t, attempt_timeout).await {
             mappings.push(m);
         }
@@ -2432,6 +2475,34 @@ mod tests {
         .await;
         assert_eq!(t3.len(), 1);
         assert_eq!(t3[0].ip().to_string(), "5.9.157.221");
+    }
+
+    /// W5(b) — the self-vantage filter: targets whose IP is one of the
+    /// host's own drop from the TYPING set; everything else survives in
+    /// order. Pure core tested with a synthetic own-set (the `if_addrs`
+    /// wrapper is environment-dependent by nature).
+    #[test]
+    fn exclude_vantages_in_drops_own_ips_and_keeps_the_rest() {
+        use std::collections::HashSet;
+        use std::net::IpAddr;
+        let own: HashSet<IpAddr> = ["94.130.141.74", "10.10.20.11"]
+            .into_iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let t = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        let targets = [
+            t("94.130.141.74:3478"), // self (mars-style co-hosted PoP)
+            t("5.9.157.221:3478"),
+            t("10.10.20.11:3478"), // self (pod IP)
+            t("5.9.157.226:3478"),
+        ];
+        let kept = exclude_vantages_in(&targets, &own);
+        assert_eq!(kept, vec![t("5.9.157.221:3478"), t("5.9.157.226:3478")]);
+        // No own-IPs ⇒ untouched; all-own ⇒ empty (typing then abstains —
+        // `None`/unknown beats a hairpin-forged "symmetric").
+        assert_eq!(exclude_vantages_in(&targets, &HashSet::new()), targets);
+        let all_own: HashSet<IpAddr> = targets.iter().map(|t| t.ip()).collect();
+        assert!(exclude_vantages_in(&targets, &all_own).is_empty());
     }
 
     #[tokio::test]
