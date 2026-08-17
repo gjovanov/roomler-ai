@@ -68,6 +68,10 @@ pub struct PeerConfig {
     /// from U2 onward). Part of the both-ends gate for applying a
     /// server-computed `relay_strategy`.
     pub supports_forced_derp: bool,
+    /// Phase A (overlay v3) — the peer runs the DERP always-on floor (its
+    /// central /derp mux is open + registered for the whole session). A pair
+    /// is floored at birth only when BOTH ends carry this.
+    pub supports_derp_floor: bool,
     /// Data-probe — the peer's overlay ENGINE answers the overlay-native
     /// echo probe inline (guaranteed responder, netstack included). The
     /// carrier data-probe uses the engine echo toward such peers and the
@@ -114,6 +118,7 @@ pub fn peer_config_from_netmap(peer: &NetmapPeer) -> Option<PeerConfig> {
         supports_relay_single: peer.supports_relay_single,
         supports_derp: peer.supports_derp,
         supports_forced_derp: peer.supports_forced_derp,
+        supports_derp_floor: peer.supports_derp_floor,
         supports_overlay_echo: peer.supports_overlay_echo,
         relay_strategy: peer.relay_strategy,
         relay_home: peer.relay_home.clone(),

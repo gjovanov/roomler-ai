@@ -1455,6 +1455,36 @@ impl OverlayRuntime {
                     .await;
                 }
                 CarrierMode::Relay => {
+                    // Phase A2 (overlay v3) — DERP floor at birth, BEFORE any
+                    // direct-tier pick: a fresh pair with nothing installed
+                    // gets the derp carrier IMMEDIATELY (both ends
+                    // floor-capable, mux alive), the better-tier coordination
+                    // fires in the SAME pass, and the direct tiers arrive as
+                    // MBB upgrade probes OVER the floor on the next walks
+                    // (the relay-installed arm never inspects relay_kind).
+                    // Placement is load-bearing: the fresh walk short-circuits
+                    // at the first dialable direct tier — field 2026-08-17,
+                    // rc.398: CORPLAP-3's dead srflx punch looped 12 s deadlines
+                    // forever, the relay arm was never reached, and the pair
+                    // sat carrier-less. The floor must come FIRST so a wrong
+                    // direct guess costs an upgrade-probe, never the carrier.
+                    // A withheld floor (mux down / peer not capable) falls
+                    // through to the whole ladder unchanged; DERP-strategy
+                    // pairs skip the redundant TURN request.
+                    if let Some(coord) = relay.as_mut()
+                        && !relay_bq.in_flight.contains_key(&np.node_id)
+                        && !coord.is_tracking(&np.node_id)
+                        && !coord.is_floored(&np.node_id)
+                        && let Some(link) = coord.build_floor(np.node_id, &cfg)
+                    {
+                        let t0 = Instant::now();
+                        self.install_ready(wg, by_node, tun, link, relay_bq).await;
+                        warn_if_slow("install_ready(floor)", t0);
+                        if !coord.strategy_is_derp(&np.node_id, &cfg) {
+                            coord.request(np.node_id, cfg.clone()).await;
+                        }
+                        continue;
+                    }
                     // P9 — fresh-install LAN is PROBE-FIRST under make-before-
                     // break: a same-/24 match is only a HINT the peer is on
                     // this LAN. Two sites on a vendor-default subnet
@@ -2574,6 +2604,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_derp_floor: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             relay_home: None,
