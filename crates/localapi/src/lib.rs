@@ -135,16 +135,6 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub orgs: Vec<OrgStatus>,
     /// Multi-org v2 retirement evidence — cumulative compensation-layer
-    /// activity since daemon start (`tunnel_core::evidence`). The Phase-3
-    /// deletion gate reads these: fleet-wide zeros over the soak window is
-    /// the license to delete the layer. `None` from a daemon predating the
-    /// counters; consumers DIFF two readings, never judge absolutes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mux_nat_rewrites: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mux_nat_restores: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skip_as_source_flips: Option<u64>,
     /// PR-B1 — per-bound-direct-socket receive liveness, copied verbatim from
     /// [`OverlayView::direct_socks`]. A socket whose `rx_pkts` is frozen while
     /// peers punch its advertised endpoint is the 2026-08-10 wedge signature
@@ -1916,9 +1906,6 @@ mod tests {
                 srflx: None,
                 warm_relay: None,
                 orgs: Vec::new(),
-                mux_nat_rewrites: None,
-                mux_nat_restores: None,
-                skip_as_source_flips: None,
                 direct_socks: Vec::new(),
                 direct_bind_walks: None,
                 roam_adoptions: None,
