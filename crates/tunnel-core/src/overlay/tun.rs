@@ -62,23 +62,6 @@ pub trait TunIo: Send + Sync {
     /// mesh). Best-effort; never fails the caller.
     async fn del_peer_route(&self, _peer: std::net::Ipv4Addr) {}
 
-    /// Multi-org twin of [`add_peer_route`](Self::add_peer_route) carrying the
-    /// org's own address. On Linux the route gets a `src` hint (RTA_PREFSRC)
-    /// so the kernel's source selection can never pick ANOTHER org's address
-    /// for this peer — with nested org blocks on one shared device the
-    /// unhinted choice is address-order-dependent (field 2026-08-09: the
-    /// Linux fleet nodes sourced grox-bound traffic from their second org's
-    /// address, tripping every receiver's RPF). Default: the plain call
-    /// (single-org devices, mocks, netstack; Windows routes cannot carry a
-    /// source hint — the mux NAT in `tun_mux` covers it there).
-    async fn add_peer_route_from(
-        &self,
-        peer: std::net::Ipv4Addr,
-        _src: std::net::Ipv4Addr,
-    ) -> std::io::Result<()> {
-        self.add_peer_route(peer).await
-    }
-
     /// rc.278 — evict any FOREIGN `/32` for **our own** overlay address.
     ///
     /// [`add_peer_route`] has evicted VPN-installed competing `/32`s for every
@@ -119,18 +102,6 @@ pub trait TunIo: Send + Sync {
     /// Remove a CIDR route installed by [`add_cidr_route`]. Best-effort.
     async fn del_cidr_route(&self, _cidr: &str) {}
 
-    /// Multi-org twin of [`add_cidr_route`](Self::add_cidr_route) — see
-    /// [`add_peer_route_from`](Self::add_peer_route_from). The source hint
-    /// applies to v4 CIDRs only; v6 (and every non-Linux platform) delegates
-    /// unchanged.
-    async fn add_cidr_route_from(
-        &self,
-        cidr: &str,
-        _src: std::net::Ipv4Addr,
-    ) -> std::io::Result<()> {
-        self.add_cidr_route(cidr).await
-    }
-
     /// Change B (corp-gateway leak) — maintain the BLOCK-FLOOR routes: the
     /// four `plen+2` sub-prefixes of the connected overlay block, installed
     /// via this device. A full-tunnel VPN that claims a LONGER prefix than the
@@ -153,7 +124,7 @@ pub trait TunIo: Send + Sync {
 
     /// Multi-org twin of [`defend_block_floor`](Self::defend_block_floor) —
     /// maintain the floors of the GIVEN block instead of the device's own
-    /// connected block. A [`tun_mux`](super::tun_mux) port forwards here with
+    /// connected block. Historically the shared-TUN mux ports forwarded here with
     /// ITS org's block: the shared device's connected block is the CREATOR
     /// org's only, so the plain method would floor one org's block and
     /// silently skip every sibling's. Default no-op, like the plain method.
@@ -1048,32 +1019,21 @@ mod system {
     ///   so the skew — and the 4×150 ms polling loop that tolerated it —
     ///   cannot exist here.
     ///
-    /// The multi-org `SkipAsSource` reconcile also lives here: on one shared
-    /// adapter, Windows source-selection prefers the MOST-SPECIFIC address
-    /// regardless of destination, so a carved block nested inside another
-    /// org's block (CORPLAP-1: jovanov `100.65.0.5/22` inside grox's
-    /// `100.64.0.28/10`) gets picked as the source for the OUTER org's
-    /// destinations — and single-org receivers then reply into their own
-    /// on-link blackhole (field 2026-08-09, 100 % initiated-only loss). The
-    /// hand-applied mitigation (`SkipAsSource=$true` on the nested address)
-    /// was reverted by every restart; [`reconcile_skip_as_source`] re-derives
-    /// it from the address-table geometry after every add/remove, making it
-    /// durable. (The full fix — egress source normalization in `tun_mux` —
-    /// is separate; this keeps the field mitigation standing until then.)
+    /// (The multi-org `SkipAsSource` reconcile that lived here died with the
+    /// shared-TUN mux in W7c: per-org adapters hold ONE address each, so the
+    /// nested-block source-selection geometry cannot exist.)
     #[cfg(windows)]
     mod winaddr {
-        use std::net::{IpAddr, Ipv4Addr};
+        use std::net::IpAddr;
 
         use windows_sys::Win32::Foundation::{
             ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
         };
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            CreateUnicastIpAddressEntry, DeleteUnicastIpAddressEntry, FreeMibTable,
-            GetUnicastIpAddressEntry, GetUnicastIpAddressTable, InitializeUnicastIpAddressEntry,
-            MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE, SetUnicastIpAddressEntry,
+            CreateUnicastIpAddressEntry, DeleteUnicastIpAddressEntry,
+            InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
         };
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-        use windows_sys::Win32::Networking::WinSock::AF_INET;
 
         /// A minimal row identifying `ip` on `luid` — the (luid, address) pair
         /// is the key every Get/Delete matches on.
@@ -1124,8 +1084,17 @@ mod system {
         }
 
         /// Every IPv4 `(address, prefix_len, skip_as_source)` currently on
-        /// `luid` — the geometry input for the SkipAsSource reconcile.
-        pub fn list_v4(luid: u64) -> std::io::Result<Vec<(Ipv4Addr, u8, bool)>> {
+        /// `luid`. Test-only since W7c removed its production caller (the
+        /// SkipAsSource reconcile): the manual `manual_list_v4_probe` keeps
+        /// it as the live-field FFI diagnostic that caught the 2.0.64.100
+        /// byte-flip a unit test structurally can't.
+        #[cfg(test)]
+        pub fn list_v4(luid: u64) -> std::io::Result<Vec<(std::net::Ipv4Addr, u8, bool)>> {
+            use std::net::Ipv4Addr;
+            use windows_sys::Win32::NetworkManagement::IpHelper::{
+                FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE,
+            };
+            use windows_sys::Win32::Networking::WinSock::AF_INET;
             let mut out = Vec::new();
             // SAFETY: GetUnicastIpAddressTable allocates a snapshot we iterate
             // then free — same idiom as `winroute::evict_competing_v4`.
@@ -1156,77 +1125,6 @@ mod system {
             }
             Ok(out)
         }
-
-        /// Flip one address's `SkipAsSource` in place (Get → mutate → Set; no
-        /// delete/re-add, so the connected route never flaps).
-        fn set_skip_as_source(luid: u64, ip: Ipv4Addr, skip: bool) -> std::io::Result<()> {
-            let mut r = row_for(luid, IpAddr::V4(ip));
-            // SAFETY: Get fills the row matched by (luid, address); Set writes
-            // the mutated copy back.
-            unsafe {
-                let rc = GetUnicastIpAddressEntry(&mut r);
-                if rc != NO_ERROR {
-                    return Err(std::io::Error::from_raw_os_error(rc as i32));
-                }
-                if r.SkipAsSource == skip {
-                    return Ok(());
-                }
-                r.SkipAsSource = skip;
-                let rc = SetUnicastIpAddressEntry(&r);
-                if rc != NO_ERROR {
-                    return Err(std::io::Error::from_raw_os_error(rc as i32));
-                }
-            }
-            crate::evidence::SKIP_AS_SOURCE_FLIPS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(
-                %ip, skip,
-                "overlay: SkipAsSource reconciled (nested multi-org block source-selection guard)"
-            );
-            Ok(())
-        }
-
-        /// Multi-org source-selection guard — re-derive every overlay
-        /// address's `SkipAsSource` from the adapter's current geometry: an
-        /// address whose prefix nests STRICTLY inside another address's
-        /// prefix on the same adapter gets `skip = true` (Windows would
-        /// otherwise prefer it as the source for the outer block's
-        /// destinations); everything else gets `skip = false`. Deterministic
-        /// regardless of add order, so a restart, a re-claim, or an adapter
-        /// recreate always converges to the same flags — the property the
-        /// hand-applied CORPLAP-1 mitigation lacked. Best-effort: geometry we
-        /// cannot read leaves the flags as they are.
-        pub fn reconcile_skip_as_source(luid: u64) {
-            let Ok(addrs) = list_v4(luid) else { return };
-            for (ip, plen, cur) in &addrs {
-                let desired = addrs.iter().any(|(oip, oplen, _)| {
-                    (oip, oplen) != (ip, plen)
-                        && super::nests_strictly_within((*ip, *plen), (*oip, *oplen))
-                });
-                if *cur != desired
-                    && let Err(e) = set_skip_as_source(luid, *ip, desired)
-                {
-                    tracing::warn!(%ip, desired, %e, "overlay: SkipAsSource reconcile failed");
-                }
-            }
-        }
-    }
-
-    /// Track N1 (pure) — does prefix `a` nest STRICTLY inside prefix `b`?
-    /// True when `a`'s prefix is longer than `b`'s and `a`'s network falls
-    /// inside `b`. This is the exact geometry where Windows source-selection
-    /// picks the wrong org's address on a shared adapter (the more-specific
-    /// address wins for ANY destination), so it is the trigger for the
-    /// `SkipAsSource` guard.
-    #[cfg(any(windows, test))]
-    pub(crate) fn nests_strictly_within(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
-        let (aip, aplen) = a;
-        let (bip, bplen) = b;
-        if aplen <= bplen || bplen == 0 || bplen > 32 {
-            return false;
-        }
-        let mask = !0u32 << (32 - u32::from(bplen));
-        (u32::from(aip) & mask) == (u32::from(bip) & mask)
     }
 
     /// rc.288 — prefix length of an IPv4 netmask, e.g. `255.192.0.0` yields
@@ -1300,7 +1198,7 @@ mod system {
         /// asserted, 2 = withheld), so the defense wave logs the DECISION
         /// only when it flips instead of once per 2–30 s wave. Keyed by
         /// block because a shared multi-org device floors one block per org
-        /// (each [`tun_mux`](super::tun_mux) port forwards its own), and
+        /// (historically one per shared-mux org port), and
         /// their decisions flip independently.
         #[cfg(windows)]
         floor_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), u8)>>,
@@ -1731,10 +1629,6 @@ mod system {
                 // "already exists" at all).
                 let luid = self.dev.tun_luid();
                 winaddr::ensure(luid, std::net::IpAddr::V4(ip), prefix)?;
-                // Multi-org source-selection guard: a carved block nested in
-                // another org's block must not be picked as the source for
-                // the outer block's destinations (field 2026-08-09, CORPLAP-1).
-                winaddr::reconcile_skip_as_source(luid);
                 Ok(())
             }
             #[cfg(target_os = "linux")]
@@ -1808,8 +1702,6 @@ mod system {
                 let _ = (prefix, &run); // Linux/macOS shell out; Windows is typed (N1).
                 let luid = self.dev.tun_luid();
                 winaddr::remove(luid, std::net::IpAddr::V4(ip));
-                // Removing a block can un-nest a survivor — heal the flags.
-                winaddr::reconcile_skip_as_source(luid);
             }
             #[cfg(target_os = "linux")]
             run(
@@ -2233,35 +2125,6 @@ mod system {
             }
         }
 
-        /// Linux: the peer `/32` with `src <self>` (RTA_PREFSRC), so kernel
-        /// source selection is pinned per-route — see
-        /// [`TunIo::add_peer_route_from`]. Every other platform: the plain
-        /// route (Windows has no per-route source hint; the mux NAT covers
-        /// the multi-org case there).
-        async fn add_peer_route_from(&self, peer: Ipv4Addr, src: Ipv4Addr) -> std::io::Result<()> {
-            #[cfg(target_os = "linux")]
-            {
-                run_cmd(
-                    "ip",
-                    vec![
-                        "route".into(),
-                        "replace".into(),
-                        format!("{peer}/32"),
-                        "dev".into(),
-                        self.if_name.clone(),
-                        "src".into(),
-                        src.to_string(),
-                    ],
-                )
-                .await
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = src;
-                self.add_peer_route(peer).await
-            }
-        }
-
         /// rc.278 — see [`TunIo::defend_self_route`]. Windows-only: a VPN's
         /// metric-1 `/32` for OUR OWN overlay address out-ranks the metric-256
         /// on-link route Windows derives from the interface address, diverting
@@ -2420,36 +2283,6 @@ mod system {
             {
                 let _ = (cidr, v6);
                 Ok(())
-            }
-        }
-
-        /// Linux + v4: the subnet route with `src <self>` — see
-        /// [`TunIo::add_cidr_route_from`]. v6 and every other platform
-        /// delegate to the plain call.
-        async fn add_cidr_route_from(&self, cidr: &str, src: Ipv4Addr) -> std::io::Result<()> {
-            #[cfg(target_os = "linux")]
-            {
-                if is_v6_cidr(cidr) {
-                    return self.add_cidr_route(cidr).await;
-                }
-                run_cmd(
-                    "ip",
-                    vec![
-                        "route".into(),
-                        "replace".into(),
-                        cidr.to_string(),
-                        "dev".into(),
-                        self.if_name.clone(),
-                        "src".into(),
-                        src.to_string(),
-                    ],
-                )
-                .await
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = src;
-                self.add_cidr_route(cidr).await
             }
         }
 
@@ -3361,44 +3194,6 @@ mod system {
             // the multi-address path.
             assert!(m(mac, Ipv4Addr::new(100, 65, 0, 5)));
             assert!(!m("", Ipv4Addr::new(100, 64, 0, 28)));
-        }
-
-        /// Track N1 — the multi-org source-selection geometry: an address
-        /// nests STRICTLY inside another when its prefix is longer and its
-        /// network falls inside the other's. This is what decides
-        /// `SkipAsSource` (Windows prefers the most-specific address as a
-        /// source for ANY destination — CORPLAP-1's jovanov /22 inside grox's
-        /// /10 sourced grox-bound packets and single-org receivers replied
-        /// into their own on-link blackhole, field 2026-08-09).
-        #[test]
-        fn nesting_rule_matches_the_field_geometry() {
-            use super::nests_strictly_within as nests;
-            use std::net::Ipv4Addr;
-            let grox = (Ipv4Addr::new(100, 64, 0, 28), 10u8);
-            let jovanov = (Ipv4Addr::new(100, 65, 0, 5), 22u8);
-            // The CORPLAP-1 shape: the carved /22 nests inside the /10 — and
-            // only in that direction.
-            assert!(nests(jovanov, grox));
-            assert!(!nests(grox, jovanov));
-            // Nothing nests in itself; equal prefixes never nest.
-            assert!(!nests(grox, grox));
-            assert!(!nests(
-                (Ipv4Addr::new(100, 64, 0, 1), 22),
-                (Ipv4Addr::new(100, 64, 0, 2), 22)
-            ));
-            // Disjoint blocks: no nesting, no flags.
-            assert!(!nests(
-                (Ipv4Addr::new(100, 66, 0, 1), 22),
-                (Ipv4Addr::new(100, 72, 0, 1), 22)
-            ));
-            // A /0 outer would swallow everything — deliberately never an
-            // outer (a stray default-shaped address must not flag the world).
-            assert!(!nests(jovanov, (Ipv4Addr::new(0, 0, 0, 0), 0)));
-            // Host-bit-dirty inputs are masked, not trusted.
-            assert!(nests(
-                (Ipv4Addr::new(100, 65, 3, 99), 22),
-                (Ipv4Addr::new(100, 127, 255, 255), 10)
-            ));
         }
 
         /// Multi-org P2a — the boot-reconciler keep-set accepts ANY on-link
