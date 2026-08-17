@@ -30,6 +30,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
@@ -160,6 +161,10 @@ pub struct DerpMux {
     self_pubkey: DerpPubKey,
     ws_out: mpsc::Sender<Vec<u8>>,
     alive: Arc<AtomicBool>,
+    /// When the CURRENT outage began (`None` while up). Lets the evidence
+    /// path distinguish a reconnect blip from a sustained WSS outage — the
+    /// U1 healer must not clear force-DERP pins on a flap (Phase A1).
+    down_since: Mutex<Option<Instant>>,
     peers: Mutex<HashMap<DerpPubKey, mpsc::Sender<Vec<u8>>>>,
 }
 
@@ -174,6 +179,7 @@ impl DerpMux {
             self_pubkey,
             ws_out,
             alive: Arc::new(AtomicBool::new(true)),
+            down_since: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         });
         (mux, ws_out_rx)
@@ -217,19 +223,34 @@ impl DerpMux {
     }
 
     /// Mark the node WS down — subsequent `DerpConn::send_to` calls error so the
-    /// carrier's `dead` latch fires and the sweep rebuilds.
+    /// carrier's `dead` latch fires and the sweep rebuilds. The first
+    /// `mark_down` of an outage stamps `down_since`; repeats keep the
+    /// original stamp so `down_for` measures the whole outage.
     pub fn mark_down(&self) {
         self.alive.store(false, Ordering::Relaxed);
+        let mut since = self.down_since.lock().unwrap();
+        if since.is_none() {
+            *since = Some(Instant::now());
+        }
     }
 
     /// Mark the node WS up again (after a reconnect + re-register).
     pub fn mark_up(&self) {
         self.alive.store(true, Ordering::Relaxed);
+        *self.down_since.lock().unwrap() = None;
     }
 
     /// Whether the node WS is currently up.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// How long the WS has been down, or `None` while it is up.
+    pub fn down_for(&self) -> Option<Duration> {
+        if self.is_alive() {
+            return None;
+        }
+        self.down_since.lock().unwrap().map(|t| t.elapsed())
     }
 }
 
@@ -239,6 +260,35 @@ mod tests {
 
     fn pk(b: u8) -> DerpPubKey {
         [b; 32]
+    }
+
+    /// Phase A1 — `down_for` measures the WHOLE outage (repeated
+    /// `mark_down`s keep the original stamp) and clears on `mark_up`, so
+    /// the evidence path can apply hysteresis without flap noise.
+    #[test]
+    fn down_for_spans_the_outage_and_clears_on_up() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        assert!(mux.is_alive());
+        assert_eq!(mux.down_for(), None, "up ⇒ no outage duration");
+
+        mux.mark_down();
+        let first = mux.down_for().expect("down ⇒ Some(elapsed)");
+        std::thread::sleep(Duration::from_millis(15));
+        mux.mark_down(); // a repeat must NOT reset the stamp
+        let later = mux.down_for().expect("still down");
+        assert!(
+            later >= first + Duration::from_millis(10),
+            "repeated mark_down must keep the original outage start"
+        );
+
+        mux.mark_up();
+        assert!(mux.is_alive());
+        assert_eq!(mux.down_for(), None, "up again ⇒ cleared");
+        mux.mark_down();
+        assert!(
+            mux.down_for().expect("fresh outage") < later,
+            "a NEW outage restarts the clock"
+        );
     }
 
     #[tokio::test]
