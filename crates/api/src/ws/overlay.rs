@@ -1658,10 +1658,19 @@ fn verdict_from_nodes(
     ) else {
         return None;
     };
-    Some(relay_verdict_core(
-        pinned,
-        recipient.supports_derp && peer.supports_derp,
-        recipient.supports_relay_single && peer.supports_relay_single,
+    // B3 — MEASURED capability supersedes the derived inputs when BOTH ends
+    // hold a fresh vector carrying the relay-band bit (mirrors the client's
+    // rule in `relay_strategy` exactly: one-sided measurement keeps the
+    // legacy rules, so a mixed pair can never split roles; no srflx ANDing
+    // on the measured branch — the probe ran over the exact dial path).
+    let measured = match (
+        fresh_caps(recipient).and_then(|c| c.relay_band_udp),
+        fresh_caps(peer).and_then(|c| c.relay_band_udp),
+    ) {
+        (Some(mine), Some(theirs)) => Some((mine, theirs)),
+        _ => None,
+    };
+    let (my_udp_ok, peer_udp_ok) = measured.unwrap_or((
         effective_udp_ok(
             !recipient.srflx_endpoints.is_empty(),
             recipient.udp_dialer_ok,
@@ -1672,6 +1681,13 @@ fn verdict_from_nodes(
             peer.udp_dialer_ok,
             recipient.udp_dialer_ok,
         ),
+    ));
+    Some(relay_verdict_core(
+        pinned,
+        recipient.supports_derp && peer.supports_derp,
+        recipient.supports_relay_single && peer.supports_relay_single,
+        my_udp_ok,
+        peer_udp_ok,
         !recipient.srflx_endpoints.is_empty(),
         !peer.srflx_endpoints.is_empty(),
         &my_pk,
@@ -2367,6 +2383,79 @@ mod tests {
         b.supports_server_relay_strategy = false;
         assert_eq!(verdict_from_nodes(&a, &b, false), None);
         assert_eq!(verdict_from_nodes(&b, &a, false), None);
+    }
+
+    /// B3 — the MEASURED relay-band pair supersedes the srflx/latch inputs
+    /// when BOTH ends hold a fresh vector (mirrors the client's
+    /// `relay_strategy` measured branch); one-sided or STALE measurement
+    /// keeps the legacy rules verbatim.
+    #[test]
+    fn server_verdict_measured_branch_and_freshness() {
+        use roomler_ai_remote_control::signaling::CapVectorWire;
+        let caps = |band: Option<bool>| {
+            Some(CapVectorWire {
+                stun_udp: true,
+                relay_band_udp: band,
+                derp_ws_ok: true,
+            })
+        };
+        let mut a = node("a", "100.64.0.2");
+        let mut b = node("b", "100.64.0.4");
+        a.wg_public_key = BASE64.encode([1u8; 32]);
+        b.wg_public_key = BASE64.encode([9u8; 32]);
+        a.supports_server_relay_strategy = true;
+        b.supports_server_relay_strategy = true;
+        // The CORPLAP-3 case, measured: srflx PRESENT + no latch, but the probe
+        // proved a's relay band is dropped ⇒ a anchors, b dials — despite
+        // the srflx/pubkey inputs saying otherwise.
+        a.srflx_endpoints = vec!["1.2.3.4:5".into()];
+        b.srflx_endpoints = vec!["6.7.8.9:0".into()];
+        a.caps = caps(Some(false));
+        a.caps_measured_at = Some(bson::DateTime::now());
+        b.caps = caps(Some(true));
+        b.caps_measured_at = Some(bson::DateTime::now());
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor),
+            "measured relay-band-blocked host anchors despite srflx presence"
+        );
+        assert_eq!(
+            verdict_from_nodes(&b, &a, false),
+            Some(RelayStrategyWire::SingleRelayDialer),
+            "reverse edge stays symmetric on the measured inputs"
+        );
+        // Measurement outranks the latch: a's latch says blocked, but a
+        // fresh probe proved the band works ⇒ legacy latch inputs ignored.
+        a.udp_dialer_ok = Some(false);
+        a.caps = caps(Some(true));
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor),
+            "both measured-capable ⇒ pubkey tie-break (smaller anchors), latch ignored"
+        );
+        // One-sided measurement (peer's vector carries no band bit) ⇒ the
+        // legacy rules apply — and the latch now counts again (b carries
+        // the honesty field, so a's Some(false) is honoured).
+        b.caps = caps(None);
+        b.udp_dialer_ok = Some(true);
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor),
+            "one-sided measurement ⇒ legacy inputs (latched a anchors)"
+        );
+        // STALE measurement = absent: an hour-old vector on a must not
+        // engage the measured branch either.
+        a.udp_dialer_ok = None;
+        a.caps = caps(Some(false));
+        a.caps_measured_at = Some(bson::DateTime::from_millis(
+            bson::DateTime::now().timestamp_millis() - 61 * 60 * 1000,
+        ));
+        b.caps = caps(Some(true));
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor),
+            "stale vector ⇒ legacy srflx inputs (both udp-ok ⇒ smaller pubkey anchors)"
+        );
     }
 
     #[test]

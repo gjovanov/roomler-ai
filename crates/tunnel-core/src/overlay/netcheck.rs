@@ -74,6 +74,18 @@ pub struct CapVector {
 /// egress policy for every org runtime, like netstate/dialer).
 static CURRENT: Mutex<Option<(CapVector, Instant)>> = Mutex::new(None);
 
+/// B3 — the client-side freshness gate, same constant as the server's
+/// `fresh_caps`: a vector older than 3× the 20-min cadence is treated as
+/// ABSENT, so a stalled prober can never stay authoritative for selection.
+pub const FRESHNESS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The latest vector iff younger than [`FRESHNESS_MAX_AGE`] — the ONLY
+/// accessor selection inputs may use ([`current`] keeps the raw slot for
+/// observability).
+pub fn current_fresh() -> Option<CapVector> {
+    current().and_then(|(v, age)| (age < FRESHNESS_MAX_AGE).then_some(v))
+}
+
 /// The latest vector, if any measurement has completed, with its age.
 pub fn current() -> Option<(CapVector, Duration)> {
     CURRENT
@@ -228,11 +240,18 @@ mod tests {
         let (got, age) = current().expect("published");
         assert_eq!(got, v);
         assert!(age < Duration::from_secs(5));
-        // Re-publish unchanged keeps it; invalidate clears it.
+        // B3 — a just-published vector passes the freshness gate (the
+        // stale side of the gate can't be exercised against a monotonic
+        // clock; the constant equals the server's `fresh_caps` window,
+        // which owns the stale-side test).
+        assert_eq!(current_fresh().as_ref(), Some(&got));
+        // Re-publish unchanged keeps it; invalidate clears it (and the
+        // fresh view with it).
         publish(v);
         assert!(current().is_some());
         invalidate_on_network_change();
         assert!(current().is_none());
+        assert!(current_fresh().is_none());
     }
 
     /// The probe against a loopback echo standing in for coturn: the raw
