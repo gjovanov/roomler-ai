@@ -1384,10 +1384,15 @@ impl CarrierPlane {
         // the mappings that produced it were never logged. Cost: one short
         // Vec per gather (gathers are rare: boot/rebuild/regather).
         let mut typing: Vec<String> = Vec::new();
-        let my_nat = if targets.len() >= 2 {
+        // W5(b) — typing must never consult a vantage that IS this host
+        // (kernel-hairpin mappings fake "symmetric" on NAT-less cluster
+        // nodes). The GATHER above keeps the full list — only the CLASSIFIER
+        // input is filtered.
+        let typing_targets = direct::exclude_self_vantages(&targets);
+        let my_nat = if typing_targets.len() >= 2 {
             let punch_sock = pairs[0].1.clone();
-            let mut mappings: Vec<SocketAddr> = Vec::with_capacity(targets.len());
-            for t in &targets {
+            let mut mappings: Vec<SocketAddr> = Vec::with_capacity(typing_targets.len());
+            for t in &typing_targets {
                 match crate::transport::stun::srflx_query_via_sink(
                     &punch_sock,
                     rx,
