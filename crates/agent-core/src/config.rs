@@ -211,13 +211,6 @@ pub struct AgentConfig {
     /// Built-in default: off.
     #[serde(default)]
     pub overlay_relay_tls: Option<bool>,
-    /// Multi-org mux NAT — rewrite a cross-org egress SOURCE the OS picked
-    /// from the wrong org on the shared adapter, and restore matching reply
-    /// destinations (`ROOMLER_NODE_OVERLAY_MUX_NAT`). Built-in default: on.
-    /// `off` restores the pre-fix behavior (single-org hosts are unaffected
-    /// either way).
-    #[serde(default)]
-    pub overlay_mux_nat: Option<bool>,
     /// Multi-org v2 shared carrier plane — ONE process-wide direct-socket
     /// set shared by every org's engine, inbound demultiplexed by WireGuard
     /// receiver index (`ROOMLER_NODE_OVERLAY_SHARED_CARRIER`). Retires the
@@ -226,14 +219,6 @@ pub struct AgentConfig {
     /// (explicit `false` is the kill switch).
     #[serde(default)]
     pub overlay_shared_carrier: Option<bool>,
-    /// Multi-org v2 per-org TUN adapters — each org gets its OWN device
-    /// (own address space + route domain; one address per adapter, so OS
-    /// source selection is trivially correct) instead of the shared-TUN mux
-    /// (`ROOMLER_NODE_OVERLAY_TUN_PER_ORG`). Built-in default: on since
-    /// rc.339 (explicit `false` falls back to the shared-TUN mux). Only
-    /// engages when `overlay_multi_org` is on.
-    #[serde(default)]
-    pub overlay_tun_per_org: Option<bool>,
     /// A3 — WG-style endpoint roaming: adopt a peer's observed source after an
     /// AUTHENTICATED inbound from it, repointing the carrier in place
     /// (`ROOMLER_NODE_OVERLAY_ROAM`). Completes a punch from a symmetric-NAT
@@ -1201,9 +1186,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
         overlay_relay_tls: None,
-        overlay_mux_nat: None,
         overlay_shared_carrier: None,
-        overlay_tun_per_org: None,
         overlay_roam: None,
         overlay_plane_watchdog: None,
         overlay_session_trace: None,
@@ -1334,7 +1317,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 39] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 37] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1357,9 +1340,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 39]
         ("OVERLAY_ROUTE_EVENTS", cfg.overlay_route_events),
         ("OVERLAY_NETMON", cfg.overlay_netmon),
         ("OVERLAY_RELAY_TLS", cfg.overlay_relay_tls),
-        ("OVERLAY_MUX_NAT", cfg.overlay_mux_nat),
         ("OVERLAY_SHARED_CARRIER", cfg.overlay_shared_carrier),
-        ("OVERLAY_TUN_PER_ORG", cfg.overlay_tun_per_org),
         ("OVERLAY_ROAM", cfg.overlay_roam),
         ("OVERLAY_PLANE_WATCHDOG", cfg.overlay_plane_watchdog),
         ("OVERLAY_SESSION_TRACE", cfg.overlay_session_trace),
