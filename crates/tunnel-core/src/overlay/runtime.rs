@@ -834,7 +834,7 @@ async fn run_srflx_keepalive(
                     // Re-send our NAT type with every advert so the server
                     // never clears it.
                     nat: nat.clone(),
-                    udp_dialer_ok: Some(crate::overlay::dialer::udp_dialer_ok()),
+                    udp_dialer_ok: Some(crate::overlay::dialer::advertised_dialer_ok()),
                 })
                 .await
                 .is_err();
@@ -971,7 +971,7 @@ fn spawn_plane_srflx_forwarder(
                     nat: s.my_nat,
                     // Read at SEND time so a mid-life latch flip rides the
                     // next periodic re-advert without any extra plumbing.
-                    udp_dialer_ok: Some(crate::overlay::dialer::udp_dialer_ok()),
+                    udp_dialer_ok: Some(crate::overlay::dialer::advertised_dialer_ok()),
                 })
                 .await;
             debug!(self_v4 = %label, trigger, candidates = n, ok = sent.is_ok(),
@@ -2651,6 +2651,14 @@ impl OverlayRuntime {
                                 netcheck_next = Instant::now() + Duration::from_secs(60);
                                 if let Some(coord) = relay.as_mut() {
                                     coord.set_udp_dialer_ok(super::dialer::udp_dialer_ok());
+                                    // B3 — the invalidate above just emptied
+                                    // the slot; mirror the absence so roles
+                                    // fall back to presence rules until the
+                                    // re-measure lands.
+                                    coord.set_relay_band_udp(
+                                        super::netcheck::current_fresh()
+                                            .and_then(|v| v.relay_band_udp),
+                                    );
                                 }
                                 self.shadow(|s| s.mon.on_network_changed());
                                 netchange_poke_due = false; // consumed inline
@@ -2837,6 +2845,16 @@ impl OverlayRuntime {
                     // spawns the dedicated probe allocation when
                     // `netcheck_pending` rides it). Shares the warm request
                     // wire; a grant that warm doesn't need is a no-op there.
+                    // B3 — a dialer-role conviction is a DETECTOR now: it
+                    // requests an immediate re-measure instead of (only)
+                    // flipping roles through the latch.
+                    if netcheck_enabled
+                        && super::dialer::take_probe_request()
+                        && !netcheck_pending
+                    {
+                        info!("netcheck: dialer-role conviction — immediate re-measure scheduled");
+                        netcheck_next = now;
+                    }
                     if netcheck_enabled && !netcheck_pending && now >= netcheck_next {
                         netcheck_pending = true;
                         netcheck_next = now + super::netcheck::NETCHECK_INTERVAL;
@@ -2848,6 +2866,14 @@ impl OverlayRuntime {
                         {
                             debug!("netcheck: measurement due — creds requested");
                         }
+                    }
+                    // B3 — keep the coordinator's measured-verdict mirror in
+                    // step with the slot each tick (the publish runs
+                    // off-loop; freshness expiry must also read as a change).
+                    if let Some(coord) = relay.as_mut() {
+                        coord.set_relay_band_udp(
+                            super::netcheck::current_fresh().and_then(|v| v.relay_band_udp),
+                        );
                     }
                     self.warm_relay_status = Some(warm.status(now));
                 },
@@ -3008,7 +3034,7 @@ impl OverlayRuntime {
                                 .send(ClientMsg::OverlaySrflx {
                                     candidates: srflx_advertised.clone(),
                                     nat: srflx_my_nat.clone(),
-                                    udp_dialer_ok: Some(super::dialer::udp_dialer_ok()),
+                                    udp_dialer_ok: Some(super::dialer::advertised_dialer_ok()),
                                 })
                                 .await;
                         }
