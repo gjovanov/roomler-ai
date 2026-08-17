@@ -290,6 +290,12 @@ pub struct RelayCoordinator {
     /// like a udp-blocked host, and the role split treats it as such against
     /// honesty-capable peers.
     my_udp_dialer_ok: bool,
+    /// B3 — our own MEASURED relay-band verdict (netcheck `relay_band_udp`),
+    /// synced by the runtime at sweep time like the latch mirror above, and
+    /// already freshness-gated at the sync site (`None` = no fresh vector).
+    /// When BOTH this and the peer's netmap-carried bit are present, the
+    /// measured pair supersedes the srflx/latch inference in the role split.
+    my_relay_band_udp: Option<bool>,
     /// Phase D — v1 single-relay DIALER links awaiting the anchor's advertised
     /// relay `R`. We hold NO allocation for these (the anchor owns the sole
     /// relay); each becomes a raw [`UdpRelayConn`](crate::transport::relay::UdpRelayConn)
@@ -439,7 +445,12 @@ pub struct RelayCoordinator {
 /// into "something changed". Only meaningful within one process lifetime —
 /// `DefaultHasher` is not stable across runs — which is all the coordinator's
 /// in-memory maps live for anyway.
-fn strategy_fingerprint(my_udp_relay_ok: bool, my_udp_dialer_ok: bool, peer: &PeerConfig) -> u64 {
+fn strategy_fingerprint(
+    my_udp_relay_ok: bool,
+    my_udp_dialer_ok: bool,
+    my_relay_band_udp: Option<bool>,
+    peer: &PeerConfig,
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -449,6 +460,10 @@ fn strategy_fingerprint(my_udp_relay_ok: bool, my_udp_dialer_ok: bool, peer: &Pe
     // re-establish the pair on the corrected roles.
     my_udp_dialer_ok.hash(&mut h);
     peer.udp_dialer_ok.hash(&mut h);
+    // B3 — the measured pair likewise: a fresh vector landing (either
+    // side), changing, or expiring must re-establish on the new roles.
+    my_relay_band_udp.hash(&mut h);
+    peer.relay_band_udp.hash(&mut h);
     peer.supports_relay_single.hash(&mut h);
     peer.supports_derp.hash(&mut h);
     // Order-independent: the netmap does not promise a stable ordering, and a
@@ -491,6 +506,11 @@ impl RelayCoordinator {
                 && !super::direct::relay_tls_forced(),
             my_udp_relay_ok,
             my_udp_dialer_ok: super::dialer::udp_dialer_ok(),
+            // B3 — deliberately NOT read from the netcheck slot here: the
+            // runtime tick syncs it within one cycle, the slot is empty at
+            // process start (45 s startup delay) anyway, and a construction-
+            // time read would couple every unit test to process-wide state.
+            my_relay_band_udp: None,
             dialing: HashMap::new(),
             derping: HashMap::new(),
             floored: HashMap::new(),
@@ -566,6 +586,20 @@ impl RelayCoordinator {
             );
         }
         self.my_udp_dialer_ok = ok;
+    }
+
+    /// B3 — sync our own measured relay-band verdict (freshness-gated at
+    /// the call site: `None` = no fresh netcheck vector). Same runtime
+    /// sweep-time discipline as [`set_udp_dialer_ok`](Self::set_udp_dialer_ok).
+    pub fn set_relay_band_udp(&mut self, measured: Option<bool>) {
+        if self.my_relay_band_udp != measured {
+            info!(
+                was = ?self.my_relay_band_udp,
+                now = ?measured,
+                "overlay relay: own measured relay-band verdict changed — relay roles recompute on the next cycle"
+            );
+        }
+        self.my_relay_band_udp = measured;
     }
 
     /// Whether the tracked strategy for `node_id` was single-relay with US
@@ -852,15 +886,32 @@ impl RelayCoordinator {
                 RelayStrategyWire::BothAllocate => RelayStrategy::BothAllocate,
             };
         }
-        // Dialer honesty — a srflx candidate only proves UDP to a WELL-KNOWN
-        // port; the DIALER role needs raw UDP to the coturn relay band. Fold
-        // the honest verdicts in, gated on the PEER carrying the field at
-        // all (`None` = pre-honesty peer ⇒ BOTH ends keep the legacy
-        // srflx-only inputs, so a mixed-version pair can never split roles —
-        // field presence is the capability signal).
-        let honest = peer.udp_dialer_ok.is_some();
-        let my_udp_ok = self.my_udp_relay_ok && (self.my_udp_dialer_ok || !honest);
-        let peer_udp_ok = !peer.srflx_endpoints.is_empty() && peer.udp_dialer_ok.unwrap_or(true);
+        // B3 — MEASURED capability supersedes every derived input, but only
+        // when BOTH ends carry a fresh relay-band bit: ours from the local
+        // netcheck slot (freshness-gated at the runtime sync), the peer's
+        // from the netmap (freshness-gated by the server). One-sided
+        // measurement keeps the legacy rules — the same both-ends symmetry
+        // discipline as the honesty latch below, so a mixed pair can never
+        // split roles. The measured bit is the probe over the EXACT
+        // single-relay dial path, strictly stronger than any srflx/latch
+        // inference — no srflx ANDing on this branch by design (a dialer
+        // needs no srflx to dial; srflx was only ever the proxy).
+        let (my_udp_ok, peer_udp_ok) =
+            if let (Some(mine), Some(theirs)) = (self.my_relay_band_udp, peer.relay_band_udp) {
+                (mine, theirs)
+            } else {
+                // Dialer honesty (legacy inputs) — a srflx candidate only proves
+                // UDP to a WELL-KNOWN port; the DIALER role needs raw UDP to the
+                // coturn relay band. Fold the honest verdicts in, gated on the
+                // PEER carrying the field at all (`None` = pre-honesty peer ⇒
+                // BOTH ends keep the srflx-only inputs — field presence is the
+                // capability signal).
+                let honest = peer.udp_dialer_ok.is_some();
+                (
+                    self.my_udp_relay_ok && (self.my_udp_dialer_ok || !honest),
+                    !peer.srflx_endpoints.is_empty() && peer.udp_dialer_ok.unwrap_or(true),
+                )
+            };
         if self.single_relay && peer.supports_relay_single {
             match (my_udp_ok, peer_udp_ok) {
                 (true, false) => return RelayStrategy::SingleRelay(false), // peer blocked → it anchors, we dial
@@ -935,7 +986,12 @@ impl RelayCoordinator {
         // on a timer alone is a guess: if nothing about the pair has changed,
         // the attempt can only fail again and cost the carrier a second
         // disturbance. So a peer with strikes must show NEW EVIDENCE.
-        let fp = strategy_fingerprint(self.my_udp_relay_ok, self.my_udp_dialer_ok, peer);
+        let fp = strategy_fingerprint(
+            self.my_udp_relay_ok,
+            self.my_udp_dialer_ok,
+            self.my_relay_band_udp,
+            peer,
+        );
         let evidence_changed = self
             .derp_regrade_inputs
             .get(node_id)
@@ -2046,6 +2102,7 @@ mod tests {
             srflx_endpoints: vec![],
             srflx_nat: None,
             udp_dialer_ok: None,
+            relay_band_udp: None,
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
@@ -2600,12 +2657,96 @@ mod tests {
         // fingerprint so tracked pairs re-establish on the corrected roles.
         let p = honest_peer(small, Some(true));
         assert_ne!(
-            strategy_fingerprint(true, true, &p),
-            strategy_fingerprint(true, false, &p)
+            strategy_fingerprint(true, true, None, &p),
+            strategy_fingerprint(true, false, None, &p)
         );
         assert_ne!(
-            strategy_fingerprint(true, true, &p),
-            strategy_fingerprint(true, true, &honest_peer(small, Some(false)))
+            strategy_fingerprint(true, true, None, &p),
+            strategy_fingerprint(true, true, None, &honest_peer(small, Some(false)))
+        );
+        // B3 — the measured pair is likewise strategy-input material, on
+        // both the own-side and the peer-side halves.
+        assert_ne!(
+            strategy_fingerprint(true, true, None, &p),
+            strategy_fingerprint(true, true, Some(false), &p)
+        );
+        let mut measured_peer = p.clone();
+        measured_peer.relay_band_udp = Some(false);
+        assert_ne!(
+            strategy_fingerprint(true, true, None, &p),
+            strategy_fingerprint(true, true, None, &measured_peer)
+        );
+    }
+
+    /// B3 — the MEASURED relay-band pair supersedes every derived input
+    /// (srflx presence AND the honesty latch), but only when BOTH ends
+    /// carry a fresh bit; one-sided measurement keeps the legacy rules so
+    /// a mixed pair can never split roles.
+    #[tokio::test]
+    async fn measured_relay_band_supersedes_latch_and_srflx_when_both_ends_carry_it() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (small, large) = ([0x01u8; 32], [0xFFu8; 32]);
+        let peer = |pk: [u8; 32], dialer_ok: Option<bool>, band: Option<bool>| PeerConfig {
+            public_key: pk,
+            supports_relay_single: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            udp_dialer_ok: dialer_ok,
+            relay_band_udp: band,
+            ..base_peer()
+        };
+        let coord = |pk: [u8; 32], band: Option<bool>| {
+            let mut c = RelayCoordinator::new(tx.clone(), pk, true, vec![], None);
+            c.single_relay = true;
+            c.set_relay_band_udp(band);
+            c
+        };
+
+        // The clk case, measured: srflx PRESENT + latch clear, but the probe
+        // proved the relay band is dropped ⇒ we ANCHOR (peer measured-capable
+        // dials), pubkey order be damned.
+        assert_eq!(
+            coord(small, Some(false))
+                .single_relay_role(&test_nid(), &peer(large, None, Some(true))),
+            Some(true),
+            "measured relay-band-blocked host must anchor despite srflx presence"
+        );
+        // Mirror: the PEER measured blocked ⇒ we dial.
+        assert_eq!(
+            coord(large, Some(true))
+                .single_relay_role(&test_nid(), &peer(small, None, Some(false))),
+            Some(false),
+            "measured-capable side dials toward a measured-blocked peer"
+        );
+        // Measurement outranks a (possibly false) latch: latched host whose
+        // fresh probe says the band works dials again immediately — no
+        // LATCH_TTL wait.
+        let mut c = coord(large, Some(true));
+        c.set_udp_dialer_ok(false);
+        assert_eq!(
+            c.single_relay_role(&test_nid(), &peer(small, Some(true), Some(true))),
+            Some(false),
+            "a fresh measured-capable verdict overrides the latch (larger pubkey ⇒ dialer)"
+        );
+        // One-sided measurement ⇒ legacy rules verbatim (here: the latch
+        // applies against an honesty-capable peer ⇒ we anchor).
+        let mut one_sided = coord(large, Some(true));
+        one_sided.set_udp_dialer_ok(false);
+        assert_eq!(
+            one_sided.single_relay_role(&test_nid(), &peer(small, Some(true), None)),
+            Some(true),
+            "peer without a fresh vector ⇒ measured branch must NOT engage"
+        );
+        // Both measured blocked ⇒ no raw-UDP dialer ⇒ not single-relay.
+        assert_eq!(
+            coord(small, Some(false))
+                .single_relay_role(&test_nid(), &peer(large, None, Some(false))),
+            None
+        );
+        // Both measured capable ⇒ deterministic pubkey tie-break survives.
+        assert_eq!(
+            coord(small, Some(true)).single_relay_role(&test_nid(), &peer(large, None, Some(true))),
+            Some(true),
+            "smaller pubkey anchors on the measured both-capable tie-break"
         );
     }
 
