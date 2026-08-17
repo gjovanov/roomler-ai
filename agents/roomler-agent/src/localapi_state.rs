@@ -308,9 +308,6 @@ impl DaemonState {
 #[async_trait]
 impl LocalApiState for DaemonState {
     fn status(&self) -> NodeStatus {
-        // Multi-org v2 retirement evidence — one snapshot per status read.
-        let (mux_nat_rewrites, mux_nat_restores, skip_as_source_flips) =
-            tunnel_core::evidence::snapshot();
         NodeStatus {
             node_id: self.node_id.clone(),
             name: self.name.lock().map(|n| n.clone()).unwrap_or_default(),
@@ -368,11 +365,6 @@ impl LocalApiState for DaemonState {
                         .unwrap_or_default()
                 })
                 .unwrap_or_default(),
-            // Multi-org v2 retirement evidence — the Phase-3 deletion gate
-            // reads these (fleet-wide zeros over the soak window).
-            mux_nat_rewrites: Some(mux_nat_rewrites),
-            mux_nat_restores: Some(mux_nat_restores),
-            skip_as_source_flips: Some(skip_as_source_flips),
             // PR-B1 — per-socket receive liveness + band-walk tripwire.
             direct_socks: self.overlay.borrow().direct_socks.clone(),
             direct_bind_walks: Some(
