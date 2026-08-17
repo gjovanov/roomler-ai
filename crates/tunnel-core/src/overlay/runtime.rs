@@ -1565,6 +1565,7 @@ impl OverlayRuntime {
             // until field-proven; the server only stamps a verdict when BOTH
             // ends advertise this.
             supports_server_relay_strategy: crate::overlay::direct::server_relay_strategy_enabled(),
+            supports_derp_floor: crate::overlay::direct::derp_floor_enabled(),
             // Data-probe — this build's engine answers the overlay-native
             // echo inline (wired in `process_inbound`), so advertise it.
             supports_overlay_echo: true,
@@ -1982,11 +1983,18 @@ impl OverlayRuntime {
             "overlay: route guard armed"
         );
         // Phase D — LAZY `/derp`: open the WS (via the agent-provided factory)
-        // ONLY for a relay-mode node that is itself UDP-blocked — i.e. its srflx
-        // gather found nothing (`srflx_advertised.is_empty()`). A UDP-capable
-        // node can never be in a both-UDP-blocked pair, so it doesn't hold an
-        // idle `/derp` WS. The factory is `FnOnce`, so `take()` it; a reconnect
-        // re-runs `run` and re-decides from the fresh gather.
+        // Historically ONLY for a relay-mode node that is itself UDP-blocked —
+        // its srflx gather found nothing (`srflx_advertised.is_empty()`), the
+        // exact condition under which the DERP strategy arm can pick it. The
+        // factory is `FnOnce`, so `take()` it; a reconnect re-runs `run` and
+        // re-decides from the fresh gather.
+        //
+        // Phase A1 (overlay v3) — with `overlay_derp_floor` on, the mux opens
+        // UNCONDITIONALLY in relay mode: the floor contract is "every
+        // floor-capable node is registered on `/derp` at all times", so a pair
+        // can be floored at birth without predicting the peer's mux state
+        // (the rc.393 deadlock class). One idle WSS per org; the server's
+        // 30 s keepalive (#509) carries it.
         //
         // P7 — the factory is RETAINED (moved into a local, not consumed at
         // startup unless needed): a UDP-capable node can now be force-pinned
@@ -1996,7 +2004,9 @@ impl OverlayRuntime {
         let mut derp_factory = self.derp_mux_factory.take();
         // Multi-region DERP — reusable per-URL opener for regional relays.
         let regional_derp_factory = self.regional_derp_factory.take();
-        let derp_mux = if matches!(self.mode, CarrierMode::Relay) && srflx_advertised.is_empty() {
+        let derp_mux = if matches!(self.mode, CarrierMode::Relay)
+            && (srflx_advertised.is_empty() || super::direct::derp_floor_enabled())
+        {
             derp_factory.take().map(|f| f())
         } else {
             None
@@ -3709,6 +3719,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_derp_floor: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
@@ -5517,6 +5528,7 @@ mod tests {
                 supports_relay_single: false,
                 supports_derp: false,
                 supports_forced_derp: false,
+                supports_derp_floor: false,
                 supports_overlay_echo: false,
                 relay_strategy: None,
                 routes: vec![],
@@ -5760,6 +5772,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_derp_floor: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec![],
@@ -6317,6 +6330,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_derp_floor: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes,
@@ -6489,6 +6503,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_derp_floor: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             routes: vec!["192.168.5.0/24".into(), "0.0.0.0/0".into()],
