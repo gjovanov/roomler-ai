@@ -90,6 +90,8 @@ impl OverlayNodeDao {
             srflx_endpoints: Vec::new(),
             // Phase C — NAT type is unknown until the node probes + trickles it.
             srflx_nat: None,
+            caps: None,
+            caps_measured_at: None,
             udp_dialer_ok: None,
             relay_home: None,
             // C4 stage 2 (PR-B) — no warm leg until the node's runtime
@@ -177,6 +179,11 @@ impl OverlayNodeDao {
                         // restarted runtime re-earns the verdict (and its
                         // first srflx trickle re-declares it).
                         "udp_dialer_ok": bson::Bson::Null,
+                        // Phase B — the capability vector is re-measured
+                        // ~45 s after start; a prior session's measurements
+                        // are meaningless on a possibly-new network.
+                        "caps": bson::Bson::Null,
+                        "caps_measured_at": bson::Bson::Null,
                         // C4 stage 2 (PR-B) — clear the stale warm-leg address
                         // for the same reason: a restarted runtime holds no
                         // allocation; its heartbeats re-mirror a fresh one.
@@ -374,6 +381,26 @@ impl OverlayNodeDao {
                     // silently drops absent fields.
                     "udp_dialer_ok": udp_dialer_ok,
                     "last_seen_at": DateTime::now(),
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await
+    }
+
+    /// Phase B (overlay v3) — store a freshly-measured capability vector
+    /// with its receipt stamp (the freshness gate's input). Explicit `$set`
+    /// on both fields — a hand-built doc silently drops absent keys.
+    pub async fn update_netcheck_caps(
+        &self,
+        node_id: ObjectId,
+        caps: roomler_ai_remote_control::signaling::CapVectorWire,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_by_id(
+                node_id,
+                doc! { "$set": {
+                    "caps": bson::to_bson(&caps).unwrap_or(bson::Bson::Null),
+                    "caps_measured_at": DateTime::now(),
                     "updated_at": DateTime::now(),
                 } },
             )
