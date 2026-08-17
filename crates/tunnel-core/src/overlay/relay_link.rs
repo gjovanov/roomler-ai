@@ -77,20 +77,30 @@ const REGRADE_OVERRULE_WINDOW: Duration = Duration::from_secs(600);
 /// Observed on NEO16 2026-08-07: neo16-wsl's pin lapsed at 09:32:01 and the
 /// regrade re-fired at 09:32:16, 15 s later.
 ///
-/// So the first strike must exceed the pin TTL, and repeats must decay hard.
-/// A pair that truly cannot carry TURN converges on one cheap retry a day —
-/// still self-correcting if its network changes — while a pair that can is
-/// unaffected, because a regrade that is NOT overruled never books a strike.
+/// Historically the first rung therefore had to exceed the pin TTL (40 min).
+/// Since [`REGRADE_EVIDENCE_CEILING`] landed, IT is what keeps the pin-lapse
+/// cycle dead — a struck peer with unchanged evidence waits the ceiling, not
+/// the rung — so the rungs only pace post-ceiling retries and evidence-driven
+/// ones, and Phase C shrank them accordingly (see [`REGRADE_BACKOFF`]).
+/// A regrade that is NOT overruled never books a strike, so capable pairs are
+/// unaffected.
 /// How long a previously-overruled peer stays gated on NEW EVIDENCE before the
 /// backoff timer alone is allowed to release it again.
 ///
 /// This is the difference between repeats trending to zero and merely being
 /// rarer. Without it the ladder still fires a doomed retry on schedule; with it
 /// a pair whose situation has not changed simply never retries, because
-/// "40 minutes elapsed" is not a reason to believe TURN will work this time.
+/// "the timer elapsed" is not a reason to believe TURN will work this time.
 /// The ceiling exists only to cover changes we cannot observe from here
-/// (the far side's firewall, a coturn fix) — one cheap probe a day.
-const REGRADE_EVIDENCE_CEILING: Duration = Duration::from_secs(86_400);
+/// (the far side's firewall, a coturn fix).
+///
+/// Phase C — shrunk from 24 h to 2 h: a no-evidence retry now costs a brief
+/// break-before-make blip cushioned by the permanent DERP floor (A2), not a
+/// carrier outage, and the netcheck vector (B3) turns most formerly-invisible
+/// far-side changes into observable evidence anyway (a measured flip bypasses
+/// this gate entirely). Worst case for a genuinely TURN-less pair: one
+/// floor-cushioned probe every 2 h instead of one a day.
+const REGRADE_EVIDENCE_CEILING: Duration = Duration::from_secs(7_200);
 
 /// Phase A1 — how long the central `/derp` WS must be continuously DOWN
 /// before relay-request evidence reports `derp_mux_failed`. Above the
@@ -115,11 +125,21 @@ pub(crate) fn relay_death_backoff(streak: u32) -> Option<Duration> {
     Some(cap.min(base * 2u32.saturating_pow(streak - 3)))
 }
 
+/// Phase C (overlay v3) — shrunk from `[40 min, 2 h, 8 h, 24 h]`: with the
+/// DERP floor permanent (A2) a failed regrade rebuild falls back onto the
+/// floor within one cycle instead of leaving the pair carrier-less, and with
+/// the measured capability vector (B3) driving the strategy, a host that
+/// provably can't dial never becomes the would-be dialer in the first place —
+/// the blind-retry-into-a-wall class the 40-min first rung guarded is gone
+/// structurally. The pin-lapse re-churn cycle (rc.314) stays dead via
+/// [`REGRADE_EVIDENCE_CEILING`]: a struck peer with UNCHANGED evidence waits
+/// the ceiling, not the rung, and a netcheck re-measure is what changes
+/// evidence now.
 const REGRADE_BACKOFF: [Duration; 4] = [
-    Duration::from_secs(2_400),  // 40 min — clears the 30-min pin with margin
-    Duration::from_secs(7_200),  // 2 h
-    Duration::from_secs(28_800), // 8 h
-    Duration::from_secs(86_400), // 24 h
+    Duration::from_secs(120),   // 2 min
+    Duration::from_secs(600),   // 10 min
+    Duration::from_secs(1_800), // 30 min
+    Duration::from_secs(7_200), // 2 h
 ];
 
 /// Which relay carrier a [`ReadyLink`] rides. `install_ready` gates the
@@ -2946,21 +2966,20 @@ mod tests {
             !c.derp_regrade_due(&nid, &udp_ok, t0 + Duration::from_secs(1_815)),
             "must NOT re-fire the moment the 30-min pin lapses"
         );
-        // Past the first backoff (40 min from the pin) the TIMER is satisfied —
-        // but the evidence gate holds an overruled peer until something about
-        // the pair actually changes, so this test threads fresh evidence to
-        // exercise the ladder. `overruled_peer_does_not_retry_on_the_timer_alone`
-        // covers the unchanged case.
+        // Well past the pin the TIMER is satisfied — but the evidence gate
+        // holds an overruled peer until something about the pair actually
+        // changes, so this test threads fresh evidence to exercise the
+        // ladder. `overruled_peer_does_not_retry_on_the_timer_alone` covers
+        // the unchanged case.
         let moved = PeerConfig {
             srflx_endpoints: vec!["198.51.100.1:41000".into()],
             ..udp_ok.clone()
         };
         assert!(c.derp_regrade_due(&nid, &moved, t0 + Duration::from_secs(180 + 2_400)));
 
-        // A second overrule escalates the ladder to its 2 h step: the 40 min
-        // that sufficed last time no longer does. Same `moved` config as the
-        // last fire, so the evidence gate is neutral and the BACKOFF is what
-        // is under test.
+        // A second overrule escalates the ladder a rung and the evidence
+        // ceiling re-arms. Same `moved` config as the last fire, so the
+        // evidence gate is neutral and the gating alone is under test.
         let t2 = t0 + Duration::from_secs(180 + 2_400);
         c.note_regrade_overruled(&nid, t2 + Duration::from_secs(180));
         assert_eq!(c.derp_regrade_strikes.get(&nid), Some(&2));
@@ -2970,7 +2989,7 @@ mod tests {
 
     /// A regrade the server never overruled counts as having HELD: the peer's
     /// strikes reset, so a pair whose network later recovers is not stuck on
-    /// yesterday's 24 h backoff forever.
+    /// yesterday's top-rung backoff forever.
     #[test]
     fn surviving_regrade_clears_the_backoff() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
@@ -3048,9 +3067,69 @@ mod tests {
         // fired and produced the repeat.
         c.roles.insert(nid, RelayStrategy::Derp);
         assert!(!c.derp_regrade_due(&nid, &peer, t0 + Duration::from_secs(3_000)));
-        // …and stays refused for the whole day, not just one window.
+        // …and stays refused for the whole evidence ceiling, not just one
+        // backoff window.
         c.roles.insert(nid, RelayStrategy::Derp);
-        assert!(!c.derp_regrade_due(&nid, &peer, t0 + Duration::from_secs(80_000)));
+        assert!(!c.derp_regrade_due(&nid, &peer, t0 + Duration::from_secs(7_000)));
+        // Phase C — past the ceiling the exile is BOUNDED: one floor-cushioned
+        // probe is permitted even with unchanged evidence (covers far-side
+        // changes the vector cannot observe).
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(c.derp_regrade_due(&nid, &peer, t0 + Duration::from_secs(8_000)));
+    }
+
+    /// Phase C — the measured vector is first-class regrade evidence: a
+    /// struck peer whose `relay_band_udp` bit flips (a netcheck re-measure
+    /// landed on either end) bypasses the evidence ceiling immediately,
+    /// while the same peer with an unchanged vector stays gated. This is
+    /// the loop the latch demotion promised: conviction → re-probe →
+    /// measured flip → selection recomputes, no timer guessing.
+    #[test]
+    fn measured_vector_flip_unlocks_a_struck_regrade() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mux = DerpMux::new([9u8; 32]).0;
+        let nid = test_nid();
+        let peer = PeerConfig {
+            public_key: [0xFFu8; 32],
+            supports_relay_single: true,
+            supports_derp: true,
+            srflx_endpoints: vec!["203.0.113.9:40000".into()],
+            ..base_peer()
+        };
+        let mut c = RelayCoordinator::new(tx, [0x00u8; 32], false, vec![], Some(mux));
+        c.single_relay = true;
+        c.derp = true;
+        c.roles.insert(nid, RelayStrategy::Derp);
+        let t0 = Instant::now();
+        assert!(c.derp_regrade_due(&nid, &peer, t0));
+        c.note_regrade_overruled(&nid, t0 + Duration::from_secs(120));
+
+        // Unchanged inputs inside the ceiling ⇒ gated (the baseline).
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(!c.derp_regrade_due(&nid, &peer, t0 + Duration::from_secs(3_000)));
+
+        // The peer's measured relay-band bit lands (netcheck advert reached
+        // the netmap) ⇒ NEW EVIDENCE ⇒ the gate opens at once.
+        let measured = PeerConfig {
+            relay_band_udp: Some(true),
+            ..peer.clone()
+        };
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(
+            c.derp_regrade_due(&nid, &measured, t0 + Duration::from_secs(3_100)),
+            "a measured-vector flip must supersede the evidence ceiling"
+        );
+
+        // Our OWN measured bit flipping is evidence too.
+        c.note_regrade_overruled(&nid, t0 + Duration::from_secs(3_200));
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(!c.derp_regrade_due(&nid, &measured, t0 + Duration::from_secs(6_000)));
+        c.set_relay_band_udp(Some(true));
+        c.roles.insert(nid, RelayStrategy::Derp);
+        assert!(
+            c.derp_regrade_due(&nid, &measured, t0 + Duration::from_secs(6_100)),
+            "our own measured flip is regrade evidence as well"
+        );
     }
 
     /// …but the gate must not WEDGE a pair: real new evidence (the peer's srflx
