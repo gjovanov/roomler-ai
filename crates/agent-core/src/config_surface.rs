@@ -121,6 +121,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "U2 — accept the server's computed relay-tier verdict instead of the local derivation. Built-in default: off.",
     ),
     (
+        "overlay_derp_floor",
+        "tribool",
+        "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session and advertise the capability. Built-in default: off.",
+    ),
+    (
         "overlay_mbb",
         "tribool",
         "Make-before-break overlay carrier upgrades. Built-in default: on.",
@@ -440,6 +445,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_direct" => cfg.overlay_direct.map(fmt_bool),
         "overlay_derp" => cfg.overlay_derp.map(fmt_bool),
         "overlay_server_relay_strategy" => cfg.overlay_server_relay_strategy.map(fmt_bool),
+        "overlay_derp_floor" => cfg.overlay_derp_floor.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard.map(fmt_bool),
@@ -555,6 +561,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_server_relay_strategy" => {
             cfg.overlay_server_relay_strategy = parse_tribool(value)?
         }
+        "overlay_derp_floor" => cfg.overlay_derp_floor = parse_tribool(value)?,
         "overlay_mbb" => cfg.overlay_mbb = parse_tribool(value)?,
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter = parse_tribool(value)?,
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard = parse_tribool(value)?,

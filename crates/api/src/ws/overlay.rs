@@ -89,6 +89,7 @@ pub async fn relay_overlay_msg_from_node(
             supports_derp,
             supports_forced_derp,
             supports_server_relay_strategy,
+            supports_derp_floor,
             supports_overlay_echo,
             advertised_routes,
             ..
@@ -104,6 +105,7 @@ pub async fn relay_overlay_msg_from_node(
                 supports_derp,
                 supports_forced_derp,
                 supports_server_relay_strategy,
+                supports_derp_floor,
                 supports_overlay_echo,
                 advertised_routes,
             )
@@ -203,6 +205,7 @@ async fn handle_overlay_join(
     supports_derp: bool,
     supports_forced_derp: bool,
     supports_server_relay_strategy: bool,
+    supports_derp_floor: bool,
     supports_overlay_echo: bool,
     advertised_routes: Vec<String>,
 ) {
@@ -262,6 +265,7 @@ async fn handle_overlay_join(
                     supports_derp,
                     supports_forced_derp,
                     supports_server_relay_strategy,
+                    supports_derp_floor,
                     supports_overlay_echo,
                     &advertised_routes,
                 )
@@ -321,6 +325,7 @@ async fn handle_overlay_join(
                         supports_derp,
                         supports_forced_derp,
                         supports_server_relay_strategy,
+                        supports_derp_floor,
                         supports_overlay_echo,
                         advertised_routes.clone(),
                     )
@@ -1782,6 +1787,9 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // the recipient and this peer's full node stamp it via
         // `server_relay_verdict`.
         supports_forced_derp: node.supports_forced_derp,
+        // Phase A (overlay v3) — echo the floor capability so a pair is only
+        // floored on DERP at birth when BOTH ends run the permanent mux.
+        supports_derp_floor: node.supports_derp_floor,
         relay_strategy: None,
         // Data-probe — echo the peer's overlay-native-echo capability so
         // probers pick the engine echo over ICMP for capable peers.
@@ -2116,6 +2124,7 @@ mod tests {
             supports_derp: true,
             supports_forced_derp: true,
             supports_server_relay_strategy: false,
+            supports_derp_floor: false,
             advertised_routes: vec![],
             approved_routes: vec![],
             is_exit_node: false,
