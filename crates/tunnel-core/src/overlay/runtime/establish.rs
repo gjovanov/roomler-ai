@@ -594,6 +594,9 @@ impl OverlayRuntime {
                     crate::overlay::dialer::note_dialer_conviction(nid);
                 }
                 coord.set_udp_dialer_ok(crate::overlay::dialer::udp_dialer_ok());
+                coord.set_relay_band_udp(
+                    crate::overlay::netcheck::current_fresh().and_then(|v| v.relay_band_udp),
+                );
                 if !tier.is_direct() {
                     coord.forget(&nid);
                 }
@@ -2600,6 +2603,7 @@ mod tests {
             srflx_endpoints: srflx.iter().map(|s| s.to_string()).collect(),
             srflx_nat: nat.map(|s| s.to_string()),
             udp_dialer_ok: None,
+            relay_band_udp: None,
             supports_quic: false,
             supports_relay_single: false,
             supports_derp: false,
