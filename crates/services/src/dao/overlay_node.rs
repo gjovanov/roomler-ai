@@ -65,6 +65,7 @@ impl OverlayNodeDao {
         supports_derp: bool,
         supports_forced_derp: bool,
         supports_server_relay_strategy: bool,
+        supports_derp_floor: bool,
         supports_overlay_echo: bool,
         advertised_routes: Vec<String>,
     ) -> DaoResult<OverlayNode> {
@@ -99,6 +100,7 @@ impl OverlayNodeDao {
             supports_derp,
             supports_forced_derp,
             supports_server_relay_strategy,
+            supports_derp_floor,
             supports_overlay_echo,
             // Phase 1 — the node's claimed routes; nothing approved until an
             // admin acts, so a fresh node routes for no one.
@@ -137,6 +139,7 @@ impl OverlayNodeDao {
         supports_derp: bool,
         supports_forced_derp: bool,
         supports_server_relay_strategy: bool,
+        supports_derp_floor: bool,
         supports_overlay_echo: bool,
         advertised_routes: &[String],
     ) -> DaoResult<OverlayNode> {
@@ -192,6 +195,7 @@ impl OverlayNodeDao {
                         // U2 — refresh the server-relay-strategy opt-in likewise
                         // (an operator may flip OVERLAY_SERVER_RELAY_STRATEGY).
                         "supports_server_relay_strategy": supports_server_relay_strategy,
+                        "supports_derp_floor": supports_derp_floor,
                         // Data-probe — refresh the overlay-native-echo capability
                         // on each re-join (a downgrade must clear it). Hand-built
                         // doc: adding the field HERE is load-bearing (a doc!{} miss

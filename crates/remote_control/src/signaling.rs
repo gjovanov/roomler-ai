@@ -771,6 +771,16 @@ pub enum ClientMsg {
         /// `OVERLAY_SERVER_RELAY_STRATEGY` env/config is on.
         #[serde(default)]
         supports_server_relay_strategy: bool,
+        /// Phase A (overlay v3) — the node runs the DERP always-on floor: its
+        /// central `/derp` mux is open and registered for the whole session
+        /// (not just when its srflx gather came up empty), so a pair may be
+        /// floored on DERP at birth without predicting mux state. The server
+        /// echoes it per-peer; the floor (and any measured DERP keying) is
+        /// gated on BOTH ends advertising it — a pre-floor peer whose srflx
+        /// gather succeeded holds no mux and never registers, so a floor
+        /// toward it would blackhole. Absent ⇒ `false`.
+        #[serde(default)]
+        supports_derp_floor: bool,
         /// Data-probe — the node's overlay engine answers the overlay-native
         /// echo probe inline (the non-ICMP half of the hybrid carrier
         /// data-probe). Persisted + echoed per-peer so a prober prefers the
@@ -1808,6 +1818,12 @@ pub struct NetmapPeer {
     /// the rest. Pre-capability server/peer ⇒ `false` ⇒ ICMP.
     #[serde(default)]
     pub supports_overlay_echo: bool,
+    /// Phase A (overlay v3) — this peer advertised the DERP always-on floor
+    /// (its `/derp` mux is permanently open + registered). A pair is floored
+    /// at birth only when BOTH ends carry this. Pre-floor server/peer ⇒
+    /// `false` ⇒ the lazy-mux rules apply unchanged.
+    #[serde(default)]
+    pub supports_derp_floor: bool,
     /// Phase 1 — subnet routes this peer is an **approved** router for (CIDR
     /// strings like `"192.168.1.0/24"`). A receiving node installs each CIDR
     /// into its router (allowed_ips) + OS route table pointing at this peer, so
@@ -3052,6 +3068,7 @@ mod tests {
             supports_forced_derp: true,
             supports_overlay_echo: false,
             supports_server_relay_strategy: true,
+            supports_derp_floor: true,
             advertised_routes: vec!["192.168.1.0/24".into()],
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -3066,6 +3083,7 @@ mod tests {
                 supports_derp,
                 supports_forced_derp,
                 supports_server_relay_strategy,
+                supports_derp_floor,
                 advertised_routes,
                 ..
             } => {
@@ -3085,6 +3103,10 @@ mod tests {
                 assert!(
                     supports_server_relay_strategy,
                     "supports_server_relay_strategy must round-trip (U2)"
+                );
+                assert!(
+                    supports_derp_floor,
+                    "supports_derp_floor must round-trip (Phase A)"
                 );
                 assert_eq!(advertised_routes, vec!["192.168.1.0/24".to_string()]);
             }
@@ -3580,6 +3602,7 @@ mod tests {
                 supports_relay_single: true,
                 supports_derp: true,
                 supports_forced_derp: true,
+                supports_derp_floor: false,
                 supports_overlay_echo: false,
                 relay_strategy: Some(RelayStrategyWire::SingleRelayDialer),
                 routes: vec!["10.0.0.0/24".into()],
@@ -3812,6 +3835,24 @@ mod tests {
     /// Phase C — `srflx_nat` back-compat: a pre-Phase-C server/peer omits it →
     /// defaults `None` (unknown ⇒ punch attempted, never skipped); `None` is
     /// OMITTED on the wire; populated round-trips.
+    #[test]
+    fn netmap_peer_supports_derp_floor_default_and_roundtrip() {
+        // Phase A back-compat: absent from a pre-floor server ⇒ false (the
+        // lazy-mux rules apply); a set flag round-trips.
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert!(!p.supports_derp_floor, "pre-floor peer must default false");
+        let mut p2 = p.clone();
+        p2.supports_derp_floor = true;
+        let s = serde_json::to_string(&p2).unwrap();
+        assert_eq!(serde_json::from_str::<NetmapPeer>(&s).unwrap(), p2);
+    }
+
     #[test]
     fn netmap_peer_srflx_nat_default_and_skip() {
         let json = r#"{
