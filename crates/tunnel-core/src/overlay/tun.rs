@@ -1024,18 +1024,16 @@ mod system {
     /// nested-block source-selection geometry cannot exist.)
     #[cfg(windows)]
     mod winaddr {
-        use std::net::{IpAddr, Ipv4Addr};
+        use std::net::IpAddr;
 
         use windows_sys::Win32::Foundation::{
             ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR,
         };
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            CreateUnicastIpAddressEntry, DeleteUnicastIpAddressEntry, FreeMibTable,
-            GetUnicastIpAddressTable, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
-            MIB_UNICASTIPADDRESS_TABLE,
+            CreateUnicastIpAddressEntry, DeleteUnicastIpAddressEntry,
+            InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
         };
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-        use windows_sys::Win32::Networking::WinSock::AF_INET;
 
         /// A minimal row identifying `ip` on `luid` — the (luid, address) pair
         /// is the key every Get/Delete matches on.
@@ -1086,8 +1084,17 @@ mod system {
         }
 
         /// Every IPv4 `(address, prefix_len, skip_as_source)` currently on
-        /// `luid` — the geometry input for the SkipAsSource reconcile.
-        pub fn list_v4(luid: u64) -> std::io::Result<Vec<(Ipv4Addr, u8, bool)>> {
+        /// `luid`. Test-only since W7c removed its production caller (the
+        /// SkipAsSource reconcile): the manual `manual_list_v4_probe` keeps
+        /// it as the live-field FFI diagnostic that caught the 2.0.64.100
+        /// byte-flip a unit test structurally can't.
+        #[cfg(test)]
+        pub fn list_v4(luid: u64) -> std::io::Result<Vec<(std::net::Ipv4Addr, u8, bool)>> {
+            use std::net::Ipv4Addr;
+            use windows_sys::Win32::NetworkManagement::IpHelper::{
+                FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_TABLE,
+            };
+            use windows_sys::Win32::Networking::WinSock::AF_INET;
             let mut out = Vec::new();
             // SAFETY: GetUnicastIpAddressTable allocates a snapshot we iterate
             // then free — same idiom as `winroute::evict_competing_v4`.
