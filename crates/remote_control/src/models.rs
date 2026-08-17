@@ -1444,6 +1444,12 @@ pub struct OverlayNode {
     /// `false` ⇒ the pair keeps the client-authoritative path.
     #[serde(default)]
     pub supports_server_relay_strategy: bool,
+    /// Phase A (overlay v3) — the node advertised (on JOIN) the DERP
+    /// always-on floor: its central `/derp` mux stays open + registered for
+    /// the whole session. Echoed per-peer; the floor is gated on BOTH ends.
+    /// Absent on a pre-floor row ⇒ `false`.
+    #[serde(default)]
+    pub supports_derp_floor: bool,
     /// Data-probe — the node's overlay engine answers the overlay-native echo
     /// probe inline (advertised on JOIN, echoed per-peer in the netmap so
     /// probers prefer the engine-guaranteed echo). Absent on an older row ⇒
