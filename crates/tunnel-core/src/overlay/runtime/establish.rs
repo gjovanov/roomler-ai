@@ -1572,6 +1572,30 @@ impl OverlayRuntime {
                         if relay_bq.in_flight.contains_key(&np.node_id) {
                             continue;
                         }
+                        // Phase A2 (overlay v3) — DERP floor at birth: a fresh
+                        // pair with nothing installed gets the derp carrier
+                        // IMMEDIATELY (both ends floor-capable, mux alive),
+                        // and the better-tier coordination fires in the SAME
+                        // pass (the lan_probe_first precedent: hold one
+                        // working thing, keep walking) — `install_ready`
+                        // replaces the floor when the grant lands. A withheld
+                        // floor (mux down / peer not capable) falls through
+                        // to the ladder below unchanged, so pair formation
+                        // never couples to /derp health. Pairs whose computed
+                        // strategy is DERP anyway skip the request — the
+                        // floor IS their carrier.
+                        if !coord.is_tracking(&np.node_id)
+                            && !coord.is_floored(&np.node_id)
+                            && let Some(link) = coord.build_floor(np.node_id, &cfg)
+                        {
+                            let t0 = Instant::now();
+                            self.install_ready(wg, by_node, tun, link, relay_bq).await;
+                            warn_if_slow("install_ready(floor)", t0);
+                            if !coord.strategy_is_derp(&np.node_id, &cfg) {
+                                coord.request(np.node_id, cfg).await;
+                            }
+                            continue;
+                        }
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {
                             let t0 = Instant::now();
                             self.install_ready(wg, by_node, tun, link, relay_bq).await;
@@ -2574,6 +2598,7 @@ mod tests {
             supports_relay_single: false,
             supports_derp: false,
             supports_forced_derp: false,
+            supports_derp_floor: false,
             supports_overlay_echo: false,
             relay_strategy: None,
             relay_home: None,
