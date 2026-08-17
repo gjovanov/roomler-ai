@@ -118,6 +118,11 @@ pub struct AgentConfig {
     /// is the per-host off-switch.
     #[serde(default)]
     pub overlay_derp_floor: Option<bool>,
+    /// Phase B (overlay v3) — netcheck: measure egress capabilities (relay-band
+    /// probe, STUN/NAT, /derp health) every ~20 min and publish the CapVector
+    /// (`ROOMLER_NODE_OVERLAY_NETCHECK`). Built-in default: on.
+    #[serde(default)]
+    pub overlay_netcheck: Option<bool>,
     /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
     /// Built-in default: on.
     #[serde(default)]
@@ -1171,6 +1176,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_derp: None,
         overlay_server_relay_strategy: None,
         overlay_derp_floor: None,
+        overlay_netcheck: None,
         overlay_mbb: None,
         overlay_lan_iface_filter: None,
         overlay_wsl_mirrored_guard: None,
@@ -1318,7 +1324,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 37] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 38] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1329,6 +1335,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 37]
             cfg.overlay_server_relay_strategy,
         ),
         ("OVERLAY_DERP_FLOOR", cfg.overlay_derp_floor),
+        ("OVERLAY_NETCHECK", cfg.overlay_netcheck),
         ("OVERLAY_MBB", cfg.overlay_mbb),
         ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
         ("OVERLAY_WSL_MIRRORED_GUARD", cfg.overlay_wsl_mirrored_guard),
