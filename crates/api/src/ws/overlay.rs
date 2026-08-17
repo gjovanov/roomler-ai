@@ -1245,6 +1245,27 @@ async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, rea
     } else {
         None
     };
+    // D0 (overlay v3) — the REVERSE direction. This fan re-stamps the
+    // `peer → changed-node` verdict for every recipient, but the changed
+    // node itself would receive nothing — so after a one-sided change its
+    // OWN `node → peer` verdicts stay a generation behind. Under
+    // server-authoritative selection (U3) that skew is a silent wedge:
+    // both-anchor reads "blocked", and both-DIALER means neither end
+    // allocates, no link forms, no handshake deadline fires, so no
+    // conviction and no re-probe ever detect it. Push the changed node one
+    // delta re-stamping its outgoing edges whenever it is present and
+    // U2-capable (verdicts are the only per-edge data its change moves;
+    // pre-U2 nodes ignore stamps, so the delta would be pure noise there).
+    let reverse = reachable && node.supports_server_relay_strategy;
+    let (node_recip_src, peer_reach) = if reverse {
+        (
+            Some(overlay_source_of(state, node).await),
+            reachability(state, &peers).await,
+        )
+    } else {
+        (None, HashMap::new())
+    };
+    let mut reverse_rows: Vec<NetmapPeer> = Vec::new();
     for peer in peers.iter().filter(|p| p.id != node.id) {
         let src = overlay_source_of(state, peer).await;
         // U2 — the edge is `recipient=peer → this fanned node`; both full
@@ -1264,6 +1285,42 @@ async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, rea
                 epoch,
                 upserts,
                 removes,
+            },
+        )
+        .await;
+        // D0 — the mirror row for the changed node: recipient=node,
+        // shaped=peer, verdict for the `node → peer` edge. Same shaping
+        // rules as any row toward `node` (ACL from its source; the peer's
+        // real presence, not the changed node's).
+        if let Some(rsrc) = node_recip_src.as_ref() {
+            let rev_verdict = server_relay_verdict(state, node, peer);
+            let peer_src_arg = if acl.enforcing() { Some(&src) } else { None };
+            if let Some(mut r) = shape_peer(
+                &acl,
+                rsrc,
+                peer,
+                peer_src_arg,
+                is_reachable(&peer_reach, peer),
+            ) {
+                r.relay_strategy = rev_verdict;
+                reverse_rows.push(r);
+            }
+        }
+    }
+    if !reverse_rows.is_empty() {
+        debug!(
+            node = %node.name,
+            rows = reverse_rows.len(),
+            epoch,
+            "overlay: reverse verdict delta — re-stamping the changed node's outgoing edges (D0)"
+        );
+        send_to_node(
+            state,
+            node,
+            ServerMsg::OverlayNetmapDelta {
+                epoch,
+                upserts: reverse_rows,
+                removes: vec![],
             },
         )
         .await;
@@ -2383,6 +2440,67 @@ mod tests {
         b.supports_server_relay_strategy = false;
         assert_eq!(verdict_from_nodes(&a, &b, false), None);
         assert_eq!(verdict_from_nodes(&b, &a, false), None);
+    }
+
+    /// D0 — after a ONE-SIDED input change, re-computing BOTH directions
+    /// from the same row generation must land a coherent anchor/dialer
+    /// pair. The reverse fan (`fan_upsert_shaped`) delivers the
+    /// `changed-node → peer` half to the changed node itself; this locks
+    /// that the two halves can never disagree when both are stamped from
+    /// the same rows — the both-dialer wedge requires a GENERATION split,
+    /// never a rule split.
+    #[test]
+    fn one_sided_change_restamps_a_coherent_pair() {
+        let mut a = node("a", "100.64.0.2");
+        let mut b = node("b", "100.64.0.4");
+        a.wg_public_key = BASE64.encode([1u8; 32]);
+        b.wg_public_key = BASE64.encode([9u8; 32]);
+        a.supports_server_relay_strategy = true;
+        b.supports_server_relay_strategy = true;
+        a.srflx_endpoints = vec!["1.2.3.4:5".into()];
+        b.srflx_endpoints = vec!["6.7.8.9:0".into()];
+        // Baseline: both udp-ok ⇒ smaller pubkey (a) anchors.
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor)
+        );
+        // One-sided flip: a loses its srflx. Both directions re-stamped
+        // from the SAME new generation stay complementary.
+        a.srflx_endpoints.clear();
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor),
+            "blocked side anchors"
+        );
+        assert_eq!(
+            verdict_from_nodes(&b, &a, false),
+            Some(RelayStrategyWire::SingleRelayDialer),
+            "capable side dials — coherent with the reverse half"
+        );
+        // One-sided MEASURED flip: a's fresh vector says the band is
+        // dropped while b's says it works — still exactly one dialer.
+        use roomler_ai_remote_control::signaling::CapVectorWire;
+        a.srflx_endpoints = vec!["1.2.3.4:5".into()];
+        a.caps = Some(CapVectorWire {
+            stun_udp: true,
+            relay_band_udp: Some(false),
+            derp_ws_ok: true,
+        });
+        a.caps_measured_at = Some(bson::DateTime::now());
+        b.caps = Some(CapVectorWire {
+            stun_udp: true,
+            relay_band_udp: Some(true),
+            derp_ws_ok: true,
+        });
+        b.caps_measured_at = Some(bson::DateTime::now());
+        assert_eq!(
+            verdict_from_nodes(&a, &b, false),
+            Some(RelayStrategyWire::SingleRelayAnchor)
+        );
+        assert_eq!(
+            verdict_from_nodes(&b, &a, false),
+            Some(RelayStrategyWire::SingleRelayDialer)
+        );
     }
 
     /// B3 — the MEASURED relay-band pair supersedes the srflx/latch inputs
