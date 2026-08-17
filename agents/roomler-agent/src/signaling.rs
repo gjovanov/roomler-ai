@@ -121,6 +121,44 @@ const WS_PONG_RTT_STRIKES: u32 = 2;
 /// answer before the second strike.
 const WS_PING_RETRY_ACCEL: Duration = Duration::from_secs(10);
 
+/// Slowness-cycle treadmill cap: consecutive YOUNG connections (see
+/// [`WS_TREADMILL_FRESH_WINDOW`]) convicted for RTT degradation before the
+/// loop stops cycling and HOLDS the alive-but-slow WS instead.
+///
+/// The degraded-cycle verdict exists for the regime where a fresh
+/// connection escapes a zombie (field 2026-08-15: the secondary org
+/// reconnected fresh after a capture and relayed fine while the primary's
+/// grandfathered WS crawled). But the OPPOSITE regime is just as real
+/// (field 2026-08-17, CORPLAP-1 in-VPN morning): Check Point throttled EVERY
+/// connection to ~41 s RTTs, so each cycle bought a fresh WS that
+/// re-convicted within 2-3 min — a treadmill whose collateral was worse
+/// than the slowness itself (each cycle flaps server presence
+/// offline→online, so every peer's netmap churns and half-rebuilt pairs
+/// park "blocked"; grants/netmap/exec stall in every down-window). Two
+/// consecutive fresh connections that ALSO went slow prove cycling is not
+/// helping — from then on slowness only detects (logged, strikes reset),
+/// never selects the cycle. True deadness still convicts: the
+/// [`WS_RX_DEADLINE`] path and send failures are untouched.
+const WS_SLOWNESS_TREADMILL_CAP: u32 = 2;
+
+/// A connection that stayed healthy at least this long before its first
+/// degradation verdict starts a FRESH slowness episode (treadmill counter
+/// rearms at 1): the path evidently worked, so cycling deserves another
+/// chance. Connections convicted younger than this are treadmill evidence.
+const WS_TREADMILL_FRESH_WINDOW: Duration = Duration::from_secs(600);
+
+/// `true` = HOLD the degraded-but-alive WS (cycling has been shown not to
+/// help); `false` = cycle as before. Books this conviction on the
+/// cross-connection counter either way.
+fn slowness_treadmill_holds(cycles: &mut u32, connection_age: Duration) -> bool {
+    if connection_age >= WS_TREADMILL_FRESH_WINDOW {
+        *cycles = 1;
+        return false;
+    }
+    *cycles = cycles.saturating_add(1);
+    *cycles > WS_SLOWNESS_TREADMILL_CAP
+}
+
 /// netstate PR-2 — a MAJOR network change (default route moved / addresses
 /// vanished) probes the control WS immediately: a ping with this deadline,
 /// [`WS_NETCHANGE_PROBE_STRIKES`] chances. The first cut (5 s, single
@@ -469,6 +507,9 @@ pub async fn run(
     // to find + stop the duplicate (or re-enrol THIS host with a
     // fresh enrollment JWT to mint a new agent_id).
     let mut recent_replacements: Vec<std::time::Instant> = Vec::new();
+    // Slowness-cycle treadmill (see [`WS_SLOWNESS_TREADMILL_CAP`]): spans
+    // reconnects so "the fresh connection ALSO went slow" is countable.
+    let mut slowness_cycles: u32 = 0;
     loop {
         if *shutdown.borrow() {
             info!("shutdown signalled; exiting signaling loop");
@@ -487,6 +528,7 @@ pub async fn run(
             rtt_sample_slot.clone(),
             derp_ticket_slot.clone(),
             tunnel_hub.clone(),
+            &mut slowness_cycles,
             &mut kill_rx,
         )
         .await
@@ -494,6 +536,7 @@ pub async fn run(
             Ok(()) => {
                 info!("signaling connection closed cleanly, reconnecting");
                 backoff = Duration::from_secs(1);
+                slowness_cycles = 0;
                 if auth_failures > 0 {
                     info!(
                         prior_auth_failures = auth_failures,
@@ -694,6 +737,9 @@ pub async fn run(
                     _ = next_major_netchange(&mut ladder_net_rx) => {
                         info!("network changed during reconnect backoff — retrying immediately");
                         backoff = Duration::from_secs(1);
+                        // New network = new throttle regime: the slowness
+                        // treadmill re-earns its verdict from scratch.
+                        slowness_cycles = 0;
                     },
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() { return Ok(()); }
@@ -808,6 +854,10 @@ async fn connect_once(
     // rc.307 (B) — process-scope DERP admission-ticket cache (see run()).
     derp_ticket_slot: crate::relay_probe::DerpTicketSlot,
     tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
+    // Slowness-cycle treadmill counter (see [`WS_SLOWNESS_TREADMILL_CAP`]) —
+    // lives in `run`'s loop so it spans reconnects; reset on a clean close
+    // and on a netstate Major (new network = new regime).
+    slowness_cycles: &mut u32,
     // Overlay "Disconnect" → session ObjectId to tear down. Borrowed
     // (not owned) so the same receiver survives across reconnects.
     kill_rx: &mut mpsc::Receiver<bson::oid::ObjectId>,
@@ -1219,15 +1269,24 @@ async fn connect_once(
                             "control WS keepalive ping unanswered past the degradation bound"
                         );
                         if slow_pongs >= WS_PONG_RTT_STRIKES {
-                            close_all_peers(&mut peers, &indicator).await;
-                            close_all_tunnel_peers(&mut tunnel_peers).await;
-                            close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
-                            return Err(ConnectError::Transient(anyhow::anyhow!(
-                                "control WS degraded: keepalive ping unanswered for {} s \
-                                 ({} strikes) — cycling to a fresh connection",
-                                sent.elapsed().as_secs(),
-                                slow_pongs
-                            )));
+                            if slowness_treadmill_holds(slowness_cycles, ws_epoch.elapsed()) {
+                                warn!(
+                                    unanswered_s = sent.elapsed().as_secs(),
+                                    treadmill_cycles = *slowness_cycles,
+                                    "control WS degraded but HELD — fresh connections re-throttled repeatedly, cycling is not improving the path; keeping the alive-but-slow WS (deadness still convicts via the rx deadline)"
+                                );
+                                slow_pongs = 0;
+                            } else {
+                                close_all_peers(&mut peers, &indicator).await;
+                                close_all_tunnel_peers(&mut tunnel_peers).await;
+                                close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                                return Err(ConnectError::Transient(anyhow::anyhow!(
+                                    "control WS degraded: keepalive ping unanswered for {} s \
+                                     ({} strikes) — cycling to a fresh connection",
+                                    sent.elapsed().as_secs(),
+                                    slow_pongs
+                                )));
+                            }
                         }
                         true
                     }
@@ -1262,6 +1321,9 @@ async fn connect_once(
                 watchdog::tick(ctx.pump);
             }
             summary = next_major_netchange(&mut net_rx) => {
+                // New network = new throttle regime — the slowness treadmill
+                // re-earns its hold verdict from scratch.
+                *slowness_cycles = 0;
                 // netstate PR-2 — the network materially moved. Probe the
                 // WS immediately (one ping, 5 s verdict at the pulled-
                 // forward keepalive tick) instead of trusting a socket the
@@ -1509,16 +1571,25 @@ async fn connect_once(
                                 "control WS pong RTT degraded"
                             );
                             if slow_pongs >= WS_PONG_RTT_STRIKES {
-                                close_all_peers(&mut peers, &indicator).await;
-                                close_all_tunnel_peers(&mut tunnel_peers).await;
-                                close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
-                                return Err(ConnectError::Transient(anyhow::anyhow!(
-                                    "control WS degraded: pong rtt {} s ({} consecutive over \
-                                     the {} s bound) — cycling to a fresh connection",
-                                    rtt.as_secs(),
-                                    slow_pongs,
-                                    WS_PONG_RTT_DEGRADED.as_secs()
-                                )));
+                                if slowness_treadmill_holds(slowness_cycles, ws_epoch.elapsed()) {
+                                    warn!(
+                                        rtt_s = rtt.as_secs(),
+                                        treadmill_cycles = *slowness_cycles,
+                                        "control WS degraded but HELD — fresh connections re-throttled repeatedly, cycling is not improving the path; keeping the alive-but-slow WS (deadness still convicts via the rx deadline)"
+                                    );
+                                    slow_pongs = 0;
+                                } else {
+                                    close_all_peers(&mut peers, &indicator).await;
+                                    close_all_tunnel_peers(&mut tunnel_peers).await;
+                                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                                    return Err(ConnectError::Transient(anyhow::anyhow!(
+                                        "control WS degraded: pong rtt {} s ({} consecutive over \
+                                         the {} s bound) — cycling to a fresh connection",
+                                        rtt.as_secs(),
+                                        slow_pongs,
+                                        WS_PONG_RTT_DEGRADED.as_secs()
+                                    )));
+                                }
                             }
                         } else {
                             slow_pongs = 0;
@@ -2727,6 +2798,43 @@ pub(crate) fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slowness-cycle treadmill (field CORPLAP-1 2026-08-17): cycling on RTT
+    /// degradation is allowed twice; a THIRD young-connection conviction
+    /// holds instead — but a connection that ran healthy past the fresh
+    /// window re-arms the counter (the 2026-08-15 escape-the-zombie regime
+    /// must keep working).
+    #[test]
+    fn slowness_treadmill_caps_young_reconvictions_and_rearms_on_aged_connections() {
+        let young = Duration::from_secs(120);
+        let aged = WS_TREADMILL_FRESH_WINDOW + Duration::from_secs(1);
+        let mut cycles = 0u32;
+
+        // First two young convictions cycle (the proven-useful regime).
+        assert!(!slowness_treadmill_holds(&mut cycles, young));
+        assert_eq!(cycles, 1);
+        assert!(!slowness_treadmill_holds(&mut cycles, young));
+        assert_eq!(cycles, 2);
+        // Third young conviction: the fresh connections ALSO went slow —
+        // cycling is a treadmill; hold.
+        assert!(slowness_treadmill_holds(&mut cycles, young));
+        // Further convictions on the same held connection keep holding.
+        assert!(slowness_treadmill_holds(&mut cycles, young));
+
+        // A connection that stayed healthy past the window before
+        // degrading is a NEW episode: counter re-arms at 1 and the cycle
+        // fires again.
+        assert!(!slowness_treadmill_holds(&mut cycles, aged));
+        assert_eq!(cycles, 1);
+        // And the treadmill can re-latch from there.
+        assert!(!slowness_treadmill_holds(&mut cycles, young));
+        assert!(slowness_treadmill_holds(&mut cycles, young));
+
+        // The outer loop's resets (clean close / netstate Major) restore
+        // full cycling credit.
+        cycles = 0;
+        assert!(!slowness_treadmill_holds(&mut cycles, young));
+    }
 
     /// The keepalive ping payload must round-trip through [`pong_rtt`] as a
     /// near-zero RTT, and foreign pong shapes must abstain rather than
