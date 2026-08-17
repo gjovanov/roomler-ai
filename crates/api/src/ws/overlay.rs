@@ -124,6 +124,10 @@ pub async fn relay_overlay_msg_from_node(
             handle_overlay_srflx(state, ident, candidates, nat, udp_dialer_ok).await;
             None
         }
+        ClientMsg::OverlayNetcheck { caps } => {
+            handle_overlay_netcheck(state, ident, caps).await;
+            None
+        }
         ClientMsg::OverlayLeave {} => {
             handle_overlay_leave(state, ident).await;
             None
@@ -558,6 +562,57 @@ async fn handle_overlay_srflx(
     updated.udp_dialer_ok = udp_dialer_ok;
     let epoch = next_epoch();
     fan_upsert_shaped(state, &updated, epoch, true).await;
+}
+
+/// Phase B (overlay v3) — store a node's measured capability vector and fan
+/// the delta (peers re-read `NetmapPeer.caps` behind the freshness gate).
+/// A CHANGED vector logs at INFO — it is exactly the evidence the selection
+/// layers act on from PR-B3.
+async fn handle_overlay_netcheck(
+    state: &AppState,
+    ident: NodeIdentity,
+    caps: roomler_ai_remote_control::signaling::CapVectorWire,
+) {
+    let Some(self_node) = current_node(state, ident).await else {
+        debug!(?ident, "overlay.netcheck before join; ignoring");
+        return;
+    };
+    let Some(self_id) = self_node.id else { return };
+    if self_node.caps != Some(caps) {
+        tracing::info!(
+            %self_id, node = %self_node.name,
+            stun_udp = caps.stun_udp,
+            relay_band_udp = ?caps.relay_band_udp,
+            derp_ws_ok = caps.derp_ws_ok,
+            "overlay.netcheck: capability vector changed"
+        );
+    }
+    if let Err(e) = state
+        .overlay_nodes
+        .update_netcheck_caps(self_id, caps)
+        .await
+    {
+        warn!(%self_id, %e, "overlay.netcheck: store failed");
+        return;
+    }
+    let mut updated = self_node;
+    updated.caps = Some(caps);
+    updated.caps_measured_at = Some(bson::DateTime::now());
+    let epoch = next_epoch();
+    fan_upsert_shaped(state, &updated, epoch, true).await;
+}
+
+/// Phase B — the freshness gate: a vector older than 3× the measurement
+/// cadence (20 min) is surfaced as ABSENT, so a stalled prober can never
+/// stay fleet-authoritative (consumers then fall back to presence rules).
+fn fresh_caps(node: &OverlayNode) -> Option<roomler_ai_remote_control::signaling::CapVectorWire> {
+    const CAPS_FRESH_MS: i64 = 60 * 60 * 1000; // 3 × the 20-min cadence
+    let at = node.caps_measured_at?;
+    let age_ms = bson::DateTime::now().timestamp_millis() - at.timestamp_millis();
+    if age_ms > CAPS_FRESH_MS {
+        return None;
+    }
+    node.caps
 }
 
 /// Graceful leave (or WS teardown): mark offline + tell peers to drop.
@@ -1764,6 +1819,9 @@ fn to_netmap_peer(node: &OverlayNode, reachable: bool) -> NetmapPeer {
         // Phase C — surface the node's probed NAT type so a dialer can skip a
         // futile both-symmetric punch (VERBATIM, like srflx_endpoints).
         srflx_nat: node.srflx_nat.clone(),
+        // Phase B — the measured capability vector behind the freshness
+        // gate (stale ⇒ absent ⇒ consumers fall back to presence rules).
+        caps: fresh_caps(node),
         // Dialer honesty — surface the node's raw-dial verdict VERBATIM
         // (`None` = pre-honesty agent; peers then keep legacy role inputs).
         udp_dialer_ok: node.udp_dialer_ok,
@@ -2116,6 +2174,8 @@ mod tests {
             lan_endpoints: vec!["192.168.1.5:41641".into()],
             srflx_endpoints: vec!["5.6.7.8:5678".into()],
             srflx_nat: Some("cone".into()),
+            caps: None,
+            caps_measured_at: None,
             udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,
