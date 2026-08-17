@@ -1455,6 +1455,36 @@ impl OverlayRuntime {
                     .await;
                 }
                 CarrierMode::Relay => {
+                    // Phase A2 (overlay v3) — DERP floor at birth, BEFORE any
+                    // direct-tier pick: a fresh pair with nothing installed
+                    // gets the derp carrier IMMEDIATELY (both ends
+                    // floor-capable, mux alive), the better-tier coordination
+                    // fires in the SAME pass, and the direct tiers arrive as
+                    // MBB upgrade probes OVER the floor on the next walks
+                    // (the relay-installed arm never inspects relay_kind).
+                    // Placement is load-bearing: the fresh walk short-circuits
+                    // at the first dialable direct tier — field 2026-08-17,
+                    // rc.398: clk's dead srflx punch looped 12 s deadlines
+                    // forever, the relay arm was never reached, and the pair
+                    // sat carrier-less. The floor must come FIRST so a wrong
+                    // direct guess costs an upgrade-probe, never the carrier.
+                    // A withheld floor (mux down / peer not capable) falls
+                    // through to the whole ladder unchanged; DERP-strategy
+                    // pairs skip the redundant TURN request.
+                    if let Some(coord) = relay.as_mut()
+                        && !relay_bq.in_flight.contains_key(&np.node_id)
+                        && !coord.is_tracking(&np.node_id)
+                        && !coord.is_floored(&np.node_id)
+                        && let Some(link) = coord.build_floor(np.node_id, &cfg)
+                    {
+                        let t0 = Instant::now();
+                        self.install_ready(wg, by_node, tun, link, relay_bq).await;
+                        warn_if_slow("install_ready(floor)", t0);
+                        if !coord.strategy_is_derp(&np.node_id, &cfg) {
+                            coord.request(np.node_id, cfg.clone()).await;
+                        }
+                        continue;
+                    }
                     // P9 — fresh-install LAN is PROBE-FIRST under make-before-
                     // break: a same-/24 match is only a HINT the peer is on
                     // this LAN. Two sites on a vendor-default subnet
@@ -1570,30 +1600,6 @@ impl OverlayRuntime {
                         // without this guard `!is_tracking` would re-`request` a
                         // DUPLICATE coordination during the 8 s QUIC window.
                         if relay_bq.in_flight.contains_key(&np.node_id) {
-                            continue;
-                        }
-                        // Phase A2 (overlay v3) — DERP floor at birth: a fresh
-                        // pair with nothing installed gets the derp carrier
-                        // IMMEDIATELY (both ends floor-capable, mux alive),
-                        // and the better-tier coordination fires in the SAME
-                        // pass (the lan_probe_first precedent: hold one
-                        // working thing, keep walking) — `install_ready`
-                        // replaces the floor when the grant lands. A withheld
-                        // floor (mux down / peer not capable) falls through
-                        // to the ladder below unchanged, so pair formation
-                        // never couples to /derp health. Pairs whose computed
-                        // strategy is DERP anyway skip the request — the
-                        // floor IS their carrier.
-                        if !coord.is_tracking(&np.node_id)
-                            && !coord.is_floored(&np.node_id)
-                            && let Some(link) = coord.build_floor(np.node_id, &cfg)
-                        {
-                            let t0 = Instant::now();
-                            self.install_ready(wg, by_node, tun, link, relay_bq).await;
-                            warn_if_slow("install_ready(floor)", t0);
-                            if !coord.strategy_is_derp(&np.node_id, &cfg) {
-                                coord.request(np.node_id, cfg).await;
-                            }
                             continue;
                         }
                         if let Some(link) = coord.maybe_complete(np.node_id, &cfg) {

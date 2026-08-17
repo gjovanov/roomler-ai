@@ -588,9 +588,22 @@ impl RelayCoordinator {
         reason: &'static str,
     ) {
         self.refresh_ctx.insert(node_id, (kind, reason));
-        // Unresponsive-peer backoff — every relay death without an
+        // Unresponsive-peer backoff — every RELAY death without an
         // intervening completed handshake escalates the streak; from the
         // 3rd, our OWN next `request` is deferred (see `death_streaks`).
+        //
+        // RELAY deaths only (`kind.is_some()`): the first cut booked EVERY
+        // death, and a direct-tier failure loop (a srflx punch dying at its
+        // 12 s deadline every ~65 s walk) then re-armed the 300 s hold
+        // faster than it could expire — the relay re-request starved
+        // FOREVER while the pair sat carrier-less (field 2026-08-17,
+        // rc.398 post-roll: clk/pc50045 pairs wedged fleet-wide once the
+        // storm-era force-DERP pins expired and stopped masking it). A
+        // direct-tier death says nothing about grinding allocations —
+        // #496's whole point — so it must not feed this streak.
+        if kind.is_none() {
+            return;
+        }
         let now = Instant::now();
         let entry = self.death_streaks.entry(node_id).or_insert((0, now));
         entry.0 = entry.0.saturating_add(1);
@@ -2157,11 +2170,30 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
         let node = ObjectId::new();
-        for _ in 0..3 {
+        // rc.398 regression lock: DIRECT-tier deaths (kind=None) must NOT
+        // feed the streak — a dead srflx punch looping its 12 s deadline
+        // re-armed the 300 s hold faster than expiry and starved the relay
+        // re-request forever (the post-roll carrier-less wedge).
+        for _ in 0..5 {
             coord.note_refresh_context(node, None, "handshake-deadline");
         }
         coord.request(node, base_peer()).await;
-        assert!(!coord.is_tracking(&node), "3rd-death re-request is held");
+        assert!(
+            coord.is_tracking(&node),
+            "direct-tier deaths never defer the relay request"
+        );
+        coord.forget(&node);
+        assert!(rx.try_recv().is_ok(), "the request went out");
+
+        // RELAY deaths (kind=Some) book as before: 3rd holds.
+        for _ in 0..3 {
+            coord.note_refresh_context(node, Some(RelayKind::Turn), "handshake-deadline");
+        }
+        coord.request(node, base_peer()).await;
+        assert!(
+            !coord.is_tracking(&node),
+            "3rd relay-death re-request is held"
+        );
         assert!(rx.try_recv().is_err(), "nothing sent while held");
 
         coord.clear_death_streak(&node);
