@@ -142,6 +142,7 @@ mod tests {
             lan_endpoints: vec![],
             srflx_endpoints: vec![],
             srflx_nat: None,
+            caps: None,
             udp_dialer_ok: None,
             relay_home: None,
             warm_relay_endpoint: None,

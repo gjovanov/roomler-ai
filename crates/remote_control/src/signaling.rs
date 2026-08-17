@@ -831,6 +831,17 @@ pub enum ClientMsg {
         udp_dialer_ok: Option<bool>,
     },
 
+    /// Phase B (overlay v3) — the node's MEASURED capability vector
+    /// (netcheck): relay-band reachability over the exact dialer path,
+    /// STUN/NAT snapshot, `/derp` WS health. Sent after each measurement
+    /// pass (startup / netstate Major / ~20 min cadence). The server stores
+    /// it with a receipt stamp and surfaces it per-peer behind a FRESHNESS
+    /// gate — a stalled prober's vector must never stay fleet-
+    /// authoritative. Unknown to a pre-B2 server ⇒ logged-and-ignored on
+    /// the agent socket (no capability gate needed).
+    #[serde(rename = "rc:overlay.netcheck")]
+    OverlayNetcheck { caps: CapVectorWire },
+
     /// Node leaves the overlay (graceful). Server marks it offline and
     /// pushes a `netmap_delta` removing it from peers.
     #[serde(rename = "rc:overlay.leave")]
@@ -1520,6 +1531,25 @@ pub struct IceServer {
     pub credential: Option<String>,
 }
 
+/// Phase B (overlay v3) — the MEASURED capability vector on the wire
+/// (netcheck). Every field serde-defaulted so the shape can grow; `Option`
+/// fields distinguish "measured false" from "not measured" — absence of
+/// measurement is NEVER evidence of absence of capability, and consumers
+/// fall back to presence rules on `None`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, Copy)]
+pub struct CapVectorWire {
+    /// The srflx gather found a public mapping.
+    #[serde(default)]
+    pub stun_udp: bool,
+    /// Raw UDP reaches coturn's relay band, measured over the exact
+    /// single-relay dialer path. `Some(false)` = the CORPLAP-3-class egress drop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_band_udp: Option<bool>,
+    /// The central `/derp` WS is up + registered (the floor's health).
+    #[serde(default)]
+    pub derp_ws_ok: bool,
+}
+
 /// One relay region as pushed in [`ServerMsg::RelayRegions`] — the probe
 /// target, not the credential set (creds keep flowing through the normal
 /// grant paths; this only lets the node measure which PoP is nearest).
@@ -1753,6 +1783,13 @@ pub struct NetmapPeer {
     /// pre-Phase-C server/peer stays "unknown" (attempted, never skipped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srflx_nat: Option<String>,
+    /// Phase B (overlay v3) — this peer's MEASURED capability vector, or
+    /// `None` when the peer hasn't measured (pre-B agent) or its vector went
+    /// STALE (the server's freshness gate treats >3× cadence as absent — a
+    /// stalled prober must not stay fleet-authoritative). Consumers fall
+    /// back to the presence rules whenever this is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<CapVectorWire>,
     /// Dialer honesty (field 2026-08-16, CORPLAP-3) — can this peer
     /// raw-UDP-dial ARBITRARY high ports (the single-relay DIALER's job:
     /// its raw socket sends straight to a coturn relay-band port)? A srflx
@@ -3594,6 +3631,7 @@ mod tests {
                 lan_endpoints: vec!["203.0.113.9:51820".into()],
                 srflx_endpoints: vec!["198.51.100.7:41820".into()],
                 srflx_nat: Some("cone".into()),
+                caps: None,
                 udp_dialer_ok: None,
                 relay_home: None,
                 warm_relay_endpoint: None,
@@ -3835,6 +3873,57 @@ mod tests {
     /// Phase C — `srflx_nat` back-compat: a pre-Phase-C server/peer omits it →
     /// defaults `None` (unknown ⇒ punch attempted, never skipped); `None` is
     /// OMITTED on the wire; populated round-trips.
+    #[test]
+    fn netcheck_msg_and_netmap_caps_default_skip_and_roundtrip() {
+        // Wire message: a populated vector round-trips; the tag is stable.
+        let m = ClientMsg::OverlayNetcheck {
+            caps: CapVectorWire {
+                stun_udp: true,
+                relay_band_udp: Some(false),
+                derp_ws_ok: true,
+            },
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""t":"rc:overlay.netcheck""#));
+        assert!(s.contains(r#""relay_band_udp":false"#));
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::OverlayNetcheck { caps } => {
+                assert!(caps.stun_udp && caps.derp_ws_ok);
+                assert_eq!(caps.relay_band_udp, Some(false));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Unmeasured relay_band is OMITTED on the wire; absent parses None.
+        let partial = serde_json::to_string(&CapVectorWire {
+            stun_udp: true,
+            relay_band_udp: None,
+            derp_ws_ok: false,
+        })
+        .unwrap();
+        assert!(!partial.contains("relay_band_udp"));
+
+        // NetmapPeer.caps: absent from a pre-B server ⇒ None + omitted on
+        // the wire; populated round-trips.
+        let json = r#"{
+            "node_id":"507f1f77bcf86cd799439011",
+            "overlay_ip":"100.64.0.4",
+            "wg_public_key":"cGVlcg==",
+            "reachable":true
+        }"#;
+        let p: NetmapPeer = serde_json::from_str(json).unwrap();
+        assert!(p.caps.is_none());
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(!s.contains("\"caps\""), "absent caps omitted: {s}");
+        let mut p2 = p.clone();
+        p2.caps = Some(CapVectorWire {
+            stun_udp: false,
+            relay_band_udp: Some(true),
+            derp_ws_ok: true,
+        });
+        let s2 = serde_json::to_string(&p2).unwrap();
+        assert_eq!(serde_json::from_str::<NetmapPeer>(&s2).unwrap(), p2);
+    }
+
     #[test]
     fn netmap_peer_supports_derp_floor_default_and_roundtrip() {
         // Phase A back-compat: absent from a pre-floor server ⇒ false (the
