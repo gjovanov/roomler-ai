@@ -2064,6 +2064,11 @@ impl OverlayRuntime {
             super::direct::netcheck_enabled() && matches!(self.mode, CarrierMode::Relay);
         let mut netcheck_next = Instant::now() + super::netcheck::NETCHECK_STARTUP_DELAY;
         let mut netcheck_pending = false;
+        // The measurement clock — deliberately NOT the warm tick (see the
+        // netcheck select arm): 15 s granularity against the minutes-scale
+        // `netcheck_next` schedule.
+        let mut netcheck_tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        netcheck_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // rc.211 — off-loop relay carrier builds (see `RelayBuildQueue`).
         // Created before the FIRST install so the startup batch can spawn too.
@@ -2841,21 +2846,28 @@ impl OverlayRuntime {
                             let _ = tx.send(msg).await;
                         });
                     }
-                    // Phase B — netcheck due: request creds (the grant arm
-                    // spawns the dedicated probe allocation when
-                    // `netcheck_pending` rides it). Shares the warm request
-                    // wire; a grant that warm doesn't need is a no-op there.
-                    // B3 — a dialer-role conviction is a DETECTOR now: it
+                    self.warm_relay_status = Some(warm.status(now));
+                },
+                // Phase B (netcheck) — its OWN cadence arm. B1 parked this
+                // logic inside the warm tick, but `warm_enabled` requires the
+                // default-OFF `OVERLAY_WARM_RELAY` flag — so every host
+                // without the warm leg (the whole direct-carrier fleet) never
+                // measured, its peers saw no vector, and the B3 measured
+                // branch silently stayed legacy for every pair touching such
+                // a host. The request still rides the warm-grant creds wire
+                // (`OverlayWarmRelayRequest` → `WarmRelayGrant`, whose arm
+                // spawns the probe when `netcheck_pending` rides it) — only
+                // the CLOCK is independent now.
+                _ = netcheck_tick.tick(), if netcheck_enabled => {
+                    let now = Instant::now();
+                    // B3 — a dialer-role conviction is a DETECTOR: it
                     // requests an immediate re-measure instead of (only)
                     // flipping roles through the latch.
-                    if netcheck_enabled
-                        && super::dialer::take_probe_request()
-                        && !netcheck_pending
-                    {
+                    if super::dialer::take_probe_request() && !netcheck_pending {
                         info!("netcheck: dialer-role conviction — immediate re-measure scheduled");
                         netcheck_next = now;
                     }
-                    if netcheck_enabled && !netcheck_pending && now >= netcheck_next {
+                    if !netcheck_pending && now >= netcheck_next {
                         netcheck_pending = true;
                         netcheck_next = now + super::netcheck::NETCHECK_INTERVAL;
                         if self
@@ -2868,14 +2880,13 @@ impl OverlayRuntime {
                         }
                     }
                     // B3 — keep the coordinator's measured-verdict mirror in
-                    // step with the slot each tick (the publish runs
-                    // off-loop; freshness expiry must also read as a change).
+                    // step with the slot (the publish runs off-loop;
+                    // freshness expiry must also read as a change).
                     if let Some(coord) = relay.as_mut() {
                         coord.set_relay_band_udp(
                             super::netcheck::current_fresh().and_then(|v| v.relay_band_udp),
                         );
                     }
-                    self.warm_relay_status = Some(warm.status(now));
                 },
                 Some(wm) = warm_rx.recv() => {
                     let now = Instant::now();
