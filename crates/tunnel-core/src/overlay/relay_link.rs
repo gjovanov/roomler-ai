@@ -1632,6 +1632,15 @@ impl RelayCoordinator {
         self.floored.contains_key(node_id)
     }
 
+    /// Phase B (netcheck) — is the central `/derp` WS present AND alive
+    /// right now? The capability vector's `derp_ws_ok` bit.
+    pub fn derp_ws_alive(&self) -> bool {
+        self.derp_mux
+            .as_ref()
+            .map(|m| m.is_alive())
+            .unwrap_or(false)
+    }
+
     /// Phase A2 — would the pair's computed strategy be DERP anyway? The
     /// floor block skips the parallel TURN `request` for such pairs — the
     /// floor IS their carrier, and a request would double-build it.

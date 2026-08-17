@@ -850,6 +850,17 @@ pub fn derp_floor_enabled() -> bool {
     crate::env::flag("OVERLAY_DERP_FLOOR", true)
 }
 
+/// Phase B (overlay v3) — netcheck: periodically MEASURE this host's
+/// egress capabilities (relay-band reachability over the exact dialer
+/// path, STUN/NAT snapshot, `/derp` WS health) and publish the
+/// [`CapVector`](super::netcheck::CapVector) selection consumes instead of
+/// presence folklore. `ROOMLER_NODE_OVERLAY_NETCHECK`, config-surface key
+/// `overlay_netcheck`. Default-ON: measurement-only in PR-B1 (nothing
+/// selects on it until PR-B3), one dedicated TURN allocation per ~20 min.
+pub fn netcheck_enabled() -> bool {
+    crate::env::flag("OVERLAY_NETCHECK", true)
+}
+
 /// Phase D — should this node GATHER + ADVERTISE its own srflx candidates? True
 /// when the srflx-direct tier is on OR single-relay is on. Single-relay needs it
 /// even with srflx-direct OFF: a single-relay DIALER (larger pubkey) runs no
