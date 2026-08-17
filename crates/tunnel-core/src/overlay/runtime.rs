@@ -2053,6 +2053,17 @@ impl OverlayRuntime {
         if warm_enabled {
             info!("overlay warm relay: enabled — will establish once srflx proves UDP egress");
         }
+        // Phase B (netcheck) — the measurement cadence. Rides the warm-grant
+        // creds flow (`OverlayWarmRelayRequest` → `WarmRelayGrant`) with NO
+        // new wire message: when a measurement is due, the tick requests
+        // creds with `netcheck_pending` set, and the grant arm spawns the
+        // dedicated probe allocation alongside (never instead of) the warm
+        // machinery. A netstate Major invalidates the vector and pulls the
+        // next measurement close.
+        let netcheck_enabled =
+            super::direct::netcheck_enabled() && matches!(self.mode, CarrierMode::Relay);
+        let mut netcheck_next = Instant::now() + super::netcheck::NETCHECK_STARTUP_DELAY;
+        let mut netcheck_pending = false;
 
         // rc.211 — off-loop relay carrier builds (see `RelayBuildQueue`).
         // Created before the FIRST install so the startup batch can spawn too.
@@ -2633,6 +2644,11 @@ impl OverlayRuntime {
                                 // the coordinator mirror; the periodic srflx
                                 // advert re-publishes the reset verdict.
                                 super::dialer::reset_on_network_change();
+                                // Phase B — the capability vector describes a
+                                // network that no longer exists; invalidate
+                                // and re-measure once the transition settles.
+                                super::netcheck::invalidate_on_network_change();
+                                netcheck_next = Instant::now() + Duration::from_secs(60);
                                 if let Some(coord) = relay.as_mut() {
                                     coord.set_udp_dialer_ok(super::dialer::udp_dialer_ok());
                                 }
@@ -2816,6 +2832,22 @@ impl OverlayRuntime {
                             };
                             let _ = tx.send(msg).await;
                         });
+                    }
+                    // Phase B — netcheck due: request creds (the grant arm
+                    // spawns the dedicated probe allocation when
+                    // `netcheck_pending` rides it). Shares the warm request
+                    // wire; a grant that warm doesn't need is a no-op there.
+                    if netcheck_enabled && !netcheck_pending && now >= netcheck_next {
+                        netcheck_pending = true;
+                        netcheck_next = now + super::netcheck::NETCHECK_INTERVAL;
+                        if self
+                            .outbound
+                            .send(ClientMsg::OverlayWarmRelayRequest {})
+                            .await
+                            .is_ok()
+                        {
+                            debug!("netcheck: measurement due — creds requested");
+                        }
                     }
                     self.warm_relay_status = Some(warm.status(now));
                 },
@@ -3176,7 +3208,56 @@ impl OverlayRuntime {
                     // allocation would just be today's TURNS fallback), and
                     // let the warm_rx arm commit the outcome.
                     Some(OverlayEvent::WarmRelayGrant { ice_servers }) => {
-                        if warm_enabled {
+                        // Phase B — a due netcheck rode this grant: spawn the
+                        // DEDICATED probe allocation (never the warm leg —
+                        // its relayed address is dialed by real peers) and
+                        // publish the measured vector. Runs alongside the
+                        // warm machinery below; allocation failure publishes
+                        // an honest partial (relay_band unmeasured).
+                        if netcheck_pending {
+                            netcheck_pending = false;
+                            let stun_udp = !srflx_advertised.is_empty();
+                            let nat = srflx_my_nat.clone();
+                            let derp_ws_ok = relay
+                                .as_ref()
+                                .map(|r| r.derp_ws_alive())
+                                .unwrap_or(false);
+                            let own_ips: Vec<std::net::IpAddr> = srflx_advertised
+                                .iter()
+                                .filter_map(|e| e.parse::<SocketAddr>().ok())
+                                .map(|a| a.ip())
+                                .collect();
+                            let creds = super::relay_link::turn_creds(&ice_servers);
+                            tokio::spawn(async move {
+                                let alloc = match (&creds, stun_udp) {
+                                    (Some((urls, user, cred)), true) => {
+                                        let udp = super::warm_relay::udp_turn_urls(urls);
+                                        match crate::transport::relay::allocate_relay_from_ice_tiered(
+                                            &udp, user, cred, false,
+                                        )
+                                        .await
+                                        {
+                                            Ok(c) => {
+                                                let conn: std::sync::Arc<
+                                                    dyn crate::transport::relay::RelayConn,
+                                                > = std::sync::Arc::new(c);
+                                                conn.local_addr().ok().map(|r| (conn, r))
+                                            }
+                                            Err(e) => {
+                                                debug!(%e, "netcheck: probe allocation failed — relay_band unmeasured");
+                                                None
+                                            }
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                super::netcheck::run_measurement(
+                                    stun_udp, nat, derp_ws_ok, alloc, own_ips,
+                                )
+                                .await;
+                            });
+                        }
+                        if warm_enabled && !warm.is_live() {
                             match super::relay_link::turn_creds(&ice_servers) {
                                 Some((urls, user, cred)) => {
                                     // C4 stage 2 — flavor ladder: UDP while it can work
