@@ -681,7 +681,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/stripe/webhook", post(routes::stripe::webhook))
         .route("/ws", get(ws::handler::ws_upgrade))
         .route("/derp", get(ws::derp::derp_upgrade))
-        .layer(TraceLayer::new_for_http())
+        // Security — never let a bearer-carrying query string into the logs:
+        // `/ws?token=<jwt>&role=agent` and `/derp?token=<jwt>` authenticate
+        // via the query (WS clients can't set headers), and TraceLayer's
+        // default span records the FULL uri at DEBUG — pod logs held live
+        // long-lived agent JWTs (field 2026-08-18, task #15). Queries that
+        // carry no token stay logged verbatim (pagination etc. is useful).
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |req: &axum::http::Request<axum::body::Body>| {
+                let uri = req.uri();
+                let shown = match uri.query() {
+                    Some(q) if q.contains("token") => {
+                        format!("{}?<token redacted>", uri.path())
+                    }
+                    _ => uri.to_string(),
+                };
+                tracing::debug_span!("request", method = %req.method(), uri = %shown)
+            },
+        ))
         .layer(cors)
         .with_state(state)
 }
