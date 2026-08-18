@@ -801,6 +801,15 @@ async fn handle_overlay_relay_request(
             },
         )
         .await;
+        // D2 (overlay v3) — the pin through the VERDICT channel too: both
+        // ends get the other's row re-stamped NOW (`pinned` resolves to
+        // verdict=Derp inside `server_relay_verdict`), so a D1 consumer
+        // flips tiers off the stamp at escalation time instead of waiting
+        // for the next incidental trickle to re-fan it. `OverlayForceDerp`
+        // above stays for wire compat (pre-D1 nodes) and as the TTL
+        // carrier; when the pin lapses the next fan re-stamps the
+        // capability-derived verdict and the pair regrades per Phase C.
+        fan_pair_verdicts(state, &self_node, &peer).await;
         return;
     }
 
@@ -1325,6 +1334,73 @@ async fn fan_upsert_shaped(state: &AppState, node: &OverlayNode, epoch: u64, rea
         )
         .await;
     }
+}
+
+/// D2 — re-stamp ONE pair's verdicts on both ends, now.
+///
+/// Used by the P7 escalation so the forced-DERP decision rides the verdict
+/// channel at the moment it is made (D1 consumers act on stamps; the live
+/// `OverlayForceDerp` push covers pre-D1 nodes and carries the TTL). Each
+/// end receives the OTHER's row, ACL-shaped from its own source, with the
+/// verdict for its outgoing edge — the same two halves
+/// [`fan_upsert_shaped`] maintains on ordinary changes.
+async fn fan_pair_verdicts(state: &AppState, a: &OverlayNode, b: &OverlayNode) {
+    let acl = load_acl(state, a.tenant_id).await;
+    let a_src = overlay_source_of(state, a).await;
+    let b_src = overlay_source_of(state, b).await;
+    let reach = reachability(state, std::slice::from_ref(b)).await;
+    let epoch = next_epoch();
+    // Toward `a`: b's row, stamped with the a→b verdict. The requester `a`
+    // is on a live WS by construction; `b`'s presence comes from the
+    // snapshot so a dead peer's row does not read dialable.
+    let b_reach = is_reachable(&reach, b);
+    let enforcing = acl.enforcing();
+    if a.supports_server_relay_strategy
+        && let Some(mut row) = shape_peer(
+            &acl,
+            &a_src,
+            b,
+            if enforcing { Some(&b_src) } else { None },
+            b_reach,
+        )
+    {
+        row.relay_strategy = server_relay_verdict(state, a, b);
+        send_to_node(
+            state,
+            a,
+            ServerMsg::OverlayNetmapDelta {
+                epoch,
+                upserts: vec![row],
+                removes: vec![],
+            },
+        )
+        .await;
+    }
+    if b.supports_server_relay_strategy
+        && let Some(mut row) = shape_peer(
+            &acl,
+            &b_src,
+            a,
+            if enforcing { Some(&a_src) } else { None },
+            true,
+        )
+    {
+        row.relay_strategy = server_relay_verdict(state, b, a);
+        send_to_node(
+            state,
+            b,
+            ServerMsg::OverlayNetmapDelta {
+                epoch,
+                upserts: vec![row],
+                removes: vec![],
+            },
+        )
+        .await;
+    }
+    debug!(
+        a = %a.name, b = %b.name, epoch,
+        "overlay: pair verdicts re-stamped at escalation (D2)"
+    );
 }
 
 /// Fan a delta to an EXPLICIT peer list, skipping `exclude`.
