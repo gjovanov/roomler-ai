@@ -472,6 +472,16 @@ pub struct PeerStats {
     /// `rx` would freeze it and the rx-staleness watchdog would reap a healthy
     /// link. Single-consumer: only the sweep reads (and zeroes) it.
     rx_any: AtomicU64,
+    /// #22 — authenticated handshake INITIATIONS received from this peer
+    /// since the sweep last drained it (`peer_take_reinits`). A healthy peer
+    /// initiates a rekey about every 2 minutes; a peer that cannot hear our
+    /// responses retries its initiation every ~5 s (boringtun's rekey
+    /// timeout), so a BURST of these against an established session is
+    /// one-way evidence: our inbound works, our outbound does not — the
+    /// exact signature the 08-18 zombie-leg wedge broadcast unheard for 30
+    /// minutes (a rebirthing DERP floor re-initiating every ~70 s). The
+    /// sweep turns sustained pressure into an immediate revalidation poke.
+    reinit_seen: AtomicU64,
     /// Phase C — latched `true` the moment a WG handshake to this peer
     /// completes (a session exists), for EITHER role (the responder establishes
     /// on receiving the init, the initiator on receiving the response). The
@@ -2122,6 +2132,17 @@ impl WgDevice {
         }
     }
 
+    /// #22 — authenticated handshake INITIATIONS from this peer since the
+    /// last call (single-consumer drain, same discipline as
+    /// [`peer_take_rx_any`](Self::peer_take_rx_any)). The sweep accumulates
+    /// these into a re-init-pressure window; see `PeerStats::reinit_seen`.
+    pub fn peer_take_reinits(&self, peer_public: &[u8; 32]) -> u64 {
+        match self.peers.get(peer_public) {
+            Some(p) => p.stats.reinit_seen.swap(0, Ordering::Relaxed),
+            None => 0,
+        }
+    }
+
     /// rc.181 — `true` if `peer_public`'s carrier has latched a hard send error
     /// (a TURNS/TCP reset or a lost QUIC-over-TURN connection); `false` for a
     /// healthy or direct carrier; `None` if the peer is unknown. Lock-free. The
@@ -2244,6 +2265,14 @@ impl WgDevice {
             p.stats.rx_any.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    /// #22 test hook — simulate authenticated handshake initiations from
+    /// `peer_public` (the re-init-pressure input; see `peer_take_reinits`).
+    pub fn test_bump_reinits(&self, peer_public: &[u8; 32], n: u64) {
+        if let Some(p) = self.peers.get(peer_public) {
+            p.stats.reinit_seen.fetch_add(n, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Handle one inbound carrier datagram: decapsulate, echo any
@@ -2279,6 +2308,14 @@ pub(crate) async fn process_inbound(
     // packet, so it must not count as liveness. `Err` (replay / garbage) isn't.
     if authenticated {
         stats.rx_any.fetch_add(1, Ordering::Relaxed);
+        // #22 — a HANDSHAKE INITIATION (type 1) from the peer: counted so
+        // the sweep can spot re-init PRESSURE (a ~5 s retry cadence means
+        // the peer cannot hear our responses — see `PeerStats::reinit_seen`).
+        // boringtun authenticated it (mac1/cookie), so a spoofed flood
+        // cannot bump this.
+        if n >= 4 && buf[0] == 1 && buf[1..4] == [0, 0, 0] {
+            stats.reinit_seen.fetch_add(1, Ordering::Relaxed);
+        }
         // Stage 2 — a HANDSHAKE RESPONSE (type 2) that decapsulated without
         // error means a handshake WE initiated just completed: boringtun only
         // accepts a response against our own outstanding initiator state, so
