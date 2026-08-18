@@ -104,6 +104,14 @@ pub(super) fn defended_routes(
 /// delete-then-add on the same prefix, and awaiting it inline would stall
 /// the outbound TUN arm).
 pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
+    // v3 (#23) — the peer list doubles as the reclaim step's target set.
+    let peers: Vec<Ipv4Addr> = set
+        .iter()
+        .filter_map(|e| match e {
+            Defend::AssertPeer(ip) => Some(*ip),
+            _ => None,
+        })
+        .collect();
     for entry in set {
         match entry {
             Defend::AssertPeer(ip) => {
@@ -112,6 +120,14 @@ pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
             Defend::EvictSelf(ip) => tun.defend_self_route(ip).await,
             Defend::BlockFloor => tun.defend_block_floor().await,
         }
+    }
+    // v3 (#23) — reclaim runs LAST, after every per-peer `/32` was
+    // re-ensured and the floor step ran its (debounced) in-block eviction:
+    // a stolen destination repointed here re-resolves against the freshest
+    // possible table, and the pin lands microseconds after the targeted
+    // eviction instead of a prober cycle later.
+    if !peers.is_empty() {
+        tun.reclaim_stolen_peer_paths(&peers).await;
     }
 }
 
