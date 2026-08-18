@@ -128,6 +128,15 @@ pub struct RelayRegionSpec {
     /// Which transport variants this PoP serves (absent fields = true).
     #[serde(default)]
     pub caps: crate::turn_url::VariantCaps,
+    /// Phase E (overlay v3) — the region's coturn relay allocation band
+    /// (`min-port`..=`max-port`, a DEPLOYMENT property mirrored from the
+    /// PoP's coturn config). Pushed to agents in
+    /// [`crate::signaling::RelayRegionInfo`] so the netcheck relay-band
+    /// probe (and operators) can name the REAL band a dialer must reach,
+    /// instead of inferring it from one allocation's port. Absent = not
+    /// declared (agents keep the allocation-derived behavior).
+    #[serde(default)]
+    pub relay_band: Option<(u16, u16)>,
     /// Parsed-but-disabled regions never issue (procurement staging).
     #[serde(default = "spec_enabled_default")]
     pub enabled: bool,
@@ -197,6 +206,7 @@ pub fn relay_regions_wire(map: &TurnMap) -> Option<(Vec<crate::signaling::RelayR
             id: spec.id.clone(),
             stun: format!("{host}:{port}"),
             derp_url: spec.derp_url.clone(),
+            relay_band: spec.relay_band,
         });
     }
     if out.is_empty() {
@@ -289,12 +299,33 @@ pub fn select_pair_region(
     home_a: Option<&str>,
     home_b: Option<&str>,
     pair_key: &str,
+    needs_tls: bool,
 ) -> Option<String> {
     if !map.enabled {
         return None;
     }
-    let known_a = home_a.filter(|r| map.regions.contains_key(*r));
-    let known_b = home_b.filter(|r| map.regions.contains_key(*r));
+    // Phase E — region-level capability filter: when either end of the pair
+    // can only reach coturn over TLS (measured `!stun_udp`, or srflx-empty
+    // as the legacy proxy — derived by the caller), a candidate region must
+    // actually serve a TLS variant, or that end's anchor allocation strands
+    // at grant time. Falling out of every home lands on the DEFAULT region
+    // (`None`), which serves the full variant set. Per-worker filtering is
+    // deliberately absent (no recorded intra-region divergence; hand-written
+    // per-worker caps would drift exactly like the tribal knowledge did) —
+    // and the pair-sticky cache above this fn keys the OUTPUT, so a mid-TTL
+    // capability change can never split the two ends' worker sets.
+    let serves = |r: &str| -> bool {
+        if !needs_tls {
+            return true;
+        }
+        map.specs
+            .iter()
+            .find(|s| s.id == r)
+            .map(|s| s.caps.tls_5349 || s.caps.tls_443_tcp)
+            .unwrap_or(true)
+    };
+    let known_a = home_a.filter(|r| map.regions.contains_key(*r) && serves(r));
+    let known_b = home_b.filter(|r| map.regions.contains_key(*r) && serves(r));
     let chosen = match (known_a, known_b) {
         (Some(a), Some(b)) if a == b => Some(a.to_string()),
         (Some(a), Some(b)) => {
@@ -509,7 +540,14 @@ mod tests {
             assert_eq!(cfg.urls[0], "turn:coturn.example:3478");
         }
         assert_eq!(
-            select_pair_region(&map, &no_load(), Some("us-east"), Some("us-east"), "k"),
+            select_pair_region(
+                &map,
+                &no_load(),
+                Some("us-east"),
+                Some("us-east"),
+                "k",
+                false
+            ),
             None
         );
     }
@@ -537,23 +575,49 @@ mod tests {
         let map = two_region_map(true);
         // Agreement.
         assert_eq!(
-            select_pair_region(&map, &no_load(), Some("us-east"), Some("us-east"), "k").as_deref(),
+            select_pair_region(
+                &map,
+                &no_load(),
+                Some("us-east"),
+                Some("us-east"),
+                "k",
+                false
+            )
+            .as_deref(),
             Some("us-east")
         );
         // One known home wins over none / over an UNKNOWN home.
         assert_eq!(
-            select_pair_region(&map, &no_load(), Some("eu-west"), None, "k").as_deref(),
+            select_pair_region(&map, &no_load(), Some("eu-west"), None, "k", false).as_deref(),
             Some("eu-west")
         );
         assert_eq!(
-            select_pair_region(&map, &no_load(), Some("gone"), Some("eu-west"), "k").as_deref(),
+            select_pair_region(&map, &no_load(), Some("gone"), Some("eu-west"), "k", false)
+                .as_deref(),
             Some("eu-west")
         );
         // No homes → default region.
-        assert_eq!(select_pair_region(&map, &no_load(), None, None, "k"), None);
+        assert_eq!(
+            select_pair_region(&map, &no_load(), None, None, "k", false),
+            None
+        );
         // Differing homes: deterministic AND symmetric in argument order.
-        let ab = select_pair_region(&map, &no_load(), Some("us-east"), Some("eu-west"), "pair-1");
-        let ba = select_pair_region(&map, &no_load(), Some("eu-west"), Some("us-east"), "pair-1");
+        let ab = select_pair_region(
+            &map,
+            &no_load(),
+            Some("us-east"),
+            Some("eu-west"),
+            "pair-1",
+            false,
+        );
+        let ba = select_pair_region(
+            &map,
+            &no_load(),
+            Some("eu-west"),
+            Some("us-east"),
+            "pair-1",
+            false,
+        );
         assert_eq!(ab, ba);
         assert!(ab.as_deref() == Some("us-east") || ab.as_deref() == Some("eu-west"));
     }
@@ -611,11 +675,12 @@ mod tests {
         // Pair fallback: busy pick moves to the other end's home, else default.
         let busy_us = load_with("us-east", true, 0);
         assert_eq!(
-            select_pair_region(&map, &busy_us, Some("us-east"), Some("eu-west"), "k").as_deref(),
+            select_pair_region(&map, &busy_us, Some("us-east"), Some("eu-west"), "k", false)
+                .as_deref(),
             Some("eu-west")
         );
         assert_eq!(
-            select_pair_region(&map, &busy_us, Some("us-east"), Some("us-east"), "k"),
+            select_pair_region(&map, &busy_us, Some("us-east"), Some("us-east"), "k", false),
             None,
             "both ends on the busy region → default"
         );
@@ -631,6 +696,7 @@ mod tests {
             stats_urls: vec![],
             shared_secret: None,
             caps: Default::default(),
+            relay_band: Some((10000, 13000)),
             enabled,
         };
         let mut map = two_region_map(true);
@@ -645,11 +711,93 @@ mod tests {
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].id, "us-east");
         assert_eq!(regions[0].stun, "coturn-us-east.example:3478");
+        // Phase E — the region's declared relay band rides the wire.
+        assert_eq!(regions[0].relay_band, Some((10000, 13000)));
         // rev is stable across calls (deterministic hash).
         assert_eq!(relay_regions_wire(&map).unwrap().1, rev);
         // Master flag off ⇒ nothing is ever pushed.
         map.enabled = false;
         assert!(relay_regions_wire(&map).is_none());
+    }
+
+    /// Phase E — the region-level capability filter: a TLS-needing pair is
+    /// never granted a region without a TLS listener; a spec-less region
+    /// fails OPEN (region_cfg-only maps stay unfiltered), and needs_tls =
+    /// false leaves every input byte-identical to pre-E behavior.
+    #[test]
+    fn needs_tls_filters_regions_without_a_tls_listener() {
+        let spec = |id: &str, tls: bool| RelayRegionSpec {
+            id: id.into(),
+            turn_url: format!("turn:coturn-{id}.example:3478"),
+            worker_urls: vec![],
+            derp_url: None,
+            stats_urls: vec![],
+            shared_secret: None,
+            caps: crate::turn_url::VariantCaps {
+                tls_5349: tls,
+                tls_443_tcp: tls,
+                ..Default::default()
+            },
+            relay_band: None,
+            enabled: true,
+        };
+        let mut map = two_region_map(true);
+        map.specs = vec![spec("us-east", false), spec("eu-west", true)];
+
+        // No TLS need: the home wins exactly as before.
+        assert_eq!(
+            select_pair_region(
+                &map,
+                &no_load(),
+                Some("us-east"),
+                Some("us-east"),
+                "k",
+                false
+            )
+            .as_deref(),
+            Some("us-east")
+        );
+        // TLS-needing pair homed on the TLS-less region: falls to the OTHER
+        // end's (TLS-capable) home…
+        assert_eq!(
+            select_pair_region(
+                &map,
+                &no_load(),
+                Some("us-east"),
+                Some("eu-west"),
+                "k",
+                true
+            )
+            .as_deref(),
+            Some("eu-west")
+        );
+        // …and with no qualifying home at all, to the default region (None),
+        // which serves the full variant set.
+        assert_eq!(
+            select_pair_region(
+                &map,
+                &no_load(),
+                Some("us-east"),
+                Some("us-east"),
+                "k",
+                true
+            ),
+            None
+        );
+        // A region WITHOUT a spec fails open (filter can't judge it).
+        map.specs = vec![];
+        assert_eq!(
+            select_pair_region(
+                &map,
+                &no_load(),
+                Some("us-east"),
+                Some("us-east"),
+                "k",
+                true
+            )
+            .as_deref(),
+            Some("us-east")
+        );
     }
 
     #[test]
