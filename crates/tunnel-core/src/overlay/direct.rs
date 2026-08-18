@@ -134,6 +134,25 @@ pub fn direct_port_candidates(base: u16) -> impl Iterator<Item = u16> + Clone {
 pub fn direct_port() -> u16 {
     match crate::env::node_env("OVERLAY_DIRECT_PORT") {
         Some(v) => match v.trim().parse::<u32>() {
+            // W5 close-out (2026-08-18) — `0` (ephemeral ports) is
+            // DEPRECATED: the stable port is what lets srflx mappings and
+            // firewall-grandfathered flows survive VPN cycles and daemon
+            // restarts (field-proven: recovery in seconds with a
+            // near-identical mapping vs a fresh random 5-tuple the corp
+            // session table drops). Honored for now; warned once per
+            // process; scheduled for removal.
+            Ok(0) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "overlay_direct_port=0 (ephemeral ports) is DEPRECATED and will be \
+                         removed — the stable port keeps srflx mappings + grandfathered \
+                         corp-firewall flows alive across VPN cycles and restarts; unset \
+                         the key to use the stable default"
+                    );
+                });
+                0
+            }
             // Cap leaves room for the public dialer's band
             // (`base + PUBLIC_DIAL_PORT_OFFSET + DIRECT_PORT_BAND`).
             Ok(n) if n <= MAX_DIRECT_PORT_BASE as u32 => n as u16,
