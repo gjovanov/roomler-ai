@@ -321,6 +321,18 @@ struct Installed {
     /// measuring volume — and volume is exactly what decides whether `enforce`
     /// is safe to flip.
     rx_denied: u64,
+    /// #22 — authenticated handshake INITIATIONS from the peer accumulated
+    /// within the current [`Self::reinit_window_from`] window. A healthy
+    /// peer re-initiates ~every 2 min; sustained ~5 s-cadence re-inits
+    /// against an established session mean the peer cannot hear our
+    /// responses (our outbound is one-way) — the sweep converts that
+    /// pressure into an immediate revalidation poke instead of waiting for
+    /// the slow proof-age trigger (the 08-18 zombie-leg wedge sat unheard
+    /// for ~30 min on exactly this signal).
+    reinit_recent: u32,
+    /// Window anchor for [`Self::reinit_recent`]; reset every
+    /// `REINIT_WINDOW`.
+    reinit_window_from: Instant,
     /// The `Rpf(NoRoute)` subset of [`Self::rx_denied`] — sources NO installed
     /// peer owns, whose replies this node cannot route back (the multi-org
     /// wrong-source signature). Snapshotted beside it.
@@ -423,6 +435,8 @@ impl Installed {
             public_direct_dst: None,
             rx_denied: 0,
             rx_denied_noroute: 0,
+            reinit_recent: 0,
+            reinit_window_from: now,
             tier,
         }
     }
@@ -5154,6 +5168,97 @@ mod tests {
                 "no failure is booked for a healthy carrier"
             );
         }
+    }
+
+    /// #22 — re-init PRESSURE forces an immediate revalidation poke: a peer
+    /// hammering handshake initiations at the ~5 s failure cadence against
+    /// our ESTABLISHED session can't hear our responses, and rx-silence can
+    /// never catch it (the re-inits themselves keep `last_rx_at` fresh — the
+    /// 08-18 zombie-leg wedge sat 30 min on exactly that). Below the
+    /// threshold nothing arms; at it, the poke arms at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reinit_pressure_forces_an_immediate_revalidation_poke() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 3);
+        wg.add_direct_peer(
+            sock.clone(),
+            peer_kp.public.to_bytes(),
+            overlay_ip,
+            dst,
+            true,
+        )
+        .await;
+        wg.test_latch_handshake_done(&peer_kp.public.to_bytes());
+        let snap = wg.peer_traffic(&peer_kp.public.to_bytes()).unwrap();
+        let nid = ObjectId::from_bytes([8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let now = Instant::now();
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                last_traffic: snap,
+                public_direct_dst: Some(dst),
+                ..Installed::base(
+                    peer_kp.public.to_bytes(),
+                    overlay_ip,
+                    DirectTier::Srflx,
+                    now,
+                )
+            },
+        );
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        // Below the threshold: a couple of inits (an ordinary rekey + a
+        // stray retry) must NOT arm a poke on a fresh, healthy carrier.
+        wg.test_bump_reinits(&peer_kp.public.to_bytes(), 2);
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            false,
+        )
+        .await;
+        assert!(
+            by_node.get(&nid).unwrap().last_poke_at.is_none(),
+            "ordinary rekey cadence must not trigger the pressure poke"
+        );
+
+        // Sustained pressure: the retry storm crosses the threshold (the
+        // window already holds 2) — the poke arms THIS sweep.
+        wg.test_bump_reinits(&peer_kp.public.to_bytes(), 4);
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            false,
+        )
+        .await;
+        assert!(
+            by_node.get(&nid).unwrap().last_poke_at.is_some(),
+            "re-init pressure must force an immediate revalidation poke"
+        );
     }
 
     /// bind-to-interface-by-route (Phase 1): with the gate OFF, `lan_egress_socket`
