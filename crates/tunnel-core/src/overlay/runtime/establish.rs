@@ -7,6 +7,16 @@
 
 use super::*;
 
+/// #22 — the re-init-pressure window and threshold. A healthy peer
+/// initiates a rekey about once per ~120 s (plus a stray retry on a lossy
+/// hop: ≤2 initiations per window); a peer that cannot hear our responses
+/// retries every ~5 s (boringtun's rekey timeout), i.e. ≥12 per window —
+/// the two populations never overlap at 5. The 08-18 zombie-leg wedge's
+/// rebirthing floor (fresh init burst every ~70 s carrier life) also
+/// clears 5 comfortably.
+const REINIT_WINDOW: Duration = Duration::from_secs(60);
+const REINIT_PRESSURE_MIN: u32 = 5;
+
 /// rc.131/132/143 — direct LAN carrier context: one UDP socket per LAN
 /// interface (each bound to that interface IP — rc.143), this node's LAN IPs
 /// across ALL interfaces (for the same-subnet test), and the `IP:port`
@@ -292,6 +302,16 @@ impl OverlayRuntime {
             if heard {
                 e.last_rx_at = now;
             }
+            // #22 — re-init pressure: accumulate the peer's authenticated
+            // handshake INITIATIONS in a rolling window. Judged below when
+            // arming revalidation; drained here so the counter can't grow
+            // unread.
+            let reinits = wg.peer_take_reinits(&e.pubkey) as u32;
+            if now.saturating_duration_since(e.reinit_window_from) > REINIT_WINDOW {
+                e.reinit_window_from = now;
+                e.reinit_recent = 0;
+            }
+            e.reinit_recent = e.reinit_recent.saturating_add(reinits);
             // P4 — snapshot the ingress-ACL denial counter for the LocalAPI
             // view. Monotonic, so a plain read (not a drain like `rx_any`).
             e.rx_denied = wg.peer_rx_denied(&e.pubkey);
@@ -411,6 +431,14 @@ impl OverlayRuntime {
             {
                 c.clear_death_streak(nid);
             }
+            // #22 — a peer we HEARD this sweep is not asleep: void any
+            // active relay-death defer for it (the defer exists for silent
+            // peers; an audible peer whose pair still churns will never
+            // re-request from ITS side if its own leg round-trips — the
+            // 08-18 mutual-defer wedge).
+            if heard && let Some(c) = relay.as_mut() {
+                c.note_peer_audible(nid);
+            }
             // PR-E — the strike-clear (CC1: the carrier's OWN tier only)
             // lives in the monitor now (`on_healthy_rx`, fed just above).
             if let Some(reason) = v.death {
@@ -436,11 +464,31 @@ impl OverlayRuntime {
                 // refresh logic.
                 let forced =
                     force_poke && e.is_direct && should_poke_on_netchange(handshake_done, false);
-                if (forced || should_poke(handshake_done, false, since_last_rx, since_proof))
+                // #22 — re-init pressure: the peer is retrying its handshake
+                // at the ~5 s failure cadence against our ESTABLISHED
+                // session, which means it cannot hear our responses on the
+                // path it uses. Force the round-trip proof through OUR leg
+                // now; if ours is the dead one the poke goes unanswered and
+                // the tick's deadline convicts in seconds instead of the
+                // ~30 min the proof-age trigger took on 08-18. rx-silence
+                // can never catch this: the re-inits themselves keep
+                // `last_rx_at` fresh.
+                let pressured = handshake_done && e.reinit_recent >= REINIT_PRESSURE_MIN;
+                if (forced
+                    || pressured
+                    || should_poke(handshake_done, false, since_last_rx, since_proof))
                     && wg.poke_handshake(&e.pubkey)
                 {
                     e.last_poke_at = Some(now);
-                    if forced {
+                    if pressured && !forced {
+                        info!(
+                            peer = %nid, tier = ?e.tier,
+                            reinits_in_window = e.reinit_recent,
+                            "overlay: peer re-initiating rapidly against an established session — our outbound may be one-way; revalidating now (#22)"
+                        );
+                        e.reinit_recent = 0;
+                        e.reinit_window_from = now;
+                    } else if forced {
                         info!(
                             peer = %nid, tier = ?e.tier,
                             silent_s = since_last_rx.as_secs(),
