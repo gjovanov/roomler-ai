@@ -121,13 +121,13 @@ pub(super) async fn run_defense_wave(tun: Arc<dyn TunIo>, set: Vec<Defend>) {
             Defend::BlockFloor => tun.defend_block_floor().await,
         }
     }
-    // v3 (#23) — reclaim runs LAST, after every per-peer `/32` was
-    // re-ensured and the floor step ran its (debounced) in-block eviction:
-    // a stolen destination repointed here re-resolves against the freshest
-    // possible table, and the pin lands microseconds after the targeted
-    // eviction instead of a prober cycle later.
+    // v3 (#23) — the ownership CHECK runs last, against the freshest
+    // possible table: with the interface metric pinned to 0 our rows win
+    // every tie outright, so this only has work to do when the pin was
+    // reverted (adapter reset / profile change) or a third product outranks
+    // us — both of which it reports rather than fights.
     if !peers.is_empty() {
-        tun.reclaim_stolen_peer_paths(&peers).await;
+        tun.verify_peer_path_ownership(&peers).await;
     }
 }
 
