@@ -334,6 +334,23 @@ impl LocalApiState for DaemonState {
             srflx: self.overlay.borrow().srflx.clone(),
             // C4 stage 1 — the warm TURN/UDP allocation's state.
             warm_relay: self.overlay.borrow().warm_relay.clone(),
+            // B4 — the measured capability vector, read straight from the
+            // process-wide netcheck slot (a HOST property; no runtime
+            // threading needed). The slot lives behind tunnel-core's
+            // `overlay-l3` feature; a signalling-only build reports None
+            // exactly like a pre-B4 daemon.
+            #[cfg(feature = "overlay-l3")]
+            netcheck: tunnel_core::overlay::netcheck::current().map(|(v, age)| {
+                tunnel_core::localapi::NetcheckStatus {
+                    stun_udp: v.stun_udp,
+                    relay_band_udp: v.relay_band_udp,
+                    derp_ws_ok: v.derp_ws_ok,
+                    nat: v.nat,
+                    age_s: age.as_secs(),
+                }
+            }),
+            #[cfg(not(feature = "overlay-l3"))]
+            netcheck: None,
             // Multi-org P1 — one row per enrollment; empty (and omitted on
             // the wire) for a single-org daemon or a state built without
             // the registry.
