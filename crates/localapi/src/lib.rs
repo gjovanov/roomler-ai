@@ -127,6 +127,11 @@ pub struct NodeStatus {
     /// predates the feature or has `overlay_warm_relay` off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_relay: Option<WarmRelayStatus>,
+    /// B4 (overlay v3) — the measured netcheck capability vector + its age
+    /// (`roomler netcheck`). `None` from a pre-B4 daemon or before the
+    /// first measurement completes (~45 s after start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netcheck: Option<NetcheckStatus>,
     /// Multi-org P1 — one row per enrollment (the primary first, then each
     /// `[[orgs]]` entry). Empty from a pre-multi-org daemon and omitted by a
     /// single-org one; the top-level scalar fields (`node_id` / `tenant_id`
@@ -263,6 +268,28 @@ impl SrflxStatus {
     pub fn is_healthy(&self) -> bool {
         !self.candidates.is_empty()
     }
+}
+
+/// B4 (overlay v3) — the measured netcheck capability vector as surfaced by
+/// `roomler netcheck`: what selection actually keys on, plus the
+/// measurement's age (fresh under 60 min; stale vectors are treated as
+/// absent by every consumer).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetcheckStatus {
+    /// The srflx gather found a public mapping.
+    pub stun_udp: bool,
+    /// Raw UDP reaches coturn's relay band, measured over the exact
+    /// single-relay dialer path. `None` = could not be measured (no creds /
+    /// no srflx to permit) — absence of measurement is never evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_band_udp: Option<bool>,
+    /// The central `/derp` WS is up + registered (the floor's health).
+    pub derp_ws_ok: bool,
+    /// Probed NAT class (`cone` / `symmetric`), when typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat: Option<String>,
+    /// Seconds since the vector was measured.
+    pub age_s: u64,
 }
 
 /// C4 stage 1 — the standing warm TURN/UDP allocation (measurement-only:

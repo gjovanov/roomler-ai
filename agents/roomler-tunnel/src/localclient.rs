@@ -112,6 +112,43 @@ pub async fn logs(
     Ok(())
 }
 
+/// `roomler netcheck` — the measured capability vector (overlay v3 B4),
+/// read from the daemon's status payload. What selection actually keys on,
+/// plus how old the measurement is.
+pub async fn netcheck(json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let status = client.status().await.map_err(daemon_err)?;
+    match status.netcheck {
+        Some(nc) if json => println!("{}", serde_json::to_string_pretty(&nc)?),
+        Some(nc) => {
+            let band = match nc.relay_band_udp {
+                Some(true) => "reachable",
+                Some(false) => "BLOCKED",
+                None => "unmeasured",
+            };
+            println!(
+                "stun/udp:        {}",
+                if nc.stun_udp { "ok" } else { "NO MAPPING" }
+            );
+            println!("relay band/udp:  {band}");
+            println!(
+                "derp floor ws:   {}",
+                if nc.derp_ws_ok { "up" } else { "DOWN" }
+            );
+            println!(
+                "nat:             {}",
+                nc.nat.as_deref().unwrap_or("untyped")
+            );
+            println!("measured:        {}s ago (fresh < 3600s)", nc.age_s);
+        }
+        None if json => println!("null"),
+        None => println!(
+            "no measurement yet — the daemon probes ~45 s after start (older daemons never do)"
+        ),
+    }
+    Ok(())
+}
+
 /// `roomler peers` — every peer this node sees, with its live connection type.
 pub async fn peers(json: bool) -> Result<()> {
     let mut client = localapi::connect().await.map_err(daemon_err)?;

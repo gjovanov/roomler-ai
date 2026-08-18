@@ -208,6 +208,15 @@ enum Command {
         #[command(flatten)]
         fmt: OutputFmt,
     },
+    /// Show this node's measured network capability vector (overlay v3
+    /// netcheck): STUN reachability, the raw relay-band verdict the dialer
+    /// role keys on, `/derp` floor health, NAT class, and the measurement's
+    /// age. `None`/absent until the first probe completes (~45 s after the
+    /// daemon starts).
+    Netcheck {
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
     /// List the local daemon's active forwards / SOCKS5 listeners + throughput.
     /// (Empty until the tunnel data plane folds into the daemon — P3b.)
     Flows {
@@ -554,6 +563,7 @@ where
             fmt,
         } => localclient::logs(source, max_bytes, grep, lines, fmt.json).await,
         Command::Peers { fmt } => localclient::peers(fmt.json).await,
+        Command::Netcheck { fmt } => localclient::netcheck(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
         Command::Rename { name } => localclient::rename(&name).await,
         Command::Config { action } => match action {
