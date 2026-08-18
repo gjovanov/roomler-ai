@@ -678,6 +678,79 @@ mod system {
             }
         }
 
+        /// CORPLAP-3 route war, 08-18 — is `row_net/row_plen` ENTIRELY inside
+        /// `net/plen`? The in-block eviction's targeting rule, split out
+        /// pure so the subset math is unit-tested without a FIB. Requiring
+        /// the row's plen to be at least the block's structurally excludes
+        /// broader routes (defaults, /1 split-halves, corp LANs): only
+        /// prefixes that fit inside the overlay block can ever match.
+        pub(crate) fn row_in_block(row_net: u32, row_plen: u8, net: u32, plen: u8) -> bool {
+            // A broader-or-equal-scope rival (row_plen < plen) is never
+            // in-block; a zero/invalid block plen matches nothing (an
+            // uninitialized block must fail toward touching nothing).
+            if row_plen < plen || plen == 0 || plen > 32 {
+                return false;
+            }
+            let mask: u32 = if plen == 32 {
+                u32::MAX
+            } else {
+                !(u32::MAX >> plen)
+            };
+            (row_net & mask) == (net & mask)
+        }
+
+        /// CORPLAP-3 route war, 08-18 — evict EVERY foreign v4 route whose prefix
+        /// lies INSIDE `net/plen`, at ANY prefix length. Generalizes
+        /// [`evict_competing_v4`], which matches its exact defended plen
+        /// (/32 peers, the block floor) — and which the Check Point endpoint
+        /// manager learned to sidestep by shadowing the overlay block with
+        /// **/24s** (plus broadcast /32s and learned per-flow host routes):
+        /// prefixes we never defended, out-prefixing the /22 floor for any
+        /// destination without a /32 winner, steering overlay traffic into
+        /// the corp gateway where it dies (field: CORPLAP-3, four peers
+        /// unreachable while their carriers ran). Same kill-switch
+        /// (`overlay_route_evict`) and the same WARN-on-actual-deletion
+        /// contract; the CALLER gates on `floor_safe` so a CGNAT uplink
+        /// (whose real routes live inside the block) is never touched.
+        pub fn evict_foreign_in_block_v4(ours: u64, net: Ipv4Addr, plen: u8) {
+            if !super::route_evict_enabled() {
+                return;
+            }
+            let block = u32::from_be_bytes(net.octets());
+            // SAFETY: same snapshot-iterate-free shape as `evict_competing_v4`;
+            // every union read is guarded by the `si_family` check.
+            unsafe {
+                let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                if GetIpForwardTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+                    return;
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for r in rows {
+                    if r.DestinationPrefix.Prefix.si_family == AF_INET
+                        && r.InterfaceLuid.Value != ours
+                        && row_in_block(
+                            u32::from_be(r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr),
+                            r.DestinationPrefix.PrefixLength,
+                            block,
+                            plen,
+                        )
+                        && DeleteIpForwardEntry2(r) == NO_ERROR
+                    {
+                        evict_warn(
+                            IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                                r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr,
+                            ))),
+                            r.DestinationPrefix.PrefixLength,
+                            r.InterfaceIndex,
+                            r.InterfaceLuid.Value,
+                        );
+                    }
+                }
+                FreeMibTable(table as *const core::ffi::c_void);
+            }
+        }
+
         /// rc.281 — v6 twin of [`evict_competing_v4`]: same route war, ULA
         /// prefixes. Shares the `overlay_route_evict` kill-switch and the
         /// WARN-on-actual-deletion observability contract.
@@ -2353,6 +2426,18 @@ mod system {
                         self.del_cidr_route(c).await;
                     }
                 }
+                // CORPLAP-3 route war, 08-18 — with the floor SAFE (the uplink
+                // provably lives outside the block), also evict every
+                // foreign route INSIDE the block at any prefix length: the
+                // Check Point manager shadows the overlay with /24s +
+                // learned host routes that the exact-plen per-/32 eviction
+                // never matched, steering per-destination traffic into the
+                // corp gateway. Under `!safe` (CGNAT uplink inside the
+                // block) we touch nothing — the same fail-toward-withhold
+                // stance as the floor itself.
+                if safe {
+                    winroute::evict_foreign_in_block_v4(self.dev.tun_luid(), net, plen);
+                }
             }
             #[cfg(not(windows))]
             {
@@ -3129,6 +3214,60 @@ mod system {
     mod tests {
         use std::cell::Cell;
         use std::time::Duration;
+
+        /// CORPLAP-3 route war — the in-block eviction's targeting rule. The
+        /// safety property under test: ONLY prefixes that fit entirely
+        /// inside the overlay block match; anything broader (defaults, /1
+        /// split-halves, corp LANs, an adjacent CGNAT block) never does.
+        #[cfg(windows)]
+        #[test]
+        fn row_in_block_targets_only_subsets_of_the_block() {
+            use super::winroute::row_in_block;
+            let block = u32::from_be_bytes([100, 65, 4, 0]); // 100.65.4.0/22
+            // The observed Check Point shadows: /24s inside the /22,
+            // broadcast /32s, learned per-host /32s — all in-block.
+            for (net, plen) in [
+                ([100, 65, 4, 0], 24),
+                ([100, 65, 5, 0], 24),
+                ([100, 65, 7, 0], 24),
+                ([100, 65, 4, 4], 32),
+                ([100, 65, 6, 255], 32),
+                ([100, 65, 4, 0], 22), // an exact-block rival
+            ] {
+                assert!(
+                    row_in_block(u32::from_be_bytes(net), plen, block, 22),
+                    "{net:?}/{plen} must be in-block"
+                );
+            }
+            // Never touched: broader scopes and out-of-block prefixes.
+            for (net, plen) in [
+                ([0, 0, 0, 0], 0),      // default
+                ([0, 0, 0, 0], 1),      // split-default half
+                ([100, 64, 0, 0], 10),  // the whole CGNAT /10 (broader)
+                ([100, 65, 0, 0], 22),  // the ADJACENT block (jovanov)
+                ([100, 65, 8, 0], 24),  // outside the /22
+                ([10, 138, 80, 0], 24), // corp LAN
+                ([100, 65, 4, 0], 21),  // broader than the block
+            ] {
+                assert!(
+                    !row_in_block(u32::from_be_bytes(net), plen, block, 22),
+                    "{net:?}/{plen} must NOT match"
+                );
+            }
+            // An uninitialized/invalid block plen matches nothing.
+            assert!(!row_in_block(
+                u32::from_be_bytes([100, 65, 4, 4]),
+                32,
+                block,
+                0
+            ));
+            assert!(!row_in_block(
+                u32::from_be_bytes([100, 65, 4, 4]),
+                32,
+                block,
+                33
+            ));
+        }
 
         /// Live field probe against the local `roomler` adapter — run
         /// manually with `--ignored --nocapture`. This is the probe that
