@@ -288,6 +288,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Route-war eviction of competing VPN-installed routes for overlay prefixes (Windows). Built-in default: on.",
     ),
     (
+        "overlay_route_reclaim",
+        "tribool",
+        "Route-war stolen-path reclaim (targeted evict + cache pin for tie-captured destinations) and evict-on-change debounce (Windows). Built-in default: on.",
+    ),
+    (
         "overlay_tun_persist",
         "tribool",
         "Keep the overlay TUN device alive across signaling reconnects (process-lifetime cache). Built-in default: on.",
@@ -472,6 +477,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_disco_probe" => cfg.overlay_disco_probe.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
+        "overlay_route_reclaim" => cfg.overlay_route_reclaim.map(fmt_bool),
         "overlay_tun_persist" => cfg.overlay_tun_persist.map(fmt_bool),
         "overlay_route_metric0" => cfg.overlay_route_metric0.map(fmt_bool),
         "local_turn" => cfg.local_turn.map(fmt_bool),
@@ -696,6 +702,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_disco_probe" => cfg.overlay_disco_probe = parse_tribool(value)?,
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
+        "overlay_route_reclaim" => cfg.overlay_route_reclaim = parse_tribool(value)?,
         "overlay_tun_persist" => cfg.overlay_tun_persist = parse_tribool(value)?,
         "overlay_route_metric0" => cfg.overlay_route_metric0 = parse_tribool(value)?,
         "local_turn" => cfg.local_turn = parse_tribool(value)?,

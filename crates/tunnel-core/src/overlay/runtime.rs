@@ -4410,6 +4410,14 @@ mod tests {
                 .unwrap()
                 .push(("floor", Ipv4Addr::UNSPECIFIED));
         }
+        async fn reclaim_stolen_peer_paths(&self, peers: &[Ipv4Addr]) {
+            // v3 (#23) — recorded per peer, so the wave test can assert the
+            // reclaim runs LAST and receives exactly the asserted peer set.
+            let mut g = self.routes.lock().unwrap();
+            for ip in peers {
+                g.push(("reclaim", *ip));
+            }
+        }
     }
 
     /// rc.278 — the route-guard re-assert must cover our OWN overlay `/32`, not
@@ -4435,14 +4443,31 @@ mod tests {
         run_defense_wave(t, defended_routes(&by_node, self_v4)).await;
 
         let got = tun.calls();
-        assert_eq!(got.len(), peers.len() + 2);
+        // v3 (#23) — peers asserted, self defended, floor, then the reclaim
+        // step once per peer.
+        assert_eq!(got.len(), peers.len() * 2 + 2);
+        let reclaimed: HashSet<Ipv4Addr> = got[peers.len() + 2..]
+            .iter()
+            .map(|(op, ip)| {
+                assert_eq!(
+                    *op, "reclaim",
+                    "everything after the floor is the reclaim step"
+                );
+                *ip
+            })
+            .collect();
         assert_eq!(
-            got.last(),
-            Some(&("floor", Ipv4Addr::UNSPECIFIED)),
-            "the block-floor maintenance runs LAST (Change B)"
+            reclaimed,
+            peers.iter().copied().collect::<HashSet<_>>(),
+            "the reclaim step receives exactly the asserted peer set, after the floor"
         );
         assert_eq!(
-            got.get(got.len() - 2),
+            got.get(peers.len() + 1),
+            Some(&("floor", Ipv4Addr::UNSPECIFIED)),
+            "the block-floor maintenance runs after peers + self (Change B)"
+        );
+        assert_eq!(
+            got.get(peers.len()),
             Some(&("defend", self_v4)),
             "our own address defended after every peer re-assert"
         );
