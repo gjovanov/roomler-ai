@@ -676,6 +676,32 @@ impl RelayCoordinator {
         self.death_streaks.remove(node_id);
     }
 
+    /// #22 — a peer we can HEAR is not asleep, so the defer's premise is
+    /// void: `relay_death_backoff` exists to stop hammering allocations at a
+    /// SLEEPING peer, but the 08-18 neo16↔CORPLAP-1 wedge showed the other
+    /// face — one end's replacement legs kept dying (rebirthing floor) while
+    /// it deferred "because their own request still pairs us instantly", and
+    /// the peer, whose OWN leg round-tripped fine, never had a reason to
+    /// re-request. The deferring end could hear the peer the whole time.
+    /// Called by the health sweep whenever the peer was heard this sweep:
+    /// an active hold expires immediately (the streak COUNT survives for
+    /// telemetry and re-books on the next death — against a still-audible
+    /// peer it is voided again, restoring the pre-defer request cadence,
+    /// which is exactly right: only silence earns the defer).
+    pub fn note_peer_audible(&mut self, node_id: &ObjectId) {
+        let now = Instant::now();
+        if let Some((streak, until)) = self.death_streaks.get_mut(node_id)
+            && relay_death_backoff(*streak).is_some()
+            && *until > now
+        {
+            info!(
+                peer = %node_id, streak = *streak,
+                "overlay relay: deferred peer is AUDIBLE — voiding the hold (a heard peer is not asleep; its own leg may be healthy and it will never re-request)"
+            );
+            *until = now;
+        }
+    }
+
     /// P7 — does this coordinator hold a live `/derp` mux? The runtime checks
     /// before a force-DERP conversion and lazily opens one when absent.
     pub fn has_derp_mux(&self) -> bool {
@@ -2289,6 +2315,39 @@ mod tests {
             rx.recv().await,
             Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node
         ));
+    }
+
+    /// #22 (mutual-defer wedge, 08-18) — a peer we can HEAR must not stay
+    /// deferred: the sweep's `note_peer_audible` voids an active hold, so
+    /// the deferring end re-requests instead of waiting forever for a peer
+    /// whose own leg is healthy (and who therefore never re-requests). A
+    /// SILENT peer's hold is untouched — the defer's real target.
+    #[tokio::test]
+    async fn audible_peer_voids_the_relay_death_defer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], None);
+        let node = ObjectId::new();
+        for _ in 0..3 {
+            coord.note_refresh_context(node, Some(RelayKind::Turn), "handshake-deadline");
+        }
+        coord.request(node, base_peer()).await;
+        assert!(!coord.is_tracking(&node), "3rd relay-death re-request held");
+        assert!(rx.try_recv().is_err(), "nothing sent while held");
+
+        // The sweep heard the peer this tick — the "asleep" premise is void.
+        coord.note_peer_audible(&node);
+        coord.request(node, base_peer()).await;
+        assert!(
+            coord.is_tracking(&node),
+            "an audible peer's hold is voided — the request goes out"
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(ClientMsg::OverlayRelayRequest { peer_node_id, .. }) if peer_node_id == node
+        ));
+        // The streak itself survives (telemetry + re-books on the next
+        // death); only the HOLD was voided.
+        assert!(coord.death_streaks.contains_key(&node));
     }
 
     /// C4 stage 2 (PR-B) — a fixed-address stand-in for the warm leg's
