@@ -277,6 +277,14 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_ROUTE_EVICT`). Built-in default: on.
     #[serde(default)]
     pub overlay_route_evict: Option<bool>,
+    /// Route-war stolen-path reclaim — repoint destinations whose OS
+    /// forwarding cache a corp VPN captured at an equal-metric tie
+    /// (targeted evict + immediate cache pin), and debounce the in-block
+    /// eviction to evict-on-change, Windows only
+    /// (`ROOMLER_NODE_OVERLAY_ROUTE_RECLAIM`). Built-in default: on; off
+    /// restores the pre-rc.409 blind per-wave eviction.
+    #[serde(default)]
+    pub overlay_route_reclaim: Option<bool>,
     /// Keep the overlay TUN device alive across signaling reconnects
     /// (process-lifetime cache in the agent's TUN factory)
     /// (`ROOMLER_NODE_OVERLAY_TUN_PERSIST`). Built-in default: on.
@@ -1204,6 +1212,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_disco_probe: None,
         overlay_tun_stable_guid: None,
         overlay_route_evict: None,
+        overlay_route_reclaim: None,
         overlay_tun_persist: None,
         overlay_route_metric0: None,
         overlay_direct_port: None,
@@ -1326,7 +1335,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 38] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 39] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("OVERLAY_QUIC", cfg.overlay_quic),
@@ -1358,6 +1367,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 38]
         ("OVERLAY_DISCO_PROBE", cfg.overlay_disco_probe),
         ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
         ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
+        ("OVERLAY_ROUTE_RECLAIM", cfg.overlay_route_reclaim),
         ("OVERLAY_TUN_PERSIST", cfg.overlay_tun_persist),
         ("OVERLAY_ROUTE_METRIC0", cfg.overlay_route_metric0),
         ("LOCAL_TURN", cfg.local_turn),

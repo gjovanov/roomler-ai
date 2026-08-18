@@ -130,6 +130,32 @@ pub trait TunIo: Send + Sync {
     /// silently skip every sibling's. Default no-op, like the plain method.
     async fn defend_block_floor_of(&self, _net: std::net::Ipv4Addr, _plen: u8) {}
 
+    /// CORPLAP-3 route war v3 (#23) — reclaim STOLEN per-peer forwarding paths.
+    ///
+    /// Eviction alone cannot win a route war against a corp endpoint manager
+    /// that mirrors our prefixes at equal effective metric (Check Point:
+    /// route metric 1 on an interface pinned to metric 1 — a FULL tie at
+    /// every plen; its monitor re-adds within seconds of a deletion). At a
+    /// tie Windows' per-DESTINATION choice is arbitrary and sticky: whoever
+    /// wins a destination's re-resolution keeps it — across fresh flows,
+    /// fresh processes, even our daemon restarts (the cache is the OS's, not
+    /// ours). Field (CORPLAP-3, 2026-08-18): four peers with healthy
+    /// carriers and fresh inbound were 100 % unreachable node-initiated —
+    /// their destinations had stuck to the corp NIC — while replies escaped
+    /// via strong-host source pinning, so the peer side measured green RTTs
+    /// against a pair the owner couldn't use.
+    ///
+    /// The missing move: nothing TRANSMITS inside the eviction gap, so the
+    /// re-resolution that would flip a stolen destination back to us happens
+    /// minutes later (next prober tick), long after the competitor re-added
+    /// its rows and re-tied the table. This step closes the gap: detect the
+    /// destinations whose ACTIVE path-cache entry rides a foreign interface,
+    /// evict the foreign covering rows for exactly those, and immediately
+    /// send a one-byte pin so the destination re-resolves onto us while the
+    /// competitor's rows are still absent. Sticky then works FOR us.
+    /// Default no-op (mock, netstack, non-Windows).
+    async fn reclaim_stolen_peer_paths(&self, _peers: &[std::net::Ipv4Addr]) {}
+
     /// P5 exit-node — install a `/32` (host) **exemption** route for `ip` via the
     /// host's ORIGINAL default gateway (captured at TUN bring-up), NOT via this
     /// overlay device. When an exit-node client installs the split-default
@@ -355,7 +381,8 @@ mod system {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
             DeleteIpForwardEntry2, FreeMibTable, GetIpForwardEntry2, GetIpForwardTable2,
-            InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, SetIpForwardEntry2,
+            GetIpPathTable, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+            MIB_IPPATH_TABLE, SetIpForwardEntry2,
         };
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
@@ -749,6 +776,208 @@ mod system {
                 }
                 FreeMibTable(table as *const core::ffi::c_void);
             }
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — does `row_net/row_plen` COVER `ip` (the
+        /// address lies inside the row's prefix)? Pure, like
+        /// [`row_in_block`]; the targeted reclaim eviction combines both:
+        /// only rows that are INSIDE the overlay block AND cover the stolen
+        /// destination are candidates, so defaults, split-`/1`s and corp
+        /// LANs stay structurally untouchable no matter what covers the
+        /// address.
+        pub(crate) fn row_covers_ip(row_net: u32, row_plen: u8, ip: u32) -> bool {
+            if row_plen > 32 {
+                return false;
+            }
+            let mask: u32 = if row_plen == 0 {
+                0
+            } else {
+                !(u32::MAX >> (row_plen - 1) >> 1)
+            };
+            (ip & mask) == (row_net & mask)
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — evict every foreign v4 route that both
+        /// lies INSIDE `net/plen` and COVERS `ip`: the targeted,
+        /// per-stolen-destination twin of [`evict_foreign_in_block_v4`], run
+        /// by the reclaim step immediately before its cache pin so the
+        /// eviction gap and the repointing transmit are microseconds apart
+        /// (a corp route monitor re-adds in well under a wave). Same
+        /// kill-switch and WARN-on-actual-deletion contract as every other
+        /// eviction.
+        pub fn evict_foreign_covering_v4(ours: u64, ip: Ipv4Addr, net: Ipv4Addr, plen: u8) {
+            if !super::route_evict_enabled() {
+                return;
+            }
+            let block = u32::from_be_bytes(net.octets());
+            let want = u32::from_be_bytes(ip.octets());
+            // SAFETY: same snapshot-iterate-free shape as `evict_competing_v4`;
+            // every union read is guarded by the `si_family` check.
+            unsafe {
+                let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                if GetIpForwardTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+                    return;
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for r in rows {
+                    if r.DestinationPrefix.Prefix.si_family != AF_INET
+                        || r.InterfaceLuid.Value == ours
+                    {
+                        continue;
+                    }
+                    let rn = u32::from_be(r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr);
+                    let rp = r.DestinationPrefix.PrefixLength;
+                    if row_in_block(rn, rp, block, plen)
+                        && row_covers_ip(rn, rp, want)
+                        && DeleteIpForwardEntry2(r) == NO_ERROR
+                    {
+                        evict_warn(
+                            IpAddr::V4(Ipv4Addr::from(rn)),
+                            rp,
+                            r.InterfaceIndex,
+                            r.InterfaceLuid.Value,
+                        );
+                    }
+                }
+                FreeMibTable(table as *const core::ffi::c_void);
+            }
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — the interface LUID the FIB would pick
+        /// for `dst` right now. Unlike [`best_route`] it does NOT filter
+        /// on-link results away — our TUN routes ARE on-link, and "does the
+        /// best route ride OUR device?" is exactly the reclaim's
+        /// post-eviction check before it commits a cache pin (pinning while
+        /// a foreign row still wins would cement the theft instead of
+        /// undoing it).
+        pub fn best_route_luid(dst: IpAddr) -> Option<u64> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::GetBestRoute2;
+            // SAFETY: out-params are written on success; the destination is
+            // a fully-initialised SOCKADDR_INET.
+            unsafe {
+                let dest = sockaddr(dst);
+                let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+                let mut src: SOCKADDR_INET = std::mem::zeroed();
+                (GetBestRoute2(
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    &dest,
+                    0,
+                    &mut row,
+                    &mut src,
+                ) == NO_ERROR)
+                    .then_some(row.InterfaceLuid.Value)
+            }
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — every in-block v4 destination whose
+        /// ACTIVE forwarding decision rides a FOREIGN interface, read from
+        /// the OS path table (`GetIpPathTable` — the destination-cache
+        /// view). This is the theft detector: a fresh `GetBestRoute2`
+        /// computation can disagree with what established flows actually
+        /// use (at an equal-metric tie its pick is arbitrary), but the path
+        /// table IS the per-destination state packets follow, so an entry
+        /// via a foreign LUID is a real capture, present tense — and its
+        /// disappearance after a reclaim is the proof the pin landed.
+        /// Distinct destinations, order unspecified.
+        pub fn foreign_paths_v4(ours: u64, net: Ipv4Addr, plen: u8) -> Vec<Ipv4Addr> {
+            let block = u32::from_be_bytes(net.octets());
+            let mut out: Vec<Ipv4Addr> = Vec::new();
+            // SAFETY: GetIpPathTable allocates a snapshot we iterate then
+            // free (same idiom as the forward-table walks); every union
+            // read is guarded by the `si_family` check.
+            unsafe {
+                let mut table: *mut MIB_IPPATH_TABLE = std::ptr::null_mut();
+                if GetIpPathTable(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+                    return out;
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for r in rows {
+                    if r.Destination.si_family != AF_INET || r.InterfaceLuid.Value == ours {
+                        continue;
+                    }
+                    let d = u32::from_be(r.Destination.Ipv4.sin_addr.S_un.S_addr);
+                    if row_covers_ip(block, plen, d) {
+                        let ip = Ipv4Addr::from(d);
+                        if !out.contains(&ip) {
+                            out.push(ip);
+                        }
+                    }
+                }
+                FreeMibTable(table as *const core::ffi::c_void);
+            }
+            out
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — order-insensitive fold of one foreign
+        /// in-block row into a set fingerprint (FNV-1a per row, XOR across
+        /// rows: commutative, so FIB iteration order can never fake a
+        /// change). Pure; the debounce decision is exactly "did this value
+        /// change since the last wave".
+        pub(crate) fn fp_fold(acc: u64, net: u32, plen: u8, luid: u64) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in net
+                .to_be_bytes()
+                .into_iter()
+                .chain([plen])
+                .chain(luid.to_be_bytes())
+            {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            acc ^ h
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — fingerprint of the current FOREIGN
+        /// in-block route set (the exact rows [`evict_foreign_in_block_v4`]
+        /// would delete). `0` = empty set. The caller compares waves and
+        /// skips the blind eviction when nothing changed — see
+        /// `SystemTun::in_block_fp` for why an unchanged competing set is
+        /// left alone.
+        pub fn foreign_in_block_fp(ours: u64, net: Ipv4Addr, plen: u8) -> u64 {
+            let block = u32::from_be_bytes(net.octets());
+            let mut fp = 0u64;
+            // SAFETY: same snapshot-iterate-free shape; union reads guarded
+            // by the `si_family` check.
+            unsafe {
+                let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+                if GetIpForwardTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
+                    return fp;
+                }
+                let n = (*table).NumEntries as usize;
+                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+                for r in rows {
+                    if r.DestinationPrefix.Prefix.si_family != AF_INET
+                        || r.InterfaceLuid.Value == ours
+                    {
+                        continue;
+                    }
+                    let rn = u32::from_be(r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr);
+                    let rp = r.DestinationPrefix.PrefixLength;
+                    if row_in_block(rn, rp, block, plen) {
+                        fp = fp_fold(fp, rn, rp, r.InterfaceLuid.Value);
+                    }
+                }
+                FreeMibTable(table as *const core::ffi::c_void);
+            }
+            fp
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — reclaim-outcome log throttle (the same
+        /// 1/min/destination discipline as [`evict_warn`]; a host whose
+        /// competitor wins the pin race would otherwise emit every wave).
+        /// `Some(suppressed)` = log now; `None` = inside the quiet window.
+        pub(super) fn reclaim_note(dest: IpAddr) -> Option<u64> {
+            static RECLAIM_THROTTLE: std::sync::Mutex<Option<EvictThrottle>> =
+                std::sync::Mutex::new(None);
+            let mut g = RECLAIM_THROTTLE.lock().unwrap();
+            let t = g.get_or_insert_with(|| EvictThrottle {
+                last: std::collections::HashMap::new(),
+            });
+            t.note((dest, 32), std::time::Instant::now())
         }
 
         /// rc.281 — v6 twin of [`evict_competing_v4`]: same route war, ULA
@@ -1275,6 +1504,19 @@ mod system {
         /// their decisions flip independently.
         #[cfg(windows)]
         floor_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), u8)>>,
+        /// CORPLAP-3 route war v3 (#23) — fingerprint of the FOREIGN in-block route
+        /// set per block, from the last wave that ran the blind in-block
+        /// eviction. The wave re-evicts only when the set CHANGED: a corp
+        /// route monitor re-adds the same rows within seconds of every
+        /// deletion, so the unconditional per-wave eviction was a permanent
+        /// route-table flap (delete → re-add → delete …) feeding the
+        /// netstate watcher a Major every few waves and forcing carrier
+        /// pokes fleet-wide on the host. An UNCHANGED competing set sits in
+        /// the table losing every lookup (the reclaim step repoints any
+        /// destination it actually captures), which is a stable détente the
+        /// OS never reports as change. Keyed by block, like `floor_state`.
+        #[cfg(windows)]
+        in_block_fp: std::sync::Mutex<Vec<((Ipv4Addr, u8), u64)>>,
     }
 
     /// rc.209 — bounded retry-with-backoff around a fallible create. Returns the
@@ -1516,6 +1758,22 @@ mod system {
     #[cfg(windows)]
     fn route_evict_enabled() -> bool {
         crate::env::flag("OVERLAY_ROUTE_EVICT", true)
+    }
+
+    /// CORPLAP-3 route war v3 (#23) — gate for the stolen-path reclaim (detect →
+    /// targeted evict → pin, [`TunIo::reclaim_stolen_peer_paths`]) AND the
+    /// in-block eviction debounce that rides on it (blind per-wave eviction
+    /// is what fed the route-flap → netstate-Major → forced-poke treadmill;
+    /// with reclaim covering genuine theft on demand, the blind wave only
+    /// needs to fire when the foreign row SET changes).
+    /// `ROOMLER_NODE_OVERLAY_ROUTE_RECLAIM` (config key
+    /// `overlay_route_reclaim`). Default **ON**; OFF restores the pre-rc.409
+    /// behaviour exactly (evict every wave, never pin). Subordinate to
+    /// [`route_evict_enabled`] — reclaim deletes foreign rows, so the master
+    /// eviction kill-switch also disables it.
+    #[cfg(windows)]
+    fn route_reclaim_enabled() -> bool {
+        crate::env::flag("OVERLAY_ROUTE_RECLAIM", true)
     }
 
     /// rc.287 — install defended peer `/32`s (and assert the ULA `/96` + the
@@ -2058,6 +2316,8 @@ mod system {
                 _wfp,
                 #[cfg(windows)]
                 floor_state: std::sync::Mutex::new(Vec::new()),
+                #[cfg(windows)]
+                in_block_fp: std::sync::Mutex::new(Vec::new()),
             })
         }
     }
@@ -2085,6 +2345,24 @@ mod system {
                 })
                 .collect(),
         )
+    }
+
+    /// CORPLAP-3 route war v3 (#23) — the cache pin: one zero byte of UDP to
+    /// `ip`'s discard port from an unbound socket, so the OS runs a fresh
+    /// route lookup for the destination RIGHT NOW — inside the eviction gap,
+    /// while the competitor's covering rows are absent — and the sticky
+    /// per-destination choice lands on the overlay NIC. Only called after
+    /// [`winroute::best_route_luid`] confirmed our device wins the lookup
+    /// (pinning under a foreign winner would cement the theft). The packet
+    /// itself rides the tunnel as ordinary encrypted data and is dropped by
+    /// the peer's stack; a send failure is irrelevant — the route lookup,
+    /// not the delivery, is the point. Sync and instant (UDP send-to never
+    /// blocks meaningfully), so it is safe inside the detached wave task.
+    #[cfg(windows)]
+    fn pin_dest_v4(ip: Ipv4Addr) {
+        if let Ok(s) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+            let _ = s.send_to(&[0u8], (ip, 9));
+        }
     }
 
     #[async_trait]
@@ -2435,13 +2713,112 @@ mod system {
                 // corp gateway. Under `!safe` (CGNAT uplink inside the
                 // block) we touch nothing — the same fail-toward-withhold
                 // stance as the floor itself.
+                //
+                // v3 (#23) — DEBOUNCED: the manager re-adds the same rows
+                // within seconds of every deletion, so the unconditional
+                // per-wave eviction was a permanent delete→re-add flap that
+                // fed the netstate watcher a Major every few waves and
+                // force-poked every direct carrier on the host. Evict only
+                // when the foreign row SET changed; an unchanged set sits in
+                // the table losing every lookup (stolen destinations are
+                // repointed by the reclaim step, which brings its own
+                // targeted eviction). Reclaim OFF restores the blind wave.
                 if safe {
-                    winroute::evict_foreign_in_block_v4(self.dev.tun_luid(), net, plen);
+                    let ours = self.dev.tun_luid();
+                    if !route_reclaim_enabled() {
+                        winroute::evict_foreign_in_block_v4(ours, net, plen);
+                    } else {
+                        let fp = winroute::foreign_in_block_fp(ours, net, plen);
+                        let changed = {
+                            let mut st = self.in_block_fp.lock().unwrap_or_else(|e| e.into_inner());
+                            match st.iter_mut().find(|(b, _)| *b == (net, plen)) {
+                                Some((_, s)) if *s == fp => false,
+                                Some((_, s)) => {
+                                    *s = fp;
+                                    true
+                                }
+                                None => {
+                                    st.push(((net, plen), fp));
+                                    true
+                                }
+                            }
+                        };
+                        if changed && fp != 0 {
+                            winroute::evict_foreign_in_block_v4(ours, net, plen);
+                        }
+                    }
                 }
             }
             #[cfg(not(windows))]
             {
                 let _ = (net, plen);
+            }
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — see [`TunIo::reclaim_stolen_peer_paths`].
+        /// Windows-only. Per stolen destination the sequence is
+        /// detect → targeted evict → verify → pin, back-to-back so the
+        /// competitor's re-add monitor cannot re-tie the table before the
+        /// pin's route lookup runs; the pin is a single zero byte of UDP to
+        /// the discard port through our own tunnel. Everything fails toward
+        /// no-op: reclaim disabled, eviction kill-switched, no connected
+        /// block, floor-unsafe (CGNAT uplink inside the block), or a
+        /// post-eviction lookup still preferring a foreign interface (then
+        /// pinning would cement the theft — log and retry next wave).
+        async fn reclaim_stolen_peer_paths(&self, peers: &[Ipv4Addr]) {
+            #[cfg(windows)]
+            {
+                if !route_reclaim_enabled() || !route_evict_enabled() {
+                    return;
+                }
+                let Some((net, plen)) = self.connected_v4 else {
+                    return;
+                };
+                let safe = non_overlay_v4_addrs(&self.if_name).is_some_and(|addrs| {
+                    super::floor_safe(
+                        &addrs,
+                        self.orig_default.as_ref().map(|r| r.gateway),
+                        (net, plen),
+                    )
+                });
+                if !safe {
+                    return;
+                }
+                let ours = self.dev.tun_luid();
+                let stolen = winroute::foreign_paths_v4(ours, net, plen);
+                if stolen.is_empty() {
+                    return;
+                }
+                for ip in peers.iter().filter(|ip| stolen.contains(ip)) {
+                    winroute::evict_foreign_covering_v4(ours, *ip, net, plen);
+                    let best = winroute::best_route_luid(std::net::IpAddr::V4(*ip));
+                    let repointed = best == Some(ours);
+                    if repointed {
+                        pin_dest_v4(*ip);
+                    }
+                    if let Some(suppressed) = winroute::reclaim_note(std::net::IpAddr::V4(*ip)) {
+                        if repointed {
+                            tracing::info!(
+                                dest = %ip, suppressed_since_last = suppressed,
+                                "overlay: reclaimed a STOLEN peer path — foreign covering \
+                                 routes evicted and the destination re-pinned to the overlay \
+                                 NIC (per-destination tie stickiness now works for us)"
+                            );
+                        } else {
+                            tracing::warn!(
+                                dest = %ip, best_luid = ?best,
+                                suppressed_since_last = suppressed,
+                                "overlay: reclaim could NOT repoint a stolen peer path — a \
+                                 foreign route still wins the lookup after eviction (pin \
+                                 withheld; retrying next wave)"
+                            );
+                        }
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = peers;
             }
         }
 
@@ -3267,6 +3644,88 @@ mod system {
                 block,
                 33
             ));
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — the reclaim's covering rule, and its
+        /// combination with [`row_in_block`]: the pair of predicates the
+        /// targeted eviction applies must delete exactly the foreign rows
+        /// that both live inside the block and cover the stolen address —
+        /// so a covering-but-broader route (a default, the whole /10) is
+        /// structurally untouchable even though it covers everything.
+        #[cfg(windows)]
+        #[test]
+        fn row_covers_ip_and_in_block_bound_the_targeted_eviction() {
+            use super::winroute::{row_covers_ip, row_in_block};
+            let ip = u32::from_be_bytes([100, 65, 4, 14]); // the stolen dest
+            let block = u32::from_be_bytes([100, 65, 4, 0]); // 100.65.4.0/22
+            // Covering: its own /32, the /24, the /22, broad scopes.
+            for (net, plen) in [
+                ([100, 65, 4, 14], 32),
+                ([100, 65, 4, 0], 24),
+                ([100, 65, 4, 0], 22),
+                ([100, 64, 0, 0], 10),
+                ([0, 0, 0, 0], 1),
+                ([0, 0, 0, 0], 0),
+            ] {
+                assert!(
+                    row_covers_ip(u32::from_be_bytes(net), plen, ip),
+                    "{net:?}/{plen} covers .14"
+                );
+            }
+            // Not covering: a sibling host, a sibling /24, the next block.
+            for (net, plen) in [
+                ([100, 65, 4, 15], 32),
+                ([100, 65, 5, 0], 24),
+                ([100, 65, 0, 0], 22),
+            ] {
+                assert!(
+                    !row_covers_ip(u32::from_be_bytes(net), plen, ip),
+                    "{net:?}/{plen} must not cover .14"
+                );
+            }
+            assert!(!row_covers_ip(ip, 33, ip), "invalid plen never covers");
+            // The COMBINED predicate (what `evict_foreign_covering_v4`
+            // deletes): in-block AND covering.
+            let target = |net: [u8; 4], plen: u8| {
+                let n = u32::from_be_bytes(net);
+                row_in_block(n, plen, block, 22) && row_covers_ip(n, plen, ip)
+            };
+            assert!(target([100, 65, 4, 14], 32), "the CP host-route twin");
+            assert!(target([100, 65, 4, 0], 24), "the CP /24 shadow");
+            assert!(target([100, 65, 4, 0], 22), "an exact-block rival");
+            assert!(!target([100, 64, 0, 0], 10), "broader than the block");
+            assert!(!target([0, 0, 0, 0], 0), "the default route");
+            assert!(!target([100, 65, 4, 4], 32), "another peer's /32");
+            assert!(!target([100, 65, 5, 0], 24), "a floor not covering .14");
+        }
+
+        /// CORPLAP-3 route war v3 (#23) — the eviction-debounce fingerprint:
+        /// order-insensitive (FIB iteration order can never fake a change),
+        /// sensitive to every component of a row (prefix, plen, luid), and
+        /// zero only for the empty set — the exact properties the
+        /// evict-on-change decision rests on.
+        #[cfg(windows)]
+        #[test]
+        fn foreign_row_fingerprint_is_order_insensitive_and_component_sensitive() {
+            use super::winroute::fp_fold;
+            let a = (u32::from_be_bytes([100, 65, 4, 0]), 24u8, 7u64);
+            let b = (u32::from_be_bytes([100, 65, 4, 14]), 32u8, 7u64);
+            let ab = fp_fold(fp_fold(0, a.0, a.1, a.2), b.0, b.1, b.2);
+            let ba = fp_fold(fp_fold(0, b.0, b.1, b.2), a.0, a.1, a.2);
+            assert_eq!(ab, ba, "iteration order must not matter");
+            assert_ne!(ab, 0, "a non-empty set never fingerprints as empty");
+            let just_a = fp_fold(0, a.0, a.1, a.2);
+            assert_ne!(ab, just_a, "adding a row changes the set");
+            assert_ne!(
+                just_a,
+                fp_fold(0, a.0, 25, a.2),
+                "plen is part of the row identity"
+            );
+            assert_ne!(
+                just_a,
+                fp_fold(0, a.0, a.1, 8),
+                "the owning interface is part of the row identity"
+            );
         }
 
         /// Live field probe against the local `roomler` adapter — run
