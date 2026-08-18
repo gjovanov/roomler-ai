@@ -107,8 +107,10 @@ pub struct AgentConfig {
     pub overlay_derp: Option<bool>,
     /// U2 — accept the server's computed relay-tier verdict in place of the
     /// local `relay_strategy()` derivation
-    /// (`ROOMLER_NODE_OVERLAY_SERVER_RELAY_STRATEGY`). Built-in default: **off**
-    /// (the U2 program soaks per-host before fleet-wide).
+    /// (`ROOMLER_NODE_OVERLAY_SERVER_RELAY_STRATEGY`). Built-in default: **on**
+    /// since D1 (overlay v3); `false` is the per-host off-switch — the server
+    /// withholds stamps unless BOTH ends advertise, so opting out cleanly
+    /// reverts that host's pairs to the client-authoritative path.
     #[serde(default)]
     pub overlay_server_relay_strategy: Option<bool>,
     /// Phase A (overlay v3) — DERP always-on floor: open the central `/derp`
