@@ -10,6 +10,13 @@ jobs:
   rust:
     name: Rust checks
     runs-on: ubuntu-latest
+    # Warm baseline is 4-5 min; the only step that can blow past it is an
+    # Ubuntu-mirror stall inside apt (2026-08-18 evening: 14/19/20/29-min
+    # runs, run 32191779671's apt step alone took 25m47s). The apt-package
+    # caches below take the mirror out of the hot path; this timeout turns
+    # any residual pathological stall into a fast, loud, retryable failure
+    # instead of a silent half-hour merge blocker.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -51,16 +58,25 @@ jobs:
       - name: Vendored wintun-bindings drift check
         run: bash scripts/revendor-wintun-bindings.sh --check
 
+      # Belt for the cold path of the cached-apt steps below: apt retries
+      # transient mirror failures instead of stalling into the job timeout.
+      - name: Configure apt retries
+        run: echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+
       # rc.18 added a Tauri-tray companion (agents/roomler-tray) that
       # pulls in glib-sys / gobject-sys on Linux. Workspace clippy walks
       # every crate, so the build needs libglib2.0-dev + libgtk-3-dev
       # available even before the vp9-444 / scrap apt step further down.
-      - name: Install system deps for workspace clippy
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libglib2.0-dev libgtk-3-dev \
-            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
-            libwebkit2gtk-4.1-dev pkg-config
+      # Cached via cache-apt-pkgs-action: on a cache hit the packages
+      # restore from the Actions cache in seconds with ZERO mirror
+      # contact — the 2026-08-18 mirror-stall class (25m47s for this one
+      # step, run 32191779671) can only ever bite the first run after
+      # the package list or runner image changes.
+      - name: Install system deps for workspace clippy (cached apt)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
+          version: ci-gtk-v1
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
@@ -73,12 +89,11 @@ jobs:
       # `--features full`, no vp9-444 yet) doesn't ship a regression
       # latent under the feature flag — and so the `bun run e2e`
       # VP9-444 spec doesn't drift away from the agent it's testing.
-      - name: Install libvpx (apt)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvpx-dev pkg-config \
-            libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
-            cmake libclang-dev
+      - name: Install libvpx (cached apt)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev
+          version: ci-vpx-v1
 
       # Pair `vp9-444` with `vp9-444-bindgen` on Linux so env-libvpx-sys
       # regenerates its FFI bindings via bindgen against the installed
