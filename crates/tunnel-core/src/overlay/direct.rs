@@ -824,13 +824,17 @@ pub fn derp_enabled() -> bool {
 /// is on, and the server only stamps a per-edge verdict when BOTH ends
 /// advertise it — so an unset host, or a host talking to an unset peer,
 /// keeps the exact pre-U2 client-authoritative path.
+///
+/// D1 (overlay v3) — default ON: the server's verdict core is a verbatim
+/// transcription of the client rules (locked by the parity matrix), its
+/// inputs are the measured vectors (B3) with D0's reverse fan keeping both
+/// ends on one verdict generation, and the flip was soaked on
+/// neo16+CORPLAP-3+zeus (relay + direct pair classes) before landing. The env
+/// var / config key `overlay_server_relay_strategy` remains the per-host
+/// off-switch; the server still withholds stamps unless BOTH ends
+/// advertise, so one opted-out host cleanly reverts its pairs.
 pub fn server_relay_strategy_enabled() -> bool {
-    matches!(
-        crate::env::node_env("OVERLAY_SERVER_RELAY_STRATEGY")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
+    crate::env::flag("OVERLAY_SERVER_RELAY_STRATEGY", true)
 }
 
 /// Phase A (overlay v3) — DERP always-on floor: open this node's central
