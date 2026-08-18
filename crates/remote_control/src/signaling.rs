@@ -1563,6 +1563,12 @@ pub struct RelayRegionInfo {
     /// The region's DERP endpoint, when it runs one (regional-DERP dialing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derp_url: Option<String>,
+    /// Phase E (overlay v3) — the region's coturn relay allocation band
+    /// (`min..=max` UDP ports). Lets the netcheck relay-band probe target
+    /// the region's REAL band; absent from a pre-E server ⇒ agents keep
+    /// the allocation-derived behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_band: Option<(u16, u16)>,
 }
 
 /// Agent host/process telemetry riding [`ClientMsg::AgentHeartbeat`]
@@ -1997,11 +2003,13 @@ mod tests {
                     id: "us-east".into(),
                     stun: "coturn-us-east.roomler.ai:3478".into(),
                     derp_url: Some("wss://derp-us-east.roomler.ai/derp".into()),
+                    relay_band: Some((49152, 65535)),
                 },
                 RelayRegionInfo {
                     id: "eu-central".into(),
                     stun: "coturn.roomler.ai:3478".into(),
                     derp_url: None,
+                    relay_band: None,
                 },
             ],
             rev: 7,
