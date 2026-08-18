@@ -184,6 +184,7 @@ async fn handle_overlay_warm_relay_request(state: &AppState, ident: NodeIdentity
         self_node.relay_home.as_deref(),
         self_node.relay_home.as_deref(),
         Some(WARM_CRED_TTL_SECS),
+        needs_tls_relay(&self_node),
     )
     .await;
     debug!(node = %self_id, "overlay relay: warm-allocation creds granted (72h)");
@@ -615,6 +616,17 @@ fn fresh_caps(node: &OverlayNode) -> Option<roomler_ai_remote_control::signaling
     node.caps
 }
 
+/// Phase E — does this end need a TLS variant to reach coturn AT ALL?
+/// Measured `!stun_udp` when a fresh vector exists, srflx-emptiness as the
+/// legacy proxy otherwise. Feeds the region-level grant filter
+/// (`select_pair_region`) so a TLS-only end is never granted a region
+/// without a TLS listener.
+fn needs_tls_relay(node: &OverlayNode) -> bool {
+    fresh_caps(node)
+        .map(|c| !c.stun_udp)
+        .unwrap_or_else(|| node.srflx_endpoints.is_empty())
+}
+
 /// Graceful leave (or WS teardown): mark offline + tell peers to drop.
 pub async fn handle_overlay_leave(state: &AppState, ident: NodeIdentity) {
     let Some(self_node) = current_node(state, ident).await else {
@@ -747,6 +759,7 @@ async fn handle_overlay_relay_request(
             &pair_key,
             self_node.relay_home.as_deref(),
             peer.relay_home.as_deref(),
+            needs_tls_relay(&self_node) || needs_tls_relay(&peer),
         )
         .and_then(|region| {
             state
@@ -822,6 +835,7 @@ async fn handle_overlay_relay_request(
         &pair_key,
         self_node.relay_home.as_deref(),
         peer.relay_home.as_deref(),
+        needs_tls_relay(&self_node) || needs_tls_relay(&peer),
     )
     .await;
 
@@ -2081,8 +2095,9 @@ async fn overlay_ice_servers(
     pair_key: &str,
     home_a: Option<&str>,
     home_b: Option<&str>,
+    needs_tls: bool,
 ) -> Vec<IceServer> {
-    overlay_ice_servers_with_ttl(state, pair_key, home_a, home_b, None).await
+    overlay_ice_servers_with_ttl(state, pair_key, home_a, home_b, None, needs_tls).await
 }
 
 /// C4 stage 1.5 — [`overlay_ice_servers`] with an optional credential-TTL
@@ -2095,8 +2110,16 @@ async fn overlay_ice_servers_with_ttl(
     home_a: Option<&str>,
     home_b: Option<&str>,
     ttl_override: Option<u32>,
+    needs_tls: bool,
 ) -> Vec<IceServer> {
-    let region = sticky_pair_region(&state.turn_map, &state.relay_load, pair_key, home_a, home_b);
+    let region = sticky_pair_region(
+        &state.turn_map,
+        &state.relay_load,
+        pair_key,
+        home_a,
+        home_b,
+        needs_tls,
+    );
     if region.is_some() {
         crate::cluster::metrics::bump(&crate::cluster::metrics::RELAY_REGION_PICK_TOTAL);
     }
@@ -2263,6 +2286,7 @@ fn sticky_pair_region(
     pair_key: &str,
     home_a: Option<&str>,
     home_b: Option<&str>,
+    needs_tls: bool,
 ) -> Option<String> {
     if !map.enabled {
         return None;
@@ -2278,7 +2302,7 @@ fn sticky_pair_region(
     if cache.len() > 2048 {
         cache.retain(|_, (_, at)| at.elapsed() < PAIR_REGION_TTL);
     }
-    let region = turn_creds::select_pair_region(map, load, home_a, home_b, pair_key);
+    let region = turn_creds::select_pair_region(map, load, home_a, home_b, pair_key, needs_tls);
     cache.insert(pair_key.to_string(), (region.clone(), Instant::now()));
     region
 }
