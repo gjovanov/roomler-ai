@@ -186,11 +186,13 @@ mod tests {
                 id: "up".into(),
                 stun: addr.to_string(),
                 derp_url: None,
+                relay_band: None,
             },
             RelayRegionInfo {
                 id: "bogus".into(),
                 stun: "this-host-does-not-exist.invalid:3478".into(),
                 derp_url: None,
+                relay_band: None,
             },
         ];
         let table = probe_regions(&regions).await;
