@@ -31,6 +31,13 @@
 //!    QP scale + weaker intra prediction). The h264_* encoders get a
 //!    2-step sharper constant-quality target off the shared `FFMPEG_CQ`
 //!    base (env still wins as the base; the adjustment is relative).
+//!
+//! 4. **Idle-settle keyframe gate** ([`SettleKeyframeGate`]): the rc.187
+//!    settle IDR, burst-gated so caret blinks stop metronoming forced IDRs.
+//!
+//! 5. **Scale-aware CQ bias** ([`scale_cq_bias`], P7): deep resolution
+//!    rungs run far below the [3, 12] Mbps maxrate floor's bpp budget —
+//!    spend the headroom on text sharpness instead of leaving it unused.
 
 use std::time::{Duration, Instant};
 
@@ -113,6 +120,52 @@ pub fn h264_cq_adjust(encoder_name: &str, cq: u32) -> u32 {
     } else {
         cq
     }
+}
+
+/// P7 (2026-08-20) — CQ sharpening steps for deep resolution rungs. When a
+/// cap has shrunk the encode area well below native, the [3, 12] Mbps
+/// maxrate floor grants 1.4-2.2× the 0.07-bpp design budget — headroom that
+/// CQ-driven VBR never spends (it uses only what the quality target
+/// demands). Trade it for text sharpness. Ladder on AREA ratio:
+///   ≤ 32% area (~0.57 linear) → max_steps    (Smoother 1024 rung:
+///                                             1920×1200→1024×640 = 28%)
+///   ≤ 50% area (~0.71 linear) → max_steps/2  (Balanced relay 1280 rung:
+///                                             1920×1200→1280×800 = 44%)
+///   else 0 (near-native rungs already run at the design bpp).
+/// NVENC/QSV quality steps cost ~7-10% bits each, so the default 4 steps ≈
+/// 1.3-1.5× sustained bits — inside the floor headroom with margin, and the
+/// UNCHANGED maxrate ceiling + HRD still bound the worst case (the bias can
+/// only spend budget the design already allocated).
+pub fn scale_cq_bias(enc_w: u32, enc_h: u32, native_w: u32, native_h: u32, max_steps: u32) -> u32 {
+    let enc_area = enc_w as u64 * enc_h as u64;
+    let native_area = native_w as u64 * native_h as u64;
+    if enc_area == 0 || native_area == 0 || enc_area >= native_area {
+        return 0;
+    }
+    // Integer percent avoids f32 wobble at the ladder boundaries.
+    let pct = enc_area * 100 / native_area;
+    if pct <= 32 {
+        max_steps
+    } else if pct <= 50 {
+        max_steps / 2
+    } else {
+        0
+    }
+}
+
+/// Env-resolved `max_steps` for [`scale_cq_bias`]:
+/// `ROOMLER_AGENT_SCALE_CQ_BOOST`, default 4, `0` disables the bias.
+pub fn scale_cq_boost_steps() -> u32 {
+    tunnel_core::env::node_env("SCALE_CQ_BOOST")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(4)
+}
+
+/// Apply a CQ bias with the shared global floor (10 — below that is
+/// near-lossless blow-out, see `ffmpeg_cq`). Composes with
+/// [`h264_cq_adjust`]: 22 → 20 (h264) → 16 (deep rung); one shared floor.
+pub fn apply_cq_bias(cq: u32, steps: u32) -> u32 {
+    cq.saturating_sub(steps).max(10)
 }
 
 /// Real frames since the last settle that make a motion episode "a burst"
@@ -272,6 +325,47 @@ mod tests {
         assert_eq!(h264_cq_adjust("h264_amf", 10), 10);
         assert_eq!(h264_cq_adjust("hevc_qsv", 22), 22);
         assert_eq!(h264_cq_adjust("vp9_qsv", 22), 22);
+    }
+
+    // P7 — scale-aware CQ bias ladder.
+    #[test]
+    fn scale_cq_bias_full_at_smoother_rung() {
+        // 1920×1200 → 1024×640 = 28% area; 2560×1600 → 1024×640 = 16%.
+        assert_eq!(scale_cq_bias(1024, 640, 1920, 1200, 4), 4);
+        assert_eq!(scale_cq_bias(1024, 640, 2560, 1600, 4), 4);
+    }
+
+    #[test]
+    fn scale_cq_bias_half_at_relay_rung() {
+        // 1920×1200 → 1280×800 = 44% area.
+        assert_eq!(scale_cq_bias(1280, 800, 1920, 1200, 4), 2);
+    }
+
+    #[test]
+    fn scale_cq_bias_zero_near_native() {
+        // Snap-native leftovers and small trims spend nothing (1836×1148 =
+        // 91% area), and equal dims are exactly zero.
+        assert_eq!(scale_cq_bias(1836, 1148, 1920, 1200, 4), 0);
+        assert_eq!(scale_cq_bias(1920, 1200, 1920, 1200, 4), 0);
+    }
+
+    #[test]
+    fn scale_cq_bias_zero_dims_and_zero_steps_safe() {
+        // Unpublished native dims (0) or a disabled knob (max_steps 0)
+        // must never bias.
+        assert_eq!(scale_cq_bias(1024, 640, 0, 0, 4), 0);
+        assert_eq!(scale_cq_bias(0, 0, 1920, 1200, 4), 0);
+        assert_eq!(scale_cq_bias(1024, 640, 1920, 1200, 0), 0);
+        assert_eq!(scale_cq_bias(1280, 800, 1920, 1200, 0), 0);
+    }
+
+    #[test]
+    fn cq_bias_composes_with_h264_adjust_at_the_floor() {
+        // Floor is shared: 14 → 12 (h264) → 10 (bias clamps at the floor).
+        assert_eq!(apply_cq_bias(h264_cq_adjust("h264_nvenc", 14), 4), 10);
+        // Nominal cases: 22 → 20 (h264) → 16; HEVC skips the codec adjust.
+        assert_eq!(apply_cq_bias(h264_cq_adjust("h264_nvenc", 22), 4), 16);
+        assert_eq!(apply_cq_bias(h264_cq_adjust("hevc_nvenc", 22), 4), 18);
     }
 
     fn gate() -> SettleKeyframeGate {
