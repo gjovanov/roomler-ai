@@ -1548,10 +1548,36 @@ impl OverlayRuntime {
                     // one peer on a Derp strategy stayed healthy). A DERPING
                     // peer is still excluded — its link is the same carrier
                     // over the same mux, arriving via `maybe_complete`.
+                    // rc.414 (#25) — REPAIR stale floor bookkeeping instead of
+                    // obeying it. `floored` asserts "the birth floor IS this
+                    // peer's installed carrier", and this block is reached
+                    // ONLY when nothing is installed (the `match installed`
+                    // above `continue`s for every installed shape). So a
+                    // `floored` entry seen HERE is stale by construction —
+                    // whatever dropped the carrier failed to clear it (an
+                    // `install_ready` that did not take, a teardown path that
+                    // bypassed `forget`/`clear_floor`, …). Treating it as
+                    // authoritative is what stranded peers permanently:
+                    // rc.413's field probe on CORPLAP-1 found peers `blocked`
+                    // with ZERO "floor WITHHELD" lines and 111 successful
+                    // floor installs, i.e. `build_floor` was never even
+                    // CALLED for them — they were skipped by this gate.
+                    // Clearing lets the floor rebuild, and a rebuild that
+                    // keeps failing simply retries next walk instead of
+                    // giving up for the process's life.
+                    if let Some(coord) = relay.as_mut()
+                        && coord.clear_floor(&np.node_id)
+                    {
+                        warn!(
+                            peer = %np.node_id,
+                            "overlay relay: repaired STALE floor bookkeeping — the peer was \
+                             marked floored with no installed carrier, which blocked its \
+                             floor from ever rebuilding; rebuilding now"
+                        );
+                    }
                     if let Some(coord) = relay.as_mut()
                         && !relay_bq.in_flight.contains_key(&np.node_id)
                         && !coord.is_derping(&np.node_id)
-                        && !coord.is_floored(&np.node_id)
                         && let Some(link) = coord.build_floor(np.node_id, &cfg)
                     {
                         let t0 = Instant::now();
@@ -1561,6 +1587,27 @@ impl OverlayRuntime {
                             coord.request(np.node_id, cfg.clone()).await;
                         }
                         continue;
+                    }
+                    // rc.414 (#25) — the floor did NOT install for a
+                    // carrier-less peer. `build_floor` reports its own
+                    // refusals (rc.413); the two gates ABOVE it were silent,
+                    // which is how a blocked peer could produce no
+                    // explanation at all. Report them, throttled by the same
+                    // coordinator-side helper.
+                    if let Some(coord) = relay.as_mut() {
+                        if relay_bq.in_flight.contains_key(&np.node_id) {
+                            coord.note_floor_skipped(
+                                np.node_id,
+                                10,
+                                "a TURN grant is already in flight for it",
+                            );
+                        } else if coord.is_derping(&np.node_id) {
+                            coord.note_floor_skipped(
+                                np.node_id,
+                                11,
+                                "it is coordinating a DERP link of its own (same carrier, same mux)",
+                            );
+                        }
                     }
                     // P9 — fresh-install LAN is PROBE-FIRST under make-before-
                     // break: a same-/24 match is only a HINT the peer is on
