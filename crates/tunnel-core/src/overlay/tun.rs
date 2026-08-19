@@ -1403,6 +1403,25 @@ mod system {
         /// OS never reports as change. Keyed by block, like `floor_state`.
         #[cfg(windows)]
         in_block_fp: std::sync::Mutex<Vec<((Ipv4Addr, u8), u64)>>,
+        /// rc.411 (#23) — peers whose `/32` has been ESCALATED to route
+        /// metric 0 because a foreign interface out-ranked us for them even
+        /// at our pinned interface metric (the equal-interface-metric tie:
+        /// pc50045's Check Point NIC and pc55331's both sit at interface
+        /// metric 0 like ours, so a mirrored row at route metric 1 would tie
+        /// our route-1 + interface-0 total and win on lower ifIndex —
+        /// exactly what clk demonstrated at 1-vs-1).
+        ///
+        /// Sticky for the process, and consulted by
+        /// [`TunIo::add_peer_route`]: the defense wave re-asserts every
+        /// `/32` on each pass, so without this the escalated metric would be
+        /// reset to 1 and re-escalated every wave — a delete-then-add flap
+        /// on the very prefix we are trying to stabilise (the churn the
+        /// in-block debounce exists to prevent). Never shrinks: metric 0
+        /// stays correct once the competitor withdraws, and
+        /// `winroute::ensure` auto-yields to 1 on hosts where metric-0 rows
+        /// do not survive (rc.289).
+        #[cfg(windows)]
+        escalated: std::sync::Mutex<std::collections::HashSet<Ipv4Addr>>,
     }
 
     /// rc.209 — bounded retry-with-backoff around a fallible create. Returns the
@@ -2249,6 +2268,8 @@ mod system {
                 floor_state: std::sync::Mutex::new(Vec::new()),
                 #[cfg(windows)]
                 in_block_fp: std::sync::Mutex::new(Vec::new()),
+                #[cfg(windows)]
+                escalated: std::sync::Mutex::new(std::collections::HashSet::new()),
             })
         }
     }
@@ -2323,6 +2344,19 @@ mod system {
                 // head-of-line-stall the data plane.
                 let luid = self.dev.tun_luid();
                 winroute::evict_competing_v4(luid, peer, 32);
+                // rc.411 (#23) — an ESCALATED peer keeps route metric 0 (see
+                // `SystemTun::escalated`); re-asserting it at 1 here would
+                // undo the escalation on every wave.
+                let metric = if self
+                    .escalated
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&peer)
+                {
+                    0
+                } else {
+                    defended_route_metric()
+                };
                 // rc.287 — the metric became dynamic (0 under the metric0
                 // gate, 1 with it off), which is exactly the case the old
                 // constancy comment warned about: `add` skips on
@@ -2331,12 +2365,7 @@ mod system {
                 // one in-memory Get per wave, delete-then-re-add only on an
                 // actual mismatch (i.e. once, when the gate flips or an old
                 // agent's metric-1 rows are inherited).
-                winroute::ensure(
-                    luid,
-                    std::net::IpAddr::V4(peer),
-                    32,
-                    defended_route_metric(),
-                )
+                winroute::ensure(luid, std::net::IpAddr::V4(peer), 32, metric)
             }
             #[cfg(target_os = "linux")]
             {
@@ -2667,16 +2696,16 @@ mod system {
             }
         }
 
-        /// clk route war v3 (#23) — see [`TunIo::reclaim_stolen_peer_paths`].
-        /// Windows-only. Per stolen destination the sequence is
-        /// detect → targeted evict → verify → pin, back-to-back so the
-        /// competitor's re-add monitor cannot re-tie the table before the
-        /// pin's route lookup runs; the pin is a single zero byte of UDP to
-        /// the discard port through our own tunnel. Everything fails toward
-        /// no-op: reclaim disabled, eviction kill-switched, no connected
-        /// block, floor-unsafe (CGNAT uplink inside the block), or a
-        /// post-eviction lookup still preferring a foreign interface (then
-        /// pinning would cement the theft — log and retry next wave).
+        /// clk route war v3 (#23) — see
+        /// [`TunIo::verify_peer_path_ownership`]. Windows-only, and a
+        /// two-rung escalation rather than a fight: ask the FIB who owns
+        /// each peer, and on a foreign winner (1) re-assert the INTERFACE
+        /// metric, which is the rung that decides same-prefix ties and which
+        /// a network-profile change or adapter reset can revert underneath
+        /// us, then (2) for anything still lost — meaning the competitor is
+        /// pinned as low as we can go and takes the ifIndex tie-break —
+        /// escalate that peer's own ROUTE metric to 0, which wins outright.
+        /// Everything fails toward no-op + a throttled report.
         async fn verify_peer_path_ownership(&self, peers: &[Ipv4Addr]) {
             #[cfg(windows)]
             {
@@ -2715,11 +2744,60 @@ mod system {
                             .is_some_and(|luid| luid != ours)
                     })
                     .collect();
-                let Some(first) = still.first().or(stolen.first()) else {
-                    return;
+                // rc.411 (#23) — still losing at our lowest INTERFACE metric
+                // means the competitor's interface is pinned as low as ours
+                // (pc50045's Check Point NIC and pc55331's both sit at 0),
+                // so the totals TIE and Windows breaks it on lower ifIndex —
+                // theirs, since our adapter is created later. The interface
+                // metric has no lower rung, so escalate the ROUTE metric for
+                // exactly these peers: 0 + 0 beats their 1 + 0 outright.
+                // `ensure` auto-yields to 1 on hosts where metric-0 rows do
+                // not survive (rc.289), and the escalation is remembered so
+                // the next defense wave re-asserts 0 instead of resetting to
+                // 1 (which would flap the prefix every wave).
+                let escalated: Vec<Ipv4Addr> = if still.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut done = Vec::new();
+                    for ip in &still {
+                        {
+                            let mut set = self.escalated.lock().unwrap_or_else(|e| e.into_inner());
+                            if !set.insert(*ip) {
+                                continue; // already escalated; nothing new to try
+                            }
+                        }
+                        let _ = winroute::ensure(ours, std::net::IpAddr::V4(*ip), 32, 0);
+                        if winroute::best_route_luid(std::net::IpAddr::V4(*ip)) == Some(ours) {
+                            done.push(*ip);
+                        }
+                    }
+                    done
                 };
-                if let Some(suppressed) = winroute::reclaim_note(std::net::IpAddr::V4(*first)) {
-                    if still.is_empty() {
+                let unresolved: Vec<Ipv4Addr> = still
+                    .iter()
+                    .copied()
+                    .filter(|ip| !escalated.contains(ip))
+                    .collect();
+                if !escalated.is_empty()
+                    && let Some(first) = escalated.first()
+                    && let Some(suppressed) = winroute::reclaim_note(std::net::IpAddr::V4(*first))
+                {
+                    tracing::warn!(
+                        recovered = escalated.len(),
+                        example = %first,
+                        suppressed_since_last = suppressed,
+                        "overlay: a competing interface is pinned as low as ours, so the \
+                         interface metric only TIED (they win the ifIndex tie-break) — \
+                         escalated these peers' routes to metric 0, which wins outright"
+                    );
+                }
+                if still.is_empty() {
+                    // The re-assert alone recovered them: the pin had been
+                    // reverted underneath us.
+                    if let Some(first) = stolen.first()
+                        && let Some(suppressed) =
+                            winroute::reclaim_note(std::net::IpAddr::V4(*first))
+                    {
                         tracing::warn!(
                             recovered = stolen.len(),
                             metric = want,
@@ -2728,18 +2806,26 @@ mod system {
                              profile change / adapter reset?) — re-asserted, and the peers \
                              it had cost us are back on the overlay NIC"
                         );
-                    } else {
-                        tracing::warn!(
-                            stolen = still.len(), metric = want,
-                            example = %first,
-                            suppressed_since_last = suppressed,
-                            "overlay: another interface OUTRANKS the overlay for installed \
-                             peers even at our pinned interface metric — node-initiated \
-                             traffic to them will use that interface (inbound still works). \
-                             Lower `overlay_iface_metric` or split-exclude the overlay \
-                             prefixes on the competing product"
-                        );
                     }
+                } else if let Some(first) = unresolved.first()
+                    && let Some(suppressed) = winroute::reclaim_note(std::net::IpAddr::V4(*first))
+                {
+                    // Neither the interface metric nor a metric-0 route won:
+                    // the competitor matches us at both rungs (or holds a
+                    // LONGER prefix than any route of ours — longest match is
+                    // evaluated before metric, so a rival /32 beats our /24
+                    // floor at any metric until our own /32 for that peer is
+                    // installed).
+                    tracing::warn!(
+                        stolen = unresolved.len(), metric = want,
+                        example = %first,
+                        suppressed_since_last = suppressed,
+                        "overlay: another interface OUTRANKS the overlay for installed \
+                         peers even at metric 0 — it either matches us at every metric \
+                         rung or holds a longer prefix. Node-initiated traffic to them \
+                         uses that interface (inbound still works). Split-exclude the \
+                         overlay prefixes on the competing product"
+                    );
                 }
             }
             #[cfg(not(windows))]
@@ -3570,6 +3656,55 @@ mod system {
                 block,
                 33
             ));
+        }
+
+        /// rc.411 (#23) — the escalation must be STICKY, because the defense
+        /// wave re-asserts every peer `/32` on each pass: if
+        /// `add_peer_route` ignored the escalated set it would reset the
+        /// metric to 1, the ownership check would escalate to 0 again, and
+        /// the prefix would delete-then-re-add forever — the exact churn the
+        /// in-block debounce exists to prevent, on the one prefix we are
+        /// trying to stabilise. This locks the contract that the metric
+        /// choice reads the set (the FIB half needs a real adapter, so the
+        /// set membership is what the unit test can hold).
+        #[cfg(windows)]
+        #[test]
+        fn escalated_peers_keep_metric_zero_across_waves() {
+            use std::net::Ipv4Addr;
+            let set: std::sync::Mutex<std::collections::HashSet<Ipv4Addr>> =
+                std::sync::Mutex::new(std::collections::HashSet::new());
+            let escalated_ip = Ipv4Addr::new(100, 65, 4, 14);
+            let plain_ip = Ipv4Addr::new(100, 65, 4, 15);
+            // The wave's metric choice, mirrored from `add_peer_route`.
+            let metric_for = |ip: Ipv4Addr| -> u32 {
+                if set.lock().unwrap().contains(&ip) {
+                    0
+                } else {
+                    1
+                }
+            };
+            assert_eq!(metric_for(escalated_ip), 1, "not escalated yet");
+            set.lock().unwrap().insert(escalated_ip);
+            // Re-running the wave must NOT reset the escalated peer to 1.
+            for wave in 0..3 {
+                assert_eq!(
+                    metric_for(escalated_ip),
+                    0,
+                    "wave {wave} reset an escalated peer to metric 1 — that flaps the \
+                     prefix (delete-then-re-add) on every wave"
+                );
+                assert_eq!(
+                    metric_for(plain_ip),
+                    1,
+                    "wave {wave} escalated a peer that never lost its path"
+                );
+            }
+            // Escalation is per-peer and idempotent (a second insert is a
+            // no-op, which is what suppresses repeated `ensure` calls).
+            assert!(
+                !set.lock().unwrap().insert(escalated_ip),
+                "already escalated"
+            );
         }
 
         /// rc.410 (#23) — the interface metric must default to 0, the value
