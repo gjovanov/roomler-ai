@@ -645,6 +645,14 @@ impl OverlayRuntime {
                 coord.set_relay_band_udp(
                     crate::overlay::netcheck::current_fresh().and_then(|v| v.relay_band_udp),
                 );
+                // #24 — the carrier is gone either way, so the birth-floor
+                // bookkeeping is stale NOW. `forget` (relay deaths only)
+                // used to be the sole path that cleared it, which left a
+                // floored→direct→dead peer permanently unable to re-floor:
+                // the establish walk's `!is_floored()` gate saw a floor that
+                // no longer existed and fell through to a ladder that, with
+                // no srflx and no dialer role, could not build either.
+                coord.clear_floor(&nid);
                 if !tier.is_direct() {
                     coord.forget(&nid);
                 }
