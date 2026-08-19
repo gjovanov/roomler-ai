@@ -7,7 +7,7 @@ description: >-
   anywhere. A same-lockfile twin rehearsal loses the save reservation
   race and warns ("cache already exists") — harmless, the winner's
   content is equivalent. After saving, this action retires its OWN
-  family's superseded generations (keeps the 2 newest on this ref) —
+  family's superseded generations (keeps ONLY the newest on this ref: at current sizes (~950 MB avg) even two generations per family total ~9.5 GB and re-evict the CI lane; a partial newest from a failed rehearsal is replaced within one release cycle by the next reseed) —
   self-cleaning at the production site. The 2026-08-18 lesson: relying
   on cache-janitor's 96 h idle sweep let generations pile to 9.5 GB of
   the 10 GB pool within a day of releases, and GitHub's LRU evicted the
@@ -41,7 +41,7 @@ runs:
           target
         key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Retire superseded generations (keep newest 2 on this ref)
+    - name: Retire superseded generations (keep only the newest on this ref)
       shell: bash
       run: |
         set -uo pipefail
@@ -56,7 +56,7 @@ runs:
         # cache-on-failure); delete the rest ON THIS REF ONLY.
         gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" \
           --jq ".actions_caches[] | select(.ref == \"${ref}\" and (.key | startswith(\"${fam}\"))) | [.created_at, .id, .key] | @tsv" \
-          | sort -r | tail -n +3 | while IFS=$'\t' read -r created id key; do
+          | sort -r | tail -n +2 | while IFS=$'\t' read -r created id key; do
               if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/caches/${id}" >/dev/null 2>&1; then
                 echo "retired ${key} (created ${created})"
               fi
