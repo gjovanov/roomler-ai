@@ -427,6 +427,12 @@ jobs:
         if: always() && github.ref_type != 'tag'
         continue-on-error: true
         uses: ./.github/actions/seed-cache-save
+        # GH_TOKEN powers the action's generation-retirement step (keeps
+        # the 2 newest generations of this family, deletes the rest) —
+        # without it, generations piled to 9.5 GB in a day and LRU evicted
+        # the CI lane's caches instead (run 32198738776).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-linux
 
@@ -576,6 +582,12 @@ jobs:
         if: always() && github.ref_type != 'tag'
         continue-on-error: true
         uses: ./.github/actions/seed-cache-save
+        # GH_TOKEN powers the action's generation-retirement step (keeps
+        # the 2 newest generations of this family, deletes the rest) —
+        # without it, generations piled to 9.5 GB in a day and LRU evicted
+        # the CI lane's caches instead (run 32198738776).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-linux-arm64
 
@@ -1201,6 +1213,12 @@ jobs:
         if: always() && github.ref_type != 'tag'
         continue-on-error: true
         uses: ./.github/actions/seed-cache-save
+        # GH_TOKEN powers the action's generation-retirement step (keeps
+        # the 2 newest generations of this family, deletes the rest) —
+        # without it, generations piled to 9.5 GB in a day and LRU evicted
+        # the CI lane's caches instead (run 32198738776).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-windows-vp9-444
 
@@ -1338,6 +1356,12 @@ jobs:
         if: always() && github.ref_type != 'tag'
         continue-on-error: true
         uses: ./.github/actions/seed-cache-save
+        # GH_TOKEN powers the action's generation-retirement step (keeps
+        # the 2 newest generations of this family, deletes the rest) —
+        # without it, generations piled to 9.5 GB in a day and LRU evicted
+        # the CI lane's caches instead (run 32198738776).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: installer-smoke-windows
 
@@ -1626,6 +1650,12 @@ jobs:
         if: always() && github.ref_type != 'tag'
         continue-on-error: true
         uses: ./.github/actions/seed-cache-save
+        # GH_TOKEN powers the action's generation-retirement step (keeps
+        # the 2 newest generations of this family, deletes the rest) —
+        # without it, generations piled to 9.5 GB in a day and LRU evicted
+        # the CI lane's caches instead (run 32198738776).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-macos
 
