@@ -1751,6 +1751,24 @@ impl RelayCoordinator {
     }
 
     /// Phase A2 — is this peer's installed carrier the birth floor?
+    /// rc.412 (#24) — is a DERP link already coming for this peer through the
+    /// strategy path (`request` put it in `derping`; `maybe_complete` builds
+    /// it)? The floor would be the SAME carrier over the same mux, so
+    /// flooring a derping peer is pure duplication — the one tracking state
+    /// that must still suppress the floor.
+    ///
+    /// Every OTHER tracking state must NOT: a carrier-less peer waiting on a
+    /// better tier is exactly what the floor is for. In particular
+    /// `SingleRelay(false)` — we are the dialer awaiting the anchor's `R` —
+    /// only does `dialing.insert(...)` and returns, with no allocation, no
+    /// wire message and nothing that can time out, so `is_tracking` stays
+    /// true forever if the anchor never advertises. Gating the floor on
+    /// `!is_tracking` therefore starved precisely those pairs (field:
+    /// pc50045's secondary org under corp VPN, 2026-08-19).
+    pub fn is_derping(&self, node_id: &ObjectId) -> bool {
+        self.derping.contains_key(node_id)
+    }
+
     pub fn is_floored(&self, node_id: &ObjectId) -> bool {
         self.floored.contains_key(node_id)
     }
@@ -3512,6 +3530,29 @@ mod tests {
         // to run for peers that were never floored).
         assert!(coord.clear_floor(&node));
         assert!(!coord.clear_floor(&node));
+
+        // (8) #24 — the establish walk gates the floor on `is_derping`, NOT
+        // `is_tracking`. A peer tracked as a single-relay DIALER is
+        // carrier-less and waiting on an anchor advert that may never come
+        // (`request` inserts into `dialing` and returns — no allocation, no
+        // wire message, no timeout), so it MUST still be floorable. Only a
+        // DERPING peer is excluded, because its link is the same carrier
+        // over the same mux.
+        coord.forget(&node);
+        coord.dialing.insert(node, peer.clone());
+        assert!(coord.is_tracking(&node), "dialing counts as tracking");
+        assert!(
+            !coord.is_derping(&node),
+            "a single-relay dialer is NOT derping — it must remain floorable, \
+             or it starves whenever the anchor never advertises R"
+        );
+        coord.dialing.remove(&node);
+        coord.derping.insert(node, peer.clone());
+        assert!(
+            coord.is_derping(&node),
+            "a derping peer IS excluded — the floor would duplicate its link"
+        );
+        coord.derping.remove(&node);
     }
 
     #[tokio::test]
