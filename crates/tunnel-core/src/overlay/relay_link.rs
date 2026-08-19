@@ -1729,6 +1729,27 @@ impl RelayCoordinator {
         Some(link)
     }
 
+    /// rc.411 (#24) — the peer lost its carrier, so the floor bookkeeping is
+    /// stale: drop it so a fresh floor can be built again.
+    ///
+    /// `floored` means "the birth floor IS this peer's installed carrier".
+    /// It is cleared when a TURN or DERP link supersedes the floor, and by
+    /// [`Self::forget`] — but `forget` runs only for RELAY deaths (a direct
+    /// death must not wipe allocation/role state). So a peer that was
+    /// floored, upgraded to a direct tier, then LOST that direct carrier
+    /// kept a stale entry forever, and the establish walk's
+    /// `!coord.is_floored()` gate suppressed its floor rebuild permanently.
+    /// With no srflx and no dialer role — a corp VPN connecting — the
+    /// fallback ladder can't build either, so the pair sat "blocked"
+    /// indefinitely: exactly the state the floor exists to make impossible
+    /// (field: CORPLAP-1's secondary org, 2026-08-19, four peers wedged from
+    /// the moment its VPN came up and killed their direct carriers).
+    ///
+    /// Returns whether anything was cleared (for the caller's log).
+    pub fn clear_floor(&mut self, node_id: &ObjectId) -> bool {
+        self.floored.remove(node_id).is_some()
+    }
+
     /// Phase A2 — is this peer's installed carrier the birth floor?
     pub fn is_floored(&self, node_id: &ObjectId) -> bool {
         self.floored.contains_key(node_id)
@@ -3470,6 +3491,27 @@ mod tests {
         coord.forget(&node);
         assert!(coord.build_floor(node, &peer).is_some());
         assert!(coord.is_floored(&node));
+
+        // (7) #24 — a DIRECT death must also free the floor. `forget` runs
+        // only for relay deaths (a direct death must not wipe allocation /
+        // role state), so `clear_floor` is what the direct path calls. Without
+        // it the stale entry made `!is_floored()` false forever and the
+        // establish walk never rebuilt the floor — the peer then depended
+        // entirely on a ladder that a corp VPN (no srflx, no dialer role) can
+        // not complete, and sat "blocked" indefinitely.
+        assert!(coord.is_floored(&node), "floored before the direct upgrade");
+        assert!(coord.clear_floor(&node), "the direct death frees the floor");
+        assert!(!coord.is_floored(&node));
+        assert!(
+            coord.build_floor(node, &peer).is_some(),
+            "the floor MUST rebuild after a direct carrier dies — this is the \
+             regression that wedged CORPLAP-1's secondary org on 2026-08-19"
+        );
+        assert!(coord.is_floored(&node));
+        // Idempotent: clearing twice is harmless (the death path is allowed
+        // to run for peers that were never floored).
+        assert!(coord.clear_floor(&node));
+        assert!(!coord.clear_floor(&node));
     }
 
     #[tokio::test]
