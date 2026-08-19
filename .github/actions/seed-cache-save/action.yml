@@ -51,9 +51,8 @@ runs:
         fi
         fam="seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-"
         ref="${GITHUB_REF}"
-        # Newest-first by created_at; drop the 2 newest (the one just saved
-        # + one fallback in case the newest came from a failed rehearsal via
-        # cache-on-failure); delete the rest ON THIS REF ONLY.
+        # Newest-first by created_at; keep only the newest (the one just
+        # saved); delete the rest ON THIS REF ONLY.
         gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" \
           --jq ".actions_caches[] | select(.ref == \"${ref}\" and (.key | startswith(\"${fam}\"))) | [.created_at, .id, .key] | @tsv" \
           | sort -r | tail -n +2 | while IFS=$'\t' read -r created id key; do
