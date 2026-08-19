@@ -1146,6 +1146,66 @@ pub enum ExecDenyReason {
     AgentDisabled,
 }
 
+/// Why a roomler-SSH grant was refused. The twin of [`ExecDenyReason`]; kept
+/// separate so the two features' reasons cannot drift into each other's
+/// vocabulary as they diverge (SSH grows account modes and session limits that
+/// mean nothing to exec).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SshDenyReason {
+    /// Gate 1 — the org's `remote_ssh_enabled` kill-switch is off.
+    OrgDisabled,
+    /// Gate 2 — the caller lacks `SSH_DEVICE`.
+    NoPermission,
+    /// Gate 3 — the target device's [`SshPolicy::mode`] is `Off`.
+    DeviceDisabled,
+    /// Gate 3 — the caller isn't in the device's allowed users/roles.
+    CallerNotAllowed,
+    /// The originating device isn't blessed with `can_originate`.
+    OriginNotAllowed,
+    /// The agent doesn't advertise the `ssh` RPC capability — an older build,
+    /// or one compiled without the `ssh-server` feature.
+    Unsupported,
+    /// The device is offline.
+    Offline,
+    /// The device is on the mesh but has no overlay address to dial, so there
+    /// is nowhere to send the caller even though every gate passed.
+    NoOverlayAddress,
+    /// Per-(user, device) rate limit.
+    RateLimited,
+    /// The caller offered something other than a usable ed25519 public key.
+    BadPublicKey,
+}
+
+impl SshDenyReason {
+    /// One line an operator can act on. Deliberately names WHICH gate said no:
+    /// "denied" without a reason turns a five-second config fix into a
+    /// support ticket.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::OrgDisabled => {
+                "roomler SSH is disabled for this organization (an admin must enable it)"
+            }
+            Self::NoPermission => "you do not have the SSH_DEVICE permission in this organization",
+            Self::DeviceDisabled => "this device does not accept SSH sessions (its policy is off)",
+            Self::CallerNotAllowed => "this device's policy does not list you as an allowed caller",
+            Self::OriginNotAllowed => {
+                "the device you are calling from is not permitted to originate SSH sessions"
+            }
+            Self::Unsupported => {
+                "this device's agent does not support roomler SSH (needs a build with the \
+                 ssh-server feature)"
+            }
+            Self::Offline => "the device is offline",
+            Self::NoOverlayAddress => {
+                "the device has no overlay address — it is not on the mesh right now"
+            }
+            Self::RateLimited => "too many SSH requests for this device; try again shortly",
+            Self::BadPublicKey => "the session public key is missing or not a usable ed25519 key",
+        }
+    }
+}
+
 /// One remote-execution attempt. Written on EVERY attempt, allowed or denied.
 /// TTL-expired after 90 days like [`RemoteAuditEvent`].
 ///

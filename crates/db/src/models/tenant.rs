@@ -64,6 +64,14 @@ pub struct TenantSettings {
     /// its own policy is enabled.
     #[serde(default)]
     pub remote_exec_enabled: bool,
+    /// Roomler SSH — the org-wide kill-switch (gate 1 of four), the twin of
+    /// [`Self::remote_exec_enabled`] and deliberately a SEPARATE switch: an org
+    /// that allows bounded diagnostic commands has not thereby allowed
+    /// interactive sessions. `false` by default and for every pre-feature row;
+    /// flipping it on still leaves each device off until its own `SshPolicy`
+    /// is enabled.
+    #[serde(default)]
+    pub remote_ssh_enabled: bool,
 }
 
 impl Default for TenantSettings {
@@ -78,6 +86,7 @@ impl Default for TenantSettings {
             magic_dns_domain: None,
             magic_dns_nameservers: Vec::new(),
             remote_exec_enabled: false,
+            remote_ssh_enabled: false,
         }
     }
 }

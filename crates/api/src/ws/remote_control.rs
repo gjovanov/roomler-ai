@@ -110,6 +110,10 @@ pub async fn handle_agent_socket(
     // with 412 instead of pushing a frame it drops in its unknown-tag branch,
     // which would leave the caller waiting out its whole deadline.
     let supports_exec = caps.rpc.iter().any(|c| c == "exec");
+    // Roomler SSH — same distillation, same reason: a grant pushed to a build
+    // without the `ssh-server` feature is recorded by nobody, and the caller
+    // then dials a port that authenticates them against an empty table.
+    let supports_ssh = caps.rpc.iter().any(|c| c == "ssh");
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
@@ -119,6 +123,7 @@ pub async fn handle_agent_socket(
         input_arbiter,
         supports_exec,
     );
+    state.rc_hub.set_agent_ssh_support(agent_id, supports_ssh);
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
@@ -413,6 +418,34 @@ pub async fn handle_agent_socket(
                                         handle_agent_exec_request(
                                             &state, tenant_id, agent_id, request_id, target, shell,
                                             command, timeout_ms, reply_tx,
+                                        )
+                                        .await;
+                                    });
+                                    continue;
+                                }
+                                // A device asking for an SSH session on
+                                // ANOTHER device (`roomler ssh`). Spawned for
+                                // the same reason as the exec leg: this is the
+                                // REQUESTING agent's read loop, and gate
+                                // evaluation touches the database.
+                                ClientMsg::SshRequest {
+                                    request_id,
+                                    target,
+                                    public_key,
+                                    session_secs,
+                                } => {
+                                    let state = state.clone();
+                                    let reply_tx = registered_tx.clone();
+                                    tokio::spawn(async move {
+                                        handle_agent_ssh_request(
+                                            &state,
+                                            tenant_id,
+                                            agent_id,
+                                            request_id,
+                                            target,
+                                            public_key,
+                                            session_secs,
+                                            reply_tx,
                                         )
                                         .await;
                                     });
@@ -732,6 +765,94 @@ async fn handle_agent_exec_request(
     let res = crate::routes::agent_exec::dispatch(state, tenant_id, &agent, &caller, &body).await;
     if reply_tx.try_send(reply(res.outcome)).is_err() {
         warn!(%origin_agent_id, %request_id, "rc:rpc.response undeliverable — origin WS gone");
+    }
+}
+
+/// The device-originated SSH leg (`roomler ssh <device>`).
+///
+/// Mirrors [`handle_agent_exec_request`] and goes through the SAME
+/// [`agent_ssh::dispatch`] the HTTP route uses, so there is exactly one place
+/// where the gates are evaluated regardless of how the request arrived.
+///
+/// [`agent_ssh::dispatch`]: crate::routes::agent_ssh::dispatch
+#[allow(clippy::too_many_arguments)]
+async fn handle_agent_ssh_request(
+    state: &AppState,
+    tenant_id: bson::oid::ObjectId,
+    origin_agent_id: bson::oid::ObjectId,
+    request_id: String,
+    target: String,
+    public_key: String,
+    session_secs: u64,
+    reply_tx: roomler_ai_remote_control::session::ClientTx,
+) {
+    let fail = |msg: String| ServerMsg::SshResponse {
+        request_id: request_id.clone(),
+        address: None,
+        port: None,
+        grant_id: None,
+        expires_at_ms: None,
+        error: Some(msg),
+    };
+
+    // The origin's owner is the person whose permissions this runs under. A
+    // device whose row vanished mid-flight has no principal, so it gets
+    // nothing.
+    let origin = match state
+        .agents
+        .find_in_tenant(tenant_id, origin_agent_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = reply_tx.try_send(fail(format!("origin device unknown: {e}")));
+            return;
+        }
+    };
+
+    let agent = match resolve_exec_target(state, tenant_id, &target).await {
+        Some(a) => a,
+        None => {
+            let _ = reply_tx.try_send(fail(format!("no device named {target:?} in this org")));
+            return;
+        }
+    };
+
+    // "<person> (via <device>)" — the target's log and consent prompt name
+    // both the human accountable and the box the request came from.
+    let who = state
+        .users
+        .base
+        .find_by_id(origin.owner_user_id)
+        .await
+        .map(|u| u.display_name)
+        .unwrap_or_else(|_| origin.owner_user_id.to_hex());
+    let caller = crate::routes::agent_ssh::Caller {
+        user_id: origin.owner_user_id,
+        display: format!("{who} (via {})", origin.name),
+        origin_agent_id: Some(origin_agent_id),
+    };
+
+    let res = crate::routes::agent_ssh::dispatch(
+        state,
+        tenant_id,
+        &agent,
+        &caller,
+        &public_key,
+        session_secs,
+    )
+    .await;
+
+    let msg = ServerMsg::SshResponse {
+        request_id: request_id.clone(),
+        address: res.address,
+        port: res.port,
+        grant_id: res.grant_id,
+        expires_at_ms: res.expires_at_ms,
+        error: res.error,
+    };
+    if reply_tx.try_send(msg).is_err() {
+        warn!(%origin_agent_id, %request_id, "rc:ssh.response undeliverable — origin WS gone");
     }
 }
 

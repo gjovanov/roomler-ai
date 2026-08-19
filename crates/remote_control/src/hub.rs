@@ -102,6 +102,12 @@ pub struct ConnectedAgent {
     /// with [`Error::ExecUnsupported`] rather than pushing a frame the agent
     /// will silently drop.
     pub supports_exec: bool,
+    /// Roomler SSH — the agent advertises `AgentCaps.rpc` containing `ssh`,
+    /// i.e. it was built with the `ssh-server` feature and will record an
+    /// `rc:ssh.grant`. Same rationale as [`Self::supports_exec`]: pushing a
+    /// grant to a build that drops it would leave the caller dialling a port
+    /// that authenticates nobody, with nothing anywhere saying why.
+    pub supports_ssh: bool,
 }
 
 pub struct ConnectedController {
@@ -293,6 +299,13 @@ impl Hub {
             relay_home: None,
             region_prefs: Vec::new(),
             supports_exec,
+            // Set right after registration by `set_agent_ssh_support`, so this
+            // signature — which already carries an
+            // `allow(clippy::too_many_arguments)` — does not grow a ninth
+            // positional bool that every test would have to thread through.
+            // `false` is the safe starting point: an agent whose capability is
+            // never recorded is treated as unable to serve SSH.
+            supports_ssh: false,
         };
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
@@ -1215,6 +1228,55 @@ impl Hub {
     /// here.
     pub fn agent_supports_exec(&self, agent_id: ObjectId) -> Option<bool> {
         self.inner.agents.get(&agent_id).map(|a| a.supports_exec)
+    }
+
+    /// Push an authorization to a device and return immediately.
+    ///
+    /// Unlike [`Self::exec_on_agent`] there is nothing to wait for: the target
+    /// records the grant, and the *caller* learns whether it worked by dialling
+    /// the overlay address and authenticating — over a path the server is not
+    /// on and cannot observe. So the only failures this can report are the ones
+    /// visible from here: not connected, wrong tenant, or a build that would
+    /// drop the frame.
+    pub fn push_ssh_grant(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        msg: ServerMsg,
+    ) -> Result<()> {
+        {
+            let entry = self
+                .inner
+                .agents
+                .get(&agent_id)
+                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+            // Cross-tenant is reported as offline, deliberately: a caller in
+            // org A must not be able to tell org B's devices apart from
+            // absent ones.
+            if entry.tenant_id != tenant_id {
+                return Err(Error::AgentOffline(agent_id.to_hex()));
+            }
+            if !entry.supports_ssh {
+                return Err(Error::ExecUnsupported(agent_id.to_hex()));
+            }
+        }
+        self.send_to_agent(agent_id, msg)
+    }
+
+    /// Whether a connected agent advertises the `ssh` RPC capability.
+    pub fn agent_supports_ssh(&self, agent_id: ObjectId) -> Option<bool> {
+        self.inner.agents.get(&agent_id).map(|a| a.supports_ssh)
+    }
+
+    /// Record an agent's `ssh` capability, immediately after registration.
+    ///
+    /// Deliberately not a `register_agent` parameter — see the field's
+    /// initialiser. No-op if the agent is already gone, which is the correct
+    /// outcome: there is nothing to serve.
+    pub fn set_agent_ssh_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_ssh = supports;
+        }
     }
 
     /// Push `rc:rpc.exec` and await the matching `rc:rpc.result`.
