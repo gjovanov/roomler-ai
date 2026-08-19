@@ -494,11 +494,16 @@ fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Result<(), St
              running as SYSTEM."
         )),
 
+        // Handled before this point by the `win_console` branch in
+        // `spawn_and_wait` — the token must be supplied to
+        // `CreateProcessAsUserW`, so there is nothing to configure on a
+        // `tokio::process::Command`. Reaching here would mean that branch was
+        // removed, and running as the daemon instead is exactly the silent
+        // escalation this type exists to prevent.
         #[cfg(windows)]
         RunAs::ConsoleUser => Err(
-            "running as the signed-in console user is not implemented yet (the token-stealing \
-             path exists for the lock-screen worker but does not yet capture command output). \
-             Refusing rather than running as SYSTEM, which is not what the policy asked for."
+            "internal: console-user sessions must be dispatched to the CreateProcessAsUserW \
+             path, not configured on a Command"
                 .into(),
         ),
         #[cfg(not(windows))]
@@ -839,6 +844,26 @@ impl ExecEngine {
         #[cfg(not(windows))]
         let command = req.command.clone();
 
+        // Console-user sessions cannot go through `tokio::process`: on Windows
+        // the identity is chosen at `CreateProcessAsUserW` time, so the token
+        // has to be supplied at spawn. Everything around this — the permit,
+        // the cancel registration, redaction, the duration — is the caller's
+        // and is unaffected; the branch only replaces the spawn, and the
+        // replacement enforces the same timeout, ceiling and tree-kill.
+        #[cfg(windows)]
+        if matches!(req.run_as, RunAs::ConsoleUser) {
+            return win_console::run(
+                program,
+                args,
+                &command,
+                req.cwd.clone(),
+                timeout_ms,
+                max_output,
+                cancel_rx,
+            )
+            .await;
+        }
+
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(args)
             // The caller's command is ONE argv element. Nothing in it can
@@ -974,19 +999,29 @@ where
 
 /// Kill the child AND everything it spawned. A diagnostic that shells out
 /// must not leave a detached process behind when it times out.
+/// Kill a process tree by pid alone.
+///
+/// Split out of [`kill_tree`] for the console-user path, which owns a raw
+/// `OwnedProcess` rather than a `tokio::process::Child` — the tree still has to
+/// die, and `TerminateProcess` on the parent alone leaves grandchildren behind.
+#[cfg(windows)]
+async fn kill_tree_pid(pid: u32) {
+    let _ = tokio::process::Command::new("taskkill.exe")
+        .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
 async fn kill_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
     #[cfg(windows)]
     {
         if let Some(pid) = pid {
             // `taskkill /T` is the only way to reach grandchildren without
             // building a Job Object around every spawn.
-            let _ = tokio::process::Command::new("taskkill.exe")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
+            kill_tree_pid(pid).await;
         }
     }
     #[cfg(unix)]
@@ -1453,5 +1488,212 @@ mod tests {
         assert_eq!(a.output_bytes(), b.output_bytes());
         assert_ne!(a.output_sha256(), b.output_sha256());
         assert_eq!(a.output_sha256().len(), 64);
+    }
+}
+
+/// Running a command as the signed-in console user (roomler SSH P5b).
+///
+/// Windows has no way to hand `tokio::process::Command` a token — the identity
+/// is chosen at `CreateProcessAsUserW` time — so this path cannot reuse the
+/// ordinary spawn. It reuses everything else: the caller has already taken the
+/// concurrency permit and registered the cancel channel, and it enforces the
+/// same wall-clock timeout, the same COMBINED output ceiling and the same
+/// process-tree kill, so a session here is bounded exactly like Fleet RPC.
+///
+/// Requires the daemon to be SYSTEM (`WTSQueryUserToken` returns
+/// `ERROR_PRIVILEGE_NOT_HELD` otherwise), which a perMachine service install
+/// is and a perUser task install is not. That is reported as a refusal, not a
+/// fallback — see [`RunAs`].
+#[cfg(windows)]
+mod win_console {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use tokio::sync::oneshot;
+
+    use super::ExecOutcome;
+    use crate::win_service::supervisor;
+
+    /// Build the command line `CreateProcessAsUserW` receives.
+    ///
+    /// Quoting matters more here than in the ordinary path: there is no argv
+    /// array, only one string the child re-parses. The command itself is
+    /// wrapped in double quotes with any embedded `"` doubled, which is what
+    /// both `cmd` and PowerShell expect for a single argument.
+    pub(super) fn build_cmdline(program: &str, args: &[&str], command: &str) -> String {
+        let mut s = String::with_capacity(program.len() + command.len() + 32);
+        s.push('"');
+        s.push_str(program);
+        s.push('"');
+        for a in args {
+            s.push(' ');
+            s.push_str(a);
+        }
+        s.push(' ');
+        s.push('"');
+        s.push_str(&command.replace('"', "\"\""));
+        s.push('"');
+        s
+    }
+
+    /// Spawn as the console user, drain both pipes, enforce the bounds.
+    pub(super) async fn run(
+        program: &str,
+        args: &[&str],
+        command: &str,
+        cwd: Option<String>,
+        timeout_ms: u64,
+        max_output: u64,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> ExecOutcome {
+        let cmdline = build_cmdline(program, args, command);
+
+        let Some(session) = supervisor::active_console_session_id() else {
+            return ExecOutcome::failed(
+                "no user is signed in at the console, so there is no session to run as. \
+                 Set the device's SSH policy to `daemon` if a SYSTEM session is intended.",
+            );
+        };
+
+        let token = match supervisor::query_user_token(session) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return ExecOutcome::failed(format!(
+                    "console session {session} has no user token (nobody has signed in since \
+                     boot); nothing to run as"
+                ));
+            }
+            Err(e) => {
+                // The overwhelmingly likely cause is the daemon not running as
+                // SYSTEM, so say that rather than echoing a bare error number.
+                return ExecOutcome::failed(format!(
+                    "cannot obtain the console user's token ({e}). This needs the daemon to run \
+                     as SYSTEM — a perMachine service install, not a perUser task."
+                ));
+            }
+        };
+
+        let budget = Arc::new(AtomicU64::new(max_output));
+        let budget_out = budget.clone();
+        let budget_err = budget.clone();
+
+        // Everything Win32 happens on ONE blocking thread that owns the child,
+        // and hands back the pieces the async side needs. `spawn_blocking`
+        // rather than inline: `CreateProcessAsUserW`, `ReadFile` and
+        // `WaitForSingleObject` all block, and blocking the runtime here would
+        // stall every other session on this device.
+        let spawned = tokio::task::spawn_blocking(move || {
+            // SAFETY: `token` is a live user token, alive for the call.
+            let child = unsafe {
+                supervisor::spawn_in_session_captured(
+                    token.raw(),
+                    &cmdline,
+                    cwd.as_deref().map(std::path::Path::new),
+                )
+            }?;
+            let supervisor::CapturedChild {
+                process,
+                stdout,
+                stderr,
+            } = child;
+            let pid = process.pid;
+
+            // BOTH pipes must be drained concurrently. Reading one to EOF
+            // first deadlocks as soon as the child fills the other's buffer —
+            // the classic two-pipe hang, and it would look like a timeout.
+            let out_t =
+                std::thread::spawn(move || supervisor::read_pipe_to_end(&stdout, &budget_out));
+            let err_t =
+                std::thread::spawn(move || supervisor::read_pipe_to_end(&stderr, &budget_err));
+
+            Ok::<_, anyhow::Error>((process, pid, out_t, err_t))
+        })
+        .await;
+
+        let (process, pid, out_t, err_t) = match spawned {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return ExecOutcome::failed(format!("spawn as console user failed: {e}")),
+            Err(e) => return ExecOutcome::failed(format!("spawn task panicked: {e}")),
+        };
+
+        let process = Arc::new(process);
+        let waiter = process.clone();
+        // The blocking wait is a BACKSTOP, not the deadline: the `select!`
+        // below owns the timeout. An hour is far beyond `MAX_TIMEOUT_MS`
+        // (300 s), so this only bounds the thread if the select somehow never
+        // fires — a leaked blocking thread is worse than a late one.
+        let wait = tokio::task::spawn_blocking(move || {
+            waiter.wait_for_exit(std::time::Duration::from_secs(3600))
+        });
+        tokio::pin!(wait);
+
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
+        tokio::pin!(timeout);
+
+        let error = tokio::select! {
+            _ = &mut wait => None,
+            _ = &mut timeout => {
+                super::kill_tree_pid(pid).await;
+                process.terminate();
+                Some(format!("timed out after {timeout_ms}ms"))
+            }
+            _ = cancel_rx => {
+                super::kill_tree_pid(pid).await;
+                process.terminate();
+                Some("cancelled by the caller".to_string())
+            }
+        };
+
+        // The drain threads end when the pipes hit EOF, which the kill above
+        // guarantees even in the timeout path — the child's handles close when
+        // it dies. Joining on a blocking pool keeps the runtime free.
+        let joined = tokio::task::spawn_blocking(move || {
+            let (o, ot) = out_t.join().unwrap_or_default();
+            let (e, et) = err_t.join().unwrap_or_default();
+            (o, ot, e, et)
+        })
+        .await
+        .unwrap_or_default();
+        let (out_bytes, out_trunc, err_bytes, err_trunc) = joined;
+
+        let exit_code = match process.try_wait() {
+            Ok(Some(code)) => Some(code as i32),
+            _ => None,
+        };
+
+        ExecOutcome {
+            exit_code: if error.is_some() { None } else { exit_code },
+            stdout: String::from_utf8_lossy(&out_bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&err_bytes).into_owned(),
+            truncated: out_trunc || err_trunc,
+            duration_ms: 0,
+            error,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_command_is_one_quoted_argument() {
+            let line = build_cmdline("powershell", &["-NoProfile", "-Command"], "echo hi");
+            assert_eq!(line, r#""powershell" -NoProfile -Command "echo hi""#);
+        }
+
+        /// There is no argv array here — only a string the child re-parses — so
+        /// an embedded quote that escaped the wrapper would let the caller's
+        /// text become additional ARGUMENTS to the shell rather than its
+        /// command. Doubling is what both cmd and PowerShell expect.
+        #[test]
+        fn embedded_quotes_cannot_break_out_of_the_argument() {
+            let line = build_cmdline("cmd", &["/c"], r#"echo "a" & whoami"#);
+            assert_eq!(line, r#""cmd" /c "echo ""a"" & whoami""#);
+            // The payload stays inside exactly one quoted run: count the quote
+            // characters after the program+flags and confirm they pair up.
+            let payload = &line[line.find("/c ").unwrap() + 3..];
+            assert!(payload.starts_with('"') && payload.ends_with('"'));
+            assert_eq!(payload.matches('"').count() % 2, 0);
+        }
     }
 }
