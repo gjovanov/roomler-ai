@@ -74,10 +74,22 @@ import {
   storedPerFrameMsg,
   storedFlowParams,
   diagHudEnabled,
+  storedSharpenMode,
+  storedSharpness,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
 } from '@/composables/useRemoteControl'
+import {
+  computeRenderTarget,
+  easuConstants,
+  normalizeSharpenMode,
+  normalizeSharpness,
+  FSR_MAX_SCALE,
+  FSR_MAX_AXIS,
+  RCAS_ONLY_MAX_SCALE,
+  DEFAULT_RCAS_SHARPNESS,
+} from '@/workers/rc-fsr-render'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
 import { shouldDecodeFrame as shouldDecodeFrameHevc, classifyCrop } from '@/workers/rc-hevc-worker'
@@ -2849,5 +2861,142 @@ describe('P6 — flow-control knobs + sustained-window struggle rule', () => {
   it('StruggleWindow sanitizes a nonsense windows count to 1', () => {
     expect(new StruggleWindow(0).observe(true)).toBe(true)
     expect(new StruggleWindow(Number.NaN).observe(true)).toBe(true)
+  })
+})
+
+describe('P7 — FSR sharpening sizing policy (computeRenderTarget)', () => {
+  it('off / bad inputs / no viewport all degrade to the 1:1 blit path', () => {
+    const blit = { w: 1024, h: 640, scale: 1, pass: 'blit' }
+    expect(computeRenderTarget(1024, 640, 1920, 1200, 1.25, 'off')).toEqual(blit)
+    // No viewport report yet (synthetic-canvas phase).
+    expect(computeRenderTarget(1024, 640, 0, 0, 1, 'auto')).toEqual(blit)
+    // Garbage decoded dims.
+    expect(computeRenderTarget(0, 0, 1920, 1200, 1, 'auto').pass).toBe('blit')
+    expect(computeRenderTarget(Number.NaN, 640, 1920, 1200, 1, 'auto').pass).toBe('blit')
+    // Garbage viewport.
+    expect(computeRenderTarget(1024, 640, Number.NaN, 1200, 1, 'auto').pass).toBe('blit')
+    expect(computeRenderTarget(1024, 640, -5, 1200, 1, 'auto').pass).toBe('blit')
+  })
+
+  it('downscale case: auto stays 2D, on sharpens at decoded size', () => {
+    // Stream LARGER than the window (2560×1600 into a 1280×800 box).
+    expect(computeRenderTarget(2560, 1600, 1280, 800, 1, 'auto').pass).toBe('blit')
+    const on = computeRenderTarget(2560, 1600, 1280, 800, 1, 'on')
+    expect(on.pass).toBe('rcas')
+    expect(on.w).toBe(2560)
+    expect(on.h).toBe(1600)
+  })
+
+  it('near-1:1 upscale sharpens without EASU', () => {
+    // 1.03× need ≤ RCAS_ONLY_MAX_SCALE → rcas at decoded size.
+    const t = computeRenderTarget(1000, 625, 1030, 644, 1, 'auto')
+    expect(t.pass).toBe('rcas')
+    expect(t.w).toBe(1000)
+    expect(t.h).toBe(625)
+    expect(RCAS_ONLY_MAX_SCALE).toBeCloseTo(1.05)
+  })
+
+  it('the field case: Smoother 1024×640 in a 1920×1200 CSS box at 1.25 dpr → 2048×1280 EASU', () => {
+    // needScale = min(1920·1.25/1024, 1200·1.25/640) = 2.34 → capped at 2.0.
+    const t = computeRenderTarget(1024, 640, 1920, 1200, 1.25, 'auto')
+    expect(t.pass).toBe('easu-rcas')
+    expect(t.w).toBe(1024 * FSR_MAX_SCALE)
+    expect(t.h).toBe(640 * FSR_MAX_SCALE)
+  })
+
+  it('uncapped upscale renders at the window need and keeps the decoded aspect', () => {
+    // needScale = 1.875 (1920/1024 = 1200/640) — under the 2× cap.
+    const t = computeRenderTarget(1024, 640, 1920, 1200, 1, 'auto')
+    expect(t.pass).toBe('easu-rcas')
+    expect(t.w).toBe(1920)
+    expect(t.h).toBe(1200)
+    expect(t.w / t.h).toBeCloseTo(1024 / 640, 5)
+  })
+
+  it('letterbox: the contain min-axis drives the scale', () => {
+    // A wider-than-stream box (2400×1200): height is the binding axis.
+    const t = computeRenderTarget(1024, 640, 2400, 1200, 1, 'auto')
+    expect(t.pass).toBe('easu-rcas')
+    expect(t.h).toBe(1200)
+    expect(t.w).toBe(Math.round(1024 * (1200 / 640)))
+  })
+
+  it('the 4096 axis cap bounds huge streams (and can crush to rcas-only)', () => {
+    // 3840 decoded × 2 dpr would want 2×; the axis cap allows only
+    // 4096/3840 ≈ 1.067 → still EASU but at the capped size.
+    const capped = computeRenderTarget(3840, 2160, 3840, 2160, 2, 'auto')
+    expect(capped.w).toBeLessThanOrEqual(FSR_MAX_AXIS)
+    expect(capped.pass).toBe('easu-rcas')
+    // 4090 decoded: cap ratio 4096/4090 ≈ 1.0015 ≤ 1.05 → rcas at decoded.
+    const crushed = computeRenderTarget(4090, 2160, 8000, 4400, 2, 'auto')
+    expect(crushed.pass).toBe('rcas')
+    expect(crushed.w).toBe(4090)
+  })
+
+  it('dpr is clamped to [1, 4]', () => {
+    // dpr 0.5 clamps to 1 → need 1.875× (not 0.94× which would blit).
+    expect(computeRenderTarget(1024, 640, 1920, 1200, 0.5, 'auto').pass).toBe('easu-rcas')
+    // dpr 10 clamps to 4 — target still bounded by the 2× scale cap.
+    const t = computeRenderTarget(1024, 640, 1920, 1200, 10, 'auto')
+    expect(t.w).toBe(2048)
+  })
+
+  it('normalizeSharpenMode / normalizeSharpness default and clamp', () => {
+    expect(normalizeSharpenMode('auto')).toBe('auto')
+    expect(normalizeSharpenMode('on')).toBe('on')
+    expect(normalizeSharpenMode('off')).toBe('off')
+    expect(normalizeSharpenMode('banana')).toBe('auto')
+    expect(normalizeSharpenMode(null)).toBe('auto')
+    expect(normalizeSharpness('0.25')).toBe(0.25)
+    expect(normalizeSharpness(1.5)).toBe(1.5)
+    expect(normalizeSharpness('9')).toBe(2)
+    expect(normalizeSharpness('-1')).toBe(0)
+    expect(normalizeSharpness('banana')).toBe(DEFAULT_RCAS_SHARPNESS)
+    expect(normalizeSharpness(undefined)).toBe(DEFAULT_RCAS_SHARPNESS)
+  })
+
+  it('easuConstants matches the hand-computed FsrEasuCon for the field pair', () => {
+    const c = easuConstants(1024, 640, 2048, 1280)
+    // con0 — output→input scale + half-texel bias.
+    expect(c[0]).toBeCloseTo(0.5, 6)
+    expect(c[1]).toBeCloseTo(0.5, 6)
+    expect(c[2]).toBeCloseTo(-0.25, 6)
+    expect(c[3]).toBeCloseTo(-0.25, 6)
+    // con1 — input texel steps.
+    expect(c[4]).toBeCloseTo(1 / 1024, 9)
+    expect(c[5]).toBeCloseTo(1 / 640, 9)
+    expect(c[7]).toBeCloseTo(-1 / 640, 9)
+    // con2/con3.
+    expect(c[8]).toBeCloseTo(-1 / 1024, 9)
+    expect(c[9]).toBeCloseTo(2 / 640, 9)
+    expect(c[13]).toBeCloseTo(4 / 640, 9)
+    expect(c[15]).toBe(0)
+  })
+})
+
+describe('P7 — FSR localStorage knobs', () => {
+  afterEach(() => {
+    localStorage.removeItem('roomler-rc-sharpen')
+    localStorage.removeItem('roomler-rc-fsr-sharpness')
+  })
+
+  it('storedSharpenMode defaults to auto and honours on/off', () => {
+    expect(storedSharpenMode()).toBe('auto')
+    localStorage.setItem('roomler-rc-sharpen', 'off')
+    expect(storedSharpenMode()).toBe('off')
+    localStorage.setItem('roomler-rc-sharpen', 'on')
+    expect(storedSharpenMode()).toBe('on')
+    localStorage.setItem('roomler-rc-sharpen', 'banana')
+    expect(storedSharpenMode()).toBe('auto')
+  })
+
+  it('storedSharpness defaults to 0.25 and clamps overrides', () => {
+    expect(storedSharpness()).toBe(DEFAULT_RCAS_SHARPNESS)
+    localStorage.setItem('roomler-rc-fsr-sharpness', '0.5')
+    expect(storedSharpness()).toBe(0.5)
+    localStorage.setItem('roomler-rc-fsr-sharpness', '99')
+    expect(storedSharpness()).toBe(2)
+    localStorage.setItem('roomler-rc-fsr-sharpness', 'banana')
+    expect(storedSharpness()).toBe(DEFAULT_RCAS_SHARPNESS)
   })
 })
