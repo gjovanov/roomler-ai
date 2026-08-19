@@ -1598,8 +1598,25 @@ impl OverlayRuntime {
                     // in-flight-grant is the DESIGNED combination. When the
                     // grant lands, `install_ready` replaces the floor
                     // MBB-style and the TURN link clears the floor bookkeeping.
+                    // rc.416 (#25) — and NOT gated on `is_derping` either.
+                    // That exclusion (rc.412) rested on "a derping peer's link
+                    // is the same carrier over the same mux, arriving via
+                    // `maybe_complete`, so flooring it is pure duplication" —
+                    // true ONLY if the coordination actually completes. It has
+                    // the identical flaw as the `is_tracking` gate it replaced:
+                    // `derping` has NO timeout. `request` for a Derp strategy
+                    // just does `derping.insert(...)` and returns, and the
+                    // entry is cleared only by `maybe_complete`/`forget`. When
+                    // the trickle that would drive `maybe_complete` never
+                    // arrives, the peer starves — field: pc50045 → neo16 sat
+                    // blocked for 70+ min on rc.415 while this very branch
+                    // logged "coordinating a DERP link of its own" every 5 min.
+                    //
+                    // Since the floor IS that DERP link, building it directly
+                    // is not duplication — it is the same carrier, delivered
+                    // now instead of never. `build_floor` clears the `derping`
+                    // entry it satisfies.
                     if let Some(coord) = relay.as_mut()
-                        && !coord.is_derping(&np.node_id)
                         && let Some(link) = coord.build_floor(np.node_id, &cfg)
                     {
                         let t0 = Instant::now();
@@ -1610,22 +1627,11 @@ impl OverlayRuntime {
                         }
                         continue;
                     }
-                    // rc.414 (#25) — the floor did NOT install for a
-                    // carrier-less peer. `build_floor` reports its own
-                    // refusals (rc.413); the gate above it was silent, which
-                    // is how a blocked peer could produce no explanation at
-                    // all. Report it, throttled by the same coordinator-side
-                    // helper. (The in-flight-grant gate is gone as of rc.415 —
-                    // it was the one the field convicted.)
-                    if let Some(coord) = relay.as_mut()
-                        && coord.is_derping(&np.node_id)
-                    {
-                        coord.note_floor_skipped(
-                            np.node_id,
-                            11,
-                            "it is coordinating a DERP link of its own (same carrier, same mux)",
-                        );
-                    }
+                    // rc.416 (#25) — reaching here means `build_floor` itself
+                    // refused, and it reports its own reason (rc.413). Both
+                    // pre-gates are gone now: the in-flight TURN grant
+                    // (rc.415) and the derping exclusion (rc.416), each
+                    // convicted in the field by the line it was made to emit.
                     // P9 — fresh-install LAN is PROBE-FIRST under make-before-
                     // break: a same-/24 match is only a HINT the peer is on
                     // this LAN. Two sites on a vendor-default subnet
