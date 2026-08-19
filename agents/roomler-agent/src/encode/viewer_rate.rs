@@ -46,17 +46,31 @@ fn min_fps() -> u32 {
     env_u32("VIEWER_RATE_MIN_FPS", 12).max(1)
 }
 
-/// fps step per adjustment — down on struggle, up on recovery.
-/// Env `ROOMLER_AGENT_VIEWER_RATE_STEP` (default 10).
+/// fps step per adjustment — down on struggle, and (unless overridden) up on
+/// recovery. Env `ROOMLER_AGENT_VIEWER_RATE_STEP` (default 10).
 fn fps_step() -> u32 {
     env_u32("VIEWER_RATE_STEP", 10).max(1)
 }
 
+/// P6 — separate fps step for the recovery climb, so burst-recovery is fast
+/// without coarsening the shed clamp. Env `ROOMLER_AGENT_VIEWER_RATE_STEP_UP`;
+/// defaults to 2× the down-step (P6 field bake 2026-07-26 — with recover=3
+/// this recovers a shallow clamp in one ~3 s probe and a deep clamp in ~9 s;
+/// the shed still steps down by the small `step`).
+fn fps_step_up(default_step: u32) -> u32 {
+    env_u32("VIEWER_RATE_STEP_UP", default_step.saturating_mul(2)).max(1)
+}
+
 /// Consecutive clean windows before the cap probes back UP one step. Lazy so a
 /// viewer parked just under its ceiling doesn't oscillate every window.
-/// Env `ROOMLER_AGENT_VIEWER_RATE_RECOVER` (default 6).
+/// Env `ROOMLER_AGENT_VIEWER_RATE_RECOVER` (default 3 — P6 field bake
+/// 2026-07-26: the old 6 measured 15.5 s deep-clamp recovery on the canonical
+/// pair (cap 12 → divisor 1, probes every 3.1 s, model-exact); 3 plus the 2×
+/// up-step brings the common shallow clamp to ≤3 s and a deep clamp to ~9 s.
+/// The viewer's P6 sustained-window struggle rule (2 consecutive bad windows)
+/// damps the ceiling-oscillation risk that originally motivated 6).
 fn recover_windows() -> u32 {
-    env_u32("VIEWER_RATE_RECOVER", 6).max(1)
+    env_u32("VIEWER_RATE_RECOVER", 3).max(1)
 }
 
 /// Turns a stream of viewer decode reports into a send-fps cap for one DC pump.
@@ -69,6 +83,8 @@ pub struct ViewerRateController {
     clean_streak: u32,
     min_fps: u32,
     step: u32,
+    /// P6 — recovery climb step (defaults to `step`; env-tunable separately).
+    step_up: u32,
     recover: u32,
     enabled: bool,
 }
@@ -76,12 +92,14 @@ pub struct ViewerRateController {
 impl ViewerRateController {
     pub fn new(capture_fps: u32) -> Self {
         let capture_fps = capture_fps.max(1);
+        let step = fps_step();
         Self {
             cap_fps: capture_fps,
             capture_fps,
             clean_streak: 0,
             min_fps: min_fps().min(capture_fps),
-            step: fps_step(),
+            step,
+            step_up: fps_step_up(step),
             recover: recover_windows(),
             // Kill switch — default ON; `ROOMLER_AGENT_VIEWER_RATE=0` (or
             // `false`) pins the cap at the capture rate (divisor 1, no shedding)
@@ -123,7 +141,7 @@ impl ViewerRateController {
         } else {
             self.clean_streak += 1;
             if self.clean_streak >= self.recover {
-                self.cap_fps = (self.cap_fps + self.step).min(self.capture_fps);
+                self.cap_fps = (self.cap_fps + self.step_up).min(self.capture_fps);
                 self.clean_streak = 0;
             }
         }
@@ -173,6 +191,7 @@ mod tests {
             clean_streak: 0,
             min_fps: 12,
             step: 10,
+            step_up: 10,
             recover: 6,
             enabled: true,
         }
@@ -241,6 +260,25 @@ mod tests {
         }
         assert_eq!(c.cap_fps(), 60);
         assert_eq!(c.divisor(), 1);
+    }
+
+    #[test]
+    fn asymmetric_step_up_climbs_faster_without_coarsening_the_shed() {
+        let mut c = ctrl(60);
+        c.step_up = 30;
+        // Shed still clamps by the (small) down-step: 35-10=25.
+        c.observe(35, true, 60);
+        assert_eq!(c.cap_fps(), 25);
+        // One recovery streak climbs by the (big) up-step: 25+30=55.
+        for _ in 0..6 {
+            c.observe(25, false, 60);
+        }
+        assert_eq!(c.cap_fps(), 55);
+        // Ceiling still respected on the next probe.
+        for _ in 0..6 {
+            c.observe(55, false, 60);
+        }
+        assert_eq!(c.cap_fps(), 60);
     }
 
     #[test]
