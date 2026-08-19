@@ -31,7 +31,12 @@ name: Cache janitor
 
 on:
   schedule:
-    - cron: '43 4 * * *'
+    # Every 6 h (was daily): seed-cache-save now retires its own family's
+    # superseded generations inline, but branch-ref leftovers, PR caches,
+    # and anything a failed run orphans still need the sweep — and a daily
+    # cadence let the pool sit over budget for hours (2026-08-18:
+    # generations hit 9.5 GB and LRU evicted the CI cargo caches).
+    - cron: '43 */6 * * *'
   workflow_dispatch: {}
 
 permissions:
