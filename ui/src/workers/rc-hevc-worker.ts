@@ -38,7 +38,9 @@ import {
   ctxOptionsFor,
   epochNowMs,
   normalizeCtxMode,
+  normalizeIntKnob,
   round1,
+  DEFAULT_MAX_DECODE_QUEUE,
   type CtxMode,
 } from './rc-hop-stats'
 
@@ -61,6 +63,10 @@ type InitCanvasMessage = {
    *  (localStorage `roomler-rc-per-frame-msg`). Default OFF — see the
    *  vp9-444 worker's comment. */
   perFrameMsg?: boolean
+  /** P6 — backlog-drop threshold override (localStorage
+   *  `roomler-rc-max-queue`). Sticks across the idempotent visible-canvas
+   *  re-init (which omits it), like `ctxMode`. */
+  maxQueue?: number
 }
 type ChunkMessage = {
   type: 'chunk'
@@ -126,9 +132,11 @@ let framesSkippedAwaitingKey = 0
 // The higher ceiling only matters transiently — it lets an onset burst (the
 // first ~1 s of a window-drag, before the agent's cap engages) ride through
 // WITHOUT the destructive drop+IDR-storm that used to freeze the screen. The
-// `struggling` bit we report trips at queue > 1, so the cap reacts before we
-// ever reach this drop threshold.
-const MAX_DECODE_QUEUE = 4
+// composable's `struggling` rule trips at a lower queue depth, so the cap
+// reacts before we ever reach this drop threshold.
+// P6 — init-canvas-configurable (localStorage `roomler-rc-max-queue`) for the
+// flow-control field-tuning round; default unchanged.
+let maxDecodeQueue = DEFAULT_MAX_DECODE_QUEUE
 let framesDroppedBacklog = 0
 let lastKeyframeReqMs = 0
 
@@ -264,6 +272,9 @@ workerScope.onmessage = (e) => {
     // P1 — ctx mode sticks across the idempotent visible-canvas re-init.
     if (msg.ctxMode !== undefined) ctxMode = normalizeCtxMode(msg.ctxMode)
     if (typeof msg.perFrameMsg === 'boolean') perFrameMsg = msg.perFrameMsg
+    if (msg.maxQueue !== undefined) {
+      maxDecodeQueue = normalizeIntKnob(msg.maxQueue, DEFAULT_MAX_DECODE_QUEUE, 1, 60)
+    }
     ctx = canvas.getContext('2d', ctxOptionsFor(ctxMode))
     if (typeof msg.codec === 'string' && msg.codec.length > 0) {
       activeCodec = msg.codec
@@ -528,7 +539,7 @@ function emitFrame(): void {
   // and re-arm the keyframe gate so we keep dropping deltas (which would
   // otherwise decode-error against the missing reference and tear the path
   // down to <video>) until the resync IDR lands.
-  if (!isKey && decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+  if (!isKey && decoder.decodeQueueSize > maxDecodeQueue) {
     framesDroppedBacklog++
     sawKeyframe = false
     requestKeyframeResync()
