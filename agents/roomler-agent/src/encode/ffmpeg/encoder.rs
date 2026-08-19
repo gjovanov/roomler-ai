@@ -461,6 +461,7 @@ impl FfmpegEncoder {
             height,
             DEFAULT_ENCODER_FPS,
             maxrate,
+            0,
         )
     }
 
@@ -482,6 +483,7 @@ impl FfmpegEncoder {
             height,
             DEFAULT_ENCODER_FPS,
             maxrate,
+            0,
         )
     }
 
@@ -489,11 +491,15 @@ impl FfmpegEncoder {
     /// `target_fps` and a per-session `maxrate_bps` ceiling (relay-aware, from
     /// the pump's `detect_constrained_transport`), so the encoder's framerate
     /// and burst cap match the actual link instead of the fixed-30 defaults.
+    /// P7 — `cq_bias`: extra CQ sharpening steps for deep resolution rungs
+    /// (`rate_profile::scale_cq_bias`, computed by the pump at each rebuild
+    /// from encode-vs-native area); the probe constructors pass 0.
     pub fn new_hevc_adaptive(
         width: u32,
         height: u32,
         fps: u32,
         maxrate_bps: usize,
+        cq_bias: u32,
     ) -> Result<Self> {
         Self::new_with_dispatch(
             HEVC_ENCODER_NAMES,
@@ -501,18 +507,26 @@ impl FfmpegEncoder {
             height,
             fps.max(1) as i32,
             maxrate_bps,
+            cq_bias,
         )
     }
 
     /// Phase B — DataChannel-pump VP9 (`vp9_qsv`) constructor. See
     /// [`Self::new_hevc_adaptive`].
-    pub fn new_vp9_adaptive(width: u32, height: u32, fps: u32, maxrate_bps: usize) -> Result<Self> {
+    pub fn new_vp9_adaptive(
+        width: u32,
+        height: u32,
+        fps: u32,
+        maxrate_bps: usize,
+        cq_bias: u32,
+    ) -> Result<Self> {
         Self::new_with_dispatch(
             VP9_ENCODER_NAMES,
             width,
             height,
             fps.max(1) as i32,
             maxrate_bps,
+            cq_bias,
         )
     }
 
@@ -532,18 +546,27 @@ impl FfmpegEncoder {
             height,
             DEFAULT_ENCODER_FPS,
             maxrate,
+            0,
         )
     }
 
     /// rc.190 — DataChannel-pump AV1 constructor. See
-    /// [`Self::new_hevc_adaptive`] for the fps/maxrate threading contract.
-    pub fn new_av1_adaptive(width: u32, height: u32, fps: u32, maxrate_bps: usize) -> Result<Self> {
+    /// [`Self::new_hevc_adaptive`] for the fps/maxrate/cq_bias threading
+    /// contract.
+    pub fn new_av1_adaptive(
+        width: u32,
+        height: u32,
+        fps: u32,
+        maxrate_bps: usize,
+        cq_bias: u32,
+    ) -> Result<Self> {
         Self::new_with_dispatch(
             AV1_ENCODER_NAMES,
             width,
             height,
             fps.max(1) as i32,
             maxrate_bps,
+            cq_bias,
         )
     }
 
@@ -563,6 +586,7 @@ impl FfmpegEncoder {
             height,
             DEFAULT_ENCODER_FPS,
             maxrate,
+            0,
         )
     }
 
@@ -580,6 +604,7 @@ impl FfmpegEncoder {
         height: u32,
         fps: u32,
         maxrate_bps: usize,
+        cq_bias: u32,
     ) -> Result<Self> {
         Self::new_with_dispatch(
             H264_ENCODER_NAMES,
@@ -587,6 +612,7 @@ impl FfmpegEncoder {
             height,
             fps.max(1) as i32,
             maxrate_bps,
+            cq_bias,
         )
     }
 
@@ -727,6 +753,7 @@ impl FfmpegEncoder {
         height: u32,
         fps: i32,
         maxrate_bps: usize,
+        cq_bias: u32,
     ) -> Result<Self> {
         // `ffmpeg_next::init()` is idempotent + cheap to call; safe to
         // run on each new encoder. Sets up codec registration.
@@ -740,7 +767,12 @@ impl FfmpegEncoder {
         // frames cost ~0 and bursts are bounded by the cap. cq is
         // env-overridable; `fps` + `maxrate_bps` come from the caller
         // (Phase B threads the DC pump's real per-session values).
-        let cq = ffmpeg_cq();
+        // P7 — `cq_bias` sharpens deep resolution rungs (see
+        // rate_profile::scale_cq_bias). Applied ONCE here: the encoder is
+        // rebuilt on every dims change, so build-time application is exact,
+        // and `self.cq` stores the biased value — the QSV/AMF set_bitrate
+        // rebuild path reuses it verbatim (dims never change there).
+        let cq = crate::encode::rate_profile::apply_cq_bias(ffmpeg_cq(), cq_bias);
         // P4 — vp9_qsv GOP/low_power from the cached startup IDR-probe
         // verdict (containment defaults when unprobed); ignored by every
         // other candidate name.
@@ -765,6 +797,7 @@ impl FfmpegEncoder {
                         height,
                         fps,
                         cq,
+                        cq_bias,
                         maxrate_bps,
                         "ffmpeg encoder opened (constant-quality + maxrate cap)"
                     );
@@ -1233,6 +1266,7 @@ mod tests {
             360,
             30,
             3_000_000,
+            0,
         );
         assert!(res.is_err(), "expected Err for unknown encoder names");
         let msg = res.unwrap_err().to_string();
