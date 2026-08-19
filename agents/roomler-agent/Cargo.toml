@@ -146,6 +146,17 @@ dcv-color-primitives = { version = "0.6", optional = true }
 # Cross-platform input injection (mouse / keyboard).
 enigo = { workspace = true, optional = true }
 
+# Roomler SSH server (`ssh-server` feature). `default-features = false` is
+# NOT optional here: russh's defaults are `["flate2", "aws-lc-rs", "rsa"]`,
+# and aws-lc-rs is a C/NASM build that would break the deliberate ring-only /
+# no-openssl invariant `tunnel-core` maintains for QUIC (see its `quinn` dep
+# comment). `ring` is already in the tree, so this adds no new C build.
+#
+# `rsa` is deliberately left OFF: it costs ~0.32 MiB, pulls a `0.10.0-rc`
+# pre-release into the graph, and roomler SSH authenticates ed25519 keys —
+# an RSA host or user key is not something we need to accept.
+russh = { version = "0.62", default-features = false, features = ["ring"], optional = true }
+
 # Opus audio encoder for the system/desktop-audio WebRTC track (`audio`
 # feature). Bundles libopus and builds it from C source on first build,
 # so there's no runtime lib dependency and it's independent of the
@@ -473,6 +484,23 @@ overlay-l3 = ["roomler-ai-tunnel-core/overlay-l3", "roomler-agent-core/overlay-l
 # `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>` (see `overlay.rs`). Independent
 # of `overlay-l3`; a build may carry either or both (config picks at runtime).
 overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack", "roomler-agent-core/overlay-netstack"]
+
+# Roomler SSH server (P2) — an in-daemon SSH endpoint on this node's overlay
+# address. Implies `overlay-netstack`: the port is served by the userspace
+# stack via `split_tun`, never by an OS socket, which is the only way it can
+# coexist with an `sshd` already holding `0.0.0.0:22` (the state of every
+# Linux host in the fleet).
+#
+# Measured cost, x86_64-pc-windows-msvc, cgu=1, by building `roomlerd` with
+# and without this feature: **+1.86 MiB** (29.94 -> 31.80, +6.2%). An isolated
+# harness predicted +2.57; the real binary absorbs more because it already
+# links a far larger std/tokio/webrtc surface for the linker to share against.
+# Little of it is CRYPTO sharing, though — russh 0.62 sits on the NEXT
+# RustCrypto generation (aes-gcm 0.11 vs our 0.10, curve25519-dalek 5 vs 4,
+# p256 0.14 vs 0.13, sha2 0.11 vs 0.10), so the binary really does carry a
+# second, parallel primitive stack and ~99 extra crates. That is the honest
+# price of the feature and the reason it is opt-in per build.
+ssh-server = ["dep:russh", "overlay-netstack"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }

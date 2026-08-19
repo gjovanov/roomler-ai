@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DisplayInfo, ExecPolicy, OsKind,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DisplayInfo, ExecPolicy, OsKind, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -51,6 +51,7 @@ impl AgentDao {
             // Fleet RPC off on a new device — enabling it is a deliberate
             // admin act, never a side effect of enrollment.
             exec_policy: ExecPolicy::default(),
+            ssh_policy: SshPolicy::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
@@ -360,6 +361,25 @@ impl AgentDao {
             .update_one(
                 doc! { "_id": agent_id, "tenant_id": tenant_id },
                 doc! { "$set": { "exec_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// Replace the device's roomler-SSH policy (gate 3). A `MANAGE_AGENTS`
+    /// admin action, exactly like [`Self::update_exec_policy`] — and kept
+    /// separate from it so enabling one can never be a side effect of
+    /// enabling the other.
+    pub async fn update_ssh_policy(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        policy: &SshPolicy,
+    ) -> DaoResult<bool> {
+        let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "ssh_policy": policy_bson } },
             )
             .await
     }

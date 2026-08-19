@@ -3,6 +3,7 @@ pub mod agent_exec;
 pub mod agent_log;
 pub mod agent_org;
 pub mod agent_release;
+pub mod agent_ssh;
 pub mod auth;
 pub mod background_task;
 pub mod cluster;

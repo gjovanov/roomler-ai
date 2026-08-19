@@ -53,6 +53,13 @@ pub(crate) mod path;
 pub mod relay_link;
 pub mod router;
 pub mod runtime;
+/// Port-intercept shim: terminates one TCP port of this node's overlay address
+/// in the in-process [`netstack`] instead of handing it to the OS, so an
+/// in-daemon service can own e.g. `:22` on a host where `sshd` already holds
+/// `0.0.0.0:22` — and without binding a socket a firewall or EDR agent could
+/// block. Feature `overlay-netstack`.
+#[cfg(feature = "overlay-netstack")]
+pub mod split_tun;
 pub mod tun;
 /// Multi-org P2c — one shared OS TUN carrying N per-org runtimes behind
 /// per-org [`tun::TunIo`] facades with dst-based longest-prefix demux.

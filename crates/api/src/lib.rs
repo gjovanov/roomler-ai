@@ -379,7 +379,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{agent_id}/exec-policy",
             put(routes::agent_exec::set_policy),
-        );
+        )
+        // Roomler SSH — ask for a session on one device. Answers 200 with
+        // either where to dial or which gate refused; a denial is a policy
+        // outcome the caller must read, not a transport failure.
+        .route("/{agent_id}/ssh", post(routes::agent_ssh::request_session))
+        // Gate 3's twin, and the same MANAGE_AGENTS-not-SSH_DEVICE split.
+        .route("/{agent_id}/ssh-policy", put(routes::agent_ssh::set_policy));
 
     // Remote-control session routes (tenant-scoped)
     let remote_session_routes = Router::new()
@@ -496,6 +502,14 @@ pub fn build_router(state: AppState) -> Router {
     let exec_settings_routes = Router::new().route(
         "/",
         get(routes::agent_exec::get_org_settings).put(routes::agent_exec::set_org_settings),
+    );
+
+    // Roomler SSH — its own org kill-switch (gate 1). A separate switch from
+    // the exec one on purpose: allowing bounded diagnostic commands is not
+    // the same decision as allowing interactive sessions.
+    let ssh_settings_routes = Router::new().route(
+        "/",
+        get(routes::agent_ssh::get_org_settings).put(routes::agent_ssh::set_org_settings),
     );
 
     // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
@@ -659,6 +673,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
         .nest("/tenant/{tenant_id}/exec-audit", exec_audit_routes)
         .nest("/tenant/{tenant_id}/exec-settings", exec_settings_routes)
+        .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);
 
     // Health check. `/health` stays a cheap process-alive 200 (liveness /
