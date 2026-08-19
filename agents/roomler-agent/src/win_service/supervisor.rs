@@ -35,19 +35,23 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NO_TOKEN, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_NO_TOKEN, FALSE, GENERIC_READ, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, STILL_ACTIVE, SetHandleInformation, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
-    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ALL_ACCESS,
-    TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType, TokenElevationTypeLimited,
-    TokenLinkedToken, TokenPrimary,
+    DuplicateTokenEx, GetTokenInformation, SECURITY_ATTRIBUTES, SecurityImpersonation,
+    TOKEN_ALL_ACCESS, TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType,
+    TokenElevationTypeLimited, TokenLinkedToken, TokenPrimary,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
 };
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
-    PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 
 /// Sentinel for "no console session is currently attached" — what
@@ -101,6 +105,21 @@ impl OwnedHandle {
         self.0
     }
 }
+
+// SAFETY: a Win32 `HANDLE` is a process-wide reference to a kernel object, not
+// a thread-affine resource — any thread in the process may use it, and the
+// operations performed on these (WaitForSingleObject, GetExitCodeProcess,
+// TerminateProcess, ReadFile, CloseHandle) are all thread-safe. The
+// thread-affine exceptions in Win32 are GUI objects — window handles bound to a
+// message queue, some GDI DCs — and none are ever wrapped here: this holds
+// tokens, pipes and process handles.
+//
+// `Sync` too, because the console-user exec path shares the child process
+// handle between a blocking waiter and the async select that may terminate it.
+// `Arc` guarantees the single `CloseHandle` on drop runs after every reference
+// is gone, so the one non-reentrant operation cannot race.
+unsafe impl Send for OwnedHandle {}
+unsafe impl Sync for OwnedHandle {}
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
@@ -484,10 +503,12 @@ impl OwnedProcess {
     /// `mem::forget`'s the original wrapper, transferring sole
     /// ownership to the tuple).
     ///
-    /// Gated behind `feature = "system-context"` because the only
-    /// caller is the M3 A1 spawn arm; without the feature this
-    /// would surface as a `dead_code` warning under `-D warnings`.
-    #[cfg(feature = "system-context")]
+    /// Was `system-context`-gated when the M3 A1 spawn arm was its only
+    /// caller. Roomler SSH's console-user path is a second caller in a
+    /// different feature, so the gate would have to become an `any(...)`
+    /// growing with each new one — and the `dead_code` warning it avoided
+    /// cannot fire now: `spawn_in_session_captured` in this module calls it
+    /// unconditionally.
     pub(crate) fn from_raw_parts(process: HANDLE, thread: HANDLE, pid: u32) -> Self {
         Self {
             process: OwnedHandle(process),
@@ -1555,6 +1576,222 @@ pub fn run(
 
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Output-capturing spawn (roomler SSH P5b)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A child spawned into a user session with its output piped back.
+///
+/// The read ends are plain blocking pipe handles; drain them with
+/// [`read_pipe_to_end`], one thread each. Both must be drained or a child that
+/// fills the other pipe's 4 KiB buffer blocks forever — that is the classic
+/// two-pipe deadlock, and it is why the caller cannot simply read stdout first.
+pub struct CapturedChild {
+    pub process: OwnedProcess,
+    pub stdout: OwnedHandle,
+    pub stderr: OwnedHandle,
+}
+
+/// Output-capturing twin of [`spawn_in_session`], for running a SHELL COMMAND
+/// LINE as the signed-in console user and reading back what it printed.
+///
+/// [`spawn_in_session`] launches our own EXE and ignores its output; roomler
+/// SSH needs the opposite, so this takes a full command line (no
+/// `lpApplicationName`) and wires three pipes.
+///
+/// # Why the handle flags are the way they are
+///
+/// Two mistakes here produce a hang rather than an error, so both are spelled
+/// out:
+///
+/// * The pipe WRITE ends must be inheritable and the READ ends must not. If a
+///   read end leaks into the child, the pipe never reaches EOF after the child
+///   exits — because the child still holds a writer's counterpart open — and
+///   the reader blocks forever.
+/// * The parent must close ITS copies of the write ends immediately after the
+///   spawn. Same failure: as long as this process holds a writer, `ReadFile`
+///   on the read end never returns 0.
+///
+/// # Safety
+///
+/// `token` must be a live primary token for the target session (from
+/// [`query_user_token`] + [`duplicate_primary`]). The caller keeps it alive
+/// across the call.
+pub unsafe fn spawn_in_session_captured(
+    token: HANDLE,
+    cmdline: &str,
+    cwd: Option<&Path>,
+) -> Result<CapturedChild> {
+    let env = EnvBlock::for_token(token).context("CreateEnvironmentBlock")?;
+
+    // Inheritable by default — each read end is explicitly de-inherited below.
+    let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = std::ptr::null_mut();
+
+    let (out_r, out_w) = unsafe { make_pipe(&mut sa) }.context("CreatePipe (stdout)")?;
+    let (err_r, err_w) = unsafe { make_pipe(&mut sa) }.context("CreatePipe (stderr)")?;
+
+    // stdin from NUL rather than a null handle: with STARTF_USESTDHANDLES the
+    // child gets exactly these three, and a shell handed an invalid stdin can
+    // fail in ways that look like the command misbehaving.
+    let nul_w = encode_wide(OsStr::new("NUL"));
+    // SAFETY: documented CreateFileW call; the wide string outlives it.
+    let nul = unsafe {
+        CreateFileW(
+            nul_w.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &sa,
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    let nul = OwnedHandle::new(nul).ok_or_else(|| anyhow!("opening NUL for stdin failed"))?;
+
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nul.raw();
+    si.hStdOutput = out_w.raw();
+    si.hStdError = err_w.raw();
+    // Same interactive-desktop attachment as `spawn_in_session`: without it the
+    // child lands on a noninteractive desktop, which matters for anything the
+    // user's shell profile might touch.
+    let mut desktop_w = encode_wide(OsStr::new("winsta0\\default"));
+    si.lpDesktop = desktop_w.as_mut_ptr();
+
+    let mut cmdline_w = encode_wide(OsStr::new(cmdline));
+    let cwd_w = cwd.map(|p| encode_wide(p.as_os_str()));
+    let cwd_ptr = cwd_w
+        .as_ref()
+        .map(|w| w.as_ptr())
+        .unwrap_or(std::ptr::null());
+
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+    // SAFETY: every buffer outlives the call; out-params are valid; the flags
+    // and the TRUE inherit-handles argument are exactly what the pipe wiring
+    // above requires.
+    let ok = unsafe {
+        CreateProcessAsUserW(
+            token,
+            std::ptr::null(), // no lpApplicationName — cmdline carries the shell
+            cmdline_w.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            TRUE, // inherit handles — required for the pipes to reach the child
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            env.raw,
+            cwd_ptr,
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("CreateProcessAsUserW failed (err {err})");
+    }
+
+    // Drop OUR write ends and the NUL handle NOW. While this process holds a
+    // writer, the corresponding read end never sees EOF and the drain threads
+    // below would block until the timeout regardless of the child exiting.
+    drop(out_w);
+    drop(err_w);
+    drop(nul);
+
+    Ok(CapturedChild {
+        process: OwnedProcess::from_raw_parts(pi.hProcess, pi.hThread, pi.dwProcessId),
+        stdout: out_r,
+        stderr: err_r,
+    })
+}
+
+/// One anonymous pipe: `(read, write)`, with the read end de-inherited.
+///
+/// # Safety
+/// `sa` must be a valid, initialised `SECURITY_ATTRIBUTES`.
+unsafe fn make_pipe(sa: &mut SECURITY_ATTRIBUTES) -> Result<(OwnedHandle, OwnedHandle)> {
+    let mut r: HANDLE = std::ptr::null_mut();
+    let mut w: HANDLE = std::ptr::null_mut();
+    // SAFETY: out-params are valid; `sa` is caller-validated.
+    let ok = unsafe { CreatePipe(&mut r, &mut w, sa, 0) };
+    if ok == 0 {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("CreatePipe failed (err {err})");
+    }
+    let r = OwnedHandle::new(r).ok_or_else(|| anyhow!("CreatePipe returned a null read handle"))?;
+    let w =
+        OwnedHandle::new(w).ok_or_else(|| anyhow!("CreatePipe returned a null write handle"))?;
+    // The child must NOT inherit the read end — see the deadlock note on
+    // `spawn_in_session_captured`.
+    // SAFETY: `r` is a live handle we own.
+    let ok = unsafe { SetHandleInformation(r.raw(), HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("SetHandleInformation on the pipe read end failed (err {err})");
+    }
+    Ok((r, w))
+}
+
+/// Drain a pipe to EOF, stopping early once `budget` is exhausted.
+///
+/// Blocking by design — the caller runs one of these per stream on a blocking
+/// thread. Returns the bytes read and whether the budget cut it short, so the
+/// caller can report truncation the same way the ordinary exec path does.
+///
+/// `budget` is shared across both streams: the wire promises a COMBINED
+/// ceiling, so two independent caps would silently double it.
+pub fn read_pipe_to_end(
+    pipe: &OwnedHandle,
+    budget: &std::sync::atomic::AtomicU64,
+) -> (Vec<u8>, bool) {
+    use std::sync::atomic::Ordering;
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let mut read: u32 = 0;
+        // SAFETY: `pipe` is a live read handle we own; `buf`/`read` are valid
+        // out-params for the length passed.
+        let ok = unsafe {
+            ReadFile(
+                pipe.raw(),
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || read == 0 {
+            // ERROR_BROKEN_PIPE is the normal end: the last writer closed.
+            break;
+        }
+        let n = read as usize;
+        let allowed = budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+            Some(b.saturating_sub(n as u64))
+        });
+        let remaining = allowed.unwrap_or(0);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let take = n.min(remaining as usize);
+        out.extend_from_slice(&buf[..take]);
+        if take < n {
+            truncated = true;
+            break;
+        }
+    }
+    (out, truncated)
 }
 
 #[cfg(test)]
