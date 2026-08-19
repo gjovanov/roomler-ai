@@ -116,6 +116,35 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ssh_port: Option<u16>,
 
+    /// OpenSSH public keys allowed to open an SSH session, one entry per key
+    /// in `authorized_keys` form (`ssh-ed25519 AAAA… comment`).
+    ///
+    /// **Empty means nobody**, which is why [`Self::ssh_enabled`] alone cannot
+    /// let anyone in. P3 replaces this as the primary path with server-minted,
+    /// short-lived session grants tied to a roomler user — but the list stays
+    /// as the break-glass route for when the control plane is the thing that is
+    /// broken, which is exactly when a remote shell is most wanted.
+    ///
+    /// Reaching the port at all already requires clearing WireGuard as an
+    /// enrolled peer of this org; this is the second, device-owned factor.
+    #[serde(default)]
+    pub ssh_authorized_keys: Vec<String>,
+
+    /// This node's SSH host private key, OpenSSH format, generated on the first
+    /// SSH-enabled start.
+    ///
+    /// It lives in the config rather than a file of its own so it inherits
+    /// every protection the config already has: atomic write with `sync_all`
+    /// before the rename, `.prev` rotation, `0600` on Unix and the hardened
+    /// ACL on a machine-global Windows install. The file already holds
+    /// `agent_token`, so this changes the file's sensitivity not at all.
+    ///
+    /// Rotating it makes every client that pinned the old fingerprint refuse to
+    /// connect, which is the correct behaviour — clear the key only when you
+    /// mean to invalidate that trust.
+    #[serde(default)]
+    pub ssh_host_key: Option<String>,
+
     // ─── S2: env-bridged operator knobs ──────────────────────────────────
     // Each mirrors an env var read through `tunnel_core::env::node_env`
     // (precedence: env — either prefix — > this config key > built-in
@@ -1238,6 +1267,8 @@ pub fn test_fixture() -> AgentConfig {
         exec_enabled: false,
         ssh_enabled: false,
         ssh_port: None,
+        ssh_authorized_keys: Vec::new(),
+        ssh_host_key: None,
         overlay_quic: None,
         overlay_direct: None,
         overlay_derp: None,

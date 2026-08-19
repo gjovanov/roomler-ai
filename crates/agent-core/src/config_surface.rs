@@ -101,6 +101,13 @@ const KEYS: &[(&str, &str, &str)] = &[
         "TCP port intercepted on the overlay address when ssh_enabled is on (1-65535). Empty = built-in default (2222).",
     ),
     (
+        "ssh_authorized_keys",
+        "list",
+        "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access).",
+    ),
+    // `ssh_host_key` is deliberately ABSENT from this surface: it is private
+    // key material, and everything here is readable over the LocalAPI.
+    (
         "encoder_preference",
         "enum:auto|hardware|software",
         "Video encoder selection: auto (HW probe then fallback), hardware, or software.",
@@ -449,6 +456,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
+        "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
                 EncoderPreferenceChoice::Auto => "auto",
@@ -561,6 +569,18 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                     Some(p)
                 }
             }
+        }
+        // Clearing the key empties the list, i.e. revokes everyone — the
+        // fail-safe direction, and the fastest way to shut SSH access off
+        // without touching the transport.
+        "ssh_authorized_keys" => {
+            cfg.ssh_authorized_keys = value
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
         }
         "encoder_preference" => {
             cfg.encoder_preference = match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
