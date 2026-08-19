@@ -805,6 +805,21 @@
           >
             1:1 Match host display — {{ displayMatchOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <div class="text-caption text-medium-emphasis mb-1 ml-1 mt-4">Text sharpening (FSR)</div>
+          <v-btn-toggle
+            v-model="sharpen"
+            mandatory
+            divided
+            color="primary"
+            variant="outlined"
+            density="comfortable"
+            class="mb-1 d-flex w-100"
+          >
+            <v-btn value="auto" size="small" class="flex-grow-1">Auto</v-btn>
+            <v-btn value="on" size="small" class="flex-grow-1">On</v-btn>
+            <v-btn value="off" size="small" class="flex-grow-1">Off</v-btn>
+          </v-btn-toggle>
+          <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ sharpenHint }}</div>
 
           <v-divider class="my-4" />
 
@@ -2167,6 +2182,25 @@ const priorityOptions = [
 const priorityHint = computed<string>(
   () => priorityOptions.find((o) => o.value === priority.value)?.props.subtitle ?? '',
 )
+
+// P7 — FSR text sharpening (viewer-side, live; see rc-fsr-render.ts). Auto
+// engages the EASU+RCAS upscale only when the decoded stream is smaller
+// than the window needs (the Smoother/relay rungs) — exactly when CSS
+// bilinear used to smear remote text.
+const sharpen = computed<'auto' | 'on' | 'off'>({
+  get: () => rc.sharpenMode.value,
+  set: (v) => rc.setSharpenMode(v),
+})
+const sharpenHint = computed<string>(() => {
+  switch (sharpen.value) {
+    case 'on':
+      return 'Always sharpen (AMD FSR), even at 1:1 — maximum text crispness'
+    case 'off':
+      return 'Plain browser scaling (pre-P7 behaviour)'
+    default:
+      return 'Sharpen (AMD FSR) only when the stream is smaller than your window'
+  }
+})
 // Native-source hint for the Resolution select (reused from the retired
 // mobile sheet). Explains why a big custom target on a small-panel host
 // doesn't change anything, and surfaces the agent's native dims.
@@ -2217,10 +2251,14 @@ const diagLabel = computed(() => {
   if (!d) return ''
   const hop = (w: { avgMs: number; maxMs: number } | null) =>
     w ? `${w.avgMs}/${w.maxMs}` : '–'
+  // P7 — active render path + actual backing size (e.g. "fsr@2048x1280"),
+  // for field-verifying the FSR sizing policy.
+  const r = rc.renderInfo.value
+  const render = r ? ` · ${r.mode}@${r.w}x${r.h}` : ''
   return (
     `paint ${hop(d.paint)} · fwd ${hop(d.fwd)} · dec ${hop(d.decode)}`
     + ` · gap ${d.outGapMaxMs} · q ${d.queue} · drop ${d.droppedTotal}`
-    + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}`
+    + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}${render}`
   )
 })
 /** Bind callback for the HEVC canvas. Same `transferControlToOffscreen`
@@ -2612,7 +2650,10 @@ const statsCodecLabel = computed(() => {
         : rc.viewerDecodeHw.value === false
           ? ' · dec SW'
           : ''
-    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec
+    // P7 — flag the active FSR sharpening pass (exact mode + backing size
+    // live in the diag HUD; the pill stays binary for glanceability).
+    const fsr = rc.renderInfo.value && rc.renderInfo.value.mode !== '2d' ? ' · FSR' : ''
+    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec + fsr
   }
   // Fallback when the agent hasn't sent video-info (legacy track /
   // libvpx VP9-444 path). Derive chroma from the USER's selection

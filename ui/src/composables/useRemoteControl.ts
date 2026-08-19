@@ -12,6 +12,12 @@ import {
   type CtxMode,
   type HopWindow,
 } from '@/workers/rc-hop-stats'
+import {
+  normalizeSharpenMode,
+  normalizeSharpness,
+  DEFAULT_RCAS_SHARPNESS,
+  type SharpenMode,
+} from '@/workers/rc-fsr-render'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -783,6 +789,81 @@ export function diagHudEnabled(): boolean {
     return globalThis.localStorage?.getItem(DIAG_HUD_STORAGE_KEY) === '1'
   } catch {
     return false
+  }
+}
+
+// P7 (Parsec-class plan) — FSR sharpening knobs (see rc-fsr-render.ts).
+//  - roomler-rc-sharpen: 'auto' | 'on' | 'off'. Default 'auto' — the EASU+
+//    RCAS upscale engages only when the decoded stream is SMALLER than the
+//    viewer's window needs (the Smoother/relay rungs). Doubles as the field
+//    escape hatch: localStorage.setItem('roomler-rc-sharpen','off') + refresh.
+//  - roomler-rc-fsr-sharpness: RCAS sharpness in AMD stops (default 0.25,
+//    clamp 0..2; LOWER = sharper). Tuning-only — no UI.
+const SHARPEN_STORAGE_KEY = 'roomler-rc-sharpen'
+const FSR_SHARPNESS_STORAGE_KEY = 'roomler-rc-fsr-sharpness'
+
+export function storedSharpenMode(): SharpenMode {
+  try {
+    return normalizeSharpenMode(globalThis.localStorage?.getItem(SHARPEN_STORAGE_KEY))
+  } catch {
+    return 'auto'
+  }
+}
+
+export function storedSharpness(): number {
+  try {
+    const raw = globalThis.localStorage?.getItem(FSR_SHARPNESS_STORAGE_KEY)
+    return raw === null || raw === undefined ? DEFAULT_RCAS_SHARPNESS : normalizeSharpness(raw)
+  } catch {
+    return DEFAULT_RCAS_SHARPNESS
+  }
+}
+
+function persistSharpenMode(m: SharpenMode) {
+  try {
+    globalThis.localStorage?.setItem(SHARPEN_STORAGE_KEY, m)
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** P7 — report the canvas element's CSS box + devicePixelRatio to a DC
+ *  video worker (drives the FSR backing-store sizing policy). Posts once
+ *  immediately, then on element resize (150 ms trailing debounce — a
+ *  backing realloc is cheap, no encoder rebuild involved) and on window
+ *  `resize` (catches browser-zoom / monitor-move DPR changes that don't
+ *  change the element box). Returns a cleanup closure. */
+export function startViewportReporter(el: HTMLCanvasElement, worker: Worker): () => void {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const post = () => {
+    timer = null
+    const rect = el.getBoundingClientRect()
+    try {
+      worker.postMessage({
+        type: 'viewport',
+        cssW: rect.width,
+        cssH: rect.height,
+        dpr: globalThis.devicePixelRatio ?? 1,
+      })
+    } catch {
+      /* worker torn down mid-report */
+    }
+  }
+  const schedule = () => {
+    if (timer !== null) clearTimeout(timer)
+    timer = setTimeout(post, 150)
+  }
+  post()
+  let ro: ResizeObserver | null = null
+  if (typeof ResizeObserver !== 'undefined') {
+    ro = new ResizeObserver(schedule)
+    ro.observe(el)
+  }
+  globalThis.addEventListener?.('resize', schedule)
+  return () => {
+    if (timer !== null) clearTimeout(timer)
+    ro?.disconnect()
+    globalThis.removeEventListener?.('resize', schedule)
   }
 }
 
@@ -2454,6 +2535,40 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  correctly renders the `<video>` rather than a permanent black
    *  canvas. */
   const webcodecsActive = ref(false)
+
+  // P7 — FSR sharpening (see rc-fsr-render.ts). `sharpenMode` is the live
+  // setting (persisted + posted to whichever DC worker is active);
+  // `renderInfo` mirrors the worker's 1 s stats (active render path +
+  // actual backing size) for the stats pill ("· FSR") and the diag HUD.
+  const sharpenMode = ref<SharpenMode>(storedSharpenMode())
+  const renderInfo = ref<{ mode: string; w: number; h: number } | null>(null)
+  let vp9ViewportCleanup: (() => void) | null = null
+  let hevcViewportCleanup: (() => void) | null = null
+
+  function setSharpenMode(m: SharpenMode) {
+    const mode = normalizeSharpenMode(m)
+    sharpenMode.value = mode
+    persistSharpenMode(mode)
+    const worker = hevcWorker ?? vp9_444Worker
+    if (worker) {
+      try {
+        worker.postMessage({ type: 'render-mode', sharpen: mode })
+      } catch {
+        /* worker torn down mid-change */
+      }
+    }
+  }
+
+  /** P7 — fold the worker stats' render fields into `renderInfo`. */
+  function updateRenderInfo(m: { render?: string; renderW?: number; renderH?: number }) {
+    if (typeof m.render === 'string') {
+      renderInfo.value = {
+        mode: m.render,
+        w: typeof m.renderW === 'number' ? m.renderW : 0,
+        h: typeof m.renderH === 'number' ? m.renderH : 0,
+      }
+    }
+  }
 
   // Phase Y.3: VP9-444 over DataChannel pipeline. Independent of the
   // RTCRtpScriptTransform path above — uses its OWN worker
@@ -4144,6 +4259,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.warn('[rc] vp9-444 DECODE STALL — no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
       } else if (msg.type === 'decode-stall-recovered') {
         console.warn('[rc] vp9-444 decode stall recovered after', msg.gapMs, 'ms')
+      } else if (msg.type === 'render-fallback') {
+        // P7 — GL unavailable/lost for good this session; the worker
+        // reverted to the byte-identical 2D paint path.
+        console.warn('[rc] vp9-444 FSR unavailable — 2D paint path:', msg.reason)
       } else if (msg.type === 'frame-decoded') {
         // Worker emits this for every decoded frame after the first.
         // Driven by the worker's `output` callback, used by tests +
@@ -4168,7 +4287,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           decode?: HopWindow
           outGapMaxMs?: number
           ctxMode?: string
+          render?: string
+          renderW?: number
+          renderH?: number
         }
+        updateRenderInfo(m)
         vp9_444Stats.value = {
           bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
           fps: typeof m.fps === 'number' ? m.fps : 0,
@@ -4221,6 +4344,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
           maxQueue: flowParams.maxQueue,
+          // P7 — FSR knobs (sticky across the visible-canvas re-init).
+          sharpen: sharpenMode.value,
+          sharpness: storedSharpness(),
         },
         [synthetic],
       )
@@ -4270,6 +4396,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   function stopVp9_444Path() {
     vp9_444Active.value = false
     vp9_444FramesDecoded.value = 0
+    // P7 — drop the viewport reporter + render-path mirror with the path.
+    vp9ViewportCleanup?.()
+    vp9ViewportCleanup = null
+    renderInfo.value = null
     if (!vp9_444Worker) return
     try { vp9_444Worker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { vp9_444Worker.terminate() } catch { /* ignore */ }
@@ -4281,10 +4411,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  treats `init-canvas` as idempotent — second call replaces the
    *  paint target. */
   watch(vp9_444CanvasEl, (el) => {
+    vp9ViewportCleanup?.()
+    vp9ViewportCleanup = null
     if (!el || !vp9_444Worker) return
     try {
       const off = el.transferControlToOffscreen()
       vp9_444Worker.postMessage({ type: 'init-canvas', canvas: off }, [off])
+      // P7 — start reporting the element box for the FSR sizing policy.
+      vp9ViewportCleanup = startViewportReporter(el, vp9_444Worker)
     } catch (err) {
       console.warn('[rc] vp9-444: transferControlToOffscreen failed', err)
     }
@@ -4365,6 +4499,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.warn('[rc] hevc DECODE STALL — no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
       } else if (msg.type === 'decode-stall-recovered') {
         console.warn('[rc] hevc decode stall recovered after', msg.gapMs, 'ms')
+      } else if (msg.type === 'render-fallback') {
+        // P7 — GL unavailable/lost for good this session; the worker
+        // reverted to the byte-identical 2D paint path.
+        console.warn('[rc] hevc FSR unavailable — 2D paint path:', msg.reason)
       } else if (msg.type === 'frame-decoded') {
         hevcFramesDecoded.value++
       } else if (msg.type === 'stats') {
@@ -4382,7 +4520,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           decode?: HopWindow
           outGapMaxMs?: number
           ctxMode?: string
+          render?: string
+          renderW?: number
+          renderH?: number
         }
+        updateRenderInfo(m)
         hevcStats.value = {
           bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
           fps: typeof m.fps === 'number' ? m.fps : 0,
@@ -4412,6 +4554,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
           maxQueue: flowParams.maxQueue,
+          // P7 — FSR knobs (sticky across the visible-canvas re-init).
+          sharpen: sharpenMode.value,
+          sharpness: storedSharpness(),
         },
         [synthetic],
       )
@@ -4463,6 +4608,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   function stopHevcPath() {
     hevcActive.value = false
     hevcFramesDecoded.value = 0
+    // P7 — drop the viewport reporter + render-path mirror with the path.
+    hevcViewportCleanup?.()
+    hevcViewportCleanup = null
+    renderInfo.value = null
     if (!hevcWorker) return
     try { hevcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { hevcWorker.terminate() } catch { /* ignore */ }
@@ -4470,10 +4619,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   }
 
   watch(hevcCanvasEl, (el) => {
+    hevcViewportCleanup?.()
+    hevcViewportCleanup = null
     if (!el || !hevcWorker) return
     try {
       const off = el.transferControlToOffscreen()
       hevcWorker.postMessage({ type: 'init-canvas', canvas: off }, [off])
+      // P7 — start reporting the element box for the FSR sizing policy.
+      hevcViewportCleanup = startViewportReporter(el, hevcWorker)
     } catch (err) {
       console.warn('[rc] hevc: transferControlToOffscreen failed', err)
     }
@@ -7915,6 +8068,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      *  control DC). Balanced / Sharper (relay-cap override) / Smoother. */
     priority,
     setPriority,
+    /** P7 — FSR sharpening mode ('auto' | 'on' | 'off') + its setter (live;
+     *  posted to the active DC video worker) and the worker-reported active
+     *  render path + backing size (for the "· FSR" pill / diag HUD). */
+    sharpenMode,
+    setSharpenMode,
+    renderInfo,
     /** rc.199 — the unified Codec picker (computed over transport+chroma+
      *  preferredCodec+renderPath). Read for the picker's value; assign to
      *  apply a choice. Replaces the 4 transport toggles + 2 dropdowns. */
