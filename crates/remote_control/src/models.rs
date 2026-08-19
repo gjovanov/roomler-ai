@@ -137,6 +137,11 @@ pub struct AgentCaps {
     /// * `originate` — the agent honours `rc:rpc.response`, i.e. its LocalAPI
     ///   can originate an exec against ANOTHER device (the `roomler exec`
     ///   CLI path).
+    /// * `ssh` — the agent honours `rc:ssh.grant`: it serves roomler SSH on
+    ///   its overlay address and will admit the granted key.
+    /// * `ssh-originate` — the agent honours `rc:ssh.response`, i.e. its
+    ///   LocalAPI can originate an SSH session against ANOTHER device (the
+    ///   `roomler ssh` CLI path).
     ///
     /// Empty / unset = a pre-fleet-RPC agent. Same rule as [`Self::multi_org`]:
     /// the server refuses the request with `412` rather than pushing a message
@@ -444,6 +449,11 @@ pub struct Agent {
     /// pre-feature row deserialises to [`ExecMode::Off`].
     #[serde(default)]
     pub exec_policy: ExecPolicy,
+    /// Roomler-SSH policy for this device (gate 3). Same shape and the same
+    /// closed default as [`Self::exec_policy`] — every pre-feature row
+    /// deserialises to [`SshMode::Off`].
+    #[serde(default)]
+    pub ssh_policy: SshPolicy,
     /// Subnet-router CIDRs this agent is a gateway for (Phase 2). The SOCKS
     /// mesh longest-prefix-matches a LAN-IP target against these to pick the
     /// covering agent, which then dials the real IP (still gated by the
@@ -477,6 +487,151 @@ pub struct Agent {
 
 impl Agent {
     pub const COLLECTION: &'static str = "agents";
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Roomler SSH
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Bounds on a roomler-SSH session grant. The server clamps before minting;
+/// the agent re-clamps on receipt, so a forged or replayed grant cannot ask for
+/// a longer-lived session than policy allows.
+pub mod ssh_limits {
+    /// How long a minted grant stays usable before the target discards it.
+    ///
+    /// Short on purpose: the grant is consumed by a TCP connection the caller
+    /// makes immediately after receiving it, so this only has to cover
+    /// signalling latency plus a slow WireGuard handshake. A grant that
+    /// lingered would be a standing key to the device.
+    pub const GRANT_TTL_SECS: u64 = 60;
+    /// Hard ceiling on a session's lifetime, after which the agent closes it.
+    /// Twelve hours is long enough for a working day and short enough that a
+    /// forgotten terminal does not stay open for a week.
+    pub const MAX_SESSION_SECS: u64 = 12 * 3600;
+    /// Concurrent SSH sessions one device will serve. Beyond this the agent
+    /// refuses rather than queues.
+    pub const MAX_CONCURRENT_PER_AGENT: usize = 8;
+    /// Grants per minute per (caller, device) pair.
+    pub const RATE_LIMIT_PER_MINUTE: u32 = 20;
+
+    /// Clamp a caller-supplied session budget into range, substituting the
+    /// ceiling for `None`/0.
+    pub fn clamp_session_secs(requested: u64) -> u64 {
+        match requested {
+            0 => MAX_SESSION_SECS,
+            n => n.min(MAX_SESSION_SECS),
+        }
+    }
+}
+
+/// Whether a device accepts roomler-SSH sessions at all.
+///
+/// Default `Off` — every existing row deserialises to it, so enabling the
+/// feature can never retroactively open a device.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshMode {
+    /// Refuse every SSH grant request. The default.
+    #[default]
+    Off,
+    /// Accept grants for callers that clear every other gate.
+    On,
+}
+
+/// Which local account an SSH session runs as.
+///
+/// Windows has no password-free way to become an arbitrary local user, so the
+/// choices are deliberately the two the daemon can actually reach: its own
+/// identity, or the token of whoever is signed in at the console (which the
+/// SystemContext machinery already obtains for the lock-screen path). Naming a
+/// specific Unix account is the third, and is Unix-only by construction.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshAccountMode {
+    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    ///
+    /// The default *today* because it is what P2 can actually do, and it is
+    /// why `SshMode::On` is root-equivalent until the P5 privilege-drop slice
+    /// lands. It is not the right long-term default and the admin UI says so.
+    #[default]
+    Daemon,
+    /// The user signed in at the console, via their session token. No password
+    /// required, and the session cannot outlive their sign-in.
+    ConsoleUser,
+    /// A named local account (Unix only; requires the P5 privilege drop).
+    Named,
+}
+
+/// Per-device roomler-SSH policy — gate 3 of four, the exact shape of
+/// [`ExecPolicy`] because the reasoning is identical and a reader who knows one
+/// should recognise the other.
+///
+/// Deliberately NOT folded into [`ExecPolicy`]: "may run one clamped command"
+/// and "may hold an interactive session" are different grants, and an operator
+/// who enabled the first must not silently acquire the second.
+///
+/// ⚠️ With [`SshAccountMode::Daemon`] — the current default — `SshMode::On` is
+/// root-equivalent by construction, exactly like `ExecMode::On`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SshPolicy {
+    /// Does this device accept SSH sessions? Gate 3.
+    #[serde(default)]
+    pub mode: SshMode,
+    /// May this device *originate* SSH against other devices (the
+    /// `roomler ssh` CLI path, where the daemon's own agent WS carries the
+    /// request)? Default `false` — without it, compromising any enrolled
+    /// laptop would inherit its owner's SSH rights across the whole fleet.
+    #[serde(default)]
+    pub can_originate: bool,
+    /// Restrict callers to these users. Empty = no user restriction (the
+    /// permission bit + the other gates still apply).
+    #[serde(default)]
+    pub allowed_user_ids: Vec<ObjectId>,
+    /// Restrict callers to holders of these roles. Empty = no role
+    /// restriction.
+    #[serde(default)]
+    pub allowed_role_ids: Vec<ObjectId>,
+    /// Which local account sessions run as.
+    #[serde(default)]
+    pub account_mode: SshAccountMode,
+    /// The account for [`SshAccountMode::Named`]. Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// How consent is obtained before a session opens. `None` = the safe
+    /// default ([`ConsentMode::Prompt`]); unattended servers set `Auto`.
+    /// Only `Auto` and `Prompt` are honoured, as for exec.
+    #[serde(default)]
+    pub consent_mode: Option<ConsentMode>,
+}
+
+impl SshPolicy {
+    /// Effective consent mode. Unset ⇒ [`ConsentMode::Prompt`] (attended);
+    /// the session-shaped variants collapse to `Prompt`, matching
+    /// [`ExecPolicy::effective_consent_mode`].
+    pub fn effective_consent_mode(&self) -> ConsentMode {
+        match self.consent_mode {
+            Some(ConsentMode::Auto) => ConsentMode::Auto,
+            _ => ConsentMode::Prompt,
+        }
+    }
+
+    /// Is `user` allowed by the user/role allowlists?
+    ///
+    /// Empty lists mean "no restriction at this layer" — never "deny all" —
+    /// because the permission bit and the org kill-switch are the layers that
+    /// decide *whether* anyone may connect. Mirrors the exec check so the two
+    /// policies cannot drift apart in meaning.
+    pub fn allows_caller(&self, user_id: &ObjectId, role_ids: &[ObjectId]) -> bool {
+        if !self.allowed_user_ids.is_empty() && !self.allowed_user_ids.contains(user_id) {
+            return false;
+        }
+        if !self.allowed_role_ids.is_empty()
+            && !role_ids.iter().any(|r| self.allowed_role_ids.contains(r))
+        {
+            return false;
+        }
+        true
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -989,6 +1144,66 @@ pub enum ExecDenyReason {
     /// Gate 4 — the agent's own `exec_enabled` config key is false. Reported
     /// by the agent rather than decided server-side.
     AgentDisabled,
+}
+
+/// Why a roomler-SSH grant was refused. The twin of [`ExecDenyReason`]; kept
+/// separate so the two features' reasons cannot drift into each other's
+/// vocabulary as they diverge (SSH grows account modes and session limits that
+/// mean nothing to exec).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SshDenyReason {
+    /// Gate 1 — the org's `remote_ssh_enabled` kill-switch is off.
+    OrgDisabled,
+    /// Gate 2 — the caller lacks `SSH_DEVICE`.
+    NoPermission,
+    /// Gate 3 — the target device's [`SshPolicy::mode`] is `Off`.
+    DeviceDisabled,
+    /// Gate 3 — the caller isn't in the device's allowed users/roles.
+    CallerNotAllowed,
+    /// The originating device isn't blessed with `can_originate`.
+    OriginNotAllowed,
+    /// The agent doesn't advertise the `ssh` RPC capability — an older build,
+    /// or one compiled without the `ssh-server` feature.
+    Unsupported,
+    /// The device is offline.
+    Offline,
+    /// The device is on the mesh but has no overlay address to dial, so there
+    /// is nowhere to send the caller even though every gate passed.
+    NoOverlayAddress,
+    /// Per-(user, device) rate limit.
+    RateLimited,
+    /// The caller offered something other than a usable ed25519 public key.
+    BadPublicKey,
+}
+
+impl SshDenyReason {
+    /// One line an operator can act on. Deliberately names WHICH gate said no:
+    /// "denied" without a reason turns a five-second config fix into a
+    /// support ticket.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::OrgDisabled => {
+                "roomler SSH is disabled for this organization (an admin must enable it)"
+            }
+            Self::NoPermission => "you do not have the SSH_DEVICE permission in this organization",
+            Self::DeviceDisabled => "this device does not accept SSH sessions (its policy is off)",
+            Self::CallerNotAllowed => "this device's policy does not list you as an allowed caller",
+            Self::OriginNotAllowed => {
+                "the device you are calling from is not permitted to originate SSH sessions"
+            }
+            Self::Unsupported => {
+                "this device's agent does not support roomler SSH (needs a build with the \
+                 ssh-server feature)"
+            }
+            Self::Offline => "the device is offline",
+            Self::NoOverlayAddress => {
+                "the device has no overlay address — it is not on the mesh right now"
+            }
+            Self::RateLimited => "too many SSH requests for this device; try again shortly",
+            Self::BadPublicKey => "the session public key is missing or not a usable ed25519 key",
+        }
+    }
 }
 
 /// One remote-execution attempt. Written on EVERY attempt, allowed or denied.
@@ -1824,6 +2039,60 @@ mod tests {
         }"#;
         let a: Agent = serde_json::from_str(caps_free).unwrap();
         assert_eq!(a.exec_policy.mode, ExecMode::Off);
+        // The SSH policy rides the same row and carries the same guarantee:
+        // shipping the feature must not retroactively open a single device.
+        assert_eq!(a.ssh_policy.mode, SshMode::Off);
+    }
+
+    #[test]
+    fn ssh_policy_defaults_are_closed() {
+        let p: SshPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.mode, SshMode::Off);
+        assert!(!p.can_originate);
+        assert_eq!(p.effective_consent_mode(), ConsentMode::Prompt);
+        // `Daemon` is root-equivalent, so it must be a DELIBERATE choice that
+        // an operator can see — not something a device silently acquires. It
+        // is the default only because it is the one mode P2 can actually
+        // perform; P5 is what makes the others real.
+        assert_eq!(p.account_mode, SshAccountMode::Daemon);
+    }
+
+    #[test]
+    fn ssh_policy_allowlists_restrict_only_when_populated() {
+        let user = ObjectId::new();
+        let role = ObjectId::new();
+        let other = ObjectId::new();
+
+        // Empty lists mean "no restriction at THIS layer" — never "deny all".
+        // The permission bit and the org kill-switch are the layers that decide
+        // whether anyone may connect at all.
+        let open = SshPolicy::default();
+        assert!(open.allows_caller(&user, &[role]));
+
+        let by_user = SshPolicy {
+            allowed_user_ids: vec![user],
+            ..Default::default()
+        };
+        assert!(by_user.allows_caller(&user, &[]));
+        assert!(!by_user.allows_caller(&other, &[]));
+
+        let by_role = SshPolicy {
+            allowed_role_ids: vec![role],
+            ..Default::default()
+        };
+        assert!(by_role.allows_caller(&other, &[role]));
+        assert!(!by_role.allows_caller(&other, &[]));
+
+        // Both populated ⇒ both must match; they are AND, not OR, so
+        // narrowing by role cannot widen who the user allowlist admitted.
+        let both = SshPolicy {
+            allowed_user_ids: vec![user],
+            allowed_role_ids: vec![role],
+            ..Default::default()
+        };
+        assert!(both.allows_caller(&user, &[role]));
+        assert!(!both.allows_caller(&user, &[other]));
+        assert!(!both.allows_caller(&other, &[role]));
     }
 
     #[test]

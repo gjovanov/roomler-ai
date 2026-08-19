@@ -275,7 +275,7 @@ jobs:
           # cmake_minimum_required(VERSION < 3.5); CMake 3.31+ errors without
           # this policy shim.
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder"
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server"
 
       # P3e Phase 2: the .deb's `roomler` is now the CLI SHIM (re-execs
       # `roomlerd cli`) — the Linux twin of the rc.365 MSI change. It must
@@ -501,7 +501,7 @@ jobs:
       - name: Build agent (release, full + vp9-444, no ffmpeg-encoder)
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack"
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server"
 
       - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
         run: |
@@ -887,7 +887,7 @@ jobs:
         # extra lib on Windows) + audiopus (bundled libopus via CMake).
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack"
+        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
 
       - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
         shell: pwsh
@@ -1132,6 +1132,13 @@ jobs:
           # 13.13 MB (minimal vendored FFmpeg). A baseline left above the real value is
           # exactly the silent failure this guard exists to catch — it would
           # swallow a multi-MB regression as "within budget".
+          # Roomler SSH (`ssh-server`) is a DELIBERATE growth on top of that
+          # baseline: russh measured +1.86 MiB in roomlerd, ~+0.7 MB
+          # compressed here. That stays inside the +2 warn band, so the guard
+          # is deliberately NOT re-pinned in the same commit that adds it —
+          # re-pin from the first measured release run, never from an
+          # estimate, or the baseline swallows exactly the regression it
+          # exists to catch.
           $p4bBaseline = 13.13
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
@@ -1459,7 +1466,7 @@ jobs:
         # lib) + audiopus (bundled libopus via CMake).
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder" --target aarch64-apple-darwin
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server" --target aarch64-apple-darwin
 
       - name: Stage .app bundle
         shell: bash

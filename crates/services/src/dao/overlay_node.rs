@@ -314,6 +314,27 @@ impl OverlayNodeDao {
     /// Multi-region relay PoPs: mirror an AGENT's derived `relay_home` onto
     /// its live overlay-node row(s) — the netmap already fans `relay_home`
     /// per peer, and the broker's pair-region pick reads it from here.
+    /// The LIVE overlay row for an agent, if it has one.
+    ///
+    /// Roomler SSH needs it to tell a caller where to dial. Live-scoped
+    /// (`deleted_at: null`) on purpose: a tombstone keeps the address it once
+    /// held as a forensic record, and handing that out would send the caller
+    /// to whoever holds it now.
+    pub async fn find_live_by_agent(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+    ) -> DaoResult<Option<OverlayNode>> {
+        self.base
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "node_ref.kind": "agent",
+                "node_ref.id": agent_id,
+                "deleted_at": bson::Bson::Null,
+            })
+            .await
+    }
+
     pub async fn set_relay_home_for_agent(
         &self,
         agent_id: ObjectId,

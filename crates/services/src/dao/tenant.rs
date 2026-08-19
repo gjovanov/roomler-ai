@@ -87,6 +87,25 @@ impl TenantDao {
         self.base.find_by_id(tenant_id).await
     }
 
+    /// Roomler SSH's org kill-switch (gate 1). A separate switch from
+    /// [`Self::set_remote_exec_enabled`] because they are separate grants.
+    pub async fn set_remote_ssh_enabled(
+        &self,
+        tenant_id: ObjectId,
+        enabled: bool,
+    ) -> DaoResult<Tenant> {
+        self.base
+            .update_by_id(
+                tenant_id,
+                doc! { "$set": {
+                    "settings.remote_ssh_enabled": enabled,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(tenant_id).await
+    }
+
     pub async fn create(
         &self,
         name: String,

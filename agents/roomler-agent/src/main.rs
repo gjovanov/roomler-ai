@@ -1705,6 +1705,41 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         }
     }
 
+    // Roomler SSH (P2) — mint this node's SSH host identity on the first
+    // SSH-enabled start, same shape as the WG key above: generated locally,
+    // persisted through `config::save` (atomic + fsync + `.prev` + 0600 / ACL),
+    // never transmitted. A device that never enables SSH never generates one.
+    //
+    // Failing to persist is FATAL to the feature rather than merely logged: a
+    // host key that changes on every boot trains operators to accept unknown
+    // fingerprints, which is precisely the habit that makes SSH host
+    // verification worthless. Better to serve nothing than to serve a new
+    // identity every restart.
+    #[cfg(feature = "ssh-server")]
+    if cfg.ssh_enabled && cfg.ssh_host_key.is_none() {
+        match roomler_agent::ssh::generate_host_key() {
+            Ok(pem) => {
+                cfg.ssh_host_key = Some(pem);
+                match config::save(config_path, &cfg) {
+                    Ok(()) => tracing::info!("ssh: generated + persisted node SSH host key"),
+                    Err(e) => {
+                        cfg.ssh_host_key = None;
+                        cfg.ssh_enabled = false;
+                        tracing::error!(
+                            error = %e,
+                            "ssh: could not persist the host key — SSH stays OFF this run \
+                             rather than serving an identity that changes on every restart"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                cfg.ssh_enabled = false;
+                tracing::error!(error = %e, "ssh: host key generation failed — SSH stays OFF");
+            }
+        }
+    }
+
     // P5 exit-node crash-safety (A2) — boot-time stale-route reconciler. Purge
     // any split-default (`/1`) route a PRIOR run left on the overlay NIC after a
     // crash / kill / unclean reboot, BEFORE the overlay runtime can (re)install a

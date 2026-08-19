@@ -69,6 +69,16 @@ pub mod permissions {
     pub const EXEC_DEVICE: u64 = 1 << 27;
     /// View the Fleet-RPC audit log (`exec_audit`) — who ran what, where.
     pub const VIEW_EXEC_AUDIT: u64 = 1 << 28;
+    /// Open a roomler SSH session to a device (`roomler ssh`). Gate 2 of four,
+    /// mirroring [`EXEC_DEVICE`].
+    ///
+    /// Deliberately a SEPARATE bit rather than a reuse of `EXEC_DEVICE`, for
+    /// the same reason `EXEC_DEVICE` is separate from `MANAGE_AGENTS`: an SSH
+    /// session is strictly more than a bounded command. It is interactive, it
+    /// lasts, and it grows file transfer and port forwarding as later slices
+    /// land — so "may run one clamped diagnostic" and "may hold a live session"
+    /// have to be grantable independently.
+    pub const SSH_DEVICE: u64 = 1 << 29;
 
     /// Default member permissions
     pub const DEFAULT_MEMBER: u64 = VIEW_CHANNELS
@@ -99,18 +109,18 @@ pub mod permissions {
         | MANAGE_AGENTS
         | REMOTE_CONTROL
         | VIEW_REMOTE_AUDIT
-        // VIEW_EXEC_AUDIT but deliberately NOT EXEC_DEVICE: an admin should
-        // see every command the fleet ran without silently gaining the power
-        // to run one. REMOTE_CONTROL is not the same power — it is
-        // consent-gated, visible to whoever is at the machine, and runs as
-        // the interactive user; exec runs as SYSTEM/root with nobody
-        // watching. Granting exec stays an explicit act.
+        // VIEW_EXEC_AUDIT but deliberately NOT EXEC_DEVICE, and for the same
+        // reason not SSH_DEVICE: an admin should see every command the fleet
+        // ran without silently gaining the power to run one. REMOTE_CONTROL is
+        // not the same power — it is consent-gated, visible to whoever is at
+        // the machine, and runs as the interactive user; exec and ssh run as
+        // SYSTEM/root with nobody watching. Both stay explicit grants.
         | VIEW_EXEC_AUDIT;
 
     /// Owner permissions (everything). Bump the mask whenever a new bit is
     /// added above so `ALL` literally contains every defined permission (owner
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
-    pub const ALL: u64 = (1 << 29) - 1;
+    pub const ALL: u64 = (1 << 30) - 1;
 
     pub fn has(permissions: u64, flag: u64) -> bool {
         permissions & ADMINISTRATOR != 0 || permissions & flag == flag
