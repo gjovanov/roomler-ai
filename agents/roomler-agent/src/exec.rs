@@ -523,6 +523,11 @@ mod unix_priv {
     use std::ffi::CString;
 
     /// A resolved local account: everything the child needs, pre-computed.
+    ///
+    /// `Debug` is for the tests' `unwrap_err()`; nothing secret lives here —
+    /// uid, gid, group list and home path are all readable from `/etc/passwd`
+    /// by anyone on the box.
+    #[derive(Debug)]
     struct Account {
         uid: libc::uid_t,
         gid: libc::gid_t,
@@ -538,7 +543,11 @@ mod unix_priv {
 
         // `getpwnam_r` with a buffer we grow rather than `getpwnam`, which
         // returns a pointer into static storage another thread can overwrite.
-        let mut buf = vec![0i8; 1024];
+        // `libc::c_char`, NOT `i8`: it is `u8` on aarch64 Linux, and the fleet
+        // ships an aarch64 .deb. That target is only built at RELEASE-TAG
+        // time, so hardcoding `i8` here would compile clean in CI and break a
+        // release.
+        let mut buf = vec![0 as libc::c_char; 1024];
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut result: *mut libc::passwd = std::ptr::null_mut();
         loop {
@@ -628,9 +637,10 @@ mod unix_priv {
     }
 
     /// Resolve `account` and arrange for the child to become it.
+    /// `pre_exec` below is tokio's own inherent method on `Command`, not
+    /// std's `CommandExt` — importing the extension trait here is redundant
+    /// and `-D warnings` rejects it.
     pub(super) fn drop_to(cmd: &mut tokio::process::Command, account: &str) -> Result<(), String> {
-        use std::os::unix::process::CommandExt;
-
         let acct = resolve(account)?;
 
         // The environment a shell needs to behave as that user. Without HOME
@@ -654,7 +664,10 @@ mod unix_priv {
                 // order silently leaves the child in root's groups. That is
                 // the classic privilege-retention bug, and it looks like a
                 // successful drop from the outside.
-                if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+                // `as _` on the count: Linux takes `size_t`, macOS takes
+                // `c_int`. Same release-only-build reasoning as the buffer
+                // above — macOS agent builds happen at tag time, not in CI.
+                if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::setgid(gid) != 0 {
