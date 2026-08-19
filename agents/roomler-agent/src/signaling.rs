@@ -2491,6 +2491,10 @@ async fn handle_server_msg(
                 max_output_bytes,
                 cwd,
                 caller: caller.clone(),
+                // Fleet RPC is privileged diagnostics by design — the whole
+                // point is `netsh`, route tables and service state. It has
+                // always run as the daemon and continues to.
+                run_as: crate::exec::RunAs::Daemon,
             };
             tokio::spawn(async move {
                 let decision = broker.request_with_mode(&request_id, consent_mode).await;
@@ -2532,6 +2536,77 @@ async fn handle_server_msg(
                 let found = crate::exec::shared().cancel(&request_id).await;
                 info!(%request_id, found, "rc:rpc.cancel");
             });
+        }
+
+        // Roomler SSH — the server authorized ONE inbound session against this
+        // device. Recording it is all that happens here; the grant is redeemed
+        // (and consumed) when a connection authenticates with the named key.
+        //
+        // Gate 4 is re-checked locally: a device with `ssh_enabled` off must
+        // not accumulate grants it would never honour, and refusing loudly
+        // beats a caller timing out against a port that answers nothing.
+        ServerMsg::SshGrant {
+            grant_id,
+            public_key,
+            caller,
+            account_mode,
+            account,
+            expires_at_ms,
+            session_secs,
+            consent_mode: _,
+        } => {
+            #[cfg(feature = "ssh-server")]
+            {
+                if !agent_cfg.ssh_enabled {
+                    warn!(
+                        %grant_id, %caller,
+                        "rc:ssh.grant refused — ssh_enabled is off on this device"
+                    );
+                } else if let Err(e) = crate::ssh::record_grant(
+                    grant_id.clone(),
+                    public_key,
+                    caller.clone(),
+                    account_mode,
+                    account,
+                    expires_at_ms,
+                    session_secs,
+                ) {
+                    warn!(%grant_id, %caller, %e, "rc:ssh.grant rejected");
+                }
+            }
+            #[cfg(not(feature = "ssh-server"))]
+            {
+                let _ = (
+                    &public_key,
+                    &account_mode,
+                    &account,
+                    expires_at_ms,
+                    session_secs,
+                );
+                warn!(
+                    %grant_id, %caller,
+                    "rc:ssh.grant ignored — this build lacks the `ssh-server` feature"
+                );
+            }
+        }
+
+        // Roomler SSH — the answer to a session THIS device asked for
+        // (`roomler ssh`). The LocalAPI leg that originates those lands in a
+        // later slice; until then, log it rather than let it vanish into the
+        // unknown-variant branch.
+        ServerMsg::SshResponse {
+            request_id,
+            address,
+            port,
+            grant_id,
+            expires_at_ms: _,
+            error,
+        } => {
+            info!(
+                %request_id,
+                address = ?address, port = ?port, grant_id = ?grant_id, error = ?error,
+                "rc:ssh.response (originating leg not wired yet)"
+            );
         }
 
         // Fleet RPC — the answer to a command THIS device asked another device

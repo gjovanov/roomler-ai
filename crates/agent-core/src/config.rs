@@ -88,6 +88,63 @@ pub struct AgentConfig {
     #[serde(default)]
     pub exec_enabled: bool,
 
+    /// Serve SSH on this node's overlay address, in-process.
+    ///
+    /// Default **`false`**, for the same reason as [`Self::exec_enabled`] and
+    /// then some: an SSH session is a superset of a Fleet-RPC command (it is
+    /// interactive, it carries file transfer and port forwarding, and it lasts).
+    /// The gate that belongs to whoever holds the box has to be off until they
+    /// say otherwise, and it is the refusal that survives a compromised server.
+    ///
+    /// ⚠️ Turning this on changes *who answers* for mesh traffic to
+    /// `<overlay ip>:<ssh_port>`: the daemon intercepts those packets before the
+    /// OS sees them (see `tunnel_core::overlay::split_tun`), so on a host whose
+    /// `sshd` already serves that address the in-process server takes over for
+    /// peers. The daemon logs a warning when it detects that case at start-up.
+    #[serde(default)]
+    pub ssh_enabled: bool,
+
+    /// TCP port intercepted on the overlay address when [`Self::ssh_enabled`]
+    /// is on. `None` = the built-in default, **2222**.
+    ///
+    /// The default is deliberately not 22: four of the seven hosts in the first
+    /// field survey already had something on `:22` (`sshd` on `0.0.0.0:22` on
+    /// the Linux boxes, `sshd` bound to the overlay address on `neo16`, WSL's
+    /// relay on `clk`'s loopback). 2222 lets roomler SSH and an existing `sshd`
+    /// coexist while the fleet migrates; set it to 22 per device once the
+    /// in-process server is the one you want peers to reach.
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+
+    /// OpenSSH public keys allowed to open an SSH session, one entry per key
+    /// in `authorized_keys` form (`ssh-ed25519 AAAA… comment`).
+    ///
+    /// **Empty means nobody**, which is why [`Self::ssh_enabled`] alone cannot
+    /// let anyone in. P3 replaces this as the primary path with server-minted,
+    /// short-lived session grants tied to a roomler user — but the list stays
+    /// as the break-glass route for when the control plane is the thing that is
+    /// broken, which is exactly when a remote shell is most wanted.
+    ///
+    /// Reaching the port at all already requires clearing WireGuard as an
+    /// enrolled peer of this org; this is the second, device-owned factor.
+    #[serde(default)]
+    pub ssh_authorized_keys: Vec<String>,
+
+    /// This node's SSH host private key, OpenSSH format, generated on the first
+    /// SSH-enabled start.
+    ///
+    /// It lives in the config rather than a file of its own so it inherits
+    /// every protection the config already has: atomic write with `sync_all`
+    /// before the rename, `.prev` rotation, `0600` on Unix and the hardened
+    /// ACL on a machine-global Windows install. The file already holds
+    /// `agent_token`, so this changes the file's sensitivity not at all.
+    ///
+    /// Rotating it makes every client that pinned the old fingerprint refuse to
+    /// connect, which is the correct behaviour — clear the key only when you
+    /// mean to invalidate that trust.
+    #[serde(default)]
+    pub ssh_host_key: Option<String>,
+
     // ─── S2: env-bridged operator knobs ──────────────────────────────────
     // Each mirrors an env var read through `tunnel_core::env::node_env`
     // (precedence: env — either prefix — > this config key > built-in
@@ -946,7 +1003,23 @@ impl AgentConfig {
         }
         routes
     }
+
+    /// The TCP port the in-process SSH server intercepts on the overlay
+    /// address: [`ssh_port`](Self::ssh_port), or the built-in default when
+    /// unset. A configured `0` is treated as unset — port 0 means "any" to a
+    /// binding API and nothing at all to an intercept rule, so honouring it
+    /// would silently disable the feature.
+    pub fn effective_ssh_port(&self) -> u16 {
+        match self.ssh_port {
+            Some(0) | None => DEFAULT_SSH_PORT,
+            Some(p) => p,
+        }
+    }
 }
+
+/// Built-in intercepted SSH port. See [`AgentConfig::ssh_port`] for why this is
+/// 2222 rather than 22.
+pub const DEFAULT_SSH_PORT: u16 = 2222;
 
 /// serde default for `advertise_local_subnets` — auto-detect is ON by default.
 fn default_true() -> bool {
@@ -1192,6 +1265,10 @@ pub fn test_fixture() -> AgentConfig {
         enable_remote_browse: true,
         auto_grant_session: true,
         exec_enabled: false,
+        ssh_enabled: false,
+        ssh_port: None,
+        ssh_authorized_keys: Vec::new(),
+        ssh_host_key: None,
         overlay_quic: None,
         overlay_direct: None,
         overlay_derp: None,
