@@ -1770,6 +1770,11 @@ impl RelayCoordinator {
             relay_kind: RelayKind::Derp,
             subnets: peer.subnets.clone(),
         };
+        // rc.416 (#25) — the floor IS this peer's DERP link (same mux, same
+        // `conn_for`), so any pending DERP coordination is now satisfied.
+        // Leaving the `derping` entry would let `maybe_complete` later build a
+        // second, identical link over the same mux for no benefit.
+        self.derping.remove(&node_id);
         self.floored.insert(node_id, peer.clone());
         info!(peer = %node_id, "overlay relay: DERP floor installed at birth (better tiers coordinate in parallel)");
         Some(link)
@@ -1781,15 +1786,6 @@ impl RelayCoordinator {
     /// SILENT refusal is worse — it is exactly the "blocked with no
     /// explanation" state that cost three diagnosis rounds. WARN, because a
     /// carrier-less peer is a user-visible outage of that leg.
-    /// rc.414 (#25) — the establish walk's twin of [`Self::note_floor_withheld`],
-    /// for the gates that sit BEFORE `build_floor` is ever called (a TURN
-    /// grant in flight, or the peer coordinating its own DERP link). Those
-    /// were silent, which is exactly how a `blocked` peer could produce no
-    /// explanation anywhere in the log. Same throttle, distinct reason codes.
-    pub(crate) fn note_floor_skipped(&mut self, node_id: ObjectId, code: u8, reason: &str) {
-        self.note_floor_withheld(node_id, code, reason);
-    }
-
     fn note_floor_withheld(&mut self, node_id: ObjectId, code: u8, reason: &str) {
         const QUIET: Duration = Duration::from_secs(300);
         let now = Instant::now();
