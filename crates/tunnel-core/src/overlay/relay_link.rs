@@ -1781,6 +1781,15 @@ impl RelayCoordinator {
     /// SILENT refusal is worse — it is exactly the "blocked with no
     /// explanation" state that cost three diagnosis rounds. WARN, because a
     /// carrier-less peer is a user-visible outage of that leg.
+    /// rc.414 (#25) — the establish walk's twin of [`Self::note_floor_withheld`],
+    /// for the gates that sit BEFORE `build_floor` is ever called (a TURN
+    /// grant in flight, or the peer coordinating its own DERP link). Those
+    /// were silent, which is exactly how a `blocked` peer could produce no
+    /// explanation anywhere in the log. Same throttle, distinct reason codes.
+    pub(crate) fn note_floor_skipped(&mut self, node_id: ObjectId, code: u8, reason: &str) {
+        self.note_floor_withheld(node_id, code, reason);
+    }
+
     fn note_floor_withheld(&mut self, node_id: ObjectId, code: u8, reason: &str) {
         const QUIET: Duration = Duration::from_secs(300);
         let now = Instant::now();
