@@ -344,6 +344,9 @@ pub struct RelayCoordinator {
     /// coordinator-built link supersedes the floor (`try_build*` hooks) or
     /// the peer is forgotten.
     floored: HashMap<ObjectId, PeerConfig>,
+    /// rc.413 (#25) — per-peer throttle for the floor-withheld report:
+    /// `(last_logged, reason_code)`. See `note_floor_withheld`.
+    floor_withheld_log: HashMap<ObjectId, (Instant, u8)>,
     /// Phase D — our end of the DERP opt-in ([`derp_enabled`](super::direct::derp_enabled),
     /// default-OFF). A link goes DERP only when this is set, the peer advertises
     /// `supports_derp`, both ends are UDP-blocked, AND `derp_mux` is present.
@@ -534,6 +537,7 @@ impl RelayCoordinator {
             dialing: HashMap::new(),
             derping: HashMap::new(),
             floored: HashMap::new(),
+            floor_withheld_log: HashMap::new(),
             derp: super::direct::derp_enabled(),
             derp_floor: super::direct::derp_floor_enabled(),
             derp_mux,
@@ -1700,12 +1704,54 @@ impl RelayCoordinator {
     /// and corp middleboxes split them, so pair formation must never couple
     /// to `/derp` health.
     pub fn build_floor(&mut self, node_id: ObjectId, peer: &PeerConfig) -> Option<ReadyLink> {
-        if !self.derp_floor || !self.derp || !peer.supports_derp || !peer.supports_derp_floor {
+        // rc.413 (#25) — every withhold reason is REPORTED, throttled to one
+        // line per peer per reason-change (or per 5 min).
+        //
+        // This branch was a single `debug!` covering only the WS-down case,
+        // which made the whole class invisible at INFO: a peer that stays
+        // "blocked" for hours produced NO log explaining why its floor never
+        // appeared, so three separate diagnosis rounds had to infer it from
+        // peers-table shapes. A carrier-less peer is precisely the state the
+        // floor exists to prevent, so the refusal is operator-relevant by
+        // definition — see the field wedges on CORPLAP-1 / CORPLAP-2 / CORPLAP-3 under
+        // corp VPN, 2026-08-19.
+        let reason = if !self.derp_floor {
+            Some("the overlay_derp_floor flag is off on THIS node")
+        } else if !self.derp {
+            Some("DERP is not enabled on THIS node")
+        } else if !peer.supports_derp {
+            Some("the PEER does not advertise supports_derp (pre-DERP build?)")
+        } else if !peer.supports_derp_floor {
+            Some(
+                "the PEER does not advertise supports_derp_floor (build predates the floor — it holds no mux, so a floor toward it would blackhole)",
+            )
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            self.note_floor_withheld(node_id, 1, reason);
             return None;
         }
-        let mux = self.mux_for(&node_id)?;
+        let Some(mux) = self.mux_for(&node_id) else {
+            self.note_floor_withheld(
+                node_id,
+                2,
+                "no /derp mux exists for this peer (neither a pinned regional mux nor the central one)",
+            );
+            return None;
+        };
         if !mux.is_alive() {
-            debug!(peer = %node_id, "overlay relay: floor withheld — /derp WS down; fresh ladder proceeds");
+            // Which mux: a server-pinned REGIONAL relay, or the central one?
+            // The distinction matters — a corp VPN can reach one and not the
+            // other, and a dead regional mux silently starves every peer
+            // pinned to it while central-mux peers stay healthy.
+            let pinned = self.forced_urls.get(&node_id).cloned();
+            let which = pinned.unwrap_or_else(|| "central".to_string());
+            self.note_floor_withheld(
+                node_id,
+                3,
+                &format!("its /derp mux is DOWN (relay={which}); the fresh ladder proceeds"),
+            );
             return None;
         }
         let derp_conn = mux.conn_for(peer.public_key);
@@ -1727,6 +1773,29 @@ impl RelayCoordinator {
         self.floored.insert(node_id, peer.clone());
         info!(peer = %node_id, "overlay relay: DERP floor installed at birth (better tiers coordinate in parallel)");
         Some(link)
+    }
+
+    /// rc.413 (#25) — report a floor refusal, at most one line per peer per
+    /// (changed) reason or per 5 minutes. The establish walk re-runs on every
+    /// netmap delta and sweep, so an unthrottled line would be a flood; but a
+    /// SILENT refusal is worse — it is exactly the "blocked with no
+    /// explanation" state that cost three diagnosis rounds. WARN, because a
+    /// carrier-less peer is a user-visible outage of that leg.
+    fn note_floor_withheld(&mut self, node_id: ObjectId, code: u8, reason: &str) {
+        const QUIET: Duration = Duration::from_secs(300);
+        let now = Instant::now();
+        let fresh = match self.floor_withheld_log.get(&node_id) {
+            Some((at, c)) => *c != code || now.duration_since(*at) >= QUIET,
+            None => true,
+        };
+        if fresh {
+            self.floor_withheld_log.insert(node_id, (now, code));
+            warn!(
+                peer = %node_id,
+                "overlay relay: DERP floor WITHHELD — {reason}. This peer has no carrier \
+                 until a better tier completes, so it shows as `blocked`"
+            );
+        }
     }
 
     /// rc.411 (#24) — the peer lost its carrier, so the floor bookkeeping is
