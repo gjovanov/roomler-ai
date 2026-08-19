@@ -4410,12 +4410,12 @@ mod tests {
                 .unwrap()
                 .push(("floor", Ipv4Addr::UNSPECIFIED));
         }
-        async fn reclaim_stolen_peer_paths(&self, peers: &[Ipv4Addr]) {
+        async fn verify_peer_path_ownership(&self, peers: &[Ipv4Addr]) {
             // v3 (#23) — recorded per peer, so the wave test can assert the
-            // reclaim runs LAST and receives exactly the asserted peer set.
+            // ownership check runs LAST and receives exactly the asserted peer set.
             let mut g = self.routes.lock().unwrap();
             for ip in peers {
-                g.push(("reclaim", *ip));
+                g.push(("verify", *ip));
             }
         }
     }
@@ -4443,23 +4443,23 @@ mod tests {
         run_defense_wave(t, defended_routes(&by_node, self_v4)).await;
 
         let got = tun.calls();
-        // v3 (#23) — peers asserted, self defended, floor, then the reclaim
+        // v3 (#23) — peers asserted, self defended, floor, then the ownership check
         // step once per peer.
         assert_eq!(got.len(), peers.len() * 2 + 2);
-        let reclaimed: HashSet<Ipv4Addr> = got[peers.len() + 2..]
+        let verified: HashSet<Ipv4Addr> = got[peers.len() + 2..]
             .iter()
             .map(|(op, ip)| {
                 assert_eq!(
-                    *op, "reclaim",
-                    "everything after the floor is the reclaim step"
+                    *op, "verify",
+                    "everything after the floor is the ownership check"
                 );
                 *ip
             })
             .collect();
         assert_eq!(
-            reclaimed,
+            verified,
             peers.iter().copied().collect::<HashSet<_>>(),
-            "the reclaim step receives exactly the asserted peer set, after the floor"
+            "the ownership check receives exactly the asserted peer set, after the floor"
         );
         assert_eq!(
             got.get(peers.len() + 1),
