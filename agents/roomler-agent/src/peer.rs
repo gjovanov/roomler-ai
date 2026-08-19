@@ -3223,19 +3223,23 @@ impl FfmpegDcCodec {
     /// Phase B — `fps` + `maxrate_bps` are the pump's per-session values
     /// (real `target_fps`, relay-aware ceiling), threaded into the encoder so
     /// its framerate + burst cap match the actual link instead of a fixed 30.
+    /// P7 — `cq_bias`: CQ sharpening steps for deep resolution rungs,
+    /// computed at each rebuild from encode-vs-native area
+    /// (`rate_profile::scale_cq_bias`).
     fn open(
         self,
         w: u32,
         h: u32,
         fps: u32,
         maxrate_bps: usize,
+        cq_bias: u32,
     ) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
         use crate::encode::ffmpeg::FfmpegEncoder;
         match self {
-            Self::Hevc => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps),
-            Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps),
-            Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps),
-            Self::H264 => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps),
+            Self::Hevc => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps, cq_bias),
+            Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps, cq_bias),
+            Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps, cq_bias),
+            Self::H264 => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps, cq_bias),
         }
     }
 
@@ -3884,6 +3888,9 @@ async fn media_pump_ffmpeg_dc(
             );
             res_cap_logged = Some(effective_target);
         }
+        // P7 — snapshot the native dims before the downscale shadows `frame`;
+        // the CQ bias at the rebuild site is keyed on encode-vs-native area.
+        let (native_w, native_h) = (frame.width, frame.height);
         let scale_start = std::time::Instant::now();
         let frame = apply_target_resolution(frame, effective_target);
         scale_us += scale_start.elapsed().as_micros() as u64;
@@ -3922,7 +3929,17 @@ async fn media_pump_ffmpeg_dc(
             None => true,
         };
         if need_rebuild {
-            match codec.open(w, h, target_fps, ceiling as usize) {
+            // P7 — deep-rung CQ sharpening, recomputed at every rebuild from
+            // the encode-vs-native area (0 at/near native, so a native
+            // rebuild keeps the base CQ). Env ROOMLER_AGENT_SCALE_CQ_BOOST.
+            let cq_bias = crate::encode::rate_profile::scale_cq_bias(
+                w,
+                h,
+                native_w,
+                native_h,
+                crate::encode::rate_profile::scale_cq_boost_steps(),
+            );
+            match codec.open(w, h, target_fps, ceiling as usize, cq_bias) {
                 Ok(enc) => {
                     let encoder_name = enc.name();
                     info!(
@@ -3930,6 +3947,7 @@ async fn media_pump_ffmpeg_dc(
                         codec_label,
                         width = w,
                         height = h,
+                        cq_bias,
                         encoder = encoder_name,
                         "FFmpeg DC pump: encoder (re)built"
                     );
