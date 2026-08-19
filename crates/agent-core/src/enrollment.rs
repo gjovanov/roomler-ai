@@ -86,6 +86,15 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // deliberate act by whoever holds the box, never a side effect of
         // joining an org.
         exec_enabled: false,
+        // Same rule for SSH, which grants strictly more than a bounded command.
+        // `preserve_operator_config` keeps both across a RE-enrollment (they sit
+        // in the `..existing` tail), so a device that opted in stays opted in.
+        ssh_enabled: false,
+        ssh_port: None,
+        ssh_authorized_keys: Vec::new(),
+        // Minted on the first SSH-enabled start, not at enrollment: a device
+        // that never turns SSH on never generates a host key at all.
+        ssh_host_key: None,
         // S2 env-bridged knobs: unset → built-in defaults.
         overlay_quic: None,
         overlay_direct: None,

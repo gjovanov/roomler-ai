@@ -336,6 +336,30 @@ pub enum ClientMsg {
         timeout_ms: u64,
     },
 
+    /// Device-originated roomler-SSH against ANOTHER device — the
+    /// `roomler ssh` CLI leg, the twin of [`Self::RpcExecRequest`].
+    ///
+    /// The caller mints an **ephemeral** keypair per session and sends only
+    /// the public half. If the server authorizes, it pushes the key to the
+    /// target as a single-use [`ServerMsg::SshGrant`] and answers here with
+    /// where to connect. Nothing long-lived is distributed and no secret
+    /// crosses the wire: the private half never leaves the calling device, and
+    /// the target learns a key it will accept exactly once, briefly.
+    #[serde(rename = "rc:ssh.request")]
+    SshRequest {
+        /// Client-minted correlation id, echoed on the response.
+        request_id: String,
+        /// Target device: an agent id (hex) or its device name.
+        target: String,
+        /// OpenSSH public key of the ephemeral session keypair
+        /// (`ssh-ed25519 AAAA…`).
+        public_key: String,
+        /// Requested session lifetime in seconds. Server-clamped to
+        /// [`crate::models::ssh_limits::MAX_SESSION_SECS`]; 0 ⇒ the ceiling.
+        #[serde(default)]
+        session_secs: u64,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -1187,6 +1211,69 @@ pub enum ServerMsg {
     /// `error`), so a cancelled caller is never left waiting.
     #[serde(rename = "rc:rpc.cancel")]
     RpcCancel { request_id: String },
+
+    /// Authorize ONE inbound roomler-SSH session on this device.
+    ///
+    /// Pushed to the **target** after the server has cleared gates 1-3 (org
+    /// kill-switch, the caller's `SSH_DEVICE` permission, the device's
+    /// `SshPolicy`). The agent holds it briefly and consumes it when a
+    /// connection authenticates with the named key.
+    ///
+    /// This is why roomler SSH needs no key distribution and no shared secret
+    /// with the server: the agent does not *verify* the grant cryptographically,
+    /// it receives it over the control WS it is already authenticated on —
+    /// the same trust path `rc:request` uses to open a remote-control session.
+    #[serde(rename = "rc:ssh.grant")]
+    SshGrant {
+        /// Server-minted, single-use.
+        grant_id: String,
+        /// OpenSSH public key the caller will authenticate with. Accepted for
+        /// exactly one session, until `expires_at_ms`.
+        public_key: String,
+        /// Display name of the acting principal — shown in the consent prompt,
+        /// written to the agent's local log and carried into the audit record,
+        /// so the person at the device can see who connected.
+        caller: String,
+        /// Which local account the session runs as, server-resolved from the
+        /// device's policy: `daemon` | `console_user` | `named`.
+        account_mode: String,
+        /// The account for `named`. Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// Unix ms after which the grant may no longer be redeemed. Short —
+        /// see [`crate::models::ssh_limits::GRANT_TTL_SECS`].
+        expires_at_ms: u64,
+        /// Server-clamped lifetime of the session once redeemed.
+        session_secs: u64,
+        /// Server-resolved consent directive, mirroring [`Self::RpcExec`].
+        /// Absent ⇒ the agent prompts, the fail-safe direction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent_mode: Option<crate::models::ConsentMode>,
+    },
+
+    /// Answer to a device-originated [`ClientMsg::SshRequest`] — the
+    /// `roomler ssh` CLI leg. Carries where to connect, or why not.
+    #[serde(rename = "rc:ssh.response")]
+    SshResponse {
+        request_id: String,
+        /// The target's overlay address. Absent on refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+        /// The target's intercepted SSH port. Absent on refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// Echo of the grant the target was given, for correlation in logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_id: Option<String>,
+        /// Unix ms the grant stops being redeemable — the caller should dial
+        /// before this and give up after.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+        /// Set when the server refused. A caller is blocked on this frame, so
+        /// a refusal is always answered rather than dropped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 
     /// Answer to a device-originated [`ClientMsg::RpcExecRequest`] — the
     /// `roomler exec` CLI leg. Carries the same payload the HTTP caller would

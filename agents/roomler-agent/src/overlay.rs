@@ -264,6 +264,13 @@ pub async fn maybe_start(
             None => systun_tun_factory()?,
         }
     };
+    // Roomler SSH — when this node opts in, splice a port-intercept shim over
+    // whichever device we just chose, so `<overlay ip>:<ssh_port>` terminates in
+    // the daemon. Deliberately applied AFTER the mode selection: it decorates
+    // the OS-TUN, per-org and netstack factories identically, so SSH behaves the
+    // same on a server, a multi-org host and a locked-down corp laptop.
+    // No-op (and byte-for-byte the old path) unless `ssh_enabled` is on.
+    let tun_factory = crate::ssh::maybe_intercept(tun_factory, cfg);
     // P5 exit-node client — resolve the coordination server's IPs NOW, while the
     // uplink is still clean (before any split-default is installed), so exit
     // routing can exempt them. Only when this node opts into an exit node.
@@ -818,7 +825,7 @@ fn netstack_tun_factory(
 
 /// IPv4 netmask → prefix length (count of leading one-bits).
 #[cfg(feature = "overlay-netstack")]
-fn netmask_to_prefix(nm: std::net::Ipv4Addr) -> u8 {
+pub(crate) fn netmask_to_prefix(nm: std::net::Ipv4Addr) -> u8 {
     u32::from(nm).count_ones() as u8
 }
 

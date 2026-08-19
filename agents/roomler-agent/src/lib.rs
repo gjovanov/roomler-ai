@@ -68,6 +68,11 @@ pub mod relay_probe;
 pub mod service;
 pub mod session_telemetry;
 pub mod signaling;
+/// Roomler SSH — the in-daemon SSH surface served on this node's overlay
+/// address, intercepted before the OS (`ssh_enabled`, default off). Gated with
+/// [`overlay`]: without an overlay there is no address to serve on.
+#[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+pub mod ssh;
 pub mod subnet_detect;
 #[cfg(feature = "system-context")]
 pub mod system_context;
