@@ -130,31 +130,23 @@ pub trait TunIo: Send + Sync {
     /// silently skip every sibling's. Default no-op, like the plain method.
     async fn defend_block_floor_of(&self, _net: std::net::Ipv4Addr, _plen: u8) {}
 
-    /// CORPLAP-3 route war v3 (#23) — reclaim STOLEN per-peer forwarding paths.
+    /// CORPLAP-3 route war v3 (#23) — verify the overlay actually WINS the OS
+    /// forwarding decision for each installed peer, and re-assert the
+    /// tie-breaking interface metric if it doesn't.
     ///
-    /// Eviction alone cannot win a route war against a corp endpoint manager
-    /// that mirrors our prefixes at equal effective metric (Check Point:
-    /// route metric 1 on an interface pinned to metric 1 — a FULL tie at
-    /// every plen; its monitor re-adds within seconds of a deletion). At a
-    /// tie Windows' per-DESTINATION choice is arbitrary and sticky: whoever
-    /// wins a destination's re-resolution keeps it — across fresh flows,
-    /// fresh processes, even our daemon restarts (the cache is the OS's, not
-    /// ours). Field (CORPLAP-3, 2026-08-18): four peers with healthy
-    /// carriers and fresh inbound were 100 % unreachable node-initiated —
-    /// their destinations had stuck to the corp NIC — while replies escaped
-    /// via strong-host source pinning, so the peer side measured green RTTs
-    /// against a pair the owner couldn't use.
-    ///
-    /// The missing move: nothing TRANSMITS inside the eviction gap, so the
-    /// re-resolution that would flip a stolen destination back to us happens
-    /// minutes later (next prober tick), long after the competitor re-added
-    /// its rows and re-tied the table. This step closes the gap: detect the
-    /// destinations whose ACTIVE path-cache entry rides a foreign interface,
-    /// evict the foreign covering rows for exactly those, and immediately
-    /// send a one-byte pin so the destination re-resolves onto us while the
-    /// competitor's rows are still absent. Sticky then works FOR us.
+    /// The route war's decisive lever is the adapter's INTERFACE metric (see
+    /// the pin in `SystemTun::up_with`): a corp endpoint manager mirrors our
+    /// prefixes at equal route metric on an equally-pinned interface, so
+    /// eviction alone only ever produced a tie that Windows broke by lower
+    /// ifIndex — the VPN's — and the per-destination pick is sticky, which is
+    /// how peers stayed captured across restarts (CORPLAP-3, 2026-08-18/19). With
+    /// the metric pinned to 0 our rows win outright, so this step is the
+    /// CHECK rather than the fight: ask the FIB which interface it would use
+    /// per peer, and if any answer is foreign, re-pin the metric (a network
+    /// profile change or an adapter reset can revert it) and log what the
+    /// competitor is doing. Purely diagnostic when everything is healthy.
     /// Default no-op (mock, netstack, non-Windows).
-    async fn reclaim_stolen_peer_paths(&self, _peers: &[std::net::Ipv4Addr]) {}
+    async fn verify_peer_path_ownership(&self, _peers: &[std::net::Ipv4Addr]) {}
 
     /// P5 exit-node — install a `/32` (host) **exemption** route for `ip` via the
     /// host's ORIGINAL default gateway (captured at TUN bring-up), NOT via this
@@ -381,8 +373,7 @@ mod system {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             ConvertInterfaceLuidToGuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
             DeleteIpForwardEntry2, FreeMibTable, GetIpForwardEntry2, GetIpForwardTable2,
-            GetIpPathTable, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-            MIB_IPPATH_TABLE, SetIpForwardEntry2,
+            InitializeIpForwardEntry, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, SetIpForwardEntry2,
         };
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_INET};
@@ -778,140 +769,6 @@ mod system {
             }
         }
 
-        /// CORPLAP-3 route war v3 (#23) — does `row_net/row_plen` COVER `ip` (the
-        /// address lies inside the row's prefix)? Pure, like
-        /// [`row_in_block`]; the targeted reclaim eviction combines both:
-        /// only rows that are INSIDE the overlay block AND cover the stolen
-        /// destination are candidates, so defaults, split-`/1`s and corp
-        /// LANs stay structurally untouchable no matter what covers the
-        /// address.
-        pub(crate) fn row_covers_ip(row_net: u32, row_plen: u8, ip: u32) -> bool {
-            if row_plen > 32 {
-                return false;
-            }
-            let mask: u32 = if row_plen == 0 {
-                0
-            } else {
-                !(u32::MAX >> (row_plen - 1) >> 1)
-            };
-            (ip & mask) == (row_net & mask)
-        }
-
-        /// CORPLAP-3 route war v3 (#23) — evict every foreign v4 route that both
-        /// lies INSIDE `net/plen` and COVERS `ip`: the targeted,
-        /// per-stolen-destination twin of [`evict_foreign_in_block_v4`], run
-        /// by the reclaim step immediately before its cache pin so the
-        /// eviction gap and the repointing transmit are microseconds apart
-        /// (a corp route monitor re-adds in well under a wave). Same
-        /// kill-switch and WARN-on-actual-deletion contract as every other
-        /// eviction.
-        pub fn evict_foreign_covering_v4(ours: u64, ip: Ipv4Addr, net: Ipv4Addr, plen: u8) {
-            if !super::route_evict_enabled() {
-                return;
-            }
-            let block = u32::from_be_bytes(net.octets());
-            let want = u32::from_be_bytes(ip.octets());
-            // SAFETY: same snapshot-iterate-free shape as `evict_competing_v4`;
-            // every union read is guarded by the `si_family` check.
-            unsafe {
-                let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
-                if GetIpForwardTable2(AF_INET, &mut table) != NO_ERROR || table.is_null() {
-                    return;
-                }
-                let n = (*table).NumEntries as usize;
-                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
-                for r in rows {
-                    if r.DestinationPrefix.Prefix.si_family != AF_INET
-                        || r.InterfaceLuid.Value == ours
-                    {
-                        continue;
-                    }
-                    let rn = u32::from_be(r.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr);
-                    let rp = r.DestinationPrefix.PrefixLength;
-                    if row_in_block(rn, rp, block, plen)
-                        && row_covers_ip(rn, rp, want)
-                        && DeleteIpForwardEntry2(r) == NO_ERROR
-                    {
-                        evict_warn(
-                            IpAddr::V4(Ipv4Addr::from(rn)),
-                            rp,
-                            r.InterfaceIndex,
-                            r.InterfaceLuid.Value,
-                        );
-                    }
-                }
-                FreeMibTable(table as *const core::ffi::c_void);
-            }
-        }
-
-        /// CORPLAP-3 route war v3 (#23) — the interface LUID the FIB would pick
-        /// for `dst` right now. Unlike [`best_route`] it does NOT filter
-        /// on-link results away — our TUN routes ARE on-link, and "does the
-        /// best route ride OUR device?" is exactly the reclaim's
-        /// post-eviction check before it commits a cache pin (pinning while
-        /// a foreign row still wins would cement the theft instead of
-        /// undoing it).
-        pub fn best_route_luid(dst: IpAddr) -> Option<u64> {
-            use windows_sys::Win32::NetworkManagement::IpHelper::GetBestRoute2;
-            // SAFETY: out-params are written on success; the destination is
-            // a fully-initialised SOCKADDR_INET.
-            unsafe {
-                let dest = sockaddr(dst);
-                let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
-                let mut src: SOCKADDR_INET = std::mem::zeroed();
-                (GetBestRoute2(
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                    &dest,
-                    0,
-                    &mut row,
-                    &mut src,
-                ) == NO_ERROR)
-                    .then_some(row.InterfaceLuid.Value)
-            }
-        }
-
-        /// CORPLAP-3 route war v3 (#23) — every in-block v4 destination whose
-        /// ACTIVE forwarding decision rides a FOREIGN interface, read from
-        /// the OS path table (`GetIpPathTable` — the destination-cache
-        /// view). This is the theft detector: a fresh `GetBestRoute2`
-        /// computation can disagree with what established flows actually
-        /// use (at an equal-metric tie its pick is arbitrary), but the path
-        /// table IS the per-destination state packets follow, so an entry
-        /// via a foreign LUID is a real capture, present tense — and its
-        /// disappearance after a reclaim is the proof the pin landed.
-        /// Distinct destinations, order unspecified.
-        pub fn foreign_paths_v4(ours: u64, net: Ipv4Addr, plen: u8) -> Vec<Ipv4Addr> {
-            let block = u32::from_be_bytes(net.octets());
-            let mut out: Vec<Ipv4Addr> = Vec::new();
-            // SAFETY: GetIpPathTable allocates a snapshot we iterate then
-            // free (same idiom as the forward-table walks); every union
-            // read is guarded by the `si_family` check.
-            unsafe {
-                let mut table: *mut MIB_IPPATH_TABLE = std::ptr::null_mut();
-                if GetIpPathTable(AF_INET, &mut table) != NO_ERROR || table.is_null() {
-                    return out;
-                }
-                let n = (*table).NumEntries as usize;
-                let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
-                for r in rows {
-                    if r.Destination.si_family != AF_INET || r.InterfaceLuid.Value == ours {
-                        continue;
-                    }
-                    let d = u32::from_be(r.Destination.Ipv4.sin_addr.S_un.S_addr);
-                    if row_covers_ip(block, plen, d) {
-                        let ip = Ipv4Addr::from(d);
-                        if !out.contains(&ip) {
-                            out.push(ip);
-                        }
-                    }
-                }
-                FreeMibTable(table as *const core::ffi::c_void);
-            }
-            out
-        }
-
         /// CORPLAP-3 route war v3 (#23) — order-insensitive fold of one foreign
         /// in-block row into a set fingerprint (FNV-1a per row, XOR across
         /// rows: commutative, so FIB iteration order can never fake a
@@ -1082,6 +939,35 @@ mod system {
                 }
             }
             out
+        }
+
+        /// rc.410 (#23) — the interface LUID the FIB would pick for `dst`
+        /// right now. Unlike [`best_route`] it does NOT filter on-link
+        /// results away: our TUN routes ARE on-link, and "does the overlay
+        /// actually win this destination?" is precisely the ownership check
+        /// the defense wave runs. `GetBestRoute2` is the honest oracle for
+        /// it — the OS PATH table only holds destinations with live
+        /// conversations, so it reports nothing for relay-carried peers
+        /// (which is exactly the set that was captured on CORPLAP-3).
+        pub fn best_route_luid(dst: IpAddr) -> Option<u64> {
+            use windows_sys::Win32::NetworkManagement::IpHelper::GetBestRoute2;
+            // SAFETY: out-params are written on success; the destination is
+            // a fully-initialised SOCKADDR_INET.
+            unsafe {
+                let dest = sockaddr(dst);
+                let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+                let mut src: SOCKADDR_INET = std::mem::zeroed();
+                (GetBestRoute2(
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                    &dest,
+                    0,
+                    &mut row,
+                    &mut src,
+                ) == NO_ERROR)
+                    .then_some(row.InterfaceLuid.Value)
+            }
         }
 
         /// N2 — the host's best route toward `dst` as `(ifIndex, gateway)`,
@@ -1813,6 +1699,33 @@ mod system {
         if route_metric0_enabled() { 0 } else { 1 }
     }
 
+    /// rc.410 (#23) — the overlay NIC's IPv4 INTERFACE metric.
+    /// `ROOMLER_NODE_OVERLAY_IFACE_METRIC` (config key
+    /// `overlay_iface_metric`), default **0**.
+    ///
+    /// This is the route war's decisive lever, and the one a corp endpoint
+    /// manager cannot counter. Windows ranks routes by `route metric +
+    /// interface metric`; Check Point / AnyConnect mirror our prefixes at
+    /// route metric 1 on an interface pinned to metric 1, so the historical
+    /// pin of 1 produced an exact tie at every prefix length and Windows
+    /// broke it by lower ifIndex — the VPN's. Metric-0 ROUTES (rc.287) were
+    /// the previous attempt and get deleted by those same managers (rc.289
+    /// auto-yield). An interface metric is a property of OUR adapter: the
+    /// VPN has no route-monitor hook for it, and `0 + 1` beats `1 + 1`
+    /// outright.
+    ///
+    /// Values above 0 are honoured verbatim for operators who need the
+    /// overlay to LOSE against a specific higher-priority interface; the
+    /// value is clamped to a sane ceiling so a typo cannot make the overlay
+    /// unroutable.
+    #[cfg(windows)]
+    fn iface_metric() -> u32 {
+        crate::env::node_env("OVERLAY_IFACE_METRIC")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.min(9999))
+            .unwrap_or(0)
+    }
+
     /// rc.279 — one-shot per process: remove stray roomler Wintun devices
     /// left by crashed prior runs (hard exits skip `Drop`, so
     /// close-of-created never removed them; the boot reconciler cleans
@@ -2181,20 +2094,38 @@ mod system {
                 tracing::info!(%if_name, "overlay: OS-assigned TUN interface name");
             }
 
-            // Pin the overlay NIC to the lowest interface metric so its routes
-            // (the connected `/10` + the per-peer `/32`s) are preferred over a
-            // full-tunnel VPN's captured routes for the overlay's 100.64.0.0/10
-            // range. Check Point Endpoint installs competing `/32`s via its NIC
-            // at metric 1, which otherwise swallow overlay traffic (the packet
-            // is bounced to the VPN gateway → "destination host unreachable").
+            // Pin the overlay NIC's interface metric so its routes (the
+            // connected block + the per-peer `/32`s) are preferred over a
+            // full-tunnel VPN's captured routes for the overlay range.
             // N5 — typed (`Get/SetIpInterfaceEntry`, in-memory µs) instead of
             // the old blocking `netsh` spawn. Still best-effort: a failure
             // just leaves the default metric.
+            //
+            // rc.410 (#23) — the value is [`overlay_iface_metric`] (0 by
+            // default), NOT 1. Windows ranks a route by `route metric +
+            // INTERFACE metric`, and Check Point / AnyConnect mirror our
+            // prefixes at route metric 1 on a NIC whose own interface metric
+            // is also 1 — a FULL tie at every prefix length, which Windows
+            // breaks by lower ifIndex, i.e. reliably in the VPN's favour
+            // (CORPLAP-3: Ethernet 2 = ifIndex 10 vs roomler = 20). At a tie the
+            // per-destination pick is also STICKY, so peers stayed captured
+            // across restarts: node-initiated traffic died 100 % while
+            // strong-host source pinning kept replies flowing, and the RTT
+            // prober (which shells the OS `ping`) showed a dash — the
+            // "one-way carrier" that was never a carrier fault at all.
+            // The rc.287 answer was metric-0 ROUTES, which those VPNs simply
+            // delete (the rc.289 auto-yield, re-observed on CORPLAP-3 2026-08-19).
+            // An INTERFACE metric is not a route: the VPN cannot delete it,
+            // and 0 + 1 beats 1 + 1 outright with no tie-break — field-proven
+            // on CORPLAP-3, where all four captured peers flipped to the overlay NIC
+            // instantly (0 % loss, 24-26 ms) with every competing `/32` still
+            // in the table.
             #[cfg(target_os = "windows")]
             {
                 use tun::AbstractDeviceExt as _;
-                if let Err(e) = winroute::set_iface_metric_v4(dev.tun_luid(), 1) {
-                    tracing::warn!(%e, "overlay: interface metric pin failed; keeping the default");
+                let m = iface_metric();
+                if let Err(e) = winroute::set_iface_metric_v4(dev.tun_luid(), m) {
+                    tracing::warn!(%e, metric = m, "overlay: interface metric pin failed; keeping the default");
                 }
             }
 
@@ -2346,25 +2277,6 @@ mod system {
                 .collect(),
         )
     }
-
-    /// CORPLAP-3 route war v3 (#23) — the cache pin: one zero byte of UDP to
-    /// `ip`'s discard port from an unbound socket, so the OS runs a fresh
-    /// route lookup for the destination RIGHT NOW — inside the eviction gap,
-    /// while the competitor's covering rows are absent — and the sticky
-    /// per-destination choice lands on the overlay NIC. Only called after
-    /// [`winroute::best_route_luid`] confirmed our device wins the lookup
-    /// (pinning under a foreign winner would cement the theft). The packet
-    /// itself rides the tunnel as ordinary encrypted data and is dropped by
-    /// the peer's stack; a send failure is irrelevant — the route lookup,
-    /// not the delivery, is the point. Sync and instant (UDP send-to never
-    /// blocks meaningfully), so it is safe inside the detached wave task.
-    #[cfg(windows)]
-    fn pin_dest_v4(ip: Ipv4Addr) {
-        if let Ok(s) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
-            let _ = s.send_to(&[0u8], (ip, 9));
-        }
-    }
-
     #[async_trait]
     impl TunIo for SystemTun {
         async fn read_packet(&self) -> std::io::Result<Vec<u8>> {
@@ -2765,54 +2677,68 @@ mod system {
         /// block, floor-unsafe (CGNAT uplink inside the block), or a
         /// post-eviction lookup still preferring a foreign interface (then
         /// pinning would cement the theft — log and retry next wave).
-        async fn reclaim_stolen_peer_paths(&self, peers: &[Ipv4Addr]) {
+        async fn verify_peer_path_ownership(&self, peers: &[Ipv4Addr]) {
             #[cfg(windows)]
             {
-                if !route_reclaim_enabled() || !route_evict_enabled() {
-                    return;
-                }
-                let Some((net, plen)) = self.connected_v4 else {
-                    return;
-                };
-                let safe = non_overlay_v4_addrs(&self.if_name).is_some_and(|addrs| {
-                    super::floor_safe(
-                        &addrs,
-                        self.orig_default.as_ref().map(|r| r.gateway),
-                        (net, plen),
-                    )
-                });
-                if !safe {
+                if !route_reclaim_enabled() {
                     return;
                 }
                 let ours = self.dev.tun_luid();
-                let stolen = winroute::foreign_paths_v4(ours, net, plen);
+                // Ask the FIB, per peer, which interface it would actually
+                // use. `GetBestRoute2` is the honest oracle here — unlike the
+                // OS path table it answers for every destination, not only
+                // ones with live conversations (the path table is empty for
+                // relay-carried peers, which is exactly the set that was
+                // captured on CORPLAP-3).
+                let stolen: Vec<Ipv4Addr> = peers
+                    .iter()
+                    .copied()
+                    .filter(|ip| {
+                        winroute::best_route_luid(std::net::IpAddr::V4(*ip))
+                            .is_some_and(|luid| luid != ours)
+                    })
+                    .collect();
                 if stolen.is_empty() {
                     return;
                 }
-                for ip in peers.iter().filter(|ip| stolen.contains(ip)) {
-                    winroute::evict_foreign_covering_v4(ours, *ip, net, plen);
-                    let best = winroute::best_route_luid(std::net::IpAddr::V4(*ip));
-                    let repointed = best == Some(ours);
-                    if repointed {
-                        pin_dest_v4(*ip);
-                    }
-                    if let Some(suppressed) = winroute::reclaim_note(std::net::IpAddr::V4(*ip)) {
-                        if repointed {
-                            tracing::info!(
-                                dest = %ip, suppressed_since_last = suppressed,
-                                "overlay: reclaimed a STOLEN peer path — foreign covering \
-                                 routes evicted and the destination re-pinned to the overlay \
-                                 NIC (per-destination tie stickiness now works for us)"
-                            );
-                        } else {
-                            tracing::warn!(
-                                dest = %ip, best_luid = ?best,
-                                suppressed_since_last = suppressed,
-                                "overlay: reclaim could NOT repoint a stolen peer path — a \
-                                 foreign route still wins the lookup after eviction (pin \
-                                 withheld; retrying next wave)"
-                            );
-                        }
+                // Something outranks us for real destinations. The metric is
+                // the lever that decides ties, so re-assert it first (a
+                // network-profile change or an adapter reset reverts it) and
+                // re-check: if the peers flip back, the pin was simply stale.
+                let want = iface_metric();
+                let _ = winroute::set_iface_metric_v4(ours, want);
+                let still: Vec<Ipv4Addr> = stolen
+                    .iter()
+                    .copied()
+                    .filter(|ip| {
+                        winroute::best_route_luid(std::net::IpAddr::V4(*ip))
+                            .is_some_and(|luid| luid != ours)
+                    })
+                    .collect();
+                let Some(first) = still.first().or(stolen.first()) else {
+                    return;
+                };
+                if let Some(suppressed) = winroute::reclaim_note(std::net::IpAddr::V4(*first)) {
+                    if still.is_empty() {
+                        tracing::warn!(
+                            recovered = stolen.len(),
+                            metric = want,
+                            suppressed_since_last = suppressed,
+                            "overlay: the interface-metric pin had been reverted (network \
+                             profile change / adapter reset?) — re-asserted, and the peers \
+                             it had cost us are back on the overlay NIC"
+                        );
+                    } else {
+                        tracing::warn!(
+                            stolen = still.len(), metric = want,
+                            example = %first,
+                            suppressed_since_last = suppressed,
+                            "overlay: another interface OUTRANKS the overlay for installed \
+                             peers even at our pinned interface metric — node-initiated \
+                             traffic to them will use that interface (inbound still works). \
+                             Lower `overlay_iface_metric` or split-exclude the overlay \
+                             prefixes on the competing product"
+                        );
                     }
                 }
             }
@@ -3646,57 +3572,23 @@ mod system {
             ));
         }
 
-        /// CORPLAP-3 route war v3 (#23) — the reclaim's covering rule, and its
-        /// combination with [`row_in_block`]: the pair of predicates the
-        /// targeted eviction applies must delete exactly the foreign rows
-        /// that both live inside the block and cover the stolen address —
-        /// so a covering-but-broader route (a default, the whole /10) is
-        /// structurally untouchable even though it covers everything.
+        /// rc.410 (#23) — the interface metric must default to 0, the value
+        /// that wins the route war outright. A regression to 1 restores the
+        /// exact tie (route 1 + iface 1 on both sides) that let Check Point
+        /// capture CORPLAP-3's peers by ifIndex tie-break for weeks, and the
+        /// failure is INVISIBLE without a hostile VPN present — so the
+        /// default is locked here rather than left to field observation.
         #[cfg(windows)]
         #[test]
-        fn row_covers_ip_and_in_block_bound_the_targeted_eviction() {
-            use super::winroute::{row_covers_ip, row_in_block};
-            let ip = u32::from_be_bytes([100, 65, 4, 14]); // the stolen dest
-            let block = u32::from_be_bytes([100, 65, 4, 0]); // 100.65.4.0/22
-            // Covering: its own /32, the /24, the /22, broad scopes.
-            for (net, plen) in [
-                ([100, 65, 4, 14], 32),
-                ([100, 65, 4, 0], 24),
-                ([100, 65, 4, 0], 22),
-                ([100, 64, 0, 0], 10),
-                ([0, 0, 0, 0], 1),
-                ([0, 0, 0, 0], 0),
-            ] {
-                assert!(
-                    row_covers_ip(u32::from_be_bytes(net), plen, ip),
-                    "{net:?}/{plen} covers .14"
-                );
-            }
-            // Not covering: a sibling host, a sibling /24, the next block.
-            for (net, plen) in [
-                ([100, 65, 4, 15], 32),
-                ([100, 65, 5, 0], 24),
-                ([100, 65, 0, 0], 22),
-            ] {
-                assert!(
-                    !row_covers_ip(u32::from_be_bytes(net), plen, ip),
-                    "{net:?}/{plen} must not cover .14"
-                );
-            }
-            assert!(!row_covers_ip(ip, 33, ip), "invalid plen never covers");
-            // The COMBINED predicate (what `evict_foreign_covering_v4`
-            // deletes): in-block AND covering.
-            let target = |net: [u8; 4], plen: u8| {
-                let n = u32::from_be_bytes(net);
-                row_in_block(n, plen, block, 22) && row_covers_ip(n, plen, ip)
-            };
-            assert!(target([100, 65, 4, 14], 32), "the CP host-route twin");
-            assert!(target([100, 65, 4, 0], 24), "the CP /24 shadow");
-            assert!(target([100, 65, 4, 0], 22), "an exact-block rival");
-            assert!(!target([100, 64, 0, 0], 10), "broader than the block");
-            assert!(!target([0, 0, 0, 0], 0), "the default route");
-            assert!(!target([100, 65, 4, 4], 32), "another peer's /32");
-            assert!(!target([100, 65, 5, 0], 24), "a floor not covering .14");
+        fn interface_metric_defaults_to_zero() {
+            // No env override in the test process ⇒ the built-in default.
+            assert_eq!(
+                super::iface_metric(),
+                0,
+                "the overlay interface metric must default to 0: Windows ranks by \
+                 route metric + INTERFACE metric, so 1 ties with a corp VPN's mirrored \
+                 rows and loses the ifIndex tie-break (CORPLAP-3, 2026-08-18)"
+            );
         }
 
         /// CORPLAP-3 route war v3 (#23) — the eviction-debounce fingerprint:
