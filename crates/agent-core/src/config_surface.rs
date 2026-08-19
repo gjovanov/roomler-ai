@@ -238,6 +238,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Stable UDP base port for the overlay direct sockets (per-interface LAN; the public/srflx dialer takes base+256). Stateful corp firewalls grandfather pre-VPN UDP flows — a stable port lets a rebuilt carrier reuse the same 5-tuple instead of relay-locking. A swallowed base walks an 8-port band, then the same walk at base+512 (Hyper-V/WSL reserve invisible pools that move between boots). 0 = ephemeral ports. Built-in default: DERIVED per machine (43648 + machine-id-hash slot, 43648..43896) so siblings behind one NAT never collide; set 43648 explicitly to pin the old fleet-wide constant. Env: ROOMLER_NODE_OVERLAY_DIRECT_PORT.",
     ),
     (
+        "overlay_iface_metric",
+        "number",
+        "The overlay NIC's IPv4 interface metric (Windows). Windows ranks a route by route metric + INTERFACE metric; corp endpoint managers (Check Point, AnyConnect) mirror overlay prefixes at route metric 1 on an interface also pinned to 1, producing an exact tie that Windows breaks by lower ifIndex — the VPN's — and the per-destination pick is sticky, so peers stay captured across restarts. Unlike metric-0 routes (which those products delete), an interface metric has no route-monitor hook, so 0 wins outright. Raise only to make the overlay deliberately lose against another interface. Built-in default: 0. Env: ROOMLER_NODE_OVERLAY_IFACE_METRIC.",
+    ),
+    (
         "shared_encoder",
         "tribool",
         "P5 shared-floor encoder: concurrent same-profile DC viewers share one capture+encoder with floor-merged rate/dials. off = one pipeline per session (rc.302 behaviour). Built-in default: on.",
@@ -467,6 +472,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "netstack_socks_port" => cfg.netstack_socks_port.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
         "overlay_direct_port" => cfg.overlay_direct_port.map(|v| v.to_string()),
+        "overlay_iface_metric" => cfg.overlay_iface_metric.map(|v| v.to_string()),
         "shared_encoder" => cfg.shared_encoder.map(fmt_bool),
         "overlay_relay_tls" => cfg.overlay_relay_tls.map(fmt_bool),
         "overlay_shared_carrier" => cfg.overlay_shared_carrier.map(fmt_bool),
@@ -666,6 +672,20 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         .map_err(|_| format!("rc_max_sessions must be a number (got {v:?})"))?;
                     if !(1..=8).contains(&n) {
                         return Err("rc_max_sessions must be between 1 and 8".into());
+                    }
+                    Some(n)
+                }
+            }
+        }
+        "overlay_iface_metric" => {
+            cfg.overlay_iface_metric = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let n: u32 = v.parse().map_err(|_| {
+                        format!("overlay_iface_metric must be a number (got {v:?})")
+                    })?;
+                    if n > 9999 {
+                        return Err(format!("overlay_iface_metric must be 0..=9999 (got {n})"));
                     }
                     Some(n)
                 }
