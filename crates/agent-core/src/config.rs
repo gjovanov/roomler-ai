@@ -319,6 +319,17 @@ pub struct AgentConfig {
     /// back to an ephemeral port with a WARN, restoring the old behavior.
     #[serde(default)]
     pub overlay_direct_port: Option<u32>,
+    /// The overlay NIC's IPv4 interface metric, Windows only
+    /// (`ROOMLER_NODE_OVERLAY_IFACE_METRIC`). Built-in default: **0** — the
+    /// route war's decisive lever. Windows ranks routes by route metric +
+    /// INTERFACE metric, and corp endpoint managers mirror overlay prefixes
+    /// at route metric 1 on an interface also pinned to 1, so the historical
+    /// pin of 1 tied at every prefix length and lost the ifIndex tie-break.
+    /// Unlike metric-0 routes (which those products delete), an interface
+    /// metric has no route-monitor hook. Raise it only to make the overlay
+    /// deliberately lose against another interface.
+    #[serde(default)]
+    pub overlay_iface_metric: Option<u32>,
     /// Loopback-TURN corp-relay for co-located controllers
     /// (`ROOMLER_AGENT_LOCAL_TURN`). Built-in default: on.
     #[serde(default)]
@@ -1216,6 +1227,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_tun_persist: None,
         overlay_route_metric0: None,
         overlay_direct_port: None,
+        overlay_iface_metric: None,
         local_turn: None,
         dns_aaaa: None,
         auto_update: None,
@@ -1384,8 +1396,9 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 39]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 6] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 7] {
     [
+        ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
         ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
         ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
