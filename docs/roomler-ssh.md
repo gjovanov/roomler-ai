@@ -5,8 +5,14 @@ without distributing `authorized_keys`, and without opening a port on the host.
 The roomler answer to [Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh)
 — with one capability theirs does not have: **it works on Windows.**
 
-Status: **P1 + P2 shipped** (transport + server). P3–P5 below are designed, not
-built. The feature is off at every level until an operator turns it on.
+Status: **P1, P2, P3 and P5a shipped** — transport, server, the full
+four-gate authorization path, and the privilege model. P4 (PTY), P5b (Windows
+console-user sessions), P6 (client) and P7 (SFTP) are designed, not built.
+
+Nothing has run on a fleet device yet, and the feature is off at every level
+until an operator turns it on: the `ssh-server` cargo feature is not in the
+release sets, `ssh_enabled` defaults false, `ssh_authorized_keys` defaults
+empty, and every device's `SshPolicy` defaults to `Off`.
 
 ---
 
@@ -103,10 +109,43 @@ can be pinned out of band.
   implemented yet". Port forwarding (`-L`, `-R`) is rejected by russh's own
   defaults, promptly and cleanly.
 
-⚠️ **Commands inherit the daemon's identity — SYSTEM on Windows, root under
-systemd**, exactly like Fleet RPC and for the same reason. Privilege drop and
-local-account mapping are P5. Until then, listing a key in
-`ssh_authorized_keys` grants root to its holder.
+### Which account a session runs as (P5a)
+
+The device's `SshPolicy.account_mode` decides, and the agent maps it through
+`RunAs`:
+
+| Mode | Unix | Windows |
+|---|---|---|
+| `daemon` (default) | root | SYSTEM |
+| `named` | **drops to that account** | refused — becoming an arbitrary user needs that user's credentials |
+| `console_user` | refused — no console session token exists | refused, pending P5b |
+
+The rule the whole type exists to enforce: **never silently run as something
+more privileged than was asked for.** A policy that says `console_user` on a
+host that cannot obtain that token FAILS the command; it does not fall back to
+SYSTEM. Falling back is how an operator ends up believing sessions are
+unprivileged while they are root — the worst outcome, because it is invisible
+until it isn't. An account mode this agent doesn't recognise (a newer server)
+is likewise an error, never a downgrade.
+
+The Unix drop is `setgroups` → `setgid` → `setuid`, **in that order** — after
+`setuid` the process can no longer change either, so a reversed order silently
+leaves the child in root's supplementary groups, which is the classic
+privilege-retention bug and looks like a successful drop from outside. The
+result is then verified (`getuid`/`geteuid`) rather than assumed. Account and
+group lookup happen in the *parent*: everything between `fork` and `exec` must
+be async-signal-safe and must not allocate, since a malloc lock held by another
+thread at fork time is never released in the child.
+
+Naming an account that resolves to uid 0 is refused. Not because running as
+root is impossible — `daemon` already is root there — but because it has to be
+the policy's explicit choice rather than a side effect of naming an account
+that happens to be uid 0.
+
+⚠️ `daemon` is still the default, so a device whose policy has not been set
+runs sessions as **SYSTEM / root**, exactly like Fleet RPC and for the same
+reason. Listing a key in `ssh_authorized_keys` grants root to its holder unless
+the policy says otherwise.
 
 ## 4. Authorization, and the gap P3 closes
 
@@ -179,7 +218,8 @@ record, which a key-list session cannot.
 | P3b | The server half: `agent_ssh.rs` (gates 1-3 + grant minting), hub push, the `ssh_policy` + org-settings API, and the `rc:ssh.request` device leg | **shipped** |
 | P3c | Admin UI for the two policies, and `exec_audit`-style auditing of SSH grants (today a denial is logged, not persisted) | next |
 | P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | designed |
-| P5 | Local-account mapping + privilege drop (Windows: console-session token via `system_context`; Unix: setuid) | designed |
+| P5a | `RunAs` + the never-silently-escalate rule; Unix named-account privilege drop (setgroups→setgid→setuid, verified); every unsupported mode refused | **shipped** |
+| P5b | Windows console-user sessions: `WTSQueryUserToken` + `CreateProcessAsUserW` with captured output (`system_context` has the token path but not the capture) | next |
 | P6 | `roomler ssh <name>`, netmap-verified host keys (no TOFU), stdio `ProxyCommand` | designed |
 | P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
 | P8 | Audit + session recording + admin UI | designed |

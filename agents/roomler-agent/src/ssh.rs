@@ -439,8 +439,35 @@ mod sshd {
 
             let handle = session.handle();
             let caller = self.caller_label();
+            // Resolve the identity from the GRANT, not from anything the
+            // client said. A key-list session has no grant and therefore no
+            // policy behind it, so it gets the daemon identity — which is what
+            // it already had, and what the config key's documentation warns
+            // about in those words.
+            let run_as = match &self.grant {
+                Some(g) => crate::exec::RunAs::from_wire(&g.account_mode, g.account.as_deref()),
+                None => Ok(crate::exec::RunAs::Daemon),
+            };
+            let run_as = match run_as {
+                Ok(r) => r,
+                Err(e) => {
+                    // An unreadable identity is a refusal, never a fallback:
+                    // running as the daemon because the policy could not be
+                    // parsed is exactly the silent escalation this design
+                    // exists to prevent.
+                    warn!(peer = %self.peer, %e, "ssh: refusing exec — unusable account mode");
+                    let _ = session.extended_data(
+                        channel,
+                        1,
+                        format!("roomler-ssh: {e}\r\n").into_bytes(),
+                    );
+                    session.exit_status_request(channel, 1)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+            };
             tokio::spawn(async move {
-                run_exec(handle, channel, command, caller).await;
+                run_exec(handle, channel, command, caller, run_as).await;
             });
             Ok(())
         }
@@ -534,10 +561,13 @@ mod sshd {
         channel: ChannelId,
         command: String,
         caller: String,
+        run_as: crate::exec::RunAs,
     ) {
         use roomler_ai_remote_control::models::exec_limits;
 
         let request_id = format!("ssh-{:016x}", rand::random::<u64>());
+        let identity = run_as.label();
+        let privileged = run_as.is_privileged();
         let req = crate::exec::ExecRequest {
             request_id,
             // Empty = the host's own default shell, matching `roomler exec`.
@@ -547,6 +577,7 @@ mod sshd {
             max_output_bytes: exec_limits::MAX_OUTPUT_BYTES,
             cwd: None,
             caller: caller.clone(),
+            run_as,
         };
 
         let outcome = crate::exec::shared()
@@ -586,8 +617,13 @@ mod sshd {
         let _ = handle.eof(channel).await;
         let _ = handle.close(channel).await;
 
+        // `privileged` is on the line on purpose: "who ran this, and was it as
+        // root?" is the question anyone reading these logs after an incident
+        // is actually asking, and it should not require joining against the
+        // device's policy to answer.
         info!(
-            %caller, exit = status, duration_ms = outcome.duration_ms,
+            %caller, run_as = %identity, privileged,
+            exit = status, duration_ms = outcome.duration_ms,
             bytes = outcome.output_bytes(), truncated = outcome.truncated,
             "ssh: exec finished"
         );

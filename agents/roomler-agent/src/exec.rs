@@ -64,6 +64,13 @@ pub struct ExecRequest {
     pub cwd: Option<String>,
     /// Display name of the acting principal, for the local log.
     pub caller: String,
+    /// Which local account to run as.
+    ///
+    /// Fleet RPC always leaves this [`RunAs::Daemon`] — its whole purpose is
+    /// privileged diagnostics — so exec behaves exactly as it always has.
+    /// Roomler SSH sets it from the device's policy.
+    #[allow(dead_code)]
+    pub run_as: RunAs,
 }
 
 /// What came back. Mirrors `ClientMsg::RpcResult` one-for-one.
@@ -398,6 +405,322 @@ pub fn deliver_response(request_id: &str, outcome: ExecOutcome) -> bool {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Privilege — which local account a command runs as
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The identity a command should run under.
+///
+/// [`Daemon`](RunAs::Daemon) is what Fleet RPC has always done and stays the
+/// default, so nothing about exec changes. Roomler SSH sets the others from
+/// the device's `SshPolicy`.
+///
+/// # The rule this type exists to enforce
+///
+/// **Never silently run as something more privileged than was asked for.** A
+/// policy that says `console_user` on a host where the daemon cannot obtain
+/// that token must FAIL, not quietly fall back to SYSTEM. Falling back is how
+/// an operator ends up believing sessions are unprivileged while they are
+/// root — the worst possible outcome, because it is invisible until it isn't.
+/// Every unsupported combination below returns an error that names what was
+/// asked for and why it could not be done.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RunAs {
+    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    #[default]
+    Daemon,
+    /// A named local account. Unix only: Windows has no way to become an
+    /// arbitrary local user without that user's credentials.
+    Named(String),
+    /// The user signed in at the console, via their session token. Windows
+    /// only, and not yet implemented (see [`apply_run_as`]).
+    ConsoleUser,
+}
+
+impl RunAs {
+    /// Parse the wire spelling the server sends in `rc:ssh.grant`.
+    ///
+    /// An unknown mode resolves to an ERROR, never to `Daemon`: a newer server
+    /// naming a mode this agent does not understand must not have its
+    /// intent downgraded into "run as root".
+    pub fn from_wire(mode: &str, account: Option<&str>) -> Result<Self, String> {
+        match mode {
+            "daemon" => Ok(Self::Daemon),
+            "console_user" => Ok(Self::ConsoleUser),
+            "named" => match account.map(str::trim).filter(|a| !a.is_empty()) {
+                Some(a) => Ok(Self::Named(a.to_string())),
+                None => Err("account_mode `named` was requested without an account".into()),
+            },
+            other => Err(format!(
+                "unknown account_mode {other:?} — refusing rather than guessing"
+            )),
+        }
+    }
+
+    /// A short label for logs and audit records.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Daemon => "daemon".into(),
+            Self::ConsoleUser => "console_user".into(),
+            Self::Named(a) => format!("named:{a}"),
+        }
+    }
+
+    /// Does this ask for the daemon's own (privileged) identity?
+    pub fn is_privileged(&self) -> bool {
+        matches!(self, Self::Daemon)
+    }
+}
+
+/// Configure `cmd` to run as `who`, or explain why it cannot.
+///
+/// Returns `Err` rather than silently doing something else — see [`RunAs`].
+fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Result<(), String> {
+    // Only the Unix drop path configures the command. On Windows every
+    // non-daemon mode is currently a refusal, so nothing is set — which is the
+    // point: refusing configures nothing and spawns nothing.
+    #[cfg(not(unix))]
+    let _ = &cmd;
+    match who {
+        RunAs::Daemon => Ok(()),
+
+        #[cfg(unix)]
+        RunAs::Named(account) => unix_priv::drop_to(cmd, account),
+        #[cfg(not(unix))]
+        RunAs::Named(account) => Err(format!(
+            "cannot run as the local account {account:?}: becoming an arbitrary user on Windows \
+             requires that user's credentials, which this daemon does not have and will not ask \
+             for. Use account_mode `console_user` for the signed-in user, or `daemon` to accept \
+             running as SYSTEM."
+        )),
+
+        #[cfg(windows)]
+        RunAs::ConsoleUser => Err(
+            "running as the signed-in console user is not implemented yet (the token-stealing \
+             path exists for the lock-screen worker but does not yet capture command output). \
+             Refusing rather than running as SYSTEM, which is not what the policy asked for."
+                .into(),
+        ),
+        #[cfg(not(windows))]
+        RunAs::ConsoleUser => Err(
+            "account_mode `console_user` is a Windows concept — there is no console session token \
+             to assume here. Name a local account instead."
+                .into(),
+        ),
+    }
+}
+
+/// Unix privilege drop.
+///
+/// Split into a "resolve everything first, then apply" shape for one specific
+/// reason: the code that runs between `fork` and `exec` must be
+/// async-signal-safe, and in a multithreaded process it must not allocate — a
+/// malloc lock held by another thread at fork time never gets released in the
+/// child. So `getpwnam`/`getgrouplist` (both of which allocate) happen in the
+/// parent, and the child only makes bare syscalls over already-owned memory.
+#[cfg(unix)]
+mod unix_priv {
+    use std::ffi::CString;
+
+    /// A resolved local account: everything the child needs, pre-computed.
+    struct Account {
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        groups: Vec<libc::gid_t>,
+        home: String,
+        name: String,
+    }
+
+    /// Look up an account by name.
+    fn resolve(account: &str) -> Result<Account, String> {
+        let c_name = CString::new(account)
+            .map_err(|_| format!("account name {account:?} contains a NUL byte"))?;
+
+        // `getpwnam_r` with a buffer we grow rather than `getpwnam`, which
+        // returns a pointer into static storage another thread can overwrite.
+        let mut buf = vec![0i8; 1024];
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        loop {
+            let rc = unsafe {
+                libc::getpwnam_r(
+                    c_name.as_ptr(),
+                    &mut pwd,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                )
+            };
+            if rc == libc::ERANGE && buf.len() < 64 * 1024 {
+                buf.resize(buf.len() * 2, 0);
+                continue;
+            }
+            if rc != 0 {
+                return Err(format!(
+                    "looking up local account {account:?} failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                ));
+            }
+            break;
+        }
+        if result.is_null() {
+            return Err(format!("no local account named {account:?} on this host"));
+        }
+
+        let uid = pwd.pw_uid;
+        let gid = pwd.pw_gid;
+
+        // Refuse uid 0 through this path. Not because running as root is
+        // impossible — `RunAs::Daemon` already is root here — but because it
+        // must be an explicit choice in the policy rather than a side effect
+        // of naming an account that happens to be uid 0.
+        if uid == 0 {
+            return Err(format!(
+                "account {account:?} is uid 0; use account_mode `daemon` if running as root is \
+                 really intended"
+            ));
+        }
+
+        let home = unsafe { cstr_to_string(pwd.pw_dir) };
+
+        // Supplementary groups, resolved HERE because getgrouplist allocates.
+        let mut ngroups: libc::c_int = 32;
+        let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
+        loop {
+            let rc = unsafe {
+                libc::getgrouplist(
+                    c_name.as_ptr(),
+                    gid as _,
+                    groups.as_mut_ptr() as *mut _,
+                    &mut ngroups,
+                )
+            };
+            if rc >= 0 {
+                groups.truncate(ngroups.max(0) as usize);
+                break;
+            }
+            if ngroups as usize <= groups.len() || ngroups > 4096 {
+                // No progress, or an unreasonable answer: fall back to the
+                // primary group alone rather than looping. A session with only
+                // its primary group is degraded, not unsafe.
+                groups = vec![gid];
+                break;
+            }
+            groups.resize(ngroups as usize, 0);
+        }
+
+        Ok(Account {
+            uid,
+            gid,
+            groups,
+            home,
+            name: account.to_string(),
+        })
+    }
+
+    unsafe fn cstr_to_string(p: *const libc::c_char) -> String {
+        if p.is_null() {
+            return String::new();
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Resolve `account` and arrange for the child to become it.
+    pub(super) fn drop_to(cmd: &mut tokio::process::Command, account: &str) -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+
+        let acct = resolve(account)?;
+
+        // The environment a shell needs to behave as that user. Without HOME
+        // the shell writes history and dotfiles into the daemon's home — as
+        // the wrong user, usually failing, occasionally succeeding, which is
+        // worse.
+        cmd.env("HOME", &acct.home)
+            .env("USER", &acct.name)
+            .env("LOGNAME", &acct.name);
+
+        let (uid, gid) = (acct.uid, acct.gid);
+        let groups = acct.groups.clone();
+
+        // SAFETY: everything below is an async-signal-safe syscall over memory
+        // owned by the closure. No allocation, no locks — see the module docs.
+        unsafe {
+            cmd.pre_exec(move || {
+                // ORDER IS LOAD-BEARING. Supplementary groups and the primary
+                // gid must be set BEFORE the uid: after `setuid` the process
+                // no longer has the privilege to change either, so a reversed
+                // order silently leaves the child in root's groups. That is
+                // the classic privilege-retention bug, and it looks like a
+                // successful drop from the outside.
+                if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(gid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Verify rather than assume. `setuid` can succeed partially in
+                // some configurations, and a command that runs with more
+                // privilege than intended must never start.
+                if libc::getuid() != uid || libc::geteuid() != uid {
+                    return Err(std::io::Error::other("privilege drop did not take effect"));
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn root_is_refused_through_the_named_path() {
+            // uid 0 by any name must be an explicit `daemon`, never a side
+            // effect of naming an account.
+            match resolve("root") {
+                Err(e) => assert!(e.contains("uid 0"), "unexpected refusal: {e}"),
+                Ok(_) => panic!("resolving root as a named account must be refused"),
+            }
+        }
+
+        #[test]
+        fn a_missing_account_is_named_in_the_error() {
+            let e = resolve("definitely-not-a-real-account-xyz").unwrap_err();
+            assert!(e.contains("no local account"), "unexpected error: {e}");
+        }
+
+        #[test]
+        fn an_account_with_a_nul_byte_is_refused() {
+            let e = resolve("na\0me").unwrap_err();
+            assert!(e.contains("NUL"), "unexpected error: {e}");
+        }
+
+        /// The primary group is always in the list handed to `setgroups`, so a
+        /// child can never end up with fewer privileges than its own group.
+        #[test]
+        fn a_resolvable_account_carries_its_primary_group() {
+            // `nobody` exists on essentially every Linux image, including the
+            // CI runner. Skip rather than fail where it doesn't.
+            let Ok(acct) = resolve("nobody") else {
+                return;
+            };
+            assert!(acct.uid != 0);
+            assert!(
+                acct.groups.contains(&acct.gid),
+                "primary gid {} missing from {:?}",
+                acct.gid,
+                acct.groups
+            );
+        }
+    }
+}
+
 /// Serialises + bounds every exec on this device.
 pub struct ExecEngine {
     sem: Arc<Semaphore>,
@@ -527,6 +850,17 @@ impl ExecEngine {
             // Lead a new process group so a timeout can signal the whole
             // tree, not just the shell that spawned it.
             cmd.process_group(0);
+        }
+
+        // Privilege LAST, so nothing configured after it could quietly undo
+        // the drop, and so a refusal costs nothing that was already spawned.
+        if let Err(e) = apply_run_as(&mut cmd, &req.run_as) {
+            warn!(
+                request_id = %req.request_id, caller = %req.caller,
+                run_as = %req.run_as.label(),
+                "exec: refusing to run — the requested identity is unavailable"
+            );
+            return ExecOutcome::failed(e);
         }
 
         let mut child = match cmd.spawn() {
@@ -668,6 +1002,126 @@ mod tests {
         ExecEngine::new()
     }
 
+    // ── Privilege: the identity a command runs as ─────────────────────────
+
+    /// The wire spellings the server sends, and the one rule that matters:
+    /// anything we do not understand is an ERROR, never a downgrade to the
+    /// daemon's identity.
+    #[test]
+    fn an_unknown_account_mode_is_refused_not_downgraded() {
+        assert_eq!(RunAs::from_wire("daemon", None).unwrap(), RunAs::Daemon);
+        assert_eq!(
+            RunAs::from_wire("console_user", None).unwrap(),
+            RunAs::ConsoleUser
+        );
+        assert_eq!(
+            RunAs::from_wire("named", Some("goran")).unwrap(),
+            RunAs::Named("goran".into())
+        );
+
+        // A newer server naming a mode this agent has never heard of must not
+        // have its intent silently reinterpreted as "run as root".
+        let e = RunAs::from_wire("some_future_mode", None).unwrap_err();
+        assert!(e.contains("unknown account_mode"), "got {e:?}");
+
+        // `named` with nothing to name is unsatisfiable, and says so.
+        let e = RunAs::from_wire("named", None).unwrap_err();
+        assert!(e.contains("without an account"), "got {e:?}");
+        let e = RunAs::from_wire("named", Some("   ")).unwrap_err();
+        assert!(e.contains("without an account"), "got {e:?}");
+    }
+
+    #[test]
+    fn only_the_daemon_identity_reports_as_privileged() {
+        assert!(RunAs::Daemon.is_privileged());
+        assert!(!RunAs::Named("nobody".into()).is_privileged());
+        assert!(!RunAs::ConsoleUser.is_privileged());
+        assert_eq!(RunAs::Named("goran".into()).label(), "named:goran");
+    }
+
+    /// A command that cannot be run as the requested identity must FAIL, and
+    /// the failure must reach the caller as an error rather than as output
+    /// from a process that ran as somebody else.
+    #[tokio::test]
+    async fn an_unavailable_identity_refuses_instead_of_running_as_the_daemon() {
+        let engine = ExecEngine::new();
+
+        // `console_user` on Unix and `named` on Windows are both
+        // structurally impossible, so exactly one of these is the local case —
+        // and whichever it is, it must refuse.
+        let impossible = if cfg!(windows) {
+            RunAs::Named("nobody".into())
+        } else {
+            RunAs::ConsoleUser
+        };
+
+        let mut r = req("echo should-never-run");
+        r.run_as = impossible;
+        let outcome = engine.run(r, &Redactor::default()).await;
+
+        assert!(
+            outcome.error.is_some(),
+            "an unavailable identity must be an error, got {outcome:?}"
+        );
+        assert!(
+            outcome.exit_code.is_none(),
+            "nothing should have been spawned"
+        );
+        assert!(
+            !outcome.stdout.contains("should-never-run"),
+            "the command ran despite an unavailable identity — this is the silent-escalation bug"
+        );
+    }
+
+    /// The default is unchanged, so Fleet RPC behaves exactly as before.
+    #[tokio::test]
+    async fn the_daemon_identity_still_runs_normally() {
+        let engine = ExecEngine::new();
+        let outcome = engine
+            .run(req("echo run-as-daemon-ok"), &Redactor::default())
+            .await;
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert!(outcome.stdout.contains("run-as-daemon-ok"), "{outcome:?}");
+    }
+
+    /// On Unix, naming an account that does not exist must be refused BEFORE
+    /// anything is spawned — not discovered as a confusing exec failure in the
+    /// child.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_nonexistent_unix_account_refuses_before_spawning() {
+        let engine = ExecEngine::new();
+        let mut r = req("echo should-never-run");
+        r.run_as = RunAs::Named("definitely-not-a-real-account-xyz".into());
+        let outcome = engine.run(r, &Redactor::default()).await;
+
+        assert!(outcome.error.is_some(), "{outcome:?}");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no local account"),
+            "the refusal should name the problem, got {:?}",
+            outcome.error
+        );
+        assert!(!outcome.stdout.contains("should-never-run"));
+    }
+
+    /// Naming root is refused through the `named` path even though the daemon
+    /// IS root — running as root has to be the policy's explicit choice.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn naming_root_is_refused_even_though_the_daemon_is_root() {
+        let engine = ExecEngine::new();
+        let mut r = req("echo should-never-run");
+        r.run_as = RunAs::Named("root".into());
+        let outcome = engine.run(r, &Redactor::default()).await;
+
+        assert!(outcome.error.is_some(), "{outcome:?}");
+        assert!(!outcome.stdout.contains("should-never-run"));
+    }
+
     fn req(command: &str) -> ExecRequest {
         ExecRequest {
             request_id: "t1".into(),
@@ -677,6 +1131,7 @@ mod tests {
             max_output_bytes: 0,
             cwd: None,
             caller: "test".into(),
+            run_as: RunAs::Daemon,
         }
     }
 

@@ -2491,6 +2491,10 @@ async fn handle_server_msg(
                 max_output_bytes,
                 cwd,
                 caller: caller.clone(),
+                // Fleet RPC is privileged diagnostics by design — the whole
+                // point is `netsh`, route tables and service state. It has
+                // always run as the daemon and continues to.
+                run_as: crate::exec::RunAs::Daemon,
             };
             tokio::spawn(async move {
                 let decision = broker.request_with_mode(&request_id, consent_mode).await;
