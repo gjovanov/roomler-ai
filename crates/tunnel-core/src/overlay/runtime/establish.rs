@@ -1575,8 +1575,30 @@ impl OverlayRuntime {
                              floor from ever rebuilding; rebuilding now"
                         );
                     }
+                    // rc.415 (#25) — an in-flight TURN grant no longer blocks
+                    // the floor. This was the LAST gate standing between a
+                    // carrier-less peer and its floor, and the field convicted
+                    // it directly: rc.414 on CORPLAP-1 + CORPLAP-2 logged
+                    // `repairs=0` (so stale bookkeeping was NOT the cause) and
+                    // every single withhold line read "a TURN grant is already
+                    // in flight for it".
+                    //
+                    // Under a corp VPN that grant CHURNS — UDP allocations to
+                    // the relay band time out and retry for tens of seconds at
+                    // a time (CORPLAP-1: repeated "pinned UDP TURN allocate timed
+                    // out" against :3478 AND :443 before TLS:443 finally took)
+                    // — so `in_flight` is occupied on essentially every walk
+                    // and the peer waits out the entire churn with NO carrier.
+                    // That is precisely the outage the floor exists to prevent,
+                    // and precisely the pairs that need it most.
+                    //
+                    // Safe by the same argument as the tracking gate: this walk
+                    // only ever sees carrier-less peers, and the block already
+                    // fires `coord.request(...)` right below, so floor-plus-
+                    // in-flight-grant is the DESIGNED combination. When the
+                    // grant lands, `install_ready` replaces the floor
+                    // MBB-style and the TURN link clears the floor bookkeeping.
                     if let Some(coord) = relay.as_mut()
-                        && !relay_bq.in_flight.contains_key(&np.node_id)
                         && !coord.is_derping(&np.node_id)
                         && let Some(link) = coord.build_floor(np.node_id, &cfg)
                     {
@@ -1590,24 +1612,19 @@ impl OverlayRuntime {
                     }
                     // rc.414 (#25) — the floor did NOT install for a
                     // carrier-less peer. `build_floor` reports its own
-                    // refusals (rc.413); the two gates ABOVE it were silent,
-                    // which is how a blocked peer could produce no
-                    // explanation at all. Report them, throttled by the same
-                    // coordinator-side helper.
-                    if let Some(coord) = relay.as_mut() {
-                        if relay_bq.in_flight.contains_key(&np.node_id) {
-                            coord.note_floor_skipped(
-                                np.node_id,
-                                10,
-                                "a TURN grant is already in flight for it",
-                            );
-                        } else if coord.is_derping(&np.node_id) {
-                            coord.note_floor_skipped(
-                                np.node_id,
-                                11,
-                                "it is coordinating a DERP link of its own (same carrier, same mux)",
-                            );
-                        }
+                    // refusals (rc.413); the gate above it was silent, which
+                    // is how a blocked peer could produce no explanation at
+                    // all. Report it, throttled by the same coordinator-side
+                    // helper. (The in-flight-grant gate is gone as of rc.415 —
+                    // it was the one the field convicted.)
+                    if let Some(coord) = relay.as_mut()
+                        && coord.is_derping(&np.node_id)
+                    {
+                        coord.note_floor_skipped(
+                            np.node_id,
+                            11,
+                            "it is coordinating a DERP link of its own (same carrier, same mux)",
+                        );
                     }
                     // P9 — fresh-install LAN is PROBE-FIRST under make-before-
                     // break: a same-/24 match is only a HINT the peer is on
