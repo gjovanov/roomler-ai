@@ -10,9 +10,11 @@
 //!   against [`ssh_authorized_keys`], and an `exec` channel routed through the
 //!   daemon's existing [`crate::exec`] engine. PTY, SFTP and forwarding are
 //!   refused with an explicit reason rather than left to hang.
-//! * **P3 (next) — authorization.** Server-minted, short-lived session grants
-//!   naming a roomler user, checked against `SshPolicy` and the `SSH_DEVICE`
-//!   permission.
+//! * **P3a — the device half of authorization.** `rc:ssh.grant` carries a
+//!   server-minted, single-use, short-lived authorization naming a roomler
+//!   principal and an ephemeral public key; [`record_grant`] holds it and
+//!   [`auth_publickey`] redeems it. The server half that decides *whether* to
+//!   mint one (`SshPolicy`, `SSH_DEVICE`, the org kill-switch) is P3b.
 //!
 //! Built without the `ssh-server` feature the module still compiles and serves
 //! the P1 banner+echo, which keeps the transport independently testable in a
@@ -27,12 +29,18 @@
 //! claim, a cryptographic fact. That is what the whole design rests on, and
 //! what eventually lets roomler SSH have no key distribution at all.
 //!
-//! It is not *authorization*. An enrolled peer is authenticated, not entitled,
-//! and today nothing here can name the human behind the connection. Until P3
-//! that gap is closed by [`ssh_authorized_keys`]: a device-owned list, empty by
-//! default, so `ssh_enabled` on its own grants nobody anything. Do not let a
-//! later slice drop that second factor before the grants that replace it
-//! actually exist.
+//! It is not *authorization*. An enrolled peer is authenticated, not entitled.
+//! Two things close that gap, in this order:
+//!
+//! 1. A **server grant** ([`record_grant`]) names a roomler principal and one
+//!    ephemeral key, is redeemed once, and dies in seconds. This is the path
+//!    that will make key distribution unnecessary.
+//! 2. [`ssh_authorized_keys`] — a device-owned list, empty by default, so
+//!    `ssh_enabled` on its own grants nobody anything. It stays after P3 as
+//!    the break-glass route for when the control plane is the broken thing,
+//!    which is when a remote shell is wanted most.
+//!
+//! Grants are tried first and consumed; the list is the fallback.
 //!
 //! # What a session can do
 //!
@@ -314,9 +322,17 @@ mod sshd {
         /// us only by clearing WireGuard against a key from our netmap — so it
         /// is what every log line and audit record is keyed on.
         peer: std::net::SocketAddr,
-        /// The SSH username offered. Recorded, never trusted: until P3 mints
-        /// server-side grants there is no roomler user behind it.
+        /// The SSH username offered. Recorded, never trusted — it is whatever
+        /// the client typed. The authorized principal, when there is one, is
+        /// [`Self::principal`].
         user: String,
+        /// The roomler principal the server named in the grant. `None` means
+        /// the session authenticated off the device-owned key list, where no
+        /// roomler identity exists to name.
+        principal: Option<String>,
+        /// The redeemed grant, kept for the account mode it carries (P5 acts
+        /// on it) and for the audit record.
+        grant: Option<super::Grant>,
     }
 
     impl Handler {
@@ -325,6 +341,18 @@ mod sshd {
                 ctx,
                 peer,
                 user: String::new(),
+                principal: None,
+                grant: None,
+            }
+        }
+
+        /// Who to attribute this session's actions to. Prefers the
+        /// server-named principal; falls back to the SSH username and peer,
+        /// which is all a key-list session can honestly claim.
+        fn caller_label(&self) -> String {
+            match &self.principal {
+                Some(p) => format!("ssh:{p}@{}", self.peer),
+                None => format!("ssh:{}@{} (key-list)", self.user, self.peer),
             }
         }
     }
@@ -337,16 +365,35 @@ mod sshd {
             user: &str,
             key: &PublicKey,
         ) -> Result<Auth, Self::Error> {
-            // Compare KEY DATA, not the `PublicKey` itself: the parsed value
-            // carries the trailing comment, so two records of the same key
-            // with different comments would not be equal.
-            let accepted = self
+            let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+
+            // A server-minted grant is tried FIRST, and consumed when it
+            // matches. It is the path that carries a roomler identity, and it
+            // is single-use — so a captured public key cannot be replayed into
+            // a second session even within the grant's lifetime.
+            if let Some(grant) = super::take_grant_for(key) {
+                self.user = user.to_string();
+                self.principal = Some(grant.caller.clone());
+                self.grant = Some(grant.clone());
+                info!(
+                    peer = %self.peer, %user, %fingerprint,
+                    grant_id = %grant.grant_id, caller = %grant.caller,
+                    account_mode = %grant.account_mode,
+                    "ssh: authenticated (server grant)"
+                );
+                return Ok(Auth::Accept);
+            }
+
+            // Otherwise the device-owned list. Compare KEY DATA, not the
+            // `PublicKey` itself: the parsed value carries the trailing
+            // comment, so the same key recorded with a different comment would
+            // not be equal.
+            let listed = self
                 .ctx
                 .authorized
                 .iter()
                 .any(|k| k.key_data() == key.key_data());
-            let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
-            if accepted {
+            if listed {
                 self.user = user.to_string();
                 info!(
                     peer = %self.peer, %user, %fingerprint,
@@ -356,7 +403,8 @@ mod sshd {
             } else {
                 warn!(
                     peer = %self.peer, %user, %fingerprint,
-                    "ssh: rejected — key is not in ssh_authorized_keys"
+                    pending_grants = super::pending_grants(),
+                    "ssh: rejected — no live grant for this key and it is not in ssh_authorized_keys"
                 );
                 Ok(Auth::reject())
             }
@@ -390,7 +438,7 @@ mod sshd {
             session.channel_success(channel)?;
 
             let handle = session.handle();
-            let caller = format!("ssh:{}@{}", self.user, self.peer);
+            let caller = self.caller_label();
             tokio::spawn(async move {
                 run_exec(handle, channel, command, caller).await;
             });
@@ -574,6 +622,166 @@ async fn serve_conn(stream: tunnel_core::overlay::netstack::NsTcpStream, ctx: Se
         },
         Err(e) => warn!(%peer, %e, "ssh: handshake failed"),
     }
+}
+
+// ===========================================================================
+// P3 — server-minted session grants.
+// ===========================================================================
+
+/// One authorization to open a session, pushed by the server as
+/// `rc:ssh.grant` after it cleared the org kill-switch, the caller's
+/// `SSH_DEVICE` permission and this device's `SshPolicy`.
+///
+/// The agent does not verify a signature on this. It does not need to: the
+/// frame arrived over the control WebSocket the daemon is already
+/// authenticated on, which is the same trust path `rc:request` uses to open a
+/// remote-control session. What the agent *does* enforce are the bounds it can
+/// check locally — expiry, single use, and a cap on how many can be pending —
+/// because "the server said so" is not a reason to accept an unbounded table
+/// or an eternal key.
+#[cfg(feature = "ssh-server")]
+#[derive(Debug, Clone)]
+pub struct Grant {
+    pub grant_id: String,
+    /// The public key this grant admits, in OpenSSH form. Matched by key data.
+    pub public_key: String,
+    /// Display name of the acting principal, for the log and the audit record.
+    pub caller: String,
+    /// Which local account the session runs as. Carried through now; P5 is
+    /// what makes anything other than `daemon` actually happen.
+    pub account_mode: String,
+    pub account: Option<String>,
+    /// Server-clamped session lifetime once redeemed.
+    pub session_secs: u64,
+    /// LOCAL deadline after which this grant is dead.
+    ///
+    /// Deliberately an `Instant` derived from arrival rather than the server's
+    /// wall-clock `expires_at_ms`: the two machines' clocks can differ by
+    /// minutes, and a skewed or malformed timestamp must not be able to
+    /// produce a grant that never expires. The server's value only ever
+    /// SHORTENS the local ceiling.
+    deadline: std::time::Instant,
+}
+
+/// Pending grants, oldest first.
+///
+/// A `Vec` rather than a map because the lookup key is "whichever entry's key
+/// data matches", the table is capped at a handful of entries, and a linear
+/// scan of eight items is not worth a hashing strategy.
+#[cfg(feature = "ssh-server")]
+static GRANTS: std::sync::LazyLock<std::sync::Mutex<Vec<Grant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Most grants we will hold at once. A grant is redeemed within seconds of
+/// being issued, so a backlog means something is wrong — and an unbounded
+/// table would be a memory sink reachable from the control plane.
+#[cfg(feature = "ssh-server")]
+const MAX_PENDING_GRANTS: usize = 16;
+
+/// Record an `rc:ssh.grant`. Returns an error string to log when the grant is
+/// unusable; the caller does not answer the server, because the caller of the
+/// SSH session (a different device) is the one waiting, and it learns the
+/// outcome by its connection succeeding or not.
+#[cfg(feature = "ssh-server")]
+pub fn record_grant(
+    grant_id: String,
+    public_key: String,
+    caller: String,
+    account_mode: String,
+    account: Option<String>,
+    expires_at_ms: u64,
+    session_secs: u64,
+) -> Result<(), String> {
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use roomler_ai_remote_control::models::ssh_limits;
+
+    // Parse now, not at authentication time: a malformed key should be a
+    // start-up-shaped error in the log, not a mysterious auth failure later.
+    russh::keys::ssh_key::PublicKey::from_openssh(&public_key)
+        .map_err(|e| format!("grant carries an unparseable public key: {e}"))?;
+
+    // Re-clamp the lifetime against our own clock. The server's timestamp can
+    // only make the window SMALLER than the local ceiling, never larger.
+    let ceiling = Duration::from_secs(ssh_limits::GRANT_TTL_SECS);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let server_window = Duration::from_millis(expires_at_ms.saturating_sub(now_ms));
+    let window = server_window.min(ceiling);
+    if window.is_zero() {
+        return Err("grant is already expired on arrival (clock skew?)".into());
+    }
+
+    let grant = Grant {
+        grant_id,
+        public_key,
+        caller,
+        account_mode,
+        account,
+        session_secs: ssh_limits::clamp_session_secs(session_secs),
+        deadline: Instant::now() + window,
+    };
+
+    let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+    prune(&mut grants);
+    if grants.len() >= MAX_PENDING_GRANTS {
+        // Drop the OLDEST rather than refusing the newest: the newest is the
+        // one a caller is actively waiting on, and the oldest is within
+        // seconds of expiring anyway.
+        grants.remove(0);
+        tracing::warn!("ssh: pending-grant table full — dropped the oldest");
+    }
+    tracing::info!(
+        grant_id = %grant.grant_id, caller = %grant.caller,
+        account_mode = %grant.account_mode, ttl_secs = window.as_secs(),
+        "ssh: grant recorded"
+    );
+    grants.push(grant);
+    Ok(())
+}
+
+/// Drop everything past its deadline.
+#[cfg(feature = "ssh-server")]
+fn prune(grants: &mut Vec<Grant>) {
+    let now = std::time::Instant::now();
+    grants.retain(|g| {
+        let live = g.deadline > now;
+        if !live {
+            tracing::debug!(grant_id = %g.grant_id, "ssh: grant expired unredeemed");
+        }
+        live
+    });
+}
+
+/// Consume the live grant admitting `key`, if any. Single use: a redeemed
+/// grant is gone, so a captured public key cannot be replayed into a second
+/// session.
+#[cfg(feature = "ssh-server")]
+fn take_grant_for(key: &russh::keys::ssh_key::PublicKey) -> Option<Grant> {
+    let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+    prune(&mut grants);
+    let idx = grants.iter().position(|g| {
+        russh::keys::ssh_key::PublicKey::from_openssh(&g.public_key)
+            .is_ok_and(|k| k.key_data() == key.key_data())
+    })?;
+    Some(grants.remove(idx))
+}
+
+/// How many grants are pending — surfaced in diagnostics.
+#[cfg(feature = "ssh-server")]
+pub fn pending_grants() -> usize {
+    let mut grants = GRANTS.lock().unwrap_or_else(|e| e.into_inner());
+    prune(&mut grants);
+    grants.len()
+}
+
+/// Test-only: empty the table so cases cannot leak into each other through
+/// process-global state.
+#[cfg(all(test, feature = "ssh-server"))]
+fn clear_grants() {
+    GRANTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 #[cfg(all(test, feature = "ssh-server"))]
@@ -783,6 +991,165 @@ mod tests {
         assert!(
             reason.contains("SFTP"),
             "the refusal must say why — a silent failure is how `scp` turns into a hang; got {reason:?}"
+        );
+    }
+
+    // ── P3: server-minted grants ──────────────────────────────────────────
+
+    /// The grant table is process-global, and `cargo test` runs these
+    /// concurrently — so every grant test takes this first and starts from an
+    /// empty table. Without it, the capped-table case (which deliberately
+    /// overflows the table) evicts the grants the other cases are relying on,
+    /// and the failures look like product bugs.
+    static GRANT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Take the lock and hand back an empty table.
+    async fn grant_test<'a>() -> tokio::sync::MutexGuard<'a, ()> {
+        let guard = GRANT_TEST_LOCK.lock().await;
+        super::clear_grants();
+        guard
+    }
+
+    fn now_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn grant_for(line: &str, ttl_ms: u64) -> Result<(), String> {
+        super::record_grant(
+            format!("g-{}", rand::random::<u32>()),
+            line.to_string(),
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            now_ms() + ttl_ms,
+            0,
+        )
+    }
+
+    /// A grant admits its key, and admits it exactly once. Without single-use,
+    /// a captured public key would be a standing credential for the whole
+    /// grant lifetime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_grant_admits_its_key_exactly_once() {
+        let _lock = grant_test().await;
+        let (key, line) = client_key(10);
+        // The device-owned list is EMPTY: this proves the grant alone let the
+        // session in.
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        grant_for(&line, 30_000).unwrap();
+        assert_eq!(super::pending_grants(), 1);
+
+        let session = connect(addr, key.clone()).await;
+        assert_eq!(
+            super::pending_grants(),
+            0,
+            "redeeming a grant must consume it"
+        );
+
+        // Prove it is a working session, not just an accepted handshake.
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, "echo granted").await.unwrap();
+        let mut out = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            if let russh::ChannelMsg::Data { ref data } = msg {
+                out.extend_from_slice(data);
+            }
+        }
+        assert!(String::from_utf8_lossy(&out).contains("granted"));
+
+        // The same key a second time now has nothing backing it.
+        let addr2 = serve_one(&cfg_with(Vec::new())).await;
+        let config = Arc::new(russh::client::Config::default());
+        let stream = TcpStream::connect(addr2).await.unwrap();
+        let mut replay = russh::client::connect_stream(config, stream, TestClient)
+            .await
+            .unwrap();
+        let hash = replay.best_supported_rsa_hash().await.unwrap().flatten();
+        let res = replay
+            .authenticate_publickey(
+                "roomler",
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .unwrap();
+        assert!(!res.success(), "a redeemed grant must not be replayable");
+    }
+
+    /// An expired grant is not a grant. The deadline is derived from arrival,
+    /// so this does not depend on the two clocks agreeing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_expired_grant_admits_nobody() {
+        let _lock = grant_test().await;
+        let (key, line) = client_key(11);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+
+        // Arrives already past its expiry — rejected outright rather than
+        // stored as a live credential.
+        assert!(grant_for(&line, 0).is_err());
+        assert_eq!(super::pending_grants(), 0);
+
+        let config = Arc::new(russh::client::Config::default());
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut session = russh::client::connect_stream(config, stream, TestClient)
+            .await
+            .unwrap();
+        let hash = session.best_supported_rsa_hash().await.unwrap().flatten();
+        let res = session
+            .authenticate_publickey(
+                "roomler",
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .unwrap();
+        assert!(!res.success());
+    }
+
+    /// The server can only ever SHORTEN the local window. A grant claiming a
+    /// year of validity — a skewed clock, or a compromised control plane —
+    /// still dies at the local ceiling.
+    #[tokio::test]
+    async fn a_far_future_expiry_is_clamped_to_the_local_ceiling() {
+        use roomler_ai_remote_control::models::ssh_limits;
+
+        let _lock = grant_test().await;
+        let (_key, line) = client_key(12);
+        grant_for(&line, 365 * 24 * 3600 * 1000).unwrap();
+
+        let grants = super::GRANTS.lock().unwrap();
+        let remaining = grants[0]
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining.as_secs() <= ssh_limits::GRANT_TTL_SECS,
+            "a grant must never outlive the local ceiling; got {remaining:?}"
+        );
+    }
+
+    /// A malformed key is refused when the grant arrives, not discovered later
+    /// as an unexplained authentication failure.
+    #[tokio::test]
+    async fn a_grant_with_an_unparseable_key_is_refused_on_arrival() {
+        let _lock = grant_test().await;
+        assert!(grant_for("ssh-ed25519 not-actually-base64", 30_000).is_err());
+        assert_eq!(super::pending_grants(), 0);
+    }
+
+    /// The table cannot be grown without bound from the control plane.
+    #[tokio::test]
+    async fn the_pending_table_is_capped() {
+        let _lock = grant_test().await;
+        for i in 0..40u8 {
+            let (_k, line) = client_key(100u8.wrapping_add(i));
+            grant_for(&line, 30_000).unwrap();
+        }
+        assert!(
+            super::pending_grants() <= super::MAX_PENDING_GRANTS,
+            "pending grants must stay capped, got {}",
+            super::pending_grants()
         );
     }
 }

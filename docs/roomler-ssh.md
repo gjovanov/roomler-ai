@@ -113,17 +113,40 @@ local-account mapping are P5. Until then, listing a key in
 | Gate | Owner | State |
 |---|---|---|
 | 0 — carrier identity | topology | **live.** The connection cleared WireGuard against a netmap key, so the peer is a specific enrolled node in a specific org — a cryptographic fact, not a claim |
-| 1 — org kill-switch | server | P3 |
-| 2 — caller permission (`SSH_DEVICE`) | server | P3 — a *separate* bit from `EXEC_DEVICE`: "may run a bounded command" and "may hold an interactive root session with file transfer" are not the same grant |
-| 3 — `SshPolicy` | server | P3 |
+| 1 — org kill-switch | server | P3b |
+| 2 — caller permission (`SSH_DEVICE`, `1 << 29`) | server | **bit defined**, enforcement P3b. A *separate* bit from `EXEC_DEVICE` and, like it, deliberately **not** in `DEFAULT_ADMIN` |
+| 3 — `SshPolicy` | server | **model defined** (`SshMode::Off` default, `can_originate`, user/role allowlists, `account_mode`, consent), enforcement P3b |
 | 4 — `ssh_enabled` + `ssh_authorized_keys` | the device | **live.** The refusal that survives a compromised control plane |
 
-Gate 0 is what eventually removes key management entirely: the server mints a
-short-lived grant naming a roomler user, the target verifies it, and no
-`authorized_keys` line exists anywhere. `ssh_authorized_keys` is the device-owned
-second factor until then — and stays afterwards as the break-glass route for
-when the control plane is the thing that is broken, which is when a remote shell
-is wanted most.
+### How a grant works (P3a — shipped)
+
+The caller mints an **ephemeral keypair per session** and sends only the public
+half in `rc:ssh.request`. If the server authorizes, it pushes
+`rc:ssh.grant` — that key, the principal's name, the account mode, an expiry —
+to the **target**, and answers the caller with where to dial.
+
+The agent does not verify a signature on the grant, and does not need to: the
+frame arrived over the control WebSocket it is already authenticated on, the
+same trust path `rc:request` uses to open a remote-control session. No shared
+secret with the server, no key distribution, nothing long-lived anywhere.
+
+What the agent *does* enforce locally, because "the server said so" is not a
+reason to accept an unbounded table or an eternal key:
+
+- **Single use.** A redeemed grant is removed, so a captured public key cannot
+  be replayed into a second session even inside its lifetime.
+- **A local deadline**, derived from *arrival* (`Instant`), not from the
+  server's wall clock. The server's timestamp can only ever shorten the window
+  — a skewed clock or a compromised control plane cannot mint an immortal
+  grant. Ceiling: 60 s.
+- **A capped table** (16 pending), so the control plane cannot grow agent
+  memory. Overflow drops the oldest, which is the one closest to expiry anyway.
+- **Gate 4 again.** A device with `ssh_enabled` off refuses to record grants at
+  all rather than accumulating credentials it would never honour.
+
+Grants are tried before `ssh_authorized_keys` and take precedence; sessions
+authenticated by a grant carry the roomler principal into the log and the audit
+record, which a key-list session cannot.
 
 ## 5. Roadmap
 
@@ -131,7 +154,8 @@ is wanted most.
 |---|---|---|
 | P1 | Transport seam (`SplitTun`, netstack termination) | **shipped** |
 | P2 | russh server, publickey auth, `exec` via the exec engine | **shipped** |
-| P3 | `SshPolicy`, `SSH_DEVICE`, `rc:ssh.request` signalling, server-minted grants | designed |
+| P3a | Wire protocol (`rc:ssh.request` / `.grant` / `.response`), `SshPolicy` + `SshMode` + `SshAccountMode` models, `SSH_DEVICE` bit, agent-side grant table + redemption, `ssh` capability | **shipped** |
+| P3b | The server half: `agent_ssh.rs::authorize` (gates 1-3), hub routing, the `ssh_policy` admin API + UI, and the `roomler ssh` CLI leg that originates a request | next |
 | P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | designed |
 | P5 | Local-account mapping + privilege drop (Windows: console-session token via `system_context`; Unix: setuid) | designed |
 | P6 | `roomler ssh <name>`, netmap-verified host keys (no TOFU), stdio `ProxyCommand` | designed |

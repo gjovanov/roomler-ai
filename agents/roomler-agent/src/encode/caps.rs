@@ -458,8 +458,27 @@ fn compute_caps() -> AgentCaps {
         // says only "this agent understands the verbs": the org kill-switch,
         // the device's ExecPolicy, and the agent's own `exec_enabled` config
         // key all still have to say yes before anything runs.
-        rpc: vec!["exec".into(), "originate".into()],
+        rpc: rpc_caps(),
     }
+}
+
+/// Fleet-RPC + roomler-SSH verb capabilities.
+///
+/// `exec` / `originate` are build-independent (the exec engine is std process
+/// spawning). `ssh` is NOT: it is gated on the `ssh-server` feature, because
+/// `rc:ssh.grant` reaching a build without the server would be recorded by
+/// nobody and the caller would hang against a port that answers nothing — the
+/// exact failure the capability list exists to prevent.
+///
+/// Advertising a verb says only "this agent understands it". The org
+/// kill-switch, the device's policy and the agent-local config key all still
+/// have to say yes before anything happens.
+fn rpc_caps() -> Vec<String> {
+    let mut caps = vec!["exec".to_string(), "originate".to_string()];
+    if cfg!(feature = "ssh-server") {
+        caps.push("ssh".to_string());
+    }
+    caps
 }
 
 /// Multi-user P3 — how many CONCURRENT remote-control sessions this agent

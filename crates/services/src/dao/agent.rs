@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DisplayInfo, ExecPolicy, OsKind,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DisplayInfo, ExecPolicy, OsKind, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -51,6 +51,7 @@ impl AgentDao {
             // Fleet RPC off on a new device — enabling it is a deliberate
             // admin act, never a side effect of enrollment.
             exec_policy: ExecPolicy::default(),
+            ssh_policy: SshPolicy::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
