@@ -238,8 +238,21 @@ fn encoder_options(
         // NVENC constant-quality VBR: `cq` drives quality, `maxrate`
         // bounds the burst, bit_rate=0 (set in build_encoder) makes it
         // pure target-quality. `tune=ll` keeps it responsive for remote
-        // desktop; `spatial-aq` spends bits on high-detail text regions;
-        // bf=0 + rc-lookahead=0 minimise latency.
+        // desktop; bf=0 + rc-lookahead=0 minimise latency.
+        //
+        // P7 (2026-08-20) — spatial AQ is OFF by default for desktop
+        // content (key OMITTED — FFmpeg's nvenc default is 0, so omission
+        // carries zero open-rejection risk and the tiered open is
+        // untouched). The old comment here claimed AQ "spends bits on
+        // high-detail text regions"; it does the opposite — AQ shifts QP
+        // toward low-detail areas where banding would show and AWAY from
+        // high-frequency detail, and on a desktop that detail IS the text.
+        // Same reason the libvpx screen path pins VP9E_SET_AQ_MODE=0
+        // (libvpx.rs — "AQ mis-fires on desktop and softens text").
+        // temporal-aq is not an alternative: it needs rc-lookahead>0 and
+        // we run 0 for latency. `ROOMLER_AGENT_NVENC_SPATIAL_AQ=1`
+        // restores the pre-P7 behaviour for camera-heavy hosts
+        // (video-in-a-window content).
         //
         // rc.98 — `forced-idr=1` is REQUIRED for our keyframe forcing to
         // work on NVENC. We force keyframes via `frame.set_kind(I)`
@@ -260,7 +273,9 @@ fn encoder_options(
         base.push(("rc-lookahead".into(), "0".into()));
         base.push(("bf".into(), "0".into()));
         base.push(("forced-idr".into(), "1".into()));
-        base.push(("spatial-aq".into(), "1".into()));
+        if node_env("NVENC_SPATIAL_AQ").as_deref().map(str::trim) == Some("1") {
+            base.push(("spatial-aq".into(), "1".into()));
+        }
         base.push(("maxrate".into(), cap.clone()));
         base.push(("bufsize".into(), buf.clone()));
         // rc.130 — `delay=0`: emit each packet with ZERO output-queue delay.
@@ -276,6 +291,9 @@ fn encoder_options(
         // Intel QSV: ICQ-style quality via `global_quality`; `maxrate`
         // caps the burst. `low_power` uses the fixed-function VDENC path
         // (faster, lower power — the Iris Xe fps-unlock path).
+        // P7 — no AQ analogue is set here ON PURPOSE: `mbbrc` stays at the
+        // driver default (its behaviour on the low_power VDENC path is
+        // unverified) — aligned with the nvenc spatial-aq-off default.
         base.push(("global_quality".into(), cq_s.clone()));
         if let Some(p) = preset.as_deref() {
             base.push(("preset".into(), p.into()));
@@ -307,6 +325,8 @@ fn encoder_options(
     } else if name.contains("amf") {
         // AMD AMF: constant-QP-ish via qp_i/qp_p, latency-tuned VBR,
         // capped burst.
+        // P7 — `vbaq` (AMF's AQ) defaults OFF in FFmpeg and stays unset —
+        // aligned with the nvenc spatial-aq-off default; don't "fix" it.
         base.push(("rc".into(), "vbr_latency".into()));
         base.push(("qp_i".into(), cq_s.clone()));
         base.push(("qp_p".into(), cq_s.clone()));
@@ -1052,5 +1072,50 @@ mod tests {
     #[test]
     fn hevc_dispatch_order_is_nvenc_qsv_amf() {
         assert_eq!(HEVC_ENCODER_NAMES, &["hevc_nvenc", "hevc_qsv", "hevc_amf"]);
+    }
+
+    // P7 (2026-08-20) — serialise the spatial-AQ env test against any future
+    // sibling that touches the same var (the encode/mod.rs RELAY_ENV_LOCK
+    // lesson: cargo's parallel runner interleaves env writers).
+    static AQ_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// P7 — spatial AQ must be ABSENT from the nvenc option set by default
+    /// (it softens desktop text) and restorable via env for camera-heavy
+    /// hosts. `encoder_options` is pure (no ffmpeg calls), so this runs on
+    /// every build.
+    #[test]
+    fn nvenc_spatial_aq_default_off_env_restores() {
+        let _guard = AQ_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: same reasoning as encode/mod.rs::relay_max_bps_reads_env —
+        // nothing else in the crate touches this var at test time, and any
+        // future test that does must share AQ_ENV_LOCK.
+        let prior = std::env::var("ROOMLER_AGENT_NVENC_SPATIAL_AQ").ok();
+
+        unsafe { std::env::remove_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ") };
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22);
+        assert!(
+            !summary.contains("spatial-aq"),
+            "spatial-aq must be omitted by default, got: {summary}"
+        );
+        // The load-bearing keys survive the omission.
+        assert!(summary.contains("forced-idr=1"), "got: {summary}");
+        assert!(summary.contains("rc=vbr"), "got: {summary}");
+
+        unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "1") };
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22);
+        assert!(
+            summary.contains("spatial-aq=1"),
+            "env=1 must restore spatial-aq, got: {summary}"
+        );
+
+        // Any non-"1" value keeps it off (explicit-opt-in semantics).
+        unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "0") };
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22);
+        assert!(!summary.contains("spatial-aq"), "got: {summary}");
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", v) },
+            None => unsafe { std::env::remove_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ") },
+        }
     }
 }
