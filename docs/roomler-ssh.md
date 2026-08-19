@@ -113,10 +113,31 @@ local-account mapping are P5. Until then, listing a key in
 | Gate | Owner | State |
 |---|---|---|
 | 0 — carrier identity | topology | **live.** The connection cleared WireGuard against a netmap key, so the peer is a specific enrolled node in a specific org — a cryptographic fact, not a claim |
-| 1 — org kill-switch | server | P3b |
-| 2 — caller permission (`SSH_DEVICE`, `1 << 29`) | server | **bit defined**, enforcement P3b. A *separate* bit from `EXEC_DEVICE` and, like it, deliberately **not** in `DEFAULT_ADMIN` |
-| 3 — `SshPolicy` | server | **model defined** (`SshMode::Off` default, `can_originate`, user/role allowlists, `account_mode`, consent), enforcement P3b |
+| 1 — org kill-switch (`remote_ssh_enabled`) | server | **live.** Default off, and a *separate* switch from `remote_exec_enabled`: allowing bounded diagnostic commands is not the same decision as allowing interactive sessions |
+| 2 — caller permission (`SSH_DEVICE`, `1 << 29`) | server | **live.** A *separate* bit from `EXEC_DEVICE` and, like it, deliberately **not** in `DEFAULT_ADMIN` |
+| 3 — `SshPolicy` | server | **live.** `SshMode::Off` default, `can_originate` on the *originating* device, user/role allowlists, `account_mode`, consent |
 | 4 — `ssh_enabled` + `ssh_authorized_keys` | the device | **live.** The refusal that survives a compromised control plane |
+
+All four are default-deny, and each is owned by a different party, so no single
+compromise is sufficient.
+
+### The API
+
+| Route | Permission | What |
+|---|---|---|
+| `POST …/agent/{id}/ssh` | `SSH_DEVICE` (gate 2) | Ask for a session. 200 with where to dial, or with which gate refused |
+| `PUT …/agent/{id}/ssh-policy` | `MANAGE_AGENTS` | Gate 3. Deciding a device *may* be SSHed into is a management act, distinct from being allowed to do it |
+| `GET`/`PUT …/ssh-settings` | `MANAGE_AGENTS` / `MANAGE_TENANT` | Gate 1. Writing needs the higher bar — one switch governs the org |
+
+The device-originated leg (`rc:ssh.request`, for `roomler ssh` from a laptop's
+LocalAPI) goes through the **same** `dispatch`, so there is exactly one place
+the gates are evaluated regardless of how a request arrived.
+
+A refusal is the server's last word — the session runs over a path it is not
+on, so there is no equivalent of exec's device-reported error. Every failure is
+therefore enumerated and answered synchronously, each naming which gate said
+no; "denied" without a reason turns a five-second config fix into a support
+ticket.
 
 ### How a grant works (P3a — shipped)
 
@@ -155,7 +176,8 @@ record, which a key-list session cannot.
 | P1 | Transport seam (`SplitTun`, netstack termination) | **shipped** |
 | P2 | russh server, publickey auth, `exec` via the exec engine | **shipped** |
 | P3a | Wire protocol (`rc:ssh.request` / `.grant` / `.response`), `SshPolicy` + `SshMode` + `SshAccountMode` models, `SSH_DEVICE` bit, agent-side grant table + redemption, `ssh` capability | **shipped** |
-| P3b | The server half: `agent_ssh.rs::authorize` (gates 1-3), hub routing, the `ssh_policy` admin API + UI, and the `roomler ssh` CLI leg that originates a request | next |
+| P3b | The server half: `agent_ssh.rs` (gates 1-3 + grant minting), hub push, the `ssh_policy` + org-settings API, and the `rc:ssh.request` device leg | **shipped** |
+| P3c | Admin UI for the two policies, and `exec_audit`-style auditing of SSH grants (today a denial is logged, not persisted) | next |
 | P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | designed |
 | P5 | Local-account mapping + privilege drop (Windows: console-session token via `system_context`; Unix: setuid) | designed |
 | P6 | `roomler ssh <name>`, netmap-verified host keys (no TOFU), stdio `ProxyCommand` | designed |
