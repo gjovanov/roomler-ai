@@ -1530,9 +1530,27 @@ impl OverlayRuntime {
                     // A withheld floor (mux down / peer not capable) falls
                     // through to the whole ladder unchanged; DERP-strategy
                     // pairs skip the redundant TURN request.
+                    // rc.412 (#24) — the gate is `is_derping`, NOT
+                    // `is_tracking`. This walk only sees peers with NO
+                    // installed carrier, and "carrier-less while a better
+                    // tier coordinates" is the exact state the floor exists
+                    // to cover — the block itself fires `coord.request(...)`
+                    // right below, so floor-plus-in-flight-request is the
+                    // designed combination, not a conflict. Gating on
+                    // `is_tracking` instead starved the pairs that need it
+                    // most: `request` for a `SingleRelay(false)` dialer just
+                    // inserts into `dialing` and returns — no allocation, no
+                    // wire message, nothing that can time out — so a peer
+                    // whose anchor never advertises `R` stayed tracked, and
+                    // therefore floor-less, forever (pc50045's secondary org
+                    // under corp VPN, 2026-08-19: four peers blocked from the
+                    // moment the VPN killed their direct carriers, while the
+                    // one peer on a Derp strategy stayed healthy). A DERPING
+                    // peer is still excluded — its link is the same carrier
+                    // over the same mux, arriving via `maybe_complete`.
                     if let Some(coord) = relay.as_mut()
                         && !relay_bq.in_flight.contains_key(&np.node_id)
-                        && !coord.is_tracking(&np.node_id)
+                        && !coord.is_derping(&np.node_id)
                         && !coord.is_floored(&np.node_id)
                         && let Some(link) = coord.build_floor(np.node_id, &cfg)
                     {
