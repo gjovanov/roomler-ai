@@ -43,6 +43,15 @@ import {
   DEFAULT_MAX_DECODE_QUEUE,
   type CtxMode,
 } from './rc-hop-stats'
+import {
+  FsrRenderer,
+  computeRenderTarget,
+  normalizeSharpenMode,
+  normalizeSharpness,
+  DEFAULT_RCAS_SHARPNESS,
+  type RenderPass,
+  type SharpenMode,
+} from './rc-fsr-render'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
@@ -67,6 +76,11 @@ type InitCanvasMessage = {
    *  `roomler-rc-max-queue`). Sticks across the idempotent visible-canvas
    *  re-init (which omits it), like `ctxMode`. */
   maxQueue?: number
+  /** P7 — FSR sharpening mode (localStorage `roomler-rc-sharpen`).
+   *  Sticks across the idempotent visible-canvas re-init, like `ctxMode`. */
+  sharpen?: string
+  /** P7 — RCAS sharpness stops (localStorage `roomler-rc-fsr-sharpness`). */
+  sharpness?: number
 }
 type ChunkMessage = {
   type: 'chunk'
@@ -74,8 +88,19 @@ type ChunkMessage = {
   /** P1 — main-thread epoch timestamp for the main→worker forwarding hop. */
   sentAt?: number
 }
+/** P7 — the canvas element's CSS box + devicePixelRatio, reported by the
+ *  composable's ResizeObserver. Drives the FSR backing-store sizing policy;
+ *  until the first report the worker stays on the 1:1 blit path. */
+type ViewportMessage = { type: 'viewport'; cssW: number; cssH: number; dpr: number }
+/** P7 — live sharpen-mode/sharpness change from the settings UI. */
+type RenderModeMessage = { type: 'render-mode'; sharpen?: string; sharpness?: number }
 type CloseMessage = { type: 'close' }
-type IncomingMessage = InitCanvasMessage | ChunkMessage | CloseMessage
+type IncomingMessage =
+  | InitCanvasMessage
+  | ChunkMessage
+  | ViewportMessage
+  | RenderModeMessage
+  | CloseMessage
 
 const HEADER_BYTES = 13
 const FLAG_KEYFRAME = 0x01
@@ -225,6 +250,28 @@ const decodeStats = new HopStats()
 let outGapMaxMs = 0
 const pendingDecodeAt = new Map<number, number>()
 
+// P7 — FSR sharpening state (see rc-fsr-render.ts). The renderer is created
+// lazily on the first frame that needs it; a GL failure disposes it and the
+// next frame re-creates (bounded by MAX_FSR_REBUILDS, then the session goes
+// permanently 2D with a one-shot `render-fallback` breadcrumb). The visible
+// canvas stays 2D throughout, so every failure lands on the byte-identical
+// legacy path the same frame.
+const MAX_FSR_REBUILDS = 3
+let sharpenMode: SharpenMode = 'auto'
+let sharpness = DEFAULT_RCAS_SHARPNESS
+let viewport: { cssW: number; cssH: number; dpr: number } | null = null
+let fsr: FsrRenderer | null = null
+let fsrUnavailable = false
+let fsrRebuilds = 0
+let lastRenderPass: RenderPass = 'blit'
+
+function reportFsrFallback(reason: string): void {
+  fsrUnavailable = true
+  fsr?.dispose()
+  fsr = null
+  workerScope.postMessage({ type: 'render-fallback', reason })
+}
+
 function maybeEmitStats(): void {
   const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
   const elapsed = now - statsLastEmitMs
@@ -247,6 +294,11 @@ function maybeEmitStats(): void {
     decode: decodeStats.snapshotAndReset(),
     outGapMaxMs: round1(outGapMaxMs),
     ctxMode,
+    // P7 — the active render path + actual backing size, for the stats
+    // pill ("· FSR") and the diag HUD (`fsr@2048x1280`).
+    render: lastRenderPass === 'easu-rcas' ? 'fsr' : lastRenderPass === 'rcas' ? 'rcas' : '2d',
+    renderW: canvas?.width ?? 0,
+    renderH: canvas?.height ?? 0,
   })
   outGapMaxMs = 0
   statsBytesInWindow = 0
@@ -275,6 +327,9 @@ workerScope.onmessage = (e) => {
     if (msg.maxQueue !== undefined) {
       maxDecodeQueue = normalizeIntKnob(msg.maxQueue, DEFAULT_MAX_DECODE_QUEUE, 1, 60)
     }
+    // P7 — FSR knobs stick across the idempotent visible re-init like ctxMode.
+    if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
+    if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
     ctx = canvas.getContext('2d', ctxOptionsFor(ctxMode))
     if (typeof msg.codec === 'string' && msg.codec.length > 0) {
       activeCodec = msg.codec
@@ -287,6 +342,12 @@ workerScope.onmessage = (e) => {
       decodePref = msg.decodePref
     }
     initDecoder()
+  } else if (msg.type === 'viewport') {
+    // P7 — cache the element box; the sizing policy runs per paint.
+    viewport = { cssW: msg.cssW, cssH: msg.cssH, dpr: msg.dpr }
+  } else if (msg.type === 'render-mode') {
+    if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
+    if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
   } else if (msg.type === 'chunk') {
     framesReceived++
     if (typeof msg.sentAt === 'number') fwdStats.add(epochNowMs() - msg.sentAt)
@@ -578,14 +639,54 @@ function paintFrame(frame: VideoFrame, w: number, h: number): void {
     return
   }
   try {
-    if (canvas.width !== w) canvas.width = w
-    if (canvas.height !== h) canvas.height = h
-    // rc.100 — pass the explicit dest rect. The bare `drawImage(frame, 0, 0)`
-    // uses the frame's `displayWidth/Height` as its natural size, which is
-    // exactly the shrunken value we're routing around on the NVDEC-bug path;
-    // an explicit dest of the render size (coded for the rewrapped spurious
-    // case, visible for a trusted alignment crop) keeps the output 1:1.
-    ctx.drawImage(frame, 0, 0, w, h)
+    // P7 — FSR sharpening upscale (see rc-fsr-render.ts). The sizing policy
+    // is pure and ns-cheap, so it runs per paint: a mid-stream resolution
+    // flip (the agent rebuilds on rung changes) or a window resize just
+    // yields a different target next frame. `blit` is the pre-P7 path,
+    // byte-identical; any GL failure falls back to it the SAME frame.
+    const target = computeRenderTarget(
+      w,
+      h,
+      viewport?.cssW ?? 0,
+      viewport?.cssH ?? 0,
+      viewport?.dpr ?? 1,
+      fsrUnavailable ? 'off' : sharpenMode,
+    )
+    let painted = false
+    if (target.pass !== 'blit') {
+      if (!fsr && !fsrUnavailable) {
+        fsr = FsrRenderer.create()
+        if (!fsr) reportFsrFallback('webgl2-unavailable')
+      }
+      if (fsr) {
+        const src = fsr.render(frame, w, h, target.w, target.h, target.pass, sharpness)
+        if (src) {
+          if (canvas.width !== target.w) canvas.width = target.w
+          if (canvas.height !== target.h) canvas.height = target.h
+          ctx.drawImage(src, 0, 0, target.w, target.h)
+          lastRenderPass = target.pass
+          painted = true
+        } else {
+          // Lost/failed GL — dispose so the next frame lazily re-creates a
+          // fresh context; after MAX_FSR_REBUILDS the session goes 2D.
+          fsr.dispose()
+          fsr = null
+          fsrRebuilds++
+          if (fsrRebuilds > MAX_FSR_REBUILDS) reportFsrFallback('gl-context-lost')
+        }
+      }
+    }
+    if (!painted) {
+      if (canvas.width !== w) canvas.width = w
+      if (canvas.height !== h) canvas.height = h
+      // rc.100 — pass the explicit dest rect. The bare `drawImage(frame, 0, 0)`
+      // uses the frame's `displayWidth/Height` as its natural size, which is
+      // exactly the shrunken value we're routing around on the NVDEC-bug path;
+      // an explicit dest of the render size (coded for the rewrapped spurious
+      // case, visible for a trusted alignment crop) keeps the output 1:1.
+      ctx.drawImage(frame, 0, 0, w, h)
+      lastRenderPass = 'blit'
+    }
   } catch {
     /* canvas lost mid-teardown */
   } finally {
@@ -618,6 +719,14 @@ function teardown(): void {
   fwdStats.snapshotAndReset()
   decodeStats.snapshotAndReset()
   outGapMaxMs = 0
+  // P7 — release the GL renderer; a fresh session re-creates lazily and
+  // gets a fresh unavailability verdict (a new tab/GPU state may differ).
+  fsr?.dispose()
+  fsr = null
+  fsrUnavailable = false
+  fsrRebuilds = 0
+  lastRenderPass = 'blit'
+  viewport = null
   assembler.headerHave = 0
   assembler.payloadBuf = null
   assembler.payloadHave = 0
