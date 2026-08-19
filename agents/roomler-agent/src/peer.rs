@@ -2348,6 +2348,10 @@ async fn media_pump_vp9_444_dc(
     // rc.190 — one-shot (per value) log marker for the agent-side resolution
     // caps, so the field log explains WHY the stream is smaller than asked.
     let mut res_cap_logged: Option<TargetResolution> = None;
+    // P7 — downscale-stage timing (this pump has no per-stage accumulators
+    // like the ffmpeg pump's rc.88 trio, so track ops explicitly).
+    let mut scale_us: u64 = 0;
+    let mut scale_ops: u64 = 0;
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
@@ -2718,7 +2722,10 @@ async fn media_pump_vp9_444_dc(
             );
             res_cap_logged = Some(effective_target);
         }
+        let scale_start = std::time::Instant::now();
         let frame = apply_target_resolution(frame, effective_target);
+        scale_us += scale_start.elapsed().as_micros() as u64;
+        scale_ops += 1;
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the caps can pick a smaller target than
         // the controller asked for, so TargetResolution alone is stale).
@@ -3166,6 +3173,11 @@ async fn media_pump_vp9_444_dc(
             let frames_sent = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
             let bytes_written = bytes_written.load(std::sync::atomic::Ordering::Relaxed);
             let send_errors = send_errors.load(std::sync::atomic::Ordering::Relaxed);
+            // P7 — avg downscale cost over this window (Lanczos at deep rungs
+            // is the only heavy stage that isn't the SW encoder itself).
+            let avg_scale_ms = (scale_us / scale_ops.max(1)) as f64 / 1000.0;
+            scale_us = 0;
+            scale_ops = 0;
             info!(
                 %session_id,
                 target_fps,
@@ -3174,6 +3186,7 @@ async fn media_pump_vp9_444_dc(
                 send_errors, dc_unopen_drops,
                 frames_skipped_backpressure,
                 scene_change_keyframes,
+                avg_scale_ms,
                 target_bps = last_applied_bitrate,
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
@@ -3504,6 +3517,10 @@ async fn media_pump_ffmpeg_dc(
     let mut capture_us: u64 = 0;
     let mut encode_us: u64 = 0;
     let mut send_us: u64 = 0;
+    // P7 — downscale stage joins the trio: the Lanczos floor now admits the
+    // deeper Smoother shrinks, so avg_scale_ms is the field evidence that
+    // the filter fits (or doesn't fit) this host's 30 fps budget.
+    let mut scale_us: u64 = 0;
     // rc.93 — count Ok(None) ticks (capturer had no new frame). Replaces
     // the rc.92 floor-sleep accumulator now that the pump floor is gone. A
     // high frames_empty *under motion* would mean the capture backend (not
@@ -3867,7 +3884,9 @@ async fn media_pump_ffmpeg_dc(
             );
             res_cap_logged = Some(effective_target);
         }
+        let scale_start = std::time::Instant::now();
         let frame = apply_target_resolution(frame, effective_target);
+        scale_us += scale_start.elapsed().as_micros() as u64;
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the relay cap can pick a smaller target
         // than the controller asked for).
@@ -4217,6 +4236,7 @@ async fn media_pump_ffmpeg_dc(
             let send_errors = send_errors.load(std::sync::atomic::Ordering::Relaxed);
             let window_frames = frames_encoded.saturating_sub(heartbeat_frames_base).max(1);
             let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
+            let avg_scale_ms = (scale_us / window_frames) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
             let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
             // rc.186 — step the encode-pressure controller off this window's
@@ -4236,12 +4256,13 @@ async fn media_pump_ffmpeg_dc(
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
                 frames_skipped_backpressure, frames_empty,
-                avg_capture_ms, avg_encode_ms, avg_send_ms,
+                avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 encode_factor,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
             capture_us = 0;
+            scale_us = 0;
             encode_us = 0;
             send_us = 0;
         }
@@ -4983,14 +5004,20 @@ fn apply_target_resolution(
         // than produce a mis-formatted downscale.
         return frame;
     }
-    // rc.191 — filter selection by ratio. Box averaging is correct (and
-    // cheap) for big shrinks, but at near-native ratios it blends
-    // fractional neighbours into ClearType mush (field: relay 0.67× and
-    // fit 0.75× looked "blurred/pixely"). Lanczos-3 keeps edge contrast
-    // through those ratios at a few extra ms. Kill switch
-    // `ROOMLER_AGENT_LANCZOS=0` reverts to box everywhere.
+    // rc.191 — filter selection by ratio; P7 (2026-08-20) — the floor is now
+    // env-tunable and deep enough to cover the Smoother rungs. Box averaging
+    // blends fractional neighbours into ClearType mush at ANY non-integer
+    // ratio (rc.191 field: relay 0.67× and fit 0.75× "blurred/pixely" — and
+    // the Smoother 1024 cap, 1920→1024 = 0.533×, fell straight through the
+    // old `> 0.55` gate onto box: the exact text-mush case Lanczos was added
+    // for). The Lanczos-3 kernel anti-aliases correctly at any shrink
+    // (support = 3·ratio, see lanczos3_taps) and its cost is ~flat in depth
+    // (the horizontal pass is ≈24·src_area MACs — taps ∝ 1/scale cancels
+    // dst_w ∝ scale), so the real cost driver is SOURCE area, not ratio.
+    // Kill switches: `ROOMLER_AGENT_LANCZOS=0` (box everywhere),
+    // `ROOMLER_AGENT_LANCZOS_MIN_PCT=56` (restore the pre-P7 gate).
     let scale = (tw as f32 / frame.width as f32).min(th as f32 / frame.height as f32);
-    let downscaled = if scale > 0.55 && lanczos_enabled() {
+    let downscaled = if use_lanczos_for_scale(scale, lanczos_min_scale(), lanczos_enabled()) {
         downscale_bgra_lanczos3(&frame.data, frame.width, frame.height, frame.stride, tw, th)
     } else {
         downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th)
@@ -5291,6 +5318,28 @@ fn lanczos_enabled() -> bool {
     )
 }
 
+/// P7 (2026-08-20) — minimum linear scale (as percent) at which the
+/// Lanczos-3 downscale engages; shallower shrinks below it fall back to the
+/// box filter. Default 34 covers the Smoother rungs (1920→1024 = 53%,
+/// 2560→1024 = 40%) while leaving 4K sources on box (3840→1024 = 27%,
+/// 3840→1280 = 33%, deliberately just under) — at ≤1/3 scale text is
+/// sub-readable regardless of filter, and the horizontal pass over an
+/// 8.3 MP source (~26–50 ms) would eat the 30 fps capture budget. `0` runs
+/// Lanczos for every downscale; `56` restores the pre-P7 `> 0.55` gate.
+fn lanczos_min_scale() -> f32 {
+    let pct = std::env::var("ROOMLER_AGENT_LANCZOS_MIN_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(34);
+    (pct.min(100) as f32) / 100.0
+}
+
+/// P7 — the filter decision, extracted for tests. Inclusive floor so a
+/// percent knob maps exactly (scale 0.34 passes a 34 floor).
+fn use_lanczos_for_scale(scale: f32, min_scale: f32, enabled: bool) -> bool {
+    enabled && scale >= min_scale
+}
+
 /// rc.191 — per-output-pixel Lanczos-3 tap table for one axis, in Q12
 /// fixed point. For downscaling the kernel is stretched by `src/dst`
 /// (support = 3·src/dst source pixels per output pixel); weights are
@@ -5342,15 +5391,19 @@ fn lanczos3_taps(src: u32, dst: u32) -> Vec<(i32, Vec<i32>)> {
     out
 }
 
-/// rc.191 — separable Lanczos-3 downscale for BGRA frames. The box filter
-/// below is right for BIG shrinks (≥2×, wide averaging is the correct
-/// anti-alias); at near-native ratios (relay 0.67×, fit 0.75-0.85×) it
-/// blends fractional neighbours into ClearType mush — the field
-/// "blurred/pixely text" report. Lanczos-3 keeps edge contrast through
-/// those ratios. Q12 integer accumulation (i32), horizontal pass into an
-/// i16 intermediate, vertical pass back to u8 with clamping (the kernel
-/// has negative lobes). Cost ≈ 10-20 ms for the 0.67-0.85× cases on a
-/// laptop core — inside a 30 fps budget; the >2× cases stay on box.
+/// rc.191 — separable Lanczos-3 downscale for BGRA frames. P7 (2026-08-20):
+/// the kernel is a true scaled Lanczos (support = 3·ratio via lanczos3_taps)
+/// so it anti-aliases correctly at ANY shrink — box is never *more* correct,
+/// only cheaper; box survives below the `lanczos_min_scale` floor purely as
+/// a CPU guard for huge (4K+) sources. Cost model (measured 10-20 ms at
+/// 0.67-0.85× on ~2.3 MP sources; the horizontal pass is ≈24·src_area MACs
+/// independent of ratio, the vertical pass shrinks with scale, total
+/// ≈ 24·src_area·(1+scale)): 1920×1200→1024×640 ≈ 9-17 ms and
+/// 2560×1600→1024×640 ≈ 14-28 ms on a laptop core — inside the 33 ms/30 fps
+/// budget; `avg_scale_ms` in the pump heartbeats is the field evidence.
+/// Q12 integer accumulation (i32), horizontal pass into an i16
+/// intermediate, vertical pass back to u8 with clamping (the kernel has
+/// negative lobes).
 fn downscale_bgra_lanczos3(
     src: &[u8],
     src_w: u32,
@@ -7389,6 +7442,60 @@ mod tests {
         let some = super::pack_dims(1280, 800);
         assert_eq!(super::cursor_scale_from_dims(0, some), (1.0, 1.0));
         assert_eq!(super::cursor_scale_from_dims(some, 0), (1.0, 1.0));
+    }
+
+    // P7 (2026-08-20) — the Lanczos gate must cover the Smoother rungs. The
+    // pre-P7 `scale > 0.55` gate sent the MAIN field case (Priority=Smoother
+    // on a 1920×1200 panel → 1024×640 = 0.533×) to the box filter — the
+    // exact ClearType-mush case Lanczos was added for in rc.191.
+    #[test]
+    fn lanczos_gate_covers_smoother_rungs() {
+        // Default floor 0.34: the Smoother rungs take Lanczos…
+        assert!(super::use_lanczos_for_scale(0.533, 0.34, true)); // 1920→1024
+        assert!(super::use_lanczos_for_scale(0.40, 0.34, true)); // 2560→1024
+        assert!(super::use_lanczos_for_scale(0.34, 0.34, true)); // inclusive floor
+        // …while 4K sources stay on box (a CPU guard, not quality policy).
+        assert!(!super::use_lanczos_for_scale(0.333, 0.34, true)); // 3840→1280
+        assert!(!super::use_lanczos_for_scale(0.267, 0.34, true)); // 3840→1024
+        // Kill switch wins regardless of ratio.
+        assert!(!super::use_lanczos_for_scale(0.75, 0.34, false));
+    }
+
+    // P7 — the Q12 weight normalisation must hold at the newly-admitted
+    // deep ratio: a constant-colour field survives 1920×1200 → 1024×640
+    // exactly (any drift would band flat UI backgrounds).
+    #[test]
+    fn lanczos_flat_field_roundtrip_at_deep_ratio() {
+        let (sw, sh, dw, dh) = (1920u32, 1200u32, 1024u32, 640u32);
+        let mut src = vec![0u8; (sw * sh * 4) as usize];
+        for px in src.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0x20, 0x80, 0xC0, 0xFF]);
+        }
+        let dst = super::downscale_bgra_lanczos3(&src, sw, sh, sw * 4, dw, dh);
+        assert_eq!(dst.len(), (dw * dh * 4) as usize);
+        for px in dst.chunks_exact(4) {
+            assert_eq!(px, [0x20, 0x80, 0xC0, 0xFF]);
+        }
+    }
+
+    // P7 — lock the kernel-stretch behaviour the extended gate relies on:
+    // at ratio r = src/dst the support is 3·r source pixels per side, so an
+    // interior output pixel must see ≈2·3·r taps, and every row must still
+    // sum to exactly 4096 (Q12) — the flat-field guarantee at any ratio.
+    #[test]
+    fn lanczos_taps_support_grows_with_ratio() {
+        let taps = super::lanczos3_taps(1920, 1024); // r = 1.875 → support 5.625
+        let (_lo, ws) = &taps[512]; // interior pixel, no edge clamping
+        let expected = (2.0 * 3.0 * 1.875) as usize; // 11
+        assert!(
+            ws.len() >= expected && ws.len() <= expected + 2,
+            "taps at r=1.875: {} (expected ≈{})",
+            ws.len(),
+            expected
+        );
+        for (_, ws) in &taps {
+            assert_eq!(ws.iter().sum::<i32>(), 4096);
+        }
     }
 
     // rc.190 — agent-side resolution caps (B1 relay hard / B2 SW soft).
