@@ -306,8 +306,16 @@ jobs:
           cache-on-failure: true
       - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
         run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
-      - name: Clippy roomler-agent (overlay-l3, incl. tests)
-        run: cargo clippy -p roomler-agent --features overlay-l3 --tests -- -D warnings
+      # `ssh-server` is in the set because this is the ONLY lane that lints the
+      # Windows ConPTY implementation — it is `#[cfg(windows)]` AND behind that
+      # feature, so every Linux lane compiles straight past it. It ships in all
+      # four release feature sets, so without this a lint failure there would
+      # surface at TAG time, on the slowest possible feedback loop. `overlay-l3`
+      # stays in the same invocation deliberately: it is what makes tunnel-core's
+      # helpers reachable, and dropping it turns pre-existing dead-code warnings
+      # into errors that have nothing to do with the change under test.
+      - name: Clippy roomler-agent (overlay-l3 + ssh-server, incl. tests)
+        run: cargo clippy -p roomler-agent --features overlay-l3,ssh-server --tests -- -D warnings
 
   frontend:
     name: Frontend checks
