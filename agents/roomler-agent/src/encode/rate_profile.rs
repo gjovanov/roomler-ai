@@ -404,6 +404,23 @@ pub const REFINE_REF_AREA: u64 = 1024 * 640;
 /// where the area ratio would otherwise count sub-KB caret noise).
 pub const REFINE_MIN_BYTES_FLOOR: usize = 2048;
 
+/// P8a — damaged-AREA significance floor, in permille of the frame,
+/// for backends that report tracked damage (DXGI-direct metadata, WGC
+/// DirtyRegions). Area is rung-INVARIANT (the same content damages the
+/// same fraction at any encode rung), so this leg can't oscillate the
+/// way a byte floor can — and it's judged at CAPTURE time, before the
+/// viewer-rate divisor skip, closing that blind spot for tracked
+/// motion. Calibration: caret ≈0.2 ‰ of 1920×1200, a keystroke glyph
+/// run ≈1-5 ‰, a completion popup ≈20-50 ‰, a quarter-screen terminal
+/// scroll ≈250 ‰. Per-mille (not percent): the interesting band is
+/// sub-percent. Env `ROOMLER_AGENT_IDLE_REFINE_MIN_AREA_PERMILLE`
+/// (0 = any non-empty tracked damage counts). The BYTES leg
+/// (`REFINE_MIN_FRAME_KB`) stays the fallback for untracked frames and
+/// the Down-guard for small-area/high-byte content (PiP video): a
+/// frame is judged by area when tracked-and-over-floor, else by bytes
+/// — never both.
+pub const REFINE_MIN_AREA_PERMILLE: u32 = 50;
+
 /// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
 /// a scroll/drag; typing produces 100-200 ms gaps and never chains).
 pub const REFINE_MOTION_GAP: Duration = Duration::from_millis(80);
@@ -448,6 +465,8 @@ pub struct IdleRefine {
     /// Encoded-size floor for a frame to count as motion (P7c). 0 = every
     /// real frame counts (the pre-P7c behaviour).
     min_frame_bytes: usize,
+    /// Damaged-area floor in permille for tracked frames (P8a).
+    min_area_permille: u32,
     refined: bool,
     /// Length of the current ≤`REFINE_MOTION_GAP`-chained run.
     run: u32,
@@ -459,10 +478,11 @@ pub struct IdleRefine {
 }
 
 impl IdleRefine {
-    pub fn new(enabled: bool, min_frame_bytes: usize) -> Self {
+    pub fn new(enabled: bool, min_frame_bytes: usize, min_area_permille: u32) -> Self {
         Self {
             enabled,
             min_frame_bytes,
+            min_area_permille,
             refined: false,
             run: 0,
             last_real: None,
@@ -471,9 +491,11 @@ impl IdleRefine {
         }
     }
 
-    /// Kill switch `ROOMLER_AGENT_IDLE_REFINE=0` (or `false`); significance
-    /// threshold `ROOMLER_AGENT_IDLE_REFINE_MIN_FRAME_KB` (0 = count every
-    /// real frame). node_env so the config-surface keys reach both reads.
+    /// Kill switch `ROOMLER_AGENT_IDLE_REFINE=0` (or `false`); byte floor
+    /// `ROOMLER_AGENT_IDLE_REFINE_MIN_FRAME_KB` (0 = count every real
+    /// frame); area floor `ROOMLER_AGENT_IDLE_REFINE_MIN_AREA_PERMILLE`
+    /// (0 = any non-empty tracked damage). node_env so the config-surface
+    /// keys reach every read.
     pub fn from_env() -> Self {
         let enabled = !matches!(
             tunnel_core::env::node_env("IDLE_REFINE")
@@ -484,7 +506,11 @@ impl IdleRefine {
         let min_kb = tunnel_core::env::node_env("IDLE_REFINE_MIN_FRAME_KB")
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(REFINE_MIN_FRAME_KB);
-        Self::new(enabled, min_kb as usize * 1024)
+        let min_area_pm = tunnel_core::env::node_env("IDLE_REFINE_MIN_AREA_PERMILLE")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.min(1000))
+            .unwrap_or(REFINE_MIN_AREA_PERMILLE);
+        Self::new(enabled, min_kb as usize * 1024, min_area_pm)
     }
 
     /// Whether the pump should currently run WITHOUT the resolution cap.
@@ -517,12 +543,12 @@ impl IdleRefine {
     }
 
     /// A real (damage-carrying) frame was encoded to `encoded_bytes` on the
-    /// wire at `encode_area` pixels. Returns `Some(Down)` exactly when a
-    /// refined session must drop back to the capped rung. Sub-threshold
-    /// frames (caret, keystrokes, hover highlights, small persistent
-    /// animations — judged against the rung-scaled floor) are ignored
-    /// entirely: they don't chain the run, fill the window, or block the
-    /// up-flip.
+    /// wire at `encode_area` pixels — the BYTES significance leg. Returns
+    /// `Some(Down)` exactly when a refined session must drop back to the
+    /// capped rung. Sub-threshold frames (caret, keystrokes, hover
+    /// highlights, small persistent animations — judged against the
+    /// rung-scaled floor) are ignored entirely: they don't chain the run,
+    /// fill the window, or block the up-flip.
     pub fn note_real_frame(
         &mut self,
         now: Instant,
@@ -532,6 +558,34 @@ impl IdleRefine {
         if !self.enabled || encoded_bytes < self.scaled_min_bytes(encode_area) {
             return None;
         }
+        self.note_significant(now)
+    }
+
+    /// P8a — the AREA significance leg, for frames whose backend reported
+    /// tracked damage. Fed at CAPTURE time (before the viewer-rate divisor
+    /// skip — tracked motion counts even when the frame is shed), with the
+    /// damaged area in permille of the frame. Area is rung-invariant, so
+    /// this leg cannot oscillate across encode rungs. Empty damage (0 ‰)
+    /// never counts; the floor is `min_area_permille` (0 = any non-empty
+    /// tracked damage). The pump feeds a frame to exactly ONE leg — this
+    /// one when tracked-and-over-floor, else the bytes leg (double-noting
+    /// would halve the effective Down thresholds).
+    pub fn note_real_frame_area(&mut self, now: Instant, area_permille: u32) -> Option<RefineFlip> {
+        if !self.enabled || area_permille == 0 || area_permille < self.min_area_permille {
+            return None;
+        }
+        self.note_significant(now)
+    }
+
+    /// Whether a tracked frame with `area_permille` damage clears the area
+    /// floor — the pump uses this to decide WHICH leg judges the frame.
+    pub fn area_significant(&self, area_permille: u32) -> bool {
+        area_permille > 0 && area_permille >= self.min_area_permille
+    }
+
+    /// Shared core of both significance legs: chain the run, fill the
+    /// window, and Down-flip a refined session under sustained motion.
+    fn note_significant(&mut self, now: Instant) -> Option<RefineFlip> {
         self.run = match self.last_real {
             Some(t) if now.duration_since(t) <= REFINE_MOTION_GAP => self.run.saturating_add(1),
             _ => 1,
@@ -853,7 +907,11 @@ mod tests {
     const SMALL: usize = 2_000;
 
     fn refine() -> IdleRefine {
-        IdleRefine::new(true, REFINE_MIN_FRAME_KB as usize * 1024)
+        IdleRefine::new(
+            true,
+            REFINE_MIN_FRAME_KB as usize * 1024,
+            REFINE_MIN_AREA_PERMILLE,
+        )
     }
 
     /// Drive `n` real frames of `bytes` at a fixed `gap`, asserting no Down
@@ -983,7 +1041,7 @@ mod tests {
     fn zero_threshold_restores_legacy_counting() {
         // min_frame_bytes = 0 (env IDLE_REFINE_MIN_FRAME_KB=0): every real
         // frame counts, so a small-frame trickle blocks the up-flip again.
-        let mut r = IdleRefine::new(true, 0);
+        let mut r = IdleRefine::new(true, 0, REFINE_MIN_AREA_PERMILLE);
         let mut now = t0();
         for _ in 0..10 {
             let _ = r.note_real_frame(now, SMALL, REFINE_REF_AREA);
@@ -1182,6 +1240,91 @@ mod tests {
         assert!(downed, "real motion at native must still down-flip");
     }
 
+    // ── P8a — the AREA significance leg ────────────────────────────────
+
+    #[test]
+    fn area_leg_scroll_downs_and_caret_stays_invisible() {
+        // Tracked damage at capture cadence: a quarter-screen scroll
+        // (≈250 ‰) must Down a refined session within the run rule; a
+        // caret blink (≈0.2 ‰ → rounds to 1 ‰, under the 50 ‰ floor)
+        // must neither Down nor block the up-flip.
+        let mut r = refine();
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // Caret trickle: invisible to the machine.
+        let mut t = now + Duration::from_secs(1);
+        for _ in 0..20 {
+            assert!(!r.area_significant(1));
+            assert_eq!(r.note_real_frame_area(t, 1), None);
+            t += Duration::from_millis(530);
+        }
+        assert!(r.refined());
+        // Scroll burst at 30 fps, 250 ‰ damage: run rule fires by ~8.
+        let mut downed = false;
+        for _ in 0..12 {
+            if r.note_real_frame_area(t, 250) == Some(RefineFlip::Down) {
+                downed = true;
+                break;
+            }
+            t += Duration::from_millis(33);
+        }
+        assert!(downed, "area-significant scroll must down-flip");
+        // Typing (sub-floor area) doesn't hold the blur; the window
+        // drains and the up-flip lands once the cooldown allows.
+        let mut t2 = t + Duration::from_millis(160);
+        let mut refined_at = None;
+        while t2.duration_since(t) <= Duration::from_secs(8) {
+            let _ = r.note_real_frame_area(t2, 3);
+            if r.on_keepalive(true, t2 + Duration::from_millis(60)) == Some(RefineFlip::Up) {
+                refined_at = Some(t2);
+                break;
+            }
+            t2 += Duration::from_millis(160);
+        }
+        assert!(refined_at.is_some(), "sub-floor area must not hold blur");
+    }
+
+    #[test]
+    fn area_floor_zero_counts_any_tracked_damage_but_never_empty() {
+        let mut r = IdleRefine::new(true, REFINE_MIN_FRAME_KB as usize * 1024, 0);
+        // 0 ‰ = provably-unchanged frame: never significant, even at
+        // floor 0.
+        assert!(!r.area_significant(0));
+        assert_eq!(r.note_real_frame_area(t0(), 0), None);
+        // 1 ‰ (any non-empty damage) counts at floor 0.
+        assert!(r.area_significant(1));
+        let mut now = t0();
+        for _ in 0..10 {
+            let _ = r.note_real_frame_area(now, 1);
+            now += Duration::from_millis(160);
+        }
+        assert_eq!(r.on_keepalive(true, now), None, "trickle blocks at floor 0");
+    }
+
+    #[test]
+    fn pip_video_small_area_big_bytes_still_downs_via_the_bytes_leg() {
+        // The red-team case: a PiP video is ~25 ‰ of the frame (under
+        // the 50 ‰ area floor) but encodes 30-60 KB/frame at native.
+        // The pump routes sub-area frames to the BYTES leg, which must
+        // still Down. (The pump-side routing is `area_significant` —
+        // false here — so this exercises exactly that path.)
+        let mut r = refine();
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert!(!r.area_significant(25), "PiP is under the area floor");
+        const NATIVE_AREA: u64 = 1920 * 1200;
+        let mut t = now + Duration::from_secs(1);
+        let mut downed = false;
+        for _ in 0..15 {
+            if r.note_real_frame(t, 50_000, NATIVE_AREA) == Some(RefineFlip::Down) {
+                downed = true;
+                break;
+            }
+            t += Duration::from_millis(33);
+        }
+        assert!(downed, "bytes leg must keep the PiP Down-guard");
+    }
+
     #[test]
     fn scaled_floor_tracks_encode_area_with_an_absolute_floor() {
         let r = refine();
@@ -1194,7 +1337,7 @@ mod tests {
         // …but never below the absolute floor (caret noise stays invisible).
         assert_eq!(r.scaled_min_bytes(320 * 200), REFINE_MIN_BYTES_FLOOR);
         // Legacy count-everything (floor 0) never scales.
-        let legacy = IdleRefine::new(true, 0);
+        let legacy = IdleRefine::new(true, 0, REFINE_MIN_AREA_PERMILLE);
         assert_eq!(legacy.scaled_min_bytes(1920 * 1200), 0);
     }
 
@@ -1211,7 +1354,7 @@ mod tests {
 
     #[test]
     fn disabled_never_flips() {
-        let mut r = IdleRefine::new(false, 0);
+        let mut r = IdleRefine::new(false, 0, 0);
         let mut now = t0();
         for _ in 0..50 {
             assert_eq!(r.on_keepalive(true, now), None);
