@@ -5,9 +5,10 @@ without distributing `authorized_keys`, and without opening a port on the host.
 The roomler answer to [Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh)
 — with one capability theirs does not have: **it works on Windows.**
 
-Status: **P1, P2, P3, P5a, P5b and P5c shipped** — transport, server, the full
-four-gate authorization path, and the privilege model on both Windows and Unix.
-P4 (PTY), P6 (client) and P7 (SFTP) are designed, not built.
+Status: **P1, P2, P3, P5a-d and P4a shipped** — transport, server, the full
+four-gate authorization path, the privilege model on both Windows and Unix,
+operator consent, and interactive shells on Unix. **P4b (PTY on Windows)** is
+next; P6 (client) and P7 (SFTP) are designed, not built.
 
 **Field-proven on `CORPLAP-3`** (a corp-managed laptop with no `sshd`, all
 three firewall profiles enabled, and WSL holding loopback `:22`): a session
@@ -101,7 +102,7 @@ trains operators to accept unknown fingerprints, which is exactly the habit that
 makes host verification worthless. The fingerprint is logged at start-up so it
 can be pinned out of band.
 
-## 3. What a session can do today (P2)
+## 3. What a session can do today
 
 - `ssh <node> <command>` — routed through the daemon's existing
   [`exec`](fleet-rpc.md) engine, so it inherits the wall-clock timeout, the
@@ -109,12 +110,54 @@ can be pinned out of band.
   process-tree kill. An SSH transport is not a reason to reimplement any of
   that. The cost: output arrives when the command finishes rather than
   streaming, because the engine buffers to enforce its ceiling.
-- Everything else is **refused with a stated reason on stderr**: PTY and shell
-  (P4), SFTP — and therefore `scp` — (P7). A bare channel failure reads as
+- **`ssh <node>` — a real interactive shell on a real terminal (P4a, Unix).**
+  See below.
+- Still **refused with a stated reason on stderr**: PTY and shell on *Windows*
+  (P4b), SFTP — and therefore `scp` — (P7). A bare channel failure reads as
   "administratively prohibited", which is indistinguishable from a policy
   denial; `scp` silently hanging is a much worse diagnostic than "not
   implemented yet". Port forwarding (`-L`, `-R`) is rejected by russh's own
   defaults, promptly and cleanly.
+
+### Interactive sessions (P4a — Unix)
+
+`ssh <node>` allocates a pty, runs a login shell on it, streams both ways, and
+reflows when the client window changes. `agents/roomler-agent/src/pty.rs`.
+
+**A pty session deliberately does not go through the exec engine.** The engine
+buffers a command's whole output to enforce a ceiling and returns it at the
+end — correct for one-shot commands, and the exact opposite of what an
+interactive session needs, where the output *is* the interaction. So a terminal
+session has **no output ceiling and no wall-clock timeout**. It keeps the parts
+that still apply: the same `RunAs` identity model (via the same
+`exec::apply_run_as`, so every refusal is identical and there is not a second
+privilege story for shells), the same operator-consent gate, and process-group
+teardown.
+
+Mechanics worth knowing:
+
+- **`openpty`, not `posix_openpt`.** The latter needs `ptsname_r`, which does
+  not exist on macOS. `openpty` is one call, declared for both platforms, and on
+  glibc ≥ 2.34 needs no `-lutil`. Fewer moving parts across a boundary CI never
+  compiles — macOS builds only at release-tag time.
+- **The parent must close the slave** after spawning, or reads on the master
+  never see EOF and a session whose shell exited would hang forever.
+- **Linux reports `EIO`, not EOF**, on a master whose slave has been closed.
+  Treated as end-of-session; treating it as an error would surface every normal
+  shell exit as a transport failure.
+- **The child `setsid`s and claims the tty**, so Ctrl-C signals the session's
+  process group and not the daemon's.
+- **Teardown signals the group with SIGHUP**, not just the shell — killing only
+  the shell orphans whatever it was running, which keeps the pty alive.
+- The terminal is allocated when the **shell starts**, not when `pty_request`
+  arrives: that is when the identity is known and consent has settled, so a
+  session about to be refused never gets a pty or a process.
+
+⚠️ **Windows is P4b.** ConPTY (`CreatePseudoConsole` +
+`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`) is a different
+mechanism; until it lands, a PTY request there is refused with that reason.
+This is the platform where roomler SSH matters most — CORPLAP-3 cannot host `sshd` at
+all — so P4b is the next slice, not an afterthought.
 
 ### Which account a session runs as (P5a)
 
@@ -271,7 +314,8 @@ is needed. The device owner already consented by listing the key and setting
 | P5b | Windows console-user sessions (`WTSQueryUserToken` + `CreateProcessAsUserW` with captured output) | **shipped** rc.418, field-proven |
 | P5c | `ssh_account_mode` — key-list sessions obey an explicit identity instead of silently taking the daemon's | **shipped** rc.419, field-proven |
 | P5d | `SshPolicy.consent_mode` honoured — a policy of `prompt` now prompts, and refuses when nobody can be asked | **shipped** |
-| P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | next |
+| P4a | PTY / interactive shell on **Unix** (`openpty`, login shell, resize, group teardown) | **shipped** |
+| P4b | The same on **Windows** — ConPTY + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`. The platform that needs this most | next |
 | P6 | `roomler ssh <name>`, netmap-verified host keys (no TOFU), stdio `ProxyCommand` | designed |
 | P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
 | P8 | Audit + session recording + admin UI | designed |
