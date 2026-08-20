@@ -1759,6 +1759,7 @@ async fn media_pump(
                     encoded_dims,
                     viewer_report,
                     priority,
+                    false,
                 )
                 .await;
             }
@@ -1797,6 +1798,10 @@ async fn media_pump(
                     encoded_dims,
                     viewer_report,
                     priority,
+                    // P7 — the viewer's 4:4:4 request (Rext, hevc_nvenc only;
+                    // rc:session.request `chroma_pref`, previously honoured
+                    // only by the VP9-444 transport).
+                    matches!(chroma_pref.as_deref(), Some("yuv444")),
                 )
                 .await;
             }
@@ -1835,6 +1840,7 @@ async fn media_pump(
                     encoded_dims,
                     viewer_report,
                     priority,
+                    false,
                 )
                 .await;
             }
@@ -1895,6 +1901,7 @@ async fn media_pump(
                         encoded_dims,
                         viewer_report,
                         priority,
+                        false,
                     )
                     .await;
                 }
@@ -2603,7 +2610,20 @@ async fn run_ffmpeg_dc_session(
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
     viewer_report: Arc<std::sync::atomic::AtomicU32>,
     priority: Arc<std::sync::atomic::AtomicU8>,
+    // P7 — the viewer's HEVC Rext 4:4:4 request (chroma_pref == "yuv444" on
+    // the hevc transport). Keys the shared pipeline (a Rext stream and a
+    // Main-profile stream configure DIFFERENT viewer decoders and must
+    // never share an encoder — the Vp9Dc chroma-keyed precedent) and is
+    // threaded into the pump.
+    chroma444: bool,
 ) {
+    // P7 — chroma-discriminated hard-profile label (HEVC only; every other
+    // codec ignores the flag).
+    let profile_label: &'static str = if chroma444 && matches!(codec, FfmpegDcCodec::Hevc) {
+        "HEVC-444"
+    } else {
+        codec.label()
+    };
     loop {
         let sink = crate::media_share::FollowerSink {
             session_id,
@@ -2618,7 +2638,7 @@ async fn run_ffmpeg_dc_session(
             encoded_dims: encoded_dims.clone(),
         };
         if let Some(guard) = crate::media_share::try_join(
-            crate::media_share::PipelineKey::FfmpegDc(codec.label()),
+            crate::media_share::PipelineKey::FfmpegDc(profile_label),
             sink,
             ffmpeg_target_fps(false),
         ) {
@@ -2646,6 +2666,7 @@ async fn run_ffmpeg_dc_session(
             encoded_dims,
             viewer_report,
             priority,
+            chroma444,
         )
         .await;
     }
@@ -2891,6 +2912,10 @@ async fn media_pump_vp9_444_dc(
     // rc.190 — one-shot (per value) log marker for the agent-side resolution
     // caps, so the field log explains WHY the stream is smaller than asked.
     let mut res_cap_logged: Option<TargetResolution> = None;
+    // P7 — downscale-stage timing (this pump has no per-stage accumulators
+    // like the ffmpeg pump's rc.88 trio, so track ops explicitly).
+    let mut scale_us: u64 = 0;
+    let mut scale_ops: u64 = 0;
     let mut decode_skip_divisor: u32 = 1;
     let mut decode_skip_counter: u32 = 0;
     let mut frames_skipped_decode: u64 = 0;
@@ -3279,7 +3304,10 @@ async fn media_pump_vp9_444_dc(
             );
             res_cap_logged = Some(effective_target);
         }
+        let scale_start = std::time::Instant::now();
         let frame = apply_target_resolution(frame, effective_target);
+        scale_us += scale_start.elapsed().as_micros() as u64;
+        scale_ops += 1;
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the caps can pick a smaller target than
         // the controller asked for, so TargetResolution alone is stale).
@@ -3747,6 +3775,11 @@ async fn media_pump_vp9_444_dc(
             let frames_sent = frames_sent.load(std::sync::atomic::Ordering::Relaxed);
             let bytes_written = bytes_written.load(std::sync::atomic::Ordering::Relaxed);
             let send_errors = send_errors.load(std::sync::atomic::Ordering::Relaxed);
+            // P7 — avg downscale cost over this window (Lanczos at deep rungs
+            // is the only heavy stage that isn't the SW encoder itself).
+            let avg_scale_ms = (scale_us / scale_ops.max(1)) as f64 / 1000.0;
+            scale_us = 0;
+            scale_ops = 0;
             info!(
                 %session_id,
                 target_fps,
@@ -3755,6 +3788,7 @@ async fn media_pump_vp9_444_dc(
                 send_errors, dc_unopen_drops,
                 frames_skipped_backpressure,
                 scene_change_keyframes,
+                avg_scale_ms,
                 target_bps = last_applied_bitrate,
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
@@ -3791,19 +3825,28 @@ impl FfmpegDcCodec {
     /// Phase B — `fps` + `maxrate_bps` are the pump's per-session values
     /// (real `target_fps`, relay-aware ceiling), threaded into the encoder so
     /// its framerate + burst cap match the actual link instead of a fixed 30.
+    /// P7 — `cq_bias`: CQ sharpening steps for deep resolution rungs,
+    /// computed at each rebuild from encode-vs-native area
+    /// (`rate_profile::scale_cq_bias`). `chroma444`: the viewer's Rext
+    /// 4:4:4 request — HEVC-only (nvenc), silently 4:2:0 elsewhere; read
+    /// the returned encoder's `chroma444()` for the truth.
     fn open(
         self,
         w: u32,
         h: u32,
         fps: u32,
         maxrate_bps: usize,
+        cq_bias: u32,
+        chroma444: bool,
     ) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
         use crate::encode::ffmpeg::FfmpegEncoder;
         match self {
-            Self::Hevc => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps),
-            Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps),
-            Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps),
-            Self::H264 => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps),
+            Self::Hevc => {
+                FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps, cq_bias, chroma444)
+            }
+            Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps, cq_bias),
+            Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps, cq_bias),
+            Self::H264 => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps, cq_bias),
         }
     }
 
@@ -3827,10 +3870,11 @@ impl FfmpegDcCodec {
         }
     }
 
-    /// Chroma the FFmpeg path emits. `hevc_*` (Main profile), `vp9_qsv`
-    /// (profile 0) and `av1_*` (Main profile) are all 4:2:0 8-bit — the
-    /// 4:4:4 path stays on libvpx SW (`media_pump_vp9_444_dc`), never
-    /// this pump.
+    /// Default chroma the FFmpeg path emits: `vp9_qsv` (profile 0),
+    /// `av1_*` (Main) and `h264_*` are 4:2:0 8-bit. P7 — HEVC can also run
+    /// Rext 4:4:4 (hevc_nvenc); the pump overrides this default with the
+    /// ACTIVE encoder's `chroma444()` when building `rc:video-info`, so
+    /// the badge reports the truth even after an open-time fallback.
     fn wire_chroma(self) -> &'static str {
         "yuv420"
     }
@@ -3932,11 +3976,20 @@ async fn media_pump_ffmpeg_dc(
     // rc.199 — per-session Priority dial (`rc:priority`); resolves the relay
     // resolution cap this pump feeds `effective_target_resolution`.
     priority: Arc<std::sync::atomic::AtomicU8>,
+    // P7 — the viewer's `chroma_pref == "yuv444"` request. Only the HEVC
+    // codec honours it (Rext via hevc_nvenc, see FfmpegEncoder::
+    // new_hevc_adaptive); the other codecs ignore it. May silently fall
+    // back to 4:2:0 at open time — `rc:video-info` reports the truth.
+    chroma444: bool,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
 
     let codec_label = codec.label();
+    // P7 — the session's ACTIVE chroma: starts as the request (HEVC only),
+    // downgraded by the open-time fallback; drives the maxrate chroma
+    // factor + the video-info chroma string.
+    let mut hevc_444 = chroma444 && matches!(codec, FfmpegDcCodec::Hevc);
     // P5 — shared-floor pipeline: this pump is the OWNER for its hard
     // profile (transport codec). Same-profile sessions join as followers
     // through `run_ffmpeg_dc_session`; their inputs merge into this loop as
@@ -3945,8 +3998,14 @@ async fn media_pump_ffmpeg_dc(
     // out to them. Standalone (never followed) when the key was already
     // owned by another pump. Dropping it — including task abort at session
     // teardown — detaches all followers, which then re-dispatch.
+    // P7 — the key is chroma-discriminated for HEVC ("HEVC-444" vs "HEVC",
+    // mirroring run_ffmpeg_dc_session): a Rext stream and a Main-profile
+    // stream configure different viewer decoders and must never share.
+    // Keyed on the REQUEST (not the open-time fallback): followers joined
+    // the same requested profile, and a Rext-configured viewer decoder
+    // accepts a Main-profile bitstream if the open fell back.
     let pipeline = crate::media_share::Pipeline::register(
-        crate::media_share::PipelineKey::FfmpegDc(codec_label),
+        crate::media_share::PipelineKey::FfmpegDc(if hevc_444 { "HEVC-444" } else { codec_label }),
         session_id,
     );
     let mut last_viewers: usize = 0;
@@ -4034,6 +4093,16 @@ async fn media_pump_ffmpeg_dc(
     // NEO16→PC55331 2026-07-27: blur→crystal text pulse on all codecs,
     // most visible on av1_nvenc).
     let mut settle_kf = crate::encode::rate_profile::SettleKeyframeGate::from_env();
+    // P7 — idle native-rung refinement ("crisp at rest"): when the only
+    // reason we're below native is a resolution cap (Smoother; Balanced+relay
+    // behind an env opt-in) and the scene settles, lift the cap so the
+    // dims-keyed rebuild below ships one crisp native IDR; the first motion
+    // burst restores the cap in ~300 ms. Everything downstream is already
+    // plumbed: rebuild-on-dims-change → guaranteed IDR of the settled
+    // native `last_good_frame` (stored pre-downscale), aimd.force_reapply,
+    // video_info resend, encoded_dims → cursor scale. Kill switch
+    // `ROOMLER_AGENT_IDLE_REFINE=0`; see rate_profile::IdleRefine.
+    let mut idle_refine = crate::encode::rate_profile::IdleRefine::from_env();
     // rc.130 — 60 ms (was 1 s). Doubles as the SPARSE-INPUT DRAIN. With the
     // HW encoder's output queue capped to ~1 frame (encoder.rs delay=0 /
     // async_depth=1), re-feeding the last good frame here flushes the held
@@ -4115,6 +4184,10 @@ async fn media_pump_ffmpeg_dc(
     let mut capture_us: u64 = 0;
     let mut encode_us: u64 = 0;
     let mut send_us: u64 = 0;
+    // P7 — downscale stage joins the trio: the Lanczos floor now admits the
+    // deeper Smoother shrinks, so avg_scale_ms is the field evidence that
+    // the filter fits (or doesn't fit) this host's 30 fps budget.
+    let mut scale_us: u64 = 0;
     // rc.93 — count Ok(None) ticks (capturer had no new frame). Replaces
     // the rc.92 floor-sleep accumulator now that the pump floor is gone. A
     // high frames_empty *under motion* would mean the capture backend (not
@@ -4286,7 +4359,13 @@ async fn media_pump_ffmpeg_dc(
                     codec.wire_codec(),
                     enc_name,
                     true,
-                    codec.wire_chroma(),
+                    // P7 — report the ACTIVE chroma (the 4:4:4 request may
+                    // have fallen back to 4:2:0 at open time).
+                    if hevc_444 {
+                        "yuv444"
+                    } else {
+                        codec.wire_chroma()
+                    },
                     constrained,
                     native_w,
                     native_h,
@@ -4384,6 +4463,16 @@ async fn media_pump_ffmpeg_dc(
                 frames_captured += 1;
                 // Motion continues — the settle gate counts the episode.
                 settle_kf.note_real_frame();
+                // P7 — a sustained burst while refined restores the cap
+                // (the next cap application downscales again → rebuild).
+                if let Some(flip) = idle_refine.note_real_frame(std::time::Instant::now()) {
+                    info!(
+                        %session_id,
+                        codec_label,
+                        ?flip,
+                        "idle refine: motion burst — restoring resolution cap"
+                    );
+                }
                 arc
             }
             Ok(None) => {
@@ -4411,6 +4500,43 @@ async fn media_pump_ffmpeg_dc(
                             burst,
                             "idle-settle keyframe (motion burst ended)"
                         );
+                    }
+                    // P7 — idle-refine tick. Eligible = a cap below native is
+                    // actually clamping, the controller left resolution at
+                    // Native (an explicit rc:resolution pick is the user's —
+                    // never overridden), and the dial/transport scope allows
+                    // it. On Up, the cap application below lifts for THIS
+                    // keepalive frame — the rebuild ships the settled screen
+                    // as a crisp native IDR. The settle-KF above composes:
+                    // it resyncs the CURRENT rung at settle+60 ms; the
+                    // refined native IDR follows ~1 s later.
+                    {
+                        let now = std::time::Instant::now();
+                        let prio = priority.load(std::sync::atomic::Ordering::Relaxed);
+                        let (nw, nh) = unpack_dims(
+                            capture_native_dims.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        let cap_clamps = crate::encode::priority_relay_cap(prio, constrained)
+                            .is_some_and(|c| nw.max(nh) > c);
+                        let user_native = matches!(
+                            resolve_user_box(*target_resolution.lock().unwrap(), nw, nh),
+                            TargetResolution::Native
+                        );
+                        let eligible = nw > 0
+                            && cap_clamps
+                            && user_native
+                            && crate::encode::idle_refine_applies(prio, constrained);
+                        if let Some(flip) = idle_refine.on_keepalive(eligible, now) {
+                            info!(
+                                %session_id,
+                                codec_label,
+                                ?flip,
+                                native_w = nw,
+                                native_h = nh,
+                                "idle refine: scene settled — lifting resolution cap \
+                                 (crisp native IDR incoming)"
+                            );
+                        }
                     }
                     f.clone()
                 } else {
@@ -4477,19 +4603,32 @@ async fn media_pump_ffmpeg_dc(
         // smallest resolution request and the most conservative Priority cap
         // win while shared (the badge shows "shared ×N" to explain it).
         let user_target = pipeline.merged_target(*target_resolution.lock().unwrap());
+        // rc.199 — Priority-resolved relay cap (see the VP9-444 pump). This
+        // HW-encode pump has no SW soft cap, so Sharper reaches full native.
+        let mut hard_cap = pipeline.merged_priority_cap(
+            crate::encode::priority_relay_cap(
+                priority.load(std::sync::atomic::Ordering::Relaxed),
+                constrained,
+            ),
+            constrained,
+        );
+        // P7 — while idle-refined, the cap lifts (default: full native;
+        // ROOMLER_AGENT_IDLE_REFINE_MAX_EDGE bounds the refined rung). The
+        // dims change makes the rebuild below fire, whose first frame is a
+        // guaranteed IDR; scale_cq_bias recomputes to 0 at native so the
+        // refined IDR carries the base CQ (bounded size). Applied AFTER the
+        // P5 floor-merge — a refined settle lifts the SHARED encode (every
+        // viewer gets the crisp still); the first motion burst restores the
+        // merged cap. The encode-bound soft slot below still applies (an
+        // encoder that was saturating keeps its auto-downscale protection).
+        if idle_refine.refined() {
+            hard_cap = crate::encode::idle_refine_cap_long_edge();
+        }
         let effective_target = effective_target_resolution(
             user_target,
             frame.width,
             frame.height,
-            // rc.199 — Priority-resolved relay cap (see the VP9-444 pump). This
-            // HW-encode pump has no SW soft cap, so Sharper reaches full native.
-            pipeline.merged_priority_cap(
-                crate::encode::priority_relay_cap(
-                    priority.load(std::sync::atomic::Ordering::Relaxed),
-                    constrained,
-                ),
-                constrained,
-            ),
+            hard_cap,
             // 2026-07-27 — encode-bound auto-downscale tier (soft slot: an
             // explicit controller Fixed pick bypasses it by construction).
             auto_res_cap,
@@ -4506,7 +4645,12 @@ async fn media_pump_ffmpeg_dc(
             );
             res_cap_logged = Some(effective_target);
         }
+        // P7 — snapshot the native dims before the downscale shadows `frame`;
+        // the CQ bias at the rebuild site is keyed on encode-vs-native area.
+        let (native_w, native_h) = (frame.width, frame.height);
+        let scale_start = std::time::Instant::now();
         let frame = apply_target_resolution(frame, effective_target);
+        scale_us += scale_start.elapsed().as_micros() as u64;
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the relay cap can pick a smaller target
         // than the controller asked for).
@@ -4522,12 +4666,18 @@ async fn media_pump_ffmpeg_dc(
         // with. P3 — codec-factor-aware: H.264 gets a 150% band (equal text
         // sharpness needs ~1.5× the bits of HEVC/AV1); the relay clamp still
         // applies after the factor inside the fn.
+        // P7 — chroma factor composes with the codec factor (4:4:4 carries
+        // 2× the chroma samples; same ×1.5 band as the libvpx VP9-444 pump).
+        // The relay clamp still applies after, inside the fn.
+        let rate_factor_pct = crate::encode::rate_profile::codec_rate_factor_pct(codec.label())
+            * crate::encode::rate_profile::chroma_rate_factor_pct(hevc_444)
+            / 100;
         let base_ceiling = crate::encode::ffmpeg::encoder::ffmpeg_maxrate_bps_scaled(
             w,
             h,
             target_fps,
             constrained,
-            crate::encode::rate_profile::codec_rate_factor_pct(codec.label()),
+            rate_factor_pct,
         ) as u32;
         // rc.186 — apply the encode-pressure factor. When the encoder is
         // saturating (factor < 1.0) this feeds a lower ceiling to both the
@@ -4540,14 +4690,30 @@ async fn media_pump_ffmpeg_dc(
             None => true,
         };
         if need_rebuild {
-            match codec.open(w, h, target_fps, ceiling as usize) {
+            // P7 — deep-rung CQ sharpening, recomputed at every rebuild from
+            // the encode-vs-native area (0 at/near native, so a native
+            // rebuild keeps the base CQ). Env ROOMLER_AGENT_SCALE_CQ_BOOST.
+            let cq_bias = crate::encode::rate_profile::scale_cq_bias(
+                w,
+                h,
+                native_w,
+                native_h,
+                crate::encode::rate_profile::scale_cq_boost_steps(),
+            );
+            match codec.open(w, h, target_fps, ceiling as usize, cq_bias, hevc_444) {
                 Ok(enc) => {
                     let encoder_name = enc.name();
+                    // P7 — record the ACTIVE chroma (a 4:4:4 request may have
+                    // fallen back to 4:2:0 inside new_hevc_adaptive); feeds
+                    // the maxrate chroma factor and the video-info truth.
+                    hevc_444 = enc.chroma444();
                     info!(
                         %session_id,
                         codec_label,
                         width = w,
                         height = h,
+                        cq_bias,
+                        chroma444 = hevc_444,
                         encoder = encoder_name,
                         "FFmpeg DC pump: encoder (re)built"
                     );
@@ -4873,6 +5039,7 @@ async fn media_pump_ffmpeg_dc(
             let send_errors = send_errors.load(std::sync::atomic::Ordering::Relaxed);
             let window_frames = frames_encoded.saturating_sub(heartbeat_frames_base).max(1);
             let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
+            let avg_scale_ms = (scale_us / window_frames) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
             let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
             // rc.186 — step the encode-pressure controller off this window's
@@ -4909,12 +5076,13 @@ async fn media_pump_ffmpeg_dc(
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
                 frames_skipped_backpressure, frames_empty,
-                avg_capture_ms, avg_encode_ms, avg_send_ms,
+                avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 encode_factor,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
             capture_us = 0;
+            scale_us = 0;
             encode_us = 0;
             send_us = 0;
         }
@@ -5713,14 +5881,20 @@ fn apply_target_resolution(
         // than produce a mis-formatted downscale.
         return frame;
     }
-    // rc.191 — filter selection by ratio. Box averaging is correct (and
-    // cheap) for big shrinks, but at near-native ratios it blends
-    // fractional neighbours into ClearType mush (field: relay 0.67× and
-    // fit 0.75× looked "blurred/pixely"). Lanczos-3 keeps edge contrast
-    // through those ratios at a few extra ms. Kill switch
-    // `ROOMLER_AGENT_LANCZOS=0` reverts to box everywhere.
+    // rc.191 — filter selection by ratio; P7 (2026-08-20) — the floor is now
+    // env-tunable and deep enough to cover the Smoother rungs. Box averaging
+    // blends fractional neighbours into ClearType mush at ANY non-integer
+    // ratio (rc.191 field: relay 0.67× and fit 0.75× "blurred/pixely" — and
+    // the Smoother 1024 cap, 1920→1024 = 0.533×, fell straight through the
+    // old `> 0.55` gate onto box: the exact text-mush case Lanczos was added
+    // for). The Lanczos-3 kernel anti-aliases correctly at any shrink
+    // (support = 3·ratio, see lanczos3_taps) and its cost is ~flat in depth
+    // (the horizontal pass is ≈24·src_area MACs — taps ∝ 1/scale cancels
+    // dst_w ∝ scale), so the real cost driver is SOURCE area, not ratio.
+    // Kill switches: `ROOMLER_AGENT_LANCZOS=0` (box everywhere),
+    // `ROOMLER_AGENT_LANCZOS_MIN_PCT=56` (restore the pre-P7 gate).
     let scale = (tw as f32 / frame.width as f32).min(th as f32 / frame.height as f32);
-    let downscaled = if scale > 0.55 && lanczos_enabled() {
+    let downscaled = if use_lanczos_for_scale(scale, lanczos_min_scale(), lanczos_enabled()) {
         downscale_bgra_lanczos3(&frame.data, frame.width, frame.height, frame.stride, tw, th)
     } else {
         downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th)
@@ -6021,6 +6195,29 @@ fn lanczos_enabled() -> bool {
     )
 }
 
+/// P7 (2026-08-20) — minimum linear scale (as percent) at which the
+/// Lanczos-3 downscale engages; shallower shrinks below it fall back to the
+/// box filter. Default 34 covers the Smoother rungs (1920→1024 = 53%,
+/// 2560→1024 = 40%) while leaving 4K sources on box (3840→1024 = 27%,
+/// 3840→1280 = 33%, deliberately just under) — at ≤1/3 scale text is
+/// sub-readable regardless of filter, and the horizontal pass over an
+/// 8.3 MP source (~26–50 ms) would eat the 30 fps capture budget. `0` runs
+/// Lanczos for every downscale; `56` restores the pre-P7 `> 0.55` gate.
+fn lanczos_min_scale() -> f32 {
+    // node_env (not raw std::env) so the `lanczos_min_pct` config-surface
+    // key reaches this read through the fallback map.
+    let pct = node_env("LANCZOS_MIN_PCT")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(34);
+    (pct.min(100) as f32) / 100.0
+}
+
+/// P7 — the filter decision, extracted for tests. Inclusive floor so a
+/// percent knob maps exactly (scale 0.34 passes a 34 floor).
+fn use_lanczos_for_scale(scale: f32, min_scale: f32, enabled: bool) -> bool {
+    enabled && scale >= min_scale
+}
+
 /// rc.191 — per-output-pixel Lanczos-3 tap table for one axis, in Q12
 /// fixed point. For downscaling the kernel is stretched by `src/dst`
 /// (support = 3·src/dst source pixels per output pixel); weights are
@@ -6072,15 +6269,19 @@ fn lanczos3_taps(src: u32, dst: u32) -> Vec<(i32, Vec<i32>)> {
     out
 }
 
-/// rc.191 — separable Lanczos-3 downscale for BGRA frames. The box filter
-/// below is right for BIG shrinks (≥2×, wide averaging is the correct
-/// anti-alias); at near-native ratios (relay 0.67×, fit 0.75-0.85×) it
-/// blends fractional neighbours into ClearType mush — the field
-/// "blurred/pixely text" report. Lanczos-3 keeps edge contrast through
-/// those ratios. Q12 integer accumulation (i32), horizontal pass into an
-/// i16 intermediate, vertical pass back to u8 with clamping (the kernel
-/// has negative lobes). Cost ≈ 10-20 ms for the 0.67-0.85× cases on a
-/// laptop core — inside a 30 fps budget; the >2× cases stay on box.
+/// rc.191 — separable Lanczos-3 downscale for BGRA frames. P7 (2026-08-20):
+/// the kernel is a true scaled Lanczos (support = 3·ratio via lanczos3_taps)
+/// so it anti-aliases correctly at ANY shrink — box is never *more* correct,
+/// only cheaper; box survives below the `lanczos_min_scale` floor purely as
+/// a CPU guard for huge (4K+) sources. Cost model (measured 10-20 ms at
+/// 0.67-0.85× on ~2.3 MP sources; the horizontal pass is ≈24·src_area MACs
+/// independent of ratio, the vertical pass shrinks with scale, total
+/// ≈ 24·src_area·(1+scale)): 1920×1200→1024×640 ≈ 9-17 ms and
+/// 2560×1600→1024×640 ≈ 14-28 ms on a laptop core — inside the 33 ms/30 fps
+/// budget; `avg_scale_ms` in the pump heartbeats is the field evidence.
+/// Q12 integer accumulation (i32), horizontal pass into an i16
+/// intermediate, vertical pass back to u8 with clamping (the kernel has
+/// negative lobes).
 fn downscale_bgra_lanczos3(
     src: &[u8],
     src_w: u32,
@@ -8246,6 +8447,60 @@ mod tests {
         let some = super::pack_dims(1280, 800);
         assert_eq!(super::cursor_scale_from_dims(0, some), (1.0, 1.0));
         assert_eq!(super::cursor_scale_from_dims(some, 0), (1.0, 1.0));
+    }
+
+    // P7 (2026-08-20) — the Lanczos gate must cover the Smoother rungs. The
+    // pre-P7 `scale > 0.55` gate sent the MAIN field case (Priority=Smoother
+    // on a 1920×1200 panel → 1024×640 = 0.533×) to the box filter — the
+    // exact ClearType-mush case Lanczos was added for in rc.191.
+    #[test]
+    fn lanczos_gate_covers_smoother_rungs() {
+        // Default floor 0.34: the Smoother rungs take Lanczos…
+        assert!(super::use_lanczos_for_scale(0.533, 0.34, true)); // 1920→1024
+        assert!(super::use_lanczos_for_scale(0.40, 0.34, true)); // 2560→1024
+        assert!(super::use_lanczos_for_scale(0.34, 0.34, true)); // inclusive floor
+        // …while 4K sources stay on box (a CPU guard, not quality policy).
+        assert!(!super::use_lanczos_for_scale(0.333, 0.34, true)); // 3840→1280
+        assert!(!super::use_lanczos_for_scale(0.267, 0.34, true)); // 3840→1024
+        // Kill switch wins regardless of ratio.
+        assert!(!super::use_lanczos_for_scale(0.75, 0.34, false));
+    }
+
+    // P7 — the Q12 weight normalisation must hold at the newly-admitted
+    // deep ratio: a constant-colour field survives 1920×1200 → 1024×640
+    // exactly (any drift would band flat UI backgrounds).
+    #[test]
+    fn lanczos_flat_field_roundtrip_at_deep_ratio() {
+        let (sw, sh, dw, dh) = (1920u32, 1200u32, 1024u32, 640u32);
+        let mut src = vec![0u8; (sw * sh * 4) as usize];
+        for px in src.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0x20, 0x80, 0xC0, 0xFF]);
+        }
+        let dst = super::downscale_bgra_lanczos3(&src, sw, sh, sw * 4, dw, dh);
+        assert_eq!(dst.len(), (dw * dh * 4) as usize);
+        for px in dst.chunks_exact(4) {
+            assert_eq!(px, [0x20, 0x80, 0xC0, 0xFF]);
+        }
+    }
+
+    // P7 — lock the kernel-stretch behaviour the extended gate relies on:
+    // at ratio r = src/dst the support is 3·r source pixels per side, so an
+    // interior output pixel must see ≈2·3·r taps, and every row must still
+    // sum to exactly 4096 (Q12) — the flat-field guarantee at any ratio.
+    #[test]
+    fn lanczos_taps_support_grows_with_ratio() {
+        let taps = super::lanczos3_taps(1920, 1024); // r = 1.875 → support 5.625
+        let (_lo, ws) = &taps[512]; // interior pixel, no edge clamping
+        let expected = (2.0 * 3.0 * 1.875) as usize; // 11
+        assert!(
+            ws.len() >= expected && ws.len() <= expected + 2,
+            "taps at r=1.875: {} (expected ≈{})",
+            ws.len(),
+            expected
+        );
+        for (_, ws) in &taps {
+            assert_eq!(ws.iter().sum::<i32>(), 4096);
+        }
     }
 
     // rc.190 — agent-side resolution caps (B1 relay hard / B2 SW soft).

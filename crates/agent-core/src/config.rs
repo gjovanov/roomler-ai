@@ -441,6 +441,36 @@ pub struct AgentConfig {
     pub rate_factor_vp9: Option<u32>,
     #[serde(default)]
     pub rate_factor_av1: Option<u32>,
+    /// P7 — minimum linear downscale (percent) at which the Lanczos-3
+    /// filter engages; shallower shrinks fall back to box
+    /// (`ROOMLER_NODE_LANCZOS_MIN_PCT`). Built-in default: 34 — covers the
+    /// Smoother rungs; 56 restores the pre-P7 gate; 0 = Lanczos always.
+    #[serde(default)]
+    pub lanczos_min_pct: Option<u32>,
+    /// P7 — NVENC spatial AQ (`ROOMLER_NODE_NVENC_SPATIAL_AQ`).
+    /// Built-in default: OFF (AQ softens desktop text); `Some(true)`
+    /// restores it for camera-heavy hosts.
+    #[serde(default)]
+    pub nvenc_spatial_aq: Option<bool>,
+    /// P7 — CQ sharpening steps granted at deep resolution rungs
+    /// (`ROOMLER_NODE_SCALE_CQ_BOOST`). Built-in default: 4; 0 disables.
+    #[serde(default)]
+    pub scale_cq_boost: Option<u32>,
+    /// P7 — idle native-rung refinement: lift the resolution cap when the
+    /// scene settles so text is crisp at rest
+    /// (`ROOMLER_NODE_IDLE_REFINE`). Built-in default: on (Smoother scope).
+    #[serde(default)]
+    pub idle_refine: Option<bool>,
+    /// P7 — extend idle refinement to Balanced+relay sessions (lifts the
+    /// B1 physics cap at idle — field-validate first)
+    /// (`ROOMLER_NODE_IDLE_REFINE_BALANCED`). Built-in default: off.
+    #[serde(default)]
+    pub idle_refine_balanced: Option<bool>,
+    /// P7 — long-edge cap for the refined rung
+    /// (`ROOMLER_NODE_IDLE_REFINE_MAX_EDGE`). Built-in default: 0 = full
+    /// native.
+    #[serde(default)]
+    pub idle_refine_max_edge: Option<u32>,
     /// Media-ICE follow-renomination policy
     /// (`ROOMLER_ICE_FOLLOW_RENOMINATION`, raw env in the vendored
     /// webrtc-ice — bridged via a set_var-if-unset shim in `run_cmd`).
@@ -1339,6 +1369,12 @@ pub fn test_fixture() -> AgentConfig {
         rate_factor_hevc: None,
         rate_factor_vp9: None,
         rate_factor_av1: None,
+        lanczos_min_pct: None,
+        nvenc_spatial_aq: None,
+        scale_cq_boost: None,
+        idle_refine: None,
+        idle_refine_balanced: None,
+        idle_refine_max_edge: None,
         ice_follow_renomination: None,
         ice_warm_standby: None,
         ice_overlay_host_deprioritize: None,
@@ -1450,9 +1486,12 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 39] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 42] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
+        ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
+        ("IDLE_REFINE", cfg.idle_refine),
+        ("IDLE_REFINE_BALANCED", cfg.idle_refine_balanced),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
         ("OVERLAY_DERP", cfg.overlay_derp),
@@ -1499,13 +1538,16 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 39]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 7] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 10] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
         ("RATE_FACTOR_HEVC", cfg.rate_factor_hevc),
         ("RATE_FACTOR_VP9", cfg.rate_factor_vp9),
         ("RATE_FACTOR_AV1", cfg.rate_factor_av1),
+        ("LANCZOS_MIN_PCT", cfg.lanczos_min_pct),
+        ("SCALE_CQ_BOOST", cfg.scale_cq_boost),
+        ("IDLE_REFINE_MAX_EDGE", cfg.idle_refine_max_edge),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
     ]
