@@ -405,9 +405,14 @@ const KEYS: &[(&str, &str, &str)] = &[
         "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Defined at the 1024x640 reference rung and scaled by the live encode area (P7c-2 - a fixed floor oscillated across rungs). Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLER_NODE_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
     ),
     (
-        "idle_refine_min_area_permille",
+        "idle_refine_major_area_permille",
         "string",
-        "P8a - damaged-area floor (permille of the frame, 0-1000) for capture-tracked damage to count as motion in the idle-refine machine (DXGI-direct/WGC backends); rung-invariant, judged at capture time. Empty = built-in 50 (5%); 0 = any non-empty tracked damage counts. Env: ROOMLER_NODE_IDLE_REFINE_MIN_AREA_PERMILLE. Restart required.",
+        "P8a-2 - MAJOR-motion area floor (permille of the frame, 0-1000) on capture-tracked backends (DXGI-direct/WGC): only damage at/above it restores the resolution cap; smaller damage (typing, popups, windowed terminal scrolls, PiP video) stays at native so text is sharp all the time. Empty = built-in 400 (40%); 0 = any non-empty tracked damage counts (pre-P8a-2 posture). Env: ROOMLER_NODE_IDLE_REFINE_MAJOR_AREA_PERMILLE. Restart required.",
+    ),
+    (
+        "idle_refine_settle_ms",
+        "string",
+        "P8a-2 - up-flip settle (ms, 100-5000) on capture-tracked backends: the cap lifts this long after the last major-damage frame (damage truth needs no 1s window drain). Empty = built-in 500. Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_MS. Restart required.",
     ),
     (
         "ice_follow_renomination",
@@ -567,7 +572,10 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
-        "idle_refine_min_area_permille" => cfg.idle_refine_min_area_permille.map(|p| p.to_string()),
+        "idle_refine_major_area_permille" => {
+            cfg.idle_refine_major_area_permille.map(|p| p.to_string())
+        }
+        "idle_refine_settle_ms" => cfg.idle_refine_settle_ms.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
             .map(|b| if b { "always" } else { "never" }.to_string()),
@@ -867,8 +875,11 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine_min_frame_kb" => {
             cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
         }
-        "idle_refine_min_area_permille" => {
-            cfg.idle_refine_min_area_permille = parse_u32_range(key, value, 0, 1000)?
+        "idle_refine_major_area_permille" => {
+            cfg.idle_refine_major_area_permille = parse_u32_range(key, value, 0, 1000)?
+        }
+        "idle_refine_settle_ms" => {
+            cfg.idle_refine_settle_ms = parse_u32_range(key, value, 100, 5000)?
         }
         "ice_follow_renomination" => {
             cfg.ice_follow_renomination =
