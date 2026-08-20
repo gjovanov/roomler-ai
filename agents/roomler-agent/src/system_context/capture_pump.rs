@@ -723,7 +723,11 @@ fn dxgi_to_frame(f: DxgiFrame, start: Instant) -> Frame {
         data: f.bytes,
         monotonic_us: start.elapsed().as_micros() as u64,
         monitor: 0,
-        dirty_rects: vec![],
+        // P8a — the DXGI-direct backend reads the duplication metadata
+        // and reports authoritative damage; the scrap-wrapped backend
+        // can't (scrap's public API drops the frame info) and carries
+        // Unknown through the same field.
+        damage: f.damage,
     }
 }
 
@@ -736,7 +740,9 @@ fn gdi_to_frame(f: GdiFrame, start: Instant) -> Frame {
         data: f.bytes,
         monotonic_us: start.elapsed().as_micros() as u64,
         monitor: 0,
-        dirty_rects: vec![],
+        // GDI BitBlt has no damage concept — and it emits a frame on
+        // EVERY poll, so "a frame arrived" isn't motion evidence either.
+        damage: crate::capture::Damage::Unknown,
     }
 }
 
