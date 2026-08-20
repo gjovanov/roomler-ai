@@ -370,6 +370,36 @@ const KEYS: &[(&str, &str, &str)] = &[
         "AV1 maxrate ceiling factor, % (50-400). Env: ROOMLER_NODE_RATE_FACTOR_AV1. Empty = built-in 100. Restart required.",
     ),
     (
+        "lanczos_min_pct",
+        "string",
+        "P7 - minimum linear downscale (percent, 0-100) at which the Lanczos-3 text-sharp filter engages; shallower shrinks use box. Empty = built-in 34 (covers the Smoother rungs; 56 restores the pre-P7 gate; 0 = always). Env: ROOMLER_NODE_LANCZOS_MIN_PCT. Restart required.",
+    ),
+    (
+        "nvenc_spatial_aq",
+        "tribool",
+        "P7 - NVENC spatial AQ. Built-in default: OFF (AQ steals bits from desktop text); true restores it for camera-heavy hosts. Env: ROOMLER_NODE_NVENC_SPATIAL_AQ. Restart required.",
+    ),
+    (
+        "scale_cq_boost",
+        "string",
+        "P7 - CQ sharpening steps granted at deep resolution rungs (0-12; spends the maxrate-floor headroom on text). Empty = built-in 4; 0 disables. Env: ROOMLER_NODE_SCALE_CQ_BOOST. Restart required.",
+    ),
+    (
+        "idle_refine",
+        "tribool",
+        "P7 - idle native-rung refinement: lift the resolution cap when the scene settles so text is crisp at rest; motion restores it in ~300 ms. Built-in default: on (Smoother scope). Env: ROOMLER_NODE_IDLE_REFINE. Restart required.",
+    ),
+    (
+        "idle_refine_balanced",
+        "tribool",
+        "P7 - extend idle refinement to Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: off - field-validate first. Env: ROOMLER_NODE_IDLE_REFINE_BALANCED. Restart required.",
+    ),
+    (
+        "idle_refine_max_edge",
+        "string",
+        "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLER_NODE_IDLE_REFINE_MAX_EDGE. Restart required.",
+    ),
+    (
         "ice_follow_renomination",
         "enum:auto|always|never",
         "Media-ICE nomination-follow policy. auto (empty) = upward-only + stale-failover (recommended); always = legacy follow-everything (thrash-prone, diagnostics only); never = pin to first nomination. Env: ROOMLER_ICE_FOLLOW_RENOMINATION.",
@@ -520,6 +550,12 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "rate_factor_hevc" => cfg.rate_factor_hevc.map(|p| p.to_string()),
         "rate_factor_vp9" => cfg.rate_factor_vp9.map(|p| p.to_string()),
         "rate_factor_av1" => cfg.rate_factor_av1.map(|p| p.to_string()),
+        "lanczos_min_pct" => cfg.lanczos_min_pct.map(|p| p.to_string()),
+        "nvenc_spatial_aq" => cfg.nvenc_spatial_aq.map(fmt_bool),
+        "scale_cq_boost" => cfg.scale_cq_boost.map(|p| p.to_string()),
+        "idle_refine" => cfg.idle_refine.map(fmt_bool),
+        "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
+        "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
             .map(|b| if b { "always" } else { "never" }.to_string()),
@@ -810,6 +846,12 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "rate_factor_hevc" => cfg.rate_factor_hevc = parse_rate_factor(key, value)?,
         "rate_factor_vp9" => cfg.rate_factor_vp9 = parse_rate_factor(key, value)?,
         "rate_factor_av1" => cfg.rate_factor_av1 = parse_rate_factor(key, value)?,
+        "lanczos_min_pct" => cfg.lanczos_min_pct = parse_u32_range(key, value, 0, 100)?,
+        "nvenc_spatial_aq" => cfg.nvenc_spatial_aq = parse_tribool(value)?,
+        "scale_cq_boost" => cfg.scale_cq_boost = parse_u32_range(key, value, 0, 12)?,
+        "idle_refine" => cfg.idle_refine = parse_tribool(value)?,
+        "idle_refine_balanced" => cfg.idle_refine_balanced = parse_tribool(value)?,
+        "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
         "ice_follow_renomination" => {
             cfg.ice_follow_renomination =
                 match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
@@ -849,6 +891,28 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         other => return Err(format!("unknown or non-editable config key {other:?}")),
     }
     Ok(())
+}
+
+/// P7 — shared bounded-u32 parse for the plain numeric keys: empty clears
+/// (built-in applies), numeric must be within `lo..=hi`.
+fn parse_u32_range(
+    key: &str,
+    value: Option<&str>,
+    lo: u32,
+    hi: u32,
+) -> Result<Option<u32>, String> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(v) => {
+            let n: u32 = v
+                .parse()
+                .map_err(|_| format!("{key} must be a number (got {v:?})"))?;
+            if !(lo..=hi).contains(&n) {
+                return Err(format!("{key} must be between {lo} and {hi}"));
+            }
+            Ok(Some(n))
+        }
+    }
 }
 
 /// Shared parse/validate for the four `rate_factor_*` keys: empty clears
