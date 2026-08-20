@@ -89,6 +89,18 @@ pub struct AgentCaps {
     /// the empty value as `"yuv444"` for backward compat.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vp9_chroma: String,
+    /// P7 (2026-08-20) — chroma formats the agent's HEVC encoder can emit
+    /// on the `data-channel-hevc` transport. `"yuv420"` (Main profile —
+    /// every HEVC host) and `"yuv444"` (Rext profile — hevc_nvenc only;
+    /// NVENC supports HEVC 4:4:4 since Maxwell-gen2). The browser offers
+    /// its "HEVC · crisp text (4:4:4)" picker entry only when this list
+    /// contains `"yuv444"` AND its own WebCodecs Rext decode probe passes
+    /// (Chrome ≥137 + NVIDIA driver ≥572.16, or Intel Gen11+ ≥117 — there
+    /// is NO software HEVC fallback in Chrome). Empty / unset (older
+    /// agents, non-nvenc hosts) → the picker entry stays hidden and
+    /// sessions run Main-profile 4:2:0 exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hevc_chroma: Vec<String>,
     /// Audio codecs the agent can stream on the WebRTC audio track
     /// (system / desktop audio, opt-in per session). Empty / unset
     /// (older agents, or agents built without the `audio` feature)

@@ -122,6 +122,11 @@ fn compute_caps() -> AgentCaps {
 
     #[allow(unused_mut)]
     let mut transports: Vec<String> = Vec::new();
+    // P7 — chroma formats the HEVC DC transport can emit (see the probe's
+    // Ok arm below + AgentCaps::hevc_chroma). Stays empty when the ffmpeg
+    // HEVC probe fails or the feature is off.
+    #[allow(unused_mut)]
+    let mut hevc_chroma: Vec<String> = Vec::new();
 
     // rc.77 — FFmpeg HEVC over DataChannel.
     //
@@ -191,6 +196,16 @@ fn compute_caps() -> AgentCaps {
                 }
                 transports.push("data-channel-hevc".into());
                 hw_encoders.push(format!("ffmpeg-{name}"));
+                // P7 — HEVC 4:4:4 (Rext) is nvenc-only in v1 (NVENC has
+                // supported it since Maxwell-gen2; QSV Rext ENCODE is
+                // unreliable and AMF has none). Advertise both chromas so
+                // the browser can offer its "crisp text (4:4:4)" pick; the
+                // session-time open still falls back to 4:2:0 if the Rext
+                // open is rejected (driver / GPU-generation surprise).
+                hevc_chroma.push("yuv420".into());
+                if name == "hevc_nvenc" {
+                    hevc_chroma.push("yuv444".into());
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -417,6 +432,7 @@ fn compute_caps() -> AgentCaps {
         transports,
         files,
         vp9_chroma,
+        hevc_chroma,
         audio,
         apps,
         clipboard,
