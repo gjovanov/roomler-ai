@@ -611,15 +611,12 @@ mod tests {
     fn chroma_factor_composes_with_codec_factor() {
         assert_eq!(chroma_rate_factor_pct(true), 150);
         assert_eq!(chroma_rate_factor_pct(false), 100);
-        // HEVC 4:4:4 → 150; HEVC 4:2:0 → 100 (the pump's compose rule).
-        assert_eq!(
-            codec_rate_factor_pct("HEVC") * chroma_rate_factor_pct(true) / 100,
-            150
-        );
-        assert_eq!(
-            codec_rate_factor_pct("HEVC") * chroma_rate_factor_pct(false) / 100,
-            100
-        );
+        // The pump's compose rule at the HEVC built-in (125): 4:4:4 → 187 %
+        // of the base band; 4:2:0 leaves it unchanged. Literals only — the
+        // codec-factor env test above mutates ROOMLER_AGENT_RATE_FACTOR_HEVC
+        // and cargo runs tests in parallel threads.
+        assert_eq!(125 * chroma_rate_factor_pct(true) / 100, 187);
+        assert_eq!(125 * chroma_rate_factor_pct(false) / 100, 125);
     }
 
     #[test]
