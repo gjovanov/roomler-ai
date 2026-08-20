@@ -78,7 +78,13 @@ impl WinSize {
 /// Open a pty pair. Returns `(master, slave)` as owned fds.
 fn open_pty(size: WinSize) -> io::Result<(OwnedFd, OwnedFd)> {
     let size = size.sane();
-    let ws = libc::winsize {
+    // ⚠️ `mut`, and `*mut` pointers below, because the two platforms declare
+    // this differently: Linux takes `termp`/`winp` as `*const`, macOS as
+    // `*mut`. A `*mut` weakens to `*const` implicitly, so passing `*mut`
+    // satisfies BOTH; passing `*const` compiles on Linux and fails on macOS —
+    // which CI would never catch, since macOS only builds at release-tag time.
+    // (It didn't: this shape broke the rc.422 release and nothing before it.)
+    let mut ws = libc::winsize {
         ws_row: size.rows,
         ws_col: size.cols,
         ws_xpixel: 0,
@@ -94,8 +100,8 @@ fn open_pty(size: WinSize) -> io::Result<(OwnedFd, OwnedFd)> {
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            &ws,
+            std::ptr::null_mut(),
+            &mut ws,
         )
     };
     if rc != 0 {
