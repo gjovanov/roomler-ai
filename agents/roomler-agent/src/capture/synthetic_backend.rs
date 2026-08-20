@@ -21,7 +21,7 @@
 //! AND building with the `synthetic-frame-source` feature. Production
 //! agents (`full`, `full-hw` feature sets) never opt in.
 
-use crate::capture::{DownscalePolicy, Frame, PixelFormat, ScreenCapture};
+use crate::capture::{Damage, DirtyRect, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 use anyhow::Result;
 use std::time::{Duration, Instant};
 
@@ -128,7 +128,15 @@ impl ScreenCapture for SyntheticCapture {
             data,
             monotonic_us: (now - self.start).as_micros() as u64,
             monitor: 0,
-            dirty_rects: Vec::new(), // unknown = full-frame, matches scrap
+            // P8a — the shifting gradient repaints EVERY pixel each
+            // frame, so the honest tracked damage is the full frame.
+            // Also serves as the e2e oracle for the tracked path.
+            damage: Damage::Tracked(vec![DirtyRect {
+                x: 0,
+                y: 0,
+                w: FRAME_W,
+                h: FRAME_H,
+            }]),
         };
         self.counter += 1;
         Ok(Some(frame))

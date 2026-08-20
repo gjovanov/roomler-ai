@@ -343,7 +343,7 @@ mod tests {
             data,
             monotonic_us: 0,
             monitor: 0,
-            dirty_rects: Vec::new(),
+            damage: crate::capture::Damage::Unknown,
         }
     }
 

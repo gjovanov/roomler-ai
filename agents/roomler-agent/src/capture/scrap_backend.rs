@@ -22,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-use super::{DownscalePolicy, Frame, PixelFormat, ScreenCapture};
+use super::{Damage, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 pub const DEFAULT_TARGET_FPS: u32 = 30;
 
@@ -197,7 +197,7 @@ fn capture_one_blocking(
                     // dirty" / no ROI hints. WGC backend (1C.1) will
                     // populate this from Direct3D11CaptureFrame::
                     // DirtyRegion() once it lands.
-                    dirty_rects: Vec::new(),
+                    damage: Damage::Unknown,
                 }));
             }
             Err(e) if e.kind() == WouldBlock => {

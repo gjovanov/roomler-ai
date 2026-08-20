@@ -405,6 +405,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Defined at the 1024x640 reference rung and scaled by the live encode area (P7c-2 - a fixed floor oscillated across rungs). Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLER_NODE_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
     ),
     (
+        "idle_refine_min_area_permille",
+        "string",
+        "P8a - damaged-area floor (permille of the frame, 0-1000) for capture-tracked damage to count as motion in the idle-refine machine (DXGI-direct/WGC backends); rung-invariant, judged at capture time. Empty = built-in 50 (5%); 0 = any non-empty tracked damage counts. Env: ROOMLER_NODE_IDLE_REFINE_MIN_AREA_PERMILLE. Restart required.",
+    ),
+    (
         "ice_follow_renomination",
         "enum:auto|always|never",
         "Media-ICE nomination-follow policy. auto (empty) = upward-only + stale-failover (recommended); always = legacy follow-everything (thrash-prone, diagnostics only); never = pin to first nomination. Env: ROOMLER_ICE_FOLLOW_RENOMINATION.",
@@ -562,6 +567,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
+        "idle_refine_min_area_permille" => cfg.idle_refine_min_area_permille.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
             .map(|b| if b { "always" } else { "never" }.to_string()),
@@ -860,6 +866,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
         "idle_refine_min_frame_kb" => {
             cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
+        }
+        "idle_refine_min_area_permille" => {
+            cfg.idle_refine_min_area_permille = parse_u32_range(key, value, 0, 1000)?
         }
         "ice_follow_renomination" => {
             cfg.ice_follow_renomination =
