@@ -158,6 +158,12 @@ pub struct DxgiFrame {
     /// Bytes per row. Always `width * 4` on the DXGI path; carried
     /// explicitly so callers don't have to remember.
     pub stride: u32,
+    /// P8a — per-frame damage truth. The adapter-bound direct backend
+    /// reads the duplication metadata (`GetFrameMoveRects` /
+    /// `GetFrameDirtyRects`) and reports `Tracked`; the scrap-wrapped
+    /// backend cannot (scrap's public API drops the frame info) and
+    /// always reports `Unknown`.
+    pub damage: crate::capture::Damage,
 }
 
 /// Uniform interface over the two DXGI Desktop Duplication backends —
@@ -259,6 +265,7 @@ impl DxgiDupBackend {
                     width: self.width,
                     height: self.height,
                     stride,
+                    damage: crate::capture::Damage::Unknown,
                 })
             }
             Err(e) => Err(BackendBail::from_io(e)),
