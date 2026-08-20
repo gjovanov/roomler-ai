@@ -103,7 +103,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "ssh_authorized_keys",
         "list",
-        "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access).",
+        "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access). Set ssh_account_mode too, or these keys authenticate and run nothing.",
     ),
     (
         "ssh_account_mode",

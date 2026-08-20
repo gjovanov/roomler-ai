@@ -120,10 +120,14 @@ pub struct AgentConfig {
     /// in `authorized_keys` form (`ssh-ed25519 AAAA… comment`).
     ///
     /// **Empty means nobody**, which is why [`Self::ssh_enabled`] alone cannot
-    /// let anyone in. P3 replaces this as the primary path with server-minted,
+    /// let anyone in. P3 replaced this as the primary path with server-minted,
     /// short-lived session grants tied to a roomler user — but the list stays
     /// as the break-glass route for when the control plane is the thing that is
     /// broken, which is exactly when a remote shell is most wanted.
+    ///
+    /// ⚠️ A key here is only half of it: set [`Self::ssh_account_mode`] too, or
+    /// the session authenticates and then runs nothing. Break-glass access that
+    /// silently ran as SYSTEM/root is what that key exists to end.
     ///
     /// Reaching the port at all already requires clearing WireGuard as an
     /// enrolled peer of this org; this is the second, device-owned factor.

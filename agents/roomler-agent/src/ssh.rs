@@ -501,12 +501,8 @@ mod sshd {
 
             let handle = session.handle();
             let caller = self.caller_label();
-            // Resolve the identity from the GRANT, not from anything the
-            // client said. A key-list session has no grant and therefore no
-            // policy behind it, so it gets the daemon identity — which is what
-            // it already had, and what the config key's documentation warns
-            // about in those words.
-            // A grant carries the server policy's account mode and is
+            // Resolve the identity from the server, never from anything the
+            // client said. A grant carries the server policy's account mode and is
             // authoritative for its own session. A key-list session has no
             // policy behind it, so it uses the device-owned `ssh_account_mode`
             // — and if the operator never chose one, it runs NOTHING rather
