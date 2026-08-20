@@ -493,6 +493,12 @@ fn rpc_caps() -> Vec<String> {
     let mut caps = vec!["exec".to_string(), "originate".to_string()];
     if cfg!(feature = "ssh-server") {
         caps.push("ssh".to_string());
+        // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise
+        // `ssh` while silently ignoring `SshPolicy.consent_mode` — the server
+        // refuses to store a non-auto consent policy for a device that cannot
+        // honour it, rather than hand an admin a rule that reads as enforced
+        // and isn't.
+        caps.push("ssh-consent".to_string());
     }
     caps
 }
