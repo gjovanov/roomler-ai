@@ -69,7 +69,7 @@ use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemIntero
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::{IInspectable, Interface};
 
-use super::{DirtyRect, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
+use super::{Damage, DirtyRect, DownscalePolicy, Frame, PixelFormat, ScreenCapture};
 
 /// Number of buffers in the frame pool. `2` is the canonical WGC
 /// default — one frame is being decoded by the OS while the other is
@@ -115,8 +115,13 @@ struct FramePayload {
     height: u32,
     stride: u32,
     captured_at: Instant,
-    dirty_rects: Vec<DirtyRect>,
+    damage: Damage,
 }
+
+/// Cap on accumulated damage rects (slot unions can grow the list). Past
+/// this the localisation is worthless — collapse to a full-frame rect,
+/// which stays motion-TRUE (over-reports area, never under).
+const MAX_DAMAGE_RECTS: usize = 256;
 
 pub struct WgcCapture {
     shared: Arc<SharedSlot>,
@@ -322,7 +327,7 @@ fn payload_to_frame(payload: FramePayload, monitor: u8, start: Instant) -> Frame
         data: payload.bgra,
         monotonic_us,
         monitor,
-        dirty_rects: payload.dirty_rects,
+        damage: payload.damage,
     }
 }
 
@@ -471,17 +476,19 @@ fn worker_main(
             let stride = w * 4;
 
             // DirtyRegions() lands on the IDirect3D11CaptureFrame2
-            // interface, Win 11 22000+. Older Windows → cast returns
-            // an error, we skip.
-            let dirty_rects = collect_dirty_rects(&frame, w, h);
+            // interface (newer Windows 11 SDK generations). Any failure
+            // to read a COMPLETE, non-empty region list degrades to
+            // Damage::Unknown — never a shorter "authoritative" list
+            // (P8a: under-reported damage reads as a false settle).
+            let damage = collect_damage(&frame, w, h);
 
-            let payload = FramePayload {
+            let mut payload = FramePayload {
                 bgra,
                 width: w,
                 height: h,
                 stride,
                 captured_at: Instant::now(),
-                dirty_rects,
+                damage,
             };
             let arrived = handler_shared
                 .arrived_total
@@ -489,8 +496,23 @@ fn worker_main(
                 + 1;
             let had_stale = {
                 let mut slot = handler_shared.latest.lock().unwrap();
-                let prev = slot.replace(payload);
-                prev.is_some()
+                // P8a — "latest wins" must not LOSE the stale payload's
+                // damage: the consumer's last-seen frame predates it, so
+                // the replacement's damage is a delta against a frame
+                // nobody read. Union the stale rects in; a dims mismatch
+                // (mid-session resize — different coordinate spaces) or
+                // an Unknown on either side degrades to Unknown.
+                let prev = slot.take();
+                let had_stale = prev.is_some();
+                if let Some(prev) = prev {
+                    payload.damage = union_damage(
+                        prev.damage,
+                        payload.damage,
+                        (prev.width, prev.height) == (payload.width, payload.height),
+                    );
+                }
+                *slot = Some(payload);
+                had_stale
             };
             if had_stale {
                 handler_shared
@@ -669,45 +691,80 @@ fn create_staging_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D1
     out.ok_or_else(|| anyhow!("CreateTexture2D returned null"))
 }
 
-/// Pull the per-frame dirty regions from the capture frame (Win 11
-/// 22000+ only). Returns `vec![]` when the cast to
-/// `IDirect3D11CaptureFrame2` fails (older OS) or the list is empty.
-/// Rects are clipped to the frame bounds so they're always valid
-/// `DirtyRect` values for downstream consumers.
-fn collect_dirty_rects(
+/// Pull the per-frame damage from the capture frame. `Tracked` only
+/// when a COMPLETE, non-empty region list was read; every degraded
+/// case is `Unknown` (P8a):
+/// - the `IDirect3D11CaptureFrame2` cast fails (OS without the API),
+/// - `Size()`/`GetAt` errors (a partial list would under-report damage
+///   — the false-settle direction),
+/// - the list is empty or fully clipped away: WGC frames arrive
+///   BECAUSE something changed, so "changed but zero damage" is
+///   self-contradictory — an OS build that systematically reports
+///   empty regions must fall back to the bytes leg, not silently
+///   disable motion detection.
+fn collect_damage(
     frame: &windows::Graphics::Capture::Direct3D11CaptureFrame,
     w: u32,
     h: u32,
-) -> Vec<DirtyRect> {
-    // The `Direct3D11CaptureFrame` methods `DirtyRegions` / `DirtyRegionMode`
-    // are accessed via the IDirect3D11CaptureFrame2 cast. windows-rs
-    // 0.58 wraps that transparently in the `.DirtyRegions()` method
-    // but the cast fails on Windows < 22000, in which case we get
-    // Err and fall back to an empty vec.
+) -> Damage {
     let Ok(view) = frame.DirtyRegions() else {
-        return Vec::new();
+        return Damage::Unknown;
     };
-    let mut out = Vec::new();
-    if let Ok(size) = view.Size() {
-        for i in 0..size {
-            let Ok(r) = view.GetAt(i) else { continue };
-            let x = r.X.max(0) as u32;
-            let y = r.Y.max(0) as u32;
-            let rw = r.Width.max(0) as u32;
-            let rh = r.Height.max(0) as u32;
-            if rw == 0 || rh == 0 {
-                continue;
-            }
-            let x = x.min(w);
-            let y = y.min(h);
-            let rw = rw.min(w.saturating_sub(x));
-            let rh = rh.min(h.saturating_sub(y));
-            if rw > 0 && rh > 0 {
-                out.push(DirtyRect { x, y, w: rw, h: rh });
-            }
+    let Ok(size) = view.Size() else {
+        return Damage::Unknown;
+    };
+    if size == 0 {
+        return Damage::Unknown;
+    }
+    let mut out = Vec::with_capacity((size as usize).min(MAX_DAMAGE_RECTS));
+    for i in 0..size {
+        let Ok(r) = view.GetAt(i) else {
+            return Damage::Unknown;
+        };
+        let x = (r.X.max(0) as u32).min(w);
+        let y = (r.Y.max(0) as u32).min(h);
+        let rw = (r.Width.max(0) as u32).min(w.saturating_sub(x));
+        let rh = (r.Height.max(0) as u32).min(h.saturating_sub(y));
+        if rw > 0 && rh > 0 {
+            out.push(DirtyRect { x, y, w: rw, h: rh });
         }
     }
-    out
+    if out.is_empty() {
+        return Damage::Unknown;
+    }
+    if out.len() > MAX_DAMAGE_RECTS {
+        return Damage::Tracked(vec![DirtyRect { x: 0, y: 0, w, h }]);
+    }
+    Damage::Tracked(out)
+}
+
+/// Merge a dropped-stale payload's damage into its replacement (P8a).
+/// `same_dims` false (mid-session resize) ⇒ the rect coordinate spaces
+/// differ ⇒ `Unknown`; `Unknown` on either side is contagious.
+fn union_damage(prev: Damage, next: Damage, same_dims: bool) -> Damage {
+    if !same_dims {
+        return Damage::Unknown;
+    }
+    match (prev, next) {
+        (Damage::Tracked(mut a), Damage::Tracked(mut b)) => {
+            a.append(&mut b);
+            if a.len() > MAX_DAMAGE_RECTS {
+                // Collapse to the bounding box — motion-true, coarse.
+                let x0 = a.iter().map(|r| r.x).min().unwrap_or(0);
+                let y0 = a.iter().map(|r| r.y).min().unwrap_or(0);
+                let x1 = a.iter().map(|r| r.x + r.w).max().unwrap_or(0);
+                let y1 = a.iter().map(|r| r.y + r.h).max().unwrap_or(0);
+                return Damage::Tracked(vec![DirtyRect {
+                    x: x0,
+                    y: y0,
+                    w: x1.saturating_sub(x0),
+                    h: y1.saturating_sub(y0),
+                }]);
+            }
+            Damage::Tracked(a)
+        }
+        _ => Damage::Unknown,
+    }
 }
 
 /// RAII guard that calls RoUninitialize on drop. Paired with the

@@ -43,13 +43,68 @@ pub struct Frame {
     /// Screen index that produced this frame. Matches `DisplayInfo::index`
     /// in the `rc:agent.hello` message.
     pub monitor: u8,
-    /// Per-frame dirty regions. Empty = unknown / full-frame; the
-    /// encoder treats every macroblock as potentially dirty in that
-    /// case (matches scrap behaviour today). Backends that expose a
-    /// dirty-rect API (Windows.Graphics.Capture, PipeWire damage
-    /// events) populate this so the encoder can apply ROI delta-QP
-    /// or skip encode entirely on idle frames (1F.1 / 1D.1).
-    pub dirty_rects: Vec<DirtyRect>,
+    /// Per-frame damage truth (P8a). An enum rather than a bare rect
+    /// list because the two empty states mean OPPOSITE things: no
+    /// information (treat every pixel as potentially dirty — the
+    /// pre-P8a contract) vs an authoritative "provably nothing
+    /// changed". Per-FRAME rather than a capturer capability because
+    /// the SystemContext pump swaps Dxgi↔Gdi backends mid-session
+    /// without the media pump reopening the capturer.
+    pub damage: Damage,
+}
+
+/// What the capture backend can say about WHICH pixels changed in this
+/// frame relative to the previous delivered frame.
+#[derive(Clone, Debug)]
+pub enum Damage {
+    /// No damage information — the backend can't say what changed
+    /// (scrap on every OS, GDI BitBlt, WGC on builds where
+    /// `DirtyRegions` is unavailable, or any per-frame metadata
+    /// anomaly on an otherwise-tracking backend). Consumers must treat
+    /// every pixel as potentially dirty.
+    Unknown,
+    /// Authoritative damage: `rects` is exactly what changed. An EMPTY
+    /// list means "provably nothing changed" (e.g. a frozen still) —
+    /// the inverse of `Unknown`, which is why this is not a plain Vec.
+    Tracked(Vec<DirtyRect>),
+}
+
+impl Damage {
+    /// The damage rects, empty for `Unknown` — callers that only need
+    /// "which regions might I skip" semantics (ROI hints) can treat
+    /// both empty cases identically; callers that need the tracked/
+    /// unknown distinction must match instead.
+    pub fn rects(&self) -> &[DirtyRect] {
+        match self {
+            Damage::Unknown => &[],
+            Damage::Tracked(v) => v,
+        }
+    }
+
+    /// Damaged area in permille of `frame_area` px. `None` when the
+    /// backend reported no damage info. Non-empty damage floors at 1 ‰
+    /// so "any tracked damage" thresholds can distinguish it from a
+    /// provably-unchanged frame (0 ‰). Sum of rect areas, capped at the
+    /// frame — overlap over-counts, which errs toward "significant"
+    /// (the safe direction for motion detection); producers guarantee
+    /// clipped rects.
+    pub fn area_permille(&self, frame_area: u64) -> Option<u32> {
+        match self {
+            Damage::Unknown => None,
+            Damage::Tracked(v) if v.is_empty() => Some(0),
+            Damage::Tracked(v) => {
+                if frame_area == 0 {
+                    return Some(0);
+                }
+                let sum: u64 = v
+                    .iter()
+                    .map(|r| r.w as u64 * r.h as u64)
+                    .fold(0u64, u64::saturating_add)
+                    .min(frame_area);
+                Some(((sum.saturating_mul(1000) / frame_area) as u32).clamp(1, 1000))
+            }
+        }
+    }
 }
 
 /// A rectangular region of a frame that changed since the previous
@@ -395,5 +450,46 @@ mod synthetic_env_tests {
                 assert!(!synthetic_env_enabled(), "value {v:?} should be falsy");
             });
         }
+    }
+
+    // ── P8a — Damage::area_permille ────────────────────────────────────
+
+    #[test]
+    fn damage_area_permille_semantics() {
+        const AREA: u64 = 1920 * 1200;
+        // Unknown: no information, not zero.
+        assert_eq!(Damage::Unknown.area_permille(AREA), None);
+        // Tracked-empty: provably nothing changed.
+        assert_eq!(Damage::Tracked(vec![]).area_permille(AREA), Some(0));
+        // A caret-sized rect (16×32 = 0.02 ‰) floors at 1 ‰ so "any
+        // tracked damage" thresholds can tell it from provably-unchanged.
+        let caret = Damage::Tracked(vec![DirtyRect {
+            x: 100,
+            y: 100,
+            w: 16,
+            h: 32,
+        }]);
+        assert_eq!(caret.area_permille(AREA), Some(1));
+        // A quarter-screen scroll ≈ 250 ‰.
+        let quarter = Damage::Tracked(vec![DirtyRect {
+            x: 0,
+            y: 0,
+            w: 960,
+            h: 600,
+        }]);
+        assert_eq!(quarter.area_permille(AREA), Some(250));
+        // Overlapping rects over-count but cap at the frame (1000 ‰).
+        let full = DirtyRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1200,
+        };
+        assert_eq!(
+            Damage::Tracked(vec![full, full]).area_permille(AREA),
+            Some(1000)
+        );
+        // Degenerate frame area never divides by zero.
+        assert_eq!(Damage::Tracked(vec![full]).area_permille(0), Some(0));
     }
 }
