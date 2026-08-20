@@ -342,15 +342,45 @@ impl SettleKeyframeGate {
 /// main field path. `Instant`s are passed in (the FlipTracker pattern) so
 /// every behaviour below is unit-tested.
 ///
+/// P7c (field 2026-08-20, pc55331): frame COUNTING alone made interactive
+/// terminals permanently blurry — every Enter scrolls output (a genuine
+/// burst → Down), then caret blinks + keystrokes produced just enough
+/// frames to hold the up-block, and the 10 s any-flip cooldown finished
+/// the job: five Up→Down pairs in the log, each Up dead within ~1-2 s,
+/// while the user read 9-pt text at the 1024 rung. The signal was wrong,
+/// not the thresholds: a keystroke delta encodes to ~0.5-3 KB where a
+/// scroll/drag frame is tens-to-hundreds — so significance is now keyed
+/// on ENCODED BYTES (fed post-encode by the pump). Sub-threshold frames
+/// are invisible to the machine: they neither chain a run, nor fill the
+/// window, nor block the up-flip. Typing at native stays crisp; a held-
+/// key glyph repeat no longer chains a fake "scroll"; the up-flip lands
+/// ~1 s after the last SIGNIFICANT frame even mid-typing. The threshold
+/// is deliberately judged at the CURRENT rung's frame sizes: at native
+/// (where down-flipping actually protects the relay) the same content
+/// encodes 2-3× bigger, so real motion clears the bar there first.
+///
 /// Window length for the frames-per-window rate rules. Doubles as the
 /// emergent settle threshold: after motion stops, the window drains in
 /// exactly this long, so the up-flip fires ~1 s after the last burst.
 pub const REFINE_WINDOW: Duration = Duration::from_secs(1);
 
-/// Real frames per window still considered "quiet" for the UP-flip. A caret
-/// blink (~1.9 Hz → ≤2 frames/s) must refine; typing at ≥3 cps must not
-/// (each up-flip is an encoder rebuild + native IDR — not free mid-typing).
+/// Significant frames per window still considered "quiet" for the UP-flip.
+/// Since P7c only ≥`REFINE_MIN_FRAME_KB` frames count here, so this now
+/// gates sparse REPAINT trickles (a big window animation at ≤2 fps still
+/// refines; at ≥3 fps it must not — each up-flip is an encoder rebuild +
+/// native IDR). Caret blinks and keystrokes are sub-threshold and never
+/// reach the window at all.
 pub const REFINE_SPARSE_MAX: u32 = 2;
+
+/// Frames at or above this ENCODED size are "significant" — real motion
+/// (scroll, drag, animation, video). Below it: caret blinks, keystroke
+/// deltas, hover highlights — invisible to the state machine. Terminal
+/// text compresses hard, so a few scrolled lines at the LOW rung can duck
+/// under this — harmless: the stream just refines sooner, and the same
+/// scroll at the refined native rung is 2-3× the bytes and counts. Env
+/// `ROOMLER_AGENT_IDLE_REFINE_MIN_FRAME_KB` (0 = legacy: every real frame
+/// counts).
+pub const REFINE_MIN_FRAME_KB: u32 = 12;
 
 /// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
 /// a scroll/drag; typing produces 100-200 ms gaps and never chains).
@@ -368,9 +398,14 @@ pub const REFINE_DOWN_RUN: u32 = 8;
 /// stays crisp; the relay carries <10 fps of native deltas fine.
 pub const REFINE_RATE_DOWN: u32 = 10;
 
-/// Minimum spacing from ANY flip to the next UP-flip. Bounds the worst-case
-/// churn (type-pause-type) to one rebuild pair per 10 s.
-pub const REFINE_UP_COOLDOWN: Duration = Duration::from_secs(10);
+/// Minimum spacing from the last UP-flip to the next one. Bounds the
+/// worst-case churn (scroll-pause-scroll) to one rebuild pair per 5 s —
+/// the same bound the old any-flip form gave, but a Down no longer taxes
+/// the re-refine: after a lone scroll the stream is crisp again ~1 s
+/// later instead of serving the full cooldown at the blurry rung (P7c —
+/// the field log showed exactly that 10 s post-scroll blur on every
+/// terminal Enter).
+pub const REFINE_UP_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// What the pump should do about the resolution cap this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,33 +417,41 @@ pub enum RefineFlip {
 }
 
 /// See the module notes above. Owned by the ffmpeg DC pump; `note_real_frame`
-/// is called for every damage-carrying capture, `on_keepalive` on every idle
-/// keepalive tick (≥60 ms after the last real frame by construction).
+/// is called post-encode for every damage-carrying capture (with the frame's
+/// summed packet bytes), `on_keepalive` on every idle keepalive tick (≥60 ms
+/// after the last real frame by construction).
 #[derive(Debug)]
 pub struct IdleRefine {
     enabled: bool,
+    /// Encoded-size floor for a frame to count as motion (P7c). 0 = every
+    /// real frame counts (the pre-P7c behaviour).
+    min_frame_bytes: usize,
     refined: bool,
     /// Length of the current ≤`REFINE_MOTION_GAP`-chained run.
     run: u32,
     last_real: Option<Instant>,
-    /// Real-frame arrivals within the trailing `REFINE_WINDOW`.
+    /// Significant-frame arrivals within the trailing `REFINE_WINDOW`.
     window: std::collections::VecDeque<Instant>,
-    last_flip: Option<Instant>,
+    /// Last UP-flip (cooldown anchor — a Down deliberately doesn't gate).
+    last_up: Option<Instant>,
 }
 
 impl IdleRefine {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new(enabled: bool, min_frame_bytes: usize) -> Self {
         Self {
             enabled,
+            min_frame_bytes,
             refined: false,
             run: 0,
             last_real: None,
             window: std::collections::VecDeque::new(),
-            last_flip: None,
+            last_up: None,
         }
     }
 
-    /// Kill switch `ROOMLER_AGENT_IDLE_REFINE=0` (or `false`).
+    /// Kill switch `ROOMLER_AGENT_IDLE_REFINE=0` (or `false`); significance
+    /// threshold `ROOMLER_AGENT_IDLE_REFINE_MIN_FRAME_KB` (0 = count every
+    /// real frame). node_env so the config-surface keys reach both reads.
     pub fn from_env() -> Self {
         let enabled = !matches!(
             tunnel_core::env::node_env("IDLE_REFINE")
@@ -416,7 +459,10 @@ impl IdleRefine {
                 .map(str::trim),
             Some("0") | Some("false")
         );
-        Self::new(enabled)
+        let min_kb = tunnel_core::env::node_env("IDLE_REFINE_MIN_FRAME_KB")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(REFINE_MIN_FRAME_KB);
+        Self::new(enabled, min_kb as usize * 1024)
     }
 
     /// Whether the pump should currently run WITHOUT the resolution cap.
@@ -434,10 +480,13 @@ impl IdleRefine {
         }
     }
 
-    /// A real (damage-carrying) frame arrived. Returns `Some(Down)` exactly
-    /// when a refined session must drop back to the capped rung.
-    pub fn note_real_frame(&mut self, now: Instant) -> Option<RefineFlip> {
-        if !self.enabled {
+    /// A real (damage-carrying) frame was encoded to `encoded_bytes` on the
+    /// wire. Returns `Some(Down)` exactly when a refined session must drop
+    /// back to the capped rung. Sub-threshold frames (caret, keystrokes,
+    /// hover highlights — see `REFINE_MIN_FRAME_KB`) are ignored entirely:
+    /// they don't chain the run, fill the window, or block the up-flip.
+    pub fn note_real_frame(&mut self, now: Instant, encoded_bytes: usize) -> Option<RefineFlip> {
+        if !self.enabled || encoded_bytes < self.min_frame_bytes {
             return None;
         }
         self.run = match self.last_real {
@@ -456,7 +505,6 @@ impl IdleRefine {
             && (self.run >= REFINE_DOWN_RUN || self.window.len() as u32 >= REFINE_RATE_DOWN)
         {
             self.refined = false;
-            self.last_flip = Some(now);
             return Some(RefineFlip::Down);
         }
         None
@@ -483,11 +531,11 @@ impl IdleRefine {
         }
         if self.window.len() as u32 <= REFINE_SPARSE_MAX
             && self
-                .last_flip
+                .last_up
                 .is_none_or(|t| now.duration_since(t) >= REFINE_UP_COOLDOWN)
         {
             self.refined = true;
-            self.last_flip = Some(now);
+            self.last_up = Some(now);
             return Some(RefineFlip::Up);
         }
         None
@@ -755,10 +803,27 @@ mod tests {
 
     // ── P7 — IdleRefine ────────────────────────────────────────────────
 
-    /// Drive `n` real frames at a fixed `gap`, asserting no Down fires.
-    fn feed_quiet(r: &mut IdleRefine, mut now: Instant, n: u32, gap: Duration) -> Instant {
+    /// A scroll/drag-sized encoded frame (well above the significance
+    /// threshold at any rung).
+    const BIG: usize = 50_000;
+    /// A keystroke/caret-sized encoded frame (well below it).
+    const SMALL: usize = 2_000;
+
+    fn refine() -> IdleRefine {
+        IdleRefine::new(true, REFINE_MIN_FRAME_KB as usize * 1024)
+    }
+
+    /// Drive `n` real frames of `bytes` at a fixed `gap`, asserting no Down
+    /// fires.
+    fn feed_quiet(
+        r: &mut IdleRefine,
+        mut now: Instant,
+        n: u32,
+        gap: Duration,
+        bytes: usize,
+    ) -> Instant {
         for _ in 0..n {
-            assert_eq!(r.note_real_frame(now), None);
+            assert_eq!(r.note_real_frame(now, bytes), None);
             now += gap;
         }
         now
@@ -783,9 +848,9 @@ mod tests {
 
     #[test]
     fn refine_fires_about_1s_after_a_scroll_settles() {
-        let mut r = IdleRefine::new(true);
+        let mut r = refine();
         // 1 s scroll at 30 fps.
-        let now = feed_quiet(&mut r, t0(), 30, Duration::from_millis(33));
+        let now = feed_quiet(&mut r, t0(), 30, Duration::from_millis(33), BIG);
         // Keepalives start 60 ms after the last real frame; the window must
         // drain (~1 s) before the up-flip fires.
         let (_, elapsed) = tick_until_up(&mut r, now, Duration::from_secs(3)).expect("must refine");
@@ -798,15 +863,15 @@ mod tests {
 
     #[test]
     fn caret_blink_neither_blocks_refine_nor_downflips() {
-        let mut r = IdleRefine::new(true);
+        let mut r = refine();
         let mut now = t0();
         // Refine first (quiet from the start).
         assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
-        // 20 s of caret blinks (~1.9 Hz): single frames, 530 ms apart, with
-        // keepalives in between — must stay refined throughout.
+        // 20 s of caret blinks (~1.9 Hz): single tiny frames, 530 ms apart,
+        // with keepalives in between — must stay refined throughout.
         for _ in 0..38 {
             assert_eq!(
-                r.note_real_frame(now),
+                r.note_real_frame(now, SMALL),
                 None,
                 "caret blink must not down-flip"
             );
@@ -822,34 +887,79 @@ mod tests {
     }
 
     #[test]
-    fn typing_trickle_blocks_upflip() {
-        let mut r = IdleRefine::new(true);
-        // Typing at ~6 cps: 160 ms gaps → >2 frames in every 1 s window.
-        // Warm the window first (a cold ≤2-entry window refining is the
-        // fresh-session behaviour, locked by first_upflip_needs_no_prior_flip).
+    fn typing_small_frames_never_block_the_upflip() {
+        // P7c — the field regression this rewrite exists for: a terminal
+        // user types continuously (~6 cps of keystroke-sized deltas) after a
+        // scroll dropped the rung. The old frame-COUNT gate held the stream
+        // blurry for the whole typing session; size-gated, the keystrokes
+        // are invisible and the up-flip lands as soon as the (empty) window
+        // and cooldown allow — crisp text WHILE typing.
+        let mut r = refine();
         let mut now = t0();
-        let _ = r.note_real_frame(now);
+        for _ in 0..30 {
+            let _ = r.note_real_frame(now, SMALL);
+            now += Duration::from_millis(160);
+        }
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert!(r.refined());
+    }
+
+    #[test]
+    fn held_key_repeat_never_downflips() {
+        // Holding a key in a terminal repeats glyph-sized deltas at ~30 Hz —
+        // gap-chained under the old counter (a fake "scroll"), invisible now.
+        let mut r = refine();
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        let mut t = now + Duration::from_secs(1);
+        for _ in 0..60 {
+            assert_eq!(r.note_real_frame(t, SMALL), None);
+            t += Duration::from_millis(33);
+        }
+        assert!(r.refined());
+    }
+
+    #[test]
+    fn big_repaint_trickle_blocks_upflip() {
+        // ≥3 significant frames/s (a window animation repainting large
+        // regions) must still hold the up-flip — rebuild+IDR isn't free.
+        let mut r = refine();
+        let mut now = t0();
+        let _ = r.note_real_frame(now, BIG);
         now += Duration::from_millis(160);
-        let _ = r.note_real_frame(now);
+        let _ = r.note_real_frame(now, BIG);
         for _ in 0..30 {
             now += Duration::from_millis(160);
-            let _ = r.note_real_frame(now);
-            // The keepalive between keystrokes must NOT refine (window > 2).
+            let _ = r.note_real_frame(now, BIG);
             assert_eq!(r.on_keepalive(true, now + Duration::from_millis(60)), None);
         }
         assert!(!r.refined());
     }
 
     #[test]
+    fn zero_threshold_restores_legacy_counting() {
+        // min_frame_bytes = 0 (env IDLE_REFINE_MIN_FRAME_KB=0): every real
+        // frame counts, so a small-frame trickle blocks the up-flip again.
+        let mut r = IdleRefine::new(true, 0);
+        let mut now = t0();
+        for _ in 0..10 {
+            let _ = r.note_real_frame(now, SMALL);
+            now += Duration::from_millis(160);
+        }
+        assert_eq!(r.on_keepalive(true, now), None);
+        assert!(!r.refined());
+    }
+
+    #[test]
     fn scroll_burst_downflips_within_300ms() {
-        let mut r = IdleRefine::new(true);
+        let mut r = refine();
         let now = t0();
         assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
         // 30 fps drag: the chained-run rule must fire by frame 8 (~270 ms).
         let mut t = now + Duration::from_secs(2);
         let mut fired_at = None;
         for i in 0..30 {
-            if let Some(RefineFlip::Down) = r.note_real_frame(t) {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t, BIG) {
                 fired_at = Some(i);
                 break;
             }
@@ -865,7 +975,7 @@ mod tests {
 
     #[test]
     fn slow_motion_downflips_via_window_rate() {
-        let mut r = IdleRefine::new(true);
+        let mut r = refine();
         let now = t0();
         assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
         // ~10.5 fps damage (95 ms gaps > the 80 ms chain gap): the run rule
@@ -874,7 +984,7 @@ mod tests {
         let start = t;
         let mut fired = None;
         for _ in 0..40 {
-            if let Some(RefineFlip::Down) = r.note_real_frame(t) {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t, BIG) {
                 fired = Some(t.duration_since(start));
                 break;
             }
@@ -889,17 +999,18 @@ mod tests {
 
     #[test]
     fn window_animation_never_rerefines() {
-        let mut r = IdleRefine::new(true);
-        // A steady 5 fps spinner (200 ms gaps): >2 frames per window forever
-        // → the up-flip must never fire, no matter how long it runs. Warm
-        // the window past the sparse gate first (see typing test).
+        let mut r = refine();
+        // A steady 5 fps spinner repainting big regions (200 ms gaps): >2
+        // significant frames per window forever → the up-flip must never
+        // fire, no matter how long it runs. Warm the window past the sparse
+        // gate first (see big_repaint_trickle_blocks_upflip).
         let mut now = t0();
         for _ in 0..3 {
-            let _ = r.note_real_frame(now);
+            let _ = r.note_real_frame(now, BIG);
             now += Duration::from_millis(200);
         }
         for _ in 0..100 {
-            let _ = r.note_real_frame(now);
+            let _ = r.note_real_frame(now, BIG);
             assert_eq!(r.on_keepalive(true, now + Duration::from_millis(100)), None);
             now += Duration::from_millis(200);
         }
@@ -907,40 +1018,87 @@ mod tests {
     }
 
     #[test]
-    fn up_cooldown_bounds_flip_pairs() {
-        let mut r = IdleRefine::new(true);
+    fn up_cooldown_measures_from_the_last_up_not_the_down() {
+        let mut r = refine();
         let now = t0();
         assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
-        // Burst → down.
+        // Burst → down (~1.3 s after the Up).
         let mut t = now + Duration::from_secs(1);
-        let mut downed = false;
+        let mut down_at = None;
         for _ in 0..12 {
-            if r.note_real_frame(t) == Some(RefineFlip::Down) {
-                downed = true;
+            if r.note_real_frame(t, BIG) == Some(RefineFlip::Down) {
+                down_at = Some(t);
                 break;
             }
             t += Duration::from_millis(33);
         }
-        assert!(downed);
-        // Quiet again immediately: the window drains in 1 s but the 10 s
-        // up-cooldown must hold the next Up until ≥10 s after the Down.
+        let down_at = down_at.expect("burst must down-flip");
+        // Quiet again immediately. The re-up must respect the cooldown from
+        // the UP (≥5 s after it) — but NOT serve a fresh cooldown from the
+        // Down (P7c: the old any-flip anchor billed every scroll 10 s of
+        // blur; the churn bound only needs up-to-up spacing).
         let up = tick_until_up(
             &mut r,
-            t + Duration::from_millis(60),
+            down_at + Duration::from_millis(60),
             Duration::from_secs(15),
         )
         .expect("must eventually re-refine");
         assert!(
-            up.0.duration_since(t) >= REFINE_UP_COOLDOWN,
-            "re-refined {:?} after the down-flip (cooldown {:?})",
-            up.0.duration_since(t),
+            up.0.duration_since(now) >= REFINE_UP_COOLDOWN,
+            "re-refined {:?} after the first Up (cooldown {:?})",
+            up.0.duration_since(now),
             REFINE_UP_COOLDOWN
+        );
+        assert!(
+            up.0.duration_since(down_at) < REFINE_UP_COOLDOWN,
+            "re-up served a fresh cooldown from the Down ({:?}) — the anchor \
+             must be the last Up",
+            up.0.duration_since(down_at)
+        );
+    }
+
+    #[test]
+    fn lone_scroll_rerefines_in_about_1s_once_cooldown_is_spent() {
+        // The terminal-Enter case end-to-end: crisp for a while, one scroll
+        // burst, typing resumes — the stream must be crisp again ~1 s after
+        // the scroll (window drain), not a full extra cooldown later.
+        let mut r = refine();
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // Cooldown fully spent while crisp.
+        let mut t = now + REFINE_UP_COOLDOWN + Duration::from_secs(1);
+        // Enter → output scrolls: burst until the down-flip.
+        let mut down_at = None;
+        for _ in 0..12 {
+            if r.note_real_frame(t, BIG) == Some(RefineFlip::Down) {
+                down_at = Some(t);
+                break;
+            }
+            t += Duration::from_millis(33);
+        }
+        let down_at = down_at.expect("scroll must down-flip");
+        // Typing continues (small frames) with keepalives interleaved.
+        let mut t = down_at + Duration::from_millis(160);
+        let mut refined_at = None;
+        while t.duration_since(down_at) <= Duration::from_secs(3) {
+            let _ = r.note_real_frame(t, SMALL);
+            if r.on_keepalive(true, t + Duration::from_millis(60)) == Some(RefineFlip::Up) {
+                refined_at = Some(t + Duration::from_millis(60));
+                break;
+            }
+            t += Duration::from_millis(160);
+        }
+        let refined_at = refined_at.expect("typing must not hold the blur");
+        let took = refined_at.duration_since(down_at);
+        assert!(
+            took <= Duration::from_millis(1400),
+            "re-refine took {took:?} after the scroll (want ≈1 s)"
         );
     }
 
     #[test]
     fn eligible_false_clears_refined_silently() {
-        let mut r = IdleRefine::new(true);
+        let mut r = refine();
         let now = t0();
         assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
         assert!(r.refined());
@@ -951,11 +1109,11 @@ mod tests {
 
     #[test]
     fn disabled_never_flips() {
-        let mut r = IdleRefine::new(false);
+        let mut r = IdleRefine::new(false, 0);
         let mut now = t0();
         for _ in 0..50 {
             assert_eq!(r.on_keepalive(true, now), None);
-            assert_eq!(r.note_real_frame(now), None);
+            assert_eq!(r.note_real_frame(now, BIG), None);
             now += Duration::from_millis(60);
         }
         assert!(!r.refined());
@@ -964,8 +1122,8 @@ mod tests {
     #[test]
     fn first_upflip_needs_no_prior_flip() {
         // A session that starts quiet refines on the very first keepalive —
-        // the cooldown only spaces SUBSEQUENT flips.
-        let mut r = IdleRefine::new(true);
+        // the cooldown only spaces SUBSEQUENT up-flips.
+        let mut r = refine();
         assert_eq!(r.on_keepalive(true, t0()), Some(RefineFlip::Up));
     }
 }

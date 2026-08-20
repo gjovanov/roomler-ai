@@ -900,8 +900,9 @@ mod tests {
     ///
     /// Env hygiene: `idle_refine_applies` consults
     /// ROOMLER_AGENT_IDLE_REFINE_BALANCED for the Balanced rows — cleared
-    /// up front so the table asserts the DEFAULT (opt-in off) semantics.
-    /// (The opt-in flip itself is locked by
+    /// up front so the table asserts the DEFAULT (ON since P7c) semantics,
+    /// then set to "0" for the blocked-Balanced rows and removed again
+    /// before the serial guard drops. (The env flip itself is locked by
     /// `encode::tests::idle_refine_applies_matrix`; that test restores the
     /// var after itself, so the cross-module interleaving window is µs.)
     #[tokio::test]
@@ -915,12 +916,12 @@ mod tests {
 
         // Single viewer reduces to idle_refine_applies(own): Smoother
         // refines, Sharper is vacuously eligible (no cap — the caller's
-        // merged-cap-clamps gate is what makes it a no-op), Balanced on a
-        // relay contributes the B1 physics cap and blocks.
+        // merged-cap-clamps gate is what makes it a no-op), and since P7c
+        // Balanced's B1 relay cap is liftable by default too.
         assert!(owner.merged_refine_eligible(SMOOTHER, true));
         assert!(owner.merged_refine_eligible(SMOOTHER, false));
         assert!(owner.merged_refine_eligible(SHARPER, true));
-        assert!(!owner.merged_refine_eligible(BALANCED, true));
+        assert!(owner.merged_refine_eligible(BALANCED, true));
         assert!(owner.merged_refine_eligible(BALANCED, false));
 
         // THE field case (pc55331 2026-08-20): owner=Sharper +
@@ -933,12 +934,19 @@ mod tests {
         assert!(owner.merged_refine_eligible(SHARPER, true));
         assert!(owner.merged_refine_eligible(SHARPER, false));
 
-        // Smoother owner + Balanced follower: on a relay the follower's
-        // B1 1280 cap is NOT liftable ⇒ blocked; on direct Balanced
-        // contributes no cap ⇒ eligible.
+        // With the Balanced kill switch thrown, a Balanced dial's relay cap
+        // is NOT liftable: single-viewer Balanced blocks, and a Smoother
+        // owner + Balanced follower blocks on relay; on direct Balanced
+        // contributes no cap ⇒ eligible either way.
+        unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", "0") };
         follower_prio.store(BALANCED, std::sync::atomic::Ordering::Relaxed);
         assert!(!owner.merged_refine_eligible(SMOOTHER, true));
         assert!(owner.merged_refine_eligible(SMOOTHER, false));
+        assert!(!owner.merged_refine_eligible(BALANCED, true));
+        unsafe { std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED") };
+
+        // Default-on: the same mixed pair is eligible on relay too.
+        assert!(owner.merged_refine_eligible(SMOOTHER, true));
 
         // Back to an all-liftable pair.
         follower_prio.store(SMOOTHER, std::sync::atomic::Ordering::Relaxed);

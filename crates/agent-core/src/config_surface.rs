@@ -392,12 +392,17 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "idle_refine_balanced",
         "tribool",
-        "P7 - extend idle refinement to Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: off - field-validate first. Env: ROOMLER_NODE_IDLE_REFINE_BALANCED. Restart required.",
+        "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the pc55331 relay); off restores the un-refined Balanced rung. Env: ROOMLER_NODE_IDLE_REFINE_BALANCED. Restart required.",
     ),
     (
         "idle_refine_max_edge",
         "string",
         "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLER_NODE_IDLE_REFINE_MAX_EDGE. Restart required.",
+    ),
+    (
+        "idle_refine_min_frame_kb",
+        "string",
+        "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLER_NODE_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
     ),
     (
         "ice_follow_renomination",
@@ -556,6 +561,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine" => cfg.idle_refine.map(fmt_bool),
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
+        "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
             .map(|b| if b { "always" } else { "never" }.to_string()),
@@ -852,6 +858,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine" => cfg.idle_refine = parse_tribool(value)?,
         "idle_refine_balanced" => cfg.idle_refine_balanced = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
+        "idle_refine_min_frame_kb" => {
+            cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
+        }
         "ice_follow_renomination" => {
             cfg.ice_follow_renomination =
                 match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
