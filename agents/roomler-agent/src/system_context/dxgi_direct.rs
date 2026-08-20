@@ -65,7 +65,7 @@
 
 use std::io;
 
-use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL, HMODULE};
+use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL, HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -77,15 +77,17 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_FLAG, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_ACCESS_LOST,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1,
-    IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT, IDXGIAdapter,
+    IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::Interface;
 
 use super::dxgi_dup::{BackendBail, DxgiCapture, DxgiFrame};
+use crate::capture::{Damage, DirtyRect};
 use crate::fp16;
 
 /// Map a `windows::core::Error` HRESULT to the capture pump's typed bail.
@@ -131,6 +133,23 @@ pub struct DxgiDirectBackend {
     /// accepting FP16 here instead of bailing to the scrap path (which reads
     /// FP16 surfaces as BGRA8 → purple 2×-zoomed garbage).
     lut: Option<Box<[u8; 65536]>>,
+    /// P8a — whether duplication metadata rects can be trusted for this
+    /// output. False on rotated panels: this backend copies the surface
+    /// RAW (never re-orients), and the metadata's coordinate space vs a
+    /// rotated raw surface is ambiguous enough that damage degrades to
+    /// `Unknown` there instead of risking wrong-region truth.
+    rects_trustworthy: bool,
+    /// P8a — at least one image-carrying frame was delivered since the
+    /// duplication was (re)created. Guards the pointer-only fast-path:
+    /// the FIRST acquire after (re)creation can report
+    /// `LastPresentTime == 0` while carrying the current desktop image —
+    /// skipping it on a static desktop would black-screen the session
+    /// until the first real change.
+    delivered_any: bool,
+    /// P8a — reused metadata buffers (byte-sized per the API contract:
+    /// move rects are 24 B, dirty RECTs 16 B).
+    meta_moves: Vec<DXGI_OUTDUPL_MOVE_RECT>,
+    meta_dirty: Vec<RECT>,
 }
 
 impl DxgiDirectBackend {
@@ -209,6 +228,18 @@ impl DxgiDirectBackend {
                 "DXGI-direct: bound Desktop Duplication to the primary-output adapter (hybrid-GPU fix)"
             );
 
+            // P8a — metadata rects are only trusted on un-rotated outputs
+            // (this backend never re-orients the raw surface copy).
+            let rotation = desc.Rotation;
+            let rects_trustworthy = rotation == DXGI_MODE_ROTATION_IDENTITY
+                || rotation == DXGI_MODE_ROTATION_UNSPECIFIED;
+            if !rects_trustworthy {
+                tracing::info!(
+                    rotation = rotation.0,
+                    "DXGI-direct: rotated output — damage metadata degraded to Unknown"
+                );
+            }
+
             Ok(Self {
                 device,
                 context,
@@ -220,8 +251,114 @@ impl DxgiDirectBackend {
                 staging_h: 0,
                 staging_fmt: desktop_fmt,
                 lut: None,
+                rects_trustworthy,
+                delivered_any: false,
+                meta_moves: Vec::new(),
+                meta_dirty: Vec::new(),
             })
         }
+    }
+
+    /// P8a — read the duplication metadata for the CURRENTLY HELD frame
+    /// (valid only between `AcquireNextFrame` and `ReleaseFrame`).
+    /// Damage = dirty rects ∪ move DESTINATION rects (the changed-pixel
+    /// superset under the API's cumulative-metadata contract), clipped
+    /// to the staging dims. Any anomaly (metadata call failure, zero
+    /// metadata on an image-carrying frame, buffer weirdness) degrades
+    /// to a FULL-FRAME rect — motion-true, never an under-report.
+    fn read_damage(&mut self, frame_info: &DXGI_OUTDUPL_FRAME_INFO) -> Damage {
+        if !self.rects_trustworthy {
+            return Damage::Unknown;
+        }
+        let full = || {
+            Damage::Tracked(vec![DirtyRect {
+                x: 0,
+                y: 0,
+                w: self.width,
+                h: self.height,
+            }])
+        };
+        let total = frame_info.TotalMetadataBufferSize as usize;
+        if total == 0 {
+            // An image-carrying frame with no move/dirty metadata —
+            // shouldn't happen for real damage, so claim everything.
+            return full();
+        }
+        const MOVE_SZ: usize = std::mem::size_of::<DXGI_OUTDUPL_MOVE_RECT>();
+        const DIRTY_SZ: usize = std::mem::size_of::<RECT>();
+        // The metadata API speaks BYTES, not element counts — lock the
+        // struct sizes at compile time (the classic DXGI footgun).
+        const _: () = assert!(MOVE_SZ == 24 && DIRTY_SZ == 16);
+        // Size each typed buffer to hold the WHOLE metadata block (the
+        // API reports one combined byte budget; over-allocating per
+        // array is the documented safe pattern).
+        self.meta_moves
+            .resize(total.div_ceil(MOVE_SZ), DXGI_OUTDUPL_MOVE_RECT::default());
+        self.meta_dirty
+            .resize(total.div_ceil(DIRTY_SZ), RECT::default());
+
+        let mut moves_bytes: u32 = 0;
+        // SAFETY: buffer sized ≥ total bytes; valid only while the frame
+        // is held (caller guarantees), out-params valid for the call.
+        if unsafe {
+            self.duplication.GetFrameMoveRects(
+                (self.meta_moves.len() * MOVE_SZ) as u32,
+                self.meta_moves.as_mut_ptr(),
+                &mut moves_bytes,
+            )
+        }
+        .is_err()
+        {
+            return full();
+        }
+        let mut dirty_bytes: u32 = 0;
+        // SAFETY: same contract as above.
+        if unsafe {
+            self.duplication.GetFrameDirtyRects(
+                (self.meta_dirty.len() * DIRTY_SZ) as u32,
+                self.meta_dirty.as_mut_ptr(),
+                &mut dirty_bytes,
+            )
+        }
+        .is_err()
+        {
+            return full();
+        }
+        // Byte counts → element counts (the classic DXGI footgun — the
+        // API speaks BYTES; a unit test locks the conversion sizes).
+        let n_moves = (moves_bytes as usize) / MOVE_SZ;
+        let n_dirty = (dirty_bytes as usize) / DIRTY_SZ;
+        let mut out = Vec::with_capacity(n_moves + n_dirty);
+        let clip = |r: &RECT| -> Option<DirtyRect> {
+            let x = r.left.max(0) as u32;
+            let y = r.top.max(0) as u32;
+            let x1 = (r.right.max(0) as u32).min(self.width);
+            let y1 = (r.bottom.max(0) as u32).min(self.height);
+            let x = x.min(self.width);
+            let y = y.min(self.height);
+            (x1 > x && y1 > y).then(|| DirtyRect {
+                x,
+                y,
+                w: x1 - x,
+                h: y1 - y,
+            })
+        };
+        for m in &self.meta_moves[..n_moves] {
+            if let Some(r) = clip(&m.DestinationRect) {
+                out.push(r);
+            }
+        }
+        for d in &self.meta_dirty[..n_dirty] {
+            if let Some(r) = clip(d) {
+                out.push(r);
+            }
+        }
+        if out.is_empty() {
+            // Metadata present but everything clipped away — claim the
+            // frame rather than under-report.
+            return full();
+        }
+        Damage::Tracked(out)
     }
 
     /// Ensure `self.staging` is a STAGING texture matching the acquired
@@ -362,6 +499,7 @@ impl DxgiDirectBackend {
             width: self.width,
             height: self.height,
             stride: stride as u32,
+            damage: Damage::Unknown,
         })
     }
 }
@@ -380,10 +518,36 @@ impl DxgiCapture for DxgiDirectBackend {
         }
         .map_err(map_dxgi_err)?;
 
+        // P8a — pointer-only update (mouse moved, no image change):
+        // release + Transient instead of paying an 8-33 MB readback and
+        // surfacing a fake "real frame" that blocks the idle-refine
+        // keepalive path during mouse wiggle (and feeds the settle gate
+        // a phantom burst). Guarded by `delivered_any`: the FIRST
+        // acquire after (re)creation can carry the current desktop
+        // image with LastPresentTime==0 — skipping it on a static
+        // desktop would black-screen the session until the next change.
+        if self.delivered_any
+            && frame_info.LastPresentTime == 0
+            && frame_info.AccumulatedFrames == 0
+        {
+            // SAFETY: pairs with the successful AcquireNextFrame above.
+            unsafe {
+                if let Err(e) = self.duplication.ReleaseFrame() {
+                    tracing::trace!(?e, "DXGI-direct: ReleaseFrame (non-fatal)");
+                }
+            }
+            return Err(BackendBail::Transient);
+        }
+
         // From here we hold the frame and MUST ReleaseFrame before the
         // next AcquireNextFrame, on every path. read_acquired never
-        // touches self.duplication, so the borrows don't overlap.
-        let result = self.read_acquired(resource);
+        // touches self.duplication, so the borrows don't overlap; the
+        // metadata read MUST happen while the frame is still held.
+        let mut result = self.read_acquired(resource);
+        if let Ok(f) = result.as_mut() {
+            f.damage = self.read_damage(&frame_info);
+            self.delivered_any = true;
+        }
         // SAFETY: pairs with the AcquireNextFrame that just succeeded.
         unsafe {
             if let Err(e) = self.duplication.ReleaseFrame() {
