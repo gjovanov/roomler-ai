@@ -326,12 +326,15 @@ pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32>
 /// Priority dial / transport combination? (See
 /// `rate_profile::IdleRefine` for the state machine.)
 ///
-/// v1 scope: **Smoother on every path** — that dial explicitly trades
+/// Scope: **Smoother on every path** — that dial explicitly trades
 /// pixels for motion smoothness, and a settled still costs neither, so
 /// crisp-at-rest is pure win. **Balanced+relay** lifts the B1 *physics*
-/// cap even at idle (a native IDR is ~150-400 KB through a 3 Mbps pipe),
-/// so it stays behind `ROOMLER_AGENT_IDLE_REFINE_BALANCED=1` until
-/// field-validated. Sharper has no cap to lift. The vp9-444 SW pump is
+/// cap at idle (a native IDR is ~150-400 KB through a 3 Mbps pipe) —
+/// opt-in at v1, default ON since P7c: a full field day on the CORPLAP-2
+/// relay (2026-08-20) showed clean refine cycles at exactly this IDR
+/// cost, and the un-refined Balanced rung was the user-visible "still
+/// blurred" report. `ROOMLER_AGENT_IDLE_REFINE_BALANCED=0` restores the
+/// old behaviour. Sharper has no cap to lift. The vp9-444 SW pump is
 /// excluded entirely (refined-native keepalives would cost ~16 fps of
 /// native libvpx SW encode while "idle" — a real CPU tax with none of
 /// the HW pump's free-ness).
@@ -340,7 +343,13 @@ pub(crate) fn idle_refine_applies(priority: u8, constrained: bool) -> bool {
     match priority {
         self::priority::SMOOTHER => true,
         self::priority::SHARPER => false,
-        _ => constrained && node_env("IDLE_REFINE_BALANCED").as_deref().map(str::trim) == Some("1"),
+        _ => {
+            constrained
+                && !matches!(
+                    node_env("IDLE_REFINE_BALANCED").as_deref().map(str::trim),
+                    Some("0") | Some("false")
+                )
+        }
     }
 }
 
@@ -785,7 +794,8 @@ mod tests {
         assert_eq!(priority_relay_cap(42, true), Some(1280));
     }
 
-    // P7 — idle-refine scope matrix + the Balanced opt-in env.
+    // P7 — idle-refine scope matrix + the Balanced kill-switch env (P7c
+    // flipped Balanced+relay from opt-in to default ON).
     #[test]
     fn idle_refine_applies_matrix() {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -800,9 +810,14 @@ mod tests {
         // Sharper has no cap to lift.
         assert!(!idle_refine_applies(priority::SHARPER, true));
         assert!(!idle_refine_applies(priority::SHARPER, false));
-        // Balanced: opt-in only (it lifts the B1 physics cap), relay only.
+        // Balanced: default ON since P7c — relay only (no cap on direct).
+        assert!(idle_refine_applies(priority::BALANCED, true));
+        assert!(!idle_refine_applies(priority::BALANCED, false));
+        // The kill switch restores the un-refined Balanced rung.
+        unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", "0") };
         assert!(!idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
+        // The old opt-in spelling stays valid.
         unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", "1") };
         assert!(idle_refine_applies(priority::BALANCED, true));
         assert!(!idle_refine_applies(priority::BALANCED, false));
