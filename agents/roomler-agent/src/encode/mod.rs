@@ -351,8 +351,9 @@ pub(crate) fn idle_refine_applies(priority: u8, constrained: bool) -> bool {
 /// size if the field disagrees.
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub(crate) fn idle_refine_cap_long_edge() -> Option<u32> {
-    let v = std::env::var("ROOMLER_AGENT_IDLE_REFINE_MAX_EDGE")
-        .ok()
+    // node_env (not raw std::env) so the `idle_refine_max_edge` config-
+    // surface key reaches this read through the fallback map.
+    let v = node_env("IDLE_REFINE_MAX_EDGE")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(0);
     (v > 0).then_some(v)

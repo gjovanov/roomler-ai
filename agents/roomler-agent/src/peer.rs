@@ -6204,8 +6204,9 @@ fn lanczos_enabled() -> bool {
 /// 8.3 MP source (~26–50 ms) would eat the 30 fps capture budget. `0` runs
 /// Lanczos for every downscale; `56` restores the pre-P7 `> 0.55` gate.
 fn lanczos_min_scale() -> f32 {
-    let pct = std::env::var("ROOMLER_AGENT_LANCZOS_MIN_PCT")
-        .ok()
+    // node_env (not raw std::env) so the `lanczos_min_pct` config-surface
+    // key reaches this read through the fallback map.
+    let pct = node_env("LANCZOS_MIN_PCT")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(34);
     (pct.min(100) as f32) / 100.0
