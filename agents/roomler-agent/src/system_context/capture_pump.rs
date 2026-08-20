@@ -248,9 +248,15 @@ fn worker_main(
     // accumulator times JUST the `capture_one_blocking` call (scrap
     // frame() + handling) on THIS thread; the diff between the
     // worker-side avg logged here and the pump-side `avg_capture_ms`
-    // attributes the round-trip overhead. Logged ~once / 150 captures.
+    // attributes the round-trip overhead. P8a follow-up: TIME-gated
+    // (≥30 s between logs), not call-count-gated — pointer-only frames
+    // now return Transient, so empty polls dominate the call rate
+    // (~250-500/s) and the old every-150-calls gate flooded the log at
+    // ~1.7 lines/s (field pc55331, rc.428 rollout evening).
     let mut worker_capture_us: u64 = 0;
     let mut worker_capture_calls: u64 = 0;
+    let mut worker_timing_logged_at = Instant::now();
+    const WORKER_TIMING_LOG_EVERY: Duration = Duration::from_secs(30);
 
     while let Ok(res_tx) = cmd_rx.recv() {
         let cap_start = Instant::now();
@@ -264,7 +270,9 @@ fn worker_main(
         );
         worker_capture_us += cap_start.elapsed().as_micros() as u64;
         worker_capture_calls += 1;
-        if worker_capture_calls.is_multiple_of(150) {
+        if worker_capture_calls >= 150
+            && worker_timing_logged_at.elapsed() >= WORKER_TIMING_LOG_EVERY
+        {
             let avg_ms = (worker_capture_us / worker_capture_calls) as f64 / 1000.0;
             tracing::info!(
                 worker_avg_capture_ms = avg_ms,
@@ -274,6 +282,7 @@ fn worker_main(
             );
             worker_capture_us = 0;
             worker_capture_calls = 0;
+            worker_timing_logged_at = Instant::now();
         }
         // Best-effort send; if the async side dropped its rx the next
         // recv() above will error out and we exit cleanly.
