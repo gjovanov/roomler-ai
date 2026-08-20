@@ -402,7 +402,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "idle_refine_min_frame_kb",
         "string",
-        "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLER_NODE_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
+        "P7c - encoded-size floor (KiB, 0-256) for a frame to count as motion in the idle-refine machine; caret/keystroke deltas stay invisible so terminals keep the crisp rung while typing. Defined at the 1024x640 reference rung and scaled by the live encode area (P7c-2 - a fixed floor oscillated across rungs). Empty = built-in 12; 0 = every real frame counts (pre-P7c). Env: ROOMLER_NODE_IDLE_REFINE_MIN_FRAME_KB. Restart required.",
     ),
     (
         "ice_follow_renomination",
