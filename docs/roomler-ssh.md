@@ -260,6 +260,12 @@ reason to accept an unbounded table or an eternal key:
   grant. Ceiling: 60 s.
 - **A capped table** (16 pending), so the control plane cannot grow agent
   memory. Overflow drops the oldest, which is the one closest to expiry anyway.
+- **A session lifetime** (`session_secs`, requested by the caller, clamped both
+  sides; 0 = the 12 h ceiling). Enforced at the deadline by disconnect: the
+  terminal's process group dies with the pty, and an exec still in flight is
+  bounded by the engine's own wall clock. Only key-list sessions are unbounded
+  — deliberately, because the break-glass session must not die under whoever
+  is fixing the control plane.
 - **Gate 4 again.** A device with `ssh_enabled` off refuses to record grants at
   all rather than accumulating credentials it would never honour.
 
@@ -289,11 +295,18 @@ roomler-ssh: waiting up to 30s for approval at the device…
 Without that line a policy of `prompt` is indistinguishable from a 30-second
 hang. Denial and timeout both refuse with their own reason and exit 1.
 
-⚠️ **No broker means deny.** The daemon publishes its consent broker process-wide
-at start-up (`consent::set_shared`), because the SSH server is constructed
-inside the overlay's TUN factory and cannot be handed one. If none is
-registered, a session that was supposed to require approval refuses rather than
-proceeding — "nobody was there to ask" is not consent.
+⚠️ **The broker is threaded, not discovered.** The consent broker rides
+`ssh::SessionServices` from the daemon through `overlay::maybe_start` into the
+server's `Ctx`, and the field is non-optional — a server that can be
+constructed at all provably has someone to ask. (It used to be a process
+global, `consent::set_shared`, whose absence the server had to treat as a
+denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
+
+⚠️ **A denied session burns its grant.** Authentication consumes the grant
+*before* the prompt runs, so a deny — or a timeout — means requesting a new
+grant, not re-dialling with the same key. Correct by construction (single-use
+is single-use, and a refused session must not leave a redeemable credential
+behind), but surprising if you expect a simple retry.
 
 ⚠️ **Key-list sessions are deliberately exempt.** They carry no server policy,
 and they exist as the break-glass route for when the control plane is the broken
