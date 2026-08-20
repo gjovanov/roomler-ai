@@ -1396,6 +1396,7 @@ async fn media_pump(
                     encoded_dims,
                     viewer_report,
                     priority,
+                    false,
                 )
                 .await;
             }
@@ -1434,6 +1435,10 @@ async fn media_pump(
                     encoded_dims,
                     viewer_report,
                     priority,
+                    // P7 — the viewer's 4:4:4 request (Rext, hevc_nvenc only;
+                    // rc:session.request `chroma_pref`, previously honoured
+                    // only by the VP9-444 transport).
+                    matches!(chroma_pref.as_deref(), Some("yuv444")),
                 )
                 .await;
             }
@@ -1472,6 +1477,7 @@ async fn media_pump(
                     encoded_dims,
                     viewer_report,
                     priority,
+                    false,
                 )
                 .await;
             }
@@ -1532,6 +1538,7 @@ async fn media_pump(
                         encoded_dims,
                         viewer_report,
                         priority,
+                        false,
                     )
                     .await;
                 }
@@ -3225,7 +3232,9 @@ impl FfmpegDcCodec {
     /// its framerate + burst cap match the actual link instead of a fixed 30.
     /// P7 — `cq_bias`: CQ sharpening steps for deep resolution rungs,
     /// computed at each rebuild from encode-vs-native area
-    /// (`rate_profile::scale_cq_bias`).
+    /// (`rate_profile::scale_cq_bias`). `chroma444`: the viewer's Rext
+    /// 4:4:4 request — HEVC-only (nvenc), silently 4:2:0 elsewhere; read
+    /// the returned encoder's `chroma444()` for the truth.
     fn open(
         self,
         w: u32,
@@ -3233,10 +3242,13 @@ impl FfmpegDcCodec {
         fps: u32,
         maxrate_bps: usize,
         cq_bias: u32,
+        chroma444: bool,
     ) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
         use crate::encode::ffmpeg::FfmpegEncoder;
         match self {
-            Self::Hevc => FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps, cq_bias),
+            Self::Hevc => {
+                FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps, cq_bias, chroma444)
+            }
             Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps, cq_bias),
             Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps, cq_bias),
             Self::H264 => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps, cq_bias),
@@ -3263,10 +3275,11 @@ impl FfmpegDcCodec {
         }
     }
 
-    /// Chroma the FFmpeg path emits. `hevc_*` (Main profile), `vp9_qsv`
-    /// (profile 0) and `av1_*` (Main profile) are all 4:2:0 8-bit — the
-    /// 4:4:4 path stays on libvpx SW (`media_pump_vp9_444_dc`), never
-    /// this pump.
+    /// Default chroma the FFmpeg path emits: `vp9_qsv` (profile 0),
+    /// `av1_*` (Main) and `h264_*` are 4:2:0 8-bit. P7 — HEVC can also run
+    /// Rext 4:4:4 (hevc_nvenc); the pump overrides this default with the
+    /// ACTIVE encoder's `chroma444()` when building `rc:video-info`, so
+    /// the badge reports the truth even after an open-time fallback.
     fn wire_chroma(self) -> &'static str {
         "yuv420"
     }
@@ -3363,11 +3376,20 @@ async fn media_pump_ffmpeg_dc(
     // rc.199 — per-session Priority dial (`rc:priority`); resolves the relay
     // resolution cap this pump feeds `effective_target_resolution`.
     priority: Arc<std::sync::atomic::AtomicU8>,
+    // P7 — the viewer's `chroma_pref == "yuv444"` request. Only the HEVC
+    // codec honours it (Rext via hevc_nvenc, see FfmpegEncoder::
+    // new_hevc_adaptive); the other codecs ignore it. May silently fall
+    // back to 4:2:0 at open time — `rc:video-info` reports the truth.
+    chroma444: bool,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
 
     let codec_label = codec.label();
+    // P7 — the session's ACTIVE chroma: starts as the request (HEVC only),
+    // downgraded by the open-time fallback; drives the maxrate chroma
+    // factor + the video-info chroma string.
+    let mut hevc_444 = chroma444 && matches!(codec, FfmpegDcCodec::Hevc);
     // rc.87 — emit `rc:video-info` so the browser stats badge shows the
     // TRUTH (real encoder + HW + chroma + transport). Badge-truth rc:
     // RETRIED until delivered (see the loop-top block) — the old
@@ -3698,7 +3720,13 @@ async fn media_pump_ffmpeg_dc(
                     codec.wire_codec(),
                     enc_name,
                     true,
-                    codec.wire_chroma(),
+                    // P7 — report the ACTIVE chroma (the 4:4:4 request may
+                    // have fallen back to 4:2:0 at open time).
+                    if hevc_444 {
+                        "yuv444"
+                    } else {
+                        codec.wire_chroma()
+                    },
                     constrained,
                     native_w,
                     native_h,
@@ -3972,12 +4000,18 @@ async fn media_pump_ffmpeg_dc(
         // with. P3 — codec-factor-aware: H.264 gets a 150% band (equal text
         // sharpness needs ~1.5× the bits of HEVC/AV1); the relay clamp still
         // applies after the factor inside the fn.
+        // P7 — chroma factor composes with the codec factor (4:4:4 carries
+        // 2× the chroma samples; same ×1.5 band as the libvpx VP9-444 pump).
+        // The relay clamp still applies after, inside the fn.
+        let rate_factor_pct = crate::encode::rate_profile::codec_rate_factor_pct(codec.label())
+            * crate::encode::rate_profile::chroma_rate_factor_pct(hevc_444)
+            / 100;
         let base_ceiling = crate::encode::ffmpeg::encoder::ffmpeg_maxrate_bps_scaled(
             w,
             h,
             target_fps,
             constrained,
-            crate::encode::rate_profile::codec_rate_factor_pct(codec.label()),
+            rate_factor_pct,
         ) as u32;
         // rc.186 — apply the encode-pressure factor. When the encoder is
         // saturating (factor < 1.0) this feeds a lower ceiling to both the
@@ -4000,15 +4034,20 @@ async fn media_pump_ffmpeg_dc(
                 native_h,
                 crate::encode::rate_profile::scale_cq_boost_steps(),
             );
-            match codec.open(w, h, target_fps, ceiling as usize, cq_bias) {
+            match codec.open(w, h, target_fps, ceiling as usize, cq_bias, hevc_444) {
                 Ok(enc) => {
                     let encoder_name = enc.name();
+                    // P7 — record the ACTIVE chroma (a 4:4:4 request may have
+                    // fallen back to 4:2:0 inside new_hevc_adaptive); feeds
+                    // the maxrate chroma factor and the video-info truth.
+                    hevc_444 = enc.chroma444();
                     info!(
                         %session_id,
                         codec_label,
                         width = w,
                         height = h,
                         cq_bias,
+                        chroma444 = hevc_444,
                         encoder = encoder_name,
                         "FFmpeg DC pump: encoder (re)built"
                     );

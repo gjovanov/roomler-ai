@@ -1089,6 +1089,32 @@ export async function isHevcDecodeSupported(): Promise<boolean> {
   }
 }
 
+/** P7 — HEVC Rext (Range extensions) 8-bit 4:4:4 codec string, Level 5.1.
+ *  The Annex-B no-description contract is identical to the Main-profile
+ *  string the HEVC worker ships; only the profile fields differ
+ *  (profile_idc 4 + the Rext compatibility flag). */
+export const HEVC_REXT_CODEC_STRING = 'hev1.4.10.L153.B0'
+
+/** P7 — Rext 4:4:4 decode probe. Chrome support is NARROW and there is no
+ *  software HEVC fallback at all: Windows NVIDIA needs Chrome ≥137 +
+ *  driver ≥572.16; Windows Intel Gen11+ has it since 117; most other
+ *  combinations return false. The 4:4:4 picker entry AND the connect-time
+ *  chroma_pref are both gated on this probe — a mismatch would black-screen
+ *  (the exact VP9-profile-1 prefer-hardware lesson). */
+export async function isHevcRextDecodeSupported(): Promise<boolean> {
+  const g = globalThis as unknown as {
+    VideoDecoder?: { isConfigSupported?: (cfg: { codec: string }) => Promise<{ supported?: boolean }> }
+  }
+  const isConfigSupported = g.VideoDecoder?.isConfigSupported
+  if (typeof isConfigSupported !== 'function') return false
+  try {
+    const res = await isConfigSupported({ codec: HEVC_REXT_CODEC_STRING })
+    return res?.supported === true
+  } catch {
+    return false
+  }
+}
+
 /** rc.186 — HARDWARE-and-smooth HEVC decode probe.
  *
  *  `isHevcDecodeSupported()` (VideoDecoder.isConfigSupported) returns `true`
@@ -1461,7 +1487,7 @@ export function priorityWireMessage(mode: RcPriority): { t: 'rc:priority'; mode:
  *  toggle buttons + the codec-override + VP9-chroma dropdowns. Each choice
  *  maps to a full (transport, chroma, preferredCodec, renderPath) tuple so the
  *  picker fully determines the previously-scattered controls. */
-export type RcCodecChoice = 'auto' | 'av1' | 'hevc' | 'vp9-444' | 'vp9-420' | 'h264'
+export type RcCodecChoice = 'auto' | 'av1' | 'hevc' | 'hevc-444' | 'vp9-444' | 'vp9-420' | 'h264'
 
 export interface CodecChoiceSettings {
   videoTransport: RcVideoTransport
@@ -1493,6 +1519,17 @@ export function codecChoiceToSettings(
       return { videoTransport: 'data-channel-av1', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
     case 'hevc':
       return { videoTransport: 'data-channel-hevc', chroma: 'auto', preferredCodec: null, renderPath: 'webcodecs' }
+    case 'hevc-444':
+      // P7 — HEVC Rext 4:4:4 (hevc_nvenc + Chrome Rext decode; kills
+      // ClearType chroma fringing on the HW pipeline). connect() gates on
+      // BOTH ends and silently falls back to 4:2:0 HEVC when either lacks
+      // Rext.
+      return {
+        videoTransport: 'data-channel-hevc',
+        chroma: 'yuv444',
+        preferredCodec: null,
+        renderPath: 'webcodecs',
+      }
     case 'vp9-444':
       return {
         videoTransport: 'data-channel-vp9-444',
@@ -1536,7 +1573,9 @@ export function settingsToCodecChoice(
     case 'data-channel-av1':
       return 'av1'
     case 'data-channel-hevc':
-      return 'hevc'
+      // P7 — an explicit yuv444 chroma on the HEVC transport is the Rext
+      // pick; everything else (incl. the legacy 'auto') reads as plain HEVC.
+      return chroma === 'yuv444' ? 'hevc-444' : 'hevc'
     case 'data-channel-vp9-444':
       return chroma === 'yuv444' ? 'vp9-444' : 'vp9-420'
     case 'data-channel-h264':
@@ -2621,6 +2660,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   const hevcSupported = ref<boolean>(false)
   void isHevcDecodeSupported().then((ok) => {
     hevcSupported.value = ok
+  })
+  /** P7 — whether this browser decodes HEVC Rext 4:4:4 (narrow: Chrome ≥137
+   *  + NV driver ≥572.16, or Intel Gen11+ ≥117). Gates the "HEVC · crisp
+   *  text (4:4:4)" picker entry together with the agent's `hevc_chroma`. */
+  const hevcRextSupported = ref<boolean>(false)
+  void isHevcRextDecodeSupported().then((ok) => {
+    hevcRextSupported.value = ok
   })
   /** `true` once the HEVC worker has been spun up and the DC opened.
    *  Same semantics as `vp9_444Active`. */
@@ -4431,7 +4477,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  `data-channel-hevc` AND `hevcSupported` resolved true.
    *
    *  Returns the worker handle so tests can drive it directly. */
-  function startHevcPath(): Worker | null {
+  function startHevcPath(codecOverride?: string): Worker | null {
     if (hevcWorker) return hevcWorker
     if (!pc) return null
     let worker: Worker
@@ -4550,6 +4596,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         {
           type: 'init-canvas',
           canvas: synthetic,
+          // P7 — Rext 4:4:4 sessions override the Main-profile default
+          // (hev1.4.10.L153.B0 vs hev1.1.6.L153.B0); undefined keeps it.
+          codec: codecOverride,
           decodePref: storedDecodePref(),
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
@@ -5893,6 +5942,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // P2 — the avc1 codec string the H.264-DC worker should configure with
     // (probe-ladder result); null when H.264-DC isn't in play.
     let h264DcCodec: string | null = null
+    // P7 — true when the hevc-444 pick passed BOTH Rext gates (browser
+    // probe + agent hevc_chroma); drives the worker codec override + the
+    // chroma_pref field.
+    let hevcRextPick = false
     viewerDecodeHw.value = null
     if (videoTransport.value === 'auto') {
       // rc.190 (A3) — HW×HW auto-rank. A codec is only smooth when it's
@@ -5996,6 +6049,25 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (hwSmooth) {
         preferredTransport = 'data-channel-hevc'
         viewerDecodeHw.value = true
+        // P7 — the hevc-444 pick (chroma yuv444 on the HEVC transport):
+        // honour it only when BOTH ends do Rext — this browser's probe AND
+        // the agent's advertised hevc_chroma. Either missing → silently run
+        // the normal 4:2:0 HEVC session (no chroma_pref sent).
+        if (vp9Chroma.value === 'yuv444') {
+          const rext = hevcRextSupported.value || (await isHevcRextDecodeSupported())
+          hevcRextSupported.value = rext
+          const agentRext =
+            agent?.value?.capabilities?.hevc_chroma?.includes('yuv444') === true
+          if (rext && agentRext) {
+            hevcRextPick = true
+          } else {
+            console.info(
+              rext
+                ? '[rc] HEVC 4:4:4 dropped — agent does not advertise hevc_chroma yuv444 (non-nvenc host / older agent). Running HEVC 4:2:0.'
+                : '[rc] HEVC 4:4:4 dropped — this browser lacks WebCodecs Rext decode (Chrome ≥137 + NV driver ≥572.16, or Intel Gen11+). Running HEVC 4:2:0.',
+            )
+          }
+        }
       } else {
         const fallback = vp9_444Supported.value || (await isVp9_444DecodeSupported())
         vp9_444Supported.value = fallback
@@ -6030,7 +6102,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // deriving from the user's chroma pref (which may say 4:4:4).
       startVp9_444Path(chromaOverride === 'yuv420' ? 'vp09.00.10.08' : undefined)
     } else if (preferredTransport === 'data-channel-hevc') {
-      startHevcPath()
+      // P7 — the Rext pick reconfigures the worker's VideoDecoder with the
+      // Rext codec string (same Annex-B no-description contract; only the
+      // profile fields differ).
+      startHevcPath(hevcRextPick ? HEVC_REXT_CODEC_STRING : undefined)
     } else if (preferredTransport === 'data-channel-av1') {
       // rc.190 — AV1 rides the SAME wire format + worker as VP9-over-DC
       // (13-byte length-prefix framing; the worker's VideoDecoder just
@@ -6079,6 +6154,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         } else if (vp9Chroma.value !== 'auto') {
           requestPayload.chroma_pref = vp9Chroma.value
         }
+      }
+      // P7 — the HEVC transport now honours chroma_pref too (Rext 4:4:4 via
+      // hevc_nvenc). Sent ONLY when both ends passed the Rext gate above;
+      // older agents ignore the field entirely.
+      if (preferredTransport === 'data-channel-hevc' && hevcRextPick) {
+        requestPayload.chroma_pref = 'yuv444'
       }
     }
     // Opt-in host audio → `audio_enabled: true` (omitted when off so
@@ -8088,6 +8169,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     vp9_444FramesDecoded,
     vp9_444Stats,
     vp9_444CanvasEl,
+    /** P7 — whether this browser decodes HEVC Rext 4:4:4 (gates the
+     *  "HEVC · crisp text (4:4:4)" picker entry with the agent's
+     *  hevc_chroma caps). */
+    hevcRextSupported,
     /** rc.78 — HEVC over DataChannel (Option B). Same shape as the
      *  VP9-444 fields above; view can branch on which is active to
      *  decide which canvas/HUD to render. */

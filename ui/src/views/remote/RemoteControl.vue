@@ -1977,6 +1977,15 @@ const agentHasAv1 = computed<boolean>(() => {
     || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-av1_'))
   )
 })
+// P7 — whether the AGENT can emit HEVC Rext 4:4:4 (hevc_nvenc only; the
+// caps probe advertises hevc_chroma). NOT optimistic when caps are absent —
+// unlike the transport fallback, a 4:4:4/4:2:0 codec-string mismatch
+// black-screens the decoder, so the picker entry demands positive proof
+// from BOTH ends (connect() re-gates anyway; this just avoids offering a
+// pick that would silently downgrade).
+const agentHasHevc444 = computed<boolean>(
+  () => agent.value?.capabilities?.hevc_chroma?.includes('yuv444') === true,
+)
 // Opt-in "receive host audio" toggle. Same "takes effect on next
 // Connect" shape as the transport toggles above (the recvonly audio
 // transceiver + `audio_enabled` request flag are fixed at offer time),
@@ -2118,6 +2127,16 @@ const codecChoiceOptions = computed(() => {
   const hevcReason = rc.hevcSupported.value
     ? 'HW H.265 encode on the agent (NVENC/QSV/AMF)'
     : 'This browser lacks a HW HEVC decoder'
+  // P7 — HEVC Rext 4:4:4 needs positive proof on BOTH ends (no SW HEVC
+  // fallback exists in Chrome; a mismatch black-screens).
+  const hevc444Ok = rc.hevcSupported.value && rc.hevcRextSupported.value && agentHasHevc444.value
+  const hevc444Reason = !rc.hevcSupported.value
+    ? 'This browser lacks a HW HEVC decoder'
+    : !rc.hevcRextSupported.value
+      ? 'This browser lacks HEVC Rext 4:4:4 decode (Chrome ≥137 + NVIDIA driver ≥572.16, or Intel Gen11+)'
+      : !agentHasHevc444.value
+        ? 'This agent has no NVENC HEVC 4:4:4 encoder'
+        : 'Sharpest text on the HW pipeline, ~1.5× bitrate (NVENC Rext)'
   const vp9Reason = rc.vp9_444Supported.value
     ? 'Software VP9 — universally decodable'
     : 'This browser can’t decode VP9 profile 1'
@@ -2136,6 +2155,14 @@ const codecChoiceOptions = computed(() => {
       title: 'HEVC (H.265)',
       value: 'hevc',
       props: { disabled: !rc.hevcSupported.value, subtitle: hevcReason },
+    },
+    {
+      title: 'HEVC · crisp text (4:4:4)',
+      value: 'hevc-444',
+      props: {
+        disabled: !hevc444Ok,
+        subtitle: hevc444Reason,
+      },
     },
     {
       title: 'VP9 · crisp text (4:4:4)',
