@@ -106,6 +106,35 @@ Key properties:
 | Intel Iris Xe | MF HW MFT is async-only; the async-unlock path handles it, FFmpeg QSV (`hevc_qsv`, `vp9_qsv`) proven in the field |
 | NVIDIA idle P-states | First seconds of a session encode at ~20 ms/frame until clocks ramp — `gpu_clock.rs` pins graphics clocks via NVML for exactly the session's lifetime (the Parsec "boost" trick) |
 | Windows 11 ACM / HDR desktops | Desktop Duplication hands out FP16 scRGB frames; `fp16.rs` converts scRGB→BGRA8 sRGB so capture doesn't fall back or ship corrupt stripes |
+| WSL (libcuda stub, no driver) | `hevc_nvenc` **dlopens successfully** and then SEGVs when `cuInit(0)` fails. See below — this is the one quirk the cascade does NOT route around |
+
+### ⚠️ Open: the probe shares an address space with the daemon
+
+The HW probe runs **in-process**, so a segfault inside a vendor driver takes
+`roomlerd` down — and the service manager restarts it straight back into the
+same probe. The result is a crash-loop instead of an agent that runs with
+software encoding.
+
+Observed 2026-08-20 on the WSL sibling. WSL ships `/usr/lib/wsl/lib/libcuda.so.1`
+as a stub with no usable driver, which puts nvenc in the **loaded-but-unusable**
+state: the `dlopen` succeeds, so the "not available" branch is never taken, and
+the failure path from `cuInit(0)` crashes. Hosts with *no* libcuda at all
+(`ldconfig -p | grep -c libcuda` = 0) are fine — they take the clean
+dlopen-failed branch.
+
+Not version-specific and not a regression: it is latent, because the probe only
+runs at startup. An agent that has been up for hours never re-enters it, so the
+crash appears at the next restart and looks like whatever shipped most recently.
+
+⚠️ `ROOMLER_AGENT_HW_AUTO=0` and `ROOMLER_AGENT_ENCODER=software` do **not**
+skip it. Those select an encoder; the caps probe enumerates what to *advertise*
+and always runs.
+
+**Fix direction: probe in a CHILD PROCESS**, and read "the child died" as
+"codec unavailable". A capability probe is untrusted third-party code by
+definition — vendor drivers and GPU firmware — and should not share an address
+space with the daemon. That retires the whole class rather than this one CUDA
+symptom, and it is why the fix is not simply "skip nvenc on WSL".
 
 ## Capture backends
 

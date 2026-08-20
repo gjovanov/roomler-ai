@@ -2134,14 +2134,6 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         sentinel_dir = %consent_broker.sentinel_dir().display(),
         "operator-consent broker ready"
     );
-    // Publish it for subsystems built too far from here to be handed it —
-    // today, Roomler SSH, whose server is constructed inside the overlay's TUN
-    // factory. Everything else keeps receiving the broker directly.
-    if !roomler_agent::consent::set_shared(consent_broker.clone()) {
-        tracing::error!(
-            "consent broker was already published — SSH consent may prompt on a different sentinel dir than the tray watches"
-        );
-    }
     let localapi_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (overlay_view_tx, overlay_view_rx) =
         tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());

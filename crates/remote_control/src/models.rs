@@ -617,16 +617,59 @@ pub struct SshPolicy {
 }
 
 impl SshPolicy {
-    /// Effective consent mode. Unset ⇒ [`ConsentMode::Prompt`] (attended);
-    /// the session-shaped variants collapse to `Prompt`, matching
-    /// [`ExecPolicy::effective_consent_mode`].
-    pub fn effective_consent_mode(&self) -> ConsentMode {
-        match self.consent_mode {
-            Some(ConsentMode::Auto) => ConsentMode::Auto,
-            _ => ConsentMode::Prompt,
-        }
+    /// Split into the two halves the server actually uses: what is checked at
+    /// AUTHORIZE time ([`SshGates`]) and what crosses to the device in the
+    /// grant at MINT time ([`SshGrantSpec`]).
+    ///
+    /// The destructure is deliberately EXHAUSTIVE — no `..` — and this is the
+    /// only sanctioned way to consume a policy for a session decision. A field
+    /// added to `SshPolicy` therefore stops compiling HERE, and stays broken
+    /// until someone routes it into one of the halves in writing. That is the
+    /// point: `consent_mode` crossed the wire for weeks while being
+    /// destructured away (`consent_mode: _`), and reading fields off the
+    /// policy à la carte is exactly how the next field gets the same
+    /// treatment.
+    pub fn split(self) -> (SshGates, SshGrantSpec) {
+        let SshPolicy {
+            mode,
+            can_originate,
+            allowed_user_ids,
+            allowed_role_ids,
+            account_mode,
+            account,
+            consent_mode,
+        } = self;
+        (
+            SshGates {
+                mode,
+                can_originate,
+                allowed_user_ids,
+                allowed_role_ids,
+            },
+            SshGrantSpec {
+                account_mode,
+                account,
+                consent_mode,
+            },
+        )
     }
+}
 
+/// The authorize-time half of an [`SshPolicy`] — everything consulted before
+/// the server decides a grant may exist at all.
+#[derive(Debug, Clone)]
+pub struct SshGates {
+    /// Does this device accept SSH sessions? Gate 3.
+    pub mode: SshMode,
+    /// May this device ORIGINATE sessions (`roomler ssh` over its own WS)?
+    /// Not a gate for inbound sessions — it is read off the ORIGIN device's
+    /// policy on the device-originated leg.
+    pub can_originate: bool,
+    pub allowed_user_ids: Vec<ObjectId>,
+    pub allowed_role_ids: Vec<ObjectId>,
+}
+
+impl SshGates {
     /// Is `user` allowed by the user/role allowlists?
     ///
     /// Empty lists mean "no restriction at this layer" — never "deny all" —
@@ -644,6 +687,20 @@ impl SshPolicy {
         }
         true
     }
+}
+
+/// The mint-time half of an [`SshPolicy`] — what the grant carries to the
+/// device. Its fields map 1:1 onto `ServerMsg::SshGrant`, and the mint site
+/// destructures it exhaustively, so a field routed here cannot be dropped on
+/// the way to the wire.
+#[derive(Debug, Clone)]
+pub struct SshGrantSpec {
+    pub account_mode: SshAccountMode,
+    pub account: Option<String>,
+    /// Raw policy value. Only an explicit `Auto` may cross as `Auto`; the mint
+    /// site collapses everything else — including unset — to `Prompt`, the
+    /// attended default (mirroring [`ExecPolicy::effective_consent_mode`]).
+    pub consent_mode: Option<ConsentMode>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2061,7 +2118,11 @@ mod tests {
         let p: SshPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(p.mode, SshMode::Off);
         assert!(!p.can_originate);
-        assert_eq!(p.effective_consent_mode(), ConsentMode::Prompt);
+        // The consent default (unset ⇒ Prompt) is decided where the grant is
+        // minted — `agent_ssh::effective_wire_consent`, locked by the api
+        // crate's `only_an_explicit_auto_crosses_the_wire_as_auto`. Here the
+        // raw field just deserialises to "the admin said nothing".
+        assert_eq!(p.consent_mode, None);
         // `Daemon` is root-equivalent, so it must be a DELIBERATE choice that
         // an operator can see — not something a device silently acquires. It
         // is the default only because it is the one mode P2 can actually
@@ -2075,36 +2136,66 @@ mod tests {
         let role = ObjectId::new();
         let other = ObjectId::new();
 
+        let gates = |p: SshPolicy| p.split().0;
+
         // Empty lists mean "no restriction at THIS layer" — never "deny all".
         // The permission bit and the org kill-switch are the layers that decide
         // whether anyone may connect at all.
-        let open = SshPolicy::default();
+        let open = gates(SshPolicy::default());
         assert!(open.allows_caller(&user, &[role]));
 
-        let by_user = SshPolicy {
+        let by_user = gates(SshPolicy {
             allowed_user_ids: vec![user],
             ..Default::default()
-        };
+        });
         assert!(by_user.allows_caller(&user, &[]));
         assert!(!by_user.allows_caller(&other, &[]));
 
-        let by_role = SshPolicy {
+        let by_role = gates(SshPolicy {
             allowed_role_ids: vec![role],
             ..Default::default()
-        };
+        });
         assert!(by_role.allows_caller(&other, &[role]));
         assert!(!by_role.allows_caller(&other, &[]));
 
         // Both populated ⇒ both must match; they are AND, not OR, so
         // narrowing by role cannot widen who the user allowlist admitted.
-        let both = SshPolicy {
+        let both = gates(SshPolicy {
             allowed_user_ids: vec![user],
             allowed_role_ids: vec![role],
             ..Default::default()
-        };
+        });
         assert!(both.allows_caller(&user, &[role]));
         assert!(!both.allows_caller(&user, &[other]));
         assert!(!both.allows_caller(&other, &[role]));
+    }
+
+    #[test]
+    fn ssh_policy_split_routes_every_field() {
+        // The split is the ignored-field firewall: every policy field must come
+        // out in exactly one half, unchanged. If this test needs editing, make
+        // sure the field you added is actually ACTED ON by its consumer — the
+        // whole point of `split` is that routing a field is a decision, not a
+        // formality.
+        let user = ObjectId::new();
+        let role = ObjectId::new();
+        let policy = SshPolicy {
+            mode: SshMode::On,
+            can_originate: true,
+            allowed_user_ids: vec![user],
+            allowed_role_ids: vec![role],
+            account_mode: SshAccountMode::ConsoleUser,
+            account: Some("goran".into()),
+            consent_mode: Some(ConsentMode::Prompt),
+        };
+        let (gates, spec) = policy.split();
+        assert_eq!(gates.mode, SshMode::On);
+        assert!(gates.can_originate);
+        assert_eq!(gates.allowed_user_ids, vec![user]);
+        assert_eq!(gates.allowed_role_ids, vec![role]);
+        assert_eq!(spec.account_mode, SshAccountMode::ConsoleUser);
+        assert_eq!(spec.account.as_deref(), Some("goran"));
+        assert_eq!(spec.consent_mode, Some(ConsentMode::Prompt));
     }
 
     #[test]
