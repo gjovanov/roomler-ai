@@ -117,6 +117,15 @@ pub fn codec_rate_factor_pct(codec_label: &str) -> usize {
     }
 }
 
+/// P7 — chroma ceiling factor, composed multiplicatively with
+/// [`codec_rate_factor_pct`]: 4:4:4 carries 2× the chroma samples, so give
+/// it the same ×1.5 band the libvpx VP9-444 pump ships. The relay clamp
+/// still applies AFTER the composed factor (pipe physics don't grow with
+/// the chroma), so a relayed 4:4:4 session stays at `relay_max_bps`.
+pub fn chroma_rate_factor_pct(chroma444: bool) -> usize {
+    if chroma444 { 150 } else { 100 }
+}
+
 /// H.264 constant-quality adjustment: 2 steps sharper than the shared CQ
 /// base, floored at the global minimum (10). No-op for every other encoder.
 pub fn h264_cq_adjust(encoder_name: &str, cq: u32) -> u32 {
@@ -491,6 +500,22 @@ mod tests {
         assert_eq!(codec_rate_factor_pct("HEVC"), 100);
         assert_eq!(codec_rate_factor_pct("VP9"), 100);
         assert_eq!(codec_rate_factor_pct("AV1"), 100);
+    }
+
+    // P7 — chroma factor composes multiplicatively with the codec factor.
+    #[test]
+    fn chroma_factor_composes_with_codec_factor() {
+        assert_eq!(chroma_rate_factor_pct(true), 150);
+        assert_eq!(chroma_rate_factor_pct(false), 100);
+        // HEVC 4:4:4 → 150; HEVC 4:2:0 → 100 (the pump's compose rule).
+        assert_eq!(
+            codec_rate_factor_pct("HEVC") * chroma_rate_factor_pct(true) / 100,
+            150
+        );
+        assert_eq!(
+            codec_rate_factor_pct("HEVC") * chroma_rate_factor_pct(false) / 100,
+            100
+        );
     }
 
     #[test]

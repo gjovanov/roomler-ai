@@ -76,6 +76,7 @@ import {
   diagHudEnabled,
   storedSharpenMode,
   storedSharpness,
+  HEVC_REXT_CODEC_STRING,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -2469,6 +2470,14 @@ describe('codecChoiceToSettings (rc.199 unified Codec picker)', () => {
       preferredCodec: null,
       renderPath: 'webcodecs',
     })
+    // P7 — HEVC Rext 4:4:4 shares the HEVC transport and differs ONLY in
+    // chroma (the vp9-444/vp9-420 pattern).
+    expect(codecChoiceToSettings('hevc-444')).toEqual({
+      videoTransport: 'data-channel-hevc',
+      chroma: 'yuv444',
+      preferredCodec: null,
+      renderPath: 'webcodecs',
+    })
     // The two VP9 choices share a transport and differ ONLY in chroma —
     // 4:4:4 = crisp text, 4:2:0 = efficient.
     expect(codecChoiceToSettings('vp9-444')).toEqual({
@@ -2508,6 +2517,10 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
     expect(settingsToCodecChoice('auto', 'auto')).toBe('auto')
     expect(settingsToCodecChoice('data-channel-av1', 'auto')).toBe('av1')
     expect(settingsToCodecChoice('data-channel-hevc', 'auto')).toBe('hevc')
+    // P7 — explicit yuv444 on the HEVC transport reads back as the Rext
+    // pick; yuv420 (and legacy auto above) stay plain HEVC.
+    expect(settingsToCodecChoice('data-channel-hevc', 'yuv444')).toBe('hevc-444')
+    expect(settingsToCodecChoice('data-channel-hevc', 'yuv420')).toBe('hevc')
     expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv444')).toBe('vp9-444')
     expect(settingsToCodecChoice('data-channel-vp9-444', 'yuv420')).toBe('vp9-420')
     // Legacy vp9-444 sessions stored chroma 'auto' → read as the efficient
@@ -2519,11 +2532,27 @@ describe('settingsToCodecChoice (rc.199 reverse map)', () => {
   })
 
   it('round-trips every choice through settings and back', () => {
-    const choices: RcCodecChoice[] = ['auto', 'av1', 'hevc', 'vp9-444', 'vp9-420', 'h264']
+    const choices: RcCodecChoice[] = [
+      'auto',
+      'av1',
+      'hevc',
+      'hevc-444',
+      'vp9-444',
+      'vp9-420',
+      'h264',
+    ]
     for (const c of choices) {
       const s = codecChoiceToSettings(c)
       expect(settingsToCodecChoice(s.videoTransport, s.chroma)).toBe(c)
     }
+  })
+})
+
+describe('P7 — HEVC Rext 4:4:4 codec string', () => {
+  it('locks the Rext profile fields alongside the Main-profile default', () => {
+    // Same Annex-B no-description contract as the worker's default
+    // hev1.1.6.L153.B0; profile_idc 4 + the Rext compat flag + Level 5.1.
+    expect(HEVC_REXT_CODEC_STRING).toBe('hev1.4.10.L153.B0')
   })
 })
 
