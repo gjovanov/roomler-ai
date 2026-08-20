@@ -529,8 +529,15 @@ mod sshd {
                     return Ok(());
                 }
             };
+            // Does a human at this device have to approve, per the server's
+            // `SshPolicy`? Only a GRANT can carry that requirement: a key-list
+            // session has no server policy behind it, and it is deliberately
+            // the break-glass path for when the control plane is the broken
+            // thing — blocking it on a prompt would take the emergency route
+            // away exactly when it is needed.
+            let consent = self.grant.as_ref().and_then(consent_requirement);
             tokio::spawn(async move {
-                run_exec(handle, channel, command, caller, run_as).await;
+                run_exec(handle, channel, command, caller, run_as, consent).await;
             });
             Ok(())
         }
@@ -606,6 +613,76 @@ mod sshd {
         Ok(())
     }
 
+    /// What a grant demands of the operator at this device, if anything.
+    ///
+    /// Returns the sentinel id to prompt on, or `None` when the policy is an
+    /// explicit `Auto`. Anything else — `Prompt`, `Email`, `Push`, or a server
+    /// that said nothing at all — requires a human. Email and Push are folded
+    /// into the same local prompt rather than refused: the broker's sentinel is
+    /// how a decision reaches this process regardless of which channel carried
+    /// the question, and that is exactly how Fleet RPC treats them.
+    pub(super) fn consent_requirement(grant: &super::Grant) -> Option<String> {
+        use roomler_ai_remote_control::models::ConsentMode;
+        match grant.consent_mode {
+            Some(ConsentMode::Auto) => None,
+            _ => Some(grant.grant_id.clone()),
+        }
+    }
+
+    /// Ask the operator at this device, and say so on stderr first.
+    ///
+    /// The advisory line matters: without it a policy of `prompt` looks to the
+    /// caller like a 30-second hang, which is the same "a bare failure cannot
+    /// explain itself" problem that shapes every other refusal here.
+    ///
+    /// A missing broker is a DENIAL. The daemon publishes one at start-up, so
+    /// its absence means this is not a daemon — and a session that was supposed
+    /// to need a human must not proceed just because nobody was there to ask.
+    async fn await_consent(
+        handle: &russh::server::Handle,
+        channel: ChannelId,
+        caller: &str,
+        sentinel: &str,
+    ) -> Result<(), String> {
+        let Some(broker) = crate::consent::shared() else {
+            return Err(
+                "this device requires operator approval for SSH sessions but has no consent \
+                 broker running, so nobody can be asked. Refusing rather than proceeding \
+                 unapproved."
+                    .to_string(),
+            );
+        };
+
+        let timeout = crate::consent::DEFAULT_PROMPT_TIMEOUT;
+        let _ = handle
+            .extended_data(
+                channel,
+                1,
+                format!(
+                    "roomler-ssh: waiting up to {}s for approval at the device…\r\n",
+                    timeout.as_secs()
+                )
+                .into_bytes(),
+            )
+            .await;
+
+        let decision = broker
+            .request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout })
+            .await;
+        if decision.granted() {
+            info!(%caller, %sentinel, "ssh: operator approved the session");
+            return Ok(());
+        }
+        warn!(%caller, %sentinel, ?decision, "ssh: operator did not approve the session");
+        Err(match decision {
+            crate::consent::Decision::Timeout => format!(
+                "nobody approved this session at the device within {}s",
+                timeout.as_secs()
+            ),
+            _ => "the operator at this device denied this session".to_string(),
+        })
+    }
+
     /// Run one command through the daemon's existing execution engine and
     /// stream the result back over the channel.
     ///
@@ -625,8 +702,24 @@ mod sshd {
         command: String,
         caller: String,
         run_as: crate::exec::RunAs,
+        consent: Option<String>,
     ) {
         use roomler_ai_remote_control::models::exec_limits;
+
+        // Ask BEFORE anything runs, and refuse rather than fall through. The
+        // prompt is deliberately here and not at grant-arrival time: the server
+        // has already told the caller where to dial by then, so a refusal there
+        // would surface as a connection that rejects them for no stated reason.
+        if let Some(sentinel) = consent
+            && let Err(why) = await_consent(&handle, channel, &caller, &sentinel).await
+        {
+            let _ = handle
+                .extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes())
+                .await;
+            let _ = handle.exit_status_request(channel, 1).await;
+            let _ = handle.close(channel).await;
+            return;
+        }
 
         let request_id = format!("ssh-{:016x}", rand::random::<u64>());
         let identity = run_as.label();
@@ -750,6 +843,13 @@ pub struct Grant {
     /// what makes anything other than `daemon` actually happen.
     pub account_mode: String,
     pub account: Option<String>,
+    /// Whether the operator AT the device has to approve this session before
+    /// anything runs, per the device's `SshPolicy`.
+    ///
+    /// `None` means the server said nothing, which is treated exactly like
+    /// `Prompt` — the fail-safe direction for a gate whose whole purpose is to
+    /// put a human in the loop. Only an explicit `Auto` skips the prompt.
+    pub consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     /// Server-clamped session lifetime once redeemed.
     pub session_secs: u64,
     /// LOCAL deadline after which this grant is dead.
@@ -782,12 +882,14 @@ const MAX_PENDING_GRANTS: usize = 16;
 /// SSH session (a different device) is the one waiting, and it learns the
 /// outcome by its connection succeeding or not.
 #[cfg(feature = "ssh-server")]
+#[allow(clippy::too_many_arguments)]
 pub fn record_grant(
     grant_id: String,
     public_key: String,
     caller: String,
     account_mode: String,
     account: Option<String>,
+    consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     expires_at_ms: u64,
     session_secs: u64,
 ) -> Result<(), String> {
@@ -819,6 +921,7 @@ pub fn record_grant(
         caller,
         account_mode,
         account,
+        consent_mode,
         session_secs: ssh_limits::clamp_session_secs(session_secs),
         deadline: Instant::now() + window,
     };
@@ -1250,13 +1353,31 @@ mod tests {
             .as_millis() as u64
     }
 
+    /// A grant that needs no operator approval.
+    ///
+    /// `Auto` is stated explicitly rather than left to the default because the
+    /// default is the OPPOSITE: an absent consent mode means prompt. These
+    /// tests assert that a grant runs, so they have to say why nobody is asked.
     fn grant_for(line: &str, ttl_ms: u64) -> Result<(), String> {
+        grant_for_with_consent(
+            line,
+            ttl_ms,
+            Some(roomler_ai_remote_control::models::ConsentMode::Auto),
+        )
+    }
+
+    fn grant_for_with_consent(
+        line: &str,
+        ttl_ms: u64,
+        consent: Option<roomler_ai_remote_control::models::ConsentMode>,
+    ) -> Result<(), String> {
         super::record_grant(
             format!("g-{}", rand::random::<u32>()),
             line.to_string(),
             "alice@example.com".into(),
             "daemon".into(),
             None,
+            consent,
             now_ms() + ttl_ms,
             0,
         )
@@ -1383,5 +1504,106 @@ mod tests {
             "pending grants must stay capped, got {}",
             super::pending_grants()
         );
+    }
+
+    // ── Operator consent ──────────────────────────────────────────────────
+
+    /// Only an explicit `Auto` skips the prompt. Everything else — including a
+    /// server that said nothing — puts a human in the loop.
+    #[test]
+    fn only_an_explicit_auto_skips_the_operator_prompt() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let grant = |m: Option<ConsentMode>| super::Grant {
+            grant_id: "g-1".into(),
+            public_key: String::new(),
+            caller: "alice@example.com".into(),
+            account_mode: "daemon".into(),
+            account: None,
+            consent_mode: m,
+            session_secs: 0,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        };
+
+        assert!(
+            super::sshd::consent_requirement(&grant(Some(ConsentMode::Auto))).is_none(),
+            "auto is the one mode that runs without asking"
+        );
+        for m in [
+            Some(ConsentMode::Prompt),
+            Some(ConsentMode::Email),
+            Some(ConsentMode::Push),
+            None, // the fail-safe: absent directive ⇒ ask
+        ] {
+            assert_eq!(
+                super::sshd::consent_requirement(&grant(m)).as_deref(),
+                Some("g-1"),
+                "{m:?} must require approval and prompt on the grant id"
+            );
+        }
+    }
+
+    /// THE regression this slice exists for.
+    ///
+    /// `SshPolicy.consent_mode` used to cross the wire and be destructured
+    /// away, so a device policy of `prompt` prompted nobody and the session ran
+    /// anyway. An admin reading that policy would believe a human had to
+    /// approve every SSH session into the device. None ever did.
+    ///
+    /// There is no consent broker in a unit test, which is exactly the
+    /// fail-closed case: a session that was supposed to need a human must
+    /// refuse when there is nobody to ask, not proceed unapproved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_grant_requiring_consent_refuses_when_nobody_can_be_asked() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(30);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+
+        let session = connect(addr, key).await; // auth SUCCEEDS — consent is not auth
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, "echo should-never-run").await.unwrap();
+
+        let (mut stdout, mut stderr, mut exit) = (Vec::new(), Vec::new(), None);
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    stderr.extend_from_slice(data)
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(
+            !out.contains("should-never-run"),
+            "the command ran without approval — the ignored-consent_mode bug is back"
+        );
+        assert!(
+            err.contains("no consent broker"),
+            "the caller must be told WHY it was refused, got stderr {err:?}"
+        );
+        assert_eq!(exit, Some(1));
+    }
+
+    /// The mode survives the trip into the grant table, so what the server
+    /// asked for is what redemption sees.
+    #[tokio::test]
+    async fn a_recorded_grant_keeps_its_consent_mode() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(31);
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+
+        let parsed = russh::keys::ssh_key::PublicKey::from_openssh(&line).unwrap();
+        let taken = super::take_grant_for(&parsed).expect("the grant is redeemable");
+        assert_eq!(taken.consent_mode, Some(ConsentMode::Prompt));
+        let _ = key;
     }
 }
