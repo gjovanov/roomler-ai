@@ -2395,13 +2395,12 @@ async fn media_pump(
             // a meaningful value once peer.rs surfaces it.
             enc.request_reference_invalidation(0);
         }
-        // ROI hints from per-frame dirty rects. Empty for scrap
-        // captures (no dirty-rect API); WGC backend (1C.1) will
-        // populate these so MF/NVENC overrides can spend bits on
-        // changed regions. Default trait impl is a no-op so this is
-        // free for SW encoders.
-        if !frame.dirty_rects.is_empty() {
-            enc.set_roi_hints(&frame.dirty_rects, (frame.width, frame.height));
+        // ROI hints from per-frame tracked damage (P8a: `Damage` enum —
+        // `rects()` is empty for both Unknown and provably-unchanged, and
+        // every encoder's hook is a no-op today, so the distinction
+        // doesn't matter at this call site yet).
+        if !frame.damage.rects().is_empty() {
+            enc.set_roi_hints(frame.damage.rects(), (frame.width, frame.height));
         }
 
         // Adaptive bitrate: combine quality preference (controller
@@ -4455,10 +4454,13 @@ async fn media_pump_ffmpeg_dc(
         let capture_start = std::time::Instant::now();
         let next = capturer.next_frame().await;
         capture_us += capture_start.elapsed().as_micros() as u64;
-        // P7c — set on the real-capture arm; the idle-refine signal is fed
-        // AFTER encode (where the frame's wire cost is known), never for
-        // keepalive re-encodes.
+        // P7c — set on the real-capture arm; the idle-refine BYTES leg is
+        // fed AFTER encode (where the frame's wire cost is known), never
+        // for keepalive re-encodes. P8a — `area_judged` marks a frame the
+        // AREA leg already judged at capture time (tracked damage over the
+        // floor); the bytes leg skips those (one note per frame).
         let mut is_real_frame = false;
+        let mut area_judged = false;
         let frame: std::sync::Arc<crate::capture::Frame> = match next {
             Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
@@ -4468,6 +4470,29 @@ async fn media_pump_ffmpeg_dc(
                 is_real_frame = true;
                 // Motion continues — the settle gate counts the episode.
                 settle_kf.note_real_frame();
+                // P8a — AREA significance leg, judged at CAPTURE time on
+                // the pre-downscale frame (native coordinate space; also
+                // upstream of the viewer-rate divisor skip, so tracked
+                // motion counts even when this frame is later shed).
+                // Area is rung-invariant — the leg that cannot oscillate.
+                if let Some(area_pm) = arc
+                    .damage
+                    .area_permille(arc.width as u64 * arc.height as u64)
+                    && idle_refine.area_significant(area_pm)
+                {
+                    area_judged = true;
+                    if let Some(flip) =
+                        idle_refine.note_real_frame_area(std::time::Instant::now(), area_pm)
+                    {
+                        info!(
+                            %session_id,
+                            codec_label,
+                            ?flip,
+                            area_pm,
+                            "idle refine: motion burst (damage area) — restoring resolution cap"
+                        );
+                    }
+                }
                 arc
             }
             Ok(None) => {
@@ -4951,13 +4976,16 @@ async fn media_pump_ffmpeg_dc(
         // *configured* capture with a struggling viewer could slip both —
         // accepted: that stream is already fps-shedding to protect the
         // same viewer.
-        if is_real_frame {
+        if is_real_frame && !area_judged {
             let wire_bytes: usize = packets.iter().map(|p| p.data.len()).sum();
             // P7c-2 — significance is judged against the RUNG-SCALED floor
             // (`frame` here is the post-downscale encoded frame, so w×h is
             // the encode area). A fixed floor oscillated in the field: small
             // persistent animations were invisible at 1024×640 and visible
-            // at native, flipping Up/Down every ~6 s.
+            // at native, flipping Up/Down every ~6 s. P8a — this BYTES leg
+            // is the fallback for untracked frames AND the Down-guard for
+            // small-area/high-byte content (PiP video) on tracked ones;
+            // frames the area leg already judged never double-note.
             let encode_area = frame.width as u64 * frame.height as u64;
             if let Some(flip) =
                 idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes, encode_area)
@@ -5960,12 +5988,48 @@ fn apply_target_resolution(
         data: downscaled,
         monotonic_us: frame.monotonic_us,
         monitor: frame.monitor,
-        // Dirty rects at native scale; after downscale they'd need
-        // re-projection. The encoder's ROI hook treats an empty list
-        // as "unknown" which falls back to full-frame encoding — safe
-        // default until we wire per-rect scaling.
-        dirty_rects: Vec::new(),
+        // P8a — damage survives the resample (it used to be dropped
+        // here, which destroyed every tracked rect on the field path).
+        damage: scale_damage(&frame.damage, frame.width, frame.height, tw, th),
     })
+}
+
+/// P8a — re-project tracked damage through a downscale. Per-EDGE
+/// floor/ceil (`x0=floor(x·r)`, `x1=ceil((x+w)·r)`) so coverage never
+/// shrinks below the true footprint (floor-x/ceil-w under-covers when
+/// the scaled origin lands mid-pixel). `Unknown` passes through.
+fn scale_damage(
+    damage: &crate::capture::Damage,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> crate::capture::Damage {
+    use crate::capture::{Damage, DirtyRect};
+    let Damage::Tracked(rects) = damage else {
+        return Damage::Unknown;
+    };
+    if src_w == 0 || src_h == 0 {
+        return Damage::Unknown;
+    }
+    let rx = dst_w as f64 / src_w as f64;
+    let ry = dst_h as f64 / src_h as f64;
+    let out = rects
+        .iter()
+        .filter_map(|r| {
+            let x0 = ((r.x as f64 * rx).floor() as u32).min(dst_w);
+            let y0 = ((r.y as f64 * ry).floor() as u32).min(dst_h);
+            let x1 = (((r.x + r.w) as f64 * rx).ceil() as u32).min(dst_w);
+            let y1 = (((r.y + r.h) as f64 * ry).ceil() as u32).min(dst_h);
+            (x1 > x0 && y1 > y0).then_some(DirtyRect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            })
+        })
+        .collect();
+    Damage::Tracked(out)
 }
 
 /// rc.38 — aspect-preserving downscale target: shrink `(src_w, src_h)` so its
@@ -8558,6 +8622,40 @@ mod tests {
 
     // rc.190 — agent-side resolution caps (B1 relay hard / B2 SW soft).
     use super::TargetResolution as TR;
+
+    // P8a — damage re-projection through a downscale.
+    #[test]
+    fn scale_damage_per_edge_covers_and_unknown_passes_through() {
+        use crate::capture::{Damage, DirtyRect};
+        // Per-edge floor/ceil: at ratio 0.1 a rect covering source px
+        // 19..21 (x=19, w=2) maps to scaled px 1..3 — floor-x/ceil-w
+        // (1 + ceil(0.2)=1) would cover px 1 only; per-edge covers 1..3.
+        let d = Damage::Tracked(vec![DirtyRect {
+            x: 19,
+            y: 0,
+            w: 2,
+            h: 10,
+        }]);
+        let scaled = super::scale_damage(&d, 100, 100, 10, 10);
+        let Damage::Tracked(v) = &scaled else {
+            panic!("tracked must stay tracked");
+        };
+        assert_eq!(v.len(), 1);
+        assert_eq!(
+            (v[0].x, v[0].w),
+            (1, 2),
+            "per-edge scaling must not under-cover"
+        );
+        assert_eq!((v[0].y, v[0].h), (0, 1));
+        // Unknown passes through as Unknown.
+        assert!(matches!(
+            super::scale_damage(&Damage::Unknown, 100, 100, 10, 10),
+            Damage::Unknown
+        ));
+        // Tracked-empty stays tracked-empty (provably unchanged).
+        let empty = super::scale_damage(&Damage::Tracked(vec![]), 100, 100, 10, 10);
+        assert!(matches!(empty, Damage::Tracked(ref v) if v.is_empty()));
+    }
 
     #[test]
     fn aspect_preserved_target_shrinks_long_edge_even_dims() {
