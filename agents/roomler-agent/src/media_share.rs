@@ -267,6 +267,32 @@ impl Pipeline {
         cap
     }
 
+    /// P7b (merge-aware idle refine) — is the pipeline's merged cap LIFTABLE
+    /// at rest? True iff every viewer whose Priority dial contributes a cap
+    /// (`priority_relay_cap(..) == Some`) also passes `idle_refine_applies`.
+    /// Viewers contributing NO cap (Sharper; Balanced on direct) never block
+    /// — they asked for native anyway. Vacuously true when nothing caps (the
+    /// caller's merged-cap-clamps check already gates that case). Field
+    /// 2026-08-20 (pc55331): owner=Sharper + follower=Smoother parked the
+    /// shared stream at 1024 with refine dead — the floor-merge took the
+    /// follower's cap while eligibility read only the owner's dial, giving
+    /// the worst combination (capped AND never crisp at rest). With a single
+    /// viewer this reduces exactly to `idle_refine_applies(own_prio, _)`.
+    pub fn merged_refine_eligible(&self, own_prio: u8, constrained: bool) -> bool {
+        let blocks = |p: u8| {
+            crate::encode::priority_relay_cap(p, constrained).is_some()
+                && !crate::encode::idle_refine_applies(p, constrained)
+        };
+        if blocks(own_prio) {
+            return false;
+        }
+        let inner = self.inner.lock().unwrap();
+        !inner
+            .followers
+            .iter()
+            .any(|f| blocks(f.sink.priority.load(Relaxed)))
+    }
+
     /// Floor-merge of the quality dial (lowest value = most conservative;
     /// the VP9 pump's semantics). The FFmpeg pump ignores quality.
     pub fn min_quality(&self, own: u8) -> u8 {
@@ -866,6 +892,63 @@ mod tests {
             "budget-capped pipeline keeps the slow viewer (floor holds)"
         );
         drop(other);
+    }
+
+    /// P7b — the merge-aware refine-eligibility decision table. Every
+    /// cap-contributing dial must be refine-applicable; no-cap dials
+    /// (Sharper anywhere; Balanced on direct) never block.
+    ///
+    /// Env hygiene: `idle_refine_applies` consults
+    /// ROOMLER_AGENT_IDLE_REFINE_BALANCED for the Balanced rows — cleared
+    /// up front so the table asserts the DEFAULT (opt-in off) semantics.
+    /// (The opt-in flip itself is locked by
+    /// `encode::tests::idle_refine_applies_matrix`; that test restores the
+    /// var after itself, so the cross-module interleaving window is µs.)
+    #[tokio::test]
+    async fn merged_refine_eligible_decision_table() {
+        let _s = serial();
+        // SAFETY: same contract as the sibling env-clearing tests.
+        unsafe { std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED") };
+        use crate::encode::priority::{BALANCED, SHARPER, SMOOTHER};
+        let key = PipelineKey::FfmpegDc("TEST-REFINE");
+        let owner = Pipeline::register(key, ObjectId::new());
+
+        // Single viewer reduces to idle_refine_applies(own): Smoother
+        // refines, Sharper is vacuously eligible (no cap — the caller's
+        // merged-cap-clamps gate is what makes it a no-op), Balanced on a
+        // relay contributes the B1 physics cap and blocks.
+        assert!(owner.merged_refine_eligible(SMOOTHER, true));
+        assert!(owner.merged_refine_eligible(SMOOTHER, false));
+        assert!(owner.merged_refine_eligible(SHARPER, true));
+        assert!(!owner.merged_refine_eligible(BALANCED, true));
+        assert!(owner.merged_refine_eligible(BALANCED, false));
+
+        // THE field case (pc55331 2026-08-20): owner=Sharper +
+        // follower=Smoother — the follower's liftable cap clamps, Sharper
+        // contributes none ⇒ eligible.
+        let s = sink(ObjectId::new());
+        let follower_prio = s.priority.clone();
+        follower_prio.store(SMOOTHER, std::sync::atomic::Ordering::Relaxed);
+        let guard = try_join(key, s, 60).expect("join");
+        assert!(owner.merged_refine_eligible(SHARPER, true));
+        assert!(owner.merged_refine_eligible(SHARPER, false));
+
+        // Smoother owner + Balanced follower: on a relay the follower's
+        // B1 1280 cap is NOT liftable ⇒ blocked; on direct Balanced
+        // contributes no cap ⇒ eligible.
+        follower_prio.store(BALANCED, std::sync::atomic::Ordering::Relaxed);
+        assert!(!owner.merged_refine_eligible(SMOOTHER, true));
+        assert!(owner.merged_refine_eligible(SMOOTHER, false));
+
+        // Back to an all-liftable pair.
+        follower_prio.store(SMOOTHER, std::sync::atomic::Ordering::Relaxed);
+        assert!(owner.merged_refine_eligible(SMOOTHER, true));
+
+        // Follower leaves → single-viewer semantics return.
+        drop(guard);
+        assert_eq!(owner.follower_count(), 0);
+        assert!(owner.merged_refine_eligible(SHARPER, true));
+        drop(owner);
     }
 
     #[test]
