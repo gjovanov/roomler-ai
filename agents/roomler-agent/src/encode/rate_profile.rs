@@ -31,6 +31,18 @@
 //!    QP scale + weaker intra prediction). The h264_* encoders get a
 //!    2-step sharper constant-quality target off the shared `FFMPEG_CQ`
 //!    base (env still wins as the base; the adjustment is relative).
+//!
+//! 4. **Idle-settle keyframe gate** ([`SettleKeyframeGate`]): the rc.187
+//!    settle IDR, burst-gated so caret blinks stop metronoming forced IDRs.
+//!
+//! 5. **Scale-aware CQ bias** ([`scale_cq_bias`], P7): deep resolution
+//!    rungs run far below the [3, 12] Mbps maxrate floor's bpp budget —
+//!    spend the headroom on text sharpness instead of leaving it unused.
+//!
+//! 6. **Idle native-rung refinement** ([`IdleRefine`], P7): when the ONLY
+//!    reason the encode is below native is a resolution cap and the scene
+//!    has settled, lift the cap so the encoder rebuilds at native and ships
+//!    one crisp still; the first motion burst restores the cap in ~300 ms.
 
 use std::time::{Duration, Instant};
 
@@ -132,6 +144,15 @@ pub fn codec_rate_factor_pct(codec_label: &str) -> usize {
     }
 }
 
+/// P7 — chroma ceiling factor, composed multiplicatively with
+/// [`codec_rate_factor_pct`]: 4:4:4 carries 2× the chroma samples, so give
+/// it the same ×1.5 band the libvpx VP9-444 pump ships. The relay clamp
+/// still applies AFTER the composed factor (pipe physics don't grow with
+/// the chroma), so a relayed 4:4:4 session stays at `relay_max_bps`.
+pub fn chroma_rate_factor_pct(chroma444: bool) -> usize {
+    if chroma444 { 150 } else { 100 }
+}
+
 /// H.264 constant-quality adjustment: 2 steps sharper than the shared CQ
 /// base, floored at the global minimum (10). No-op for every other encoder.
 pub fn h264_cq_adjust(encoder_name: &str, cq: u32) -> u32 {
@@ -167,6 +188,52 @@ pub fn vp9_qsv_config(verdict: Option<(bool, bool)>, forced_lp: Option<bool>) ->
         Some((false, true)) => (true, false),
         Some((false, false)) | None => (false, true),
     }
+}
+
+/// P7 (2026-08-20) — CQ sharpening steps for deep resolution rungs. When a
+/// cap has shrunk the encode area well below native, the [3, 12] Mbps
+/// maxrate floor grants 1.4-2.2× the 0.07-bpp design budget — headroom that
+/// CQ-driven VBR never spends (it uses only what the quality target
+/// demands). Trade it for text sharpness. Ladder on AREA ratio:
+///   ≤ 32% area (~0.57 linear) → max_steps    (Smoother 1024 rung:
+///                                             1920×1200→1024×640 = 28%)
+///   ≤ 50% area (~0.71 linear) → max_steps/2  (Balanced relay 1280 rung:
+///                                             1920×1200→1280×800 = 44%)
+///   else 0 (near-native rungs already run at the design bpp).
+/// NVENC/QSV quality steps cost ~7-10% bits each, so the default 4 steps ≈
+/// 1.3-1.5× sustained bits — inside the floor headroom with margin, and the
+/// UNCHANGED maxrate ceiling + HRD still bound the worst case (the bias can
+/// only spend budget the design already allocated).
+pub fn scale_cq_bias(enc_w: u32, enc_h: u32, native_w: u32, native_h: u32, max_steps: u32) -> u32 {
+    let enc_area = enc_w as u64 * enc_h as u64;
+    let native_area = native_w as u64 * native_h as u64;
+    if enc_area == 0 || native_area == 0 || enc_area >= native_area {
+        return 0;
+    }
+    // Integer percent avoids f32 wobble at the ladder boundaries.
+    let pct = enc_area * 100 / native_area;
+    if pct <= 32 {
+        max_steps
+    } else if pct <= 50 {
+        max_steps / 2
+    } else {
+        0
+    }
+}
+
+/// Env-resolved `max_steps` for [`scale_cq_bias`]:
+/// `ROOMLER_AGENT_SCALE_CQ_BOOST`, default 4, `0` disables the bias.
+pub fn scale_cq_boost_steps() -> u32 {
+    tunnel_core::env::node_env("SCALE_CQ_BOOST")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(4)
+}
+
+/// Apply a CQ bias with the shared global floor (10 — below that is
+/// near-lossless blow-out, see `ffmpeg_cq`). Composes with
+/// [`h264_cq_adjust`]: 22 → 20 (h264) → 16 (deep rung); one shared floor.
+pub fn apply_cq_bias(cq: u32, steps: u32) -> u32 {
+    cq.saturating_sub(steps).max(10)
 }
 
 /// Real frames since the last settle that make a motion episode "a burst"
@@ -254,6 +321,176 @@ impl SettleKeyframeGate {
         }
         self.last_fired = Some(now);
         Some(burst)
+    }
+}
+
+/// P7 (2026-08-20) — idle native-rung refinement ("crisp at rest").
+///
+/// The Smoother/relay resolution caps trade pixels for motion smoothness —
+/// but when the user STOPS to READ, the stream stays at the low rung and
+/// 9-10 pt text remains mush (the display_match.rs thesis: the only truly
+/// crisp chain is 1:1 end-to-end). A settled desktop costs the link nothing
+/// (the 60 ms keepalive re-encodes near-zero-byte deltas at ANY rung), so:
+/// once the scene settles, lift the cap → the dims-keyed encoder rebuild
+/// ships one crisp native IDR (~150-400 KB ⇒ 0.4-1.1 s progressive
+/// crystallize over a 3 Mbps relay; HRD bufsize 750 KB fits it); the first
+/// motion burst restores the cap within ~300 ms, before the relay melts.
+///
+/// Pure state machine, frame-cadence signals only — dirty-rect damage was
+/// rejected because only the WGC backend populates rects (scrap/DXGI emit
+/// none), so damage-based motion detection would silently misbehave on the
+/// main field path. `Instant`s are passed in (the FlipTracker pattern) so
+/// every behaviour below is unit-tested.
+///
+/// Window length for the frames-per-window rate rules. Doubles as the
+/// emergent settle threshold: after motion stops, the window drains in
+/// exactly this long, so the up-flip fires ~1 s after the last burst.
+pub const REFINE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Real frames per window still considered "quiet" for the UP-flip. A caret
+/// blink (~1.9 Hz → ≤2 frames/s) must refine; typing at ≥3 cps must not
+/// (each up-flip is an encoder rebuild + native IDR — not free mid-typing).
+pub const REFINE_SPARSE_MAX: u32 = 2;
+
+/// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
+/// a scroll/drag; typing produces 100-200 ms gaps and never chains).
+pub const REFINE_MOTION_GAP: Duration = Duration::from_millis(80);
+
+/// Chained-run length that DOWN-flips a refined session: 8 frames at
+/// ≥12.5 fps ≈ 270 ms of sustained motion — fast enough that a scroll
+/// doesn't melt a 3 Mbps relay with native-sized deltas.
+pub const REFINE_DOWN_RUN: u32 = 8;
+
+/// Frames-per-window rate that DOWN-flips regardless of chaining — catches
+/// 80-250 ms-gap motion (10-12 fps window animations) within ≤1 s. Note the
+/// asymmetry with `REFINE_SPARSE_MAX`: sustained 3-9 fps damage (typing,
+/// slow spinners) neither re-refines NOR down-flips — once crisp, typing
+/// stays crisp; the relay carries <10 fps of native deltas fine.
+pub const REFINE_RATE_DOWN: u32 = 10;
+
+/// Minimum spacing from ANY flip to the next UP-flip. Bounds the worst-case
+/// churn (type-pause-type) to one rebuild pair per 10 s.
+pub const REFINE_UP_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// What the pump should do about the resolution cap this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefineFlip {
+    /// Scene settled — lift the cap (encoder rebuilds at native, crisp IDR).
+    Up,
+    /// Motion burst — restore the cap (encoder rebuilds at the low rung).
+    Down,
+}
+
+/// See the module notes above. Owned by the ffmpeg DC pump; `note_real_frame`
+/// is called for every damage-carrying capture, `on_keepalive` on every idle
+/// keepalive tick (≥60 ms after the last real frame by construction).
+#[derive(Debug)]
+pub struct IdleRefine {
+    enabled: bool,
+    refined: bool,
+    /// Length of the current ≤`REFINE_MOTION_GAP`-chained run.
+    run: u32,
+    last_real: Option<Instant>,
+    /// Real-frame arrivals within the trailing `REFINE_WINDOW`.
+    window: std::collections::VecDeque<Instant>,
+    last_flip: Option<Instant>,
+}
+
+impl IdleRefine {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            refined: false,
+            run: 0,
+            last_real: None,
+            window: std::collections::VecDeque::new(),
+            last_flip: None,
+        }
+    }
+
+    /// Kill switch `ROOMLER_AGENT_IDLE_REFINE=0` (or `false`).
+    pub fn from_env() -> Self {
+        let enabled = !matches!(
+            tunnel_core::env::node_env("IDLE_REFINE")
+                .as_deref()
+                .map(str::trim),
+            Some("0") | Some("false")
+        );
+        Self::new(enabled)
+    }
+
+    /// Whether the pump should currently run WITHOUT the resolution cap.
+    pub fn refined(&self) -> bool {
+        self.refined
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&t) = self.window.front() {
+            if now.duration_since(t) > REFINE_WINDOW {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// A real (damage-carrying) frame arrived. Returns `Some(Down)` exactly
+    /// when a refined session must drop back to the capped rung.
+    pub fn note_real_frame(&mut self, now: Instant) -> Option<RefineFlip> {
+        if !self.enabled {
+            return None;
+        }
+        self.run = match self.last_real {
+            Some(t) if now.duration_since(t) <= REFINE_MOTION_GAP => self.run.saturating_add(1),
+            _ => 1,
+        };
+        self.last_real = Some(now);
+        self.prune(now);
+        // Bounded: pruning keeps this at ~fps entries; the hard cap only
+        // matters if a backend ever bursts far above real time.
+        if self.window.len() >= 240 {
+            self.window.pop_front();
+        }
+        self.window.push_back(now);
+        if self.refined
+            && (self.run >= REFINE_DOWN_RUN || self.window.len() as u32 >= REFINE_RATE_DOWN)
+        {
+            self.refined = false;
+            self.last_flip = Some(now);
+            return Some(RefineFlip::Down);
+        }
+        None
+    }
+
+    /// An idle-keepalive tick. `eligible` = a cap below native is currently
+    /// in force AND the scope rules allow refinement (see
+    /// `encode::idle_refine_applies`; the pump also requires the controller
+    /// to have left resolution at Native — an explicit pick is the user's).
+    /// Returns `Some(Up)` when the cap should lift; `eligible=false` clears
+    /// `refined` silently (the cap situation changed externally — e.g. the
+    /// dial moved to Sharper — so there is nothing to restore).
+    pub fn on_keepalive(&mut self, eligible: bool, now: Instant) -> Option<RefineFlip> {
+        if !self.enabled {
+            return None;
+        }
+        self.prune(now);
+        if !eligible {
+            self.refined = false;
+            return None;
+        }
+        if self.refined {
+            return None;
+        }
+        if self.window.len() as u32 <= REFINE_SPARSE_MAX
+            && self
+                .last_flip
+                .is_none_or(|t| now.duration_since(t) >= REFINE_UP_COOLDOWN)
+        {
+            self.refined = true;
+            self.last_flip = Some(now);
+            return Some(RefineFlip::Up);
+        }
+        None
     }
 }
 
@@ -369,6 +606,19 @@ mod tests {
         assert_eq!(vp9_qsv_config(None, Some(true)), (false, true));
     }
 
+    // P7 — chroma factor composes multiplicatively with the codec factor.
+    #[test]
+    fn chroma_factor_composes_with_codec_factor() {
+        assert_eq!(chroma_rate_factor_pct(true), 150);
+        assert_eq!(chroma_rate_factor_pct(false), 100);
+        // The pump's compose rule at the HEVC built-in (125): 4:4:4 → 187 %
+        // of the base band; 4:2:0 leaves it unchanged. Literals only — the
+        // codec-factor env test above mutates ROOMLER_AGENT_RATE_FACTOR_HEVC
+        // and cargo runs tests in parallel threads.
+        assert_eq!(125 * chroma_rate_factor_pct(true) / 100, 187);
+        assert_eq!(125 * chroma_rate_factor_pct(false) / 100, 125);
+    }
+
     #[test]
     fn h264_cq_is_two_steps_sharper_with_a_floor() {
         assert_eq!(h264_cq_adjust("h264_nvenc", 22), 20);
@@ -376,6 +626,47 @@ mod tests {
         assert_eq!(h264_cq_adjust("h264_amf", 10), 10);
         assert_eq!(h264_cq_adjust("hevc_qsv", 22), 22);
         assert_eq!(h264_cq_adjust("vp9_qsv", 22), 22);
+    }
+
+    // P7 — scale-aware CQ bias ladder.
+    #[test]
+    fn scale_cq_bias_full_at_smoother_rung() {
+        // 1920×1200 → 1024×640 = 28% area; 2560×1600 → 1024×640 = 16%.
+        assert_eq!(scale_cq_bias(1024, 640, 1920, 1200, 4), 4);
+        assert_eq!(scale_cq_bias(1024, 640, 2560, 1600, 4), 4);
+    }
+
+    #[test]
+    fn scale_cq_bias_half_at_relay_rung() {
+        // 1920×1200 → 1280×800 = 44% area.
+        assert_eq!(scale_cq_bias(1280, 800, 1920, 1200, 4), 2);
+    }
+
+    #[test]
+    fn scale_cq_bias_zero_near_native() {
+        // Snap-native leftovers and small trims spend nothing (1836×1148 =
+        // 91% area), and equal dims are exactly zero.
+        assert_eq!(scale_cq_bias(1836, 1148, 1920, 1200, 4), 0);
+        assert_eq!(scale_cq_bias(1920, 1200, 1920, 1200, 4), 0);
+    }
+
+    #[test]
+    fn scale_cq_bias_zero_dims_and_zero_steps_safe() {
+        // Unpublished native dims (0) or a disabled knob (max_steps 0)
+        // must never bias.
+        assert_eq!(scale_cq_bias(1024, 640, 0, 0, 4), 0);
+        assert_eq!(scale_cq_bias(0, 0, 1920, 1200, 4), 0);
+        assert_eq!(scale_cq_bias(1024, 640, 1920, 1200, 0), 0);
+        assert_eq!(scale_cq_bias(1280, 800, 1920, 1200, 0), 0);
+    }
+
+    #[test]
+    fn cq_bias_composes_with_h264_adjust_at_the_floor() {
+        // Floor is shared: 14 → 12 (h264) → 10 (bias clamps at the floor).
+        assert_eq!(apply_cq_bias(h264_cq_adjust("h264_nvenc", 14), 4), 10);
+        // Nominal cases: 22 → 20 (h264) → 16; HEVC skips the codec adjust.
+        assert_eq!(apply_cq_bias(h264_cq_adjust("h264_nvenc", 22), 4), 16);
+        assert_eq!(apply_cq_bias(h264_cq_adjust("hevc_nvenc", 22), 4), 18);
     }
 
     fn gate() -> SettleKeyframeGate {
@@ -460,5 +751,221 @@ mod tests {
             assert_eq!(g.should_fire_on_settle(now), None); // same episode
             now += Duration::from_millis(530);
         }
+    }
+
+    // ── P7 — IdleRefine ────────────────────────────────────────────────
+
+    /// Drive `n` real frames at a fixed `gap`, asserting no Down fires.
+    fn feed_quiet(r: &mut IdleRefine, mut now: Instant, n: u32, gap: Duration) -> Instant {
+        for _ in 0..n {
+            assert_eq!(r.note_real_frame(now), None);
+            now += gap;
+        }
+        now
+    }
+
+    /// Keepalives every 60 ms until the first Up (or `limit` elapses);
+    /// returns (time of the Up, elapsed since start).
+    fn tick_until_up(
+        r: &mut IdleRefine,
+        mut now: Instant,
+        limit: Duration,
+    ) -> Option<(Instant, Duration)> {
+        let start = now;
+        while now.duration_since(start) <= limit {
+            if r.on_keepalive(true, now) == Some(RefineFlip::Up) {
+                return Some((now, now.duration_since(start)));
+            }
+            now += Duration::from_millis(60);
+        }
+        None
+    }
+
+    #[test]
+    fn refine_fires_about_1s_after_a_scroll_settles() {
+        let mut r = IdleRefine::new(true);
+        // 1 s scroll at 30 fps.
+        let now = feed_quiet(&mut r, t0(), 30, Duration::from_millis(33));
+        // Keepalives start 60 ms after the last real frame; the window must
+        // drain (~1 s) before the up-flip fires.
+        let (_, elapsed) = tick_until_up(&mut r, now, Duration::from_secs(3)).expect("must refine");
+        assert!(
+            elapsed >= Duration::from_millis(700) && elapsed <= Duration::from_millis(1300),
+            "settle-to-refine took {elapsed:?} (want ≈1 s)"
+        );
+        assert!(r.refined());
+    }
+
+    #[test]
+    fn caret_blink_neither_blocks_refine_nor_downflips() {
+        let mut r = IdleRefine::new(true);
+        let mut now = t0();
+        // Refine first (quiet from the start).
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // 20 s of caret blinks (~1.9 Hz): single frames, 530 ms apart, with
+        // keepalives in between — must stay refined throughout.
+        for _ in 0..38 {
+            assert_eq!(
+                r.note_real_frame(now),
+                None,
+                "caret blink must not down-flip"
+            );
+            for k in 1..=8 {
+                assert_eq!(
+                    r.on_keepalive(true, now + Duration::from_millis(60 * k)),
+                    None
+                );
+            }
+            now += Duration::from_millis(530);
+        }
+        assert!(r.refined());
+    }
+
+    #[test]
+    fn typing_trickle_blocks_upflip() {
+        let mut r = IdleRefine::new(true);
+        // Typing at ~6 cps: 160 ms gaps → >2 frames in every 1 s window.
+        // Warm the window first (a cold ≤2-entry window refining is the
+        // fresh-session behaviour, locked by first_upflip_needs_no_prior_flip).
+        let mut now = t0();
+        let _ = r.note_real_frame(now);
+        now += Duration::from_millis(160);
+        let _ = r.note_real_frame(now);
+        for _ in 0..30 {
+            now += Duration::from_millis(160);
+            let _ = r.note_real_frame(now);
+            // The keepalive between keystrokes must NOT refine (window > 2).
+            assert_eq!(r.on_keepalive(true, now + Duration::from_millis(60)), None);
+        }
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn scroll_burst_downflips_within_300ms() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // 30 fps drag: the chained-run rule must fire by frame 8 (~270 ms).
+        let mut t = now + Duration::from_secs(2);
+        let mut fired_at = None;
+        for i in 0..30 {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t) {
+                fired_at = Some(i);
+                break;
+            }
+            t += Duration::from_millis(33);
+        }
+        let frames = fired_at.expect("sustained scroll must down-flip");
+        assert!(
+            frames < 10,
+            "down-flip took {frames} frames (want <10 ≈ 300 ms)"
+        );
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn slow_motion_downflips_via_window_rate() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // ~10.5 fps damage (95 ms gaps > the 80 ms chain gap): the run rule
+        // never fires, the frames-per-window rate rule must within ≤1 s.
+        let mut t = now + Duration::from_secs(2);
+        let start = t;
+        let mut fired = None;
+        for _ in 0..40 {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t) {
+                fired = Some(t.duration_since(start));
+                break;
+            }
+            t += Duration::from_millis(95);
+        }
+        let took = fired.expect("10 fps sustained motion must down-flip");
+        assert!(
+            took <= Duration::from_millis(1100),
+            "took {took:?} (want ≤ ~1 s)"
+        );
+    }
+
+    #[test]
+    fn window_animation_never_rerefines() {
+        let mut r = IdleRefine::new(true);
+        // A steady 5 fps spinner (200 ms gaps): >2 frames per window forever
+        // → the up-flip must never fire, no matter how long it runs. Warm
+        // the window past the sparse gate first (see typing test).
+        let mut now = t0();
+        for _ in 0..3 {
+            let _ = r.note_real_frame(now);
+            now += Duration::from_millis(200);
+        }
+        for _ in 0..100 {
+            let _ = r.note_real_frame(now);
+            assert_eq!(r.on_keepalive(true, now + Duration::from_millis(100)), None);
+            now += Duration::from_millis(200);
+        }
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn up_cooldown_bounds_flip_pairs() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // Burst → down.
+        let mut t = now + Duration::from_secs(1);
+        let mut downed = false;
+        for _ in 0..12 {
+            if r.note_real_frame(t) == Some(RefineFlip::Down) {
+                downed = true;
+                break;
+            }
+            t += Duration::from_millis(33);
+        }
+        assert!(downed);
+        // Quiet again immediately: the window drains in 1 s but the 10 s
+        // up-cooldown must hold the next Up until ≥10 s after the Down.
+        let up = tick_until_up(
+            &mut r,
+            t + Duration::from_millis(60),
+            Duration::from_secs(15),
+        )
+        .expect("must eventually re-refine");
+        assert!(
+            up.0.duration_since(t) >= REFINE_UP_COOLDOWN,
+            "re-refined {:?} after the down-flip (cooldown {:?})",
+            up.0.duration_since(t),
+            REFINE_UP_COOLDOWN
+        );
+    }
+
+    #[test]
+    fn eligible_false_clears_refined_silently() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert!(r.refined());
+        // Dial moved to Sharper (no cap to lift): silent clear, no Down.
+        assert_eq!(r.on_keepalive(false, now + Duration::from_millis(60)), None);
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn disabled_never_flips() {
+        let mut r = IdleRefine::new(false);
+        let mut now = t0();
+        for _ in 0..50 {
+            assert_eq!(r.on_keepalive(true, now), None);
+            assert_eq!(r.note_real_frame(now), None);
+            now += Duration::from_millis(60);
+        }
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn first_upflip_needs_no_prior_flip() {
+        // A session that starts quiet refines on the very first keepalive —
+        // the cooldown only spaces SUBSEQUENT flips.
+        let mut r = IdleRefine::new(true);
+        assert_eq!(r.on_keepalive(true, t0()), Some(RefineFlip::Up));
     }
 }

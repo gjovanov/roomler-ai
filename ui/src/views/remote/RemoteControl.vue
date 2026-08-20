@@ -942,6 +942,21 @@
           >
             1:1 Match host display — {{ displayMatchOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <div class="text-caption text-medium-emphasis mb-1 ml-1 mt-4">Text sharpening (FSR)</div>
+          <v-btn-toggle
+            v-model="sharpen"
+            mandatory
+            divided
+            color="primary"
+            variant="outlined"
+            density="comfortable"
+            class="mb-1 d-flex w-100"
+          >
+            <v-btn value="auto" size="small" class="flex-grow-1">Auto</v-btn>
+            <v-btn value="on" size="small" class="flex-grow-1">On</v-btn>
+            <v-btn value="off" size="small" class="flex-grow-1">Off</v-btn>
+          </v-btn-toggle>
+          <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ sharpenHint }}</div>
 
           <v-divider class="my-4" />
 
@@ -2115,6 +2130,15 @@ const agentHasHevc = computed<boolean>(() => {
     || (caps.hw_encoders ?? []).some((e) => e.startsWith('ffmpeg-hevc_'))
   )
 })
+// P7 — whether the AGENT can emit HEVC Rext 4:4:4 (hevc_nvenc only; the
+// caps probe advertises hevc_chroma). NOT optimistic when caps are absent —
+// unlike the transport fallback, a 4:4:4/4:2:0 codec-string mismatch
+// black-screens the decoder, so the picker entry demands positive proof
+// from BOTH ends (connect() re-gates anyway; this just avoids offering a
+// pick that would silently downgrade).
+const agentHasHevc444 = computed<boolean>(
+  () => agent.value?.capabilities?.hevc_chroma?.includes('yuv444') === true,
+)
 // Opt-in "receive host audio" toggle. Same "takes effect on next
 // Connect" shape as the transport toggles above (the recvonly audio
 // transceiver + `audio_enabled` request flag are fixed at offer time),
@@ -2259,6 +2283,16 @@ const codecChoiceOptions = computed(() => {
     : !agentHasHevc.value
       ? 'This agent has no HEVC encoder'
       : 'HW H.265 encode on the agent (NVENC/QSV/AMF)'
+  // P7 — HEVC Rext 4:4:4 needs positive proof on BOTH ends (no SW HEVC
+  // fallback exists in Chrome; a mismatch black-screens).
+  const hevc444Ok = rc.hevcSupported.value && rc.hevcRextSupported.value && agentHasHevc444.value
+  const hevc444Reason = !rc.hevcSupported.value
+    ? 'This browser lacks a HW HEVC decoder'
+    : !rc.hevcRextSupported.value
+      ? 'This browser lacks HEVC Rext 4:4:4 decode (Chrome ≥137 + NVIDIA driver ≥572.16, or Intel Gen11+)'
+      : !agentHasHevc444.value
+        ? 'This agent has no NVENC HEVC 4:4:4 encoder'
+        : 'Sharpest text on the HW pipeline, ~1.5× bitrate (NVENC Rext)'
   const vp9Reason = rc.vp9_444Supported.value
     ? 'Software VP9 — universally decodable'
     : 'This browser can’t decode VP9 profile 1'
@@ -2277,6 +2311,14 @@ const codecChoiceOptions = computed(() => {
       title: 'HEVC (H.265)',
       value: 'hevc',
       props: { disabled: !hevcOk, subtitle: hevcReason },
+    },
+    {
+      title: 'HEVC · crisp text (4:4:4)',
+      value: 'hevc-444',
+      props: {
+        disabled: !hevc444Ok,
+        subtitle: hevc444Reason,
+      },
     },
     {
       title: 'VP9 · crisp text (4:4:4)',
@@ -2323,6 +2365,25 @@ const priorityOptions = [
 const priorityHint = computed<string>(
   () => priorityOptions.find((o) => o.value === priority.value)?.props.subtitle ?? '',
 )
+
+// P7 — FSR text sharpening (viewer-side, live; see rc-fsr-render.ts). Auto
+// engages the EASU+RCAS upscale only when the decoded stream is smaller
+// than the window needs (the Smoother/relay rungs) — exactly when CSS
+// bilinear used to smear remote text.
+const sharpen = computed<'auto' | 'on' | 'off'>({
+  get: () => rc.sharpenMode.value,
+  set: (v) => rc.setSharpenMode(v),
+})
+const sharpenHint = computed<string>(() => {
+  switch (sharpen.value) {
+    case 'on':
+      return 'Always sharpen (AMD FSR), even at 1:1 — maximum text crispness'
+    case 'off':
+      return 'Plain browser scaling (pre-P7 behaviour)'
+    default:
+      return 'Sharpen (AMD FSR) only when the stream is smaller than your window'
+  }
+})
 // Native-source hint for the Resolution select (reused from the retired
 // mobile sheet). Explains why a big custom target on a small-panel host
 // doesn't change anything, and surfaces the agent's native dims.
@@ -2373,10 +2434,14 @@ const diagLabel = computed(() => {
   if (!d) return ''
   const hop = (w: { avgMs: number; maxMs: number } | null) =>
     w ? `${w.avgMs}/${w.maxMs}` : '–'
+  // P7 — active render path + actual backing size (e.g. "fsr@2048x1280"),
+  // for field-verifying the FSR sizing policy.
+  const r = rc.renderInfo.value
+  const render = r ? ` · ${r.mode}@${r.w}x${r.h}` : ''
   return (
     `paint ${hop(d.paint)} · fwd ${hop(d.fwd)} · dec ${hop(d.decode)}`
     + ` · gap ${d.outGapMaxMs} · q ${d.queue} · drop ${d.droppedTotal}`
-    + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}`
+    + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}${render}`
   )
 })
 /** Bind callback for the HEVC canvas. Same `transferControlToOffscreen`
@@ -2776,7 +2841,10 @@ const statsCodecLabel = computed(() => {
     // stream means rate/dials are floor-merged across them, so a lower
     // fps/resolution than expected is explainable from the badge.
     const shared = (vi.viewers ?? 1) > 1 ? ` · shared ×${vi.viewers}` : ''
-    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec + shared
+    // P7 — flag the active FSR sharpening pass (exact mode + backing size
+    // live in the diag HUD; the pill stays binary for glanceability).
+    const fsr = rc.renderInfo.value && rc.renderInfo.value.mode !== '2d' ? ' · FSR' : ''
+    return [codecName, chromaName, hw].filter(Boolean).join(' ') + enc + path + dec + shared + fsr
   }
   // Fallback when the agent hasn't sent video-info (legacy track /
   // libvpx VP9-444 path). Derive chroma from the USER's selection
