@@ -4475,14 +4475,19 @@ async fn media_pump_ffmpeg_dc(
                 // upstream of the viewer-rate divisor skip, so tracked
                 // motion counts even when this frame is later shed).
                 // Area is rung-invariant — the leg that cannot oscillate.
+                // P8a-2 — tracked frames NEVER take the bytes leg: only
+                // MAJOR damage (≥ ~40 % of the frame, sustained) restores
+                // the cap; smaller damage — typing, popups, windowed
+                // terminal scrolls, PiP video — stays at native ("sharp
+                // all the time"; the encoder's maxrate + AIMD own load).
                 if let Some(area_pm) = arc
                     .damage
                     .area_permille(arc.width as u64 * arc.height as u64)
-                    && idle_refine.area_significant(area_pm)
                 {
                     area_judged = true;
-                    if let Some(flip) =
-                        idle_refine.note_real_frame_area(std::time::Instant::now(), area_pm)
+                    if idle_refine.area_major(area_pm)
+                        && let Some(flip) =
+                            idle_refine.note_real_frame_area(std::time::Instant::now(), area_pm)
                     {
                         info!(
                             %session_id,

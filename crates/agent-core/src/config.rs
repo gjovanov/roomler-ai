@@ -477,12 +477,20 @@ pub struct AgentConfig {
     /// Built-in default: 12; 0 = every real frame counts.
     #[serde(default)]
     pub idle_refine_min_frame_kb: Option<u32>,
-    /// P8a — damaged-area floor (permille of the frame) for tracked-
-    /// damage frames to count as motion in the idle-refine machine
-    /// (`ROOMLER_NODE_IDLE_REFINE_MIN_AREA_PERMILLE`). Built-in
-    /// default: 50 (5 %); 0 = any non-empty tracked damage counts.
+    /// P8a-2 — MAJOR-motion area floor (permille of the frame) on
+    /// tracked-damage backends: only damage at/above it can restore the
+    /// resolution cap; smaller damage (typing, popups, windowed
+    /// terminal scrolls) stays at native
+    /// (`ROOMLER_NODE_IDLE_REFINE_MAJOR_AREA_PERMILLE`). Built-in
+    /// default: 400 (40 %); 0 = any non-empty tracked damage counts.
     #[serde(default)]
-    pub idle_refine_min_area_permille: Option<u32>,
+    pub idle_refine_major_area_permille: Option<u32>,
+    /// P8a-2 — up-flip settle (ms) on tracked-damage backends: the cap
+    /// lifts this long after the last major-damage frame
+    /// (`ROOMLER_NODE_IDLE_REFINE_SETTLE_MS`). Built-in default: 500;
+    /// clamped 100-5000.
+    #[serde(default)]
+    pub idle_refine_settle_ms: Option<u32>,
     /// Media-ICE follow-renomination policy
     /// (`ROOMLER_ICE_FOLLOW_RENOMINATION`, raw env in the vendored
     /// webrtc-ice — bridged via a set_var-if-unset shim in `run_cmd`).
@@ -1388,7 +1396,8 @@ pub fn test_fixture() -> AgentConfig {
         idle_refine_balanced: None,
         idle_refine_max_edge: None,
         idle_refine_min_frame_kb: None,
-        idle_refine_min_area_permille: None,
+        idle_refine_major_area_permille: None,
+        idle_refine_settle_ms: None,
         ice_follow_renomination: None,
         ice_warm_standby: None,
         ice_overlay_host_deprioritize: None,
@@ -1552,7 +1561,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 42]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 12] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 13] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1564,9 +1573,10 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 1
         ("IDLE_REFINE_MAX_EDGE", cfg.idle_refine_max_edge),
         ("IDLE_REFINE_MIN_FRAME_KB", cfg.idle_refine_min_frame_kb),
         (
-            "IDLE_REFINE_MIN_AREA_PERMILLE",
-            cfg.idle_refine_min_area_permille,
+            "IDLE_REFINE_MAJOR_AREA_PERMILLE",
+            cfg.idle_refine_major_area_permille,
         ),
+        ("IDLE_REFINE_SETTLE_MS", cfg.idle_refine_settle_ms),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
     ]
