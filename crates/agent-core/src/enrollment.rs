@@ -147,6 +147,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         idle_refine_balanced: None,
         idle_refine_max_edge: None,
         idle_refine_min_frame_kb: None,
+        idle_refine_min_area_permille: None,
         ice_follow_renomination: None,
         ice_warm_standby: None,
         ice_overlay_host_deprioritize: None,

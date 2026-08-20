@@ -86,7 +86,9 @@ pub fn produce(width: u32, height: u32, monotonic_us: u64, monitor: u8) -> Arc<F
         data,
         monotonic_us,
         monitor,
-        dirty_rects: Vec::new(),
+        // P8a — a synthetic frozen still: provably nothing changes
+        // frame-to-frame while the overlay is up.
+        damage: crate::capture::Damage::Tracked(Vec::new()),
     })
 }
 
