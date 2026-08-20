@@ -4455,24 +4455,19 @@ async fn media_pump_ffmpeg_dc(
         let capture_start = std::time::Instant::now();
         let next = capturer.next_frame().await;
         capture_us += capture_start.elapsed().as_micros() as u64;
+        // P7c — set on the real-capture arm; the idle-refine signal is fed
+        // AFTER encode (where the frame's wire cost is known), never for
+        // keepalive re-encodes.
+        let mut is_real_frame = false;
         let frame: std::sync::Arc<crate::capture::Frame> = match next {
             Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 last_capture_at = std::time::Instant::now();
                 frames_captured += 1;
+                is_real_frame = true;
                 // Motion continues — the settle gate counts the episode.
                 settle_kf.note_real_frame();
-                // P7 — a sustained burst while refined restores the cap
-                // (the next cap application downscales again → rebuild).
-                if let Some(flip) = idle_refine.note_real_frame(std::time::Instant::now()) {
-                    info!(
-                        %session_id,
-                        codec_label,
-                        ?flip,
-                        "idle refine: motion burst — restoring resolution cap"
-                    );
-                }
                 arc
             }
             Ok(None) => {
@@ -4939,6 +4934,35 @@ async fn media_pump_ffmpeg_dc(
         };
         encode_us += encode_start.elapsed().as_micros() as u64;
         frames_encoded += 1;
+
+        // P7c — feed the idle-refine machine POST-encode with the frame's
+        // wire cost: significance is keyed on encoded bytes (a keystroke
+        // delta is ~0.5-3 KB, a scroll frame tens-to-hundreds), which is
+        // what made interactive terminals hold the blurry rung under the
+        // old capture-time frame COUNTING (field CORPLAP-2 2026-08-20 —
+        // every Up died within ~1-2 s of caret/typing frames). Keepalive
+        // re-encodes never count (unchanged). A Down here lands one frame
+        // later than the old capture-time hook — one extra native frame
+        // per burst, negligible. Divisor-skipped frames no longer feed the
+        // machine either: the viewer-rate min_fps floor (12) keeps the
+        // surviving encoded cadence ≥10 fps at the stock 30/60 fps
+        // captures, so sustained motion still trips the window-rate rule
+        // (and ≥12.5 fps cadences chain the run rule). Only a sub-16 fps
+        // *configured* capture with a struggling viewer could slip both —
+        // accepted: that stream is already fps-shedding to protect the
+        // same viewer.
+        if is_real_frame {
+            let wire_bytes: usize = packets.iter().map(|p| p.data.len()).sum();
+            if let Some(flip) = idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes) {
+                info!(
+                    %session_id,
+                    codec_label,
+                    ?flip,
+                    wire_bytes,
+                    "idle refine: motion burst — restoring resolution cap"
+                );
+            }
+        }
 
         // Push each emitted packet through the framer + DC. FFmpeg may
         // emit zero packets for some inputs (buffered B-frame
