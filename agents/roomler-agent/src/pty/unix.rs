@@ -1,16 +1,4 @@
-//! Pseudo-terminals for Roomler SSH interactive sessions (P4a).
-//!
-//! Everything before this slice ran through [`crate::exec`], which buffers a
-//! command's whole output to enforce its ceiling and hands it back when the
-//! process ends. That is the right shape for `ssh <node> <command>` and the
-//! wrong shape for a shell: an interactive session has to stream both ways,
-//! immediately, with no ceiling — the output IS the interaction.
-//!
-//! So a PTY session deliberately does NOT go through the exec engine, and
-//! therefore does not inherit its output cap or its wall-clock timeout. It
-//! keeps the parts that still make sense: the identity model ([`RunAs`], via
-//! the same [`crate::exec::apply_run_as`] every other path uses) and
-//! process-tree teardown.
+//! The Unix half of [`crate::pty`] — `openpty`, a login shell, and two pumps.
 //!
 //! # Why `openpty` and not `posix_openpt`
 //!
@@ -19,16 +7,8 @@
 //! is declared for both Linux and Apple in `libc`, and on glibc ≥ 2.34 lives in
 //! `libc.so.6` itself so no `-lutil` link flag is needed (our Linux targets are
 //! ubuntu-22.04 / glibc 2.35 and newer). Fewer moving parts across a platform
-//! boundary that CI does not compile — macOS builds only at release-tag time.
-//!
-//! # Unix only
-//!
-//! Windows needs ConPTY (`CreatePseudoConsole` plus the
-//! `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` attribute on `CreateProcessAsUserW`),
-//! which is a different enough mechanism to be its own slice — P4b. Until then
-//! the SSH server refuses a PTY there, saying so.
-
-#![cfg(all(unix, feature = "ssh-server"))]
+//! boundary that CI compiles only at release-tag time — and one of the two
+//! remaining `libc` calls here still managed to differ (see `open_pty`).
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -36,6 +16,8 @@ use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
 use tracing::{debug, warn};
+
+use super::WinSize;
 
 /// A pseudo-terminal with a process attached to its slave side.
 ///
@@ -52,27 +34,6 @@ pub struct PtyProcess {
     /// process-group id. Kept separately because `child.id()` returns `None`
     /// once the child has been reaped.
     pgid: libc::pid_t,
-}
-
-/// Terminal geometry, in the order SSH sends it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WinSize {
-    pub cols: u16,
-    pub rows: u16,
-}
-
-impl WinSize {
-    /// Clamp to something a terminal can actually be.
-    ///
-    /// A client may send 0×0 (some do, when the window size is not yet known),
-    /// and a zero-sized tty makes curses applications misbehave in ways that
-    /// look like a roomler bug. 80×24 is the conventional fallback.
-    fn sane(self) -> Self {
-        Self {
-            cols: if self.cols == 0 { 80 } else { self.cols },
-            rows: if self.rows == 0 { 24 } else { self.rows },
-        }
-    }
 }
 
 /// Open a pty pair. Returns `(master, slave)` as owned fds.
@@ -95,6 +56,14 @@ fn open_pty(size: WinSize) -> io::Result<(OwnedFd, OwnedFd)> {
     // SAFETY: both out-params are valid for writes; the name pointer is null
     // (we never need the slave's path) and the termios pointer is null
     // (kernel defaults are what a login shell expects).
+    //
+    // ⚠️ The `allow` is load-bearing, not laziness. On LINUX these really are
+    // `*const`, so clippy is right that `&mut` is unnecessary — and taking its
+    // advice reintroduces the exact bug that broke the rc.422 and rc.423
+    // releases, because on macOS they are `*mut`. Passing `*mut` satisfies both
+    // (it weakens implicitly); passing `*const` compiles here and fails there,
+    // where CI never looks.
+    #[allow(clippy::unnecessary_mut_passed)]
     let rc = unsafe {
         libc::openpty(
             &mut master,
@@ -250,7 +219,7 @@ impl PtyProcess {
     }
 
     /// Read one chunk of terminal output. `Ok(0)` means the session ended.
-    pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let mut guard = self.master.readable().await?;
             match guard.try_io(|inner| raw_read(inner.as_raw_fd(), buf)) {
@@ -401,33 +370,6 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A zero size is what some clients send before they know their window;
-    /// a 0×0 terminal makes curses applications misbehave in ways that read as
-    /// a roomler bug.
-    #[test]
-    fn a_zero_geometry_falls_back_to_a_usable_terminal() {
-        assert_eq!(
-            WinSize { cols: 0, rows: 0 }.sane(),
-            WinSize { cols: 80, rows: 24 }
-        );
-        assert_eq!(
-            WinSize { cols: 0, rows: 40 }.sane(),
-            WinSize { cols: 80, rows: 40 }
-        );
-        // A real size is never second-guessed.
-        assert_eq!(
-            WinSize {
-                cols: 120,
-                rows: 40
-            }
-            .sane(),
-            WinSize {
-                cols: 120,
-                rows: 40
-            }
-        );
-    }
 
     #[test]
     fn open_pty_hands_back_two_usable_fds() {

@@ -177,12 +177,18 @@ pub fn query_user_token(session_id: u32) -> Result<Option<OwnedHandle>> {
 /// CreateProcessAsUserW. The pointer must be passed to
 /// `DestroyEnvironmentBlock` when no longer needed; we package it
 /// in a tiny RAII guard.
-struct EnvBlock {
-    raw: *mut std::ffi::c_void,
+///
+/// `pub(crate)` because roomler SSH's ConPTY path builds its own
+/// `CreateProcessAsUserW` call (it must attach a pseudoconsole through an
+/// attribute list, which no helper here takes) but still needs the SAME user
+/// environment every other console-user spawn gets — a shell started without
+/// it has no `PATH`, no `USERPROFILE`, and looks broken to the operator.
+pub(crate) struct EnvBlock {
+    pub(crate) raw: *mut std::ffi::c_void,
 }
 
 impl EnvBlock {
-    fn for_token(token: HANDLE) -> Result<Self> {
+    pub(crate) fn for_token(token: HANDLE) -> Result<Self> {
         let mut env: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: `&mut env` is a valid out-pointer; second arg is
         // the user token. We pass FALSE for inherit so the system

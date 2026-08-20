@@ -527,14 +527,11 @@ mod sshd {
         /// Terminal type and geometry from `pty_request`, held until the shell
         /// starts. `Some` is also what distinguishes an interactive session
         /// from a one-shot command.
-        #[cfg(unix)]
         pty_req: Option<(String, crate::pty::WinSize)>,
         /// Sink for client keystrokes, live only while a terminal is. Cleared
         /// on EOF so the shell sees end-of-input.
-        #[cfg(unix)]
         pty_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         /// Resize half of the live terminal.
-        #[cfg(unix)]
         pty_handle: Option<crate::pty::PtyHandle>,
     }
 
@@ -545,11 +542,8 @@ mod sshd {
                 peer,
                 policy: None,
                 deadline_armed: false,
-                #[cfg(unix)]
                 pty_req: None,
-                #[cfg(unix)]
                 pty_input: None,
-                #[cfg(unix)]
                 pty_handle: None,
             }
         }
@@ -595,7 +589,6 @@ mod sshd {
         /// resolve the identity from the server (never from the client), then
         /// settle operator consent. An interactive shell is strictly more than
         /// a single command, so it cannot be held to a weaker standard.
-        #[cfg(unix)]
         async fn start_pty_session(
             &mut self,
             channel: ChannelId,
@@ -851,34 +844,18 @@ mod sshd {
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            // Written as a cfg-selected TAIL expression rather than an early
-            // `return`: the `return` a Windows build needs is redundant on
-            // Unix, and `needless_return` fires on whichever platform did not
-            // motivate it.
-            #[cfg(unix)]
-            {
-                if self.pty_req.is_some() {
-                    self.start_pty_session(channel, None, session).await
-                } else {
-                    refuse(
-                        session,
-                        channel,
-                        self.peer,
-                        "shell",
-                        "a shell needs a terminal here — drop `-T`, or use \
-                         `ssh <node> <command>` for a one-shot command.",
-                    )
-                }
+            if self.pty_req.is_some() {
+                self.start_pty_session(channel, None, session).await
+            } else {
+                refuse(
+                    session,
+                    channel,
+                    self.peer,
+                    "shell",
+                    "a shell needs a terminal here — drop `-T`, or use \
+                     `ssh <node> <command>` for a one-shot command.",
+                )
             }
-            #[cfg(not(unix))]
-            refuse(
-                session,
-                channel,
-                self.peer,
-                "shell",
-                "interactive shells on Windows arrive in P4b (ConPTY). \
-                 Use `ssh <node> <command>` for now.",
-            )
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -893,41 +870,26 @@ mod sshd {
             _modes: &[(russh::Pty, u32)],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            #[cfg(unix)]
-            {
-                // Recorded, not acted on: the terminal is allocated when the
-                // shell starts, because that is when the identity it runs as
-                // is known and when consent has been settled. Allocating here
-                // would leave a pty (and later a shell) alive for a session
-                // that is about to be refused.
-                self.pty_req = Some((
-                    term.to_string(),
-                    crate::pty::WinSize {
-                        cols: col_width as u16,
-                        rows: row_height as u16,
-                    },
-                ));
-                info!(peer = %self.peer, %term, cols = col_width, rows = row_height, "ssh: pty requested");
-                session.channel_success(channel)?;
-                Ok(())
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = (term, col_width, row_height);
-                refuse(
-                    session,
-                    channel,
-                    self.peer,
-                    "pty",
-                    "PTY allocation on Windows arrives in P4b (ConPTY). Add `-T` to skip it.",
-                )
-            }
+            // Recorded, not acted on: the terminal is allocated when the
+            // shell starts, because that is when the identity it runs as
+            // is known and when consent has been settled. Allocating here
+            // would leave a pty (and later a shell) alive for a session
+            // that is about to be refused.
+            self.pty_req = Some((
+                term.to_string(),
+                crate::pty::WinSize {
+                    cols: col_width as u16,
+                    rows: row_height as u16,
+                },
+            ));
+            info!(peer = %self.peer, %term, cols = col_width, rows = row_height, "ssh: pty requested");
+            session.channel_success(channel)?;
+            Ok(())
         }
 
         /// Client keystrokes. Only meaningful once a terminal exists; before
         /// that there is nothing to type into, and after the session ends the
         /// send simply fails and the data is dropped.
-        #[cfg(unix)]
         async fn data(
             &mut self,
             _channel: ChannelId,
@@ -941,9 +903,9 @@ mod sshd {
         }
 
         /// The client's window changed. Resizing the terminal is what makes
-        /// the far side reflow — the kernel also SIGWINCHes the foreground
-        /// group, which is how a full-screen application learns to redraw.
-        #[cfg(unix)]
+        /// the far side reflow. On Unix the kernel also SIGWINCHes the
+        /// foreground group, which is how a full-screen application learns to
+        /// redraw; ConPTY delivers the equivalent through the console host.
         async fn window_change_request(
             &mut self,
             _channel: ChannelId,
@@ -968,7 +930,6 @@ mod sshd {
         /// The client stopped sending. Close the terminal's input side so the
         /// shell sees end-of-input and exits on its own, rather than being
         /// killed — a shell that exits normally runs its logout hooks.
-        #[cfg(unix)]
         async fn channel_eof(
             &mut self,
             _channel: ChannelId,
@@ -2159,6 +2120,9 @@ mod tests {
     ///
     /// Deliberately asserts on `tty`'s answer rather than just on echoed text —
     /// a pair of pipes would also echo. Only a pty makes `tty` print a device.
+    ///
+    /// Unix-only because the ASSERTIONS are (`tty`, `tput`); the Windows twin
+    /// below covers the same claim with what a console there can answer.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_interactive_session_gets_a_real_terminal() {
@@ -2199,9 +2163,54 @@ mod tests {
         assert_eq!(exit, Some(0));
     }
 
+    /// THE P4b feature, at the SSH layer: `ssh <windows-node>` with no command
+    /// gets a real ConPTY shell, takes typed input, and streams back what the
+    /// shell printed.
+    ///
+    /// The console host's own VT would arrive even from a BROKEN session (that
+    /// was precisely the P4b symptom — title and `ESC[2J` and nothing else), so
+    /// this asserts on a marker the SHELL produced. Geometry is not asserted:
+    /// `mode con` reports the pseudoconsole's buffer, not the client's request,
+    /// and pinning that would test the console host rather than us.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_interactive_session_gets_a_real_console() {
+        let (key, line) = client_key(43);
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+        let session = connect(addr, key).await;
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm-256color", 120, 40, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        channel
+            .data(&b"echo roomler-conpty-ssh-ok\r\nexit\r\n"[..])
+            .await
+            .unwrap();
+
+        let mut out = Vec::new();
+        let mut exit = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("roomler-conpty-ssh-ok"),
+            "the shell's own output must reach the client — the console host's \
+             VT alone is exactly the P4b defect; got {text:?}"
+        );
+        assert!(exit.is_some(), "the session must report an exit status");
+    }
+
     /// A shell without a terminal is refused with a reason rather than handed
-    /// one it never asked for.
-    #[cfg(unix)]
+    /// one it never asked for. Both platforms, one code path (P4b).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_shell_without_a_pty_is_refused_with_a_reason() {
         let (key, line) = client_key(41);
@@ -2236,8 +2245,8 @@ mod tests {
 
     /// The identity gate applies to interactive sessions exactly as it does to
     /// one-shot commands: an unset key-list account mode means the client gets
-    /// a channel failure and a reason, not a root shell.
-    #[cfg(unix)]
+    /// a channel failure and a reason, not a root shell. Both platforms —
+    /// the refusal happens before any terminal is allocated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_interactive_session_without_an_account_mode_gets_no_shell() {
         let (key, line) = client_key(42);

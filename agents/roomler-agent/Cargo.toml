@@ -316,6 +316,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",                # GetWindowDC, BitBlt, CreateCompatibleBitmap, GetDIBits (M3 A1 GDI fallback)
     "Win32_Storage_FileSystem",          # GetLogicalDrives (file-DC v2 root listing) + CreateFileW/ReadFile (SSH P5b console-user capture)
     "Win32_System_Pipes",                # CreatePipe — capturing a console-user session's output (SSH P5b)
+    "Win32_System_Console",              # CreatePseudoConsole/Resize/Close + COORD — ConPTY interactive shells (SSH P4b)
+    "Win32_System_JobObjects",           # CreateJobObjectW + KILL_ON_JOB_CLOSE — Windows has no process group, so a job IS the killpg equivalent (SSH P4b)
     "Win32_System_IO",                   # OVERLAPPED, which ReadFile's signature references
     "Win32_UI_Shell",                    # ShellExecuteExW for UAC-elevated msiexec (rc.18 self-update fix)
     "Win32_System_Registry",             # SHELLEXECUTEINFOW carries an HKEY field; struct gated on this
