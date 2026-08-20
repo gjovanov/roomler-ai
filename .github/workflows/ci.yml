@@ -222,6 +222,22 @@ jobs:
       - name: cargo check tunnel-core (overlay-l3 + overlay-netstack)
         run: cargo check -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack
 
+      # This job checked tunnel-core ONLY, so `roomler-agent`'s `cfg(unix)` code
+      # was never compiled for macOS anywhere except a release-tag build — and
+      # that has now broken a release three times, always the same way: a libc
+      # declaration that differs between Linux and macOS.
+      #
+      #   `vec![0i8]`               — c_char is u8 on aarch64
+      #   `setgroups(len)`          — macOS takes c_int
+      #   `openpty(.., *const ..)`  — macOS declares termp/winp as *mut  ← rc.422
+      #
+      # Every one of those passed x86_64-linux and Windows and was invisible
+      # until tag time. `ssh-server` because that is where the raw libc lives
+      # (`src/pty.rs`, `exec.rs`'s privilege drop); check-only, so it costs a
+      # compile and not a link.
+      - name: cargo check agent (ssh-server — the raw-libc surface)
+        run: cargo check -p roomler-agent --lib --features ssh-server
+
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
         # someone's Mac, with launchctl's famously unhelpful diagnostics.
