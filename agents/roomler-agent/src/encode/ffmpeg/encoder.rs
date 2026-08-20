@@ -753,7 +753,7 @@ impl FfmpegEncoder {
                 data,
                 monotonic_us: i as u64 * 33_333,
                 monitor: 0,
-                dirty_rects: Vec::new(),
+                damage: crate::capture::Damage::Unknown,
             })
         };
         let mut enc = match Self::new_vp9_qsv_probe(W, H, low_power, KEYFRAME_INTERVAL) {
