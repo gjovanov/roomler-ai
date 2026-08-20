@@ -76,6 +76,24 @@ pub mod encode_pressure;
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub mod rate_profile;
 
+/// P8b — the encode-policy module: the resolution/ceiling decision table
+/// the pumps execute. See `policy.rs` module docs. Only the (feature-
+/// gated) DC pumps call it, hence the dead_code allow on the
+/// signalling-only build — the decision-table tests still run there.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) mod policy;
+
+/// Serialises tests that read/write the shared rate env vars
+/// (RELAY_MAX_KBPS, RATE_FACTOR_*, FFMPEG_MAXRATE_KBPS, SCALE_CQ_BOOST):
+/// cargo's parallel runner interleaved them once the test count grew
+/// (rc.191 field flake). Module-scoped (not tests-mod-private) since P8b
+/// so `policy::tests` can take the same lock.
+#[cfg(test)]
+pub(crate) static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------
 // Shared helpers usable by every backend.
 // ---------------------------------------------------------------------
@@ -831,8 +849,9 @@ mod tests {
     // rc.191 — BOTH tests below read/write ROOMLER_AGENT_RELAY_MAX_KBPS;
     // cargo's parallel runner interleaved them once the peer::tests grew
     // (field flake 2026-07-16: the clamp test observed the reader test's
-    // mid-flight "4200" write). Serialise them on one lock.
-    static RELAY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // mid-flight "4200" write). Serialise them on one lock — module-scoped
+    // since P8b (see the definition next to `mod policy`).
+    use super::RELAY_ENV_LOCK;
 
     #[test]
     fn relay_max_bps_reads_env() {
