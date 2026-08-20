@@ -95,6 +95,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // Minted on the first SSH-enabled start, not at enrollment: a device
         // that never turns SSH on never generates a host key at all.
         ssh_host_key: None,
+        ssh_account_mode: None,
         // S2 env-bridged knobs: unset → built-in defaults.
         overlay_quic: None,
         overlay_direct: None,

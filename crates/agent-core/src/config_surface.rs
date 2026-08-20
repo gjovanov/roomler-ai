@@ -103,7 +103,12 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "ssh_authorized_keys",
         "list",
-        "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access).",
+        "Comma-separated OpenSSH public keys allowed to open an SSH session. Empty = nobody (ssh_enabled alone grants no access). Set ssh_account_mode too, or these keys authenticate and run nothing.",
+    ),
+    (
+        "ssh_account_mode",
+        "string",
+        "What an ssh_authorized_keys session runs as: daemon | console_user | named:<account>. Empty = sessions authenticate but run nothing (listing a key must not silently hand out SYSTEM/root).",
     ),
     // `ssh_host_key` is deliberately ABSENT from this surface: it is private
     // key material, and everything here is readable over the LocalAPI.
@@ -457,6 +462,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
+        "ssh_account_mode" => cfg.ssh_account_mode.clone(),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
                 EncoderPreferenceChoice::Auto => "auto",
@@ -581,6 +587,28 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect()
+        }
+        // Validated on the way IN rather than at session time: a typo should be
+        // a rejected `config set`, not a session that authenticates and then
+        // refuses every command for a reason the operator has to go digging in
+        // the daemon log to find.
+        "ssh_account_mode" => {
+            cfg.ssh_account_mode = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let ok = v == "daemon"
+                        || v == "console_user"
+                        || v.strip_prefix("named:")
+                            .is_some_and(|a| !a.trim().is_empty());
+                    if !ok {
+                        return Err(format!(
+                            "ssh_account_mode must be daemon | console_user | named:<account> \
+                             (got {v:?})"
+                        ));
+                    }
+                    Some(v.to_string())
+                }
+            }
         }
         "encoder_preference" => {
             cfg.encoder_preference = match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
