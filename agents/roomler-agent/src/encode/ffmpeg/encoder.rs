@@ -697,8 +697,9 @@ impl FfmpegEncoder {
     fn new_vp9_qsv_probe(width: u32, height: u32, low_power: bool, gop: i32) -> Result<Self> {
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
         let cq = ffmpeg_cq();
-        let encoder =
-            Self::build_encoder("vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop)?;
+        let encoder = Self::build_encoder(
+            "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false,
+        )?;
         let plane_pixels = (width as usize) * (height as usize);
         Ok(Self {
             encoder_name: "vp9_qsv",
@@ -707,8 +708,10 @@ impl FfmpegEncoder {
             encoder,
             frame_count: 0,
             force_keyframe: false,
-            nv12_y: vec![0u8; plane_pixels],
-            nv12_uv: vec![0u8; plane_pixels / 2],
+            plane_y: vec![0u8; plane_pixels],
+            plane_u: vec![0u8; plane_pixels / 2],
+            plane_v: Vec::new(),
+            chroma444: false,
             fps: 30,
             cq,
             maxrate_bps: 3_000_000,
@@ -1415,12 +1418,12 @@ mod tests {
     /// profile override could change Main-profile behaviour).
     #[test]
     fn hevc_rext_profile_only_with_chroma444() {
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, true);
         assert!(
             summary.contains("profile=rext"),
             "chroma444 must set profile=rext, got: {summary}"
         );
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
         assert!(
             !summary.contains("profile"),
             "4:2:0 must not set a profile, got: {summary}"
@@ -1445,7 +1448,7 @@ mod tests {
         let prior = std::env::var("ROOMLER_AGENT_NVENC_SPATIAL_AQ").ok();
 
         unsafe { std::env::remove_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
         assert!(
             !summary.contains("spatial-aq"),
             "spatial-aq must be omitted by default, got: {summary}"
@@ -1455,7 +1458,7 @@ mod tests {
         assert!(summary.contains("rc=vbr"), "got: {summary}");
 
         unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "1") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
         assert!(
             summary.contains("spatial-aq=1"),
             "env=1 must restore spatial-aq, got: {summary}"
@@ -1463,7 +1466,7 @@ mod tests {
 
         // Any non-"1" value keeps it off (explicit-opt-in semantics).
         unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "0") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
         assert!(!summary.contains("spatial-aq"), "got: {summary}");
 
         match prior {
