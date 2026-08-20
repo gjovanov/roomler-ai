@@ -5,11 +5,17 @@ without distributing `authorized_keys`, and without opening a port on the host.
 The roomler answer to [Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh)
 — with one capability theirs does not have: **it works on Windows.**
 
-Status: **P1, P2, P3 and P5a shipped** — transport, server, the full
-four-gate authorization path, and the privilege model. P4 (PTY), P5b (Windows
-console-user sessions), P6 (client) and P7 (SFTP) are designed, not built.
+Status: **P1, P2, P3, P5a, P5b and P5c shipped** — transport, server, the full
+four-gate authorization path, and the privilege model on both Windows and Unix.
+P4 (PTY), P6 (client) and P7 (SFTP) are designed, not built.
 
-Nothing has run on a fleet device yet, and the feature is off at every level
+**Field-proven on `clk00017265`** (a corp-managed laptop with no `sshd`, all
+three firewall profiles enabled, and WSL holding loopback `:22`): a session
+opened through the full gate chain returns `orfnet\extjovanov` — the signed-in
+domain user — with **no listener bound on the SSH port** and no firewall rule
+added. Replaying the same grant is refused.
+
+The feature is off at every level
 until an operator turns it on: the `ssh-server` cargo feature is not in the
 release sets, `ssh_enabled` defaults false, `ssh_authorized_keys` defaults
 empty, and every device's `SshPolicy` defaults to `Off`.
@@ -68,6 +74,7 @@ first fragment only, every field bounds-checked, malformed input answered with
 | `ssh_enabled` | `false` | Serve SSH on this node's overlay address |
 | `ssh_port` | `2222` | The intercepted TCP port |
 | `ssh_authorized_keys` | *(empty)* | OpenSSH public keys allowed to authenticate |
+| `ssh_account_mode` | *(unset)* | What those keys run as: `daemon` \| `console_user` \| `named:<account>`. **Unset = they authenticate but run nothing** |
 | `ssh_host_key` | *(minted on first use)* | This node's host identity — **not** exposed on the config surface |
 
 ```bash
@@ -118,7 +125,16 @@ The device's `SshPolicy.account_mode` decides, and the agent maps it through
 |---|---|---|
 | `daemon` (default) | root | SYSTEM |
 | `named` | **drops to that account** | refused — becoming an arbitrary user needs that user's credentials |
-| `console_user` | refused — no console session token exists | refused, pending P5b |
+| `console_user` | refused — no console session token exists | **runs as the signed-in user** (`WTSQueryUserToken` + `CreateProcessAsUserW`); refused if nobody is signed in, or if the daemon is not SYSTEM |
+
+**Both paths obey this, and it took a fix to make that true.** A grant carries
+the policy's `account_mode`. A key-list session has no policy behind it, so it
+uses the device-owned `ssh_account_mode` — and while that was unset it fell
+back to the daemon's own identity, meaning listing a key quietly handed out
+SYSTEM/root and a policy of `console_user` was simply untrue for that path.
+Unset now means the session authenticates and runs nothing, with the reason on
+stderr. (Authenticate-then-refuse rather than refuse-the-auth, because it can
+explain itself; a bare auth failure cannot.)
 
 The rule the whole type exists to enforce: **never silently run as something
 more privileged than was asked for.** A policy that says `console_user` on a
@@ -219,7 +235,10 @@ record, which a key-list session cannot.
 | P3c | Admin UI for the two policies, and `exec_audit`-style auditing of SSH grants (today a denial is logged, not persisted) | next |
 | P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | designed |
 | P5a | `RunAs` + the never-silently-escalate rule; Unix named-account privilege drop (setgroups→setgid→setuid, verified); every unsupported mode refused | **shipped** |
-| P5b | Windows console-user sessions: `WTSQueryUserToken` + `CreateProcessAsUserW` with captured output (`system_context` has the token path but not the capture) | next |
+| P5b | Windows console-user sessions (`WTSQueryUserToken` + `CreateProcessAsUserW` with captured output) | **shipped** rc.418, field-proven |
+| P5c | `ssh_account_mode` — key-list sessions obey an explicit identity instead of silently taking the daemon's | **shipped** |
+| P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | next |
+| — | ⚠️ **Open:** `SshPolicy.consent_mode` crosses the wire but the agent ignores it — a policy of `prompt` does not prompt anyone | not started |
 | P6 | `roomler ssh <name>`, netmap-verified host keys (no TOFU), stdio `ProxyCommand` | designed |
 | P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
 | P8 | Audit + session recording + admin UI | designed |

@@ -42,13 +42,22 @@
 //!
 //! Grants are tried first and consumed; the list is the fallback.
 //!
-//! # What a session can do
+//! # What a session runs as
 //!
-//! Commands inherit the daemon's identity — **SYSTEM on Windows, root under
-//! systemd** — exactly like Fleet RPC, and for the same reason (the
-//! diagnostics this exists for need it). Privilege drop and local-account
-//! mapping are P5. Anyone enabling this before then is granting root to
-//! whoever holds a listed key.
+//! Never something more privileged than was actually asked for — the rule
+//! [`crate::exec::RunAs`] exists to enforce, applied to BOTH paths:
+//!
+//! * A **grant** carries the account mode from the device's server-side
+//!   `SshPolicy`, which is authoritative for that session.
+//! * A **key-list** session has no policy behind it, so it uses the
+//!   device-owned `ssh_account_mode`. Unset — the default — means the session
+//!   authenticates and then runs nothing, with the reason on stderr.
+//!
+//! That second rule is deliberate and was a fix: key-list sessions used to
+//! fall back to the daemon's own identity, so listing a key quietly handed out
+//! SYSTEM/root and a policy of `account_mode = console_user` was untrue for
+//! that path. Authenticating-then-refusing is chosen over refusing the auth
+//! because it can explain itself.
 //!
 //! [`ssh_authorized_keys`]: crate::config::AgentConfig::ssh_authorized_keys
 
@@ -253,6 +262,16 @@ mod sshd {
         /// transport answers, every authentication attempt fails, and the
         /// operator sees exactly why in the log.
         pub authorized: Vec<PublicKey>,
+        /// What a key-list session runs as, resolved once from
+        /// `ssh_account_mode`.
+        ///
+        /// `Err` when the operator has not chosen — which is the default, and
+        /// which refuses. A key-list session carries no server policy, so
+        /// there is nothing to infer an identity from; the old behaviour of
+        /// quietly using the daemon's own identity meant listing a key handed
+        /// out SYSTEM/root without saying so, and made a device policy of
+        /// `account_mode = console_user` untrue for this path.
+        pub key_list_run_as: Result<crate::exec::RunAs, String>,
     }
 
     impl Ctx {
@@ -303,15 +322,58 @@ mod sshd {
                 ..Default::default()
             };
 
+            // Resolve the key-list identity ONCE, here, so a missing or
+            // malformed `ssh_account_mode` is a start-up log line rather than
+            // a per-session surprise.
+            let key_list_run_as = match cfg.ssh_account_mode.as_deref() {
+                Some(m) => parse_account_mode(m),
+                None => Err(
+                    "ssh_account_mode is not set on this device, so keys in ssh_authorized_keys \
+                     may authenticate but cannot run anything. Set it to daemon, console_user or \
+                     named:<account> to choose what those keys get."
+                        .to_string(),
+                ),
+            };
+            if let Err(e) = &key_list_run_as
+                && !authorized.is_empty()
+            {
+                warn!(%e, "ssh: ssh_authorized_keys is populated but has no account mode");
+            }
+
             info!(
                 fingerprint = %host_fingerprint,
                 authorized_keys = authorized.len(),
+                key_list_run_as = key_list_run_as.as_ref().map(|r| r.label()).unwrap_or_else(|_| "unset".into()),
                 "ssh: server ready"
             );
             Some(Arc::new(Self {
                 config: Arc::new(config),
                 authorized,
+                key_list_run_as,
             }))
+        }
+    }
+
+    /// Parse the device-owned `ssh_account_mode` into a [`RunAs`].
+    ///
+    /// Accepts the same vocabulary the server's `SshPolicy.account_mode` uses,
+    /// plus `named:<account>` — the wire carries the account in its own field,
+    /// but a single config string needs somewhere to put it.
+    ///
+    /// [`RunAs`]: crate::exec::RunAs
+    pub(super) fn parse_account_mode(mode: &str) -> Result<crate::exec::RunAs, String> {
+        match mode.trim() {
+            "daemon" => Ok(crate::exec::RunAs::Daemon),
+            "console_user" => Ok(crate::exec::RunAs::ConsoleUser),
+            other => match other.strip_prefix("named:") {
+                Some(a) if !a.trim().is_empty() => {
+                    Ok(crate::exec::RunAs::Named(a.trim().to_string()))
+                }
+                _ => Err(format!(
+                    "ssh_account_mode {other:?} is not one of daemon | console_user | \
+                     named:<account>"
+                )),
+            },
         }
     }
 
@@ -444,9 +506,14 @@ mod sshd {
             // policy behind it, so it gets the daemon identity — which is what
             // it already had, and what the config key's documentation warns
             // about in those words.
+            // A grant carries the server policy's account mode and is
+            // authoritative for its own session. A key-list session has no
+            // policy behind it, so it uses the device-owned `ssh_account_mode`
+            // — and if the operator never chose one, it runs NOTHING rather
+            // than quietly taking the daemon's identity.
             let run_as = match &self.grant {
                 Some(g) => crate::exec::RunAs::from_wire(&g.account_mode, g.account.as_deref()),
-                None => Ok(crate::exec::RunAs::Daemon),
+                None => self.ctx.key_list_run_as.clone(),
             };
             let run_as = match run_as {
                 Ok(r) => r,
@@ -959,12 +1026,145 @@ mod tests {
         assert!(!res.success(), "ssh_enabled alone must grant nobody access");
     }
 
+    // ── The key-list account mode ─────────────────────────────────────────
+
+    fn cfg_with_mode(authorized: Vec<String>, mode: Option<&str>) -> crate::config::AgentConfig {
+        let mut cfg = cfg_with(authorized);
+        cfg.ssh_account_mode = mode.map(str::to_string);
+        cfg
+    }
+
+    #[test]
+    fn account_mode_parses_the_documented_vocabulary() {
+        use crate::exec::RunAs;
+        assert_eq!(
+            super::sshd::parse_account_mode("daemon").unwrap(),
+            RunAs::Daemon
+        );
+        assert_eq!(
+            super::sshd::parse_account_mode("console_user").unwrap(),
+            RunAs::ConsoleUser
+        );
+        assert_eq!(
+            super::sshd::parse_account_mode("named:goran").unwrap(),
+            RunAs::Named("goran".into())
+        );
+        // Whitespace is tolerated; an empty account and an unknown word are not.
+        assert_eq!(
+            super::sshd::parse_account_mode(" named: goran ").unwrap(),
+            RunAs::Named("goran".into())
+        );
+        assert!(super::sshd::parse_account_mode("named:").is_err());
+        assert!(super::sshd::parse_account_mode("root").is_err());
+        assert!(super::sshd::parse_account_mode("").is_err());
+    }
+
+    /// THE regression this slice exists for.
+    ///
+    /// A key-list session used to fall back to `RunAs::Daemon` — SYSTEM/root —
+    /// no matter what the device policy said. Listing a key silently handed out
+    /// the most privileged identity on the box, and a policy of
+    /// `account_mode = console_user` was simply untrue for that path.
+    #[test]
+    fn an_unset_account_mode_refuses_rather_than_granting_the_daemon_identity() {
+        let ctx = super::sshd::Ctx::build(&cfg_with_mode(vec![client_key(20).1], None))
+            .expect("a usable host key");
+
+        let err = ctx
+            .key_list_run_as
+            .as_ref()
+            .expect_err("an unset account mode must NOT resolve to an identity");
+        assert!(
+            err.contains("ssh_account_mode"),
+            "the refusal must name the key to set, got {err:?}"
+        );
+
+        // The specific bug: it must not be Daemon.
+        assert!(
+            !matches!(ctx.key_list_run_as, Ok(crate::exec::RunAs::Daemon)),
+            "unset must never mean the daemon's own identity"
+        );
+    }
+
+    #[test]
+    fn a_set_account_mode_is_what_key_list_sessions_get() {
+        let ctx =
+            super::sshd::Ctx::build(&cfg_with_mode(vec![client_key(21).1], Some("console_user")))
+                .expect("a usable host key");
+        assert_eq!(
+            ctx.key_list_run_as.as_ref().unwrap(),
+            &crate::exec::RunAs::ConsoleUser
+        );
+
+        // `daemon` stays available — but only when asked for by name.
+        let ctx = super::sshd::Ctx::build(&cfg_with_mode(vec![client_key(22).1], Some("daemon")))
+            .expect("a usable host key");
+        assert_eq!(
+            ctx.key_list_run_as.as_ref().unwrap(),
+            &crate::exec::RunAs::Daemon
+        );
+    }
+
+    /// A malformed value must not degrade into a working-but-wrong identity.
+    #[test]
+    fn a_malformed_account_mode_refuses() {
+        let ctx = super::sshd::Ctx::build(&cfg_with_mode(
+            vec![client_key(23).1],
+            Some("administrator"),
+        ))
+        .expect("a usable host key");
+        assert!(ctx.key_list_run_as.is_err());
+    }
+
+    /// End to end over a real SSH connection: an authorized key with no account
+    /// mode authenticates — so the operator gets a readable explanation rather
+    /// than a bare auth failure — and then runs nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_key_list_session_without_an_account_mode_authenticates_but_runs_nothing() {
+        let (key, line) = client_key(24);
+        let addr = serve_one(&cfg_with_mode(vec![line], None)).await;
+        let session = connect(addr, key).await; // auth SUCCEEDS
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, "echo should-never-run").await.unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => stdout.extend_from_slice(data),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    stderr.extend_from_slice(data)
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+
+        let out = String::from_utf8_lossy(&stdout);
+        let err = String::from_utf8_lossy(&stderr);
+        assert!(
+            !out.contains("should-never-run"),
+            "the command ran without an account mode — the silent-SYSTEM bug is back"
+        );
+        assert!(
+            err.contains("ssh_account_mode"),
+            "the caller must be told which key to set, got stderr {err:?}"
+        );
+        assert_eq!(exit, Some(1));
+    }
+
     /// The end-to-end P2 claim: a real SSH client runs a real command through
     /// the daemon's real exec engine and gets its output and exit status.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_authorized_key_runs_a_command_and_gets_its_output() {
         let (key, line) = client_key(4);
-        let addr = serve_one(&cfg_with(vec![line])).await;
+        // `daemon` is stated explicitly. It used to be what an unset mode
+        // silently produced, and this test passing without naming it was how
+        // that went unnoticed — listing a key handed out SYSTEM/root and the
+        // suite called it success.
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
         let session = connect(addr, key).await;
 
         let mut channel = session.channel_open_session().await.unwrap();

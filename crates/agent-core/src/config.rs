@@ -145,6 +145,27 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ssh_host_key: Option<String>,
 
+    /// Which local account a session authenticated by
+    /// [`Self::ssh_authorized_keys`] runs as: `daemon` | `console_user` |
+    /// `named:<account>`.
+    ///
+    /// **Unset means sessions authenticate but run nothing.** That is
+    /// deliberate. A key-list session carries no server policy, so there is
+    /// nothing to infer an identity from — and the previous behaviour,
+    /// silently falling back to the daemon's own identity, meant listing a key
+    /// handed out SYSTEM/root without ever saying so. It also made a device
+    /// policy of `account_mode = console_user` a lie for that path: the policy
+    /// said one thing and the key list did another.
+    ///
+    /// So the operator who lists a key also states what it gets. Same rule the
+    /// `RunAs` type enforces everywhere else: never run as something more
+    /// privileged than was actually asked for.
+    ///
+    /// Server-minted grants are unaffected — they carry their own account mode
+    /// from the device's `SshPolicy`, which stays authoritative for that path.
+    #[serde(default)]
+    pub ssh_account_mode: Option<String>,
+
     // ─── S2: env-bridged operator knobs ──────────────────────────────────
     // Each mirrors an env var read through `tunnel_core::env::node_env`
     // (precedence: env — either prefix — > this config key > built-in
@@ -1269,6 +1290,7 @@ pub fn test_fixture() -> AgentConfig {
         ssh_port: None,
         ssh_authorized_keys: Vec::new(),
         ssh_host_key: None,
+        ssh_account_mode: None,
         overlay_quic: None,
         overlay_direct: None,
         overlay_derp: None,
