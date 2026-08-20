@@ -322,6 +322,42 @@ pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32>
     }
 }
 
+/// P7 (2026-08-20) — does idle native-rung refinement apply for this
+/// Priority dial / transport combination? (See
+/// `rate_profile::IdleRefine` for the state machine.)
+///
+/// v1 scope: **Smoother on every path** — that dial explicitly trades
+/// pixels for motion smoothness, and a settled still costs neither, so
+/// crisp-at-rest is pure win. **Balanced+relay** lifts the B1 *physics*
+/// cap even at idle (a native IDR is ~150-400 KB through a 3 Mbps pipe),
+/// so it stays behind `ROOMLER_AGENT_IDLE_REFINE_BALANCED=1` until
+/// field-validated. Sharper has no cap to lift. The vp9-444 SW pump is
+/// excluded entirely (refined-native keepalives would cost ~16 fps of
+/// native libvpx SW encode while "idle" — a real CPU tax with none of
+/// the HW pump's free-ness).
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub(crate) fn idle_refine_applies(priority: u8, constrained: bool) -> bool {
+    match priority {
+        self::priority::SMOOTHER => true,
+        self::priority::SHARPER => false,
+        _ => constrained && node_env("IDLE_REFINE_BALANCED").as_deref().map(str::trim) == Some("1"),
+    }
+}
+
+/// P7 — long-edge cap for the REFINED rung. Default 0 = full native (rc.191
+/// field data: even a 0.85× resample mushes ClearType, so a half-rung pays
+/// the same rebuild + IDR without delivering 1:1 crispness). Safety valve
+/// `ROOMLER_AGENT_IDLE_REFINE_MAX_EDGE` (e.g. 1600) bounds the refined IDR
+/// size if the field disagrees.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub(crate) fn idle_refine_cap_long_edge() -> Option<u32> {
+    let v = std::env::var("ROOMLER_AGENT_IDLE_REFINE_MAX_EDGE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    (v > 0).then_some(v)
+}
+
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
@@ -746,6 +782,34 @@ mod tests {
         assert_eq!(priority_relay_cap(priority::SMOOTHER, false), Some(1024));
         // An unknown code is treated as Balanced (never uncapped by accident).
         assert_eq!(priority_relay_cap(42, true), Some(1280));
+    }
+
+    // P7 — idle-refine scope matrix + the Balanced opt-in env.
+    #[test]
+    fn idle_refine_applies_matrix() {
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: same hermetic save/restore contract as the sibling env
+        // tests; serialised on RELAY_ENV_LOCK.
+        let prior = std::env::var("ROOMLER_AGENT_IDLE_REFINE_BALANCED").ok();
+        unsafe { std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED") };
+
+        // Smoother refines on EVERY path (its cap applies on every path).
+        assert!(idle_refine_applies(priority::SMOOTHER, true));
+        assert!(idle_refine_applies(priority::SMOOTHER, false));
+        // Sharper has no cap to lift.
+        assert!(!idle_refine_applies(priority::SHARPER, true));
+        assert!(!idle_refine_applies(priority::SHARPER, false));
+        // Balanced: opt-in only (it lifts the B1 physics cap), relay only.
+        assert!(!idle_refine_applies(priority::BALANCED, true));
+        assert!(!idle_refine_applies(priority::BALANCED, false));
+        unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", "1") };
+        assert!(idle_refine_applies(priority::BALANCED, true));
+        assert!(!idle_refine_applies(priority::BALANCED, false));
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED", v) },
+            None => unsafe { std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED") },
+        }
     }
 
     // rc.191 — BOTH tests below read/write ROOMLER_AGENT_RELAY_MAX_KBPS;
