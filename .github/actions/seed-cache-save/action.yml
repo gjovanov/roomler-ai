@@ -26,9 +26,13 @@ runs:
       run: |
         # rust-cache-style trim: registry sources + git checkouts re-extract
         # cheaply from the cached index/db; incremental dirs are rebuilt
-        # every run anyway. Keeps a generation at roughly Swatinem size.
+        # every run anyway.
         rm -rf ~/.cargo/registry/src ~/.cargo/git/checkouts 2>/dev/null || true
         rm -rf target/release/incremental target/debug 2>/dev/null || true
+        # (Accretion GC lives in seed-cache-restore, deliberately BEFORE
+        # the build: the run then rebuilds whatever the GC removed, so the
+        # generation saved here is complete AND lean. GC'ing here instead
+        # would save generations with holes that tag builds pay to refill.)
         du -sh target ~/.cargo 2>/dev/null || true
 
     - uses: actions/cache/save@v4
