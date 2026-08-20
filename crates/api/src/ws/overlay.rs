@@ -2358,6 +2358,7 @@ mod tests {
             supports_forced_derp: true,
             supports_server_relay_strategy: false,
             supports_derp_floor: false,
+            supports_overlay_echo: false,
             advertised_routes: vec![],
             approved_routes: vec![],
             is_exit_node: false,
