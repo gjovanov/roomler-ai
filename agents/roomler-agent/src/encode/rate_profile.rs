@@ -376,11 +376,33 @@ pub const REFINE_SPARSE_MAX: u32 = 2;
 /// (scroll, drag, animation, video). Below it: caret blinks, keystroke
 /// deltas, hover highlights — invisible to the state machine. Terminal
 /// text compresses hard, so a few scrolled lines at the LOW rung can duck
-/// under this — harmless: the stream just refines sooner, and the same
-/// scroll at the refined native rung is 2-3× the bytes and counts. Env
+/// under this — harmless: the stream just refines sooner. Env
 /// `ROOMLER_AGENT_IDLE_REFINE_MIN_FRAME_KB` (0 = legacy: every real frame
 /// counts).
+///
+/// P7c-2 — the threshold is defined AT the reference rung below and
+/// scaled by the CURRENT encode area (`scaled_min_bytes`). A fixed byte
+/// floor is a rung-dependent OSCILLATOR: field pc55331 2026-08-20
+/// (rc.425, ~15 fps of small-animation deltas — a corp-VPN dialog's
+/// countdown + page motion): the same content encoded ~4 KB at 1024×640
+/// (below the floor ⇒ "quiet" ⇒ Up) and 12-16 KB at native 1920×1200
+/// (above ⇒ Down within ~2 s) — an endless Up/Down pair every ~6 s, each
+/// burning two rebuilds + a ~300 KB native IDR on a 3 Mbps relay. Bytes
+/// per CONTENT are ~proportional to encode area, so normalizing by area
+/// makes significance rung-invariant: the animation is invisible at both
+/// rungs (crisp text survives a ticking dialog), while a real scroll
+/// (60-300 KB at native) clears the scaled bar everywhere.
 pub const REFINE_MIN_FRAME_KB: u32 = 12;
+
+/// The encode area `REFINE_MIN_FRAME_KB` was field-calibrated at (the
+/// Smoother/relay rung where P7c's typing-vs-scroll separation was
+/// measured). `scaled_min_bytes` scales the configured floor by
+/// `encode_area / REFINE_REF_AREA`.
+pub const REFINE_REF_AREA: u64 = 1024 * 640;
+
+/// Absolute floor for the scaled threshold (guards tiny encode rungs
+/// where the area ratio would otherwise count sub-KB caret noise).
+pub const REFINE_MIN_BYTES_FLOOR: usize = 2048;
 
 /// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
 /// a scroll/drag; typing produces 100-200 ms gaps and never chains).
@@ -480,13 +502,34 @@ impl IdleRefine {
         }
     }
 
+    /// The significance floor for the CURRENT encode rung: the configured
+    /// per-reference-rung floor scaled by encode area (see the P7c-2 notes
+    /// on `REFINE_MIN_FRAME_KB` — a fixed floor oscillates across rungs).
+    /// `min_frame_bytes == 0` stays 0 (legacy count-everything).
+    fn scaled_min_bytes(&self, encode_area: u64) -> usize {
+        if self.min_frame_bytes == 0 || encode_area == 0 {
+            return self.min_frame_bytes;
+        }
+        let scaled = (self.min_frame_bytes as u64)
+            .saturating_mul(encode_area)
+            .div_ceil(REFINE_REF_AREA);
+        (scaled as usize).max(REFINE_MIN_BYTES_FLOOR)
+    }
+
     /// A real (damage-carrying) frame was encoded to `encoded_bytes` on the
-    /// wire. Returns `Some(Down)` exactly when a refined session must drop
-    /// back to the capped rung. Sub-threshold frames (caret, keystrokes,
-    /// hover highlights — see `REFINE_MIN_FRAME_KB`) are ignored entirely:
-    /// they don't chain the run, fill the window, or block the up-flip.
-    pub fn note_real_frame(&mut self, now: Instant, encoded_bytes: usize) -> Option<RefineFlip> {
-        if !self.enabled || encoded_bytes < self.min_frame_bytes {
+    /// wire at `encode_area` pixels. Returns `Some(Down)` exactly when a
+    /// refined session must drop back to the capped rung. Sub-threshold
+    /// frames (caret, keystrokes, hover highlights, small persistent
+    /// animations — judged against the rung-scaled floor) are ignored
+    /// entirely: they don't chain the run, fill the window, or block the
+    /// up-flip.
+    pub fn note_real_frame(
+        &mut self,
+        now: Instant,
+        encoded_bytes: usize,
+        encode_area: u64,
+    ) -> Option<RefineFlip> {
+        if !self.enabled || encoded_bytes < self.scaled_min_bytes(encode_area) {
             return None;
         }
         self.run = match self.last_real {
@@ -823,7 +866,7 @@ mod tests {
         bytes: usize,
     ) -> Instant {
         for _ in 0..n {
-            assert_eq!(r.note_real_frame(now, bytes), None);
+            assert_eq!(r.note_real_frame(now, bytes, REFINE_REF_AREA), None);
             now += gap;
         }
         now
@@ -871,7 +914,7 @@ mod tests {
         // with keepalives in between — must stay refined throughout.
         for _ in 0..38 {
             assert_eq!(
-                r.note_real_frame(now, SMALL),
+                r.note_real_frame(now, SMALL, REFINE_REF_AREA),
                 None,
                 "caret blink must not down-flip"
             );
@@ -897,7 +940,7 @@ mod tests {
         let mut r = refine();
         let mut now = t0();
         for _ in 0..30 {
-            let _ = r.note_real_frame(now, SMALL);
+            let _ = r.note_real_frame(now, SMALL, REFINE_REF_AREA);
             now += Duration::from_millis(160);
         }
         assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
@@ -913,7 +956,7 @@ mod tests {
         assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
         let mut t = now + Duration::from_secs(1);
         for _ in 0..60 {
-            assert_eq!(r.note_real_frame(t, SMALL), None);
+            assert_eq!(r.note_real_frame(t, SMALL, REFINE_REF_AREA), None);
             t += Duration::from_millis(33);
         }
         assert!(r.refined());
@@ -925,12 +968,12 @@ mod tests {
         // regions) must still hold the up-flip — rebuild+IDR isn't free.
         let mut r = refine();
         let mut now = t0();
-        let _ = r.note_real_frame(now, BIG);
+        let _ = r.note_real_frame(now, BIG, REFINE_REF_AREA);
         now += Duration::from_millis(160);
-        let _ = r.note_real_frame(now, BIG);
+        let _ = r.note_real_frame(now, BIG, REFINE_REF_AREA);
         for _ in 0..30 {
             now += Duration::from_millis(160);
-            let _ = r.note_real_frame(now, BIG);
+            let _ = r.note_real_frame(now, BIG, REFINE_REF_AREA);
             assert_eq!(r.on_keepalive(true, now + Duration::from_millis(60)), None);
         }
         assert!(!r.refined());
@@ -943,7 +986,7 @@ mod tests {
         let mut r = IdleRefine::new(true, 0);
         let mut now = t0();
         for _ in 0..10 {
-            let _ = r.note_real_frame(now, SMALL);
+            let _ = r.note_real_frame(now, SMALL, REFINE_REF_AREA);
             now += Duration::from_millis(160);
         }
         assert_eq!(r.on_keepalive(true, now), None);
@@ -959,7 +1002,7 @@ mod tests {
         let mut t = now + Duration::from_secs(2);
         let mut fired_at = None;
         for i in 0..30 {
-            if let Some(RefineFlip::Down) = r.note_real_frame(t, BIG) {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t, BIG, REFINE_REF_AREA) {
                 fired_at = Some(i);
                 break;
             }
@@ -984,7 +1027,7 @@ mod tests {
         let start = t;
         let mut fired = None;
         for _ in 0..40 {
-            if let Some(RefineFlip::Down) = r.note_real_frame(t, BIG) {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t, BIG, REFINE_REF_AREA) {
                 fired = Some(t.duration_since(start));
                 break;
             }
@@ -1006,11 +1049,11 @@ mod tests {
         // gate first (see big_repaint_trickle_blocks_upflip).
         let mut now = t0();
         for _ in 0..3 {
-            let _ = r.note_real_frame(now, BIG);
+            let _ = r.note_real_frame(now, BIG, REFINE_REF_AREA);
             now += Duration::from_millis(200);
         }
         for _ in 0..100 {
-            let _ = r.note_real_frame(now, BIG);
+            let _ = r.note_real_frame(now, BIG, REFINE_REF_AREA);
             assert_eq!(r.on_keepalive(true, now + Duration::from_millis(100)), None);
             now += Duration::from_millis(200);
         }
@@ -1026,7 +1069,7 @@ mod tests {
         let mut t = now + Duration::from_secs(1);
         let mut down_at = None;
         for _ in 0..12 {
-            if r.note_real_frame(t, BIG) == Some(RefineFlip::Down) {
+            if r.note_real_frame(t, BIG, REFINE_REF_AREA) == Some(RefineFlip::Down) {
                 down_at = Some(t);
                 break;
             }
@@ -1070,7 +1113,7 @@ mod tests {
         // Enter → output scrolls: burst until the down-flip.
         let mut down_at = None;
         for _ in 0..12 {
-            if r.note_real_frame(t, BIG) == Some(RefineFlip::Down) {
+            if r.note_real_frame(t, BIG, REFINE_REF_AREA) == Some(RefineFlip::Down) {
                 down_at = Some(t);
                 break;
             }
@@ -1081,7 +1124,7 @@ mod tests {
         let mut t = down_at + Duration::from_millis(160);
         let mut refined_at = None;
         while t.duration_since(down_at) <= Duration::from_secs(3) {
-            let _ = r.note_real_frame(t, SMALL);
+            let _ = r.note_real_frame(t, SMALL, REFINE_REF_AREA);
             if r.on_keepalive(true, t + Duration::from_millis(60)) == Some(RefineFlip::Up) {
                 refined_at = Some(t + Duration::from_millis(60));
                 break;
@@ -1094,6 +1137,65 @@ mod tests {
             took <= Duration::from_millis(1400),
             "re-refine took {took:?} after the scroll (want ≈1 s)"
         );
+    }
+
+    #[test]
+    fn borderline_animation_does_not_oscillate_across_rungs() {
+        // P7c-2 field lock (pc55331, rc.425): ~15 fps of small-animation
+        // deltas (a corp-VPN dialog's ticking countdown + page motion)
+        // encoded ~4 KB at the 1024×640 rung (sub-floor ⇒ "quiet" ⇒ Up)
+        // and ~14 KB at native 1920×1200 (over the FIXED 12 KiB floor ⇒
+        // Down ~2 s later) — an endless flip pair every ~6 s, each burning
+        // two rebuilds + a native IDR. With the rung-scaled floor the same
+        // content is invisible at BOTH rungs.
+        const NATIVE_AREA: u64 = 1920 * 1200;
+        let mut r = refine();
+        let mut now = t0();
+        // Capped rung: the animation trickles 4 KB frames at ~15 fps.
+        for _ in 0..30 {
+            assert_eq!(r.note_real_frame(now, 4_000, REFINE_REF_AREA), None);
+            now += Duration::from_millis(66);
+        }
+        // Animation frames are invisible ⇒ the window is quiet ⇒ Up fires.
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // Refined at native: the SAME content now encodes ~14 KB — over
+        // the old fixed floor (the oscillator), under the scaled one
+        // (12 KiB × native/ref ≈ 42 KiB) ⇒ stays crisp.
+        for _ in 0..60 {
+            assert_eq!(
+                r.note_real_frame(now, 14_000, NATIVE_AREA),
+                None,
+                "borderline animation at native must not down-flip"
+            );
+            now += Duration::from_millis(66);
+        }
+        assert!(r.refined(), "stays crisp through the ticking animation");
+        // A REAL scroll at native (~120 KB frames) still restores the cap.
+        let mut downed = false;
+        for _ in 0..12 {
+            if r.note_real_frame(now, 120_000, NATIVE_AREA) == Some(RefineFlip::Down) {
+                downed = true;
+                break;
+            }
+            now += Duration::from_millis(33);
+        }
+        assert!(downed, "real motion at native must still down-flip");
+    }
+
+    #[test]
+    fn scaled_floor_tracks_encode_area_with_an_absolute_floor() {
+        let r = refine();
+        // At the reference rung the configured floor applies verbatim.
+        assert_eq!(r.scaled_min_bytes(REFINE_REF_AREA), 12 * 1024);
+        // Native 1920×1200 = 3.515625× the reference area, exactly 43200.
+        assert_eq!(r.scaled_min_bytes(1920 * 1200), 43_200);
+        // Small rungs scale down proportionally…
+        assert_eq!(r.scaled_min_bytes(640 * 400), 4_800);
+        // …but never below the absolute floor (caret noise stays invisible).
+        assert_eq!(r.scaled_min_bytes(320 * 200), REFINE_MIN_BYTES_FLOOR);
+        // Legacy count-everything (floor 0) never scales.
+        let legacy = IdleRefine::new(true, 0);
+        assert_eq!(legacy.scaled_min_bytes(1920 * 1200), 0);
     }
 
     #[test]
@@ -1113,7 +1215,7 @@ mod tests {
         let mut now = t0();
         for _ in 0..50 {
             assert_eq!(r.on_keepalive(true, now), None);
-            assert_eq!(r.note_real_frame(now, BIG), None);
+            assert_eq!(r.note_real_frame(now, BIG, REFINE_REF_AREA), None);
             now += Duration::from_millis(60);
         }
         assert!(!r.refined());
