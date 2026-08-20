@@ -3449,6 +3449,16 @@ async fn media_pump_ffmpeg_dc(
     // NEO16→PC55331 2026-07-27: blur→crystal text pulse on all codecs,
     // most visible on av1_nvenc).
     let mut settle_kf = crate::encode::rate_profile::SettleKeyframeGate::from_env();
+    // P7 — idle native-rung refinement ("crisp at rest"): when the only
+    // reason we're below native is a resolution cap (Smoother; Balanced+relay
+    // behind an env opt-in) and the scene settles, lift the cap so the
+    // dims-keyed rebuild below ships one crisp native IDR; the first motion
+    // burst restores the cap in ~300 ms. Everything downstream is already
+    // plumbed: rebuild-on-dims-change → guaranteed IDR of the settled
+    // native `last_good_frame` (stored pre-downscale), aimd.force_reapply,
+    // video_info resend, encoded_dims → cursor scale. Kill switch
+    // `ROOMLER_AGENT_IDLE_REFINE=0`; see rate_profile::IdleRefine.
+    let mut idle_refine = crate::encode::rate_profile::IdleRefine::from_env();
     // rc.130 — 60 ms (was 1 s). Doubles as the SPARSE-INPUT DRAIN. With the
     // HW encoder's output queue capped to ~1 frame (encoder.rs delay=0 /
     // async_depth=1), re-feeding the last good frame here flushes the held
@@ -3779,6 +3789,16 @@ async fn media_pump_ffmpeg_dc(
                 frames_captured += 1;
                 // Motion continues — the settle gate counts the episode.
                 settle_kf.note_real_frame();
+                // P7 — a sustained burst while refined restores the cap
+                // (the next cap application downscales again → rebuild).
+                if let Some(flip) = idle_refine.note_real_frame(std::time::Instant::now()) {
+                    info!(
+                        %session_id,
+                        codec_label,
+                        ?flip,
+                        "idle refine: motion burst — restoring resolution cap"
+                    );
+                }
                 arc
             }
             Ok(None) => {
@@ -3806,6 +3826,43 @@ async fn media_pump_ffmpeg_dc(
                             burst,
                             "idle-settle keyframe (motion burst ended)"
                         );
+                    }
+                    // P7 — idle-refine tick. Eligible = a cap below native is
+                    // actually clamping, the controller left resolution at
+                    // Native (an explicit rc:resolution pick is the user's —
+                    // never overridden), and the dial/transport scope allows
+                    // it. On Up, the cap application below lifts for THIS
+                    // keepalive frame — the rebuild ships the settled screen
+                    // as a crisp native IDR. The settle-KF above composes:
+                    // it resyncs the CURRENT rung at settle+60 ms; the
+                    // refined native IDR follows ~1 s later.
+                    {
+                        let now = std::time::Instant::now();
+                        let prio = priority.load(std::sync::atomic::Ordering::Relaxed);
+                        let (nw, nh) = unpack_dims(
+                            capture_native_dims.load(std::sync::atomic::Ordering::Relaxed),
+                        );
+                        let cap_clamps = crate::encode::priority_relay_cap(prio, constrained)
+                            .is_some_and(|c| nw.max(nh) > c);
+                        let user_native = matches!(
+                            resolve_user_box(*target_resolution.lock().unwrap(), nw, nh),
+                            TargetResolution::Native
+                        );
+                        let eligible = nw > 0
+                            && cap_clamps
+                            && user_native
+                            && crate::encode::idle_refine_applies(prio, constrained);
+                        if let Some(flip) = idle_refine.on_keepalive(eligible, now) {
+                            info!(
+                                %session_id,
+                                codec_label,
+                                ?flip,
+                                native_w = nw,
+                                native_h = nh,
+                                "idle refine: scene settled — lifting resolution cap \
+                                 (crisp native IDR incoming)"
+                            );
+                        }
                     }
                     f.clone()
                 } else {
@@ -3864,18 +3921,22 @@ async fn media_pump_ffmpeg_dc(
         // (field NEO16→PC50045 2026-07-16, target_bps pinned 1.8M↔3.0M).
         // No SW soft cap here — this pump is HW-encode by construction.
         let user_target = *target_resolution.lock().unwrap();
-        let effective_target = effective_target_resolution(
-            user_target,
-            frame.width,
-            frame.height,
-            // rc.199 — Priority-resolved relay cap (see the VP9-444 pump). This
-            // HW-encode pump has no SW soft cap, so Sharper reaches full native.
-            crate::encode::priority_relay_cap(
-                priority.load(std::sync::atomic::Ordering::Relaxed),
-                constrained,
-            ),
-            None,
+        // rc.199 — Priority-resolved relay cap (see the VP9-444 pump). This
+        // HW-encode pump has no SW soft cap, so Sharper reaches full native.
+        let mut hard_cap = crate::encode::priority_relay_cap(
+            priority.load(std::sync::atomic::Ordering::Relaxed),
+            constrained,
         );
+        // P7 — while idle-refined, the cap lifts (default: full native;
+        // ROOMLER_AGENT_IDLE_REFINE_MAX_EDGE bounds the refined rung). The
+        // dims change makes the rebuild below fire, whose first frame is a
+        // guaranteed IDR; scale_cq_bias recomputes to 0 at native so the
+        // refined IDR carries the base CQ (bounded size).
+        if idle_refine.refined() {
+            hard_cap = crate::encode::idle_refine_cap_long_edge();
+        }
+        let effective_target =
+            effective_target_resolution(user_target, frame.width, frame.height, hard_cap, None);
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
             info!(
                 %session_id,
