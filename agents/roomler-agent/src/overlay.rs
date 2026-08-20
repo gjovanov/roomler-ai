@@ -140,6 +140,10 @@ pub async fn maybe_start(
     outbound: mpsc::Sender<ClientMsg>,
     peer_view: watch::Sender<OverlayView>,
     derp_ticket_slot: crate::relay_probe::DerpTicketSlot,
+    // A2 — the session-services bundle the SSH server is built with. Threaded
+    // explicitly (signaling::run already holds the broker) instead of the old
+    // `consent::set_shared` process global.
+    services: crate::ssh::SessionServices,
 ) -> Option<mpsc::Sender<OverlayEvent>> {
     if !cfg.overlay_enabled {
         // Drop THIS org's persistent-runtime slot entry: once the sessions'
@@ -270,7 +274,7 @@ pub async fn maybe_start(
     // the OS-TUN, per-org and netstack factories identically, so SSH behaves the
     // same on a server, a multi-org host and a locked-down corp laptop.
     // No-op (and byte-for-byte the old path) unless `ssh_enabled` is on.
-    let tun_factory = crate::ssh::maybe_intercept(tun_factory, cfg);
+    let tun_factory = crate::ssh::maybe_intercept(tun_factory, cfg, services);
     // P5 exit-node client — resolve the coordination server's IPs NOW, while the
     // uplink is still clean (before any split-default is installed), so exit
     // routing can exempt them. Only when this node opts into an exit node.

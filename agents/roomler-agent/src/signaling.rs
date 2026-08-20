@@ -983,6 +983,9 @@ async fn connect_once(
         outbound_tx.clone(),
         overlay_view_tx.clone(),
         derp_ticket_slot.clone(),
+        crate::ssh::SessionServices {
+            consent: consent_broker.clone(),
+        },
     )
     .await;
     // B1 — install THIS connection's RTT-sample sink: a hook wrapping a
@@ -1171,6 +1174,9 @@ async fn connect_once(
                         outbound_tx.clone(),
                         overlay_view_tx.clone(),
                         derp_ticket_slot.clone(),
+                        crate::ssh::SessionServices {
+                            consent: consent_broker.clone(),
+                        },
                     )
                     .await;
                 }
