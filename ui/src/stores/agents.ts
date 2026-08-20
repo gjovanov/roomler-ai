@@ -57,6 +57,14 @@ export interface AgentCapabilities {
    *  string (`vp09.01.10.08` vs `vp09.00.10.08`); mismatch leaves
    *  the canvas blank. */
   vp9_chroma?: string
+  /** P7 — chroma formats the agent's HEVC encoder can emit on the
+   *  `data-channel-hevc` transport: `'yuv420'` (Main — every HEVC host)
+   *  and `'yuv444'` (Rext — hevc_nvenc only). The browser offers its
+   *  "HEVC · crisp text (4:4:4)" picker entry only when this contains
+   *  `'yuv444'` AND its own WebCodecs Rext decode probe passes. Empty /
+   *  unset on older agents → the entry stays hidden. Mirrors
+   *  `AgentCaps.hevc_chroma` in `crates/remote_control/src/models.rs`. */
+  hevc_chroma?: string[]
   /** Audio codecs the agent can stream on the opt-in WebRTC audio
    *  track (system / desktop audio). Known value: `'opus'`. Empty /
    *  unset on older agents or agents built without the `audio` Cargo

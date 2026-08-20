@@ -203,6 +203,7 @@ fn encoder_options(
     name: &str,
     maxrate_bps: usize,
     cq: u32,
+    chroma444: bool,
 ) -> (Vec<(String, String)>, Vec<(String, String)>, String) {
     // P3 — H.264 codes text visibly softer than HEVC at equal nominal
     // quality numbers; give the h264_* encoders a 2-step sharper CQ off the
@@ -270,6 +271,14 @@ fn encoder_options(
         base.push(("cq".into(), cq_s.clone()));
         base.push(("preset".into(), preset.as_deref().unwrap_or("p4").into()));
         base.push(("tune".into(), tune.as_deref().unwrap_or("ll").into()));
+        // P7 — HEVC 4:4:4 needs the Range-extensions profile; without it
+        // nvenc silently keeps Main and rejects the yuv444p frames. Only
+        // ever set on the hevc_nvenc + chroma444 path (the pump's Rext
+        // opt-in); a rejection fails the base-tier open and the caller's
+        // 4:2:0 fallback takes over.
+        if chroma444 {
+            base.push(("profile".into(), "rext".into()));
+        }
         base.push(("rc-lookahead".into(), "0".into()));
         base.push(("bf".into(), "0".into()));
         base.push(("forced-idr".into(), "1".into()));
@@ -400,10 +409,18 @@ pub struct FfmpegEncoder {
     /// + `frame.set_pict_type(I)` to force IDR on HEVC encoders.
     force_keyframe: bool,
 
-    /// Scratch buffer for the NV12 Y plane. Reused across frames.
-    nv12_y: Vec<u8>,
-    /// Scratch buffer for the NV12 UV interleaved plane. Reused across frames.
-    nv12_uv: Vec<u8>,
+    /// Scratch buffer for the Y plane (NV12 and I444 alike). Reused across
+    /// frames.
+    plane_y: Vec<u8>,
+    /// NV12: the interleaved UV plane (pixels/2 bytes). I444 (P7 HEVC Rext):
+    /// the full-resolution U plane (pixels bytes). Reused across frames.
+    plane_u: Vec<u8>,
+    /// I444 only: the full-resolution V plane. Empty on NV12.
+    plane_v: Vec<u8>,
+    /// P7 — true when this encoder runs HEVC Rext 4:4:4 (`yuv444p` +
+    /// `profile=rext`, hevc_nvenc only). Drives the convert/build format
+    /// branches and is surfaced to the pump for `rc:video-info` truth.
+    chroma444: bool,
 
     /// Target fps this session runs at — threaded from the DC pump's
     /// `target_fps` (Phase B). Reused on the QSV/AMF bitrate REBUILD so the
@@ -446,6 +463,7 @@ impl FfmpegEncoder {
             DEFAULT_ENCODER_FPS,
             maxrate,
             0,
+            false,
         )
     }
 
@@ -468,6 +486,7 @@ impl FfmpegEncoder {
             DEFAULT_ENCODER_FPS,
             maxrate,
             0,
+            false,
         )
     }
 
@@ -478,13 +497,38 @@ impl FfmpegEncoder {
     /// P7 — `cq_bias`: extra CQ sharpening steps for deep resolution rungs
     /// (`rate_profile::scale_cq_bias`, computed by the pump at each rebuild
     /// from encode-vs-native area); the probe constructors pass 0.
+    ///
+    /// P7 — `chroma444`: try HEVC Rext 4:4:4 first (kills ClearType chroma
+    /// fringing — the RDP-AVC444 rationale). **nvenc-only**: NVENC supports
+    /// HEVC 4:4:4 since Maxwell-gen2, QSV Rext ENCODE is unreliable and AMF
+    /// has none, so the 4:4:4 attempt never cascades past hevc_nvenc. On
+    /// rejection (driver / GPU-generation surprise) falls back to the full
+    /// 4:2:0 cascade — the caller reads [`Self::chroma444`] for the truth.
     pub fn new_hevc_adaptive(
         width: u32,
         height: u32,
         fps: u32,
         maxrate_bps: usize,
         cq_bias: u32,
+        chroma444: bool,
     ) -> Result<Self> {
+        if chroma444 {
+            match Self::new_with_dispatch(
+                &["hevc_nvenc"],
+                width,
+                height,
+                fps.max(1) as i32,
+                maxrate_bps,
+                cq_bias,
+                true,
+            ) {
+                Ok(enc) => return Ok(enc),
+                Err(e) => tracing::warn!(
+                    %e,
+                    "HEVC 4:4:4 (Rext) open failed — falling back to 4:2:0 Main"
+                ),
+            }
+        }
         Self::new_with_dispatch(
             HEVC_ENCODER_NAMES,
             width,
@@ -492,6 +536,7 @@ impl FfmpegEncoder {
             fps.max(1) as i32,
             maxrate_bps,
             cq_bias,
+            false,
         )
     }
 
@@ -511,6 +556,7 @@ impl FfmpegEncoder {
             fps.max(1) as i32,
             maxrate_bps,
             cq_bias,
+            false,
         )
     }
 
@@ -531,6 +577,7 @@ impl FfmpegEncoder {
             DEFAULT_ENCODER_FPS,
             maxrate,
             0,
+            false,
         )
     }
 
@@ -551,6 +598,7 @@ impl FfmpegEncoder {
             fps.max(1) as i32,
             maxrate_bps,
             cq_bias,
+            false,
         )
     }
 
@@ -571,6 +619,7 @@ impl FfmpegEncoder {
             DEFAULT_ENCODER_FPS,
             maxrate,
             0,
+            false,
         )
     }
 
@@ -597,6 +646,7 @@ impl FfmpegEncoder {
             fps.max(1) as i32,
             maxrate_bps,
             cq_bias,
+            false,
         )
     }
 
@@ -607,6 +657,7 @@ impl FfmpegEncoder {
         fps: i32,
         maxrate_bps: usize,
         cq_bias: u32,
+        chroma444: bool,
     ) -> Result<Self> {
         // `ffmpeg_next::init()` is idempotent + cheap to call; safe to
         // run on each new encoder. Sets up codec registration.
@@ -629,7 +680,7 @@ impl FfmpegEncoder {
 
         let mut last_err: Option<anyhow::Error> = None;
         for name in names {
-            match Self::build_encoder(name, width, height, fps, maxrate_bps, cq) {
+            match Self::build_encoder(name, width, height, fps, maxrate_bps, cq, chroma444) {
                 Ok(encoder) => {
                     tracing::info!(
                         encoder = name,
@@ -639,6 +690,7 @@ impl FfmpegEncoder {
                         cq,
                         cq_bias,
                         maxrate_bps,
+                        chroma444,
                         "ffmpeg encoder opened (constant-quality + maxrate cap)"
                     );
                     let plane_pixels = (width as usize) * (height as usize);
@@ -649,9 +701,19 @@ impl FfmpegEncoder {
                         encoder,
                         frame_count: 0,
                         force_keyframe: false,
-                        nv12_y: vec![0u8; plane_pixels],
-                        // UV is half-width × half-height × 2 channels = pixels / 2
-                        nv12_uv: vec![0u8; plane_pixels / 2],
+                        plane_y: vec![0u8; plane_pixels],
+                        // NV12: UV is half-width × half-height × 2 channels
+                        // = pixels / 2. I444: full-resolution U plane.
+                        plane_u: vec![
+                            0u8;
+                            if chroma444 {
+                                plane_pixels
+                            } else {
+                                plane_pixels / 2
+                            }
+                        ],
+                        plane_v: vec![0u8; if chroma444 { plane_pixels } else { 0 }],
+                        chroma444,
                         fps,
                         cq,
                         maxrate_bps,
@@ -682,6 +744,7 @@ impl FfmpegEncoder {
         fps: i32,
         maxrate_bps: usize,
         cq: u32,
+        chroma444: bool,
     ) -> Result<codec::encoder::Video> {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
@@ -700,7 +763,13 @@ impl FfmpegEncoder {
             let mut enc = ctx.encoder().video().context("encoder().video() failed")?;
             enc.set_width(width);
             enc.set_height(height);
-            enc.set_format(format::Pixel::NV12);
+            // P7 — HEVC Rext 4:4:4 takes planar yuv444p; everything else
+            // stays on the HW-native NV12 4:2:0.
+            enc.set_format(if chroma444 {
+                format::Pixel::YUV444P
+            } else {
+                format::Pixel::NV12
+            });
             // For NVENC constant-quality VBR we set bit_rate=0 so `cq`
             // drives quality and `maxrate` is the only ceiling (idle ≈ 0).
             // QSV/AMF keep `maxrate` as the VBR anchor since their
@@ -727,7 +796,7 @@ impl FfmpegEncoder {
             Ok(enc)
         };
 
-        let (base, lowlat, opt_summary) = encoder_options(name, maxrate_bps, cq);
+        let (base, lowlat, opt_summary) = encoder_options(name, maxrate_bps, cq, chroma444);
 
         // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
         // driver rejects any single private option, the WHOLE dict is
@@ -794,7 +863,7 @@ impl FfmpegEncoder {
         }
     }
 
-    fn convert_bgra_to_nv12(&mut self, frame: &Frame) -> Result<()> {
+    fn convert_bgra(&mut self, frame: &Frame) -> Result<()> {
         if frame.pixel_format != PixelFormat::Bgra {
             // Capture layer already produced NV12 — copy planes directly.
             // WGC + DXGI on Windows can emit NV12 in some configurations.
@@ -806,24 +875,59 @@ impl FfmpegEncoder {
             ));
         }
 
-        let plane_pixels = (self.width as usize) * (self.height as usize);
-        if self.nv12_y.len() != plane_pixels {
-            self.nv12_y.resize(plane_pixels, 0);
-            self.nv12_uv.resize(plane_pixels / 2, 0);
-        }
-
-        // BGRA→NV12 via dcv_color_primitives. The crate is already a dep
-        // for the libvpx VP9 4:4:4 path (BGRA→I444). NV12 conversion uses
-        // the same SIMD primitives.
+        // BGRA→NV12 / BGRA→I444 via dcv_color_primitives. The crate is
+        // already a dep for the libvpx VP9 4:4:4 path; both conversions use
+        // the same SIMD primitives (and the same BT.601 matrix, so the P7
+        // Rext path renders identically to the libvpx 4:4:4 path).
         use dcv_color_primitives::{
             ColorSpace, ImageFormat, PixelFormat as DcvPixelFormat, convert_image,
         };
 
+        let plane_pixels = (self.width as usize) * (self.height as usize);
         let src_format = ImageFormat {
             pixel_format: DcvPixelFormat::Bgra,
             color_space: ColorSpace::Rgb,
             num_planes: 1,
         };
+
+        if self.chroma444 {
+            if self.plane_y.len() != plane_pixels {
+                self.plane_y.resize(plane_pixels, 0);
+                self.plane_u.resize(plane_pixels, 0);
+                self.plane_v.resize(plane_pixels, 0);
+            }
+            let dst_format = ImageFormat {
+                pixel_format: DcvPixelFormat::I444,
+                color_space: ColorSpace::Bt601,
+                num_planes: 3,
+            };
+            let mut dst_planes: [&mut [u8]; 3] = {
+                let (y, rest) = (
+                    &mut self.plane_y[..],
+                    (&mut self.plane_u[..], &mut self.plane_v[..]),
+                );
+                [y, rest.0, rest.1]
+            };
+            let w = self.width as usize;
+            let dst_strides = [w, w, w];
+            convert_image(
+                self.width,
+                self.height,
+                &src_format,
+                Some(&[frame.stride as usize]),
+                &[&frame.data],
+                &dst_format,
+                Some(&dst_strides),
+                &mut dst_planes,
+            )
+            .map_err(|e| anyhow!("dcv BGRA→I444 convert failed: {:?}", e))?;
+            return Ok(());
+        }
+
+        if self.plane_y.len() != plane_pixels {
+            self.plane_y.resize(plane_pixels, 0);
+            self.plane_u.resize(plane_pixels / 2, 0);
+        }
         let dst_format = ImageFormat {
             pixel_format: DcvPixelFormat::Nv12,
             color_space: ColorSpace::Bt601,
@@ -833,7 +937,7 @@ impl FfmpegEncoder {
         // Two-plane NV12: Y is width × height; UV is interleaved
         // width × (height / 2) bytes (== plane_pixels / 2 in interleaved form).
         let mut dst_planes: [&mut [u8]; 2] = {
-            let (y, uv) = (&mut self.nv12_y[..], &mut self.nv12_uv[..]);
+            let (y, uv) = (&mut self.plane_y[..], &mut self.plane_u[..]);
             [y, uv]
         };
         let dst_strides = [self.width as usize, self.width as usize];
@@ -854,7 +958,12 @@ impl FfmpegEncoder {
     }
 
     fn build_av_frame(&self, monotonic_us: u64) -> Result<frame::Video> {
-        let mut av = frame::Video::new(format::Pixel::NV12, self.width, self.height);
+        let format = if self.chroma444 {
+            format::Pixel::YUV444P
+        } else {
+            format::Pixel::NV12
+        };
+        let mut av = frame::Video::new(format, self.width, self.height);
 
         let pts = (monotonic_us / 1000) as i64;
         av.set_pts(Some(pts));
@@ -865,7 +974,7 @@ impl FfmpegEncoder {
             // set_kind(I) is the supported way to force IDR.
         }
 
-        // Copy our converted NV12 planes into the AVFrame's plane buffers.
+        // Copy our converted planes into the AVFrame's plane buffers.
         // FFmpeg's allocator gives us width/height-aligned buffers; we
         // copy row-by-row to handle stride differences.
         //
@@ -873,22 +982,30 @@ impl FfmpegEncoder {
         // borrow from data_mut(). `av.stride(N)` takes &self while
         // `av.data_mut(N)` takes &mut self — calling them on the same
         // expression triggers E0502.
-        let y_src_width = self.width as usize;
-        let y_rows = self.height as usize;
-        let uv_src_width = self.width as usize;
-        let uv_rows = (self.height / 2) as usize;
+        let w = self.width as usize;
+        let rows = self.height as usize;
         let y_stride = av.stride(0);
-        let uv_stride = av.stride(1);
-        copy_plane_into_av(av.data_mut(0), y_stride, &self.nv12_y, y_src_width, y_rows);
-        copy_plane_into_av(
-            av.data_mut(1),
-            uv_stride,
-            &self.nv12_uv,
-            uv_src_width,
-            uv_rows,
-        );
+        copy_plane_into_av(av.data_mut(0), y_stride, &self.plane_y, w, rows);
+        if self.chroma444 {
+            // P7 — planar I444: three full-resolution planes.
+            let u_stride = av.stride(1);
+            copy_plane_into_av(av.data_mut(1), u_stride, &self.plane_u, w, rows);
+            let v_stride = av.stride(2);
+            copy_plane_into_av(av.data_mut(2), v_stride, &self.plane_v, w, rows);
+        } else {
+            // NV12: interleaved UV at half height.
+            let uv_stride = av.stride(1);
+            copy_plane_into_av(av.data_mut(1), uv_stride, &self.plane_u, w, rows / 2);
+        }
 
         Ok(av)
+    }
+
+    /// P7 — whether this encoder runs HEVC Rext 4:4:4. The pump reads it
+    /// after every (re)build for `rc:video-info` truth (the 4:4:4 request
+    /// may have fallen back to 4:2:0 at open time).
+    pub fn chroma444(&self) -> bool {
+        self.chroma444
     }
 
     fn drain_packets(&mut self) -> Result<Vec<EncodedPacket>> {
@@ -931,7 +1048,7 @@ impl VideoEncoder for FfmpegEncoder {
             ));
         }
 
-        self.convert_bgra_to_nv12(&frame)?;
+        self.convert_bgra(&frame)?;
         let av = self.build_av_frame(frame.monotonic_us)?;
         self.encoder
             .send_frame(&av)
@@ -1003,6 +1120,7 @@ impl VideoEncoder for FfmpegEncoder {
                 self.fps,
                 target,
                 self.cq,
+                self.chroma444,
             ) {
                 Ok(enc) => {
                     self.encoder = enc;
@@ -1086,6 +1204,7 @@ mod tests {
             30,
             3_000_000,
             0,
+            false,
         );
         assert!(res.is_err(), "expected Err for unknown encoder names");
         let msg = res.unwrap_err().to_string();
@@ -1108,6 +1227,23 @@ mod tests {
         assert_eq!(HEVC_ENCODER_NAMES, &["hevc_nvenc", "hevc_qsv", "hevc_amf"]);
     }
 
+    /// P7 — the Rext profile key must appear exactly when 4:4:4 is
+    /// requested (and never leak into 4:2:0 sessions, where an unexpected
+    /// profile override could change Main-profile behaviour).
+    #[test]
+    fn hevc_rext_profile_only_with_chroma444() {
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true);
+        assert!(
+            summary.contains("profile=rext"),
+            "chroma444 must set profile=rext, got: {summary}"
+        );
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
+        assert!(
+            !summary.contains("profile"),
+            "4:2:0 must not set a profile, got: {summary}"
+        );
+    }
+
     // P7 (2026-08-20) — serialise the spatial-AQ env test against any future
     // sibling that touches the same var (the encode/mod.rs RELAY_ENV_LOCK
     // lesson: cargo's parallel runner interleaves env writers).
@@ -1126,7 +1262,7 @@ mod tests {
         let prior = std::env::var("ROOMLER_AGENT_NVENC_SPATIAL_AQ").ok();
 
         unsafe { std::env::remove_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
         assert!(
             !summary.contains("spatial-aq"),
             "spatial-aq must be omitted by default, got: {summary}"
@@ -1136,7 +1272,7 @@ mod tests {
         assert!(summary.contains("rc=vbr"), "got: {summary}");
 
         unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "1") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
         assert!(
             summary.contains("spatial-aq=1"),
             "env=1 must restore spatial-aq, got: {summary}"
@@ -1144,7 +1280,7 @@ mod tests {
 
         // Any non-"1" value keeps it off (explicit-opt-in semantics).
         unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "0") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, false);
         assert!(!summary.contains("spatial-aq"), "got: {summary}");
 
         match prior {
