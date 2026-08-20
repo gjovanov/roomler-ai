@@ -63,7 +63,10 @@ use axum::{
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
-    models::{Agent, ConsentMode, SshAccountMode, SshDenyReason, SshMode, SshPolicy, ssh_limits},
+    models::{
+        Agent, ConsentMode, SshAccountMode, SshDenyReason, SshGates, SshGrantSpec, SshMode,
+        SshPolicy, ssh_limits,
+    },
     signaling::ServerMsg,
 };
 use serde::{Deserialize, Serialize};
@@ -162,12 +165,32 @@ pub struct Caller {
 ///
 /// Split out from [`dispatch`] so the whole decision is testable on its own
 /// and so no path can skip a gate by taking a different route into the mint.
+///
+/// Takes the TARGET's [`SshGates`] — the authorize-time half of its policy,
+/// produced by [`SshPolicy::split`] — rather than the policy itself, so this
+/// function cannot quietly ignore a policy field: the split routes every
+/// field, and the exhaustive destructure below has to bind every gate.
 pub async fn authorize(
     state: &AppState,
     tenant_id: ObjectId,
-    agent: &Agent,
+    gates: &SshGates,
     caller: &Caller,
 ) -> Result<(), SshDenyReason> {
+    // EXHAUSTIVE — a gate added to `SshGates` must be bound (and, under
+    // `-D warnings`, used) here before this compiles again.
+    let SshGates {
+        mode,
+        can_originate,
+        allowed_user_ids,
+        allowed_role_ids,
+    } = gates;
+    // Two fields are consulted elsewhere, in writing: the TARGET's
+    // `can_originate` is not an inbound gate (it is read off the ORIGIN
+    // device's row below), and the user allowlist is consulted through
+    // `allows_caller`. Consumed here so the destructure stays exhaustive and
+    // a NEW gate cannot borrow this line as precedent for being skipped.
+    let _ = (can_originate, allowed_user_ids);
+
     // Gate 1 — the org kill-switch. First because it is the cheapest check and
     // the most likely reason a whole fleet says no.
     let tenant = match state.tenants.base.find_by_id(tenant_id).await {
@@ -189,14 +212,13 @@ pub async fn authorize(
     }
 
     // Gate 3 — the target device's own policy.
-    let policy = &agent.ssh_policy;
-    if policy.mode != SshMode::On {
+    if *mode != SshMode::On {
         return Err(SshDenyReason::DeviceDisabled);
     }
     // Role ids are only fetched when the policy actually restricts by role —
     // an extra query on every SSH request would be paid by the common case to
     // serve the rare one.
-    let role_ids = if policy.allowed_role_ids.is_empty() {
+    let role_ids = if allowed_role_ids.is_empty() {
         Vec::new()
     } else {
         state
@@ -205,7 +227,7 @@ pub async fn authorize(
             .await
             .unwrap_or_default()
     };
-    if !policy.allows_caller(&caller.user_id, &role_ids) {
+    if !gates.allows_caller(&caller.user_id, &role_ids) {
         return Err(SshDenyReason::CallerNotAllowed);
     }
 
@@ -244,7 +266,12 @@ pub async fn dispatch(
         return deny(state, agent_id, caller, SshDenyReason::BadPublicKey).await;
     }
 
-    if let Err(reason) = authorize(state, tenant_id, agent, caller).await {
+    // The ONE place the target's policy is consumed: `split` routes every
+    // field into either the authorize gates or the grant spec, so a new
+    // policy field cannot be silently ignored by either half.
+    let (gates, spec) = agent.ssh_policy.clone().split();
+
+    if let Err(reason) = authorize(state, tenant_id, &gates, caller).await {
         return deny(state, agent_id, caller, reason).await;
     }
 
@@ -262,17 +289,24 @@ pub async fn dispatch(
     let grant_id = ObjectId::new().to_hex();
     let session_secs = ssh_limits::clamp_session_secs(session_secs);
     let expires_at_ms = now_ms() + ssh_limits::GRANT_TTL_SECS * 1000;
-    let policy = &agent.ssh_policy;
 
+    // EXHAUSTIVE — the spec's fields map 1:1 onto the wire, and binding them
+    // all here is what keeps a field routed into the spec from being dropped
+    // on its way into the grant.
+    let SshGrantSpec {
+        account_mode,
+        account,
+        consent_mode,
+    } = spec;
     let msg = ServerMsg::SshGrant {
         grant_id: grant_id.clone(),
         public_key: public_key.to_string(),
         caller: caller.display.clone(),
-        account_mode: account_mode_wire(policy.account_mode).to_string(),
-        account: policy.account.clone(),
+        account_mode: account_mode_wire(account_mode).to_string(),
+        account,
         expires_at_ms,
         session_secs,
-        consent_mode: Some(policy.effective_consent_mode()),
+        consent_mode: Some(effective_wire_consent(consent_mode)),
     };
 
     if let Err(e) = state.rc_hub.push_ssh_grant(agent_id, tenant_id, msg) {
@@ -290,7 +324,7 @@ pub async fn dispatch(
 
     info!(
         agent = %agent_id, caller = %caller.display, %grant_id,
-        account_mode = ?policy.account_mode, session_secs,
+        account_mode = ?account_mode, session_secs,
         "ssh: grant issued"
     );
 
@@ -345,6 +379,19 @@ fn is_supported_public_key(line: &str) -> bool {
         return false;
     };
     algo == "ssh-ed25519" && blob.len() >= 32 && blob.chars().all(|c| c.is_ascii_graphic())
+}
+
+/// What the grant tells the device about consent. Only an explicit `Auto`
+/// crosses as `Auto`; everything else — the session-shaped Email/Push and an
+/// UNSET policy alike — collapses to `Prompt`, the attended default (the same
+/// collapse `ExecPolicy::effective_consent_mode` applies). The device treats
+/// the wire value as authoritative, so an accidental `Auto` here would skip a
+/// human the admin believed was in the loop.
+fn effective_wire_consent(mode: Option<ConsentMode>) -> ConsentMode {
+    match mode {
+        Some(ConsentMode::Auto) => ConsentMode::Auto,
+        _ => ConsentMode::Prompt,
+    }
 }
 
 /// Wire spelling of an account mode — snake_case, matching the enum's serde.
@@ -622,6 +669,26 @@ mod tests {
         for m in [None, Some(ConsentMode::Auto)] {
             assert!(!consent_mode_would_be_ignored(&older, m));
             assert!(!consent_mode_would_be_ignored(&caps(&[]), m));
+        }
+    }
+
+    /// The wire may carry `Auto` only when the policy said `Auto` in so many
+    /// words. Everything else — including a policy that said nothing — must
+    /// cross as `Prompt`.
+    #[test]
+    fn only_an_explicit_auto_crosses_the_wire_as_auto() {
+        assert_eq!(
+            effective_wire_consent(Some(ConsentMode::Auto)),
+            ConsentMode::Auto
+        );
+        for m in [
+            None,
+            Some(ConsentMode::Prompt),
+            Some(ConsentMode::Email),
+            Some(ConsentMode::Push),
+            Some(ConsentMode::PromptThenEmail),
+        ] {
+            assert_eq!(effective_wire_consent(m), ConsentMode::Prompt, "{m:?}");
         }
     }
 
