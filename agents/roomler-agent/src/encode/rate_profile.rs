@@ -38,6 +38,11 @@
 //! 5. **Scale-aware CQ bias** ([`scale_cq_bias`], P7): deep resolution
 //!    rungs run far below the [3, 12] Mbps maxrate floor's bpp budget —
 //!    spend the headroom on text sharpness instead of leaving it unused.
+//!
+//! 6. **Idle native-rung refinement** ([`IdleRefine`], P7): when the ONLY
+//!    reason the encode is below native is a resolution cap and the scene
+//!    has settled, lift the cap so the encoder rebuilds at native and ships
+//!    one crisp still; the first motion burst restores the cap in ~300 ms.
 
 use std::time::{Duration, Instant};
 
@@ -256,6 +261,176 @@ impl SettleKeyframeGate {
     }
 }
 
+/// P7 (2026-08-20) — idle native-rung refinement ("crisp at rest").
+///
+/// The Smoother/relay resolution caps trade pixels for motion smoothness —
+/// but when the user STOPS to READ, the stream stays at the low rung and
+/// 9-10 pt text remains mush (the display_match.rs thesis: the only truly
+/// crisp chain is 1:1 end-to-end). A settled desktop costs the link nothing
+/// (the 60 ms keepalive re-encodes near-zero-byte deltas at ANY rung), so:
+/// once the scene settles, lift the cap → the dims-keyed encoder rebuild
+/// ships one crisp native IDR (~150-400 KB ⇒ 0.4-1.1 s progressive
+/// crystallize over a 3 Mbps relay; HRD bufsize 750 KB fits it); the first
+/// motion burst restores the cap within ~300 ms, before the relay melts.
+///
+/// Pure state machine, frame-cadence signals only — dirty-rect damage was
+/// rejected because only the WGC backend populates rects (scrap/DXGI emit
+/// none), so damage-based motion detection would silently misbehave on the
+/// main field path. `Instant`s are passed in (the FlipTracker pattern) so
+/// every behaviour below is unit-tested.
+///
+/// Window length for the frames-per-window rate rules. Doubles as the
+/// emergent settle threshold: after motion stops, the window drains in
+/// exactly this long, so the up-flip fires ~1 s after the last burst.
+pub const REFINE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Real frames per window still considered "quiet" for the UP-flip. A caret
+/// blink (~1.9 Hz → ≤2 frames/s) must refine; typing at ≥3 cps must not
+/// (each up-flip is an encoder rebuild + native IDR — not free mid-typing).
+pub const REFINE_SPARSE_MAX: u32 = 2;
+
+/// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
+/// a scroll/drag; typing produces 100-200 ms gaps and never chains).
+pub const REFINE_MOTION_GAP: Duration = Duration::from_millis(80);
+
+/// Chained-run length that DOWN-flips a refined session: 8 frames at
+/// ≥12.5 fps ≈ 270 ms of sustained motion — fast enough that a scroll
+/// doesn't melt a 3 Mbps relay with native-sized deltas.
+pub const REFINE_DOWN_RUN: u32 = 8;
+
+/// Frames-per-window rate that DOWN-flips regardless of chaining — catches
+/// 80-250 ms-gap motion (10-12 fps window animations) within ≤1 s. Note the
+/// asymmetry with `REFINE_SPARSE_MAX`: sustained 3-9 fps damage (typing,
+/// slow spinners) neither re-refines NOR down-flips — once crisp, typing
+/// stays crisp; the relay carries <10 fps of native deltas fine.
+pub const REFINE_RATE_DOWN: u32 = 10;
+
+/// Minimum spacing from ANY flip to the next UP-flip. Bounds the worst-case
+/// churn (type-pause-type) to one rebuild pair per 10 s.
+pub const REFINE_UP_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// What the pump should do about the resolution cap this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefineFlip {
+    /// Scene settled — lift the cap (encoder rebuilds at native, crisp IDR).
+    Up,
+    /// Motion burst — restore the cap (encoder rebuilds at the low rung).
+    Down,
+}
+
+/// See the module notes above. Owned by the ffmpeg DC pump; `note_real_frame`
+/// is called for every damage-carrying capture, `on_keepalive` on every idle
+/// keepalive tick (≥60 ms after the last real frame by construction).
+#[derive(Debug)]
+pub struct IdleRefine {
+    enabled: bool,
+    refined: bool,
+    /// Length of the current ≤`REFINE_MOTION_GAP`-chained run.
+    run: u32,
+    last_real: Option<Instant>,
+    /// Real-frame arrivals within the trailing `REFINE_WINDOW`.
+    window: std::collections::VecDeque<Instant>,
+    last_flip: Option<Instant>,
+}
+
+impl IdleRefine {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            refined: false,
+            run: 0,
+            last_real: None,
+            window: std::collections::VecDeque::new(),
+            last_flip: None,
+        }
+    }
+
+    /// Kill switch `ROOMLER_AGENT_IDLE_REFINE=0` (or `false`).
+    pub fn from_env() -> Self {
+        let enabled = !matches!(
+            tunnel_core::env::node_env("IDLE_REFINE")
+                .as_deref()
+                .map(str::trim),
+            Some("0") | Some("false")
+        );
+        Self::new(enabled)
+    }
+
+    /// Whether the pump should currently run WITHOUT the resolution cap.
+    pub fn refined(&self) -> bool {
+        self.refined
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&t) = self.window.front() {
+            if now.duration_since(t) > REFINE_WINDOW {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// A real (damage-carrying) frame arrived. Returns `Some(Down)` exactly
+    /// when a refined session must drop back to the capped rung.
+    pub fn note_real_frame(&mut self, now: Instant) -> Option<RefineFlip> {
+        if !self.enabled {
+            return None;
+        }
+        self.run = match self.last_real {
+            Some(t) if now.duration_since(t) <= REFINE_MOTION_GAP => self.run.saturating_add(1),
+            _ => 1,
+        };
+        self.last_real = Some(now);
+        self.prune(now);
+        // Bounded: pruning keeps this at ~fps entries; the hard cap only
+        // matters if a backend ever bursts far above real time.
+        if self.window.len() >= 240 {
+            self.window.pop_front();
+        }
+        self.window.push_back(now);
+        if self.refined
+            && (self.run >= REFINE_DOWN_RUN || self.window.len() as u32 >= REFINE_RATE_DOWN)
+        {
+            self.refined = false;
+            self.last_flip = Some(now);
+            return Some(RefineFlip::Down);
+        }
+        None
+    }
+
+    /// An idle-keepalive tick. `eligible` = a cap below native is currently
+    /// in force AND the scope rules allow refinement (see
+    /// `encode::idle_refine_applies`; the pump also requires the controller
+    /// to have left resolution at Native — an explicit pick is the user's).
+    /// Returns `Some(Up)` when the cap should lift; `eligible=false` clears
+    /// `refined` silently (the cap situation changed externally — e.g. the
+    /// dial moved to Sharper — so there is nothing to restore).
+    pub fn on_keepalive(&mut self, eligible: bool, now: Instant) -> Option<RefineFlip> {
+        if !self.enabled {
+            return None;
+        }
+        self.prune(now);
+        if !eligible {
+            self.refined = false;
+            return None;
+        }
+        if self.refined {
+            return None;
+        }
+        if self.window.len() as u32 <= REFINE_SPARSE_MAX
+            && self
+                .last_flip
+                .is_none_or(|t| now.duration_since(t) >= REFINE_UP_COOLDOWN)
+        {
+            self.refined = true;
+            self.last_flip = Some(now);
+            return Some(RefineFlip::Up);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +625,221 @@ mod tests {
             assert_eq!(g.should_fire_on_settle(now), None); // same episode
             now += Duration::from_millis(530);
         }
+    }
+
+    // ── P7 — IdleRefine ────────────────────────────────────────────────
+
+    /// Drive `n` real frames at a fixed `gap`, asserting no Down fires.
+    fn feed_quiet(r: &mut IdleRefine, mut now: Instant, n: u32, gap: Duration) -> Instant {
+        for _ in 0..n {
+            assert_eq!(r.note_real_frame(now), None);
+            now += gap;
+        }
+        now
+    }
+
+    /// Keepalives every 60 ms until the first Up (or `limit` elapses);
+    /// returns (time of the Up, elapsed since start).
+    fn tick_until_up(
+        r: &mut IdleRefine,
+        mut now: Instant,
+        limit: Duration,
+    ) -> Option<(Instant, Duration)> {
+        let start = now;
+        while now.duration_since(start) <= limit {
+            if r.on_keepalive(true, now) == Some(RefineFlip::Up) {
+                return Some((now, now.duration_since(start)));
+            }
+            now += Duration::from_millis(60);
+        }
+        None
+    }
+
+    #[test]
+    fn refine_fires_about_1s_after_a_scroll_settles() {
+        let mut r = IdleRefine::new(true);
+        // 1 s scroll at 30 fps.
+        let now = feed_quiet(&mut r, t0(), 30, Duration::from_millis(33));
+        // Keepalives start 60 ms after the last real frame; the window must
+        // drain (~1 s) before the up-flip fires.
+        let (_, elapsed) = tick_until_up(&mut r, now, Duration::from_secs(3)).expect("must refine");
+        assert!(
+            elapsed >= Duration::from_millis(700) && elapsed <= Duration::from_millis(1300),
+            "settle-to-refine took {elapsed:?} (want ≈1 s)"
+        );
+        assert!(r.refined());
+    }
+
+    #[test]
+    fn caret_blink_neither_blocks_refine_nor_downflips() {
+        let mut r = IdleRefine::new(true);
+        let mut now = t0();
+        // Refine first (quiet from the start).
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // 20 s of caret blinks (~1.9 Hz): single frames, 530 ms apart, with
+        // keepalives in between — must stay refined throughout.
+        for _ in 0..38 {
+            assert_eq!(
+                r.note_real_frame(now),
+                None,
+                "caret blink must not down-flip"
+            );
+            for k in 1..=8 {
+                assert_eq!(
+                    r.on_keepalive(true, now + Duration::from_millis(60 * k)),
+                    None
+                );
+            }
+            now += Duration::from_millis(530);
+        }
+        assert!(r.refined());
+    }
+
+    #[test]
+    fn typing_trickle_blocks_upflip() {
+        let mut r = IdleRefine::new(true);
+        // Typing at ~6 cps: 160 ms gaps → >2 frames in every 1 s window.
+        // Warm the window first (a cold ≤2-entry window refining is the
+        // fresh-session behaviour, locked by first_upflip_needs_no_prior_flip).
+        let mut now = t0();
+        let _ = r.note_real_frame(now);
+        now += Duration::from_millis(160);
+        let _ = r.note_real_frame(now);
+        for _ in 0..30 {
+            now += Duration::from_millis(160);
+            let _ = r.note_real_frame(now);
+            // The keepalive between keystrokes must NOT refine (window > 2).
+            assert_eq!(r.on_keepalive(true, now + Duration::from_millis(60)), None);
+        }
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn scroll_burst_downflips_within_300ms() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // 30 fps drag: the chained-run rule must fire by frame 8 (~270 ms).
+        let mut t = now + Duration::from_secs(2);
+        let mut fired_at = None;
+        for i in 0..30 {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t) {
+                fired_at = Some(i);
+                break;
+            }
+            t += Duration::from_millis(33);
+        }
+        let frames = fired_at.expect("sustained scroll must down-flip");
+        assert!(
+            frames < 10,
+            "down-flip took {frames} frames (want <10 ≈ 300 ms)"
+        );
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn slow_motion_downflips_via_window_rate() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // ~10.5 fps damage (95 ms gaps > the 80 ms chain gap): the run rule
+        // never fires, the frames-per-window rate rule must within ≤1 s.
+        let mut t = now + Duration::from_secs(2);
+        let start = t;
+        let mut fired = None;
+        for _ in 0..40 {
+            if let Some(RefineFlip::Down) = r.note_real_frame(t) {
+                fired = Some(t.duration_since(start));
+                break;
+            }
+            t += Duration::from_millis(95);
+        }
+        let took = fired.expect("10 fps sustained motion must down-flip");
+        assert!(
+            took <= Duration::from_millis(1100),
+            "took {took:?} (want ≤ ~1 s)"
+        );
+    }
+
+    #[test]
+    fn window_animation_never_rerefines() {
+        let mut r = IdleRefine::new(true);
+        // A steady 5 fps spinner (200 ms gaps): >2 frames per window forever
+        // → the up-flip must never fire, no matter how long it runs. Warm
+        // the window past the sparse gate first (see typing test).
+        let mut now = t0();
+        for _ in 0..3 {
+            let _ = r.note_real_frame(now);
+            now += Duration::from_millis(200);
+        }
+        for _ in 0..100 {
+            let _ = r.note_real_frame(now);
+            assert_eq!(r.on_keepalive(true, now + Duration::from_millis(100)), None);
+            now += Duration::from_millis(200);
+        }
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn up_cooldown_bounds_flip_pairs() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        // Burst → down.
+        let mut t = now + Duration::from_secs(1);
+        let mut downed = false;
+        for _ in 0..12 {
+            if r.note_real_frame(t) == Some(RefineFlip::Down) {
+                downed = true;
+                break;
+            }
+            t += Duration::from_millis(33);
+        }
+        assert!(downed);
+        // Quiet again immediately: the window drains in 1 s but the 10 s
+        // up-cooldown must hold the next Up until ≥10 s after the Down.
+        let up = tick_until_up(
+            &mut r,
+            t + Duration::from_millis(60),
+            Duration::from_secs(15),
+        )
+        .expect("must eventually re-refine");
+        assert!(
+            up.0.duration_since(t) >= REFINE_UP_COOLDOWN,
+            "re-refined {:?} after the down-flip (cooldown {:?})",
+            up.0.duration_since(t),
+            REFINE_UP_COOLDOWN
+        );
+    }
+
+    #[test]
+    fn eligible_false_clears_refined_silently() {
+        let mut r = IdleRefine::new(true);
+        let now = t0();
+        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert!(r.refined());
+        // Dial moved to Sharper (no cap to lift): silent clear, no Down.
+        assert_eq!(r.on_keepalive(false, now + Duration::from_millis(60)), None);
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn disabled_never_flips() {
+        let mut r = IdleRefine::new(false);
+        let mut now = t0();
+        for _ in 0..50 {
+            assert_eq!(r.on_keepalive(true, now), None);
+            assert_eq!(r.note_real_frame(now), None);
+            now += Duration::from_millis(60);
+        }
+        assert!(!r.refined());
+    }
+
+    #[test]
+    fn first_upflip_needs_no_prior_flip() {
+        // A session that starts quiet refines on the very first keepalive —
+        // the cooldown only spaces SUBSEQUENT flips.
+        let mut r = IdleRefine::new(true);
+        assert_eq!(r.on_keepalive(true, t0()), Some(RefineFlip::Up));
     }
 }
