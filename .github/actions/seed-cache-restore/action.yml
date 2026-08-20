@@ -29,3 +29,25 @@ runs:
         key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-
+
+    - name: Accretion GC (rehearsals only)
+      shell: bash
+      run: |
+        # 2026-08-20: each rehearsal restores the previous generation,
+        # builds the delta, and saves EVERYTHING — without a stale-artifact
+        # sweep, artifacts of superseded dep versions accrete monotonically
+        # (generations grew ~500 MB → 1.4-2.6 GB in four days; five of
+        # them = 7.4 GB, re-evicting the CI lane's caches whenever a save
+        # crested the 10 GB pool). actions/cache preserves mtimes and a
+        # compile refreshes them, so files untouched for 4+ days are dead
+        # artifacts of superseded deps — or live-but-stable units, which is
+        # why this runs BEFORE the build and only on non-tag runs: the
+        # rehearsal rebuilds anything it deleted by mistake and saves a
+        # complete, lean generation. Tag runs never GC (they'd pay the
+        # rebuild on the release path for artifacts they don't re-save).
+        if [ "${GITHUB_REF_TYPE:-branch}" = "tag" ]; then
+          echo "tag run — skipping accretion GC"
+          exit 0
+        fi
+        find target ~/.cargo/registry/cache -type f -mtime +4 -delete 2>/dev/null || true
+        du -sh target 2>/dev/null || true
