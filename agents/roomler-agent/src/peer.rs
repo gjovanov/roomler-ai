@@ -4510,22 +4510,42 @@ async fn media_pump_ffmpeg_dc(
                     // as a crisp native IDR. The settle-KF above composes:
                     // it resyncs the CURRENT rung at settle+60 ms; the
                     // refined native IDR follows ~1 s later.
+                    //
+                    // P7b — every term is MERGE-AWARE (field 2026-08-20,
+                    // CORPLAP-2: owner=Sharper + follower=Smoother — the P5
+                    // floor-merge applied the follower's 1024 cap while
+                    // eligibility read only the owner's dial, so the shared
+                    // stream parked at the low rung with refine dead). The
+                    // clamp check uses the MERGED cap (what the frame path
+                    // actually applies), the Native check uses the MERGED
+                    // target (a FOLLOWER's explicit pick must also block),
+                    // and the scope check requires every CAP-CONTRIBUTING
+                    // dial to be refine-applicable. Single-viewer pipelines
+                    // reduce exactly to the pre-P7b expression.
                     {
                         let now = std::time::Instant::now();
                         let prio = priority.load(std::sync::atomic::Ordering::Relaxed);
                         let (nw, nh) = unpack_dims(
                             capture_native_dims.load(std::sync::atomic::Ordering::Relaxed),
                         );
-                        let cap_clamps = crate::encode::priority_relay_cap(prio, constrained)
+                        let cap_clamps = pipeline
+                            .merged_priority_cap(
+                                crate::encode::priority_relay_cap(prio, constrained),
+                                constrained,
+                            )
                             .is_some_and(|c| nw.max(nh) > c);
                         let user_native = matches!(
-                            resolve_user_box(*target_resolution.lock().unwrap(), nw, nh),
+                            resolve_user_box(
+                                pipeline.merged_target(*target_resolution.lock().unwrap()),
+                                nw,
+                                nh
+                            ),
                             TargetResolution::Native
                         );
                         let eligible = nw > 0
                             && cap_clamps
                             && user_native
-                            && crate::encode::idle_refine_applies(prio, constrained);
+                            && pipeline.merged_refine_eligible(prio, constrained);
                         if let Some(flip) = idle_refine.on_keepalive(eligible, now) {
                             info!(
                                 %session_id,
