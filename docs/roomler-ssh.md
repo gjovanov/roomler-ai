@@ -119,10 +119,14 @@ can be pinned out of band.
   implemented yet". Port forwarding (`-L`, `-R`) is rejected by russh's own
   defaults, promptly and cleanly.
 
-### Interactive sessions (P4a — Unix)
+### Interactive sessions (P4a Unix, P4b Windows)
 
-`ssh <node>` allocates a pty, runs a login shell on it, streams both ways, and
-reflows when the client window changes. `agents/roomler-agent/src/pty.rs`.
+`ssh <node>` allocates a terminal, runs a login shell on it, streams both ways,
+and reflows when the client window changes — on **both platforms**, through one
+surface: `agents/roomler-agent/src/pty/{mod,unix,windows}.rs`. `ssh.rs` has a
+single code path, which is deliberate: an interactive session is where a
+per-platform divergence would be least visible and most annoying, and two
+handlers would have grown two subtly different privilege and teardown stories.
 
 **A pty session deliberately does not go through the exec engine.** The engine
 buffers a command's whole output to enforce a ceiling and returns it at the
@@ -153,11 +157,46 @@ Mechanics worth knowing:
   arrives: that is when the identity is known and consent has settled, so a
   session about to be refused never gets a pty or a process.
 
-⚠️ **Windows is P4b.** ConPTY (`CreatePseudoConsole` +
-`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`) is a different
-mechanism; until it lands, a PTY request there is refused with that reason.
-This is the platform where roomler SSH matters most — clk cannot host `sshd` at
-all — so P4b is the next slice, not an afterthought.
+#### Windows: ConPTY (P4b)
+
+There is no pty pair to open. The console host owns the terminal:
+`CreatePseudoConsole` returns an `HPCON`, and a process is attached to it by
+passing that handle through a **process-thread attribute list**. Teardown is a
+**job object** (`KILL_ON_JOB_CLOSE`) rather than a process group — Windows has
+no `killpg`, and the job is what gives the same "nothing outlives the session"
+guarantee. The output stream ends at `ClosePseudoConsole`, which blocks until
+the host has flushed; a waiter closes it the moment the child exits, because
+otherwise a reader waits forever for an EOF that the console host will never
+send while the pseudoconsole lives.
+
+Three things cost real debugging time and are commented where they live:
+
+- ⚠️ **`STARTF_USESTDHANDLES` is required.** The pseudoconsole attribute gives
+  the child a CONSOLE; it does **not** redirect its std handles. Without this
+  the child inherits the *parent's* handle values, so the console attaches, the
+  window title is set, `> CON` renders and the exit status is right — while
+  everything the program writes to stdout goes somewhere the session never
+  sees. Diagnose it in one line, inside the session:
+  `echo a & echo b > CON` — if only the `CON` half comes back, it is this.
+- ⚠️ **Inheritance must be BOUNDED.** `STARTF_USESTDHANDLES` needs
+  `bInheritHandles=TRUE`, which alone hands the child *every* inheritable
+  handle in the process — in a daemon, that is other sessions' pipes, and
+  whoever inherits a write end keeps its owner's reader from ever seeing EOF.
+  A second `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` attribute names exactly the two
+  handles. Take both or neither.
+- ⚠️ **The HPCON is passed BY VALUE**, not as a pointer. Get it wrong and
+  `CreateProcess` *succeeds*, then the child dies instantly with `0xC0000142`
+  (`STATUS_DLL_INIT_FAILED`) because its console never initialised — visible
+  only as an empty session, so check the child's exit code before the pipes.
+
+**`console_user` works here too**, which is the point on a corp-managed
+laptop: the same attribute list goes onto `CreateProcessAsUserW` with the
+`WTSQueryUserToken` token and the user's own environment block, so the shell is
+the signed-in user's, not SYSTEM's. That needs the daemon to be SYSTEM (a
+perMachine service install); a perUser task gets `ERROR_PRIVILEGE_NOT_HELD` and
+is told so rather than quietly handed a SYSTEM shell. `named:<account>` stays
+refused on Windows for the same reason `exec` refuses it — becoming an
+arbitrary local user needs that user's credentials.
 
 ### Which account a session runs as (P5a)
 
