@@ -475,7 +475,12 @@ impl RunAs {
 /// Configure `cmd` to run as `who`, or explain why it cannot.
 ///
 /// Returns `Err` rather than silently doing something else — see [`RunAs`].
-fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Result<(), String> {
+///
+/// `pub(crate)` so the PTY path ([`crate::pty`]) applies the SAME rules rather
+/// than growing a second identity model for interactive sessions. Every
+/// refusal here — `console_user` off Windows, `named` on Windows — is a refusal
+/// there too, in the same words.
+pub(crate) fn apply_run_as(cmd: &mut tokio::process::Command, who: &RunAs) -> Result<(), String> {
     // Only the Unix drop path configures the command. On Windows every
     // non-daemon mode is currently a refusal, so nothing is set — which is the
     // point: refusing configures nothing and spawns nothing.

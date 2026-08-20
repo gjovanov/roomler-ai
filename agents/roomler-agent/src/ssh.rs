@@ -395,6 +395,18 @@ mod sshd {
         /// The redeemed grant, kept for the account mode it carries (P5 acts
         /// on it) and for the audit record.
         grant: Option<super::Grant>,
+        /// Terminal type and geometry from `pty_request`, held until the shell
+        /// starts. `Some` is also what distinguishes an interactive session
+        /// from a one-shot command.
+        #[cfg(unix)]
+        pty_req: Option<(String, crate::pty::WinSize)>,
+        /// Sink for client keystrokes, live only while a terminal is. Cleared
+        /// on EOF so the shell sees end-of-input.
+        #[cfg(unix)]
+        pty_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        /// Resize half of the live terminal.
+        #[cfg(unix)]
+        pty_handle: Option<crate::pty::PtyHandle>,
     }
 
     impl Handler {
@@ -405,7 +417,137 @@ mod sshd {
                 user: String::new(),
                 principal: None,
                 grant: None,
+                #[cfg(unix)]
+                pty_req: None,
+                #[cfg(unix)]
+                pty_input: None,
+                #[cfg(unix)]
+                pty_handle: None,
             }
+        }
+
+        /// Start an interactive session on the terminal `pty_request` asked
+        /// for.
+        ///
+        /// Runs the SAME two gates a one-shot command does, in the same order:
+        /// resolve the identity from the server (never from the client), then
+        /// settle operator consent. An interactive shell is strictly more than
+        /// a single command, so it cannot be held to a weaker standard.
+        #[cfg(unix)]
+        async fn start_pty_session(
+            &mut self,
+            channel: ChannelId,
+            command: Option<String>,
+            session: &mut Session,
+        ) -> Result<(), russh::Error> {
+            let Some((term, size)) = self.pty_req.clone() else {
+                return refuse(
+                    session,
+                    channel,
+                    self.peer,
+                    "shell",
+                    "no terminal was requested for this session",
+                );
+            };
+
+            let run_as = match &self.grant {
+                Some(g) => crate::exec::RunAs::from_wire(&g.account_mode, g.account.as_deref()),
+                None => self.ctx.key_list_run_as.clone(),
+            };
+            let run_as = match run_as {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(peer = %self.peer, %e, "ssh: refusing a shell — unusable account mode");
+                    let _ = session.extended_data(
+                        channel,
+                        1,
+                        format!("roomler-ssh: {e}\r\n").into_bytes(),
+                    );
+                    session.channel_failure(channel)?;
+                    return Ok(());
+                }
+            };
+
+            session.channel_success(channel)?;
+            let handle = session.handle();
+            let caller = self.caller_label();
+            let consent = self.grant.as_ref().and_then(consent_requirement);
+
+            if let Some(sentinel) = consent
+                && let Err(why) = await_consent(&handle, channel, &caller, &sentinel).await
+            {
+                let _ = handle
+                    .extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes())
+                    .await;
+                let _ = handle.exit_status_request(channel, 1).await;
+                let _ = handle.close(channel).await;
+                return Ok(());
+            }
+
+            let pty = match crate::pty::PtyProcess::spawn(command.as_deref(), &term, size, &run_as)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(peer = %self.peer, %e, "ssh: could not start the terminal session");
+                    let _ = handle
+                        .extended_data(channel, 1, format!("roomler-ssh: {e}\r\n").into_bytes())
+                        .await;
+                    let _ = handle.exit_status_request(channel, 1).await;
+                    let _ = handle.close(channel).await;
+                    return Ok(());
+                }
+            };
+
+            info!(
+                peer = %self.peer, %caller, run_as = %run_as.label(),
+                privileged = run_as.is_privileged(), %term,
+                "ssh: interactive session started"
+            );
+
+            // A bounded queue: an operator holding a key down must not be able
+            // to grow the daemon's memory faster than the shell drains it.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            self.pty_input = Some(tx);
+            self.pty_handle = Some(pty.handle());
+
+            let writer = pty.handle();
+            tokio::spawn(async move {
+                while let Some(chunk) = rx.recv().await {
+                    if writer.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let caller_for_pump = caller.clone();
+            tokio::spawn(async move {
+                let mut pty = pty;
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match pty.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if handle.data(channel, buf[..n].to_vec()).await.is_err() {
+                                // The client vanished. Drop the session rather
+                                // than keep a shell alive against a channel
+                                // nobody reads.
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%e, "ssh: terminal read failed");
+                            break;
+                        }
+                    }
+                }
+                let status = pty.wait().await;
+                info!(caller = %caller_for_pump, status, "ssh: interactive session ended");
+                let _ = handle.exit_status_request(channel, status).await;
+                let _ = handle.close(channel).await;
+                // `pty` drops here, which kills anything still in the group.
+            });
+
+            Ok(())
         }
 
         /// Who to attribute this session's actions to. Prefers the
@@ -542,17 +684,42 @@ mod sshd {
             Ok(())
         }
 
+        /// A shell request without a prior PTY request is a non-interactive
+        /// shell — rare, and not what this exists to serve. Refused with a
+        /// reason rather than silently handed a terminal the client never
+        /// asked for.
         async fn shell_request(
             &mut self,
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
+            // Written as a cfg-selected TAIL expression rather than an early
+            // `return`: the `return` a Windows build needs is redundant on
+            // Unix, and `needless_return` fires on whichever platform did not
+            // motivate it.
+            #[cfg(unix)]
+            {
+                if self.pty_req.is_some() {
+                    self.start_pty_session(channel, None, session).await
+                } else {
+                    refuse(
+                        session,
+                        channel,
+                        self.peer,
+                        "shell",
+                        "a shell needs a terminal here — drop `-T`, or use \
+                         `ssh <node> <command>` for a one-shot command.",
+                    )
+                }
+            }
+            #[cfg(not(unix))]
             refuse(
                 session,
                 channel,
                 self.peer,
                 "shell",
-                "interactive shells arrive in P4 (PTY). Use `ssh <node> <command>` for now.",
+                "interactive shells on Windows arrive in P4b (ConPTY). \
+                 Use `ssh <node> <command>` for now.",
             )
         }
 
@@ -560,21 +727,97 @@ mod sshd {
         async fn pty_request(
             &mut self,
             channel: ChannelId,
-            _term: &str,
-            _col_width: u32,
-            _row_height: u32,
+            term: &str,
+            col_width: u32,
+            row_height: u32,
             _pix_width: u32,
             _pix_height: u32,
             _modes: &[(russh::Pty, u32)],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            refuse(
-                session,
-                channel,
-                self.peer,
-                "pty",
-                "PTY allocation arrives in P4. Add `-T` to skip it.",
-            )
+            #[cfg(unix)]
+            {
+                // Recorded, not acted on: the terminal is allocated when the
+                // shell starts, because that is when the identity it runs as
+                // is known and when consent has been settled. Allocating here
+                // would leave a pty (and later a shell) alive for a session
+                // that is about to be refused.
+                self.pty_req = Some((
+                    term.to_string(),
+                    crate::pty::WinSize {
+                        cols: col_width as u16,
+                        rows: row_height as u16,
+                    },
+                ));
+                info!(peer = %self.peer, %term, cols = col_width, rows = row_height, "ssh: pty requested");
+                session.channel_success(channel)?;
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (term, col_width, row_height);
+                refuse(
+                    session,
+                    channel,
+                    self.peer,
+                    "pty",
+                    "PTY allocation on Windows arrives in P4b (ConPTY). Add `-T` to skip it.",
+                )
+            }
+        }
+
+        /// Client keystrokes. Only meaningful once a terminal exists; before
+        /// that there is nothing to type into, and after the session ends the
+        /// send simply fails and the data is dropped.
+        #[cfg(unix)]
+        async fn data(
+            &mut self,
+            _channel: ChannelId,
+            data: &[u8],
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(tx) = &self.pty_input {
+                let _ = tx.send(data.to_vec()).await;
+            }
+            Ok(())
+        }
+
+        /// The client's window changed. Resizing the terminal is what makes
+        /// the far side reflow — the kernel also SIGWINCHes the foreground
+        /// group, which is how a full-screen application learns to redraw.
+        #[cfg(unix)]
+        async fn window_change_request(
+            &mut self,
+            _channel: ChannelId,
+            col_width: u32,
+            row_height: u32,
+            _pix_width: u32,
+            _pix_height: u32,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            if let Some(h) = &self.pty_handle {
+                let size = crate::pty::WinSize {
+                    cols: col_width as u16,
+                    rows: row_height as u16,
+                };
+                if let Err(e) = h.resize(size) {
+                    warn!(peer = %self.peer, %e, "ssh: could not resize the terminal");
+                }
+            }
+            Ok(())
+        }
+
+        /// The client stopped sending. Close the terminal's input side so the
+        /// shell sees end-of-input and exits on its own, rather than being
+        /// killed — a shell that exits normally runs its logout hooks.
+        #[cfg(unix)]
+        async fn channel_eof(
+            &mut self,
+            _channel: ChannelId,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.pty_input = None;
+            Ok(())
         }
 
         async fn subsystem_request(
@@ -1589,6 +1832,129 @@ mod tests {
             "the caller must be told WHY it was refused, got stderr {err:?}"
         );
         assert_eq!(exit, Some(1));
+    }
+
+    // ── Interactive sessions (P4a) ────────────────────────────────────────
+
+    /// THE feature: `ssh <node>` with no command gets a real shell on a real
+    /// terminal, types into it, and gets the output back.
+    ///
+    /// Deliberately asserts on `tty`'s answer rather than just on echoed text —
+    /// a pair of pipes would also echo. Only a pty makes `tty` print a device.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_interactive_session_gets_a_real_terminal() {
+        let (key, line) = client_key(40);
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+        let session = connect(addr, key).await;
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm-256color", 120, 40, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+        channel
+            .data(&b"tty; echo COLS=$(tput cols); exit 0\n"[..])
+            .await
+            .unwrap();
+
+        let mut out = Vec::new();
+        let mut exit = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("/dev/pts/") || text.contains("/dev/ttys"),
+            "the session must be on a real tty, got {text:?}"
+        );
+        assert!(
+            text.contains("COLS=120"),
+            "the shell must see the geometry the client asked for, got {text:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
+    /// A shell without a terminal is refused with a reason rather than handed
+    /// one it never asked for.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shell_without_a_pty_is_refused_with_a_reason() {
+        let (key, line) = client_key(41);
+        let addr = serve_one(&cfg_with_mode(vec![line], Some("daemon"))).await;
+        let session = connect(addr, key).await;
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.request_shell(true).await.unwrap();
+
+        let mut refused = false;
+        let mut reason = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Failure => {
+                    refused = true;
+                    break;
+                }
+                russh::ChannelMsg::Success => panic!("a shell with no pty must not be accepted"),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    reason.extend_from_slice(data)
+                }
+                _ => {}
+            }
+        }
+        assert!(refused, "expected a channel failure");
+        assert!(
+            String::from_utf8_lossy(&reason).contains("terminal"),
+            "the refusal must explain itself, got {:?}",
+            String::from_utf8_lossy(&reason)
+        );
+    }
+
+    /// The identity gate applies to interactive sessions exactly as it does to
+    /// one-shot commands: an unset key-list account mode means the client gets
+    /// a channel failure and a reason, not a root shell.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_interactive_session_without_an_account_mode_gets_no_shell() {
+        let (key, line) = client_key(42);
+        let addr = serve_one(&cfg_with_mode(vec![line], None)).await;
+        let session = connect(addr, key).await;
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.request_shell(true).await.unwrap();
+
+        let mut reason = Vec::new();
+        let mut out = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    reason.extend_from_slice(data)
+                }
+                russh::ChannelMsg::Failure => break,
+                _ => {}
+            }
+        }
+        assert!(
+            out.is_empty(),
+            "no shell output may reach a session with no account mode, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            String::from_utf8_lossy(&reason).contains("ssh_account_mode"),
+            "the refusal must name the key to set, got {:?}",
+            String::from_utf8_lossy(&reason)
+        );
     }
 
     /// The mode survives the trip into the grant table, so what the server

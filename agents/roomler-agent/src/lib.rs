@@ -63,6 +63,9 @@ pub mod overlay;
 pub mod peer;
 pub mod post_install;
 pub mod preflight;
+/// Pseudo-terminals for Roomler SSH interactive sessions (P4a, Unix only —
+/// the module gates itself, so the `cfg` here would be redundant).
+pub mod pty;
 pub mod rc_local_turn;
 pub mod relay_probe;
 pub mod service;
