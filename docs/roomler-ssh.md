@@ -224,6 +224,40 @@ Grants are tried before `ssh_authorized_keys` and take precedence; sessions
 authenticated by a grant carry the roomler principal into the log and the audit
 record, which a key-list session cannot.
 
+### Operator consent (P5d — shipped)
+
+A device's `SshPolicy.consent_mode` decides whether a human **at the device**
+has to approve before anything runs. `auto` is the only value that skips the
+prompt; `prompt`, `email`, `push`, and a server that said nothing at all all put
+a person in the loop. Absent means ask — the fail-safe direction for a gate
+whose entire purpose is human review, and the same rule Fleet RPC applies to
+`rc:rpc.exec`.
+
+**The prompt happens at redemption, not when the grant arrives.** By grant time
+the server has already answered the caller with where to dial; refusing there
+would surface as a connection that rejects them for no stated reason. At exec
+time the session is live, so the refusal has somewhere to explain itself — and
+the caller is told *before* the wait begins:
+
+```
+roomler-ssh: waiting up to 30s for approval at the device…
+```
+
+Without that line a policy of `prompt` is indistinguishable from a 30-second
+hang. Denial and timeout both refuse with their own reason and exit 1.
+
+⚠️ **No broker means deny.** The daemon publishes its consent broker process-wide
+at start-up (`consent::set_shared`), because the SSH server is constructed
+inside the overlay's TUN factory and cannot be handed one. If none is
+registered, a session that was supposed to require approval refuses rather than
+proceeding — "nobody was there to ask" is not consent.
+
+⚠️ **Key-list sessions are deliberately exempt.** They carry no server policy,
+and they exist as the break-glass route for when the control plane is the broken
+thing. Gating them on a prompt would remove the emergency path exactly when it
+is needed. The device owner already consented by listing the key and setting
+`ssh_account_mode`.
+
 ## 5. Roadmap
 
 | Slice | Scope | State |
@@ -233,12 +267,11 @@ record, which a key-list session cannot.
 | P3a | Wire protocol (`rc:ssh.request` / `.grant` / `.response`), `SshPolicy` + `SshMode` + `SshAccountMode` models, `SSH_DEVICE` bit, agent-side grant table + redemption, `ssh` capability | **shipped** |
 | P3b | The server half: `agent_ssh.rs` (gates 1-3 + grant minting), hub push, the `ssh_policy` + org-settings API, and the `rc:ssh.request` device leg | **shipped** |
 | P3c | Admin UI for the two policies, and `exec_audit`-style auditing of SSH grants (today a denial is logged, not persisted) | next |
-| P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | designed |
 | P5a | `RunAs` + the never-silently-escalate rule; Unix named-account privilege drop (setgroups→setgid→setuid, verified); every unsupported mode refused | **shipped** |
 | P5b | Windows console-user sessions (`WTSQueryUserToken` + `CreateProcessAsUserW` with captured output) | **shipped** rc.418, field-proven |
-| P5c | `ssh_account_mode` — key-list sessions obey an explicit identity instead of silently taking the daemon's | **shipped** |
+| P5c | `ssh_account_mode` — key-list sessions obey an explicit identity instead of silently taking the daemon's | **shipped** rc.419, field-proven |
+| P5d | `SshPolicy.consent_mode` honoured — a policy of `prompt` now prompts, and refuses when nobody can be asked | **shipped** |
 | P4 | PTY / interactive shell (ConPTY on Windows, forkpty on Unix) | next |
-| — | ⚠️ **Open:** `SshPolicy.consent_mode` crosses the wire but the agent ignores it — a policy of `prompt` does not prompt anyone | not started |
 | P6 | `roomler ssh <name>`, netmap-verified host keys (no TOFU), stdio `ProxyCommand` | designed |
 | P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
 | P8 | Audit + session recording + admin UI | designed |

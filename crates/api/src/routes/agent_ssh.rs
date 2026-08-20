@@ -39,9 +39,20 @@
 //!
 //! ## Privilege
 //!
-//! Sessions inherit the daemon's identity — SYSTEM under a perMachine Windows
-//! install, root under systemd — until the account-mapping slice lands.
-//! Enabling gate 3 on a device is granting root on it.
+//! A session runs as what the policy actually asked for, never more:
+//! `SshPolicy.account_mode` crosses to the device in the grant and the agent's
+//! `RunAs` honours it or refuses (P5a/P5b). `daemon` still means SYSTEM under a
+//! perMachine Windows install and root under systemd — so a policy of `daemon`
+//! is granting root on that device, deliberately and in writing.
+//!
+//! ## Consent
+//!
+//! `SshPolicy.consent_mode` decides whether a human at the device approves
+//! before anything runs. Only `auto` skips the prompt. This route refuses to
+//! STORE a non-auto value for a device whose agent predates P5d
+//! ([`consent_mode_would_be_ignored`]) — such an agent accepts the field and
+//! ignores it, and a policy that reads as enforced while doing nothing is worse
+//! than no policy, because it gets relied upon.
 //!
 //! [`agent_exec`]: super::agent_exec
 
@@ -460,6 +471,19 @@ pub async fn set_policy(
         ));
     }
 
+    // Same rule, applied to consent: an agent older than P5d accepts a
+    // `consent_mode` and ignores it. Storing one would hand the admin a policy
+    // that reads as "a human must approve" while that device keeps letting
+    // every session straight through — which is the precise defect P5d exists
+    // to remove, so the server must not be able to recreate it per-device.
+    if consent_mode_would_be_ignored(&agent.capabilities, body.consent_mode) {
+        return Err(ApiError::BadRequest(format!(
+            "this device's agent does not honour consent_mode yet (needs the P5d agent); \
+             it would accept `{:?}` and ignore it. Update the device, or set `auto`.",
+            body.consent_mode.unwrap_or(ConsentMode::Auto)
+        )));
+    }
+
     let policy = SshPolicy {
         mode: body.mode,
         can_originate: body.can_originate,
@@ -542,9 +566,64 @@ pub async fn set_org_settings(
     }))
 }
 
+/// Would storing this `consent_mode` produce a policy the target device
+/// silently ignores?
+///
+/// Agents rc.419 and earlier advertise `ssh` while destructuring
+/// `SshPolicy.consent_mode` away, so persisting a non-auto value for one would
+/// show an admin a rule reading "a human must approve" while that device let
+/// every session straight through. P5d fixed the agent; this keeps the server
+/// from recreating the same lie on any device that hasn't updated yet.
+///
+/// `auto` and an absent value are always storable: neither promises a prompt.
+fn consent_mode_would_be_ignored(
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+    mode: Option<ConsentMode>,
+) -> bool {
+    !matches!(mode, None | Some(ConsentMode::Auto)) && !caps.rpc.iter().any(|c| c == "ssh-consent")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A policy that promises operator approval may only be stored for a device
+    /// that will actually ask. Otherwise the admin is handed a lie — the exact
+    /// defect P5d removed from the agent.
+    #[test]
+    fn a_consent_policy_is_refused_for_a_device_that_would_ignore_it() {
+        use roomler_ai_remote_control::models::AgentCaps;
+
+        let caps = |verbs: &[&str]| AgentCaps {
+            rpc: verbs.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let p5d = caps(&["exec", "originate", "ssh", "ssh-consent"]);
+        // rc.419 and earlier: advertises `ssh`, ignores consent_mode.
+        let older = caps(&["exec", "originate", "ssh"]);
+
+        for m in [
+            Some(ConsentMode::Prompt),
+            Some(ConsentMode::Email),
+            Some(ConsentMode::Push),
+        ] {
+            assert!(
+                consent_mode_would_be_ignored(&older, m),
+                "{m:?} must be refused for an agent that would ignore it"
+            );
+            assert!(
+                !consent_mode_would_be_ignored(&p5d, m),
+                "{m:?} must be storable once the device honours it"
+            );
+        }
+
+        // Neither of these promises a prompt, so both are always storable —
+        // including for an agent too old to advertise anything at all.
+        for m in [None, Some(ConsentMode::Auto)] {
+            assert!(!consent_mode_would_be_ignored(&older, m));
+            assert!(!consent_mode_would_be_ignored(&caps(&[]), m));
+        }
+    }
 
     #[test]
     fn only_ed25519_keys_are_accepted() {

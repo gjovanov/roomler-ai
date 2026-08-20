@@ -379,6 +379,7 @@ mod tests {
             stats_urls: stats.into_iter().map(str::to_string).collect(),
             shared_secret: None,
             caps: Default::default(),
+            relay_band: None,
             enabled: true,
         };
         // PoP: derived from derp_url (unchanged behaviour).

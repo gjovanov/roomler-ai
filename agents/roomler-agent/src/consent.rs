@@ -111,6 +111,34 @@ pub struct ConsentBroker {
     inner: Arc<BrokerInner>,
 }
 
+/// The one broker this process prompts on, published for subsystems that are
+/// constructed too far from `main` to be handed it.
+///
+/// The signalling loop and the LocalAPI both receive the broker directly and
+/// must keep doing so. Roomler SSH cannot: its server is built inside the
+/// overlay's TUN factory, which knows only the agent config. Rather than thread
+/// a broker through the transport seam, the daemon publishes it here once.
+///
+/// ⚠️ Callers must treat `None` as **deny**, never as auto-grant. A session
+/// whose policy demands operator consent and finds no broker has not obtained
+/// consent — inferring "no broker, so nobody objects" is exactly the
+/// fail-open this module's `new()` was fixed to avoid.
+static SHARED: std::sync::OnceLock<ConsentBroker> = std::sync::OnceLock::new();
+
+/// Publish the process-wide broker. First call wins; later ones are ignored
+/// and reported, since two brokers in one process would mean two sentinel
+/// directories and a prompt the tray never sees.
+pub fn set_shared(broker: ConsentBroker) -> bool {
+    SHARED.set(broker).is_ok()
+}
+
+/// The published broker, or `None` if the daemon never registered one — which
+/// is the case in unit tests and in any binary that isn't the daemon. See the
+/// warning on [`SHARED`]: `None` means deny, not allow.
+pub fn shared() -> Option<&'static ConsentBroker> {
+    SHARED.get()
+}
+
 struct BrokerInner {
     mode: Mode,
     /// Directory where sentinel files are read/written. One file
