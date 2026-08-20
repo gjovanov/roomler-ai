@@ -42,6 +42,28 @@ permissions:
   # window, no forced-cold rehearsals.)
   actions: write
 
+# Runner-queue hygiene (2026-08-20, run 32363354465): rc.424's Windows MSI
+# job sat QUEUED for 70 minutes — a release burst (3 tag runs in 20 min +
+# installer-smoke ×3 + a Windows job on every CI run) plus a reseed
+# rehearsal per release (2 more Windows jobs each) stacked past the
+# account's concurrent-job cap. Rehearsals exist only for their final
+# cache save and only the NEWEST one matters, so they share one
+# cancel-in-progress group: a fresh reseed cancels its superseded
+# predecessor instead of queueing behind it. Tag builds and explicit
+# publishes get a unique group and are NEVER cancelled. (A cancelled
+# rehearsal triggers no seed-failure alert — the alert keys on
+# failure, not cancellation — and its lost save is exactly the
+# generation the newer rehearsal supersedes.)
+concurrency:
+  group: >-
+    ${{ (github.event_name == 'schedule' ||
+         (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release != 'true'))
+        && 'agent-seed-rehearsal'
+        || format('agent-run-{0}', github.run_id) }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release != 'true') }}
+
 # P3e Phase 2: single-codegen-unit release artifacts. Set as WORKFLOW env
 # (cargo reads CARGO_PROFILE_RELEASE_* like a Cargo.toml [profile.release]
 # key) instead of the workspace manifest, deliberately: the manifest form
