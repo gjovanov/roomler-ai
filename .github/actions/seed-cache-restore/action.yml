@@ -33,21 +33,48 @@ runs:
     - name: Accretion GC (rehearsals only)
       shell: bash
       run: |
-        # 2026-08-20: each rehearsal restores the previous generation,
-        # builds the delta, and saves EVERYTHING — without a stale-artifact
-        # sweep, artifacts of superseded dep versions accrete monotonically
-        # (generations grew ~500 MB → 1.4-2.6 GB in four days; five of
-        # them = 7.4 GB, re-evicting the CI lane's caches whenever a save
-        # crested the 10 GB pool). actions/cache preserves mtimes and a
-        # compile refreshes them, so files untouched for 4+ days are dead
-        # artifacts of superseded deps — or live-but-stable units, which is
-        # why this runs BEFORE the build and only on non-tag runs: the
-        # rehearsal rebuilds anything it deleted by mistake and saves a
-        # complete, lean generation. Tag runs never GC (they'd pay the
-        # rebuild on the release path for artifacts they don't re-save).
+        # Each rehearsal restores the previous generation, builds the delta,
+        # and saves EVERYTHING — without a sweep, artifacts of superseded dep
+        # versions accrete monotonically (generations grew ~500 MB → 1.4-2.6 GB
+        # in four days; five of them = 7.4 GB, re-evicting the CI lane's caches
+        # whenever a save crested the 10 GB pool).
+        #
+        # ⚠️ 2026-08-20 — this used to be:
+        #
+        #     find target ~/.cargo/registry/cache -type f -mtime +4 -delete
+        #
+        # and it POISONED the seed for every downstream run. Deleting
+        # individual files inside `target` is unsound: cargo's decision to
+        # re-run a build script lives in `target/*/.fingerprint/`, not in the
+        # outputs, so removing an OUTPUT while leaving its fingerprint makes
+        # cargo skip the rebuild and the file is simply gone. The original
+        # premise — "the rehearsal rebuilds anything it deleted by mistake" —
+        # is exactly what cargo does NOT do.
+        #
+        # It hit `env-libvpx-sys`, whose build script writes `OUT_DIR/ffi.rs`.
+        # libvpx is pinned, so that file is never touched and always trips
+        # `-mtime +4`. A rehearsal deleted it and saved the hole; every later
+        # run restored it and died on
+        # `couldn't read .../out/ffi.rs` in ~2 min. Three releases in a row
+        # (rc.422/423/424) plus a dispatch run failed this way, and a re-run
+        # could not help — the poison was IN the cache.
+        #
+        # So: never touch individual files under `target`. The registry cache
+        # is safe to sweep by mtime (those are downloaded `.crate` archives;
+        # cargo re-fetches what it needs), and `target` is dropped WHOLESALE
+        # when it gets fat — one slow rehearsal, and a correct generation
+        # afterwards.
         if [ "${GITHUB_REF_TYPE:-branch}" = "tag" ]; then
           echo "tag run — skipping accretion GC"
           exit 0
         fi
-        find target ~/.cargo/registry/cache -type f -mtime +4 -delete 2>/dev/null || true
-        du -sh target 2>/dev/null || true
+        # Sound: cargo treats a missing .crate as "download it again".
+        find ~/.cargo/registry/cache -type f -mtime +4 -delete 2>/dev/null || true
+        # All-or-nothing on target. A partial sweep is what broke the releases.
+        TARGET_MB=$(du -sm target 2>/dev/null | cut -f1 || echo 0)
+        if [ "${TARGET_MB:-0}" -gt "${SEED_TARGET_MAX_MB:-3000}" ]; then
+          echo "target is ${TARGET_MB} MB (> ${SEED_TARGET_MAX_MB:-3000}) — dropping it whole"
+          rm -rf target
+        else
+          echo "target is ${TARGET_MB} MB — kept intact"
+        fi
