@@ -2553,7 +2553,7 @@ async fn handle_server_msg(
             account,
             expires_at_ms,
             session_secs,
-            consent_mode: _,
+            consent_mode,
         } => {
             #[cfg(feature = "ssh-server")]
             {
@@ -2568,6 +2568,7 @@ async fn handle_server_msg(
                     caller.clone(),
                     account_mode,
                     account,
+                    consent_mode,
                     expires_at_ms,
                     session_secs,
                 ) {
@@ -2580,6 +2581,7 @@ async fn handle_server_msg(
                     &public_key,
                     &account_mode,
                     &account,
+                    consent_mode,
                     expires_at_ms,
                     session_secs,
                 );
