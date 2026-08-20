@@ -63,6 +63,22 @@
 
 use tracing::warn;
 
+/// Process services a session depends on, threaded EXPLICITLY from the daemon
+/// into the SSH server instead of discovered through process globals.
+///
+/// The broker is non-optional on purpose. "No broker ⇒ deny" used to be a doc
+/// comment on a `static` (`consent::shared()`), and a doc comment is not a
+/// property the compiler holds anyone to — a server that can be constructed at
+/// all now provably has someone to ask. The struct exists (rather than a bare
+/// broker parameter) so the NEXT thing a session needs — the P3c audit sink is
+/// the known candidate — is one field here, not another parameter cascade.
+#[derive(Clone)]
+pub struct SessionServices {
+    /// The operator-consent broker — the same instance the tray and the
+    /// LocalAPI decide through, so an SSH prompt resolves from any of them.
+    pub consent: crate::consent::ConsentBroker,
+}
+
 /// Decorate a TUN factory so TCP to `<overlay ip>:<ssh_port>` terminates in the
 /// daemon instead of reaching the OS. Returns `inner` unchanged when the node
 /// has not opted in, so the default path is byte-for-byte the old one.
@@ -74,6 +90,7 @@ use tracing::warn;
 pub fn maybe_intercept(
     inner: tunnel_core::overlay::runtime::TunFactory,
     cfg: &crate::config::AgentConfig,
+    services: SessionServices,
 ) -> tunnel_core::overlay::runtime::TunFactory {
     use std::sync::Arc;
 
@@ -88,7 +105,7 @@ pub fn maybe_intercept(
     // host key and the authorized-key list is where an operator's typo shows
     // up, and it should surface at start-up in the daemon log, not as a silent
     // per-connection failure the caller sees as a dropped socket.
-    let ctx = build_ctx(cfg);
+    let ctx = build_ctx(cfg, services);
     Box::new(move |ip, nm, mtu| {
         let ctx = ctx.clone();
         let dev = inner(ip, nm, mtu)?;
@@ -129,6 +146,7 @@ pub fn maybe_intercept(
 pub fn maybe_intercept(
     inner: tunnel_core::overlay::runtime::TunFactory,
     cfg: &crate::config::AgentConfig,
+    _services: SessionServices,
 ) -> tunnel_core::overlay::runtime::TunFactory {
     if cfg.ssh_enabled {
         warn!(
@@ -170,8 +188,8 @@ type ServeCtx = Option<std::sync::Arc<sshd::Ctx>>;
 type ServeCtx = ();
 
 #[cfg(all(feature = "overlay-netstack", not(feature = "ssh-server")))]
-fn build_ctx(cfg: &crate::config::AgentConfig) -> ServeCtx {
-    let _ = cfg;
+fn build_ctx(cfg: &crate::config::AgentConfig, services: SessionServices) -> ServeCtx {
+    let _ = (cfg, services);
     warn!(
         "ssh_enabled is on but this build lacks the `ssh-server` feature — \
          the intercepted port answers with the P1 echo, not SSH"
@@ -272,13 +290,19 @@ mod sshd {
         /// out SYSTEM/root without saying so, and made a device policy of
         /// `account_mode = console_user` untrue for this path.
         pub key_list_run_as: Result<crate::exec::RunAs, String>,
+        /// Daemon services a session depends on — the consent broker, threaded
+        /// from `run_cmd` so it provably exists wherever a server does.
+        pub services: super::SessionServices,
     }
 
     impl Ctx {
         /// Returns `None` when the node has no usable host key — the caller
         /// then serves nothing, which is the right failure: an SSH endpoint
         /// with an improvised identity is worse than no endpoint.
-        pub fn build(cfg: &crate::config::AgentConfig) -> Option<Arc<Self>> {
+        pub fn build(
+            cfg: &crate::config::AgentConfig,
+            services: super::SessionServices,
+        ) -> Option<Arc<Self>> {
             let pem = cfg.ssh_host_key.as_deref()?;
             let host_key = match ssh_key::PrivateKey::from_openssh(pem) {
                 Ok(k) => k,
@@ -350,7 +374,115 @@ mod sshd {
                 config: Arc::new(config),
                 authorized,
                 key_list_run_as,
+                services,
             }))
+        }
+    }
+
+    /// Everything a session is allowed to do, decided in ONE place — at
+    /// authentication, from the server grant or the device-owned key list —
+    /// and the only shape the request handlers consume.
+    ///
+    /// This type exists to kill a bug class, not to organise code: rc.419
+    /// (key-list identity fell through to SYSTEM) and P5d (`consent_mode`
+    /// destructured away) were both fields that crossed into a session and
+    /// were dropped on the floor, silently. Its constructors destructure
+    /// their inputs EXHAUSTIVELY — no `..`, and every field either flows into
+    /// the type or is consumed against a written decision — so the next field
+    /// added to a grant fails to compile until someone decides what a session
+    /// does with it.
+    pub struct ResolvedSessionPolicy {
+        /// What the session runs as. `Err` = authenticate-then-refuse with
+        /// this reason when something is asked to run — a bare auth failure
+        /// cannot explain itself, which is why the refusal is deferred.
+        pub run_as: Result<crate::exec::RunAs, String>,
+        /// Sentinel the operator is prompted on before anything runs. `None`
+        /// = no prompt: either the policy said an explicit `Auto`, or this is
+        /// a key-list session — the break-glass path, deliberately exempt
+        /// from a gate the control plane owns.
+        pub consent_sentinel: Option<String>,
+        /// Hard end of the session, enforced by disconnect. `None` =
+        /// unbounded, which ONLY the key-list path produces — deliberately:
+        /// the break-glass session must not die under whoever is fixing the
+        /// control plane. A grant always carries a bound (0 clamps to the
+        /// ceiling), making `ssh_limits::MAX_SESSION_SECS`'s "after which the
+        /// agent closes it" true rather than aspirational.
+        pub deadline: Option<tokio::time::Instant>,
+        /// Who to attribute every action to, in every log line.
+        pub caller: String,
+    }
+
+    impl ResolvedSessionPolicy {
+        /// Resolve a redeemed server grant. The grant is authoritative for
+        /// everything a session may do; nothing the CLIENT said is consulted.
+        pub(super) fn from_grant(grant: super::Grant, peer: std::net::SocketAddr) -> Self {
+            use roomler_ai_remote_control::models::{ConsentMode, ssh_limits};
+
+            // EXHAUSTIVE on purpose — see the type doc. A field added to the
+            // grant must be routed here, in writing, before this compiles.
+            let super::Grant {
+                grant_id,
+                public_key,
+                caller,
+                account_mode,
+                account,
+                consent_mode,
+                session_secs,
+                deadline,
+            } = grant;
+            // Two fields were spent BEFORE resolution, and that is their
+            // decision: `public_key` is how `take_grant_for` found this grant
+            // (auth logged its fingerprint), and `deadline` is the redemption
+            // window `prune` already enforced. Consumed here so the
+            // destructure stays exhaustive and a NEW field cannot borrow this
+            // line as precedent for being dropped.
+            let _ = (public_key, deadline);
+
+            Self {
+                run_as: crate::exec::RunAs::from_wire(&account_mode, account.as_deref()),
+                // Only an explicit `Auto` skips the operator. `Prompt`,
+                // `Email`, `Push` and a server that said NOTHING all ask —
+                // the fail-safe direction for a gate whose whole purpose is a
+                // human in the loop, and the same rule Fleet RPC applies. The
+                // grant id doubles as the sentinel the decision arrives on.
+                consent_sentinel: match consent_mode {
+                    Some(ConsentMode::Auto) => None,
+                    _ => Some(grant_id),
+                },
+                // A grant session is ALWAYS time-bounded. `record_grant`
+                // already clamped this, but resolving is total on its own:
+                // 0 means the ceiling, never "forever".
+                deadline: Some(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(ssh_limits::clamp_session_secs(
+                            session_secs,
+                        )),
+                ),
+                caller: format!("ssh:{caller}@{peer}"),
+            }
+        }
+
+        /// Resolve a key-list session — the break-glass path with no server
+        /// policy behind it. Everything it may do is device-owned config.
+        pub(super) fn from_key_list(ctx: &Ctx, user: &str, peer: std::net::SocketAddr) -> Self {
+            Self {
+                // Resolved once at start-up (`Ctx::build`), so a typo'd
+                // `ssh_account_mode` is a boot log line; unset refuses with
+                // the reason on stderr rather than falling through to the
+                // daemon's own identity (the rc.419 bug).
+                run_as: ctx.key_list_run_as.clone(),
+                // Deliberately EXEMPT from consent: this path exists for when
+                // the control plane is the broken thing, and blocking it on a
+                // policy the control plane owns would take the emergency
+                // route away exactly when it is needed.
+                consent_sentinel: None,
+                // Deliberately UNBOUNDED for the same reason; the server's
+                // inactivity timeout still reaps an abandoned session.
+                deadline: None,
+                // All a key-list session can honestly claim: the username the
+                // client typed, and the overlay address WireGuard proved.
+                caller: format!("ssh:{user}@{peer} (key-list)"),
+            }
         }
     }
 
@@ -384,17 +516,14 @@ mod sshd {
         /// us only by clearing WireGuard against a key from our netmap — so it
         /// is what every log line and audit record is keyed on.
         peer: std::net::SocketAddr,
-        /// The SSH username offered. Recorded, never trusted — it is whatever
-        /// the client typed. The authorized principal, when there is one, is
-        /// [`Self::principal`].
-        user: String,
-        /// The roomler principal the server named in the grant. `None` means
-        /// the session authenticated off the device-owned key list, where no
-        /// roomler identity exists to name.
-        principal: Option<String>,
-        /// The redeemed grant, kept for the account mode it carries (P5 acts
-        /// on it) and for the audit record.
-        grant: Option<super::Grant>,
+        /// What this session may do, resolved ONCE at authentication. `None`
+        /// only before auth — russh does not deliver channel requests until
+        /// auth succeeded, so the handlers treat its absence as a refusal
+        /// rather than a reachable state.
+        policy: Option<ResolvedSessionPolicy>,
+        /// Whether the session-deadline watchdog is running; armed on the
+        /// first channel open so multiplexed channels share one timer.
+        deadline_armed: bool,
         /// Terminal type and geometry from `pty_request`, held until the shell
         /// starts. `Some` is also what distinguishes an interactive session
         /// from a one-shot command.
@@ -414,9 +543,8 @@ mod sshd {
             Self {
                 ctx,
                 peer,
-                user: String::new(),
-                principal: None,
-                grant: None,
+                policy: None,
+                deadline_armed: false,
                 #[cfg(unix)]
                 pty_req: None,
                 #[cfg(unix)]
@@ -424,6 +552,40 @@ mod sshd {
                 #[cfg(unix)]
                 pty_handle: None,
             }
+        }
+
+        /// Start the one-per-session watchdog that ends the connection when
+        /// the granted lifetime runs out. A deadline already in the past
+        /// fires immediately, so a channel opened late in a session cannot
+        /// outrun the bound.
+        ///
+        /// Disconnecting is the whole enforcement: the pty pump's writes then
+        /// fail, which drops the terminal and kills its process group, and an
+        /// exec still in flight is bounded by the engine's own wall-clock
+        /// ceiling. Key-list sessions have no deadline (see
+        /// [`ResolvedSessionPolicy::from_key_list`]) and never arm this.
+        fn arm_session_deadline(&mut self, session: &mut Session) {
+            if self.deadline_armed {
+                return;
+            }
+            let Some(policy) = &self.policy else { return };
+            let Some(deadline) = policy.deadline else {
+                return;
+            };
+            let caller = policy.caller.clone();
+            self.deadline_armed = true;
+            let handle = session.handle();
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                warn!(%caller, "ssh: session reached its granted time limit — disconnecting");
+                let _ = handle
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "roomler-ssh: session time limit reached".to_string(),
+                        String::new(),
+                    )
+                    .await;
+            });
         }
 
         /// Start an interactive session on the terminal `pty_request` asked
@@ -450,11 +612,13 @@ mod sshd {
                 );
             };
 
-            let run_as = match &self.grant {
-                Some(g) => crate::exec::RunAs::from_wire(&g.account_mode, g.account.as_deref()),
-                None => self.ctx.key_list_run_as.clone(),
+            // The session's whole entitlement was resolved at auth; requests
+            // only READ it. Absent means unauthenticated, which russh does
+            // not deliver requests for — refuse rather than reason about it.
+            let Some(policy) = &self.policy else {
+                return refuse(session, channel, self.peer, "shell", "no session policy");
             };
-            let run_as = match run_as {
+            let run_as = match policy.run_as.clone() {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(peer = %self.peer, %e, "ssh: refusing a shell — unusable account mode");
@@ -470,11 +634,12 @@ mod sshd {
 
             session.channel_success(channel)?;
             let handle = session.handle();
-            let caller = self.caller_label();
-            let consent = self.grant.as_ref().and_then(consent_requirement);
+            let caller = policy.caller.clone();
+            let consent = policy.consent_sentinel.clone();
+            let broker = self.ctx.services.consent.clone();
 
             if let Some(sentinel) = consent
-                && let Err(why) = await_consent(&handle, channel, &caller, &sentinel).await
+                && let Err(why) = await_consent(&broker, &handle, channel, &caller, &sentinel).await
             {
                 let _ = handle
                     .extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes())
@@ -549,16 +714,6 @@ mod sshd {
 
             Ok(())
         }
-
-        /// Who to attribute this session's actions to. Prefers the
-        /// server-named principal; falls back to the SSH username and peer,
-        /// which is all a key-list session can honestly claim.
-        fn caller_label(&self) -> String {
-            match &self.principal {
-                Some(p) => format!("ssh:{p}@{}", self.peer),
-                None => format!("ssh:{}@{} (key-list)", self.user, self.peer),
-            }
-        }
     }
 
     impl russh::server::Handler for Handler {
@@ -576,15 +731,16 @@ mod sshd {
             // is single-use — so a captured public key cannot be replayed into
             // a second session even within the grant's lifetime.
             if let Some(grant) = super::take_grant_for(key) {
-                self.user = user.to_string();
-                self.principal = Some(grant.caller.clone());
-                self.grant = Some(grant.clone());
                 info!(
                     peer = %self.peer, %user, %fingerprint,
                     grant_id = %grant.grant_id, caller = %grant.caller,
                     account_mode = %grant.account_mode,
                     "ssh: authenticated (server grant)"
                 );
+                // Resolving HERE — not lazily at each request — is the P5
+                // design: one place turns a grant into what a session may do,
+                // and the request handlers can only read the result.
+                self.policy = Some(ResolvedSessionPolicy::from_grant(grant, self.peer));
                 return Ok(Auth::Accept);
             }
 
@@ -598,11 +754,13 @@ mod sshd {
                 .iter()
                 .any(|k| k.key_data() == key.key_data());
             if listed {
-                self.user = user.to_string();
                 info!(
                     peer = %self.peer, %user, %fingerprint,
                     "ssh: authenticated (ssh_authorized_keys)"
                 );
+                self.policy = Some(ResolvedSessionPolicy::from_key_list(
+                    &self.ctx, user, self.peer,
+                ));
                 Ok(Auth::Accept)
             } else {
                 warn!(
@@ -618,9 +776,10 @@ mod sshd {
             &mut self,
             _channel: Channel<Msg>,
             reply: russh::server::ChannelOpenHandle,
-            _session: &mut Session,
+            session: &mut Session,
         ) -> Result<(), Self::Error> {
             reply.accept().await;
+            self.arm_session_deadline(session);
             Ok(())
         }
 
@@ -642,18 +801,21 @@ mod sshd {
             session.channel_success(channel)?;
 
             let handle = session.handle();
-            let caller = self.caller_label();
-            // Resolve the identity from the server, never from anything the
-            // client said. A grant carries the server policy's account mode and is
-            // authoritative for its own session. A key-list session has no
-            // policy behind it, so it uses the device-owned `ssh_account_mode`
-            // — and if the operator never chose one, it runs NOTHING rather
-            // than quietly taking the daemon's identity.
-            let run_as = match &self.grant {
-                Some(g) => crate::exec::RunAs::from_wire(&g.account_mode, g.account.as_deref()),
-                None => self.ctx.key_list_run_as.clone(),
+            // Everything this session may do — identity, consent, bound — was
+            // resolved ONCE at authentication ([`ResolvedSessionPolicy`]);
+            // this handler only reads it. Identity comes from the server or
+            // the device's own config, never from anything the client said.
+            let Some(policy) = &self.policy else {
+                let _ = session.extended_data(
+                    channel,
+                    1,
+                    b"roomler-ssh: no session policy\r\n".to_vec(),
+                );
+                session.exit_status_request(channel, 1)?;
+                session.close(channel)?;
+                return Ok(());
             };
-            let run_as = match run_as {
+            let run_as = match policy.run_as.clone() {
                 Ok(r) => r,
                 Err(e) => {
                     // An unreadable identity is a refusal, never a fallback:
@@ -671,15 +833,11 @@ mod sshd {
                     return Ok(());
                 }
             };
-            // Does a human at this device have to approve, per the server's
-            // `SshPolicy`? Only a GRANT can carry that requirement: a key-list
-            // session has no server policy behind it, and it is deliberately
-            // the break-glass path for when the control plane is the broken
-            // thing — blocking it on a prompt would take the emergency route
-            // away exactly when it is needed.
-            let consent = self.grant.as_ref().and_then(consent_requirement);
+            let caller = policy.caller.clone();
+            let consent = policy.consent_sentinel.clone();
+            let broker = self.ctx.services.consent.clone();
             tokio::spawn(async move {
-                run_exec(handle, channel, command, caller, run_as, consent).await;
+                run_exec(handle, channel, command, caller, run_as, consent, broker).await;
             });
             Ok(())
         }
@@ -856,46 +1014,23 @@ mod sshd {
         Ok(())
     }
 
-    /// What a grant demands of the operator at this device, if anything.
-    ///
-    /// Returns the sentinel id to prompt on, or `None` when the policy is an
-    /// explicit `Auto`. Anything else — `Prompt`, `Email`, `Push`, or a server
-    /// that said nothing at all — requires a human. Email and Push are folded
-    /// into the same local prompt rather than refused: the broker's sentinel is
-    /// how a decision reaches this process regardless of which channel carried
-    /// the question, and that is exactly how Fleet RPC treats them.
-    pub(super) fn consent_requirement(grant: &super::Grant) -> Option<String> {
-        use roomler_ai_remote_control::models::ConsentMode;
-        match grant.consent_mode {
-            Some(ConsentMode::Auto) => None,
-            _ => Some(grant.grant_id.clone()),
-        }
-    }
-
     /// Ask the operator at this device, and say so on stderr first.
     ///
     /// The advisory line matters: without it a policy of `prompt` looks to the
     /// caller like a 30-second hang, which is the same "a bare failure cannot
     /// explain itself" problem that shapes every other refusal here.
     ///
-    /// A missing broker is a DENIAL. The daemon publishes one at start-up, so
-    /// its absence means this is not a daemon — and a session that was supposed
-    /// to need a human must not proceed just because nobody was there to ask.
+    /// The broker arrives through [`super::SessionServices`], so "nobody can
+    /// be asked" is no longer a reachable state — a server that exists was
+    /// handed one at construction. (It used to be a process global whose
+    /// absence this function had to treat as a denial.)
     async fn await_consent(
+        broker: &crate::consent::ConsentBroker,
         handle: &russh::server::Handle,
         channel: ChannelId,
         caller: &str,
         sentinel: &str,
     ) -> Result<(), String> {
-        let Some(broker) = crate::consent::shared() else {
-            return Err(
-                "this device requires operator approval for SSH sessions but has no consent \
-                 broker running, so nobody can be asked. Refusing rather than proceeding \
-                 unapproved."
-                    .to_string(),
-            );
-        };
-
         let timeout = crate::consent::DEFAULT_PROMPT_TIMEOUT;
         let _ = handle
             .extended_data(
@@ -946,6 +1081,7 @@ mod sshd {
         caller: String,
         run_as: crate::exec::RunAs,
         consent: Option<String>,
+        broker: crate::consent::ConsentBroker,
     ) {
         use roomler_ai_remote_control::models::exec_limits;
 
@@ -954,7 +1090,7 @@ mod sshd {
         // has already told the caller where to dial by then, so a refusal there
         // would surface as a connection that rejects them for no stated reason.
         if let Some(sentinel) = consent
-            && let Err(why) = await_consent(&handle, channel, &caller, &sentinel).await
+            && let Err(why) = await_consent(&broker, &handle, channel, &caller, &sentinel).await
         {
             let _ = handle
                 .extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes())
@@ -1031,8 +1167,8 @@ mod sshd {
 
 /// Build the per-session server context from config.
 #[cfg(all(feature = "overlay-netstack", feature = "ssh-server"))]
-fn build_ctx(cfg: &crate::config::AgentConfig) -> ServeCtx {
-    sshd::Ctx::build(cfg)
+fn build_ctx(cfg: &crate::config::AgentConfig, services: SessionServices) -> ServeCtx {
+    sshd::Ctx::build(cfg, services)
 }
 
 /// Run the SSH protocol over one intercepted connection.
@@ -1264,12 +1400,32 @@ mod tests {
         }
     }
 
+    /// A fresh services bundle on a unique sentinel dir, exactly what the
+    /// daemon hands the server — the startup mode is irrelevant because the
+    /// server always prompts with an explicit per-session mode.
+    fn test_services() -> super::SessionServices {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("roomler-ssh-consent-{nanos}"));
+        super::SessionServices {
+            consent: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
+                .expect("a temp sentinel dir"),
+        }
+    }
+
     /// Serve exactly one connection on a loopback port and hand back its
-    /// address. The transport is a plain TCP socket here on purpose: P1's tests
-    /// already prove the interception path, so this exercises only the SSH
-    /// layer sitting on top of it.
-    async fn serve_one(cfg: &crate::config::AgentConfig) -> std::net::SocketAddr {
-        let ctx = super::sshd::Ctx::build(cfg).expect("a usable host key");
+    /// address plus the consent broker the server was built with, so a test
+    /// can play the operator. The transport is a plain TCP socket here on
+    /// purpose: P1's tests already prove the interception path, so this
+    /// exercises only the SSH layer sitting on top of it.
+    async fn serve_one_with(
+        cfg: &crate::config::AgentConfig,
+    ) -> (std::net::SocketAddr, crate::consent::ConsentBroker) {
+        let services = test_services();
+        let broker = services.consent.clone();
+        let ctx = super::sshd::Ctx::build(cfg, services).expect("a usable host key");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1281,7 +1437,11 @@ mod tests {
                 let _ = session.await;
             }
         });
-        addr
+        (addr, broker)
+    }
+
+    async fn serve_one(cfg: &crate::config::AgentConfig) -> std::net::SocketAddr {
+        serve_one_with(cfg).await.0
     }
 
     async fn connect(
@@ -1409,8 +1569,11 @@ mod tests {
     /// `account_mode = console_user` was simply untrue for that path.
     #[test]
     fn an_unset_account_mode_refuses_rather_than_granting_the_daemon_identity() {
-        let ctx = super::sshd::Ctx::build(&cfg_with_mode(vec![client_key(20).1], None))
-            .expect("a usable host key");
+        let ctx = super::sshd::Ctx::build(
+            &cfg_with_mode(vec![client_key(20).1], None),
+            test_services(),
+        )
+        .expect("a usable host key");
 
         let err = ctx
             .key_list_run_as
@@ -1430,17 +1593,22 @@ mod tests {
 
     #[test]
     fn a_set_account_mode_is_what_key_list_sessions_get() {
-        let ctx =
-            super::sshd::Ctx::build(&cfg_with_mode(vec![client_key(21).1], Some("console_user")))
-                .expect("a usable host key");
+        let ctx = super::sshd::Ctx::build(
+            &cfg_with_mode(vec![client_key(21).1], Some("console_user")),
+            test_services(),
+        )
+        .expect("a usable host key");
         assert_eq!(
             ctx.key_list_run_as.as_ref().unwrap(),
             &crate::exec::RunAs::ConsoleUser
         );
 
         // `daemon` stays available — but only when asked for by name.
-        let ctx = super::sshd::Ctx::build(&cfg_with_mode(vec![client_key(22).1], Some("daemon")))
-            .expect("a usable host key");
+        let ctx = super::sshd::Ctx::build(
+            &cfg_with_mode(vec![client_key(22).1], Some("daemon")),
+            test_services(),
+        )
+        .expect("a usable host key");
         assert_eq!(
             ctx.key_list_run_as.as_ref().unwrap(),
             &crate::exec::RunAs::Daemon
@@ -1450,10 +1618,10 @@ mod tests {
     /// A malformed value must not degrade into a working-but-wrong identity.
     #[test]
     fn a_malformed_account_mode_refuses() {
-        let ctx = super::sshd::Ctx::build(&cfg_with_mode(
-            vec![client_key(23).1],
-            Some("administrator"),
-        ))
+        let ctx = super::sshd::Ctx::build(
+            &cfg_with_mode(vec![client_key(23).1], Some("administrator")),
+            test_services(),
+        )
         .expect("a usable host key");
         assert!(ctx.key_list_run_as.is_err());
     }
@@ -1601,7 +1769,7 @@ mod tests {
     /// `Auto` is stated explicitly rather than left to the default because the
     /// default is the OPPOSITE: an absent consent mode means prompt. These
     /// tests assert that a grant runs, so they have to say why nobody is asked.
-    fn grant_for(line: &str, ttl_ms: u64) -> Result<(), String> {
+    fn grant_for(line: &str, ttl_ms: u64) -> Result<String, String> {
         grant_for_with_consent(
             line,
             ttl_ms,
@@ -1609,13 +1777,16 @@ mod tests {
         )
     }
 
+    /// Returns the grant id on success — it doubles as the consent sentinel,
+    /// which the operator-approval tests need to answer the prompt.
     fn grant_for_with_consent(
         line: &str,
         ttl_ms: u64,
         consent: Option<roomler_ai_remote_control::models::ConsentMode>,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
+        let grant_id = format!("g-{}", rand::random::<u32>());
         super::record_grant(
-            format!("g-{}", rand::random::<u32>()),
+            grant_id.clone(),
             line.to_string(),
             "alice@example.com".into(),
             "daemon".into(),
@@ -1624,6 +1795,7 @@ mod tests {
             now_ms() + ttl_ms,
             0,
         )
+        .map(|()| grant_id)
     }
 
     /// A grant admits its key, and admits it exactly once. Without single-use,
@@ -1749,27 +1921,41 @@ mod tests {
         );
     }
 
-    // ── Operator consent ──────────────────────────────────────────────────
+    // ── Resolution (A1) — the one place session entitlements are decided ──
 
-    /// Only an explicit `Auto` skips the prompt. Everything else — including a
-    /// server that said nothing — puts a human in the loop.
-    #[test]
-    fn only_an_explicit_auto_skips_the_operator_prompt() {
-        use roomler_ai_remote_control::models::ConsentMode;
-
-        let grant = |m: Option<ConsentMode>| super::Grant {
+    fn test_grant(
+        consent: Option<roomler_ai_remote_control::models::ConsentMode>,
+        session_secs: u64,
+    ) -> super::Grant {
+        super::Grant {
             grant_id: "g-1".into(),
             public_key: String::new(),
             caller: "alice@example.com".into(),
             account_mode: "daemon".into(),
             account: None,
-            consent_mode: m,
-            session_secs: 0,
+            consent_mode: consent,
+            session_secs,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
-        };
+        }
+    }
 
+    fn test_peer() -> std::net::SocketAddr {
+        "100.64.0.9:55555".parse().unwrap()
+    }
+
+    /// Only an explicit `Auto` skips the prompt. Everything else — including a
+    /// server that said nothing — puts a human in the loop. The rule now lives
+    /// in resolution, the only path a session's consent requirement can take.
+    #[test]
+    fn resolve_only_an_explicit_auto_skips_the_operator_prompt() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let auto = super::sshd::ResolvedSessionPolicy::from_grant(
+            test_grant(Some(ConsentMode::Auto), 0),
+            test_peer(),
+        );
         assert!(
-            super::sshd::consent_requirement(&grant(Some(ConsentMode::Auto))).is_none(),
+            auto.consent_sentinel.is_none(),
             "auto is the one mode that runs without asking"
         );
         for m in [
@@ -1778,36 +1964,91 @@ mod tests {
             Some(ConsentMode::Push),
             None, // the fail-safe: absent directive ⇒ ask
         ] {
+            let resolved =
+                super::sshd::ResolvedSessionPolicy::from_grant(test_grant(m, 0), test_peer());
             assert_eq!(
-                super::sshd::consent_requirement(&grant(m)).as_deref(),
+                resolved.consent_sentinel.as_deref(),
                 Some("g-1"),
                 "{m:?} must require approval and prompt on the grant id"
             );
         }
     }
 
-    /// THE regression this slice exists for.
-    ///
-    /// `SshPolicy.consent_mode` used to cross the wire and be destructured
-    /// away, so a device policy of `prompt` prompted nobody and the session ran
-    /// anyway. An admin reading that policy would believe a human had to
-    /// approve every SSH session into the device. None ever did.
-    ///
-    /// There is no consent broker in a unit test, which is exactly the
-    /// fail-closed case: a session that was supposed to need a human must
-    /// refuse when there is nobody to ask, not proceed unapproved.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_grant_requiring_consent_refuses_when_nobody_can_be_asked() {
+    /// A grant session is ALWAYS time-bounded — 0 means the ceiling, never
+    /// "forever" — and only the key-list break-glass path is unbounded.
+    /// `session_secs` is the third member of the ignored-field class: it was
+    /// carried, clamped and stored while nothing ever acted on it.
+    #[test]
+    fn resolve_bounds_grant_sessions_and_exempts_the_key_list() {
+        use roomler_ai_remote_control::models::ssh_limits;
+
+        let secs_until = |deadline: tokio::time::Instant| {
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_secs()
+        };
+
+        let bounded =
+            super::sshd::ResolvedSessionPolicy::from_grant(test_grant(None, 3600), test_peer());
+        let left = secs_until(bounded.deadline.expect("a grant session has a deadline"));
+        assert!(
+            (3595..=3600).contains(&left),
+            "expected ≈3600s, got {left}s"
+        );
+
+        let zero = super::sshd::ResolvedSessionPolicy::from_grant(test_grant(None, 0), test_peer());
+        let left = secs_until(zero.deadline.expect("0 must mean the ceiling, not forever"));
+        assert!(
+            (ssh_limits::MAX_SESSION_SECS - 5..=ssh_limits::MAX_SESSION_SECS).contains(&left),
+            "expected ≈the ceiling, got {left}s"
+        );
+
+        // The break-glass path: unbounded, consent-exempt, honestly labelled.
+        let ctx = super::sshd::Ctx::build(
+            &cfg_with_mode(vec![client_key(25).1], Some("console_user")),
+            test_services(),
+        )
+        .expect("a usable host key");
+        let key_list =
+            super::sshd::ResolvedSessionPolicy::from_key_list(&ctx, "roomler", test_peer());
+        assert!(key_list.deadline.is_none());
+        assert!(key_list.consent_sentinel.is_none());
+        assert!(key_list.caller.contains("(key-list)"));
+        assert_eq!(key_list.run_as.unwrap(), crate::exec::RunAs::ConsoleUser);
+    }
+
+    // ── Operator consent ──────────────────────────────────────────────────
+
+    /// Drive one exec through a consent-gated session and collect the outcome.
+    /// The operator's decision is played through the SAME broker the server
+    /// was built with — `record_decision` only lands while the prompt is
+    /// actually pending (the confused-deputy guard), so the approver polls.
+    async fn exec_with_operator_decision(
+        approve: bool,
+        key_seed: u8,
+    ) -> (String, String, Option<u32>, bool) {
         use roomler_ai_remote_control::models::ConsentMode;
 
-        let _lock = grant_test().await;
-        let (key, line) = client_key(30);
-        let addr = serve_one(&cfg_with(Vec::new())).await;
-        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let (key, line) = client_key(key_seed);
+        let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
+        let grant_id = grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+
+        let operator = {
+            let sid = grant_id.clone();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    if broker.record_decision(&sid, approve) {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                false
+            })
+        };
 
         let session = connect(addr, key).await; // auth SUCCEEDS — consent is not auth
         let mut channel = session.channel_open_session().await.unwrap();
-        channel.exec(true, "echo should-never-run").await.unwrap();
+        channel.exec(true, "echo consent-gated-ran").await.unwrap();
 
         let (mut stdout, mut stderr, mut exit) = (Vec::new(), Vec::new(), None);
         while let Some(msg) = channel.wait().await {
@@ -1820,18 +2061,95 @@ mod tests {
                 _ => {}
             }
         }
+        let decided = operator.await.unwrap();
+        (
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+            exit,
+            decided,
+        )
+    }
 
-        let out = String::from_utf8_lossy(&stdout);
-        let err = String::from_utf8_lossy(&stderr);
+    /// THE positive half P5d could never test: a policy of `prompt` runs the
+    /// command once — and only once — a human approves, end to end through a
+    /// real broker. Before A2 the broker was a process global no test could
+    /// safely publish, so only the refusal side was ever exercised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_grant_requiring_consent_runs_after_the_operator_approves() {
+        let _lock = grant_test().await;
+        let (out, err, exit, decided) = exec_with_operator_decision(true, 30).await;
+        assert!(decided, "the approval must have been recorded");
         assert!(
-            !out.contains("should-never-run"),
-            "the command ran without approval — the ignored-consent_mode bug is back"
+            err.contains("waiting up to"),
+            "the caller must be warned it is waiting on a human, got stderr {err:?}"
         );
         assert!(
-            err.contains("no consent broker"),
+            out.contains("consent-gated-ran"),
+            "an approved session must run the command, got {out:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
+    /// The refusal half: a denial refuses with the reason on stderr, and the
+    /// command never runs. (`consent_mode` being IGNORED — the P5d bug — would
+    /// run it regardless of the decision.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_grant_requiring_consent_refuses_when_the_operator_denies() {
+        let _lock = grant_test().await;
+        let (out, err, exit, decided) = exec_with_operator_decision(false, 32).await;
+        assert!(decided, "the denial must have been recorded");
+        assert!(
+            !out.contains("consent-gated-ran"),
+            "the command ran despite a denial — the ignored-consent_mode bug is back"
+        );
+        assert!(
+            err.contains("denied"),
             "the caller must be told WHY it was refused, got stderr {err:?}"
         );
         assert_eq!(exit, Some(1));
+    }
+
+    /// THE session bound (A1): a grant's `session_secs` now ENDS the session.
+    /// `ssh_limits::MAX_SESSION_SECS` always said "after which the agent
+    /// closes it" — before this slice, nothing did, and the field was carried,
+    /// clamped, stored and ignored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_granted_session_ends_at_its_time_bound() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        let (key, line) = client_key(33);
+        let addr = serve_one(&cfg_with(Vec::new())).await;
+        super::record_grant(
+            "g-deadline".into(),
+            line,
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            Some(ConsentMode::Auto),
+            now_ms() + 30_000,
+            1, // a one-second session budget
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let session = connect(addr, key).await;
+        let mut channel = session.channel_open_session().await.unwrap();
+        // No command — just hold the channel and wait for the SERVER to end
+        // the session. Nothing on the client side closes anything.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while channel.wait().await.is_some() {}
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "the server must disconnect a session past its granted lifetime"
+        );
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(900),
+            "the session ended before its budget: {:?}",
+            start.elapsed()
+        );
     }
 
     // ── Interactive sessions (P4a) ────────────────────────────────────────
