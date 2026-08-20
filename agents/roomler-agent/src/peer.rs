@@ -4953,12 +4953,21 @@ async fn media_pump_ffmpeg_dc(
         // same viewer.
         if is_real_frame {
             let wire_bytes: usize = packets.iter().map(|p| p.data.len()).sum();
-            if let Some(flip) = idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes) {
+            // P7c-2 — significance is judged against the RUNG-SCALED floor
+            // (`frame` here is the post-downscale encoded frame, so w×h is
+            // the encode area). A fixed floor oscillated in the field: small
+            // persistent animations were invisible at 1024×640 and visible
+            // at native, flipping Up/Down every ~6 s.
+            let encode_area = frame.width as u64 * frame.height as u64;
+            if let Some(flip) =
+                idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes, encode_area)
+            {
                 info!(
                     %session_id,
                     codec_label,
                     ?flip,
                     wire_bytes,
+                    encode_area,
                     "idle refine: motion burst — restoring resolution cap"
                 );
             }
