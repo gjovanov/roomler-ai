@@ -519,9 +519,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub constrained_queue_ms: Option<u32>,
     /// HRD/VBV window for constrained sessions, percent of maxrate
-    /// (`ROOMLER_NODE_CONSTRAINED_HRD_PCT`). Built-in default: 75;
-    /// clamped 25-200 (200 = the direct-path rc.234 window). Bounds the
-    /// single-frame IDR burst a clamped pipe must serialize.
+    /// (`ROOMLER_NODE_CONSTRAINED_HRD_PCT`). Built-in default: 200 (the
+    /// rc.234 window — rc.442's 75 % default was reverted in rc.443
+    /// after av1_qsv died on an over-budget forced IDR); clamped 25-200.
+    /// Sub-100 values are per-host experiments only.
     #[serde(default)]
     pub constrained_hrd_pct: Option<u32>,
     /// HW-downscale Phase A — worker threads for the CPU resampler's
