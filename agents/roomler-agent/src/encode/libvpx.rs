@@ -622,6 +622,25 @@ impl VideoEncoder for Vp9Encoder {
             bail!("vp9-444: vpx_codec_encode failed: {err:?}");
         }
 
+        // P8 Phase 5 (QP telemetry, record-only) — the quantizer libvpx
+        // actually used for THIS frame (its native qindex scale, not the
+        // H.264-style 0-51). Read once per encode call and stamped on
+        // every packet the drain below yields. A control failure is a
+        // telemetry gap (None), never an encode error.
+        let last_qp: Option<i32> = {
+            let mut q: c_int = -1;
+            // SAFETY: the GET controls take a *mut int out-param through
+            // the same variadic ABI as the SET calls above; ctx is alive.
+            let err = unsafe {
+                vpx::vpx_codec_control_(
+                    &mut self.ctx,
+                    vpx::vp8e_enc_control_id::VP8E_GET_LAST_QUANTIZER as c_int,
+                    &mut q as *mut c_int,
+                )
+            };
+            (err == vpx::VPX_CODEC_OK && q >= 0).then_some(q)
+        };
+
         let mut out = Vec::new();
         let mut iter: vpx::vpx_codec_iter_t = std::ptr::null();
         loop {
@@ -657,6 +676,7 @@ impl VideoEncoder for Vp9Encoder {
                 data: slice.to_vec(),
                 is_keyframe,
                 duration_us: duration,
+                qp: last_qp,
             });
         }
 
