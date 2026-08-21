@@ -1648,6 +1648,7 @@ async fn media_pump(
     let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
     // Phase A — pump-local resampler (cached taps + pooled intermediate).
     let mut resampler = crate::encode::resample::Resampler::new();
+    // Phase B — the backend cap last handed to the capturer (change-gated).
     // rc.26 — probe SystemContext once at pump start. Captured into a
     // local bool so the per-frame check is a single comparison.
     // SystemContext capture rebinds to winsta0\Winlogon on lock; the
@@ -2853,6 +2854,8 @@ async fn media_pump_vp9_444_dc(
     let mut scale_ops: u64 = 0;
     // Phase A — pump-local resampler (cached taps + pooled intermediate).
     let mut resampler = crate::encode::resample::Resampler::new();
+    // Phase B — the backend cap last handed to the capturer (change-gated).
+    let mut last_output_cap: Option<(u32, u32)> = None;
     // P8 Phase 5 — per-window QP telemetry (record-only; libvpx qindex
     // scale). See the ffmpeg pump's twin.
     let mut qp_sum: u64 = 0;
@@ -3198,7 +3201,8 @@ async fn media_pump_vp9_444_dc(
         // downscales it. On HW paths (DownscalePolicy::Never) this is the
         // true monitor resolution; that's every host that hits the DC
         // video pumps in the field.
-        let native_dims_packed = pack_dims(frame.width, frame.height);
+        let (cap_native_w, cap_native_h) = frame.native_dims();
+        let native_dims_packed = pack_dims(cap_native_w, cap_native_h);
         capture_native_dims.store(native_dims_packed, std::sync::atomic::Ordering::Relaxed);
         // rc.190 — compose the controller's request with the agent-side caps:
         // B2 soft cap (libvpx is ALWAYS software — a 4K panel crawled at
@@ -3214,8 +3218,8 @@ async fn media_pump_vp9_444_dc(
         // semantics preserved: Priority-resolved relay hard cap + the
         // always-applied SW soft cap.
         let dims_plan = crate::encode::policy::plan_dims(&crate::encode::policy::DimsInputs {
-            native_w: frame.width,
-            native_h: frame.height,
+            native_w: cap_native_w,
+            native_h: cap_native_h,
             merged_target: user_target,
             merged_priority_cap: pipeline.merged_priority_cap(
                 crate::encode::priority_relay_cap(
@@ -3229,14 +3233,25 @@ async fn media_pump_vp9_444_dc(
             soft_cap: crate::encode::sw_res_cap_long_edge(),
         });
         let effective_target = dims_plan.effective_target;
+        // Phase B — hand the effective box to the capture backend so a
+        // GPU-capable one can scale BEFORE the readback (applies from the
+        // next frame; the CPU resample below stays the fallback + truth).
+        let backend_cap = match effective_target {
+            TargetResolution::Native => None,
+            TargetResolution::Fixed { width, height } => Some((width, height)),
+        };
+        if backend_cap != last_output_cap {
+            last_output_cap = backend_cap;
+            capturer.set_output_cap(backend_cap);
+        }
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
             info!(
                 %session_id,
                 ?user_target,
                 ?effective_target,
                 reason = dims_plan.reason.as_str(),
-                native_w = frame.width,
-                native_h = frame.height,
+                native_w = cap_native_w,
+                native_h = cap_native_h,
                 constrained = constrained_transport,
                 "VP9-444 DC pump: agent-side resolution cap engaged (relay/SW-encode)"
             );
@@ -4098,6 +4113,8 @@ async fn media_pump_ffmpeg_dc(
     // Phase A — pump-local resampler (cached taps + pooled intermediate);
     // see encode::resample module docs.
     let mut resampler = crate::encode::resample::Resampler::new();
+    // Phase B — the backend cap last handed to the capturer (change-gated).
+    let mut last_output_cap: Option<(u32, u32)> = None;
     // P8 Phase 5 — per-window QP telemetry (record-only): the encoder's
     // own quantizer reports, next to the rung/ceiling the agent CHOSE.
     // This is the dataset that decides whether a closed quality loop
@@ -4569,7 +4586,8 @@ async fn media_pump_ffmpeg_dc(
         // downscales it. On HW paths (DownscalePolicy::Never) this is the
         // true monitor resolution; that's every host that hits the DC
         // video pumps in the field.
-        let native_dims_packed = pack_dims(frame.width, frame.height);
+        let (cap_native_w, cap_native_h) = frame.native_dims();
+        let native_dims_packed = pack_dims(cap_native_w, cap_native_h);
         capture_native_dims.store(native_dims_packed, std::sync::atomic::Ordering::Relaxed);
         // P8b — the rung decision moved into `encode::policy::plan_dims`:
         // one composition (P5 merges → refine lift → soft/hard tiers) that
@@ -4581,8 +4599,8 @@ async fn media_pump_ffmpeg_dc(
         // controller pick bypasses it by construction).
         let user_target = pipeline.merged_target(*target_resolution.lock().unwrap());
         let dims_plan = crate::encode::policy::plan_dims(&crate::encode::policy::DimsInputs {
-            native_w: frame.width,
-            native_h: frame.height,
+            native_w: cap_native_w,
+            native_h: cap_native_h,
             merged_target: user_target,
             merged_priority_cap: pipeline.merged_priority_cap(
                 crate::encode::priority_relay_cap(
@@ -4596,6 +4614,17 @@ async fn media_pump_ffmpeg_dc(
             soft_cap: governor.auto_res_cap(),
         });
         let effective_target = dims_plan.effective_target;
+        // Phase B — hand the effective box to the capture backend so a
+        // GPU-capable one can scale BEFORE the readback (applies from the
+        // next frame; the CPU resample below stays the fallback + truth).
+        let backend_cap = match effective_target {
+            TargetResolution::Native => None,
+            TargetResolution::Fixed { width, height } => Some((width, height)),
+        };
+        if backend_cap != last_output_cap {
+            last_output_cap = backend_cap;
+            capturer.set_output_cap(backend_cap);
+        }
         // Quiet-tick eligibility (same terms as the keepalive arm, from the
         // SAME plan — see the post-encode site). Computed here where the
         // plan and the frame's native dims are in scope.
@@ -4613,15 +4642,16 @@ async fn media_pump_ffmpeg_dc(
                 ?user_target,
                 ?effective_target,
                 reason = dims_plan.reason.as_str(),
-                native_w = frame.width,
-                native_h = frame.height,
+                native_w = cap_native_w,
+                native_h = cap_native_h,
                 "FFmpeg DC pump: agent-side relay resolution cap engaged"
             );
             res_cap_logged = Some(effective_target);
         }
         // P7 — snapshot the native dims before the downscale shadows `frame`;
         // the CQ bias at the rebuild site is keyed on encode-vs-native area.
-        let (native_w, native_h) = (frame.width, frame.height);
+        let (native_w, native_h) = frame.native_dims();
+        let pre_scale_dims = (frame.width, frame.height);
         let scale_start = std::time::Instant::now();
         let frame = crate::encode::resample::apply_target_resolution(
             &mut resampler,
@@ -4631,8 +4661,10 @@ async fn media_pump_ffmpeg_dc(
         scale_us += scale_start.elapsed().as_micros() as u64;
         // Phase A metric fix — average over REAL resamples only (see the
         // vp9 twin): pass-through frames used to dilute avg_scale_ms far
-        // below the true per-downscale cost.
-        if (frame.width, frame.height) != (native_w, native_h) {
+        // below the true per-downscale cost. Compared against the PRE-CALL
+        // frame dims, not native: a backend-scaled frame (Phase B) passes
+        // through here at ~0 cost and must not count as a CPU resample.
+        if (frame.width, frame.height) != pre_scale_dims {
             scale_ops += 1;
         }
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's

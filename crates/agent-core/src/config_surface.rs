@@ -395,6 +395,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the pc55331 relay); off restores the un-refined Balanced rung. Env: ROOMLER_NODE_IDLE_REFINE_BALANCED. Restart required.",
     ),
     (
+        "gpu_scale",
+        "tribool",
+        "HW-downscale Phase B - GPU scale-before-readback (D3D11 VideoProcessor) on DXGI-direct capture: the Smoother rung is scaled on the GPU and the readback shrinks with it. Built-in default: on; off reverts to the Phase-A CPU resample. Env: ROOMLER_NODE_GPU_SCALE. Restart required.",
+    ),
+    (
         "idle_refine_max_edge",
         "string",
         "P7 - long-edge cap for the refined rung (0-8192). Empty/0 = full native. Env: ROOMLER_NODE_IDLE_REFINE_MAX_EDGE. Restart required.",
@@ -575,6 +580,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "scale_cq_boost" => cfg.scale_cq_boost.map(|p| p.to_string()),
         "idle_refine" => cfg.idle_refine.map(fmt_bool),
         "idle_refine_balanced" => cfg.idle_refine_balanced.map(fmt_bool),
+        "gpu_scale" => cfg.gpu_scale.map(fmt_bool),
         "idle_refine_max_edge" => cfg.idle_refine_max_edge.map(|p| p.to_string()),
         "idle_refine_min_frame_kb" => cfg.idle_refine_min_frame_kb.map(|p| p.to_string()),
         "idle_refine_major_area_permille" => {
@@ -877,6 +883,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "scale_cq_boost" => cfg.scale_cq_boost = parse_u32_range(key, value, 0, 12)?,
         "idle_refine" => cfg.idle_refine = parse_tribool(value)?,
         "idle_refine_balanced" => cfg.idle_refine_balanced = parse_tribool(value)?,
+        "gpu_scale" => cfg.gpu_scale = parse_tribool(value)?,
         "idle_refine_max_edge" => cfg.idle_refine_max_edge = parse_u32_range(key, value, 0, 8192)?,
         "idle_refine_min_frame_kb" => {
             cfg.idle_refine_min_frame_kb = parse_u32_range(key, value, 0, 256)?
