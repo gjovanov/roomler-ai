@@ -42,6 +42,19 @@ jobs:
           workspaces: '. -> target'
           shared-key: ci-linux
           cache-on-failure: true
+          # Rotate the cache key whenever THIS WORKFLOW changes. Without
+          # this, a step that adds compile surface without touching
+          # Cargo.lock (2026-08-21: `Run API unit tests` pulled the whole
+          # api/services dep universe into the test profile) computes the
+          # SAME key as the pre-step cache — Swatinem's exact-hit restore
+          # then skip-saves every run, the new artifacts can never enter
+          # the immutable cache, and every run re-pays the compile
+          # (~7 min/run, runs 32509253726/32509577955/32512705127).
+          # A ci.yml edit → new key → one cold save → warm thereafter.
+          # (The release lane needs no equivalent: every release bumps the
+          # workspace version, so its lockfile-keyed generations rotate
+          # naturally within one cycle.)
+          key: wf-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Check formatting
         run: cargo fmt --check --all
