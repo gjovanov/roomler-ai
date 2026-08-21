@@ -385,4 +385,26 @@ mod tests {
         let p = rate_plan(1024, 640, 1920, 1200, 30, true, "HEVC", false, 0.01);
         assert_eq!(p.ceiling_bps, crate::encode::MIN_BITRATE_BPS);
     }
+
+    /// P8c invariant (accidental loop 2, refine→dims→ceiling): idle
+    /// refine lifting the encode dims to native must never raise a
+    /// CONSTRAINED path's ceiling past the relay clamp — the clamp
+    /// flattens area growth, so refine sharpens pixels without
+    /// inflating what a relay link is asked to carry.
+    #[test]
+    fn constrained_ceiling_is_flat_across_refine_dim_growth() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capped = rate_plan(1024, 640, 2560, 1600, 30, true, "HEVC", false, 1.0);
+        let refined = rate_plan(2560, 1600, 2560, 1600, 30, true, "HEVC", false, 1.0);
+        assert_eq!(
+            capped.ceiling_bps, refined.ceiling_bps,
+            "refine raised the relay ceiling"
+        );
+        // Same invariant at the larger 4:4:4 factor product.
+        let capped = rate_plan(1024, 640, 2560, 1600, 30, true, "HEVC", true, 1.0);
+        let refined = rate_plan(2560, 1600, 2560, 1600, 30, true, "HEVC", true, 1.0);
+        assert_eq!(capped.ceiling_bps, refined.ceiling_bps);
+    }
 }

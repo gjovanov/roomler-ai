@@ -2903,11 +2903,6 @@ async fn media_pump_vp9_444_dc(
     let mut dc_unopen_drops: u64 = 0;
     let mut frames_skipped_backpressure: u64 = 0;
     let mut scene_change_keyframes: u64 = 0;
-    // rc.188 — viewer-rate fps cap (see `encode::viewer_rate` and the identical
-    // block in `media_pump_ffmpeg_dc`). Caps send-fps to what the browser reports
-    // it can decode, via the frame-skip divisor below.
-    let mut viewer_rate = crate::encode::viewer_rate::ViewerRateController::new(target_fps);
-    let mut viewer_rate_window = std::time::Instant::now();
     // rc.190 — one-shot (per value) log marker for the agent-side resolution
     // caps, so the field log explains WHY the stream is smaller than asked.
     let mut res_cap_logged: Option<TargetResolution> = None;
@@ -2915,9 +2910,6 @@ async fn media_pump_vp9_444_dc(
     // like the ffmpeg pump's rc.88 trio, so track ops explicitly).
     let mut scale_us: u64 = 0;
     let mut scale_ops: u64 = 0;
-    let mut decode_skip_divisor: u32 = 1;
-    let mut decode_skip_counter: u32 = 0;
-    let mut frames_skipped_decode: u64 = 0;
     // Unanswered-force retry marker (see [`KEYFRAME_BACKSTOP`]).
     let mut kf_backstop_logged = false;
     // Force-ignored fallback parity (see [`KEYFRAME_FORCE_REBUILD_AFTER`]) —
@@ -3009,20 +3001,6 @@ async fn media_pump_vp9_444_dc(
     // unconditionally applies the current preference even when the
     // controller hasn't yet pushed `rc:quality`.
     let mut last_applied_quality: u8 = 0xFF;
-    // Mirror of the AIMD controller's applied bitrate, for the heartbeat log.
-    let mut last_applied_bitrate: u32 = 0;
-    // AIMD backpressure controller (rc.171) — substitutes the missing REMB
-    // path on the DC transport. It's driven off the SEND-CHANNEL OCCUPANCY at
-    // the capacity gate (the real webrtc-rs backpressure signal), NOT
-    // `dc.buffered_amount()` — the send task's `dc.send().await` blocks under
-    // SCTP flow control, so buffered_amount stays low even while the link is
-    // saturated, and the pre-rc.171 AIMD (which ran AFTER the gate's
-    // `continue`) never fired under sustained congestion → the bitrate stayed
-    // pinned at 12.4 Mbps and the pump collapsed to ~2 fps. Constructed lazily
-    // once the first encoder gives us dims → a quality/relay ceiling. See
-    // `encode::aimd` for the full signal model + the ×0.8/×1.1 factors that
-    // used to live here inline.
-    let mut aimd: Option<encode::aimd::AimdController> = None;
     // High watermark for the SECONDARY buffer-overflow decrease trigger
     // (`dc_buffered_high` above resolves it to 256 KiB on a constrained relay,
     // this 1 MiB const otherwise).
@@ -3049,6 +3027,18 @@ async fn media_pump_vp9_444_dc(
         8
     };
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(send_depth);
+    // P8c — the rate governor owns this pump's AIMD (rc.171 — driven off
+    // SEND-CHANNEL OCCUPANCY at the capacity gate, the real webrtc-rs
+    // backpressure signal; `dc.buffered_amount()` stays low under SCTP flow
+    // control even while saturated) and the rc.188 viewer-rate fps cap.
+    // The encode-pressure/tier halves sit unused here (libvpx has its own
+    // cpu_used/quality levers). See `encode::governor` module docs — incl.
+    // the preserved rebuild divergence (`on_encoder_rebuilt_mirror_only`).
+    let mut governor = crate::encode::governor::RateGovernor::new(
+        target_fps,
+        send_depth,
+        std::time::Instant::now(),
+    );
     {
         let video_bytes_dc = video_bytes_dc.clone();
         let frames_sent = frames_sent.clone();
@@ -3191,14 +3181,10 @@ async fn media_pump_vp9_444_dc(
             // frame that DOES get through is already smaller.
             // P5 — a congested follower gates production identically (the
             // shared stream paces to the slowest link; see media_share).
-            if let Some(ctrl) = aimd.as_mut() {
-                ctrl.observe(send_depth as u32, true, std::time::Instant::now());
-                if let Some(bps) = ctrl.take_pending() {
-                    if let Some(enc) = encoder.as_mut() {
-                        enc.set_bitrate(bps);
-                    }
-                    last_applied_bitrate = bps;
-                }
+            if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
+                && let Some(enc) = encoder.as_mut()
+            {
+                enc.set_bitrate(applied.bps);
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
@@ -3386,7 +3372,7 @@ async fn media_pump_vp9_444_dc(
                     // boot-time default bitrate until we push the
                     // resolution-derived quality target through.
                     last_applied_quality = 0xFF;
-                    last_applied_bitrate = 0;
+                    governor.on_encoder_rebuilt_mirror_only();
                     // rc.45 — encoder rebuild starts at base cpu-used
                     // (apply_screen_content_controls reads the env
                     // var). Reset our tracking so the next motion
@@ -3463,37 +3449,28 @@ async fn media_pump_vp9_444_dc(
         // (`rc:decodestat`: decoded fps + a struggling bit) into a send-fps cap
         // and derive the frame-skip divisor; then drop (divisor-1) of every
         // `divisor` delta frames so the agent stops sending faster than the
-        // viewer can decode. Keyframes are never skipped.
-        let dp_now = std::time::Instant::now();
-        if dp_now.duration_since(viewer_rate_window) >= Duration::from_secs(1) {
-            let raw = viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let (reported_fps, struggling) = crate::encode::viewer_rate::unpack_report(raw);
-            let own_div = viewer_rate.observe(reported_fps, struggling, target_fps);
-            // P5 — floor: fold every follower's decode report in, take the
-            // max divisor, and step the spill gate (see media_share).
-            let new_div = own_div.max(pipeline.step_viewer_windows(own_div, target_fps));
-            if new_div != decode_skip_divisor || struggling {
-                info!(
-                    %session_id,
-                    reported_fps,
-                    struggling,
-                    cap_fps = viewer_rate.cap_fps(),
-                    skip_divisor = new_div,
-                    frames_skipped_decode,
-                    "VP9-444 DC pump: viewer-rate fps cap"
-                );
-            }
-            decode_skip_divisor = new_div;
-            viewer_rate_window = dp_now;
+        // viewer can decode. Keyframes are never skipped. P5 (in the fold
+        // closure) — floor: fold every follower's decode report in, take
+        // the max divisor, and step the spill gate (see media_share).
+        if let Some(vw) = governor.tick_viewer_window(
+            std::time::Instant::now(),
+            target_fps,
+            || viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed),
+            |own_div| pipeline.step_viewer_windows(own_div, target_fps),
+        ) && (vw.changed || vw.struggling)
+        {
+            info!(
+                %session_id,
+                reported_fps = vw.reported_fps,
+                struggling = vw.struggling,
+                cap_fps = vw.cap_fps,
+                skip_divisor = vw.skip_divisor,
+                frames_skipped_decode = governor.frames_skipped_decode(),
+                "VP9-444 DC pump: viewer-rate fps cap"
+            );
         }
-        if decode_skip_divisor > 1 && !force_keyframe_this_iter {
-            // Keep 1 of every `decode_skip_divisor` delta frames.
-            if decode_skip_counter + 1 < decode_skip_divisor {
-                decode_skip_counter += 1;
-                frames_skipped_decode += 1;
-                continue;
-            }
-            decode_skip_counter = 0;
+        if governor.should_skip_delta_frame(force_keyframe_this_iter) {
+            continue;
         }
 
         // rc.33/rc.171 — resolution + quality-derived bitrate CEILING, fed to
@@ -3521,34 +3498,20 @@ async fn media_pump_vp9_444_dc(
                 base
             };
             let ceiling = quality::target_bitrate(q_now, base).min(bitrate_cap);
-            let now = std::time::Instant::now();
-            let ctrl = aimd.get_or_insert_with(|| {
-                encode::aimd::AimdController::new(
-                    ceiling,
-                    encode::MIN_BITRATE_BPS,
-                    ceiling,
-                    send_depth as u32,
-                    now,
-                )
-            });
-            ctrl.set_ceiling(ceiling);
-            // Non-full occupancy sample so the additive-increase can recover
-            // once the link has drained (the FULL samples come from the gate).
-            let cap = send_tx.capacity();
-            ctrl.observe(send_depth.saturating_sub(cap) as u32, cap == 0, now);
-            if let Some(target) = ctrl.take_pending() {
-                enc.set_bitrate(target);
-                if q_now != last_applied_quality || target != last_applied_bitrate {
+            if let Some(applied) =
+                governor.pre_encode_tick(ceiling, send_tx.capacity(), std::time::Instant::now())
+            {
+                enc.set_bitrate(applied.bps);
+                if q_now != last_applied_quality || applied.changed {
                     info!(
                         %session_id,
                         quality = quality::label(q_now),
                         base_bps = base,
                         ceiling_bps = ceiling,
-                        target_bps = target,
+                        target_bps = applied.bps,
                         "VP9-444 set_bitrate (AIMD)"
                     );
                 }
-                last_applied_bitrate = target;
             }
             last_applied_quality = q_now;
         }
@@ -3706,18 +3669,14 @@ async fn media_pump_vp9_444_dc(
         // check that also preserves the shed-on-overflow behaviour.
         let buffered = dc.buffered_amount().await as u64;
         if buffered > dc_buffered_high {
-            if let Some(ctrl) = aimd.as_mut() {
-                ctrl.note_buffer_overflow(std::time::Instant::now());
-                if let Some(bps) = ctrl.take_pending() {
-                    enc.set_bitrate(bps);
-                    info!(
-                        %session_id,
-                        buffered,
-                        new_target = bps,
-                        "VP9-444 AIMD decrease (DC buffer over high watermark)"
-                    );
-                    last_applied_bitrate = bps;
-                }
+            if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
+                enc.set_bitrate(applied.bps);
+                info!(
+                    %session_id,
+                    buffered,
+                    new_target = applied.bps,
+                    "VP9-444 AIMD decrease (DC buffer over high watermark)"
+                );
             }
             // Skip this frame entirely + ask the controller for a keyframe on
             // resume so the decoder doesn't choke on a delta-after-gap.
@@ -3793,7 +3752,7 @@ async fn media_pump_vp9_444_dc(
                 frames_skipped_backpressure,
                 scene_change_keyframes,
                 avg_scale_ms,
-                target_bps = last_applied_bitrate,
+                target_bps = governor.applied_bps(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
         }
@@ -4148,17 +4107,6 @@ async fn media_pump_ffmpeg_dc(
     // resync-keyframe churn (the HEVC delta chain stays intact). See the gate
     // at the top of the loop.
     let mut frames_skipped_backpressure: u64 = 0;
-    // rc.188 — viewer-rate fps cap. Fold the browser's measured decode report
-    // (`rc:decodestat`: decoded fps + a struggling bit) into a send-fps cap once
-    // a second → an fps-first frame-skip divisor (skip N-1 of every N delta
-    // frames; keyframes are never skipped) so the agent settles at what a weak
-    // decoder can actually sustain instead of firehosing high-motion drags.
-    // See `encode::viewer_rate`.
-    let mut viewer_rate = crate::encode::viewer_rate::ViewerRateController::new(target_fps);
-    let mut viewer_rate_window = std::time::Instant::now();
-    let mut decode_skip_divisor: u32 = 1;
-    let mut decode_skip_counter: u32 = 0;
-    let mut frames_skipped_decode: u64 = 0;
     // Unanswered-force retry marker (see [`KEYFRAME_BACKSTOP`]).
     let mut kf_backstop_logged = false;
     // Force-ignored fallback — Some(when the oldest unanswered forced-keyframe
@@ -4168,21 +4116,6 @@ async fn media_pump_ffmpeg_dc(
     let mut last_force_rebuild: Option<std::time::Instant> = None;
     // rc.190 — one-shot (per value) log marker for the relay resolution cap.
     let mut res_cap_logged: Option<TargetResolution> = None;
-    // rc.186 — encode-pressure: when the encoder saturates (heartbeat
-    // avg_encode_ms high), scale the maxrate ceiling down so a weak sender
-    // GPU stops thrashing (the dynamic `FFMPEG_FPS=30`). Stepped once per
-    // heartbeat; applied to the ceiling every frame. 1.0 = full quality.
-    let mut encode_pressure = crate::encode::encode_pressure::EncodePressure::new();
-    let mut encode_factor: f32 = 1.0;
-    // 2026-07-27 shelf item — encode-bound auto-downscale: when the bitrate
-    // lever is exhausted (factor at floor) and the encoder is STILL
-    // saturated, step the resolution tier down (native → ~1440p → ~1080p);
-    // step back up only after sustained deep headroom. Rides the SOFT slot
-    // of `effective_target_resolution`, so an explicit controller Fixed pick
-    // always wins and the relay hard cap still composes after. Kill:
-    // `ROOMLER_AGENT_AUTO_DOWNSCALE=0`.
-    let mut downscale_tier = crate::encode::encode_pressure::DownscaleTier::new();
-    let mut auto_res_cap: Option<u32> = None;
     // rc.88 — per-stage timing accumulators (µs since last heartbeat) so
     // the field log localises the bottleneck: capture vs encode vs send.
     let mut capture_us: u64 = 0;
@@ -4225,18 +4158,24 @@ async fn media_pump_ffmpeg_dc(
     let ffmpeg_send_depth = if constrained { 4 } else { 12 };
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(ffmpeg_send_depth);
 
-    // Phase B — AIMD backpressure controller (mirrors media_pump_vp9_444_dc).
-    // Substitutes the missing REMB signal on the DC transport: driven off
-    // SEND-CHANNEL OCCUPANCY at the capacity gate (the real webrtc-rs
-    // backpressure signal — the send task's `dc.send().await` blocks under SCTP
-    // flow control, so `buffered_amount()` stays low even while saturated).
-    // Constructed lazily once the first encoder gives us dims → a per-resolution,
-    // relay-aware maxrate ceiling. The controller emits a continuous target;
-    // `FfmpegEncoder::set_bitrate` coarsens it to a ladder and applies it as an
-    // in-place NVENC reconfigure or a debounced QSV/AMF rebuild.
-    let mut aimd: Option<encode::aimd::AimdController> = None;
-    // Mirror of the AIMD's applied bitrate, for the heartbeat + change-gated log.
-    let mut last_applied_bitrate: u32 = 0;
+    // P8c — the rate governor owns the four rate controllers this pump
+    // previously threaded by hand (see `encode::governor` module docs):
+    // the Phase B AIMD (lazily constructed at the first frame's ceiling;
+    // driven off SEND-CHANNEL OCCUPANCY — the real DC backpressure
+    // signal, since SCTP flow control keeps `buffered_amount()` low even
+    // while saturated), the rc.188 viewer-rate fps cap (1 s windows →
+    // frame-skip divisor; keyframes never skipped), the rc.186
+    // encode-pressure maxrate factor (stepped once per heartbeat), and
+    // the 2026-07-27 encode-bound auto-downscale tier (soft slot of the
+    // dims plan; kill `ROOMLER_AGENT_AUTO_DOWNSCALE=0`). The governor
+    // emits continuous bitrate targets; `FfmpegEncoder::set_bitrate`
+    // coarsens them to a ladder and applies in-place (NVENC reconfigure)
+    // or as a debounced QSV/AMF rebuild whose first frame is an IDR.
+    let mut governor = crate::encode::governor::RateGovernor::new(
+        target_fps,
+        ffmpeg_send_depth,
+        std::time::Instant::now(),
+    );
     {
         let video_bytes_dc = video_bytes_dc.clone();
         let frames_sent = frames_sent.clone();
@@ -4438,14 +4377,10 @@ async fn media_pump_ffmpeg_dc(
             // P5 — a congested FOLLOWER gates production the same way: the
             // shared stream paces to the slowest link (the pre-encode floor;
             // per-viewer delta drops would break that viewer's ref chain).
-            if let Some(ctrl) = aimd.as_mut() {
-                ctrl.observe(ffmpeg_send_depth as u32, true, std::time::Instant::now());
-                if let Some(bps) = ctrl.take_pending() {
-                    if let Some(enc) = encoder.as_mut() {
-                        enc.set_bitrate(bps);
-                    }
-                    last_applied_bitrate = bps;
-                }
+            if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
+                && let Some(enc) = encoder.as_mut()
+            {
+                enc.set_bitrate(applied.bps);
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
@@ -4582,7 +4517,7 @@ async fn media_pump_ffmpeg_dc(
                                 ),
                                 refined: idle_refine.refined(),
                                 refined_cap: crate::encode::idle_refine_cap_long_edge(),
-                                soft_cap: auto_res_cap,
+                                soft_cap: governor.auto_res_cap(),
                             });
                         let eligible = nw > 0
                             && plan.capped_below_native
@@ -4678,7 +4613,7 @@ async fn media_pump_ffmpeg_dc(
             ),
             refined: idle_refine.refined(),
             refined_cap: crate::encode::idle_refine_cap_long_edge(),
-            soft_cap: auto_res_cap,
+            soft_cap: governor.auto_res_cap(),
         });
         let effective_target = dims_plan.effective_target;
         // Quiet-tick eligibility (same terms as the keepalive arm, from the
@@ -4733,7 +4668,7 @@ async fn media_pump_ffmpeg_dc(
             constrained,
             codec.label(),
             hevc_444,
-            encode_factor,
+            governor.encode_factor(),
         );
         let ceiling = rate.ceiling_bps;
         let need_rebuild = match encoder_dims {
@@ -4772,9 +4707,7 @@ async fn media_pump_ffmpeg_dc(
                     // maxrate; force the AIMD to re-apply its current (possibly
                     // lower) target so we don't snap back up to the ceiling
                     // after a dim change / resolution switch.
-                    if let Some(ctrl) = aimd.as_mut() {
-                        ctrl.force_reapply();
-                    }
+                    governor.on_encoder_rebuilt();
                 }
                 Err(e) => {
                     tracing::error!(
@@ -4875,39 +4808,30 @@ async fn media_pump_ffmpeg_dc(
         // (divisor-1) of every `divisor` delta frames so the agent stops sending
         // faster than the viewer can decode (breaking the backlog→IDR→heavier-
         // decode freeze spiral). Keyframes are never skipped. No-op at divisor 1.
-        let dp_now = std::time::Instant::now();
-        if dp_now.duration_since(viewer_rate_window) >= Duration::from_secs(1) {
-            let raw = viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let (reported_fps, struggling) = crate::encode::viewer_rate::unpack_report(raw);
-            let own_div = viewer_rate.observe(reported_fps, struggling, target_fps);
-            // P5 — the shared stream paces to the SLOWEST viewer: fold every
-            // follower's decode report in and take the max divisor. Also
-            // steps the spill gate (a sustained large deviation detaches the
-            // most deviant follower to its own encoder).
-            let new_div = own_div.max(pipeline.step_viewer_windows(own_div, target_fps));
-            if new_div != decode_skip_divisor || struggling {
-                info!(
-                    %session_id,
-                    codec_label,
-                    reported_fps,
-                    struggling,
-                    cap_fps = viewer_rate.cap_fps(),
-                    skip_divisor = new_div,
-                    frames_skipped_decode,
-                    "FFmpeg DC pump: viewer-rate fps cap"
-                );
-            }
-            decode_skip_divisor = new_div;
-            viewer_rate_window = dp_now;
+        // P5 (inside the fold closure) — the shared stream paces to the
+        // SLOWEST viewer: fold every follower's decode report in and take
+        // the max divisor. Also steps the spill gate (a sustained large
+        // deviation detaches the most deviant follower to its own encoder).
+        if let Some(vw) = governor.tick_viewer_window(
+            std::time::Instant::now(),
+            target_fps,
+            || viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed),
+            |own_div| pipeline.step_viewer_windows(own_div, target_fps),
+        ) && (vw.changed || vw.struggling)
+        {
+            info!(
+                %session_id,
+                codec_label,
+                reported_fps = vw.reported_fps,
+                struggling = vw.struggling,
+                cap_fps = vw.cap_fps,
+                skip_divisor = vw.skip_divisor,
+                frames_skipped_decode = governor.frames_skipped_decode(),
+                "FFmpeg DC pump: viewer-rate fps cap"
+            );
         }
-        if decode_skip_divisor > 1 && !force_keyframe_this_iter {
-            // Keep 1 of every `decode_skip_divisor` delta frames.
-            if decode_skip_counter + 1 < decode_skip_divisor {
-                decode_skip_counter += 1;
-                frames_skipped_decode += 1;
-                continue;
-            }
-            decode_skip_counter = 0;
+        if governor.should_skip_delta_frame(force_keyframe_this_iter) {
+            continue;
         }
 
         let Some(enc) = encoder.as_mut() else {
@@ -4920,34 +4844,18 @@ async fn media_pump_ffmpeg_dc(
         // link down under congestion / back up on recovery. `set_bitrate`
         // coarsens the target to a ladder before reconfiguring, so applying it
         // every frame is cheap (a no-op unless the coarse bucket moved).
+        if let Some(applied) =
+            governor.pre_encode_tick(ceiling, send_tx.capacity(), std::time::Instant::now())
         {
-            let now = std::time::Instant::now();
-            let ctrl = aimd.get_or_insert_with(|| {
-                encode::aimd::AimdController::new(
-                    ceiling,
-                    encode::MIN_BITRATE_BPS,
-                    ceiling,
-                    ffmpeg_send_depth as u32,
-                    now,
-                )
-            });
-            ctrl.set_ceiling(ceiling);
-            // Non-full occupancy sample so the additive-increase can recover
-            // once the link has drained (the FULL samples come from the gate).
-            let cap = send_tx.capacity();
-            ctrl.observe(ffmpeg_send_depth.saturating_sub(cap) as u32, cap == 0, now);
-            if let Some(target) = ctrl.take_pending() {
-                enc.set_bitrate(target);
-                if target != last_applied_bitrate {
-                    info!(
-                        %session_id,
-                        codec_label,
-                        ceiling_bps = ceiling,
-                        target_bps = target,
-                        "FFmpeg DC pump set_bitrate (AIMD)"
-                    );
-                }
-                last_applied_bitrate = target;
+            enc.set_bitrate(applied.bps);
+            if applied.changed {
+                info!(
+                    %session_id,
+                    codec_label,
+                    ceiling_bps = ceiling,
+                    target_bps = applied.bps,
+                    "FFmpeg DC pump set_bitrate (AIMD)"
+                );
             }
         }
 
@@ -5115,12 +5023,8 @@ async fn media_pump_ffmpeg_dc(
                     // frame the link can't drain) is a secondary congestion
                     // signal; note it to the AIMD (rate-limited MD internally).
                     // `enc` is in scope from the encode above.
-                    if let Some(ctrl) = aimd.as_mut() {
-                        ctrl.note_buffer_overflow(std::time::Instant::now());
-                        if let Some(bps) = ctrl.take_pending() {
-                            enc.set_bitrate(bps);
-                            last_applied_bitrate = bps;
-                        }
+                    if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
+                        enc.set_bitrate(applied.bps);
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -5154,22 +5058,19 @@ async fn media_pump_ffmpeg_dc(
             // rc.186 — step the encode-pressure controller off this window's
             // avg encode time; the new factor applies to the ceiling from the
             // next frame on (throttles a saturating encoder, restores when it
-            // recovers).
-            encode_factor = encode_pressure.observe(avg_encode_ms as f32);
-            // 2026-07-27 — fold this window into the resolution tier. Fires
-            // rarely (≥10 s saturated-at-floor down / ≥60 s deep-headroom
-            // up, 60 s cooldown); the dims change lands via the per-frame
-            // effective_target_resolution → dim-change encoder rebuild.
-            if let Some(new_cap) =
-                downscale_tier.observe(encode_pressure.tier_signal(), std::time::Instant::now())
+            // recovers). 2026-07-27 — the same governor heartbeat folds the
+            // window into the resolution tier. Fires rarely (≥10 s
+            // saturated-at-floor down / ≥60 s deep-headroom up, 60 s
+            // cooldown); the dims change lands via the per-frame dims plan →
+            // dim-change encoder rebuild.
+            if let Some(tier) = governor.heartbeat(avg_encode_ms as f32, std::time::Instant::now())
             {
-                auto_res_cap = new_cap;
                 tracing::info!(
                     %session_id,
                     codec_label,
-                    cap_long_edge = ?auto_res_cap,
-                    ewma_encode_ms = encode_pressure.ewma_ms(),
-                    encode_factor,
+                    cap_long_edge = ?tier.cap_long_edge,
+                    ewma_encode_ms = tier.ewma_encode_ms,
+                    encode_factor = governor.encode_factor(),
                     "encode-bound auto-downscale tier change"
                 );
             }
@@ -5178,7 +5079,7 @@ async fn media_pump_ffmpeg_dc(
                 codec_label,
                 target_fps,
                 constrained,
-                target_bps = last_applied_bitrate,
+                target_bps = governor.applied_bps(),
                 width = w,
                 height = h,
                 encoder = enc.name(),
@@ -5186,7 +5087,7 @@ async fn media_pump_ffmpeg_dc(
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
                 frames_skipped_backpressure, frames_empty,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
-                encode_factor,
+                encode_factor = governor.encode_factor(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
