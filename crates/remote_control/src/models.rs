@@ -511,9 +511,15 @@ pub struct Agent {
     /// its last hello. Published so a caller can verify what it dialled
     /// instead of trusting it on first use.
     ///
-    /// Empty = the device has no host key (SSH off, or a build without
-    /// `ssh-server`), which is NOT "any key is acceptable" — it means the
-    /// device cannot prove itself, and a client that cares should refuse.
+    /// Empty = the device stores no host key (never SSH-enabled, or a build
+    /// without `ssh-server`), which is NOT "any key is acceptable" — it means
+    /// the device cannot prove itself, and a client that cares should refuse.
+    ///
+    /// ⚠️ The converse does NOT hold. `ssh_host_key` stays in the config after
+    /// SSH is switched back off, so a NON-empty value here does not mean the
+    /// device is accepting sessions (field-checked: jupiter, `ssh_enabled =
+    /// false`, still publishing its P4a key). Whether a session can be opened
+    /// is the gate chain's answer, never this field's.
     /// Refreshed from every hello rather than written once, so rotating the
     /// key on the device is enough to move the fleet view with it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
