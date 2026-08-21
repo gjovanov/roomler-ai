@@ -174,6 +174,62 @@ pub const MIN_BITRATE_BPS: u32 = 1_500_000;
 /// additive-increase headroom on the DC backpressure controller.
 pub const MAX_BITRATE_BPS: u32 = 40_000_000;
 
+/// rc.443 — consecutive-encode-error escalation for the FFmpeg DC pump.
+/// The historical arm was `warn + continue` forever, which turned a
+/// persistently-failing HW encoder into a silent frozen stream (field
+/// 2026-08-21, CORPLAP-3: av1_qsv returned `Invalid data` on a forced IDR — the
+/// error alone would have looped; the driver then hung, which the
+/// pipeline-staleness eviction covers). The ladder retries transient
+/// errors, REBUILDS the encoder at 3 and 6 consecutive failures (a fresh
+/// open clears most driver states and its first frame is an IDR), and at
+/// 9 exits the pump CLEANLY — dropping the shared pipeline so followers
+/// detach and the viewer renegotiates, possibly onto a different codec.
+/// Any successful encode resets the ladder. Only the ffmpeg-encoder pump
+/// consumes it, hence the feature-scoped dead_code allow (the `mod tests`
+/// use does not count for a non-test build — the aimd/viewer_rate
+/// pattern).
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+#[derive(Default)]
+pub(crate) struct EncodeErrorLadder {
+    consecutive: u32,
+}
+
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeErrorAction {
+    /// Transient — skip this frame, keep the encoder.
+    Retry,
+    /// Drop + rebuild the encoder before the next frame.
+    Rebuild,
+    /// Unrecoverable — exit the pump so the session/pipeline tears down.
+    ExitPump,
+}
+
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+impl EncodeErrorLadder {
+    const REBUILD_EVERY: u32 = 3;
+    const EXIT_AT: u32 = 9;
+
+    pub fn on_error(&mut self) -> EncodeErrorAction {
+        self.consecutive += 1;
+        if self.consecutive >= Self::EXIT_AT {
+            EncodeErrorAction::ExitPump
+        } else if self.consecutive.is_multiple_of(Self::REBUILD_EVERY) {
+            EncodeErrorAction::Rebuild
+        } else {
+            EncodeErrorAction::Retry
+        }
+    }
+
+    pub fn on_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    pub fn consecutive(&self) -> u32 {
+        self.consecutive
+    }
+}
+
 pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 {
     // bpp/s bumped 0.15 → 0.20 in rc.36. RustDesk's published default is
     // ≈ 0.14–0.18; field reports (the field-test host, a second field-test host, 2026-05-17)
@@ -795,6 +851,25 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rc.443 — the encode-error ladder: retry twice, rebuild at 3 and 6,
+    /// exit at 9; any success resets.
+    #[test]
+    fn encode_error_ladder_escalates_retry_rebuild_exit() {
+        use EncodeErrorAction::*;
+        let mut l = EncodeErrorLadder::default();
+        let seq: Vec<_> = (0..9).map(|_| l.on_error()).collect();
+        assert_eq!(
+            seq,
+            [
+                Retry, Retry, Rebuild, Retry, Retry, Rebuild, Retry, Retry, ExitPump
+            ]
+        );
+        // A success anywhere resets the ladder to the beginning.
+        l.on_success();
+        assert_eq!(l.consecutive(), 0);
+        assert_eq!(l.on_error(), Retry);
+    }
 
     // P8 Phase 5 — the quality-stats → QP recovery. NVENC/QSV pass
     // frameAvgQP × FF_QP2LAMBDA(118) exactly; 0/short payloads are
