@@ -106,35 +106,54 @@ Key properties:
 | Intel Iris Xe | MF HW MFT is async-only; the async-unlock path handles it, FFmpeg QSV (`hevc_qsv`, `vp9_qsv`) proven in the field |
 | NVIDIA idle P-states | First seconds of a session encode at ~20 ms/frame until clocks ramp — `gpu_clock.rs` pins graphics clocks via NVML for exactly the session's lifetime (the Parsec "boost" trick) |
 | Windows 11 ACM / HDR desktops | Desktop Duplication hands out FP16 scRGB frames; `fp16.rs` converts scRGB→BGRA8 sRGB so capture doesn't fall back or ship corrupt stripes |
-| WSL (libcuda stub, no driver) | `hevc_nvenc` **dlopens successfully** and then SEGVs when `cuInit(0)` fails. See below — this is the one quirk the cascade does NOT route around |
+| WSL (libcuda stub, no driver) | `hevc_nvenc` **dlopens successfully** and then SEGVs when `cuInit(0)` fails. Contained since rc.432 by the child-process probe below — the host loses its HW advertisement, not its daemon |
 
-### ⚠️ Open: the probe shares an address space with the daemon
+### The probe runs in a CHILD PROCESS (rc.432)
 
-The HW probe runs **in-process**, so a segfault inside a vendor driver takes
-`roomlerd` down — and the service manager restarts it straight back into the
-same probe. The result is a crash-loop instead of an agent that runs with
-software encoding.
+A capability probe is untrusted third-party code by definition — vendor drivers
+and, through them, GPU firmware. It does not belong in the daemon's address
+space, so `encode::caps::detect()` spawns `roomlerd caps-probe` (a hidden
+subcommand), reads one `ROOMLER_CAPS_JSON:{…}` line from its stdout, and treats
+**any** failure as *every hardware codec is unavailable*:
 
-Observed 2026-08-20 on the WSL sibling. WSL ships `/usr/lib/wsl/lib/libcuda.so.1`
-as a stub with no usable driver, which puts nvenc in the **loaded-but-unusable**
-state: the `dlopen` succeeds, so the "not available" branch is never taken, and
-the failure path from `cuInit(0)` crashes. Hosts with *no* libcuda at all
-(`ldconfig -p | grep -c libcuda` = 0) are fine — they take the clean
-dlopen-failed branch.
+| Outcome | Verdict |
+|---|---|
+| non-zero exit, or killed by a signal | no HW advertised (logged at ERROR with the status) |
+| still running after 60 s | killed; no HW advertised |
+| could not spawn / output unparseable | no HW advertised |
+| clean exit with a marked line | those caps, as reported |
 
-Not version-specific and not a regression: it is latent, because the probe only
-runs at startup. An agent that has been up for hours never re-enters it, so the
-crash appears at the next restart and looks like whatever shipped most recently.
+The fallback is `compute_caps(false)` — everything computable without a driver
+call. The agent stays a working agent (files, input, RPC, software codecs); it
+just stops claiming hardware it has no evidence for, which is the honest
+reading and costs a session nothing worse than a software encode.
+
+**What it replaces.** In-process, a fault took `roomlerd` down and the service
+manager restarted it straight back into the same probe — a crash-**loop**, not
+a degraded agent. Observed 2026-08-20 on the WSL sibling: WSL ships
+`/usr/lib/wsl/lib/libcuda.so.1` as a stub with no usable driver, which puts
+nvenc in the **loaded-but-unusable** state — the `dlopen` succeeds, so the "not
+available" branch is never taken, and the failure path from `cuInit(0)`
+crashes. Hosts with *no* libcuda (`ldconfig -p | grep -c libcuda` = 0) took the
+clean dlopen-failed branch, which is why this stayed latent: the probe only
+runs at startup, so a long-lived agent never re-enters it and the crash appears
+at the next restart, looking like whatever shipped most recently.
 
 ⚠️ `ROOMLER_AGENT_HW_AUTO=0` and `ROOMLER_AGENT_ENCODER=software` do **not**
-skip it. Those select an encoder; the caps probe enumerates what to *advertise*
-and always runs.
+skip the probe. Those select an encoder; the probe enumerates what to
+*advertise* and always runs.
 
-**Fix direction: probe in a CHILD PROCESS**, and read "the child died" as
-"codec unavailable". A capability probe is untrusted third-party code by
-definition — vendor drivers and GPU firmware — and should not share an address
-space with the daemon. That retires the whole class rather than this one CUDA
-symptom, and it is why the fix is not simply "skip nvenc on WSL".
+Implementation notes worth keeping:
+
+- The child sets `ROOMLER_AGENT_CAPS_CHILD=1`; `detect()` seeing that computes
+  in-process, so nothing can recurse into an endless spawn.
+- stdout is **marker-parsed, not last-line-parsed** — the daemon logs to stdout,
+  so "the last line" would have been a log line on the very first run.
+- The child's **stderr is inherited on purpose**: its per-codec probe lines are
+  the record of *which* codec died, and they belong in the daemon log directly
+  above the verdict.
+- Verified by fault injection before shipping: with the child aborting, the
+  parent logged `the probe child DIED`, fell back to no-HW caps and exited 0.
 
 ## Capture backends
 
