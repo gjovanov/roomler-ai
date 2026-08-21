@@ -77,6 +77,34 @@ pub const STALL_EXIT_CODE: i32 = 2;
 ///     the host without a manual service restart).
 pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 
+/// rc.438: sentinel for "another process already holds this config's
+/// single-instance lock, so this one is redundant — do NOT respawn it."
+///
+/// **Linux only, deliberately.** Exit 0 means opposite things depending
+/// on who is supervising, and this path needs the opposite of what a
+/// self-update needs:
+///
+///   * **Linux** `Restart=always` restarts even on a *successful* exit —
+///     it has to, because a self-update exits 0 on purpose and must come
+///     back. So a 0 here is indistinguishable from that, and systemd
+///     re-launches the redundant process every `RestartSec` forever.
+///     Field 2026-08-21: mars / zeus / jupiter each had two units enabled
+///     (packaged `roomlerd.service` + a legacy `roomler-agent.service`),
+///     and the loser burned 1500+ restarts at 5 s intervals for weeks
+///     while the winner served happily, so nothing looked wrong.
+///     `RestartPreventExitStatus` in both units lists this code.
+///   * **macOS** `KeepAlive{SuccessfulExit:false}` relaunches only on an
+///     UNsuccessful exit, so plain 0 is already correct there — emitting
+///     this code would *create* the very loop it fixes on Linux.
+///   * **Windows** `decide_exit_reaction` maps 0 to an immediate respawn
+///     with no backoff, so it has the same bug in a worse shape; fixing
+///     it needs a new `ExitReaction`, not this constant (a non-zero code
+///     there would respawn on the backoff ladder AND record a crash
+///     sidecar). Tracked separately.
+///
+/// Emitted by the `AcquireOutcome::AlreadyRunning` arm in `main.rs`.
+pub const ALREADY_RUNNING_EXIT_CODE: i32 = 8;
+
 /// Process-wide singleton. Set by `install`; read by the free
 /// functions and the `run` task.
 static WATCHDOG: OnceLock<Arc<Watchdog>> = OnceLock::new();
@@ -720,9 +748,73 @@ mod tests {
             STALL_EXIT_CODE, AGENT_DELETED_EXIT_CODE,
             "exit-code sentinels must be distinct so supervisor branches don't alias"
         );
+        let all = [
+            STALL_EXIT_CODE,
+            AGENT_DELETED_EXIT_CODE,
+            ALREADY_RUNNING_EXIT_CODE,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "exit-code sentinels must all be distinct");
+            }
+        }
         // The constants are referenced by string in field-doc
         // (operator runbook + smoke matrix) — pin the literal values.
         assert_eq!(STALL_EXIT_CODE, 2);
         assert_eq!(AGENT_DELETED_EXIT_CODE, 7);
+        assert_eq!(ALREADY_RUNNING_EXIT_CODE, 8);
+    }
+
+    #[test]
+    fn shipped_linux_units_prevent_restart_on_the_already_running_sentinel() {
+        // The constant is only HALF the fix: systemd relaunches the
+        // redundant process regardless unless the unit also lists the
+        // code. The two live in different files with nothing coupling
+        // them, so renumbering the constant alone would silently restore
+        // the 5 s restart loop this exists to kill (mars / zeus /
+        // jupiter, 1500+ restarts each, found 2026-08-21). Assert the
+        // shipped units and the constants agree — in both directions.
+        for (name, unit) in [
+            (
+                "roomlerd.service",
+                include_str!("../packaging/linux/roomlerd.service"),
+            ),
+            (
+                "roomler.service",
+                include_str!("../packaging/linux/roomler.service"),
+            ),
+        ] {
+            let line = unit
+                .lines()
+                .find(|l| l.starts_with("RestartPreventExitStatus="))
+                .unwrap_or_else(|| panic!("{name}: no RestartPreventExitStatus= line"));
+            let codes: Vec<i32> = line
+                .trim_start_matches("RestartPreventExitStatus=")
+                .split_whitespace()
+                .map(|c| {
+                    c.parse()
+                        .unwrap_or_else(|_| panic!("{name}: non-numeric exit code {c:?}"))
+                })
+                .collect();
+
+            assert!(
+                codes.contains(&ALREADY_RUNNING_EXIT_CODE),
+                "{name} must list ALREADY_RUNNING_EXIT_CODE ({ALREADY_RUNNING_EXIT_CODE}), \
+                 else a redundant instance restart-loops every RestartSec forever; got {codes:?}"
+            );
+            assert!(
+                codes.contains(&AGENT_DELETED_EXIT_CODE),
+                "{name} must still list AGENT_DELETED_EXIT_CODE ({AGENT_DELETED_EXIT_CODE}); \
+                 got {codes:?}"
+            );
+            // The inverse matters just as much: a watchdog-forced exit is
+            // the case that MUST come back, so listing it here would turn
+            // a stall into a permanently dead node.
+            assert!(
+                !codes.contains(&STALL_EXIT_CODE),
+                "{name} must NOT list STALL_EXIT_CODE ({STALL_EXIT_CODE}) — a watchdog kill \
+                 has to be restarted; got {codes:?}"
+            );
+        }
     }
 }
