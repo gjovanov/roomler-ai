@@ -565,7 +565,7 @@ mod sshd {
         pty_req: Option<(String, crate::pty::WinSize)>,
         /// Sink for client keystrokes, live only while a terminal is. Cleared
         /// on EOF so the shell sees end-of-input.
-        pty_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+        channel_input: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         /// Resize half of the live terminal.
         pty_handle: Option<crate::pty::PtyHandle>,
     }
@@ -578,7 +578,7 @@ mod sshd {
                 policy: None,
                 deadline_armed: false,
                 pty_req: None,
-                pty_input: None,
+                channel_input: None,
                 pty_handle: None,
             }
         }
@@ -615,6 +615,180 @@ mod sshd {
                     )
                     .await;
             });
+        }
+
+        /// Serve the `sftp` subsystem — which is also how modern `scp` moves
+        /// files (OpenSSH 9 replaced the old rcp-over-exec protocol).
+        ///
+        /// **It spawns OpenSSH's `sftp-server` as the session's account rather
+        /// than serving SFTP in-process**, and that is a privilege decision,
+        /// not convenience. In-process file I/O would run as the DAEMON —
+        /// SYSTEM on Windows, root under systemd — so a session resolved to
+        /// `console_user` would silently read and write every file as root.
+        /// `exec` and the pty both drop privilege by handing work to a child;
+        /// doing anything else here would introduce a second, weaker privilege
+        /// story for the one subsystem that exists to touch files. Same
+        /// `apply_run_as`, same consent gate, same identity.
+        ///
+        /// The bytes are opaque to us: the channel is spliced to the child's
+        /// stdio and roomler never parses a single SFTP packet.
+        async fn start_sftp_session(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), russh::Error> {
+            let Some(policy) = &self.policy else {
+                return refuse(session, channel, self.peer, "sftp", "no session policy");
+            };
+            let run_as = match policy.run_as.clone() {
+                Ok(r) => r,
+                Err(why) => {
+                    return refuse(session, channel, self.peer, "sftp", &why);
+                }
+            };
+
+            // Windows can only spawn as another user through
+            // `CreateProcessAsUserW`, and the streaming variant of that lives
+            // in the pty module's pseudoconsole path — it has no pipes form
+            // yet. Refusing is the honest answer; silently running the
+            // transfer as SYSTEM would be the dangerous one.
+            #[cfg(windows)]
+            if !matches!(run_as, crate::exec::RunAs::Daemon) {
+                return refuse(
+                    session,
+                    channel,
+                    self.peer,
+                    "sftp",
+                    "file transfer as the signed-in user is not supported on Windows yet \
+                     (it needs a piped CreateProcessAsUserW). Interactive shells and \
+                     commands work; scp/sftp here would otherwise run as SYSTEM, which \
+                     is why this refuses instead.",
+                );
+            }
+
+            let program = match sftp_server_path() {
+                Some(p) => p,
+                None => {
+                    return refuse(
+                        session,
+                        channel,
+                        self.peer,
+                        "sftp",
+                        "no `sftp-server` binary on this device. roomler serves SFTP by \
+                         handing the channel to OpenSSH's own server so transfers run as \
+                         the session's account; install the OpenSSH server package to \
+                         enable scp/sftp.",
+                    );
+                }
+            };
+
+            session.channel_success(channel)?;
+            let handle = session.handle();
+            let caller = policy.caller.clone();
+            let consent = policy.consent_sentinel.clone();
+            let broker = self.ctx.services.consent.clone();
+
+            if let Some(sentinel) = consent
+                && let Err(why) = await_consent(&broker, &handle, channel, &caller, &sentinel).await
+            {
+                let _ = handle
+                    .extended_data(channel, 1, format!("roomler: {why}\r\n").into_bytes())
+                    .await;
+                let _ = handle.close(channel).await;
+                return Ok(());
+            }
+
+            let mut cmd = tokio::process::Command::new(&program);
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Err(why) = crate::exec::apply_run_as(&mut cmd, &run_as) {
+                let _ = handle
+                    .extended_data(channel, 1, format!("roomler: {why}\r\n").into_bytes())
+                    .await;
+                let _ = handle.close(channel).await;
+                return Ok(());
+            }
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = handle
+                        .extended_data(
+                            channel,
+                            1,
+                            format!("roomler: could not start sftp-server: {e}\r\n").into_bytes(),
+                        )
+                        .await;
+                    let _ = handle.close(channel).await;
+                    return Ok(());
+                }
+            };
+
+            info!(
+                peer = %self.peer, %caller, run_as = %run_as.label(),
+                privileged = run_as.is_privileged(), server = %program.display(),
+                "ssh: sftp session started"
+            );
+
+            // Bounded, for the same reason the pty's queue is: a client
+            // streaming a large upload must not grow the daemon's memory
+            // faster than sftp-server drains it.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            self.channel_input = Some(tx);
+
+            let mut stdin = child.stdin.take().expect("stdin was piped");
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Some(chunk) = rx.recv().await {
+                    if stdin.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                // EOF to the child, so it finishes and exits rather than
+                // waiting on a client that has already gone.
+                let _ = stdin.shutdown().await;
+            });
+
+            let mut stdout = child.stdout.take().expect("stdout was piped");
+            let stderr = child.stderr.take();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 32 * 1024];
+                loop {
+                    match stdout.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if handle.data(channel, buf[..n].to_vec()).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Reap before closing so the child cannot outlive the channel
+                // as a zombie holding the user's files open.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = handle.eof(channel).await;
+                let _ = handle.close(channel).await;
+            });
+
+            // sftp-server writes diagnostics here. They belong in OUR log, not
+            // on the client's channel: the SFTP stream is a binary protocol
+            // and injecting text into it corrupts the transfer.
+            if let Some(mut stderr) = stderr {
+                let peer = self.peer;
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut s = String::new();
+                    if stderr.read_to_string(&mut s).await.is_ok() && !s.trim().is_empty() {
+                        warn!(%peer, msg = %s.trim(), "ssh: sftp-server stderr");
+                    }
+                });
+            }
+
+            Ok(())
         }
 
         /// Start an interactive session on the terminal `pty_request` asked
@@ -700,7 +874,7 @@ mod sshd {
             // A bounded queue: an operator holding a key down must not be able
             // to grow the daemon's memory faster than the shell drains it.
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-            self.pty_input = Some(tx);
+            self.channel_input = Some(tx);
             self.pty_handle = Some(pty.handle());
 
             let writer = pty.handle();
@@ -931,7 +1105,7 @@ mod sshd {
             data: &[u8],
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            if let Some(tx) = &self.pty_input {
+            if let Some(tx) = &self.channel_input {
                 let _ = tx.send(data.to_vec()).await;
             }
             Ok(())
@@ -970,7 +1144,7 @@ mod sshd {
             _channel: ChannelId,
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            self.pty_input = None;
+            self.channel_input = None;
             Ok(())
         }
 
@@ -980,16 +1154,51 @@ mod sshd {
             name: &str,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            // Named explicitly because `scp` on a modern OpenSSH silently
-            // becomes an SFTP subsystem request, and "scp just hangs" is a
-            // much worse diagnostic than "not implemented yet".
-            let why = if name == "sftp" {
-                "SFTP (and therefore scp) arrives in P7."
-            } else {
-                "subsystems are not implemented."
-            };
-            refuse(session, channel, self.peer, name, why)
+            if name == "sftp" {
+                return self.start_sftp_session(channel, session).await;
+            }
+            refuse(
+                session,
+                channel,
+                self.peer,
+                name,
+                "only the `sftp` subsystem is implemented.",
+            )
         }
+    }
+
+    /// Where OpenSSH keeps `sftp-server` on this platform.
+    ///
+    /// Distribution-specific by nature — Debian puts it under `/usr/lib`,
+    /// Red Hat under `/usr/libexec`, macOS ships its own — so this probes a
+    /// list rather than hardcoding one and being wrong on half the fleet.
+    /// `None` is a normal answer (no OpenSSH server installed) and the caller
+    /// turns it into a refusal that says what to install.
+    fn sftp_server_path() -> Option<std::path::PathBuf> {
+        // `ROOMLER_SFTP_SERVER` first, for a host that keeps it somewhere
+        // unusual — an escape hatch beats a support ticket.
+        if let Ok(p) = std::env::var("ROOMLER_SFTP_SERVER") {
+            let p = std::path::PathBuf::from(p);
+            return p.is_file().then_some(p);
+        }
+        #[cfg(windows)]
+        const CANDIDATES: &[&str] = &[
+            r"C:\Windows\System32\OpenSSH\sftp-server.exe",
+            r"C:\Program Files\OpenSSH\sftp-server.exe",
+        ];
+        #[cfg(target_os = "macos")]
+        const CANDIDATES: &[&str] = &["/usr/libexec/sftp-server", "/usr/lib/ssh/sftp-server"];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        const CANDIDATES: &[&str] = &[
+            "/usr/lib/openssh/sftp-server",     // Debian, Ubuntu
+            "/usr/libexec/openssh/sftp-server", // Fedora, RHEL
+            "/usr/lib/ssh/sftp-server",         // Arch, Alpine
+            "/usr/libexec/sftp-server",
+        ];
+        CANDIDATES
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.is_file())
     }
 
     /// Tell the client no, in a way a human reads on their terminal.
@@ -1749,7 +1958,10 @@ mod tests {
         // `request_subsystem` only reports that the request was *sent*; the
         // verdict comes back on the channel, so read it rather than trusting
         // the send to mean acceptance.
-        channel.request_subsystem(true, "sftp").await.unwrap();
+        // `sftp` is served since P7, so the unsupported case needs a
+        // subsystem we genuinely do not implement. The point of the test is
+        // unchanged: a refusal must arrive WITH a reason.
+        channel.request_subsystem(true, "netconf").await.unwrap();
 
         let mut refused = false;
         let mut reason = Vec::new();
@@ -1759,7 +1971,7 @@ mod tests {
                     refused = true;
                     break;
                 }
-                russh::ChannelMsg::Success => panic!("sftp must not be accepted"),
+                russh::ChannelMsg::Success => panic!("an unknown subsystem must not be accepted"),
                 russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
                     reason.extend_from_slice(data)
                 }
@@ -1773,8 +1985,50 @@ mod tests {
         );
         let reason = String::from_utf8_lossy(&reason);
         assert!(
-            reason.contains("SFTP"),
-            "the refusal must say why — a silent failure is how `scp` turns into a hang; got {reason:?}"
+            reason.contains("subsystem"),
+            "the refusal must say why — a silent failure is how a client turns into a hang; got {reason:?}"
+        );
+    }
+
+    /// SFTP inherits the session's identity, so a session that resolved to NO
+    /// account must not transfer files either.
+    ///
+    /// This is the same rule P5c set for commands — a key-list session with
+    /// `ssh_account_mode` unset authenticates and then runs nothing rather
+    /// than quietly taking SYSTEM/root. File transfer is the subsystem where
+    /// getting that wrong would be worst, so it is asserted separately
+    /// instead of assumed to follow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sftp_is_refused_when_the_session_resolved_to_no_account() {
+        let (key, line) = client_key(9);
+        // `cfg_with` leaves `ssh_account_mode` unset — the default.
+        let addr = serve_one(&cfg_with(vec![line])).await;
+        let session = connect(addr, key).await;
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.request_subsystem(true, "sftp").await.unwrap();
+
+        let mut refused = false;
+        let mut reason = Vec::new();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Failure => {
+                    refused = true;
+                    break;
+                }
+                russh::ChannelMsg::Success => {
+                    panic!("sftp must not open for a session with no account")
+                }
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    reason.extend_from_slice(data)
+                }
+                _ => {}
+            }
+        }
+        assert!(refused, "sftp must be refused without a resolved account");
+        assert!(
+            !reason.is_empty(),
+            "and the refusal must explain itself, or scp just hangs"
         );
     }
 
