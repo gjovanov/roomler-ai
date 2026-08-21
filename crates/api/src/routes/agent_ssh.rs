@@ -64,7 +64,7 @@ use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     models::{
-        Agent, ConsentMode, SshAccountMode, SshDenyReason, SshGates, SshGrantSpec, SshMode,
+        Agent, ConsentMode, RpcCap, SshAccountMode, SshDenyReason, SshGates, SshGrantSpec, SshMode,
         SshPolicy, ssh_limits,
     },
     signaling::ServerMsg,
@@ -627,7 +627,7 @@ fn consent_mode_would_be_ignored(
     caps: &roomler_ai_remote_control::models::AgentCaps,
     mode: Option<ConsentMode>,
 ) -> bool {
-    !matches!(mode, None | Some(ConsentMode::Auto)) && !caps.rpc.iter().any(|c| c == "ssh-consent")
+    !matches!(mode, None | Some(ConsentMode::Auto)) && !caps.has_rpc(RpcCap::SshConsent)
 }
 
 #[cfg(test)]

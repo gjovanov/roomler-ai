@@ -11,7 +11,7 @@ use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     hub::DispatchCtx,
-    models::ConsentMode,
+    models::{ConsentMode, RpcCap},
     signaling::{AgentSysStats, ClientMsg, RelayRegionRtt, Role, ServerMsg},
     turn_creds::relay_regions_wire,
 };
@@ -109,11 +109,11 @@ pub async fn handle_agent_socket(
     // Fleet RPC — distilled here so the Hub can refuse a pre-feature agent
     // with 412 instead of pushing a frame it drops in its unknown-tag branch,
     // which would leave the caller waiting out its whole deadline.
-    let supports_exec = caps.rpc.iter().any(|c| c == "exec");
+    let supports_exec = caps.has_rpc(RpcCap::Exec);
     // Roomler SSH — same distillation, same reason: a grant pushed to a build
     // without the `ssh-server` feature is recorded by nobody, and the caller
     // then dials a port that authenticates them against an empty table.
-    let supports_ssh = caps.rpc.iter().any(|c| c == "ssh");
+    let supports_ssh = caps.has_rpc(RpcCap::Ssh);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
         agent_id,
         tenant_id,
