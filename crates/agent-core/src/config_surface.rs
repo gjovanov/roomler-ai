@@ -440,6 +440,21 @@ const KEYS: &[(&str, &str, &str)] = &[
         "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200). Empty = built-in 200 (the rc.234 2x window; rc.442 defaulted 75 to bound IDR transit and rc.443 reverted it - av1_qsv errors and hangs on a forced IDR that exceeds a sub-1x reservoir). Sub-100 values are per-host experiments only. Env: ROOMLER_NODE_CONSTRAINED_HRD_PCT. Restart required.",
     ),
     (
+        "priority_res_cap",
+        "tribool",
+        "rc.445 - restore the pre-rc.445 Priority-dial resolution caps (Smoother 1024 everywhere / Balanced 1280 on relay). Default OFF: every mid-motion rung flip costs a blocking encoder open (0.65-0.87s measured on Iris Xe) and the field verdict was that never flipping beats the rung; the dial's bit-shedding moved to the ceiling factors. Env: ROOMLER_NODE_PRIORITY_RES_CAP. Restart required.",
+    ),
+    (
+        "smoother_rate_pct",
+        "string",
+        "rc.445 - Smoother's bitrate-ceiling factor (percent, 30-100): a lower ceiling makes the HRD raise QP during motion continuously (smaller frames, steadier fps) with ZERO encoder rebuilds; at-rest quality untouched. Empty = built-in 70. Env: ROOMLER_NODE_SMOOTHER_RATE_PCT. Restart required.",
+    ),
+    (
+        "balanced_rate_pct",
+        "string",
+        "rc.445 - Balanced's bitrate-ceiling factor (percent, 30-100). Empty = built-in 85. Env: ROOMLER_NODE_BALANCED_RATE_PCT. Restart required.",
+    ),
+    (
         "scale_threads",
         "string",
         "HW-downscale Phase A - worker threads (1-8) for the CPU resampler's row-banded passes; a lever for weak hosts where the Smoother rung's downscale eats the frame budget. Empty = built-in 1 (inline, no threads). Env: ROOMLER_NODE_SCALE_THREADS. Restart required.",
@@ -613,6 +628,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "constrained_cq_relief" => cfg.constrained_cq_relief.map(|p| p.to_string()),
         "constrained_queue_ms" => cfg.constrained_queue_ms.map(|p| p.to_string()),
         "constrained_hrd_pct" => cfg.constrained_hrd_pct.map(|p| p.to_string()),
+        "priority_res_cap" => cfg.priority_res_cap.map(fmt_bool),
+        "smoother_rate_pct" => cfg.smoother_rate_pct.map(|p| p.to_string()),
+        "balanced_rate_pct" => cfg.balanced_rate_pct.map(|p| p.to_string()),
         "scale_threads" => cfg.scale_threads.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
@@ -926,6 +944,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "constrained_cq_relief" => cfg.constrained_cq_relief = parse_u32_range(key, value, 0, 12)?,
         "constrained_queue_ms" => cfg.constrained_queue_ms = parse_u32_range(key, value, 0, 2000)?,
         "constrained_hrd_pct" => cfg.constrained_hrd_pct = parse_u32_range(key, value, 25, 200)?,
+        "priority_res_cap" => cfg.priority_res_cap = parse_tribool(value)?,
+        "smoother_rate_pct" => cfg.smoother_rate_pct = parse_u32_range(key, value, 30, 100)?,
+        "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "scale_threads" => cfg.scale_threads = parse_u32_range(key, value, 1, 8)?,
         "ice_follow_renomination" => {
             cfg.ice_follow_renomination =
