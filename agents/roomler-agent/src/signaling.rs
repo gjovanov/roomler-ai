@@ -2605,16 +2605,15 @@ async fn handle_server_msg(
         }
 
         // Roomler SSH — the answer to a session THIS device asked for
-        // (`roomler ssh`). The LocalAPI leg that originates those lands in a
-        // later slice; until then, log it rather than let it vanish into the
-        // unknown-variant branch.
+        // (`roomler ssh`). Handed to whichever LocalAPI call is parked on it;
+        // an unknown id means that caller already gave up.
         ServerMsg::SshResponse {
             request_id,
             address,
             port,
             grant_id,
             host_pubkey,
-            expires_at_ms: _,
+            expires_at_ms,
             error,
         } => {
             // The key itself is never logged — only whether one arrived. It is
@@ -2625,7 +2624,18 @@ async fn handle_server_msg(
                 %request_id,
                 address = ?address, port = ?port, grant_id = ?grant_id,
                 verifiable = host_pubkey.is_some(), error = ?error,
-                "rc:ssh.response (originating leg not wired yet)"
+                "rc:ssh.response"
+            );
+            crate::ssh_origin::deliver(
+                &request_id,
+                crate::ssh_origin::SshGrantAnswer {
+                    address,
+                    port,
+                    host_pubkey,
+                    grant_id,
+                    expires_at_ms,
+                    error,
+                },
             );
         }
 

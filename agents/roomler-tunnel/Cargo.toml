@@ -68,6 +68,7 @@ webrtc = { workspace = true }
 
 # Random fallback for machine_id
 rand = { workspace = true }
+ssh-key = { workspace = true }
 
 # rc.66: raw socket access for `setsockopt(SO_SNDBUF)` on the local
 # listener's accepted TcpStream. Tokio re-exports tcp socket helpers
