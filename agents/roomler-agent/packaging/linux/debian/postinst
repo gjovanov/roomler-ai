@@ -1,0 +1,36 @@
+#!/bin/sh
+# Reload systemd so a unit CHANGE shipped by this package takes effect on
+# upgrade.
+#
+# The units ship as plain cargo-deb assets rather than through its
+# `systemd-units` integration, and that stays deliberate: enabling and
+# starting a daemon is the operator's / installer's decision, not the
+# package's. But an asset-only install has a sharp edge — systemd keeps
+# enforcing its CACHED copy of a unit, so any edit to a `.service` file is
+# inert until the next reboot or a manual `daemon-reload`.
+#
+# That bit rc.439. It added `RestartPreventExitStatus=7 8` so a redundant
+# instance stops restart-looping, and on an upgraded host the file on disk
+# had the exception while the running systemd did not — the fix looked
+# shipped and did nothing. Verified on mars: before this script the package
+# had no maintainer scripts at all, only .list and .md5sums.
+#
+# Reload ONLY. This must never enable, start, restart or stop anything:
+# a package upgrade is not permission to change what is running on the host,
+# and restarting the daemon here would fight the self-updater that invoked
+# dpkg in the first place.
+set -e
+
+# Absent in containers / chroots / docker builds, where there is no systemd
+# to talk to and `systemctl` would fail.
+if [ -d /run/systemd/system ]; then
+    # Never fatal: a failed reload must not leave the package unconfigured.
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+# NOTE: the per-user unit (`roomler.service`, systemd --user) cannot be
+# reloaded from here — there is no user bus to talk to at dpkg time. Those
+# installs pick the change up on next login, or via an explicit
+# `systemctl --user daemon-reload` (see README.Debian).
+
+exit 0
