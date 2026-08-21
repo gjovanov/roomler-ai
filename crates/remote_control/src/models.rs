@@ -200,6 +200,83 @@ pub struct AgentCaps {
     pub layout: Vec<String>,
 }
 
+/// A verb in [`AgentCaps::rpc`] — "this agent understands this frame".
+///
+/// The WIRE stays `Vec<String>` on purpose. Agents in the field span many
+/// releases, and a typed wire format would strand every one of them; the point
+/// of this enum is not to change the protocol but to make sure **both sides go
+/// through one vocabulary**. Before it, the agent wrote four string literals
+/// and three server call sites compared against four more, so a typo could
+/// only be caught by a device silently looking unsupported — the exact
+/// failure the capability list exists to prevent.
+///
+/// Advertising a verb says only that the agent UNDERSTANDS the frame. The org
+/// kill-switch, the device's policy and the agent-local config key all still
+/// have to say yes before anything happens.
+///
+/// **Adding one:** add the variant, then its arm in [`Self::wire`] (the match
+/// is exhaustive, so the compiler makes you), then the entry in [`Self::ALL`]
+/// (the `all_entries_are_unique_and_round_trip` test makes you). Consumers then
+/// name it by variant and can no longer misspell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcCap {
+    /// `rc:rpc.exec` — run a bounded command (Fleet RPC).
+    Exec,
+    /// This device's LocalAPI may ORIGINATE a session against another device
+    /// (`roomler ssh` / `roomler exec` from the device itself).
+    Originate,
+    /// `rc:ssh.grant` — the agent runs an SSH server and can redeem a grant.
+    /// Gated on the `ssh-server` build feature, not merely on the version.
+    Ssh,
+    /// The agent HONOURS `SshPolicy.consent_mode`.
+    ///
+    /// Deliberately distinct from [`Self::Ssh`]: agents rc.419 and earlier
+    /// advertise `ssh` while destructuring `consent_mode` away, so the server
+    /// needs to ask "does this device actually do the thing?" rather than
+    /// "does it know the feature exists". Expect that distinction to recur —
+    /// it is why a verb is finer-grained than a version check.
+    SshConsent,
+}
+
+impl RpcCap {
+    /// Exactly what crosses the wire.
+    ///
+    /// ⚠️ These strings are a COMPATIBILITY SURFACE, not an implementation
+    /// detail: changing one silently un-advertises the feature on every agent
+    /// already deployed, which reads server-side as "this device does not
+    /// support it" rather than as an error. Locked by test.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Originate => "originate",
+            Self::Ssh => "ssh",
+            Self::SshConsent => "ssh-consent",
+        }
+    }
+
+    /// Every verb THIS build knows about.
+    pub const ALL: [RpcCap; 4] = [Self::Exec, Self::Originate, Self::Ssh, Self::SshConsent];
+
+    /// Parse a wire verb. `None` for anything unrecognised — see
+    /// [`AgentCaps::has_rpc`] for why that is not an error.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.wire() == s)
+    }
+}
+
+impl AgentCaps {
+    /// Does this agent advertise `cap`?
+    ///
+    /// ⚠️ Unrecognised verbs are IGNORED rather than rejected. A NEWER agent
+    /// may advertise something this server has never heard of, and the whole
+    /// point of an additive string list is that an older reader keeps working
+    /// — so "I don't know that verb" must mean "not one I gate on", never an
+    /// error.
+    pub fn has_rpc(&self, cap: RpcCap) -> bool {
+        self.rpc.iter().any(|v| v == cap.wire())
+    }
+}
+
 /// How consent is obtained before a controller may drive a device. Resolved
 /// server-side per session from the device's [`AccessPolicy::consent_mode`]
 /// (with `Prompt` — attended — as the system default), then carried to the agent
@@ -2092,6 +2169,88 @@ pub fn block_align_slot(after: u32, slots: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WIRE LOCK. These exact strings are what every deployed agent already
+    /// sends and what the server gates on; changing one does not fail loudly,
+    /// it silently makes every existing device look like it lacks the feature.
+    /// Spelled out literally rather than derived, so a rename has to be a
+    /// deliberate edit here.
+    #[test]
+    fn rpc_cap_wire_strings_are_locked() {
+        assert_eq!(RpcCap::Exec.wire(), "exec");
+        assert_eq!(RpcCap::Originate.wire(), "originate");
+        assert_eq!(RpcCap::Ssh.wire(), "ssh");
+        assert_eq!(RpcCap::SshConsent.wire(), "ssh-consent");
+    }
+
+    #[test]
+    fn all_entries_are_unique_and_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for cap in RpcCap::ALL {
+            assert!(seen.insert(cap.wire()), "duplicate wire string {cap:?}");
+            assert_eq!(RpcCap::from_wire(cap.wire()), Some(cap));
+        }
+        assert_eq!(seen.len(), RpcCap::ALL.len());
+        assert_eq!(RpcCap::from_wire("no-such-verb"), None);
+    }
+
+    /// ⚠️ `ssh` is a PREFIX of `ssh-consent`, and the difference between them
+    /// is the difference between "runs an SSH server" and "actually honours
+    /// `consent_mode`". A matcher using `starts_with`/`contains` instead of
+    /// equality would make every ssh-capable agent look consent-capable — and
+    /// re-introduce exactly the lie P5d removed, on every device in the field
+    /// at once. Lock the distinction.
+    #[test]
+    fn ssh_does_not_imply_ssh_consent() {
+        let ssh_only = AgentCaps {
+            rpc: vec!["exec".into(), "originate".into(), "ssh".into()],
+            ..Default::default()
+        };
+        assert!(ssh_only.has_rpc(RpcCap::Ssh));
+        assert!(
+            !ssh_only.has_rpc(RpcCap::SshConsent),
+            "an rc.419-era agent must NOT read as consent-capable"
+        );
+
+        let both = AgentCaps {
+            rpc: vec!["ssh".into(), "ssh-consent".into()],
+            ..Default::default()
+        };
+        assert!(both.has_rpc(RpcCap::Ssh) && both.has_rpc(RpcCap::SshConsent));
+    }
+
+    /// Forward compatibility: a NEWER agent may advertise verbs this build has
+    /// never heard of. An additive string list is only additive if an older
+    /// reader ignores what it does not recognise instead of choking.
+    #[test]
+    fn unknown_verbs_are_ignored_not_fatal() {
+        let future = AgentCaps {
+            rpc: vec!["exec".into(), "quantum-teleport".into()],
+            ..Default::default()
+        };
+        assert!(future.has_rpc(RpcCap::Exec));
+        assert!(!future.has_rpc(RpcCap::Ssh));
+    }
+
+    /// A pre-Fleet-RPC agent sends no `rpc` key at all; every gate must read
+    /// false rather than defaulting open.
+    ///
+    /// The fixture is a ROUND TRIP rather than hand-written JSON: `rpc` is
+    /// `skip_serializing_if = "Vec::is_empty"`, so an empty one genuinely
+    /// disappears from the wire — which is exactly the old-agent shape — and
+    /// deriving it this way cannot drift as other fields come and go.
+    #[test]
+    fn absent_rpc_list_advertises_nothing() {
+        let wire = serde_json::to_string(&AgentCaps::default()).unwrap();
+        assert!(
+            !wire.contains("\"rpc\""),
+            "an empty rpc list must not reach the wire at all: {wire}"
+        );
+        let old: AgentCaps = serde_json::from_str(&wire).unwrap();
+        for cap in RpcCap::ALL {
+            assert!(!old.has_rpc(cap), "{cap:?} must not be implied by silence");
+        }
+    }
 
     #[test]
     fn exec_policy_defaults_are_closed() {
