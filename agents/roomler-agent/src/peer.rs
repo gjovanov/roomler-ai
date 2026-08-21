@@ -4550,11 +4550,6 @@ async fn media_pump_ffmpeg_dc(
                     area_judged = true;
                     if idle_refine.area_major(area_pm) {
                         frame_significant = true;
-                        // rc.445 — the motion clock for the deferred-bitrate
-                        // gate: only SIGNIFICANT frames hold the deferral
-                        // (typing/caret noise must not pin a QSV rebuild
-                        // forever on always-return backends).
-                        last_motion_at = std::time::Instant::now();
                         if let Some(flip) =
                             idle_refine.note_real_frame_area(std::time::Instant::now(), area_pm)
                         {
@@ -5084,6 +5079,21 @@ async fn media_pump_ffmpeg_dc(
         };
         encode_us += encode_start.elapsed().as_micros() as u64;
         frames_encoded += 1;
+        // rc.446 — the deferred-bitrate motion clock, ONE site: any real
+        // frame whose encoded cost exceeds trivial-delta size marks motion.
+        // rc.445 armed it only on SIGNIFICANCE-floor frames (42 KB scaled),
+        // which let light motion slip through — field clk (GDI + av1):
+        // 5-30 KB window-move frames never armed the clock, so two AIMD
+        // ladder rebuilds (each a blocking QSV open) landed mid-burst
+        // anyway. 4 KB sits above caret/keystroke deltas (0.5-3 KB, which
+        // must NOT pin the deferral on always-return backends like GDI)
+        // and below any visible motion on any codec.
+        const DEFER_MOTION_MIN_BYTES: usize = 4096;
+        if is_real_frame
+            && packets.iter().map(|p| p.data.len()).sum::<usize>() >= DEFER_MOTION_MIN_BYTES
+        {
+            last_motion_at = std::time::Instant::now();
+        }
         // P8 Phase 5 — fold the encoder's QP reports into the window.
         for pkt in &packets {
             if let Some(q) = pkt.qp {
@@ -5122,8 +5132,6 @@ async fn media_pump_ffmpeg_dc(
             let encode_area = frame.width as u64 * frame.height as u64;
             if idle_refine.bytes_significant(wire_bytes, encode_area) {
                 frame_significant = true;
-                // rc.445 — motion clock, bytes leg (untracked backends).
-                last_motion_at = std::time::Instant::now();
                 if let Some(flip) =
                     idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes, encode_area)
                 {
