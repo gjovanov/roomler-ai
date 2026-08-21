@@ -989,44 +989,60 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
     // field-test host; see BLOCKER B6 in the rc.27/rc.28 master plan.
     #[cfg(target_os = "windows")]
     {
-        let flavour = current_install_flavour();
-        // rc.56 SystemContext-preserve hotfix.
-        //
-        // Without this branch, the WiX `DisableSystemContext` deferred
-        // CA fires on every auto-update msiexec because the WiX
-        // `ENABLE_SYSTEM_CONTEXT` property defaults to `'0'` and the
-        // CA is conditioned on `ENABLE_SYSTEM_CONTEXT="0" AND NOT
-        // (REMOVE="ALL")` (see `wix-perMachine/main.wxs:344-346`).
-        // The CA runs `roomler-agent disable-system-context` which
-        // strips `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` from the SCM
-        // Environment block and restarts the service. After auto-update
-        // the supervisor sees env-var-off, doesn't perform the M3 A1
-        // winlogon-token swap, and the resulting LocalSystem worker
-        // tries to read its config from `%APPDATA%` (LocalSystem
-        // profile, empty) instead of the rc.52 machine-global
-        // `%PROGRAMDATA%\roomler\roomler-agent\config.toml` path. Net
-        // effect: every SystemContext-enabled host that auto-updates
-        // loses pre-logon capability and crash-loops until an operator
-        // re-runs the wizard. Field-reproduced 2026-05-24 on CORPLAP-1
-        // (rc.55 → reinstall).
-        //
-        // Fix: detect the env var BEFORE invoking msiexec and pass
-        // `ENABLE_SYSTEM_CONTEXT=1` so the WiX `EnableSystemContext`
-        // CA fires instead. The detection reads the SCM Environment
-        // REG_MULTI_SZ via the rc.27 helper — robust whether the
-        // SystemContext was enabled via the wizard, the
-        // `enable-system-context` CLI subcommand, or a prior MSI run.
-        let properties = preserve_system_context_property(flavour);
-        let props_ref: Vec<(&str, &str)> = properties
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        spawn_installer_for_flavour_with_properties(installer_path, flavour, &props_ref)
+        spawn_installer_as_flavour(installer_path, current_install_flavour())
     }
     #[cfg(not(target_os = "windows"))]
     {
         spawn_installer_for_flavour_inner(installer_path)
     }
+}
+
+/// Windows auto-update spawn for a caller that already KNOWS the
+/// flavour of the install being replaced. [`spawn_installer_inner`]
+/// delegates here with the running EXE's classification; the
+/// post-install watcher's wedge retry passes the `--origin-exe`
+/// flavour instead, because the watcher runs from a staged copy in
+/// the %TEMP% staging dir and its own path would misclassify as
+/// PerUser (the same trap as the wizard, documented above).
+///
+/// rc.56 SystemContext-preserve hotfix lives here so BOTH callers
+/// get it.
+///
+/// Without this branch, the WiX `DisableSystemContext` deferred
+/// CA fires on every auto-update msiexec because the WiX
+/// `ENABLE_SYSTEM_CONTEXT` property defaults to `'0'` and the
+/// CA is conditioned on `ENABLE_SYSTEM_CONTEXT="0" AND NOT
+/// (REMOVE="ALL")` (see `wix-perMachine/main.wxs:344-346`).
+/// The CA runs `roomler-agent disable-system-context` which
+/// strips `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` from the SCM
+/// Environment block and restarts the service. After auto-update
+/// the supervisor sees env-var-off, doesn't perform the M3 A1
+/// winlogon-token swap, and the resulting LocalSystem worker
+/// tries to read its config from `%APPDATA%` (LocalSystem
+/// profile, empty) instead of the rc.52 machine-global
+/// `%PROGRAMDATA%\roomler\roomler-agent\config.toml` path. Net
+/// effect: every SystemContext-enabled host that auto-updates
+/// loses pre-logon capability and crash-loops until an operator
+/// re-runs the wizard. Field-reproduced 2026-05-24 on CORPLAP-1
+/// (rc.55 → reinstall).
+///
+/// Fix: detect the env var BEFORE invoking msiexec and pass
+/// `ENABLE_SYSTEM_CONTEXT=1` so the WiX `EnableSystemContext`
+/// CA fires instead. The detection reads the SCM Environment
+/// REG_MULTI_SZ via the rc.27 helper — robust whether the
+/// SystemContext was enabled via the wizard, the
+/// `enable-system-context` CLI subcommand, or a prior MSI run.
+#[cfg(target_os = "windows")]
+pub fn spawn_installer_as_flavour(
+    installer_path: &std::path::Path,
+    flavour: WindowsInstallFlavour,
+) -> Result<u32> {
+    let properties = preserve_system_context_property(flavour);
+    let props_ref: Vec<(&str, &str)> = properties
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    spawn_installer_for_flavour_with_properties(installer_path, flavour, &props_ref)
 }
 
 /// rc.56: read the current SCM Environment block. If the perMachine
@@ -1555,21 +1571,89 @@ fn spawn_watcher(
     expected_version: &str,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("locating own exe for watcher spawn")?;
-    let _child = std::process::Command::new(&exe)
-        .arg("post-install-watch")
+    // Windows: launch the watcher from a staged COPY so it doesn't
+    // hold the install-dir image — RestartManager shuts down every
+    // manageable process holding a file the MSI replaces, and a
+    // watcher killed at install start defends nothing (field
+    // forensic 2026-08-21: last-install.json frozen at InProgress,
+    // watcher born 02:54:11, RM app-shutdown 02:54:12). Unix package
+    // managers replace files without stopping readers, so the
+    // in-place spawn stays correct there.
+    #[cfg(target_os = "windows")]
+    let (launch, staged) = stage_watcher_exe(&exe, installer_path);
+    #[cfg(not(target_os = "windows"))]
+    let (launch, staged) = (exe.clone(), false);
+    let mut cmd = std::process::Command::new(&launch);
+    cmd.arg("post-install-watch")
         .arg("--installer-pid")
         .arg(installer_pid.to_string())
         .arg("--installer-path")
         .arg(installer_path)
         .arg("--expected-version")
-        .arg(expected_version)
+        .arg(expected_version);
+    if staged {
+        // The copy's own path misclassifies flavour (%TEMP% →
+        // PerUser) and probes the wrong binary; hand it the real
+        // install path explicitly.
+        cmd.arg("--origin-exe").arg(&exe);
+    }
+    let _child = cmd
         .spawn()
         .context("spawning post-install-watch subprocess")?;
+    tracing::info!(
+        watcher_exe = %launch.display(),
+        staged,
+        "post-install watcher spawned"
+    );
     // We deliberately don't capture the Child — when the parent
     // agent exits, the watcher is reparented to init/explorer
     // (Unix) / orphaned (Windows, where there's no init). Either
     // way it runs to completion on its own.
     Ok(())
+}
+
+/// Copy the running daemon EXE into the update staging directory
+/// (the installer's own directory) and return the path to launch the
+/// watcher from, plus whether it IS a staged copy. Fallback chain:
+/// fixed name → PID-suffixed name (a previous update's watcher may
+/// still be running from the fixed name; copying onto a running
+/// image fails with a sharing violation) → the original EXE
+/// (pre-fix behaviour — a watcher RestartManager may kill beats no
+/// watcher at all).
+///
+/// The name deliberately avoids the "install"/"setup"/"update"/
+/// "patch" substrings (Windows UAC's installer-detection heuristic
+/// auto-elevates EXEs matching them — the P4 lib-naming rule).
+#[cfg(target_os = "windows")]
+fn stage_watcher_exe(
+    exe: &std::path::Path,
+    installer_path: &std::path::Path,
+) -> (std::path::PathBuf, bool) {
+    let Some(staging) = installer_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return (exe.to_path_buf(), false);
+    };
+    let fixed = staging.join("roomlerd-watch.exe");
+    match std::fs::copy(exe, &fixed) {
+        Ok(_) => return (fixed, true),
+        Err(e) => {
+            tracing::debug!(error = %e, dest = %fixed.display(), "watcher stage copy (fixed name) failed; trying pid-suffixed name")
+        }
+    }
+    let suffixed = staging.join(format!("roomlerd-watch-{}.exe", std::process::id()));
+    match std::fs::copy(exe, &suffixed) {
+        Ok(_) => (suffixed, true),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "staging watcher copy failed; spawning watcher from the install-dir EXE \
+                 (RestartManager may shut it down mid-install)"
+            );
+            (exe.to_path_buf(), false)
+        }
+    }
 }
 
 /// Resolve the effective update-check cadence for this run. Order:
@@ -2558,6 +2642,31 @@ mod tests {
                 "wizard EXE at {p} unexpectedly classified as PerMachine"
             );
         }
+    }
+
+    // ----- stage_watcher_exe (RM-survivable watcher, 2026-08-21) ------
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stage_watcher_exe_copies_next_to_the_installer() {
+        let staging = std::env::temp_dir().join(format!("rw-stage-test-{}", std::process::id()));
+        std::fs::create_dir_all(&staging).unwrap();
+        let fake_exe = staging.join("fake-daemon.exe");
+        std::fs::write(&fake_exe, b"MZ-fake").unwrap();
+        let installer = staging.join("pkg.msi");
+
+        let (launch, staged) = stage_watcher_exe(&fake_exe, &installer);
+        assert!(staged, "copy into an existing staging dir must stage");
+        assert_eq!(launch, staging.join("roomlerd-watch.exe"));
+        assert_eq!(std::fs::read(&launch).unwrap(), b"MZ-fake");
+
+        // A parent-less installer path has no staging dir — fall back
+        // to spawning from the original EXE (pre-fix behaviour).
+        let (fallback, staged) = stage_watcher_exe(&fake_exe, std::path::Path::new("pkg.msi"));
+        assert!(!staged);
+        assert_eq!(fallback, fake_exe);
+
+        let _ = std::fs::remove_dir_all(&staging);
     }
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------

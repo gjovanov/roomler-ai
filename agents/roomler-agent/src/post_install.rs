@@ -26,13 +26,35 @@
 //! lifetime of the process. When the watcher exits, the new
 //! binary's pages are what subsequent invocations load.
 //!
+//! ## Why the watcher runs from a staged COPY on Windows
+//!
+//! Mapped pages survive the overwrite, but Windows Installer's
+//! RestartManager doesn't care about pages — it enumerates the
+//! *processes holding the files being replaced* and shuts down the
+//! ones whose SID it can manage. A watcher spawned from
+//! `<install>\roomlerd.exe` IS such a process, so RM killed it
+//! seconds into every install that had contended files (field
+//! forensic 2026-08-21 on the dev host: `last-install.json` frozen
+//! at `InProgress`, watcher born 02:54:11, RM app-shutdown
+//! 02:54:12) — the wedge-recovery and service-start safety nets
+//! below never ran on exactly the installs that needed them. The
+//! updater therefore copies the EXE into the update staging dir and
+//! spawns the watcher from the copy (`updater::stage_watcher_exe`),
+//! passing `--origin-exe <install-dir exe>` so flavour
+//! classification and the version probe still target the real
+//! install rather than the copy's %TEMP% location (which would
+//! misclassify as PerUser — same trap as the install wizard,
+//! see `spawn_installer_inner`'s doc).
+//!
 //! ## Lifecycle
 //!
 //! 1. Updater downloads installer.
 //! 2. Updater spawns msiexec / dpkg / installer(8) as a child.
 //! 3. Updater spawns `roomler-agent post-install-watch
 //!    --installer-pid <pid> --installer-path <path>
-//!    --expected-version <tag>`.
+//!    --expected-version <tag>` — on Windows from a staged COPY of
+//!    the EXE with `--origin-exe <install-dir exe>` appended (see
+//!    "Why the watcher runs from a staged COPY" above).
 //! 4. Updater exits the parent agent so the OS releases its EXE
 //!    file lock.
 //! 5. Watcher polls the installer PID until it exits or 10 min
@@ -166,10 +188,16 @@ pub fn read_outcome() -> Result<Option<InstallOutcome>> {
 /// budget elapses, then writes the outcome JSON. Returns Ok(()) on
 /// every observed outcome — the JSON's `status` field carries the
 /// real verdict.
+///
+/// `origin_exe`: the daemon EXE inside the real install dir, passed
+/// when the watcher runs from a staged copy (see the module docs).
+/// `None` = the watcher runs from the install dir itself, so its own
+/// `current_exe` is the correct probe/flavour source.
 pub fn watch(
     installer_pid: u32,
     installer_path: PathBuf,
     expected_version: String,
+    origin_exe: Option<PathBuf>,
 ) -> Result<InstallOutcome> {
     let started_unix = unix_now();
     let mut outcome = InstallOutcome {
@@ -197,7 +225,7 @@ pub fn watch(
                 outcome.note = format!("installer exited with {code}");
                 tracing::error!(exit = code, "installer failed");
             } else {
-                verify_new_binary(&mut outcome, &expected_version);
+                verify_new_binary(&mut outcome, &expected_version, origin_exe.as_deref());
             }
         }
         WaitOutcome::Timeout => {
@@ -210,6 +238,7 @@ pub fn watch(
                 installer_pid,
                 &installer_path,
                 &expected_version,
+                origin_exe.as_deref(),
                 &mut outcome,
             );
             #[cfg(not(target_os = "windows"))]
@@ -232,9 +261,23 @@ pub fn watch(
     // Last act on Windows perMachine: whatever the verdict, never
     // leave the host's SCM service stopped.
     #[cfg(target_os = "windows")]
-    ensure_service_running(&mut outcome);
+    ensure_service_running(&mut outcome, install_flavour(origin_exe.as_deref()));
     let _ = write_outcome(&outcome);
     Ok(outcome)
+}
+
+/// The flavour of the install this watcher is watching. Prefers the
+/// `--origin-exe` path (the real install dir) over the watcher's own
+/// location — a staged-copy watcher runs from %TEMP%, which the path
+/// heuristic would misclassify as PerUser and thereby skip the
+/// perMachine service check AND pick the wrong elevation path on the
+/// wedge retry.
+#[cfg(target_os = "windows")]
+fn install_flavour(origin: Option<&std::path::Path>) -> crate::updater::WindowsInstallFlavour {
+    match origin {
+        Some(p) => crate::updater::classify_install_flavour_from_path(p),
+        None => crate::updater::current_install_flavour(),
+    }
 }
 
 /// Installer exited 0 — give the FS a moment to settle, then run the
@@ -246,9 +289,19 @@ pub fn watch(
 /// directory — only ever sees the stale pending-delete binary at its
 /// own path; when that probe can't verify the expected version, fall
 /// back to the flavour-derived RENAMED directory.
-fn verify_new_binary(outcome: &mut InstallOutcome, expected_version: &str) {
+///
+/// With `origin` set (staged-copy watcher) the probe targets the real
+/// install path directly — the watcher's own path is a %TEMP% copy of
+/// the OLD binary and would always report the pre-update version.
+fn verify_new_binary(
+    outcome: &mut InstallOutcome,
+    expected_version: &str,
+    origin: Option<&std::path::Path>,
+) {
     std::thread::sleep(POST_INSTALL_SETTLE);
-    let exe = std::env::current_exe().ok();
+    let exe = origin
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_exe().ok());
     if let Some(p) = &exe {
         outcome.new_binary_path = Some(p.display().to_string());
         match std::process::Command::new(p).arg("--version").output() {
@@ -265,7 +318,7 @@ fn verify_new_binary(outcome: &mut InstallOutcome, expected_version: &str) {
                         p.display()
                     );
                     #[cfg(target_os = "windows")]
-                    try_renamed_dir_fallback(outcome, expected_version, Some(p));
+                    try_renamed_dir_fallback(outcome, expected_version, Some(p), origin);
                 }
             }
             Ok(out) => {
@@ -275,20 +328,20 @@ fn verify_new_binary(outcome: &mut InstallOutcome, expected_version: &str) {
                     out.status.code().unwrap_or(-1)
                 );
                 #[cfg(target_os = "windows")]
-                try_renamed_dir_fallback(outcome, expected_version, Some(p));
+                try_renamed_dir_fallback(outcome, expected_version, Some(p), origin);
             }
             Err(e) => {
                 outcome.status = InstallStatus::SucceededUnverified;
                 outcome.note = format!("could not exec new binary --version: {e}");
                 #[cfg(target_os = "windows")]
-                try_renamed_dir_fallback(outcome, expected_version, Some(p));
+                try_renamed_dir_fallback(outcome, expected_version, Some(p), origin);
             }
         }
     } else {
         outcome.status = InstallStatus::SucceededUnverified;
         outcome.note = "could not resolve own current_exe path".into();
         #[cfg(target_os = "windows")]
-        try_renamed_dir_fallback(outcome, expected_version, None);
+        try_renamed_dir_fallback(outcome, expected_version, None, origin);
     }
 }
 
@@ -311,6 +364,7 @@ fn recover_wedged_install(
     wedged_pid: u32,
     installer_path: &std::path::Path,
     expected_version: &str,
+    origin: Option<&std::path::Path>,
     outcome: &mut InstallOutcome,
 ) {
     tracing::error!(
@@ -329,21 +383,26 @@ fn recover_wedged_install(
     run_recovery_cmd("taskkill", &["/F", "/IM", "msiexec.exe"]);
     std::thread::sleep(Duration::from_secs(5));
 
-    let retry_pid = match crate::updater::spawn_installer_inner(installer_path) {
-        Ok(pid) => pid,
-        Err(e) => {
-            outcome.status = InstallStatus::Timeout;
-            outcome.note = format!("installer wedged; retry spawn failed: {e:#}");
-            tracing::error!(error = %e, "retry spawn after wedge failed");
-            return;
-        }
-    };
+    // Spawn the retry against the ORIGIN install's flavour — a
+    // staged-copy watcher's own path would classify PerUser and take
+    // the non-elevated msiexec path, which a perMachine MSI rejects
+    // (the 2026-05-15 wizard-class 1625 failure).
+    let retry_pid =
+        match crate::updater::spawn_installer_as_flavour(installer_path, install_flavour(origin)) {
+            Ok(pid) => pid,
+            Err(e) => {
+                outcome.status = InstallStatus::Timeout;
+                outcome.note = format!("installer wedged; retry spawn failed: {e:#}");
+                tracing::error!(error = %e, "retry spawn after wedge failed");
+                return;
+            }
+        };
     outcome.installer_pid = retry_pid;
     let _ = write_outcome(outcome);
     match wait_for_pid(retry_pid, INSTALLER_BUDGET) {
         WaitOutcome::Exited(0) => {
             outcome.installer_exit_code = Some(0);
-            verify_new_binary(outcome, expected_version);
+            verify_new_binary(outcome, expected_version, origin);
             outcome.note = format!(
                 "recovered by kill+retry after initial {}s wedge; {}",
                 INSTALLER_BUDGET.as_secs(),
@@ -395,11 +454,18 @@ fn run_recovery_cmd(cmd: &str, args: &[&str]) {
 /// reboot. `sc start` is effectively idempotent for our purpose:
 /// 1056 (already running) and 1060 (no such service — perUser /
 /// attended flavours never register one) are success-equivalent.
+///
+/// Best-effort by design: on SystemContext hosts the updater — and
+/// therefore this watcher — runs in the USER-session worker, whose
+/// non-elevated token lacks SERVICE_START on a LocalSystem service
+/// (`sc` exits 5). The verdict string records that honestly instead
+/// of pretending the net exists where it can't act.
 #[cfg(target_os = "windows")]
-fn ensure_service_running(outcome: &mut InstallOutcome) {
-    if crate::updater::current_install_flavour()
-        != crate::updater::WindowsInstallFlavour::PerMachine
-    {
+fn ensure_service_running(
+    outcome: &mut InstallOutcome,
+    flavour: crate::updater::WindowsInstallFlavour,
+) {
+    if flavour != crate::updater::WindowsInstallFlavour::PerMachine {
         return;
     }
     let name = crate::win_service::NEW_SERVICE_NAME;
@@ -415,6 +481,7 @@ fn ensure_service_running(outcome: &mut InstallOutcome) {
                 1056 => "already running",
                 1060 => "not installed (non-SCM flavour)",
                 1058 => "disabled — not starting",
+                5 => "access denied (watcher context lacks SERVICE_START)",
                 _ => "start attempt failed",
             };
             tracing::info!(service = name, code, verdict, "post-install service check");
@@ -445,8 +512,9 @@ fn try_renamed_dir_fallback(
     outcome: &mut InstallOutcome,
     expected_version: &str,
     own: Option<&std::path::Path>,
+    origin: Option<&std::path::Path>,
 ) {
-    let Some(candidate) = renamed_daemon_candidate() else {
+    let Some(candidate) = renamed_daemon_candidate(install_flavour(origin)) else {
         return;
     };
     if Some(candidate.as_path()) == own || !candidate.is_file() {
@@ -471,12 +539,12 @@ fn try_renamed_dir_fallback(
 }
 
 /// The daemon EXE path inside the post-P4b (`Roomler\`) install dir
-/// for the flavour the watcher itself runs under. Split out of
-/// [`try_renamed_dir_fallback`] so the pure path derivation is unit-
-/// testable without shelling anything.
+/// for the given flavour. Split out of [`try_renamed_dir_fallback`]
+/// so the pure path derivation is unit-testable without shelling
+/// anything. The flavour comes from [`install_flavour`] — origin-
+/// aware, so a staged-copy watcher still probes the right root.
 #[cfg(target_os = "windows")]
-fn renamed_daemon_candidate() -> Option<PathBuf> {
-    let flavour = crate::updater::current_install_flavour();
+fn renamed_daemon_candidate(flavour: crate::updater::WindowsInstallFlavour) -> Option<PathBuf> {
     crate::updater::install_dir_with_name(flavour, crate::updater::INSTALL_FOLDER_NAME)
         .map(|dir| dir.join("roomlerd.exe"))
 }
@@ -622,18 +690,53 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn renamed_daemon_candidate_targets_the_roomler_dir() {
-        let candidate = renamed_daemon_candidate().expect("install root env var set on Windows");
-        // The test binary never runs from Program Files, so the
-        // flavour classifies PerUser → LOCALAPPDATA\Programs\Roomler.
+        use crate::updater::WindowsInstallFlavour;
+        let per_user = renamed_daemon_candidate(WindowsInstallFlavour::PerUser)
+            .expect("install root env var set on Windows");
         assert!(
-            candidate.ends_with(
+            per_user.ends_with(
                 std::path::Path::new("Programs")
                     .join(crate::updater::INSTALL_FOLDER_NAME)
                     .join("roomlerd.exe")
             ),
-            "unexpected candidate {}",
-            candidate.display()
+            "unexpected perUser candidate {}",
+            per_user.display()
         );
+        let per_machine = renamed_daemon_candidate(WindowsInstallFlavour::PerMachine)
+            .expect("ProgramFiles env var set on Windows");
+        assert!(
+            per_machine.ends_with(
+                std::path::Path::new(crate::updater::INSTALL_FOLDER_NAME).join("roomlerd.exe")
+            ) && per_machine
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("program files"),
+            "unexpected perMachine candidate {}",
+            per_machine.display()
+        );
+    }
+
+    // Staged-copy watcher: the origin path decides the flavour; the
+    // watcher's own %TEMP% location must not. `None` keeps the old
+    // own-path classification (a test binary runs from target\ →
+    // PerUser).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn install_flavour_prefers_origin_path() {
+        use crate::updater::WindowsInstallFlavour;
+        assert_eq!(
+            install_flavour(Some(std::path::Path::new(
+                r"C:\Program Files\Roomler\roomlerd.exe"
+            ))),
+            WindowsInstallFlavour::PerMachine
+        );
+        assert_eq!(
+            install_flavour(Some(std::path::Path::new(
+                r"C:\Users\x\AppData\Local\Programs\Roomler\roomlerd.exe"
+            ))),
+            WindowsInstallFlavour::PerUser
+        );
+        assert_eq!(install_flavour(None), WindowsInstallFlavour::PerUser);
     }
 
     #[test]
