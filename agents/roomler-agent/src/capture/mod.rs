@@ -51,6 +51,23 @@ pub struct Frame {
     /// the SystemContext pump swaps Dxgi↔Gdi backends mid-session
     /// without the media pump reopening the capturer.
     pub damage: Damage,
+    /// HW-downscale Phase B — the NATIVE capture dims when this frame
+    /// was scaled below them before delivery (GPU scale-before-readback,
+    /// or the pump's CPU resample). `None` = `width`/`height` ARE the
+    /// native dims. Consumers that need capture truth (cursor mapping,
+    /// the dims plan, the CQ-bias area ratio) read [`Frame::native_dims`]
+    /// — reading `width`/`height` directly on a scaled frame is the bug
+    /// class this field exists to kill (a cursor that lands wrong exactly
+    /// and only when GPU scale engages).
+    pub source: Option<(u32, u32)>,
+}
+
+impl Frame {
+    /// The native capture dims this frame represents — its own dims
+    /// unless a downscale recorded the pre-scale size in `source`.
+    pub fn native_dims(&self) -> (u32, u32) {
+        self.source.unwrap_or((self.width, self.height))
+    }
 }
 
 /// What the capture backend can say about WHICH pixels changed in this
@@ -171,6 +188,59 @@ pub enum DownscalePolicy {
 pub trait ScreenCapture: Send {
     async fn next_frame(&mut self) -> Result<Option<Frame>>;
     fn monitor_count(&self) -> u8;
+    /// HW-downscale Phase B — the pump's CURRENT effective encode box
+    /// (aspect-preserved, even dims), so a GPU-capable backend can scale
+    /// BEFORE the CPU readback (shrinking the readback itself). `None` =
+    /// deliver native. Advisory: backends without a GPU path (scrap,
+    /// GDI, synthetic, Noop) inherit this no-op and keep delivering
+    /// native frames — the pump's CPU resample remains the fallback and
+    /// the truth (a backend-scaled frame simply passes through it).
+    /// Applies from the NEXT frame (one-frame lag, same-in-kind as the
+    /// dim-change encoder rebuild).
+    fn set_output_cap(&mut self, _target: Option<(u32, u32)>) {}
+}
+
+/// P8a — re-project tracked damage through a downscale. Per-EDGE
+/// floor/ceil (`x0=floor(x·r)`, `x1=ceil((x+w)·r)`) so coverage never
+/// shrinks below the true footprint (floor-x/ceil-w under-covers when
+/// the scaled origin lands mid-pixel). `Unknown` passes through.
+///
+/// Phase B moved this HERE from the pump-side resampler: the codebase
+/// invariant is that damage rects share the FRAME's coordinate space
+/// (`area_permille(w*h)`, ROI hints), so a backend that GPU-scales
+/// before delivery must scale its damage too — a small frame carrying
+/// native-coord rects would read every caret as full-screen motion.
+pub(crate) fn scale_damage(
+    damage: &Damage,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Damage {
+    let Damage::Tracked(rects) = damage else {
+        return Damage::Unknown;
+    };
+    if src_w == 0 || src_h == 0 {
+        return Damage::Unknown;
+    }
+    let rx = dst_w as f64 / src_w as f64;
+    let ry = dst_h as f64 / src_h as f64;
+    let out = rects
+        .iter()
+        .filter_map(|r| {
+            let x0 = ((r.x as f64 * rx).floor() as u32).min(dst_w);
+            let y0 = ((r.y as f64 * ry).floor() as u32).min(dst_h);
+            let x1 = (((r.x + r.w) as f64 * rx).ceil() as u32).min(dst_w);
+            let y1 = (((r.y + r.h) as f64 * ry).ceil() as u32).min(dst_h);
+            (x1 > x0 && y1 > y0).then_some(DirtyRect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            })
+        })
+        .collect();
+    Damage::Tracked(out)
 }
 
 /// A capture backend that never produces frames. Used when no display is
@@ -451,6 +521,45 @@ mod synthetic_env_tests {
             });
         }
     }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    // P8a — damage re-projection through a downscale (moved here with
+    // scale_damage in Phase B).
+    #[test]
+    fn scale_damage_per_edge_covers_and_unknown_passes_through() {
+        // Per-edge floor/ceil: at ratio 0.1 a rect covering source px
+        // 19..21 (x=19, w=2) maps to scaled px 1..3 — floor-x/ceil-w
+        // (1 + ceil(0.2)=1) would cover px 1 only; per-edge covers 1..3.
+        let d = Damage::Tracked(vec![DirtyRect {
+            x: 19,
+            y: 0,
+            w: 2,
+            h: 10,
+        }]);
+        let scaled = scale_damage(&d, 100, 100, 10, 10);
+        let Damage::Tracked(v) = &scaled else {
+            panic!("tracked must stay tracked");
+        };
+        assert_eq!(v.len(), 1);
+        assert_eq!(
+            (v[0].x, v[0].w),
+            (1, 2),
+            "per-edge scaling must not under-cover"
+        );
+        assert_eq!((v[0].y, v[0].h), (0, 1));
+        // Unknown passes through as Unknown.
+        assert!(matches!(
+            scale_damage(&Damage::Unknown, 100, 100, 10, 10),
+            Damage::Unknown
+        ));
+        // Tracked-empty stays tracked-empty (provably unchanged).
+        let empty = scale_damage(&Damage::Tracked(vec![]), 100, 100, 10, 10);
+        assert!(matches!(empty, Damage::Tracked(ref v) if v.is_empty()));
+    }
 
     // ── P8a — Damage::area_permille ────────────────────────────────────
 
@@ -491,5 +600,24 @@ mod synthetic_env_tests {
         );
         // Degenerate frame area never divides by zero.
         assert_eq!(Damage::Tracked(vec![full]).area_permille(0), Some(0));
+    }
+
+    // Phase B — native-dims truth on scaled frames.
+    #[test]
+    fn native_dims_prefers_source() {
+        let mut f = Frame {
+            width: 1024,
+            height: 640,
+            stride: 4096,
+            pixel_format: PixelFormat::Bgra,
+            data: vec![],
+            monotonic_us: 0,
+            monitor: 0,
+            damage: Damage::Unknown,
+            source: None,
+        };
+        assert_eq!(f.native_dims(), (1024, 640), "no source = own dims");
+        f.source = Some((1920, 1200));
+        assert_eq!(f.native_dims(), (1920, 1200));
     }
 }
