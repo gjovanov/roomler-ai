@@ -374,6 +374,13 @@ enum Command {
         /// install completes.
         #[arg(long)]
         expected_version: String,
+        /// Path of the daemon EXE inside the real install dir. Passed
+        /// when the watcher was spawned from a staged copy (Windows),
+        /// whose own %TEMP% path would misclassify the install
+        /// flavour and probe the wrong binary. Absent = the watcher
+        /// runs from the install dir itself.
+        #[arg(long)]
+        origin_exe: Option<PathBuf>,
     },
 }
 
@@ -813,7 +820,11 @@ async fn main() -> Result<()> {
             installer_pid,
             installer_path,
             expected_version,
-        } => post_install_watch_cmd(installer_pid, installer_path, expected_version).await,
+            origin_exe,
+        } => {
+            post_install_watch_cmd(installer_pid, installer_path, expected_version, origin_exe)
+                .await
+        }
     };
 
     #[cfg(target_os = "windows")]
@@ -992,17 +1003,19 @@ async fn post_install_watch_cmd(
     installer_pid: u32,
     installer_path: PathBuf,
     expected_version: String,
+    origin_exe: Option<PathBuf>,
 ) -> Result<()> {
     tracing::info!(
         installer_pid,
         path = %installer_path.display(),
         expected = %expected_version,
+        origin = ?origin_exe,
         "post-install watcher started"
     );
     // `watch` is blocking — spin a blocking task so we don't hold
     // the tokio runtime busy-waiting on a sync OS sleep loop.
     let outcome = tokio::task::spawn_blocking(move || {
-        post_install::watch(installer_pid, installer_path, expected_version)
+        post_install::watch(installer_pid, installer_path, expected_version, origin_exe)
     })
     .await
     .context("post-install watcher join")??;
