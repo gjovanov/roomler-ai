@@ -180,6 +180,7 @@ fn encoder_options(
     cq: u32,
     qsv_low_power: bool,
     chroma444: bool,
+    constrained: bool,
 ) -> (Vec<(String, String)>, Vec<(String, String)>, String) {
     // P3 — H.264 codes text visibly softer than HEVC at equal nominal
     // quality numbers; give the h264_* encoders a 2-step sharper CQ off the
@@ -195,7 +196,20 @@ fn encoder_options(
     // that the following deltas then slowly repaired. 2× lets the transient
     // spend real bits; the AVERAGE stays bounded by `maxrate`, and actual
     // congestion is owned by the DC send channel + AIMD, not the HRD.
-    let buf = maxrate_bps.saturating_mul(2).to_string();
+    //
+    // Constrained-transport trim (field 2026-08-21, CORPLAP-1/CORPLAP-3): on a
+    // relay the 2× window is a latency bomb — it authorises a single
+    // ~750 KB refine IDR that then takes 2-3 s to cross the clamped pipe
+    // (the dominant term of "text takes 4-5 s to crystallize"). Relay
+    // sessions get `constrained_hrd_pct` (default 75 % ⇒ IDR ≤ ~280 KB ≈
+    // 1 s of link); the at-rest polish loop repairs residual IDR softness
+    // within a couple of refreshes — a repair path rc.234 predates.
+    let hrd_pct: usize = if constrained {
+        crate::encode::rate_profile::constrained_hrd_pct()
+    } else {
+        200
+    };
+    let buf = (maxrate_bps.saturating_mul(hrd_pct) / 100).to_string();
     let cq_s = cq.to_string();
     let preset = node_env("FFMPEG_PRESET");
     let tune = node_env("FFMPEG_TUNE");
@@ -422,6 +436,10 @@ pub struct FfmpegEncoder {
     /// the next `send_frame` and calls `nvEncReconfigureEncoder`); QSV/AMF do
     /// NOT reliably, so they go through a full encoder rebuild instead.
     supports_dynamic_bitrate: bool,
+    /// This session's transport verdict at open time, stored so the QSV/AMF
+    /// `set_bitrate` rebuild reuses the same HRD sizing the session opened
+    /// with (constrained ⇒ the trimmed `constrained_hrd_pct` window).
+    constrained: bool,
 }
 
 impl FfmpegEncoder {
@@ -433,12 +451,8 @@ impl FfmpegEncoder {
     /// legacy REMB-adaptive WebRTC track path; the DataChannel pump uses
     /// [`Self::new_hevc_adaptive`] to thread its real per-session fps + ceiling.
     pub fn new_hevc(width: u32, height: u32) -> Result<Self> {
-        let maxrate = ffmpeg_maxrate_bps(
-            width,
-            height,
-            DEFAULT_ENCODER_FPS as u32,
-            crate::encode::transport_is_constrained(),
-        );
+        let constrained = crate::encode::transport_is_constrained();
+        let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
             HEVC_ENCODER_NAMES,
             width,
@@ -447,6 +461,7 @@ impl FfmpegEncoder {
             maxrate,
             0,
             false,
+            constrained,
         )
     }
 
@@ -456,12 +471,8 @@ impl FfmpegEncoder {
     /// profile vp9_qsv supports — 4:4:4 sessions stay on libvpx
     /// regardless of this method's availability.
     pub fn new_vp9(width: u32, height: u32) -> Result<Self> {
-        let maxrate = ffmpeg_maxrate_bps(
-            width,
-            height,
-            DEFAULT_ENCODER_FPS as u32,
-            crate::encode::transport_is_constrained(),
-        );
+        let constrained = crate::encode::transport_is_constrained();
+        let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
             VP9_ENCODER_NAMES,
             width,
@@ -470,6 +481,7 @@ impl FfmpegEncoder {
             maxrate,
             0,
             false,
+            constrained,
         )
     }
 
@@ -492,8 +504,9 @@ impl FfmpegEncoder {
         height: u32,
         fps: u32,
         maxrate_bps: usize,
-        cq_bias: u32,
+        cq_bias: i32,
         chroma444: bool,
+        constrained: bool,
     ) -> Result<Self> {
         if chroma444 {
             match Self::new_with_dispatch(
@@ -504,6 +517,7 @@ impl FfmpegEncoder {
                 maxrate_bps,
                 cq_bias,
                 true,
+                constrained,
             ) {
                 Ok(enc) => return Ok(enc),
                 Err(e) => tracing::warn!(
@@ -520,6 +534,7 @@ impl FfmpegEncoder {
             maxrate_bps,
             cq_bias,
             false,
+            constrained,
         )
     }
 
@@ -530,7 +545,8 @@ impl FfmpegEncoder {
         height: u32,
         fps: u32,
         maxrate_bps: usize,
-        cq_bias: u32,
+        cq_bias: i32,
+        constrained: bool,
     ) -> Result<Self> {
         Self::new_with_dispatch(
             VP9_ENCODER_NAMES,
@@ -540,6 +556,7 @@ impl FfmpegEncoder {
             maxrate_bps,
             cq_bias,
             false,
+            constrained,
         )
     }
 
@@ -547,12 +564,8 @@ impl FfmpegEncoder {
     /// (`av1_nvenc` → `av1_qsv` → `av1_amf`); `Err` on hosts without AV1
     /// encode silicon, which simply don't advertise `data-channel-av1`.
     pub fn new_av1(width: u32, height: u32) -> Result<Self> {
-        let maxrate = ffmpeg_maxrate_bps(
-            width,
-            height,
-            DEFAULT_ENCODER_FPS as u32,
-            crate::encode::transport_is_constrained(),
-        );
+        let constrained = crate::encode::transport_is_constrained();
+        let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
             AV1_ENCODER_NAMES,
             width,
@@ -561,6 +574,7 @@ impl FfmpegEncoder {
             maxrate,
             0,
             false,
+            constrained,
         )
     }
 
@@ -572,7 +586,8 @@ impl FfmpegEncoder {
         height: u32,
         fps: u32,
         maxrate_bps: usize,
-        cq_bias: u32,
+        cq_bias: i32,
+        constrained: bool,
     ) -> Result<Self> {
         Self::new_with_dispatch(
             AV1_ENCODER_NAMES,
@@ -582,6 +597,7 @@ impl FfmpegEncoder {
             maxrate_bps,
             cq_bias,
             false,
+            constrained,
         )
     }
 
@@ -589,12 +605,8 @@ impl FfmpegEncoder {
     /// (`h264_nvenc` → `h264_qsv` → `h264_amf`); `Err` on hosts without
     /// H.264 encode silicon, which don't advertise `data-channel-h264`.
     pub fn new_h264(width: u32, height: u32) -> Result<Self> {
-        let maxrate = ffmpeg_maxrate_bps(
-            width,
-            height,
-            DEFAULT_ENCODER_FPS as u32,
-            crate::encode::transport_is_constrained(),
-        );
+        let constrained = crate::encode::transport_is_constrained();
+        let maxrate = ffmpeg_maxrate_bps(width, height, DEFAULT_ENCODER_FPS as u32, constrained);
         Self::new_with_dispatch(
             H264_ENCODER_NAMES,
             width,
@@ -603,6 +615,7 @@ impl FfmpegEncoder {
             maxrate,
             0,
             false,
+            constrained,
         )
     }
 
@@ -620,7 +633,8 @@ impl FfmpegEncoder {
         height: u32,
         fps: u32,
         maxrate_bps: usize,
-        cq_bias: u32,
+        cq_bias: i32,
+        constrained: bool,
     ) -> Result<Self> {
         Self::new_with_dispatch(
             H264_ENCODER_NAMES,
@@ -630,6 +644,7 @@ impl FfmpegEncoder {
             maxrate_bps,
             cq_bias,
             false,
+            constrained,
         )
     }
 
@@ -665,7 +680,7 @@ impl FfmpegEncoder {
         ffmpeg_next::init().context("ffmpeg_next::init failed")?;
         let cq = ffmpeg_cq();
         let encoder = Self::build_encoder(
-            "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false,
+            "vp9_qsv", width, height, 30, 3_000_000, cq, low_power, gop, false, false,
         )?;
         let plane_pixels = (width as usize) * (height as usize);
         Ok(Self {
@@ -683,6 +698,7 @@ impl FfmpegEncoder {
             cq,
             maxrate_bps: 3_000_000,
             supports_dynamic_bitrate: false,
+            constrained: false,
         })
     }
 
@@ -768,14 +784,16 @@ impl FfmpegEncoder {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_dispatch(
         names: &[&'static str],
         width: u32,
         height: u32,
         fps: i32,
         maxrate_bps: usize,
-        cq_bias: u32,
+        cq_bias: i32,
         chroma444: bool,
+        constrained: bool,
     ) -> Result<Self> {
         // `ffmpeg_next::init()` is idempotent + cheap to call; safe to
         // run on each new encoder. Sets up codec registration.
@@ -812,6 +830,7 @@ impl FfmpegEncoder {
                 qsv_low_power,
                 qsv_gop,
                 chroma444,
+                constrained,
             ) {
                 Ok(encoder) => {
                     tracing::info!(
@@ -850,6 +869,7 @@ impl FfmpegEncoder {
                         cq,
                         maxrate_bps,
                         supports_dynamic_bitrate: name.contains("nvenc"),
+                        constrained,
                     });
                 }
                 Err(e) => {
@@ -869,6 +889,7 @@ impl FfmpegEncoder {
         Err(last_err.unwrap_or_else(|| anyhow!("no ffmpeg encoder candidates were tried")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_encoder(
         name: &'static str,
         width: u32,
@@ -879,6 +900,7 @@ impl FfmpegEncoder {
         qsv_low_power: bool,
         qsv_gop: i32,
         chroma444: bool,
+        constrained: bool,
     ) -> Result<codec::encoder::Video> {
         let codec = codec::encoder::find_by_name(name)
             .ok_or_else(|| anyhow!("ffmpeg encoder not registered: {}", name))?;
@@ -934,7 +956,7 @@ impl FfmpegEncoder {
         };
 
         let (base, lowlat, opt_summary) =
-            encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444);
+            encoder_options(name, maxrate_bps, cq, qsv_low_power, chroma444, constrained);
 
         // TIERED open. The encoder's option dict is ALL-OR-NOTHING: if the
         // driver rejects any single private option, the WHOLE dict is
@@ -1282,6 +1304,7 @@ impl VideoEncoder for FfmpegEncoder {
                 qsv_low_power,
                 qsv_gop,
                 self.chroma444,
+                self.constrained,
             ) {
                 Ok(enc) => {
                     self.encoder = enc;
@@ -1366,6 +1389,7 @@ mod tests {
             3_000_000,
             0,
             false,
+            false,
         );
         assert!(res.is_err(), "expected Err for unknown encoder names");
         let msg = res.unwrap_err().to_string();
@@ -1393,15 +1417,33 @@ mod tests {
     /// profile override could change Main-profile behaviour).
     #[test]
     fn hevc_rext_profile_only_with_chroma444() {
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, true);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, true, false);
         assert!(
             summary.contains("profile=rext"),
             "chroma444 must set profile=rext, got: {summary}"
         );
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(
             !summary.contains("profile"),
             "4:2:0 must not set a profile, got: {summary}"
+        );
+    }
+
+    /// Constrained-transport HRD trim (field 2026-08-21): relay sessions
+    /// get the `constrained_hrd_pct` window (default 75 % of maxrate)
+    /// instead of the rc.234 2×, bounding the single-frame IDR burst the
+    /// clamped pipe must then serialize. Direct sessions keep 2×.
+    #[test]
+    fn constrained_hrd_window_is_trimmed() {
+        let (_, _, summary) = encoder_options("hevc_qsv", 3_000_000, 22, true, false, false);
+        assert!(
+            summary.contains("bufsize=6000000"),
+            "direct keeps the 2x HRD window, got: {summary}"
+        );
+        let (_, _, summary) = encoder_options("hevc_qsv", 3_000_000, 22, true, false, true);
+        assert!(
+            summary.contains("bufsize=2250000"),
+            "constrained must trim the HRD to 75% of maxrate, got: {summary}"
         );
     }
 
@@ -1423,7 +1465,7 @@ mod tests {
         let prior = std::env::var("ROOMLER_AGENT_NVENC_SPATIAL_AQ").ok();
 
         unsafe { std::env::remove_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(
             !summary.contains("spatial-aq"),
             "spatial-aq must be omitted by default, got: {summary}"
@@ -1433,7 +1475,7 @@ mod tests {
         assert!(summary.contains("rc=vbr"), "got: {summary}");
 
         unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "1") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(
             summary.contains("spatial-aq=1"),
             "env=1 must restore spatial-aq, got: {summary}"
@@ -1441,7 +1483,7 @@ mod tests {
 
         // Any non-"1" value keeps it off (explicit-opt-in semantics).
         unsafe { std::env::set_var("ROOMLER_AGENT_NVENC_SPATIAL_AQ", "0") };
-        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false);
+        let (_, _, summary) = encoder_options("hevc_nvenc", 3_000_000, 22, true, false, false);
         assert!(!summary.contains("spatial-aq"), "got: {summary}");
 
         match prior {
