@@ -217,6 +217,8 @@ fn encode_one(
                     data,
                     is_keyframe,
                     duration_us: 0,
+                    // openh264's C API exposes no per-frame QP readout.
+                    qp: None,
                 });
             }
         }

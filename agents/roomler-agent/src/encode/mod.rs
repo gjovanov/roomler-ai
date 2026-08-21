@@ -401,6 +401,31 @@ pub struct EncodedPacket {
     pub data: Vec<u8>,
     pub is_keyframe: bool,
     pub duration_us: u64,
+    /// P8 Phase 5 (QP telemetry, record-only) — the encoder's reported
+    /// quantizer for the frame this packet belongs to, in the CODEC'S
+    /// NATIVE scale (H.264/HEVC avg-QP 0-51 recovered from FFmpeg
+    /// quality stats; VP9 the libvpx last-quantizer index). `None` =
+    /// the backend doesn't report one (openh264, MF, or an FFmpeg
+    /// encoder that attaches no quality-stats side data). Feeds the
+    /// pump heartbeats' avg/max-QP fields — the dataset that decides
+    /// whether a closed quality loop replaces the area ladder. No
+    /// control loop reads it.
+    pub qp: Option<i32>,
+}
+
+/// Recover the encoder-reported average QP from an
+/// `AV_PKT_DATA_QUALITY_STATS` side-data payload. Layout (libavcodec
+/// packet.h): `u32le quality` (frame quality factor = QP ×
+/// FF_QP2LAMBDA), `u8` pict type, `u8` error count, `u16` reserved, ….
+/// NVENC and QSV fill it via `ff_side_data_set_encoder_stats(
+/// frameAvgQP × FF_QP2LAMBDA)`; x264-class SW encoders likewise.
+/// Zero/absent/short ⇒ `None` — an honest gap, not a zero QP.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub(crate) fn qp_from_quality_stats(data: &[u8]) -> Option<i32> {
+    // FF_QP2LAMBDA = 118 (libavutil). Encoders pass exact multiples.
+    const FF_QP2LAMBDA: u32 = 118;
+    let quality = u32::from_le_bytes(data.get(..4)?.try_into().ok()?);
+    (quality > 0).then_some((quality / FF_QP2LAMBDA) as i32)
 }
 
 #[async_trait::async_trait]
@@ -755,6 +780,25 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // P8 Phase 5 — the quality-stats → QP recovery. NVENC/QSV pass
+    // frameAvgQP × FF_QP2LAMBDA(118) exactly; 0/short payloads are
+    // telemetry gaps, never a zero QP.
+    #[test]
+    fn qp_from_quality_stats_recovers_exact_multiples() {
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&(24u32 * 118).to_le_bytes());
+        assert_eq!(qp_from_quality_stats(&payload), Some(24));
+        payload[..4].copy_from_slice(&(51u32 * 118).to_le_bytes());
+        assert_eq!(qp_from_quality_stats(&payload), Some(51));
+    }
+
+    #[test]
+    fn qp_from_quality_stats_gaps_are_none() {
+        assert_eq!(qp_from_quality_stats(&[0u8; 8]), None, "zero quality");
+        assert_eq!(qp_from_quality_stats(&[1, 2]), None, "short payload");
+        assert_eq!(qp_from_quality_stats(&[]), None, "empty payload");
+    }
 
     #[test]
     fn hw_auto_disabled_reads_env() {
