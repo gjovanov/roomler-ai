@@ -408,16 +408,16 @@ mod tests {
         // width*height*4. On CI it errors at primary; we accept
         // both outcomes — lock only against panic + dimensional
         // contract.
-        if let Ok(mut b) = GdiBackend::primary() {
-            if let Ok(frame) = b.frame() {
-                let expected = (frame.width as usize) * (frame.height as usize) * 4;
-                assert_eq!(
-                    frame.bytes.len(),
-                    expected,
-                    "BGRA8 buffer size must equal width * height * 4"
-                );
-                assert_eq!(frame.stride, frame.width * 4);
-            }
+        if let Ok(mut b) = GdiBackend::primary()
+            && let Ok(frame) = b.frame()
+        {
+            let expected = (frame.width as usize) * (frame.height as usize) * 4;
+            assert_eq!(
+                frame.bytes.len(),
+                expected,
+                "BGRA8 buffer size must equal width * height * 4"
+            );
+            assert_eq!(frame.stride, frame.width * 4);
         }
     }
 }

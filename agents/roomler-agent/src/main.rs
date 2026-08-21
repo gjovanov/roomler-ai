@@ -3133,6 +3133,7 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
             monotonic_us: (i as u64) * 33_333,
             monitor: 0,
             damage: roomler_agent::capture::Damage::Unknown,
+            source: None,
         });
         if i == 5 {
             enc.request_keyframe();

@@ -103,7 +103,14 @@ enum ActiveBackend {
 }
 
 type CaptureReply = Result<Option<Frame>>;
-type CaptureCmd = oneshot::Sender<CaptureReply>;
+
+/// One capture request. Phase B — carries the pump's current effective
+/// encode box per request (race-free vs a shared cell) so a GPU-capable
+/// backend can scale BEFORE the CPU readback; `None` = deliver native.
+struct CaptureCmd {
+    reply: oneshot::Sender<CaptureReply>,
+    output_cap: Option<(u32, u32)>,
+}
 
 /// Async-side handle. `cmd_tx` posts capture requests to the worker
 /// thread; the worker fills the embedded oneshot.
@@ -111,6 +118,9 @@ pub struct SystemContextCapture {
     cmd_tx: std_mpsc::Sender<CaptureCmd>,
     width: u32,
     height: u32,
+    /// Phase B — the pump's latest `set_output_cap`, attached to every
+    /// subsequent request.
+    output_cap: Option<(u32, u32)>,
 }
 
 impl SystemContextCapture {
@@ -137,6 +147,7 @@ impl SystemContextCapture {
             cmd_tx,
             width,
             height,
+            output_cap: None,
         })
     }
 
@@ -153,7 +164,10 @@ impl ScreenCapture for SystemContextCapture {
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
         let (tx, rx) = oneshot::channel::<CaptureReply>();
         self.cmd_tx
-            .send(tx)
+            .send(CaptureCmd {
+                reply: tx,
+                output_cap: self.output_cap,
+            })
             .map_err(|_| anyhow!("system-context capture worker thread is gone"))?;
         match rx.await {
             Ok(reply) => reply,
@@ -161,6 +175,10 @@ impl ScreenCapture for SystemContextCapture {
                 "system-context capture worker dropped reply oneshot"
             )),
         }
+    }
+
+    fn set_output_cap(&mut self, target: Option<(u32, u32)>) {
+        self.output_cap = target;
     }
 
     fn monitor_count(&self) -> u8 {
@@ -258,7 +276,8 @@ fn worker_main(
     let mut worker_timing_logged_at = Instant::now();
     const WORKER_TIMING_LOG_EVERY: Duration = Duration::from_secs(30);
 
-    while let Ok(res_tx) = cmd_rx.recv() {
+    while let Ok(cmd) = cmd_rx.recv() {
+        let res_tx = cmd.reply;
         let cap_start = Instant::now();
         let reply = capture_one_blocking(
             &mut backend,
@@ -267,6 +286,7 @@ fn worker_main(
             &mut consecutive_empty,
             &mut last_dxgi_reclimb,
             start,
+            cmd.output_cap,
         );
         worker_capture_us += cap_start.elapsed().as_micros() as u64;
         worker_capture_calls += 1;
@@ -496,6 +516,11 @@ fn capture_one_blocking(
     // parameter on the GDI-only build, which Rust does not warn on.
     last_dxgi_reclimb: &mut Instant,
     start: Instant,
+    // Phase B — forwarded to GPU-capable DXGI backends; GDI ignores it.
+    #[cfg_attr(not(feature = "scrap-capture"), allow(unused_variables))] output_cap: Option<(
+        u32,
+        u32,
+    )>,
 ) -> CaptureReply {
     // rc.108 — NON-PERMANENT GDI fallback. The doc-comment has claimed
     // since M3 A1 that "every successful GDI frame also re-tries DXGI"
@@ -525,7 +550,7 @@ fn capture_one_blocking(
 
     match backend {
         #[cfg(feature = "scrap-capture")]
-        ActiveBackend::Dxgi(b) => match b.frame() {
+        ActiveBackend::Dxgi(b) => match b.frame(output_cap) {
             Ok(frame) => {
                 *consecutive_hard = 0;
                 *consecutive_access_lost = 0;
@@ -737,6 +762,7 @@ fn dxgi_to_frame(f: DxgiFrame, start: Instant) -> Frame {
         // can't (scrap's public API drops the frame info) and carries
         // Unknown through the same field.
         damage: f.damage,
+        source: f.source,
     }
 }
 
@@ -752,6 +778,7 @@ fn gdi_to_frame(f: GdiFrame, start: Instant) -> Frame {
         // GDI BitBlt has no damage concept — and it emits a frame on
         // EVERY poll, so "a frame arrived" isn't motion evidence either.
         damage: crate::capture::Damage::Unknown,
+        source: None,
     }
 }
 
