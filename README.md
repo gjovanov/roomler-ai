@@ -166,6 +166,7 @@ provenance (`gh attestation verify --repo gjovanov/roomler-ai`).
 | [Installation](docs/installation.md) | Every install path on every platform, enrollment, self-update |
 | [Remote control](docs/remote-control.md) | Full remote-desktop design: protocol, security, latency budget |
 | [Encoders](docs/encoders.md) | Codec × platform matrix, hardware cascade, rate control |
+| [Rate control](docs/rate-control.md) | The Priority dial, per-session rate loops, and why resolution never flips mid-motion |
 | [Overlay communication](docs/overlay-communication.md) | Every carrier path, inside and outside a corporate VPN |
 | [Tunnels](docs/tunnels.md) | Forwards, SOCKS5, declared routes, QUIC-over-TURN |
 | [API reference](docs/api.md) | Every HTTP route + the WebSocket surfaces |
