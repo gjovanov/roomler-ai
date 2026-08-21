@@ -817,4 +817,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn deb_postinst_is_a_unix_shell_script() {
+        // This script exists so a unit change (like the exception asserted
+        // above) is not inert until the host reboots — without a
+        // `daemon-reload` systemd keeps enforcing its cached copy.
+        //
+        // It is authored from a Windows box, and a maintainer script with
+        // CRLF endings has the shebang `#!/bin/sh\r`, which resolves to a
+        // nonexistent interpreter. dpkg then fails to CONFIGURE the package
+        // on every host it reaches — for a self-updating fleet, a
+        // fleet-wide broken upgrade. `.gitattributes` pins `eol=lf`; this
+        // asserts the result rather than trusting the config.
+        let s = include_str!("../packaging/linux/debian/postinst");
+        assert!(
+            !s.contains('\r'),
+            "postinst has CR bytes — `#!/bin/sh\\r` breaks dpkg configure fleet-wide"
+        );
+        assert!(
+            s.starts_with("#!/bin/sh\n"),
+            "postinst must open with a plain /bin/sh shebang; got {:?}",
+            s.lines().next()
+        );
+        // Reload only. Enabling/starting/restarting from a package upgrade
+        // would change what runs on the host and would fight the
+        // self-updater that invoked dpkg.
+        assert!(s.contains("daemon-reload"), "postinst must reload systemd");
+        for forbidden in ["systemctl enable", "systemctl start", "systemctl restart"] {
+            assert!(
+                !s.contains(forbidden),
+                "postinst must not `{forbidden}` — a package upgrade is not permission \
+                 to change what is running"
+            );
+        }
+    }
 }
