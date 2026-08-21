@@ -794,11 +794,14 @@ async fn handle_agent_ssh_request(
     session_secs: u64,
     reply_tx: roomler_ai_remote_control::session::ClientTx,
 ) {
+    // A refusal carries no address, so it carries no host key either — the two
+    // are only ever meaningful together.
     let fail = |msg: String| ServerMsg::SshResponse {
         request_id: request_id.clone(),
         address: None,
         port: None,
         grant_id: None,
+        host_pubkey: None,
         expires_at_ms: None,
         error: Some(msg),
     };
@@ -851,13 +854,31 @@ async fn handle_agent_ssh_request(
     )
     .await;
 
+    // EXHAUSTIVE — this hand-written mapping is how `host_pubkey` went missing
+    // on this leg in the first place: the HTTP response gained the field and a
+    // field-by-field literal silently kept sending the old shape, which
+    // compiles perfectly. Binding every field means the next addition has to be
+    // decided about rather than forgotten.
+    let crate::routes::agent_ssh::SshResponseBody {
+        address,
+        port,
+        // Dropped on purpose: this leg answers a device that named its own
+        // target, so echoing the MagicDNS name back tells it nothing it did
+        // not just say. The HTTP leg keeps it for display.
+        name: _,
+        grant_id,
+        host_pubkey,
+        expires_at_ms,
+        error,
+    } = res;
     let msg = ServerMsg::SshResponse {
         request_id: request_id.clone(),
-        address: res.address,
-        port: res.port,
-        grant_id: res.grant_id,
-        expires_at_ms: res.expires_at_ms,
-        error: res.error,
+        address,
+        port,
+        grant_id,
+        host_pubkey,
+        expires_at_ms,
+        error,
     };
     if reply_tx.try_send(msg).is_err() {
         warn!(%origin_agent_id, %request_id, "rc:ssh.response undeliverable — origin WS gone");
