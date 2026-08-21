@@ -387,6 +387,44 @@ It is re-derived on every hello, so rotating the key on the device and
 restarting moves the fleet view with it; and it is rewritten even when empty,
 so a device that switches SSH off stops advertising a key it no longer holds.
 
+### `roomler ssh <device>` (P6b — shipped)
+
+```
+roomler ssh CORPLAP-1
+roomler ssh CORPLAP-1 -- uptime
+```
+
+**It execs the system `ssh` rather than embedding a client.** What roomler adds
+is discovery, authorization and host-key distribution — which device, may you,
+where does it live, what key will answer. Once those are known, the rest (raw
+mode, resize, escape sequences, agent forwarding, `scp`) is a problem OpenSSH
+already solves better than a second implementation would, and embedding a
+client would have meant owning a terminal stack forever. Roomler is not in the
+data path, which is the same property the server has by design — and it makes
+P6c a small step rather than a rewrite.
+
+The flow: `sshcmd::run` mints an ed25519 key **in the CLI process** (so the
+private half never crosses the LocalAPI socket) → LocalAPI `SshSession` → the
+daemon relays `ClientMsg::SshRequest` over its authenticated WS → `dispatch`,
+the same gate path the HTTP route uses → `ServerMsg::SshResponse` →
+`ssh_origin::deliver` wakes the parked caller → the CLI writes the key and a
+`known_hosts` into a `0700` temp directory and execs `ssh` with
+`StrictHostKeyChecking=yes`.
+
+⚠️ **`IdentitiesOnly=yes` + `IdentityAgent=none` are load-bearing, not
+hygiene.** Without them `ssh` also offers every key in the agent and
+`~/.ssh` — so a device with a matching `authorized_keys` entry could
+authenticate a session *the grant never covered*, silently turning the
+break-glass path into the normal one.
+
+⚠️ **No host key ⇒ refuse.** If the server has no key for the device, the
+command errors out instead of connecting. Falling back to trust-on-first-use
+would defeat the whole point of P6a.
+
+⚠️ `ssh-key` is pinned with `=` to the version russh resolves. Two generations
+in one tree means two incompatible `PublicKey` types across the server and
+client halves of the same feature.
+
 ### The audit trail (P3c-1 — shipped)
 
 Every request through `dispatch` — granted **or refused** — lands in
@@ -434,7 +472,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P4a | PTY / interactive shell on **Unix** (`openpty`, login shell, resize, group teardown) | **shipped** |
 | P4b | The same on **Windows** — ConPTY + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`. The platform that needs this most | **shipped** rc.429, field-proven on CORPLAP-3 |
 | P6a | Devices publish their SSH host key; the server stores it and returns it with the grant, so a caller has something to verify against | **shipped** rc.444 |
-| P6b | `roomler ssh <name>` — ephemeral keypair → grant → dial → verify against the published key → session | next |
+| P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, not yet field-run |
 | P6c | stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync` can ride the mesh | designed |
 | P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
 | P8 | Audit + session recording + admin UI | designed |
