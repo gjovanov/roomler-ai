@@ -25,6 +25,13 @@ pub struct SessionCounters {
     pub keyframe_requests: AtomicU32,
     /// Input events accepted for injection (post-suppression).
     pub input_events: AtomicU64,
+    /// P8 Phase 4 — cumulative seconds the owner's shared pipeline
+    /// served ≥1 follower (bumped by the pump heartbeats; counted on
+    /// the OWNER session, whose pump runs the pipeline).
+    pub shared_seconds: AtomicU64,
+    /// … of which the viewers' dials (Priority / resolution) were NOT
+    /// all equal — the SVC go/no-go dataset (plan Phase 4 gate).
+    pub mixed_dial_seconds: AtomicU64,
 }
 
 impl SessionCounters {
@@ -33,6 +40,14 @@ impl SessionCounters {
     }
     pub fn note_input(&self) {
         self.input_events.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One shared heartbeat window: `secs` of shared pipeline time,
+    /// `mixed` when the viewers' dials differed during it.
+    pub fn note_shared_window(&self, secs: u64, mixed: bool) {
+        self.shared_seconds.fetch_add(secs, Ordering::Relaxed);
+        if mixed {
+            self.mixed_dial_seconds.fetch_add(secs, Ordering::Relaxed);
+        }
     }
 }
 
@@ -60,6 +75,19 @@ pub fn forget(session_id: ObjectId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // P8 Phase 4 — shared windows accumulate seconds; mixed only when
+    // the dials differed during the window.
+    #[test]
+    fn shared_windows_accumulate_and_mixed_is_a_subset() {
+        let s = ObjectId::new();
+        counters(s).note_shared_window(2, false);
+        counters(s).note_shared_window(2, true);
+        counters(s).note_shared_window(1, true);
+        assert_eq!(counters(s).shared_seconds.load(Ordering::Relaxed), 5);
+        assert_eq!(counters(s).mixed_dial_seconds.load(Ordering::Relaxed), 3);
+        forget(s);
+    }
 
     #[test]
     fn counters_are_per_session_and_forgettable() {

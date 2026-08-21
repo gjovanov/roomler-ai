@@ -337,6 +337,8 @@ pub async fn handle_agent_socket(
                                 rtt_ms,
                                 keyframe_requests,
                                 input_events,
+                                shared_seconds,
+                                mixed_dial_seconds,
                             } = &parsed
                             {
                                 if state.settings.stats.enabled
@@ -350,6 +352,8 @@ pub async fn handle_agent_socket(
                                             avg_rtt_ms: *rtt_ms,
                                             keyframe_requests: *keyframe_requests,
                                             input_events: *input_events,
+                                            shared_seconds: *shared_seconds,
+                                            mixed_dial_seconds: *mixed_dial_seconds,
                                         };
                                     if let Err(e) = state
                                         .remote_sessions
