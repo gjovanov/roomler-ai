@@ -2613,12 +2613,18 @@ async fn handle_server_msg(
             address,
             port,
             grant_id,
+            host_pubkey,
             expires_at_ms: _,
             error,
         } => {
+            // The key itself is never logged — only whether one arrived. It is
+            // public, but a log line is the wrong place to start treating key
+            // material as printable, and "did the server have one for this
+            // device" is the whole diagnostic value anyway.
             info!(
                 %request_id,
-                address = ?address, port = ?port, grant_id = ?grant_id, error = ?error,
+                address = ?address, port = ?port, grant_id = ?grant_id,
+                verifiable = host_pubkey.is_some(), error = ?error,
                 "rc:ssh.response (originating leg not wired yet)"
             );
         }
