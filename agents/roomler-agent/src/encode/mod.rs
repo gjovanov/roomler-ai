@@ -86,6 +86,16 @@ pub mod rate_profile;
 )]
 pub(crate) mod policy;
 
+/// P8c — the rate governor: one owner for the four rate controllers
+/// (AIMD, viewer-rate, encode-pressure, downscale tier) the DC pumps
+/// previously threaded by hand. Structural only — see `governor.rs`
+/// module docs. Same dead_code rationale as `policy`.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) mod governor;
+
 /// Serialises tests that read/write the shared rate env vars
 /// (RELAY_MAX_KBPS, RATE_FACTOR_*, FFMPEG_MAXRATE_KBPS, SCALE_CQ_BOOST):
 /// cargo's parallel runner interleaved them once the test count grew
