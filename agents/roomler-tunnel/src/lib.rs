@@ -19,6 +19,7 @@ pub mod forward;
 /// Thin-client read verbs (`status`/`peers`/`flows`) over the daemon LocalAPI.
 pub mod localclient;
 pub mod mesh;
+pub mod sshcmd;
 pub mod update;
 
 pub use tunnel_core::forward as core_forward;

@@ -830,6 +830,71 @@ impl LocalApiState for DaemonState {
         }
     }
 
+    /// Roomler SSH (P6b) — relay a grant request over this device's control
+    /// WS and hand the answer back to the local caller.
+    ///
+    /// The public key is the CALLER's; the daemon never sees the private half,
+    /// so a grant observed anywhere along this path is useless on its own.
+    async fn ssh_session(&self, node: &str, public_key: &str, session_secs: u64) -> Response {
+        let Some(sink) = self.tunnel_hub.sink_now() else {
+            return Response::Error {
+                message: "not connected to the server — SSH grants need the control \
+                          connection (check `roomler status`)"
+                    .into(),
+            };
+        };
+
+        let request_id = bson::oid::ObjectId::new().to_hex();
+        // Register the waiter BEFORE sending, or a fast answer could arrive
+        // with nowhere to go.
+        let (_guard, rx) = crate::ssh_origin::expect_response(&request_id);
+
+        if sink
+            .send(roomler_ai_remote_control::ClientMsg::SshRequest {
+                request_id: request_id.clone(),
+                target: node.to_string(),
+                public_key: public_key.to_string(),
+                session_secs,
+            })
+            .await
+            .is_err()
+        {
+            return Response::Error {
+                message: "the server connection dropped while requesting the session".into(),
+            };
+        }
+
+        // Short on purpose: this is a gate decision plus one push to the
+        // target, not a command that runs. A grant also expires in ~60 s, so
+        // waiting minutes for one would hand back something already dead.
+        let deadline = std::time::Duration::from_secs(30);
+        let answer = match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(_)) => crate::ssh_origin::SshGrantAnswer {
+                error: Some("the server connection dropped while awaiting the grant".into()),
+                ..Default::default()
+            },
+            Err(_) => crate::ssh_origin::SshGrantAnswer {
+                error: Some(format!(
+                    "no answer about {node} within {}s",
+                    deadline.as_secs()
+                )),
+                ..Default::default()
+            },
+        };
+
+        Response::SshSession {
+            request_id,
+            node: node.to_string(),
+            address: answer.address,
+            port: answer.port,
+            host_pubkey: answer.host_pubkey,
+            grant_id: answer.grant_id,
+            expires_at_ms: answer.expires_at_ms,
+            error: answer.error,
+        }
+    }
+
     /// S1b — archive the STALE config copy on a split-config host (the
     /// desktop's "Two configurations found" banner finally gets a button).
     /// The daemon is the only safe actor: it knows which copy it LOADED and
