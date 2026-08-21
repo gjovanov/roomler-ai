@@ -52,6 +52,7 @@ pub async fn handle_agent_socket(
             caps,
             advertised_routes,
             supports_relay_regions,
+            ssh_host_pubkey,
         }) => (
             machine_name,
             os,
@@ -60,6 +61,7 @@ pub async fn handle_agent_socket(
             caps,
             advertised_routes,
             supports_relay_regions,
+            ssh_host_pubkey,
         ),
         other => {
             warn!(?other, "agent opened WS without rc:agent.hello — closing");
@@ -74,6 +76,7 @@ pub async fn handle_agent_socket(
         caps,
         advertised_routes,
         supports_relay_regions,
+        ssh_host_pubkey,
     ) = hello;
 
     // Persist: mark online, update hello fields on the Mongo row. Best-effort —
@@ -86,6 +89,7 @@ pub async fn handle_agent_socket(
             &displays,
             &caps,
             &advertised_routes,
+            &ssh_host_pubkey,
         )
         .await
     {

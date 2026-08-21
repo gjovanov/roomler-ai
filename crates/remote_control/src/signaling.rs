@@ -218,6 +218,23 @@ pub enum ClientMsg {
         /// unknown variant. Absent ⇒ `false`.
         #[serde(default)]
         supports_relay_regions: bool,
+        /// P6 — the OpenSSH **public** half of this device's SSH host key
+        /// (`ssh-ed25519 AAAA… roomler-host`), so a caller can verify what it
+        /// dialled instead of trusting it on first use.
+        ///
+        /// Reported here rather than in [`AgentCaps`] because it is an
+        /// identity, not a capability: caps answer "what can this device do",
+        /// and two devices that can do identical things still must not be
+        /// interchangeable to a client checking who it reached.
+        ///
+        /// Empty when the device has no host key — SSH disabled, or a build
+        /// without the `ssh-server` feature. Empty must therefore never be
+        /// read as "any key is fine"; it means "this device cannot prove
+        /// itself", and a client that cares should refuse rather than fall
+        /// back to TOFU. Absent from an older agent's hello deserialises the
+        /// same way.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        ssh_host_pubkey: String,
     },
 
     /// Agent periodic stats.
@@ -2066,6 +2083,7 @@ mod tests {
             caps: Box::new(AgentCaps::default()),
             advertised_routes: vec!["192.168.1.0/24".into()],
             supports_relay_regions: true,
+            ssh_host_pubkey: String::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.hello""#));
@@ -2090,6 +2108,66 @@ mod tests {
             ),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_hello_ssh_host_pubkey_roundtrips_and_absent_means_no_key() {
+        const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExample host";
+        let m = ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Linux,
+            agent_version: "0.3.0".into(),
+            displays: vec![],
+            caps: Box::new(AgentCaps::default()),
+            advertised_routes: vec![],
+            supports_relay_regions: true,
+            ssh_host_pubkey: KEY.into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(
+            s.contains(r#""ssh_host_pubkey""#),
+            "field must reach the wire"
+        );
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::AgentHello {
+                ssh_host_pubkey, ..
+            } => assert_eq!(ssh_host_pubkey, KEY),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // An agent that predates the field — the overwhelming majority of a
+        // fleet on the day this ships — must still parse, and must land on
+        // "no key" rather than anything a client could mistake for one.
+        let mut obj = serde_json::to_value(&m).unwrap();
+        obj.as_object_mut().unwrap().remove("ssh_host_pubkey");
+        match serde_json::from_value::<ClientMsg>(obj).unwrap() {
+            ClientMsg::AgentHello {
+                ssh_host_pubkey, ..
+            } => assert!(
+                ssh_host_pubkey.is_empty(),
+                "a hello without the field must mean NO host key, never a wildcard"
+            ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // And an empty key must not be emitted at all, so "absent" and
+        // "empty" cannot drift into two different meanings on the wire.
+        let none = ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Linux,
+            agent_version: "0.3.0".into(),
+            displays: vec![],
+            caps: Box::new(AgentCaps::default()),
+            advertised_routes: vec![],
+            supports_relay_regions: true,
+            ssh_host_pubkey: String::new(),
+        };
+        assert!(
+            !serde_json::to_string(&none)
+                .unwrap()
+                .contains("ssh_host_pubkey"),
+            "an empty host key must be omitted, not sent as \"\""
+        );
     }
 
     /// Multi-region relay wire locks: exact tags, field defaults, and the
