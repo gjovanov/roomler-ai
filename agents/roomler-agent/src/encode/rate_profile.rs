@@ -482,6 +482,17 @@ pub const REFINE_MAJOR_AREA_PERMILLE: u32 = 400;
 /// cooldown bounds what remains. Env/config `idle_refine_settle_ms`.
 pub const REFINE_SETTLE_TRACKED: Duration = Duration::from_millis(500);
 
+/// Phase B field fix (2026-08-21, CORPLAP-1/CORPLAP-3) — the tracked settle on a
+/// CONSTRAINED transport. On a ~3 Mbps relay every Up→Down pair costs two
+/// encoder rebuilds plus two IDRs (~150-400 KB each ≈ 0.5-1 s of link
+/// time apiece); a 500 ms settle fires the Up on ordinary drag PAUSES, so
+/// an interactive session lives in permanent IDR recovery — the field
+/// "freezing / window seconds behind" report. The settle must comfortably
+/// exceed the refined IDR's own transmission time on the link it rides:
+/// 2 s on constrained paths; direct/LAN keeps the crisp 500 ms.
+/// Env/config `idle_refine_settle_constrained_ms`.
+pub const REFINE_SETTLE_TRACKED_CONSTRAINED: Duration = Duration::from_millis(2000);
+
 /// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
 /// a scroll/drag; typing produces 100-200 ms gaps and never chains).
 pub const REFINE_MOTION_GAP: Duration = Duration::from_millis(80);
@@ -544,6 +555,9 @@ pub struct IdleRefine {
     major_area_permille: u32,
     /// Up-flip settle on the tracked path (P8a-2).
     settle_tracked: Duration,
+    /// Phase B — the settle on CONSTRAINED transports (see the constant's
+    /// doc: the Up must outlast its own IDR's transmission time).
+    settle_tracked_constrained: Duration,
     refined: bool,
     /// Length of the current ≤`REFINE_MOTION_GAP`-chained run.
     run: u32,
@@ -561,12 +575,14 @@ impl IdleRefine {
         min_frame_bytes: usize,
         major_area_permille: u32,
         settle_tracked: Duration,
+        settle_tracked_constrained: Duration,
     ) -> Self {
         Self {
             enabled,
             min_frame_bytes,
             major_area_permille,
             settle_tracked,
+            settle_tracked_constrained,
             refined: false,
             run: 0,
             last_real: None,
@@ -601,7 +617,17 @@ impl IdleRefine {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|ms| Duration::from_millis(ms.clamp(100, 5000)))
             .unwrap_or(REFINE_SETTLE_TRACKED);
-        Self::new(enabled, min_kb as usize * 1024, major_pm, settle)
+        let settle_constrained = tunnel_core::env::node_env("IDLE_REFINE_SETTLE_CONSTRAINED_MS")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|ms| Duration::from_millis(ms.clamp(100, 10000)))
+            .unwrap_or(REFINE_SETTLE_TRACKED_CONSTRAINED);
+        Self::new(
+            enabled,
+            min_kb as usize * 1024,
+            major_pm,
+            settle,
+            settle_constrained,
+        )
     }
 
     /// Whether the pump should currently run WITHOUT the resolution cap.
@@ -724,12 +750,25 @@ impl IdleRefine {
     /// Returns `Some(Up)` when the cap should lift; `eligible=false` clears
     /// `refined` silently (the cap situation changed externally — e.g. the
     /// dial moved to Sharper — so there is nothing to restore).
-    pub fn on_keepalive(&mut self, eligible: bool, now: Instant) -> Option<RefineFlip> {
+    pub fn on_keepalive(
+        &mut self,
+        eligible: bool,
+        constrained: bool,
+        now: Instant,
+    ) -> Option<RefineFlip> {
         if !self.enabled {
             return None;
         }
         self.prune(now);
         if !eligible {
+            // Phase B field fix — this reset used to be SILENT, which made
+            // an eligibility flap look like an unexplained double-Up in the
+            // field log. State changes must be visible.
+            if self.refined {
+                tracing::debug!(
+                    "idle refine: eligibility lost while refined — resolution cap re-engages"
+                );
+            }
             self.refined = false;
             return None;
         }
@@ -737,14 +776,24 @@ impl IdleRefine {
             return None;
         }
         // P8a-2 — the settle rule depends on the signal in force. Damage
-        // truth (Area): quiet is unambiguous — no MAJOR damage for
-        // `settle_tracked` means the scene is still; fire without waiting
+        // truth (Area): quiet is unambiguous — no MAJOR damage for the
+        // settle window means the scene is still; fire without waiting
         // for the 1 s window drain. Bytes (or no note yet): keep the
         // conservative sparse-window rule (byte significance is noisy).
+        // Phase B — the settle is TRANSPORT-AWARE: on a constrained relay
+        // the refined IDR itself costs ~0.5-1 s of link time, so a 500 ms
+        // settle fired on ordinary drag pauses and kept the session in
+        // permanent IDR recovery (field 2026-08-21: "freezing / window
+        // seconds behind" on CORPLAP-1/CORPLAP-3).
+        let settle = if constrained {
+            self.settle_tracked_constrained
+        } else {
+            self.settle_tracked
+        };
         let quiet = match self.last_kind {
             Some(SigKind::Area) => self
                 .last_real
-                .is_none_or(|t| now.duration_since(t) >= self.settle_tracked),
+                .is_none_or(|t| now.duration_since(t) >= settle),
             _ => self.window.len() as u32 <= REFINE_SPARSE_MAX,
         };
         if quiet
@@ -1039,6 +1088,7 @@ mod tests {
             REFINE_MIN_FRAME_KB as usize * 1024,
             REFINE_MAJOR_AREA_PERMILLE,
             REFINE_SETTLE_TRACKED,
+            REFINE_SETTLE_TRACKED_CONSTRAINED,
         )
     }
 
@@ -1067,7 +1117,7 @@ mod tests {
     ) -> Option<(Instant, Duration)> {
         let start = now;
         while now.duration_since(start) <= limit {
-            if r.on_keepalive(true, now) == Some(RefineFlip::Up) {
+            if r.on_keepalive(true, false, now) == Some(RefineFlip::Up) {
                 return Some((now, now.duration_since(start)));
             }
             now += Duration::from_millis(60);
@@ -1095,7 +1145,7 @@ mod tests {
         let mut r = refine();
         let mut now = t0();
         // Refine first (quiet from the start).
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         // 20 s of caret blinks (~1.9 Hz): single tiny frames, 530 ms apart,
         // with keepalives in between — must stay refined throughout.
         for _ in 0..38 {
@@ -1106,7 +1156,7 @@ mod tests {
             );
             for k in 1..=8 {
                 assert_eq!(
-                    r.on_keepalive(true, now + Duration::from_millis(60 * k)),
+                    r.on_keepalive(true, false, now + Duration::from_millis(60 * k)),
                     None
                 );
             }
@@ -1129,7 +1179,7 @@ mod tests {
             let _ = r.note_real_frame(now, SMALL, REFINE_REF_AREA);
             now += Duration::from_millis(160);
         }
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         assert!(r.refined());
     }
 
@@ -1139,7 +1189,7 @@ mod tests {
         // gap-chained under the old counter (a fake "scroll"), invisible now.
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         let mut t = now + Duration::from_secs(1);
         for _ in 0..60 {
             assert_eq!(r.note_real_frame(t, SMALL, REFINE_REF_AREA), None);
@@ -1160,7 +1210,10 @@ mod tests {
         for _ in 0..30 {
             now += Duration::from_millis(160);
             let _ = r.note_real_frame(now, BIG, REFINE_REF_AREA);
-            assert_eq!(r.on_keepalive(true, now + Duration::from_millis(60)), None);
+            assert_eq!(
+                r.on_keepalive(true, false, now + Duration::from_millis(60)),
+                None
+            );
         }
         assert!(!r.refined());
     }
@@ -1169,13 +1222,19 @@ mod tests {
     fn zero_threshold_restores_legacy_counting() {
         // min_frame_bytes = 0 (env IDLE_REFINE_MIN_FRAME_KB=0): every real
         // frame counts, so a small-frame trickle blocks the up-flip again.
-        let mut r = IdleRefine::new(true, 0, REFINE_MAJOR_AREA_PERMILLE, REFINE_SETTLE_TRACKED);
+        let mut r = IdleRefine::new(
+            true,
+            0,
+            REFINE_MAJOR_AREA_PERMILLE,
+            REFINE_SETTLE_TRACKED,
+            REFINE_SETTLE_TRACKED_CONSTRAINED,
+        );
         let mut now = t0();
         for _ in 0..10 {
             let _ = r.note_real_frame(now, SMALL, REFINE_REF_AREA);
             now += Duration::from_millis(160);
         }
-        assert_eq!(r.on_keepalive(true, now), None);
+        assert_eq!(r.on_keepalive(true, false, now), None);
         assert!(!r.refined());
     }
 
@@ -1183,7 +1242,7 @@ mod tests {
     fn scroll_burst_downflips_within_300ms() {
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         // 30 fps drag: the chained-run rule must fire by frame 8 (~270 ms).
         let mut t = now + Duration::from_secs(2);
         let mut fired_at = None;
@@ -1206,7 +1265,7 @@ mod tests {
     fn slow_motion_downflips_via_window_rate() {
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         // ~10.5 fps damage (95 ms gaps > the 80 ms chain gap): the run rule
         // never fires, the frames-per-window rate rule must within ≤1 s.
         let mut t = now + Duration::from_secs(2);
@@ -1240,7 +1299,10 @@ mod tests {
         }
         for _ in 0..100 {
             let _ = r.note_real_frame(now, BIG, REFINE_REF_AREA);
-            assert_eq!(r.on_keepalive(true, now + Duration::from_millis(100)), None);
+            assert_eq!(
+                r.on_keepalive(true, false, now + Duration::from_millis(100)),
+                None
+            );
             now += Duration::from_millis(200);
         }
         assert!(!r.refined());
@@ -1250,7 +1312,7 @@ mod tests {
     fn up_cooldown_measures_from_the_last_up_not_the_down() {
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         // Burst → down (~1.3 s after the Up).
         let mut t = now + Duration::from_secs(1);
         let mut down_at = None;
@@ -1293,7 +1355,7 @@ mod tests {
         // the scroll (window drain), not a full extra cooldown later.
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         // Cooldown fully spent while crisp.
         let mut t = now + REFINE_UP_COOLDOWN + Duration::from_secs(1);
         // Enter → output scrolls: burst until the down-flip.
@@ -1311,7 +1373,7 @@ mod tests {
         let mut refined_at = None;
         while t.duration_since(down_at) <= Duration::from_secs(3) {
             let _ = r.note_real_frame(t, SMALL, REFINE_REF_AREA);
-            if r.on_keepalive(true, t + Duration::from_millis(60)) == Some(RefineFlip::Up) {
+            if r.on_keepalive(true, false, t + Duration::from_millis(60)) == Some(RefineFlip::Up) {
                 refined_at = Some(t + Duration::from_millis(60));
                 break;
             }
@@ -1343,7 +1405,7 @@ mod tests {
             now += Duration::from_millis(66);
         }
         // Animation frames are invisible ⇒ the window is quiet ⇒ Up fires.
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         // Refined at native: the SAME content now encodes ~14 KB — over
         // the old fixed floor (the oscillator), under the scaled one
         // (12 KiB × native/ref ≈ 42 KiB) ⇒ stays crisp.
@@ -1379,7 +1441,7 @@ mod tests {
         // popups (50 ‰) likewise.
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         let mut t = now + Duration::from_secs(1);
         for pm in [1u32, 50, 300] {
             assert!(!r.area_major(pm), "{pm} ‰ must be minor");
@@ -1400,7 +1462,7 @@ mod tests {
         // mask the settle timing.)
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         let mut t = now + REFINE_UP_COOLDOWN + Duration::from_secs(1);
         let mut down_at = None;
         for _ in 0..12 {
@@ -1415,7 +1477,7 @@ mod tests {
         let mut k = down_at + Duration::from_millis(60);
         let mut up_at = None;
         while k.duration_since(down_at) <= Duration::from_secs(3) {
-            if r.on_keepalive(true, k) == Some(RefineFlip::Up) {
+            if r.on_keepalive(true, false, k) == Some(RefineFlip::Up) {
                 up_at = Some(k);
                 break;
             }
@@ -1437,13 +1499,13 @@ mod tests {
         // refined. Zero flip churn.
         let mut r = refine();
         let mut now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         now += Duration::from_secs(1);
         for _ in 0..30 {
             assert_eq!(r.note_real_frame_area(now, 900), None, "no Down");
             for k in 1..=8 {
                 assert_eq!(
-                    r.on_keepalive(true, now + Duration::from_millis(60 * k)),
+                    r.on_keepalive(true, false, now + Duration::from_millis(60 * k)),
                     None,
                     "already refined — no extra Ups either"
                 );
@@ -1461,7 +1523,7 @@ mod tests {
         // settle fire through ongoing byte-significant motion).
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         // Major area burst downs the rung.
         let mut t = now + REFINE_UP_COOLDOWN + Duration::from_secs(1);
         let mut downed = false;
@@ -1479,7 +1541,7 @@ mod tests {
         for _ in 0..30 {
             let _ = r.note_real_frame(t, BIG, REFINE_REF_AREA);
             assert_eq!(
-                r.on_keepalive(true, t + Duration::from_millis(100)),
+                r.on_keepalive(true, false, t + Duration::from_millis(100)),
                 None,
                 "byte motion must hold the window rule after the swap"
             );
@@ -1495,6 +1557,7 @@ mod tests {
             REFINE_MIN_FRAME_KB as usize * 1024,
             0,
             REFINE_SETTLE_TRACKED,
+            REFINE_SETTLE_TRACKED_CONSTRAINED,
         );
         // 0 ‰ = provably-unchanged frame: never significant, even at
         // floor 0.
@@ -1509,7 +1572,7 @@ mod tests {
             now += Duration::from_millis(160);
         }
         assert_eq!(
-            r.on_keepalive(true, now + Duration::from_millis(60)),
+            r.on_keepalive(true, false, now + Duration::from_millis(60)),
             None,
             "ongoing tracked motion blocks the up-flip at floor 0 (settle unmet)"
         );
@@ -1524,7 +1587,7 @@ mod tests {
         // here; the encoder's maxrate + AIMD own the load.)
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         assert!(!r.area_major(25), "PiP is under the major bar");
         const NATIVE_AREA: u64 = 1920 * 1200;
         let mut t = now + Duration::from_secs(1);
@@ -1565,7 +1628,7 @@ mod tests {
         let mut upped = false;
         for _ in 0..30 {
             assert!(!r.bytes_significant(48, REFINE_REF_AREA));
-            if r.on_keepalive(true, now) == Some(RefineFlip::Up) {
+            if r.on_keepalive(true, false, now) == Some(RefineFlip::Up) {
                 upped = true;
                 break;
             }
@@ -1586,7 +1649,13 @@ mod tests {
         // …but never below the absolute floor (caret noise stays invisible).
         assert_eq!(r.scaled_min_bytes(320 * 200), REFINE_MIN_BYTES_FLOOR);
         // Legacy count-everything (floor 0) never scales.
-        let legacy = IdleRefine::new(true, 0, REFINE_MAJOR_AREA_PERMILLE, REFINE_SETTLE_TRACKED);
+        let legacy = IdleRefine::new(
+            true,
+            0,
+            REFINE_MAJOR_AREA_PERMILLE,
+            REFINE_SETTLE_TRACKED,
+            REFINE_SETTLE_TRACKED_CONSTRAINED,
+        );
         assert_eq!(legacy.scaled_min_bytes(1920 * 1200), 0);
     }
 
@@ -1594,19 +1663,28 @@ mod tests {
     fn eligible_false_clears_refined_silently() {
         let mut r = refine();
         let now = t0();
-        assert_eq!(r.on_keepalive(true, now), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, now), Some(RefineFlip::Up));
         assert!(r.refined());
         // Dial moved to Sharper (no cap to lift): silent clear, no Down.
-        assert_eq!(r.on_keepalive(false, now + Duration::from_millis(60)), None);
+        assert_eq!(
+            r.on_keepalive(false, false, now + Duration::from_millis(60)),
+            None
+        );
         assert!(!r.refined());
     }
 
     #[test]
     fn disabled_never_flips() {
-        let mut r = IdleRefine::new(false, 0, 0, REFINE_SETTLE_TRACKED);
+        let mut r = IdleRefine::new(
+            false,
+            0,
+            0,
+            REFINE_SETTLE_TRACKED,
+            REFINE_SETTLE_TRACKED_CONSTRAINED,
+        );
         let mut now = t0();
         for _ in 0..50 {
-            assert_eq!(r.on_keepalive(true, now), None);
+            assert_eq!(r.on_keepalive(true, false, now), None);
             assert_eq!(r.note_real_frame(now, BIG, REFINE_REF_AREA), None);
             now += Duration::from_millis(60);
         }
@@ -1618,6 +1696,34 @@ mod tests {
         // A session that starts quiet refines on the very first keepalive —
         // the cooldown only spaces SUBSEQUENT up-flips.
         let mut r = refine();
-        assert_eq!(r.on_keepalive(true, t0()), Some(RefineFlip::Up));
+        assert_eq!(r.on_keepalive(true, false, t0()), Some(RefineFlip::Up));
+    }
+
+    // Phase B field fix — the settle is transport-aware: on a constrained
+    // relay every Up costs its own ~0.5-1 s IDR of link time, so firing on
+    // ordinary drag pauses (500 ms) kept the field session in permanent
+    // IDR recovery ("freezing / window seconds behind", CORPLAP-1/CORPLAP-3
+    // 2026-08-21). Direct paths keep the crisp 500 ms.
+    #[test]
+    fn constrained_settle_outlasts_drag_pauses() {
+        let start = t0();
+        let mut relay = refine();
+        let _ = relay.note_real_frame_area(start, 600);
+        assert_eq!(
+            relay.on_keepalive(true, true, start + Duration::from_millis(1900)),
+            None,
+            "a 1.9 s drag pause must not refine on a relay"
+        );
+        assert_eq!(
+            relay.on_keepalive(true, true, start + Duration::from_millis(2000)),
+            Some(RefineFlip::Up)
+        );
+        let mut direct = refine();
+        let _ = direct.note_real_frame_area(start, 600);
+        assert_eq!(
+            direct.on_keepalive(true, false, start + Duration::from_millis(600)),
+            Some(RefineFlip::Up),
+            "direct paths keep the crisp 500 ms settle"
+        );
     }
 }
