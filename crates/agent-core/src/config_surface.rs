@@ -422,7 +422,22 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "idle_refine_settle_constrained_ms",
         "string",
-        "Phase B - tracked settle (ms, 100-10000) on CONSTRAINED transports: the cap lifts only after this long without major damage, because the refined IDR itself costs ~0.5-1 s of relay link time and a 500 ms settle fired on ordinary drag pauses (field: freezing/lag). Empty = built-in 2000. Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_CONSTRAINED_MS. Restart required.",
+        "Phase B - tracked settle (ms, 100-10000) on CONSTRAINED transports: the cap lifts only after this long without major damage, because the refined IDR itself costs link time and a 500 ms settle fired on ordinary drag pauses (field: freezing/lag). Empty = built-in 1200 (2000 before the constrained HRD trim bounded the IDR). Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_CONSTRAINED_MS. Restart required.",
+    ),
+    (
+        "constrained_cq_relief",
+        "string",
+        "Constrained-motion CQ relief (softening steps, 0-12) applied at the resolution rung of a RELAY session; the rung exists for motion fluidity and softer frames arrive steadily instead of in lumps (field 2026-08-21: the sharpening bias at the rung was the 9 fps equilibrium). At-rest native quality is untouched; an explicit resolution pick is exempt. Empty = built-in 4; 0 = no relief. Env: ROOMLER_NODE_CONSTRAINED_CQ_RELIEF. Restart required.",
+    ),
+    (
+        "constrained_queue_ms",
+        "string",
+        "Constrained send-queue byte budget (ms of the relay ceiling, 0-2000): frame production skips while more than this much link time is queued, converting viewer lag into a small fps reduction (field 2026-08-21: the drag-start freeze was ~0.5-1 MB of native motion frames queued on a ~2 Mbps relay). Empty = built-in 450; 0 = unbounded (pre-rc.442). Env: ROOMLER_NODE_CONSTRAINED_QUEUE_MS. Restart required.",
+    ),
+    (
+        "constrained_hrd_pct",
+        "string",
+        "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200): bounds the single-frame IDR burst a clamped pipe must serialize (the dominant term of crystallize latency). Direct sessions always use 200 (the rc.234 2x window). Empty = built-in 75. Env: ROOMLER_NODE_CONSTRAINED_HRD_PCT. Restart required.",
     ),
     (
         "scale_threads",
@@ -595,6 +610,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "idle_refine_settle_constrained_ms" => {
             cfg.idle_refine_settle_constrained_ms.map(|p| p.to_string())
         }
+        "constrained_cq_relief" => cfg.constrained_cq_relief.map(|p| p.to_string()),
+        "constrained_queue_ms" => cfg.constrained_queue_ms.map(|p| p.to_string()),
+        "constrained_hrd_pct" => cfg.constrained_hrd_pct.map(|p| p.to_string()),
         "scale_threads" => cfg.scale_threads.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
@@ -905,6 +923,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine_settle_constrained_ms" => {
             cfg.idle_refine_settle_constrained_ms = parse_u32_range(key, value, 100, 10000)?
         }
+        "constrained_cq_relief" => cfg.constrained_cq_relief = parse_u32_range(key, value, 0, 12)?,
+        "constrained_queue_ms" => cfg.constrained_queue_ms = parse_u32_range(key, value, 0, 2000)?,
+        "constrained_hrd_pct" => cfg.constrained_hrd_pct = parse_u32_range(key, value, 25, 200)?,
         "scale_threads" => cfg.scale_threads = parse_u32_range(key, value, 1, 8)?,
         "ice_follow_renomination" => {
             cfg.ice_follow_renomination =
