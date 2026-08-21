@@ -731,6 +731,29 @@ pub enum Request {
         #[serde(default)]
         timeout_ms: u64,
     },
+    /// Roomler SSH (P6b) — ask the server for a single-use session grant on
+    /// ANOTHER device, so `roomler ssh <device>` can dial it.
+    ///
+    /// The daemon relays this over its already-authenticated agent WS; the CLI
+    /// carries no user credentials of its own, exactly as with
+    /// [`Request::ExecRemote`], and the same four gates apply server-side.
+    ///
+    /// **The caller supplies `public_key` and keeps the private half.** The
+    /// daemon never sees it and the grant is bound to that key, so a grant
+    /// intercepted anywhere on this path is useless without the private half
+    /// that never left the requesting process.
+    ///
+    /// Returns [`Response::SshSession`].
+    SshSession {
+        /// Target device: a name (e.g. `CORPLAP-1`) or a hex agent id.
+        node: String,
+        /// OpenSSH public key of the caller's EPHEMERAL, single-session
+        /// keypair (`ssh-ed25519 AAAA… comment`).
+        public_key: String,
+        /// 0 ⇒ the server's ceiling; clamped server-side.
+        #[serde(default)]
+        session_secs: u64,
+    },
 }
 
 /// One editable config entry (S2 config surface). Values travel as
@@ -849,6 +872,30 @@ pub enum Response {
         truncated: bool,
         #[serde(default)]
         duration_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Answer to [`Request::SshSession`]. Either every dial field is present
+    /// or `error` is — a caller must never be left with half a connection.
+    SshSession {
+        request_id: String,
+        node: String,
+        /// The target's overlay address.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        /// The target's SSH host public key (P6a). **Absent means the device
+        /// cannot prove itself** — never "any key is fine". A client that
+        /// cannot verify should refuse rather than fall back to TOFU.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_pubkey: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_id: Option<String>,
+        /// Unix ms the grant stops being redeemable — dial before this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_ms: Option<u64>,
+        /// Set when the request was refused, naming which gate said no.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -1034,6 +1081,14 @@ pub trait LocalApiState: Send + Sync {
             message: "this node cannot originate remote commands (no server connection)".into(),
         }
     }
+
+    /// Ask the server for a single-use SSH grant on another device (P6b).
+    /// Default: this node has no server connection, so it cannot originate.
+    async fn ssh_session(&self, _node: &str, _public_key: &str, _session_secs: u64) -> Response {
+        Response::Error {
+            message: "this node cannot originate SSH sessions (no server connection)".into(),
+        }
+    }
 }
 
 /// Pure dispatch: map a [`Request`] to a [`Response`] over a state snapshot.
@@ -1066,7 +1121,8 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::ConfigGet
         | Request::ConfigSet { .. }
         | Request::TailLog { .. }
-        | Request::ExecRemote { .. } => Response::Error {
+        | Request::ExecRemote { .. }
+        | Request::SshSession { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -1130,6 +1186,11 @@ where
                 command,
                 timeout_ms,
             }) => state.exec_remote(&node, &shell, &command, timeout_ms).await,
+            Ok(Request::SshSession {
+                node,
+                public_key,
+                session_secs,
+            }) => state.ssh_session(&node, &public_key, session_secs).await,
             Ok(req) => handle(&req, state),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),

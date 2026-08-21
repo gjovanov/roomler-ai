@@ -256,6 +256,45 @@ async fn run_remote(node: &str, shell: &str, command: &str, timeout_ms: u64) -> 
     }
 }
 
+/// What the server answered about an SSH session request.
+pub struct SshGrant {
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    /// The target's SSH host public key. `None` = the device cannot prove
+    /// itself; the caller must refuse rather than connect unverified.
+    pub host_pubkey: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Ask the local daemon for a single-use SSH grant on `node`.
+///
+/// `public_key` is the caller's ephemeral session key — the daemon relays it
+/// and never sees the private half.
+pub async fn ssh_session(node: &str, public_key: &str, session_secs: u64) -> Result<SshGrant> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let req = localapi::Request::SshSession {
+        node: node.to_string(),
+        public_key: public_key.to_string(),
+        session_secs,
+    };
+    match client.request(&req).await.map_err(|e| anyhow!("{e}"))? {
+        localapi::Response::SshSession {
+            address,
+            port,
+            host_pubkey,
+            error,
+            ..
+        } => Ok(SshGrant {
+            address,
+            port,
+            host_pubkey,
+            error,
+        }),
+        localapi::Response::Error { message } => Err(anyhow!("{message}")),
+        other => Err(anyhow!("unexpected daemon response: {other:?}")),
+    }
+}
+
 /// `roomler exec <device> -- <command…>`
 ///
 /// Exit status mirrors the remote command's, so this composes in a script:
