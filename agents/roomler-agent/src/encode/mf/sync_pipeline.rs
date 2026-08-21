@@ -554,6 +554,9 @@ fn read_packet_from_sample(
             data,
             is_keyframe,
             duration_us: 1_000_000 / TARGET_FPS.max(1) as u64,
+            // Follow-up if the MF lane ever needs QP telemetry: read
+            // MFSampleExtension_VideoEncodeQP off the output sample.
+            qp: None,
         }))
     }
 }
