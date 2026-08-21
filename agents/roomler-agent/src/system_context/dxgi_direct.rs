@@ -952,6 +952,26 @@ impl DxgiDirectBackend {
 
 impl DxgiCapture for DxgiDirectBackend {
     fn frame(&mut self, output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail> {
+        // Phase B field fix (2026-08-21, CORPLAP-1/CORPLAP-3): a refine Up flips the
+        // cap Some→None while the desktop is AT REST — but every real frame
+        // delivered under the rung was GPU-scaled, so the pump's keepalive
+        // holds no native pixels and the "crisp native IDR" can never ship
+        // ("text doesn't crystallize", heartbeats pinned at width=1024
+        // after every Up). Desktop Duplication cannot re-deliver a static
+        // desktop on demand — but the FIRST acquire after a duplication
+        // (re)creation carries the CURRENT image (the delivered_any guard
+        // exists for exactly that). Surface AccessLost here: the pump's
+        // standard recovery rebuilds this backend, and the next acquire
+        // hands the pump a native frame to refine from. Cost: one backend
+        // rebuild per cap-LIFT, bounded by the refine Up cooldown; the
+        // Down direction needs nothing (motion is flowing by definition).
+        if output_cap.is_none() && self.output_cap.is_some() {
+            self.output_cap = None;
+            tracing::debug!(
+                "DXGI-direct: output cap lifted at rest — recycling duplication so the native redeliver can ship"
+            );
+            return Err(BackendBail::AccessLost);
+        }
         self.output_cap = output_cap;
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
