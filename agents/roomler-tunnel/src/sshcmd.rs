@@ -150,7 +150,6 @@ pub async fn run(device: &str, session_secs: u64, args: &[String]) -> Result<i32
 /// A literal IP passes straight through, so `%h` works whether the user wrote
 /// a device name or an address.
 pub async fn proxy(host: &str, port: u16) -> Result<()> {
-    use tokio::io::{AsyncWriteExt, copy};
     use tokio::net::TcpStream;
 
     // An address is already an answer. Only a NAME needs the daemon, so a
@@ -167,25 +166,53 @@ pub async fn proxy(host: &str, port: u16) -> Result<()> {
         }
     };
 
-    let mut sock = TcpStream::connect((addr.as_str(), port))
+    let sock = TcpStream::connect((addr.as_str(), port))
         .await
         .with_context(|| format!("connecting to {addr}:{port}"))?;
     // Nagle would add up to 40 ms to every keystroke of an interactive
     // session riding this pipe.
     let _ = sock.set_nodelay(true);
 
-    let (mut sr, mut sw) = sock.split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    pump(sock, tokio::io::stdin(), tokio::io::stdout()).await
+}
 
-    // Whichever direction ends first ends the proxy: `ssh` closing stdin means
-    // it is done, and the peer closing means the session is over. Waiting for
-    // BOTH would hang on the common case of a half-closed TCP stream.
-    tokio::select! {
-        r = copy(&mut stdin, &mut sw) => { r.context("stdin → peer")?; }
-        r = copy(&mut sr, &mut stdout) => { r.context("peer → stdout")?; }
-    }
-    let _ = stdout.flush().await;
+/// Splice `input`→socket→`output` until the PEER closes.
+///
+/// Split out from [`proxy`] so the EOF semantics below are testable without a
+/// real stdin — they are the whole substance of this function, and they are
+/// easy to get wrong in a way no interactive session reveals.
+///
+/// ⚠️ **Input EOF half-closes; it does NOT end the proxy.** The obvious
+/// `select!` over both directions — first one to finish wins — looks right and
+/// breaks every non-interactive use: `scp`, `rsync` and `ssh host cmd` all
+/// close stdin immediately, so the proxy would tear the connection down before
+/// the peer's first byte arrived. (Caught in the field on rc.447: piping
+/// `echo |` into the proxy returned an empty banner instead of the target's
+/// `SSH-2.0-…`.) Correct behaviour is netcat's: on input EOF send FIN and keep
+/// draining, then exit when the peer closes.
+async fn pump<I, O>(sock: tokio::net::TcpStream, mut input: I, mut output: O) -> Result<()>
+where
+    I: tokio::io::AsyncRead + Unpin + Send + 'static,
+    O: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncWriteExt, copy};
+
+    let (mut sr, mut sw) = sock.into_split();
+
+    let up = tokio::spawn(async move {
+        // Errors here are the ordinary way a session ends (the peer resets, we
+        // are killed mid-write); the downstream copy is what decides the exit
+        // status, so nothing is gained by surfacing them twice.
+        let _ = copy(&mut input, &mut sw).await;
+        let _ = sw.shutdown().await;
+    });
+
+    let r = copy(&mut sr, &mut output).await.context("peer → output");
+    let _ = output.flush().await;
+    // The uploader may still be parked on a read that will never complete
+    // (an interactive stdin nobody is typing into). The session is over.
+    up.abort();
+    r?;
     Ok(())
 }
 
@@ -271,6 +298,65 @@ mod tests {
             !msg.contains("Name or service not known") && !msg.contains("nodename nor servname"),
             "the OS resolver must never see a mesh name: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn already_closed_input_still_delivers_the_peers_reply() {
+        // The rc.447 bug, in one test. `scp`, `rsync` and `ssh host cmd` all
+        // present an input that is EOF straight away; a proxy that treats
+        // "input finished" as "session finished" tears the connection down
+        // before the peer's banner arrives and the tool sees an empty stream.
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Speak first, like a real sshd, and only then close.
+            s.write_all(b"SSH-2.0-RoomlerTest\r\n").await.unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let input = std::io::Cursor::new(Vec::new()); // EOF immediately
+        let mut out: Vec<u8> = Vec::new();
+        pump(sock, input, &mut out).await.unwrap();
+
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "SSH-2.0-RoomlerTest\r\n",
+            "input EOF must half-close, not abandon the peer's reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_reaches_the_peer_and_eof_is_seen_as_eof() {
+        // The other half: the peer must actually receive what we sent AND see
+        // a clean FIN, or an `scp` upload would hang waiting for more.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            // Returns only on EOF — so this hanging means no FIN was sent.
+            s.read_to_end(&mut got).await.unwrap();
+            s.write_all(b"ack").await.unwrap();
+            s.shutdown().await.unwrap();
+            got
+        });
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        pump(sock, std::io::Cursor::new(b"hello".to_vec()), &mut out)
+            .await
+            .unwrap();
+
+        assert_eq!(echo.await.unwrap(), b"hello", "the peer must receive input");
+        assert_eq!(&out, b"ack", "and its answer must reach the output");
     }
 
     #[tokio::test]
