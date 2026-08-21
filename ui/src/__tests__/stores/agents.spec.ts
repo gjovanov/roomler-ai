@@ -311,4 +311,84 @@ describe('useAgentStore', () => {
     expect(url).toContain('agent_id=a1')
     expect(url).toContain('per_page=25')
   })
+
+  // ── Roomler SSH ────────────────────────────────────────────────────
+
+  it('an agent with no ssh_policy is treated as closed, not permissive', () => {
+    // Same rule as exec: a device that predates the feature, or whose API
+    // body omits the field, must read as OFF. Defaulting the other way would
+    // silently open every legacy device the moment the UI shipped.
+    const a = mkAgent()
+    expect(a.ssh_policy).toBeUndefined()
+    expect(a.ssh_policy?.mode ?? 'off').toBe('off')
+  })
+
+  it('updateSshPolicy hits the ssh route and updates the row in place', async () => {
+    mockApi.put.mockResolvedValueOnce({})
+    const s = useAgentStore()
+    s.agents = [mkAgent({ id: 'a1' })]
+    const policy = {
+      mode: 'on' as const,
+      can_originate: false,
+      allowed_user_ids: [],
+      allowed_role_ids: [],
+      account_mode: 'console_user' as const,
+      account: null,
+      consent_mode: null,
+    }
+    await s.updateSshPolicy(TENANT_ID, 'a1', policy)
+    expect(mockApi.put).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/ssh-policy`, policy)
+    expect(s.agents[0]!.ssh_policy?.mode).toBe('on')
+    // The exec policy is a different gate and must not be touched by this.
+    expect(s.agents[0]!.exec_policy).toBeUndefined()
+  })
+
+  it('a rejected ssh-policy save PROPAGATES instead of reporting success', async () => {
+    // The server refuses a prompt policy for an agent that would ignore it
+    // (pre-P5d). Swallowing that would leave an admin believing a prompt is
+    // enforced when nothing would ever ask — the exact lie P5d closed.
+    mockApi.put.mockRejectedValueOnce(new Error('agent would ignore consent_mode'))
+    const s = useAgentStore()
+    s.agents = [mkAgent({ id: 'a1' })]
+    await expect(
+      s.updateSshPolicy(TENANT_ID, 'a1', {
+        mode: 'on',
+        can_originate: false,
+        allowed_user_ids: [],
+        allowed_role_ids: [],
+        account_mode: 'console_user',
+        account: null,
+        consent_mode: 'prompt',
+      }),
+    ).rejects.toThrow()
+    expect(s.agents[0]!.ssh_policy).toBeUndefined()
+  })
+
+  it('the ssh org switch is separate from the exec one', async () => {
+    // Two independent decisions server-side; the store must not let one
+    // fetch populate the other's flag.
+    mockApi.get.mockResolvedValueOnce({ remote_ssh_enabled: true })
+    const s = useAgentStore()
+    await s.fetchOrgSshEnabled(TENANT_ID)
+    expect(s.orgSshEnabled).toBe(true)
+    expect(s.orgExecEnabled).toBeNull()
+    expect(mockApi.get.mock.calls.at(-1)![0]).toBe(`/tenant/${TENANT_ID}/ssh-settings`)
+  })
+
+  it('a 403 on the ssh org switch leaves it UNKNOWN, not "off"', async () => {
+    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    const s = useAgentStore()
+    await s.fetchOrgSshEnabled(TENANT_ID)
+    expect(s.orgSshEnabled).toBeNull()
+  })
+
+  it('fetchSshAudit passes the narrowing filters through', async () => {
+    mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+    const s = useAgentStore()
+    await s.fetchSshAudit(TENANT_ID, { userId: 'u9', perPage: 25 })
+    const url = mockApi.get.mock.calls.at(-1)![0] as string
+    expect(url).toContain(`/tenant/${TENANT_ID}/ssh-audit?`)
+    expect(url).toContain('user_id=u9')
+    expect(url).toContain('per_page=25')
+  })
 })

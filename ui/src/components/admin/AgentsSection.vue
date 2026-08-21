@@ -143,6 +143,11 @@
                     title="Execution policy"
                     @click="openExecPolicy(a)"
                   />
+                  <v-list-item
+                    prepend-icon="mdi-console-network-outline"
+                    title="SSH policy"
+                    @click="openSshPolicy(a)"
+                  />
                   <v-list-subheader>Network</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-ip-network-outline"
@@ -492,6 +497,11 @@
                     title="Execution policy"
                     @click="openExecPolicy(a)"
                   />
+                  <v-list-item
+                    prepend-icon="mdi-console-network-outline"
+                    title="SSH policy"
+                    @click="openSshPolicy(a)"
+                  />
                   <v-list-subheader>Network</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-ip-network-outline"
@@ -774,6 +784,12 @@
     v-model="execPolicyDialogOpen"
     :tenant-id="tenantId"
     :agent="execPolicyTarget"
+  />
+  <SshPolicyDialog
+    v-if="sshPolicyTarget"
+    v-model="sshPolicyDialogOpen"
+    :tenant-id="tenantId"
+    :agent="sshPolicyTarget"
   />
 
   <!-- S1a — Update-all confirmation -->
@@ -1058,6 +1074,7 @@ import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
 import ExecPolicyDialog from './ExecPolicyDialog.vue'
+import SshPolicyDialog from './SshPolicyDialog.vue'
 import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 import {
   useOverlayRoutesStore,
@@ -1310,6 +1327,14 @@ const execPolicyTarget = ref<Agent | null>(null)
 function openExecPolicy(a: Agent) {
   execPolicyTarget.value = a
   execPolicyDialogOpen.value = true
+}
+
+const sshPolicyDialogOpen = ref(false)
+const sshPolicyTarget = ref<Agent | null>(null)
+
+function openSshPolicy(a: Agent) {
+  sshPolicyTarget.value = a
+  sshPolicyDialogOpen.value = true
 }
 
 function osIcon(os: string) {
