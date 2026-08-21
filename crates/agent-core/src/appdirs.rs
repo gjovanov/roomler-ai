@@ -231,6 +231,129 @@ fn migrate_dir(old: &Path, new: &Path) -> Option<String> {
     }
 }
 
+// ─── Linux: the system config lives in /etc/roomler ────────────────────────
+
+/// Canonical config for a Linux SYSTEM install (the `roomlerd.service` unit).
+///
+/// The packaged unit has run `roomlerd --config /etc/roomler/config.toml`
+/// since rc.426, but hosts enrolled before that convention keep their config
+/// in root's profile (`/root/.config/roomler/config.toml`) — so the FIRST
+/// systemd-mediated start after the packaging change died `no config found`
+/// and `Restart=always` turned it into a crash-loop. Field-hit on three nodes
+/// (mars, zeus, and the WSL sibling, the last one from a plain `dpkg -i`, with
+/// no operator restart involved at all).
+///
+/// One canonical location fixes that for good: [`migrate_system_config`] moves
+/// a legacy config here at startup, and [`crate::config::default_config_path`]
+/// resolves here for root, so an explicit `--config` and a bare `roomlerd run`
+/// can no longer disagree about where this host's identity lives.
+#[cfg(target_os = "linux")]
+pub fn system_config_path() -> PathBuf {
+    PathBuf::from("/etc/roomler/config.toml")
+}
+
+/// Is this process root? Only root may own `/etc/roomler`; a per-user Linux
+/// install keeps its profile config and must not be migrated anywhere.
+#[cfg(target_os = "linux")]
+pub fn running_as_root() -> bool {
+    // SAFETY: `geteuid` is a thread-safe read of the caller's own credentials.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// One-shot migration of a legacy root-profile config into `/etc/roomler`.
+///
+/// Same rules as [`migrate_legacy_trees`], for the same reasons:
+///   * `/etc` copy exists → leave the legacy one alone (NEW wins)
+///   * legacy absent → nothing to do
+///   * legacy present, `/etc` absent → `rename` (same filesystem in practice)
+///
+/// **Never deletes.** A failed move is noted and the read-both resolution in
+/// `default_config_path` keeps the host running on its legacy config until the
+/// next start retries — a daemon that cannot find its identity is exactly the
+/// outcome this exists to prevent.
+///
+/// The `.prev` sibling (config::save's rollback copy) moves too: leaving it
+/// behind would strand a second, credential-bearing copy of the config at a
+/// path something might later be pointed back at.
+///
+/// MUST run before `logging::init`, like the tree migration — hence the same
+/// note-collecting instead of tracing.
+#[cfg(target_os = "linux")]
+pub fn migrate_system_config() {
+    let mut notes = Vec::new();
+    if !running_as_root() {
+        let _ = SYSTEM_CONFIG_NOTES.set(notes);
+        return;
+    }
+    let new = system_config_path();
+    let legacy = ProjectDirs::from(QUALIFIER, ORG, NEW_APP)
+        .map(|d| d.config_dir().join("config.toml"))
+        .unwrap_or_default();
+
+    if new.exists() || !legacy.exists() {
+        let _ = SYSTEM_CONFIG_NOTES.set(notes);
+        return;
+    }
+    if let Some(parent) = new.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        notes.push(format!(
+            "system-config migration failed (create {}): {e}",
+            parent.display()
+        ));
+        let _ = SYSTEM_CONFIG_NOTES.set(notes);
+        return;
+    }
+    // 0700: the config carries the agent token and the WG secret key.
+    #[cfg(unix)]
+    if let Some(parent) = new.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+
+    match std::fs::rename(&legacy, &new) {
+        Ok(()) => {
+            notes.push(format!(
+                "migrated system config {} -> {}",
+                legacy.display(),
+                new.display()
+            ));
+            // Best-effort; a left-behind `.prev` is untidy, not dangerous,
+            // and must never turn a successful migration into a failure.
+            let (lp, np) = (with_prev(&legacy), with_prev(&new));
+            if lp.exists() && !np.exists() {
+                let _ = std::fs::rename(&lp, &np);
+            }
+        }
+        Err(e) => notes.push(format!(
+            "system-config migration failed ({} -> {}): {e} — staying on the legacy path",
+            legacy.display(),
+            new.display()
+        )),
+    }
+    let _ = SYSTEM_CONFIG_NOTES.set(notes);
+}
+
+#[cfg(target_os = "linux")]
+fn with_prev(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(".prev");
+    PathBuf::from(s)
+}
+
+#[cfg(target_os = "linux")]
+static SYSTEM_CONFIG_NOTES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Notes from [`migrate_system_config`], logged by the caller after
+/// `logging::init` (the migration runs before it).
+#[cfg(target_os = "linux")]
+pub fn system_config_notes() -> &'static [String] {
+    SYSTEM_CONFIG_NOTES
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
 /// Per-child fallback for a root-locked legacy dir. `config.toml` moves
 /// LAST, and any mid-way failure rolls the already-moved entries back —
 /// so the tree is always either wholly OLD or wholly NEW (a half-empty
@@ -304,6 +427,42 @@ mod tests {
         } else {
             new
         }
+    }
+
+    /// The invariant that retires the crash-loop class: for a Linux root
+    /// process, `/etc/roomler/config.toml` and the profile config resolve in a
+    /// fixed order, so the packaged unit's `--config` and a bare `roomlerd run`
+    /// can never disagree about where this host's identity lives.
+    ///
+    /// Same injected-predicate shape as the tree test above — asserting on
+    /// real `/etc` would be environment-dependent and root-dependent.
+    #[test]
+    fn linux_system_config_precedence_is_etc_then_profile_then_etc() {
+        // `/etc` present -> `/etc`, even when the legacy profile copy survives
+        // (the migration never deletes, so both CAN exist).
+        assert_eq!(
+            pick("/etc", "profile", |s| s == "/etc" || s == "profile"),
+            "/etc"
+        );
+        // Only the profile copy -> profile. A host whose migration has not run
+        // yet, or could not, keeps its identity instead of losing it.
+        assert_eq!(pick("/etc", "profile", |s| s == "profile"), "profile");
+        // Neither -> `/etc`: a fresh system install, where `enroll` writes to
+        // the path the unit already passes.
+        assert_eq!(pick("/etc", "profile", |_| false), "/etc");
+    }
+
+    /// The rollback copy carries the agent token and the WG secret key, so it
+    /// has to travel with the config — leaving it behind strands a second,
+    /// credential-bearing copy at a path something may later be pointed at
+    /// (exactly how a cleared SSH key came back on jupiter).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_prev_sibling_is_the_config_path_plus_prev() {
+        assert_eq!(
+            with_prev(Path::new("/etc/roomler/config.toml")),
+            PathBuf::from("/etc/roomler/config.toml.prev")
+        );
     }
 
     #[test]
