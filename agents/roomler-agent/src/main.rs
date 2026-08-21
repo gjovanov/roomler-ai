@@ -1566,6 +1566,27 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     Ok(Some(vd))
 }
 
+/// How `run` terminates when another process already owns the
+/// single-instance lock. Linux exits with a sentinel its units list in
+/// `RestartPreventExitStatus`; every other platform exits 0, which is
+/// already the "don't respawn me" signal for launchd. The full
+/// per-platform reasoning lives on [`watchdog::ALREADY_RUNNING_EXIT_CODE`]
+/// — read it before changing either arm, because the two platforms want
+/// literally opposite exit codes here.
+#[cfg(target_os = "linux")]
+fn already_running_exit() -> Result<()> {
+    // Diverges. The `eprintln!` above and the sync stdout tracing layer
+    // have already emitted; only the non-blocking FILE layer can lose
+    // its copy, which is the same trade `signaling.rs` makes when it
+    // exits with `AGENT_DELETED_EXIT_CODE`.
+    std::process::exit(watchdog::ALREADY_RUNNING_EXIT_CODE)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn already_running_exit() -> Result<()> {
+    Ok(())
+}
+
 async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()> {
     if !config_path.exists() {
         bail!(
@@ -1590,7 +1611,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                  or stop the running instance before starting a new one.)"
                 );
                 tracing::warn!("single-instance lock held by another process; exiting");
-                return Ok(());
+                return already_running_exit();
             }
         };
     let mut cfg = config::load(config_path).context("loading config")?;

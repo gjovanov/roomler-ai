@@ -54,10 +54,16 @@ Environment=RUST_LOG=roomler_agent=info,warn
 # leave the node stopped after a SUCCESSFUL upgrade. Codes from `watchdog.rs`:
 # 2 = STALL (watchdog forced exit) MUST come back; 7 = AGENT_DELETED (row
 # deleted / quarantined server-side) must NOT — restarting only hammers a
-# server that already said no.
+# server that already said no; 8 = ALREADY_RUNNING (another process holds the
+# single-instance lock) must NOT either — this process is redundant by
+# definition, and without the exception `always` restarts it every 5 s
+# forever. That is not hypothetical: on 2026-08-21 mars, zeus and jupiter each
+# had TWO units enabled (this one plus a legacy `roomler-agent.service`), and
+# the loser of the lock race had burned 1500+ restarts while the winner served
+# normally — `systemctl is-active` read green the whole time.
 Restart=always
 RestartSec=5
-RestartPreventExitStatus=7
+RestartPreventExitStatus=7 8
 
 # No ProtectSystem / ProtectHome / NoNewPrivileges here: this unit's whole
 # purpose is doing the privileged things the user unit cannot — writing the
