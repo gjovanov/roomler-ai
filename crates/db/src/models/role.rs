@@ -79,6 +79,14 @@ pub mod permissions {
     /// land — so "may run one clamped diagnostic" and "may hold a live session"
     /// have to be grantable independently.
     pub const SSH_DEVICE: u64 = 1 << 29;
+    /// View the roomler-SSH audit log (`ssh_audit`) — who was granted, or
+    /// refused, a session on which device.
+    ///
+    /// Separate from [`VIEW_EXEC_AUDIT`] for the same reason [`SSH_DEVICE`] is
+    /// separate from [`EXEC_DEVICE`]: the two logs answer different questions
+    /// and an org may well want one reviewer for bounded commands and another
+    /// for interactive sessions.
+    pub const VIEW_SSH_AUDIT: u64 = 1 << 30;
 
     /// Default member permissions
     pub const DEFAULT_MEMBER: u64 = VIEW_CHANNELS
@@ -115,12 +123,14 @@ pub mod permissions {
         // not the same power — it is consent-gated, visible to whoever is at
         // the machine, and runs as the interactive user; exec and ssh run as
         // SYSTEM/root with nobody watching. Both stay explicit grants.
-        | VIEW_EXEC_AUDIT;
+        | VIEW_EXEC_AUDIT
+        // Same split for SSH: see the audit without gaining the session.
+        | VIEW_SSH_AUDIT;
 
     /// Owner permissions (everything). Bump the mask whenever a new bit is
     /// added above so `ALL` literally contains every defined permission (owner
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
-    pub const ALL: u64 = (1 << 30) - 1;
+    pub const ALL: u64 = (1 << 31) - 1;
 
     pub fn has(permissions: u64, flag: u64) -> bool {
         permissions & ADMINISTRATOR != 0 || permissions & flag == flag
@@ -129,4 +139,104 @@ pub mod permissions {
 
 impl Role {
     pub const COLLECTION: &'static str = "roles";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permissions::*;
+
+    /// Every named bit, so the checks below cannot silently skip one.
+    const NAMED: &[(&str, u64)] = &[
+        ("VIEW_CHANNELS", VIEW_CHANNELS),
+        ("MANAGE_CHANNELS", MANAGE_CHANNELS),
+        ("MANAGE_ROLES", MANAGE_ROLES),
+        ("MANAGE_TENANT", MANAGE_TENANT),
+        ("KICK_MEMBERS", KICK_MEMBERS),
+        ("BAN_MEMBERS", BAN_MEMBERS),
+        ("INVITE_MEMBERS", INVITE_MEMBERS),
+        ("SEND_MESSAGES", SEND_MESSAGES),
+        ("SEND_THREADS", SEND_THREADS),
+        ("EMBED_LINKS", EMBED_LINKS),
+        ("ATTACH_FILES", ATTACH_FILES),
+        ("READ_HISTORY", READ_HISTORY),
+        ("MENTION_EVERYONE", MENTION_EVERYONE),
+        ("MANAGE_MESSAGES", MANAGE_MESSAGES),
+        ("ADD_REACTIONS", ADD_REACTIONS),
+        ("CONNECT_VOICE", CONNECT_VOICE),
+        ("SPEAK", SPEAK),
+        ("STREAM_VIDEO", STREAM_VIDEO),
+        ("MUTE_MEMBERS", MUTE_MEMBERS),
+        ("DEAFEN_MEMBERS", DEAFEN_MEMBERS),
+        ("MOVE_MEMBERS", MOVE_MEMBERS),
+        ("MANAGE_MEETINGS", MANAGE_MEETINGS),
+        ("MANAGE_DOCUMENTS", MANAGE_DOCUMENTS),
+        ("ADMINISTRATOR", ADMINISTRATOR),
+        ("MANAGE_AGENTS", MANAGE_AGENTS),
+        ("REMOTE_CONTROL", REMOTE_CONTROL),
+        ("VIEW_REMOTE_AUDIT", VIEW_REMOTE_AUDIT),
+        ("EXEC_DEVICE", EXEC_DEVICE),
+        ("VIEW_EXEC_AUDIT", VIEW_EXEC_AUDIT),
+        ("SSH_DEVICE", SSH_DEVICE),
+        ("VIEW_SSH_AUDIT", VIEW_SSH_AUDIT),
+    ];
+
+    #[test]
+    fn all_contains_every_named_permission() {
+        // `ALL` is a hand-maintained `(1 << N) - 1` and it is what the Owner
+        // role is created with. Adding a bit above without bumping it leaves
+        // Owner missing that permission — invisible, because Owner also
+        // carries ADMINISTRATOR and passes `has` by the bypass. This makes the
+        // "bump the mask" comment executable instead of advisory.
+        for (name, bit) in NAMED {
+            assert!(
+                ALL & bit == *bit,
+                "{name} ({bit:#x}) is not in ALL ({ALL:#x}) — bump the mask"
+            );
+        }
+    }
+
+    #[test]
+    fn every_named_permission_is_a_distinct_single_bit() {
+        for (name, bit) in NAMED {
+            assert_eq!(bit.count_ones(), 1, "{name} is not a single bit");
+        }
+        for (i, (an, ab)) in NAMED.iter().enumerate() {
+            for (bn, bb) in &NAMED[i + 1..] {
+                assert_ne!(ab, bb, "{an} and {bn} are the same bit");
+            }
+        }
+    }
+
+    #[test]
+    fn admins_can_read_the_audits_without_gaining_the_powers() {
+        // The deliberate asymmetry: an admin sees every session and command
+        // the fleet served without silently acquiring the ability to open one.
+        assert!(DEFAULT_ADMIN & VIEW_EXEC_AUDIT != 0);
+        assert!(DEFAULT_ADMIN & VIEW_SSH_AUDIT != 0);
+        assert_eq!(
+            DEFAULT_ADMIN & EXEC_DEVICE,
+            0,
+            "EXEC_DEVICE must stay an explicit grant"
+        );
+        assert_eq!(
+            DEFAULT_ADMIN & SSH_DEVICE,
+            0,
+            "SSH_DEVICE must stay an explicit grant"
+        );
+    }
+
+    #[test]
+    fn ssh_and_exec_are_independently_grantable() {
+        // Four separate bits on purpose: "may run one clamped command",
+        // "may hold an interactive session", and the two audit views are
+        // different powers and different jobs.
+        for (a, b) in [
+            (EXEC_DEVICE, SSH_DEVICE),
+            (VIEW_EXEC_AUDIT, VIEW_SSH_AUDIT),
+            (EXEC_DEVICE, VIEW_EXEC_AUDIT),
+            (SSH_DEVICE, VIEW_SSH_AUDIT),
+        ] {
+            assert_eq!(a & b, 0, "{a:#x} and {b:#x} overlap");
+        }
+    }
 }
