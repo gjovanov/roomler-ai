@@ -137,6 +137,7 @@ impl ScreenCapture for SyntheticCapture {
                 w: FRAME_W,
                 h: FRAME_H,
             }]),
+            source: None,
         };
         self.counter += 1;
         Ok(Some(frame))
@@ -204,7 +205,7 @@ mod tests {
         for bit in 0..64u32 {
             // Top-left row 0, column = bit. B channel is byte 0 of
             // the BGRA quad.
-            let i = ((0 * FRAME_W + bit) * 4) as usize;
+            let i = (bit * 4) as usize; // row 0 — offset is just column×4
             if data[i] == 0xFF {
                 recovered |= 1 << (63 - bit);
             }

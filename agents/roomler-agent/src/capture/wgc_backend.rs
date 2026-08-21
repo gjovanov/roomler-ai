@@ -116,6 +116,9 @@ struct FramePayload {
     stride: u32,
     captured_at: Instant,
     damage: Damage,
+    /// Phase B — native dims when the handler GPU-scaled before the
+    /// readback; `None` = the payload is native-sized.
+    source: Option<(u32, u32)>,
 }
 
 /// Cap on accumulated damage rects (slot unions can grow the list). Past
@@ -328,6 +331,7 @@ fn payload_to_frame(payload: FramePayload, monitor: u8, start: Instant) -> Frame
         monotonic_us,
         monitor,
         damage: payload.damage,
+        source: payload.source,
     }
 }
 
@@ -489,6 +493,7 @@ fn worker_main(
                 stride,
                 captured_at: Instant::now(),
                 damage,
+                source: None,
             };
             let arrived = handler_shared
                 .arrived_total

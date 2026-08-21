@@ -198,6 +198,7 @@ fn capture_one_blocking(
                     // populate this from Direct3D11CaptureFrame::
                     // DirtyRegion() once it lands.
                     damage: Damage::Unknown,
+                    source: None,
                 }));
             }
             Err(e) if e.kind() == WouldBlock => {
