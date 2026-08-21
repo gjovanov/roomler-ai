@@ -1368,6 +1368,14 @@ pub struct SessionStats {
     pub avg_rtt_ms: f32,
     pub keyframe_requests: u32,
     pub input_events: u64,
+    /// P8 Phase 4 — cumulative seconds this session's shared pipeline
+    /// served ≥1 follower. `default` so pre-Phase-4 rows deserialize.
+    #[serde(default)]
+    pub shared_seconds: u64,
+    /// … of which the viewers' dials were NOT all equal (the SVC
+    /// go/no-go dataset — see the signalling twin's doc).
+    #[serde(default)]
+    pub mixed_dial_seconds: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
