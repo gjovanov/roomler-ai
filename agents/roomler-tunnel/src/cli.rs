@@ -283,6 +283,29 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// Open an SSH session to another device in this org, over the overlay.
+    ///
+    /// No `sshd` and no open port on the target: the roomler daemon there
+    /// intercepts the connection below the OS. The session itself runs through
+    /// your system `ssh` — roomler supplies a single-use identity, the address,
+    /// and the target's host key, then gets out of the way.
+    ///
+    /// The host key is VERIFIED, never trusted on first use. If the server has
+    /// no key for the device, this refuses to connect.
+    ///
+    ///   roomler ssh CORPLAP-1
+    ///   roomler ssh CORPLAP-1 -- uptime
+    Ssh {
+        /// Target device — a name (e.g. `CORPLAP-1`) or a hex agent id.
+        device: String,
+        /// Session lifetime in seconds. 0 = the server's ceiling.
+        #[arg(long, default_value_t = 0)]
+        session_secs: u64,
+        /// Anything after `--` is passed to `ssh` verbatim — a remote command,
+        /// or extra client options: `roomler ssh box -- -v uptime`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Collect a standard diagnostic bundle from one or two devices and
     /// print it side by side.
     ///
@@ -592,6 +615,19 @@ where
                 fmt.json,
             )
             .await
+        }
+        Command::Ssh {
+            device,
+            session_secs,
+            args,
+        } => {
+            // Mirror ssh's own exit status, the same way `exec` mirrors the
+            // remote command's — so `roomler ssh box -- false` composes in a
+            // script instead of always looking successful.
+            match crate::sshcmd::run(&device, session_secs, &args).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Command::Diag { action } => match action {
             DiagAction::Host { device, fmt } => localclient::diag_bundle(&[device], fmt.json).await,
