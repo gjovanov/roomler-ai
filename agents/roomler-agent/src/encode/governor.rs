@@ -282,14 +282,6 @@ impl RateGovernor {
         self.applied_bps
     }
 
-    pub fn cap_fps(&self) -> u32 {
-        self.viewer_rate.cap_fps()
-    }
-
-    pub fn skip_divisor(&self) -> u32 {
-        self.skip_divisor
-    }
-
     pub fn frames_skipped_decode(&self) -> u64 {
         self.frames_skipped_decode
     }
