@@ -17,10 +17,15 @@ ExecStart=/usr/bin/roomlerd run
 # upgrade would read as the host going offline. Codes come from
 # `watchdog.rs`: 2 = STALL (watchdog forced exit) MUST come back;
 # 7 = AGENT_DELETED (row deleted / quarantined server-side) must NOT —
-# restarting only hammers a server that already said no.
+# restarting only hammers a server that already said no; 8 = ALREADY_RUNNING
+# (another process holds the single-instance lock) must NOT either — this
+# process is redundant by definition, and without the exception `always`
+# restarts it every 5 s forever. Especially reachable for THIS unit: a
+# per-user agent and the system `roomlerd.service` both target the same
+# config on a desktop that enabled both.
 Restart=always
 RestartSec=5
-RestartPreventExitStatus=7
+RestartPreventExitStatus=7 8
 Environment=RUST_LOG=roomler_agent=info,warn
 
 # Sandboxing — conservative defaults appropriate for a user unit.
