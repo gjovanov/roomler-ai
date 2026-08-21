@@ -544,6 +544,13 @@ peer-to-peer; the server never sees raw pixels or keystrokes."""
 depends = "libc6, libxcb1, libxcb-shm0, libxcb-randr0, libasound2"
 section = "net"
 priority = "optional"
+# One script, `postinst`, and all it does is `systemctl daemon-reload`.
+# Without it systemd keeps enforcing its CACHED copy of the units below, so
+# any unit edit we ship is inert until the host reboots — rc.439's
+# `RestartPreventExitStatus=7 8` landed on disk and did nothing. NOT
+# cargo-deb's `systemd-units` integration: that would also enable/start the
+# service, and deciding what runs on the host stays the operator's call.
+maintainer-scripts = "packaging/linux/debian"
 # `/usr/bin/roomler` was owned by the legacy standalone `roomler-tunnel` .deb.
 # Shipping the CLI from this package (see the assets below) therefore collides
 # with it, and dpkg refuses the whole upgrade:
