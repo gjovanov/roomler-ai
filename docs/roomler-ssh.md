@@ -392,7 +392,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P3a | Wire protocol (`rc:ssh.request` / `.grant` / `.response`), `SshPolicy` + `SshMode` + `SshAccountMode` models, `SSH_DEVICE` bit, agent-side grant table + redemption, `ssh` capability | **shipped** |
 | P3b | The server half: `agent_ssh.rs` (gates 1-3 + grant minting), hub push, the `ssh_policy` + org-settings API, and the `rc:ssh.request` device leg | **shipped** |
 | P3c-1 | `ssh_audit` — every request persisted, granted or refused; `GET …/ssh-audit` behind the new `VIEW_SSH_AUDIT` bit | **shipped** |
-| P3c-2 | Admin UI for the two policies (the org switch and the per-device `SshPolicy`) | next |
+| P3c-2 | Admin UI: the org switch, a per-device `SshPolicy` dialog, and the grant log | **shipped** |
 | P5a | `RunAs` + the never-silently-escalate rule; Unix named-account privilege drop (setgroups→setgid→setuid, verified); every unsupported mode refused | **shipped** |
 | P5b | Windows console-user sessions (`WTSQueryUserToken` + `CreateProcessAsUserW` with captured output) | **shipped** rc.418, field-proven |
 | P5c | `ssh_account_mode` — key-list sessions obey an explicit identity instead of silently taking the daemon's | **shipped** rc.419, field-proven |
