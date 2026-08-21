@@ -1,0 +1,14 @@
+# Files that MUST stay LF regardless of the committer's core.autocrlf.
+#
+# A dpkg maintainer script with CRLF endings has a shebang of `#!/bin/sh\r`,
+# which the kernel resolves to a nonexistent interpreter — the package then
+# fails to configure on EVERY host, and for a self-updating fleet that is a
+# fleet-wide broken upgrade. This repo is developed from a Windows box where
+# `core.autocrlf=true`, so the normalisation currently happens by config
+# rather than by rule; this makes it a rule.
+agents/roomler-agent/packaging/linux/debian/* text eol=lf
+
+# Same reasoning, lower stakes: systemd refuses to parse a unit whose lines
+# end in CR, and the shell scripts are run on Linux hosts.
+agents/roomler-agent/packaging/linux/*.service text eol=lf
+scripts/*.sh text eol=lf
