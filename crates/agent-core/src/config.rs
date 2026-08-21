@@ -1585,7 +1585,32 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 1
 pub fn default_config_path() -> Result<PathBuf> {
     let dirs =
         crate::appdirs::project_dirs().context("could not resolve a platform config directory")?;
-    Ok(dirs.config_dir().join("config.toml"))
+    let profile = dirs.config_dir().join("config.toml");
+
+    // Linux SYSTEM installs resolve to `/etc/roomler/config.toml`, which is
+    // what the packaged `roomlerd.service` passes as `--config`. Keeping the
+    // two in agreement is the whole point: when they disagreed, a host could
+    // run happily for weeks on an orphan `roomlerd run` (profile path) and
+    // then die `no config found` the first time systemd started it.
+    //
+    // The legacy profile path still wins while it is the ONLY one present, so
+    // a host whose migration has not run yet — or could not (see
+    // `migrate_system_config`) — keeps working instead of losing its identity.
+    #[cfg(target_os = "linux")]
+    if crate::appdirs::running_as_root() {
+        let system = crate::appdirs::system_config_path();
+        if system.exists() {
+            return Ok(system);
+        }
+        if profile.exists() {
+            return Ok(profile);
+        }
+        // Neither exists: a fresh system install. `enroll` writes here, so the
+        // unit finds it without a drop-in.
+        return Ok(system);
+    }
+
+    Ok(profile)
 }
 
 /// rc.52: machine-global config path —
