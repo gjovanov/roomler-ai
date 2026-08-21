@@ -58,17 +58,18 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     models::{
-        Agent, ConsentMode, RpcCap, SshAccountMode, SshDenyReason, SshGates, SshGrantSpec, SshMode,
-        SshPolicy, ssh_limits,
+        Agent, ConsentMode, RpcCap, SshAccountMode, SshAuditEvent, SshDenyReason, SshGates,
+        SshGrantSpec, SshMode, SshPolicy, ssh_limits,
     },
     signaling::ServerMsg,
 };
+use roomler_ai_services::dao::base::PaginationParams;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -248,8 +249,26 @@ pub async fn authorize(
 // Dispatch
 // ────────────────────────────────────────────────────────────────────────────
 
+/// A decision that came out `Ok`. Carries everything BOTH the response and the
+/// audit row need, so neither has to reach back into the other's leftovers.
+struct Granted {
+    grant_id: String,
+    address: String,
+    name: Option<String>,
+    expires_at_ms: u64,
+    account_mode: SshAccountMode,
+    session_secs: u64,
+}
+
 /// Gate, mint, push, answer. The ONE path a session request takes, whether it
 /// came from the browser, the API, or a device's LocalAPI.
+///
+/// The decision itself lives in [`decide`]; this wrapper exists so that EVERY
+/// outcome — grant or refusal — passes through a single audit write on its way
+/// out. Previously each refusal site called a `deny` helper, which meant a new
+/// refusal was audited only if whoever added it remembered to route through
+/// that helper. Now the type system does it: `decide` can only return
+/// `Result<Granted, SshDenyReason>`, and both arms are recorded here.
 pub async fn dispatch(
     state: &AppState,
     tenant_id: ObjectId,
@@ -259,11 +278,56 @@ pub async fn dispatch(
     session_secs: u64,
 ) -> SshResponseBody {
     let agent_id = agent.id.unwrap_or_default();
+    let outcome = decide(state, tenant_id, agent, caller, public_key, session_secs).await;
+    record_audit(state, tenant_id, agent_id, caller, &outcome).await;
+
+    match outcome {
+        Ok(g) => {
+            info!(
+                agent = %agent_id, caller = %caller.display, grant_id = %g.grant_id,
+                account_mode = ?g.account_mode, session_secs = g.session_secs,
+                "ssh: grant issued"
+            );
+            SshResponseBody {
+                address: Some(g.address),
+                // The port the device intercepts is agent-side config, and the
+                // server does not carry it. The built-in default is what an
+                // unconfigured device serves; a device that moved its port
+                // tells its own users.
+                port: Some(DEFAULT_SSH_PORT),
+                name: g.name,
+                grant_id: Some(g.grant_id),
+                expires_at_ms: Some(g.expires_at_ms),
+                error: None,
+            }
+        }
+        Err(reason) => {
+            warn!(
+                agent = %agent_id, caller = %caller.display, ?reason,
+                "ssh: request denied"
+            );
+            SshResponseBody::denied(reason)
+        }
+    }
+}
+
+/// Everything between "a request arrived" and "a grant is on its way to the
+/// device". Returns the refusal reason rather than a response body so it
+/// cannot answer the caller without [`dispatch`] auditing first.
+async fn decide(
+    state: &AppState,
+    tenant_id: ObjectId,
+    agent: &Agent,
+    caller: &Caller,
+    public_key: &str,
+    session_secs: u64,
+) -> Result<Granted, SshDenyReason> {
+    let agent_id = agent.id.unwrap_or_default();
 
     // Validate the key BEFORE consulting policy: a caller who sent garbage
     // should be told that, not told their permissions are wrong.
     if !is_supported_public_key(public_key) {
-        return deny(state, agent_id, caller, SshDenyReason::BadPublicKey).await;
+        return Err(SshDenyReason::BadPublicKey);
     }
 
     // The ONE place the target's policy is consumed: `split` routes every
@@ -271,9 +335,7 @@ pub async fn dispatch(
     // policy field cannot be silently ignored by either half.
     let (gates, spec) = agent.ssh_policy.clone().split();
 
-    if let Err(reason) = authorize(state, tenant_id, &gates, caller).await {
-        return deny(state, agent_id, caller, reason).await;
-    }
+    authorize(state, tenant_id, &gates, caller).await?;
 
     // Where to send them. A device can pass every gate and still be
     // unreachable — that is a different failure and says so.
@@ -283,7 +345,7 @@ pub async fn dispatch(
         .await
     {
         Ok(Some(n)) if !n.overlay_ip.is_empty() => n,
-        _ => return deny(state, agent_id, caller, SshDenyReason::NoOverlayAddress).await,
+        _ => return Err(SshDenyReason::NoOverlayAddress),
     };
 
     let grant_id = ObjectId::new().to_hex();
@@ -313,31 +375,74 @@ pub async fn dispatch(
         // The hub distinguishes "not connected" from "connected but cannot
         // honour it", and the caller needs that difference: one is wait and
         // retry, the other is upgrade the agent.
-        let reason = match e {
+        return Err(match e {
             roomler_ai_remote_control::error::Error::ExecUnsupported(_) => {
                 SshDenyReason::Unsupported
             }
             _ => SshDenyReason::Offline,
-        };
-        return deny(state, agent_id, caller, reason).await;
+        });
     }
 
-    info!(
-        agent = %agent_id, caller = %caller.display, %grant_id,
-        account_mode = ?account_mode, session_secs,
-        "ssh: grant issued"
-    );
-
-    SshResponseBody {
-        address: Some(node.overlay_ip.clone()),
-        // The port the device intercepts is agent-side config, and the server
-        // does not carry it. The built-in default is what an unconfigured
-        // device serves; a device that moved its port tells its own users.
-        port: Some(DEFAULT_SSH_PORT),
+    Ok(Granted {
+        grant_id,
+        address: node.overlay_ip.clone(),
         name: (!node.name.is_empty()).then(|| node.name.clone()),
-        grant_id: Some(grant_id),
-        expires_at_ms: Some(expires_at_ms),
-        error: None,
+        expires_at_ms,
+        account_mode,
+        session_secs,
+    })
+}
+
+/// Persist the decision. Best-effort by design: the audit write must never
+/// decide whether someone gets a session, so a failed insert is logged loudly
+/// — it is the record someone will come looking for — and the request
+/// proceeds.
+async fn record_audit(
+    state: &AppState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    caller: &Caller,
+    outcome: &Result<Granted, SshDenyReason>,
+) {
+    let event = audit_event(tenant_id, agent_id, caller, outcome);
+    if let Err(e) = state.ssh_audit.record(event).await {
+        warn!(%agent_id, %e, "ssh: audit write failed");
+    }
+}
+
+/// Build the row. Split from the write for the same reason [`authorize`] is
+/// split from [`dispatch`] — the interesting part is which fields a refusal is
+/// allowed to carry, and that should be assertable without a database.
+fn audit_event(
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    caller: &Caller,
+    outcome: &Result<Granted, SshDenyReason>,
+) -> SshAuditEvent {
+    // Bound once so a refusal cannot accidentally carry grant-only fields:
+    // everything below reads from THIS, not from the outcome directly.
+    let granted = outcome.as_ref().ok();
+    SshAuditEvent {
+        id: None,
+        tenant_id,
+        agent_id,
+        user_id: caller.user_id,
+        origin_agent_id: caller.origin_agent_id,
+        grant_id: granted.map(|g| g.grant_id.clone()),
+        // The HTTP leg cannot tell a browser from a script — both arrive as an
+        // authenticated caller with a bearer token — so this records the only
+        // distinction the server can actually observe.
+        source: if caller.origin_agent_id.is_some() {
+            "cli"
+        } else {
+            "api"
+        }
+        .to_string(),
+        caller: caller.display.clone(),
+        account_mode: granted.map(|g| account_mode_wire(g.account_mode).to_string()),
+        session_secs: granted.map(|g| g.session_secs),
+        at: bson::DateTime::now(),
+        denied: outcome.as_ref().err().copied(),
     }
 }
 
@@ -346,24 +451,6 @@ pub async fn dispatch(
 /// because the API crate must not depend on the agent's crate — the same
 /// reason `agent_exec` duplicates the consent timeout.
 const DEFAULT_SSH_PORT: u16 = 2222;
-
-/// Log the refusal and shape the answer.
-///
-/// Every denial is logged at WARN with the device and the principal. Auditing
-/// to a collection the way exec does is the next slice; a refusal that leaves
-/// no trace at all is how someone probes which devices will let them in.
-async fn deny(
-    _state: &AppState,
-    agent_id: ObjectId,
-    caller: &Caller,
-    reason: SshDenyReason,
-) -> SshResponseBody {
-    warn!(
-        agent = %agent_id, caller = %caller.display, ?reason,
-        "ssh: request denied"
-    );
-    SshResponseBody::denied(reason)
-}
 
 /// Is this an OpenSSH public key we will hand to a device?
 ///
@@ -628,6 +715,287 @@ fn consent_mode_would_be_ignored(
     mode: Option<ConsentMode>,
 ) -> bool {
     !matches!(mode, None | Some(ConsentMode::Auto)) && !caps.has_rpc(RpcCap::SshConsent)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Audit read side
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Projected row. The stored model is NOT serialised straight out: bson's
+/// `ObjectId` and `DateTime` render as extended JSON (`{"$oid": …}` /
+/// `{"$date": …}`), which nothing on the client parses — the same reason
+/// `ExecAuditRow` exists.
+#[derive(Debug, Serialize)]
+pub struct SshAuditRow {
+    pub id: String,
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    pub source: String,
+    pub caller: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_secs: Option<u64>,
+    pub at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied: Option<SshDenyReason>,
+    /// The refusal in the words the caller was given. Rendering `denied` alone
+    /// would make a reviewer map enum variants back to meanings by hand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied_message: Option<String>,
+}
+
+impl From<SshAuditEvent> for SshAuditRow {
+    fn from(e: SshAuditEvent) -> Self {
+        Self {
+            id: e.id.map(|i| i.to_hex()).unwrap_or_default(),
+            tenant_id: e.tenant_id.to_hex(),
+            agent_id: e.agent_id.to_hex(),
+            user_id: e.user_id.to_hex(),
+            origin_agent_id: e.origin_agent_id.map(|i| i.to_hex()),
+            grant_id: e.grant_id,
+            source: e.source,
+            caller: e.caller,
+            account_mode: e.account_mode,
+            session_secs: e.session_secs,
+            at: e.at.try_to_rfc3339_string().unwrap_or_default(),
+            denied: e.denied,
+            denied_message: e.denied.map(|d| d.message().to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SshAuditResponse {
+    pub items: Vec<SshAuditRow>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SshAuditQuery {
+    #[serde(default = "default_audit_page")]
+    pub page: u64,
+    #[serde(default = "default_audit_per_page")]
+    pub per_page: u64,
+    /// ISO 8601 — return only entries created before this instant.
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Narrow to one device — "who has been on this machine?"
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Narrow to one person — where an incident review starts.
+    #[serde(default)]
+    pub user_id: Option<String>,
+}
+
+fn default_audit_page() -> u64 {
+    1
+}
+
+fn default_audit_per_page() -> u64 {
+    50
+}
+
+impl SshAuditQuery {
+    fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            page: self.page,
+            per_page: self.per_page,
+            before: self.before.clone(),
+        }
+    }
+}
+
+/// `GET /api/tenant/{tenant_id}/ssh-audit`
+///
+/// Gated on `VIEW_SSH_AUDIT`, deliberately not on `SSH_DEVICE`: reviewing who
+/// held a session is a different job from being able to open one, and an org
+/// should be able to staff them separately.
+pub async fn audit(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<SshAuditQuery>,
+) -> Result<Json<SshAuditResponse>, ApiError> {
+    let tid = tenant_of(&tenant_id).await?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::VIEW_SSH_AUDIT,
+        "VIEW_SSH_AUDIT",
+    )
+    .await?;
+
+    let pg = q.pagination();
+    let page = match (&q.agent_id, &q.user_id) {
+        (Some(a), _) => {
+            let aid = ObjectId::parse_str(a)
+                .map_err(|_| ApiError::BadRequest("Invalid agent_id".into()))?;
+            state.ssh_audit.list_for_agent(tid, aid, &pg).await?
+        }
+        (None, Some(u)) => {
+            let uid = ObjectId::parse_str(u)
+                .map_err(|_| ApiError::BadRequest("Invalid user_id".into()))?;
+            state.ssh_audit.list_for_user(tid, uid, &pg).await?
+        }
+        (None, None) => state.ssh_audit.list_for_tenant(tid, &pg).await?,
+    };
+    Ok(Json(SshAuditResponse {
+        items: page.items.into_iter().map(Into::into).collect(),
+        total: page.total,
+        page: page.page,
+        per_page: page.per_page,
+    }))
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    fn caller(origin: Option<ObjectId>) -> Caller {
+        Caller {
+            user_id: ObjectId::new(),
+            display: "someone@example.com".to_string(),
+            origin_agent_id: origin,
+        }
+    }
+
+    fn granted() -> Granted {
+        Granted {
+            grant_id: "abc123".to_string(),
+            address: "100.65.4.30".to_string(),
+            name: Some("CORPLAP-3".to_string()),
+            expires_at_ms: 1,
+            account_mode: SshAccountMode::ConsoleUser,
+            session_secs: 900,
+        }
+    }
+
+    #[test]
+    fn a_refusal_carries_no_grant_fields() {
+        // The whole reason refusals are persisted is that they are the trace
+        // of someone probing the fleet. A row that carried a grant_id or an
+        // account_mode for a request that was REFUSED would read, to whoever
+        // reviews it later, as a session that happened.
+        let c = caller(None);
+        let e = audit_event(
+            ObjectId::new(),
+            ObjectId::new(),
+            &c,
+            &Err(SshDenyReason::NoPermission),
+        );
+        assert_eq!(e.denied, Some(SshDenyReason::NoPermission));
+        assert!(e.grant_id.is_none(), "a refusal must not carry a grant id");
+        assert!(
+            e.account_mode.is_none(),
+            "a refusal must not name an account it never granted"
+        );
+        assert!(e.session_secs.is_none());
+        assert_eq!(
+            e.user_id, c.user_id,
+            "the principal is the point of the row"
+        );
+    }
+
+    #[test]
+    fn a_grant_records_which_identity_it_authorised() {
+        // `account_mode` is the field that makes this log worth reading: it is
+        // the difference between a shell as the console user and a shell as
+        // SYSTEM/root.
+        let e = audit_event(
+            ObjectId::new(),
+            ObjectId::new(),
+            &caller(None),
+            &Ok(granted()),
+        );
+        assert!(e.denied.is_none());
+        assert_eq!(e.grant_id.as_deref(), Some("abc123"));
+        assert_eq!(e.account_mode.as_deref(), Some("console_user"));
+        assert_eq!(e.session_secs, Some(900));
+    }
+
+    #[test]
+    fn the_source_distinguishes_the_device_leg_from_an_http_caller() {
+        // Only distinction the server can actually observe — a browser and a
+        // script both arrive as an authenticated bearer token.
+        let origin = ObjectId::new();
+        let via_device = audit_event(
+            ObjectId::new(),
+            ObjectId::new(),
+            &caller(Some(origin)),
+            &Ok(granted()),
+        );
+        assert_eq!(via_device.source, "cli");
+        assert_eq!(via_device.origin_agent_id, Some(origin));
+
+        let via_http = audit_event(
+            ObjectId::new(),
+            ObjectId::new(),
+            &caller(None),
+            &Ok(granted()),
+        );
+        assert_eq!(via_http.source, "api");
+        assert!(via_http.origin_agent_id.is_none());
+    }
+
+    #[test]
+    fn every_refusal_reason_survives_the_row_and_explains_itself() {
+        // A reviewer reading the audit table should not have to map enum
+        // variants back to meanings by hand, and a reason added later must not
+        // silently render as a blank cell.
+        for reason in [
+            SshDenyReason::OrgDisabled,
+            SshDenyReason::NoPermission,
+            SshDenyReason::DeviceDisabled,
+            SshDenyReason::CallerNotAllowed,
+            SshDenyReason::OriginNotAllowed,
+            SshDenyReason::Unsupported,
+            SshDenyReason::Offline,
+            SshDenyReason::NoOverlayAddress,
+            SshDenyReason::RateLimited,
+            SshDenyReason::BadPublicKey,
+        ] {
+            let e = audit_event(
+                ObjectId::new(),
+                ObjectId::new(),
+                &caller(None),
+                &Err(reason),
+            );
+            let row = SshAuditRow::from(e);
+            assert_eq!(row.denied, Some(reason));
+            let msg = row.denied_message.expect("a refusal must explain itself");
+            assert!(!msg.is_empty(), "{reason:?} has an empty message");
+        }
+    }
+
+    #[test]
+    fn a_granted_row_projects_ids_as_hex_not_extended_json() {
+        // bson's ObjectId/DateTime serialise as {"$oid": …} / {"$date": …},
+        // which nothing on the client parses — the audit table would render
+        // `[object Object]`. Same trap `ExecAuditRow` exists to avoid.
+        let tid = ObjectId::new();
+        let aid = ObjectId::new();
+        let row = SshAuditRow::from(audit_event(tid, aid, &caller(None), &Ok(granted())));
+        assert_eq!(row.tenant_id, tid.to_hex());
+        assert_eq!(row.agent_id, aid.to_hex());
+        assert!(
+            row.denied_message.is_none(),
+            "a grant has nothing to explain"
+        );
+        let json = serde_json::to_string(&row).expect("row serialises");
+        assert!(
+            !json.contains("$oid") && !json.contains("$date"),
+            "row leaked extended JSON: {json}"
+        );
+    }
 }
 
 #[cfg(test)]

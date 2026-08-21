@@ -353,6 +353,36 @@ thing. Gating them on a prompt would remove the emergency path exactly when it
 is needed. The device owner already consented by listing the key and setting
 `ssh_account_mode`.
 
+### The audit trail (P3c-1 — shipped)
+
+Every request through `dispatch` — granted **or refused** — lands in
+`ssh_audit` (90-day TTL, indexed by tenant, by device, and by user).
+`GET /api/tenant/{tid}/ssh-audit` reads it, gated on `VIEW_SSH_AUDIT`
+(`1 << 30`), which is in `DEFAULT_ADMIN` while `SSH_DEVICE` deliberately is
+not: reviewing who held a session is a different job from being able to open
+one, and an org should be able to staff them separately.
+
+The refused rows are the load-bearing ones — without them, someone probing
+which devices will let them in leaves no trace at all. So the auditing is not
+bolted onto each refusal site: `decide` returns
+`Result<Granted, SshDenyReason>` and `dispatch` records **both arms** in one
+place, which makes "a new refusal that forgets to audit itself" unrepresentable
+rather than merely discouraged.
+
+⚠️ **A row records the DECISION, not the session.** The server hands back an
+address and a grant and then steps out of the way; the session rides the
+overlay directly and the server never sees it. So there is deliberately no
+duration, exit status or output here, and a row means "a grant was issued",
+never "a session happened" — the design that keeps the server out of the data
+path is the same design that stops it from auditing the data path. What
+happened *on* the device is the device's own log. `account_mode` is the field
+worth reading: it is the difference between a shell as the console user and a
+shell as SYSTEM/root.
+
+⚠️ `VIEW_SSH_AUDIT` is a new bit, so **existing** admin roles do not carry it
+until their mask is rewritten — the same friction `SSH_DEVICE` has. Owner is
+unaffected (it passes via the `ADMINISTRATOR` bypass).
+
 ## 5. Roadmap
 
 | Slice | Scope | State |
@@ -361,7 +391,8 @@ is needed. The device owner already consented by listing the key and setting
 | P2 | russh server, publickey auth, `exec` via the exec engine | **shipped** |
 | P3a | Wire protocol (`rc:ssh.request` / `.grant` / `.response`), `SshPolicy` + `SshMode` + `SshAccountMode` models, `SSH_DEVICE` bit, agent-side grant table + redemption, `ssh` capability | **shipped** |
 | P3b | The server half: `agent_ssh.rs` (gates 1-3 + grant minting), hub push, the `ssh_policy` + org-settings API, and the `rc:ssh.request` device leg | **shipped** |
-| P3c | Admin UI for the two policies, and `exec_audit`-style auditing of SSH grants (today a denial is logged, not persisted) | next |
+| P3c-1 | `ssh_audit` — every request persisted, granted or refused; `GET …/ssh-audit` behind the new `VIEW_SSH_AUDIT` bit | **shipped** |
+| P3c-2 | Admin UI for the two policies (the org switch and the per-device `SshPolicy`) | next |
 | P5a | `RunAs` + the never-silently-escalate rule; Unix named-account privilege drop (setgroups→setgid→setuid, verified); every unsupported mode refused | **shipped** |
 | P5b | Windows console-user sessions (`WTSQueryUserToken` + `CreateProcessAsUserW` with captured output) | **shipped** rc.418, field-proven |
 | P5c | `ssh_account_mode` — key-list sessions obey an explicit identity instead of silently taking the daemon's | **shipped** rc.419, field-proven |
