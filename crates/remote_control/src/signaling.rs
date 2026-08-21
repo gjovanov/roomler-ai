@@ -1298,6 +1298,15 @@ pub enum ServerMsg {
         /// Echo of the grant the target was given, for correlation in logs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grant_id: Option<String>,
+        /// P6a — the target's SSH host public key, so the dialling device can
+        /// verify what it reached instead of trusting it on first use.
+        ///
+        /// This leg needs it MORE than the HTTP one, not less: `roomler ssh`
+        /// originates here, and it is the caller that has no other channel to
+        /// learn the key. Absent ⇒ the device reported none, which means it
+        /// cannot prove itself — never "any key is fine".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_pubkey: Option<String>,
         /// Unix ms the grant stops being redeemable — the caller should dial
         /// before this and give up after.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2110,6 +2119,52 @@ mod tests {
                 advertised_routes.is_empty(),
                 "a hello without advertised_routes must default to none"
             ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_response_carries_the_host_key_on_the_device_leg() {
+        // `roomler ssh` originates on THIS leg, and the dialling device has no
+        // other channel to learn the key — so if it goes missing here, the
+        // client is back to TOFU with no way to notice. It went missing once
+        // already: the HTTP body gained the field and the hand-written wire
+        // mapping kept sending the old shape, which compiles cleanly.
+        const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample target";
+        let m = ServerMsg::SshResponse {
+            request_id: "r1".into(),
+            address: Some("100.65.4.30".into()),
+            port: Some(2222),
+            grant_id: Some("g1".into()),
+            host_pubkey: Some(KEY.into()),
+            expires_at_ms: Some(123),
+            error: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""host_pubkey""#), "must reach the wire");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::SshResponse { host_pubkey, .. } => {
+                assert_eq!(host_pubkey.as_deref(), Some(KEY))
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // A refusal carries neither an address nor a key — they are only ever
+        // meaningful together — and an older server that omits the field must
+        // land on "cannot verify", not on something a client treats as a key.
+        let refused = ServerMsg::SshResponse {
+            request_id: "r2".into(),
+            address: None,
+            port: None,
+            grant_id: None,
+            host_pubkey: None,
+            expires_at_ms: None,
+            error: Some("nope".into()),
+        };
+        let s = serde_json::to_string(&refused).unwrap();
+        assert!(!s.contains("host_pubkey"), "absent, not null");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::SshResponse { host_pubkey, .. } => assert!(host_pubkey.is_none()),
             other => panic!("wrong variant: {other:?}"),
         }
     }
