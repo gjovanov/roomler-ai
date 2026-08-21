@@ -496,6 +496,12 @@ pub struct AgentConfig {
     /// clamped 100-5000.
     #[serde(default)]
     pub idle_refine_settle_ms: Option<u32>,
+    /// Phase B — the tracked settle on CONSTRAINED transports
+    /// (`ROOMLER_NODE_IDLE_REFINE_SETTLE_CONSTRAINED_MS`). Built-in
+    /// default: 2000; clamped 100-10000. The Up must outlast its own
+    /// refined IDR's transmission time on the link it rides.
+    #[serde(default)]
+    pub idle_refine_settle_constrained_ms: Option<u32>,
     /// HW-downscale Phase A — worker threads for the CPU resampler's
     /// row-banded passes (`ROOMLER_NODE_SCALE_THREADS`). Built-in
     /// default: 1 (inline, no threads spawned); clamped 1-8. A lever for
@@ -1411,6 +1417,7 @@ pub fn test_fixture() -> AgentConfig {
         idle_refine_min_frame_kb: None,
         idle_refine_major_area_permille: None,
         idle_refine_settle_ms: None,
+        idle_refine_settle_constrained_ms: None,
         scale_threads: None,
         ice_follow_renomination: None,
         ice_warm_standby: None,
@@ -1576,7 +1583,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 43]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 14] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 15] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1592,6 +1599,10 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 1
             cfg.idle_refine_major_area_permille,
         ),
         ("IDLE_REFINE_SETTLE_MS", cfg.idle_refine_settle_ms),
+        (
+            "IDLE_REFINE_SETTLE_CONSTRAINED_MS",
+            cfg.idle_refine_settle_constrained_ms,
+        ),
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
