@@ -174,6 +174,12 @@ pub(crate) struct RatePlan {
 /// `user_pick`: the rung IS the controller's explicit resolution pick
 /// (`RungReason::UserPick`) — the constrained relief must not soften a
 /// resolution the user chose on purpose (they may be reading at it).
+/// `dial_pct`: the rc.445 per-dial ceiling factor
+/// (`encode::dial_rate_factor_pct` — Smoother 70 / Balanced 85 /
+/// Sharper 100), the rebuild-free replacement for the dial dims-caps: a
+/// lower ceiling makes the HRD raise QP during motion continuously, so
+/// motion frames shrink without any encoder rebuild, and a settled
+/// desktop (which never reaches the ceiling) keeps full CQ quality.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rate_plan(
     encode_w: u32,
@@ -186,6 +192,7 @@ pub(crate) fn rate_plan(
     chroma444: bool,
     encode_factor: f32,
     user_pick: bool,
+    dial_pct: usize,
 ) -> RatePlan {
     let rate_factor_pct = crate::encode::rate_profile::codec_rate_factor_pct(codec_label)
         * crate::encode::rate_profile::chroma_rate_factor_pct(chroma444)
@@ -197,6 +204,8 @@ pub(crate) fn rate_plan(
         constrained,
         rate_factor_pct,
     ) as u32;
+    let base_ceiling =
+        ((base_ceiling as u64).saturating_mul(dial_pct.clamp(30, 100) as u64) / 100) as u32;
     let ceiling_bps =
         (((base_ceiling as f32) * encode_factor) as u32).max(crate::encode::MIN_BITRATE_BPS);
     // The bias forks on transport. Unconstrained: the P7 sharpening
@@ -385,42 +394,75 @@ mod tests {
         // ceiling_bps=3000000 the CORPLAP-2 field log shows. Constrained ⇒
         // the sharpening ladder is OFF and the motion relief SOFTENS
         // (field 2026-08-21: the CQ-18 rung was the 9 fps equilibrium).
-        let p = rate_plan(1024, 640, 1920, 1200, 30, true, "HEVC", false, 1.0, false);
+        let p = rate_plan(
+            1024, 640, 1920, 1200, 30, true, "HEVC", false, 1.0, false, 100,
+        );
         assert_eq!(p.ceiling_bps, 3_000_000);
         assert_eq!(p.cq_bias, -4);
 
         // The same rung as an explicit controller pick is exempt from
         // the relief — the user chose to live at it.
-        let p = rate_plan(1024, 640, 1920, 1200, 30, true, "HEVC", false, 1.0, true);
+        let p = rate_plan(
+            1024, 640, 1920, 1200, 30, true, "HEVC", false, 1.0, true, 100,
+        );
         assert_eq!(p.cq_bias, 0);
 
         // Same rung, native encode (refined): factor band 125 % ⇒
         // clamp floor 3.75 M, raw 1920×1200×30×0.07×1.25 ≈ 6.05 M —
         // within band; relay still clamps to 3 M; cq_bias 0 at native
         // (the at-rest polish quality is untouched by the relief).
-        let p = rate_plan(1920, 1200, 1920, 1200, 30, true, "HEVC", false, 1.0, false);
+        let p = rate_plan(
+            1920, 1200, 1920, 1200, 30, true, "HEVC", false, 1.0, false, 100,
+        );
         assert_eq!(p.ceiling_bps, 3_000_000);
         assert_eq!(p.cq_bias, 0);
 
         // Direct HEVC at native 60 fps: raw 9.68 M × 1.25 = 12.096 M,
         // inside the scaled [3.75, 15] M band, no relay clamp.
-        let p = rate_plan(1920, 1200, 1920, 1200, 60, false, "HEVC", false, 1.0, false);
+        let p = rate_plan(
+            1920, 1200, 1920, 1200, 60, false, "HEVC", false, 1.0, false, 100,
+        );
         assert_eq!(p.ceiling_bps, 12_096_000);
 
         // Direct at the deep rung keeps the P7 sharpening ladder.
-        let p = rate_plan(1024, 640, 1920, 1200, 60, false, "HEVC", false, 1.0, false);
+        let p = rate_plan(
+            1024, 640, 1920, 1200, 60, false, "HEVC", false, 1.0, false, 100,
+        );
         assert_eq!(p.cq_bias, 4);
 
         // Chroma 4:4:4 composes: 125 × 150 / 100 = 187 %; relay clamps.
-        let p = rate_plan(1024, 640, 1920, 1200, 30, true, "HEVC", true, 1.0, false);
+        let p = rate_plan(
+            1024, 640, 1920, 1200, 30, true, "HEVC", true, 1.0, false, 100,
+        );
         assert_eq!(p.ceiling_bps, 3_000_000);
 
         // Encode-pressure factor scales below the clamp, floored at
         // MIN_BITRATE_BPS.
-        let p = rate_plan(1024, 640, 1920, 1200, 30, true, "HEVC", false, 0.5, false);
+        let p = rate_plan(
+            1024, 640, 1920, 1200, 30, true, "HEVC", false, 0.5, false, 100,
+        );
         assert_eq!(p.ceiling_bps, 1_500_000);
-        let p = rate_plan(1024, 640, 1920, 1200, 30, true, "HEVC", false, 0.01, false);
+        let p = rate_plan(
+            1024, 640, 1920, 1200, 30, true, "HEVC", false, 0.01, false, 100,
+        );
         assert_eq!(p.ceiling_bps, crate::encode::MIN_BITRATE_BPS);
+
+        // rc.445 — the dial ceiling factor scales the (clamped) ceiling:
+        // constrained Smoother = 3 M × 70 % = 2.1 M; Balanced 85 % = 2.55 M;
+        // the MIN_BITRATE floor still holds underneath.
+        let p = rate_plan(
+            1920, 1200, 1920, 1200, 30, true, "HEVC", false, 1.0, false, 70,
+        );
+        assert_eq!(p.ceiling_bps, 2_100_000);
+        let p = rate_plan(
+            1920, 1200, 1920, 1200, 30, true, "HEVC", false, 1.0, false, 85,
+        );
+        assert_eq!(p.ceiling_bps, 2_550_000);
+        // Direct Smoother: 12.096 M × 70 % = 8.467 M — mild squeeze, no clamp.
+        let p = rate_plan(
+            1920, 1200, 1920, 1200, 60, false, "HEVC", false, 1.0, false, 70,
+        );
+        assert_eq!(p.ceiling_bps, 8_467_200);
     }
 
     /// P8c invariant (accidental loop 2, refine→dims→ceiling): idle
@@ -433,15 +475,23 @@ mod tests {
         let _guard = crate::encode::RELAY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let capped = rate_plan(1024, 640, 2560, 1600, 30, true, "HEVC", false, 1.0, false);
-        let refined = rate_plan(2560, 1600, 2560, 1600, 30, true, "HEVC", false, 1.0, false);
+        let capped = rate_plan(
+            1024, 640, 2560, 1600, 30, true, "HEVC", false, 1.0, false, 100,
+        );
+        let refined = rate_plan(
+            2560, 1600, 2560, 1600, 30, true, "HEVC", false, 1.0, false, 100,
+        );
         assert_eq!(
             capped.ceiling_bps, refined.ceiling_bps,
             "refine raised the relay ceiling"
         );
         // Same invariant at the larger 4:4:4 factor product.
-        let capped = rate_plan(1024, 640, 2560, 1600, 30, true, "HEVC", true, 1.0, false);
-        let refined = rate_plan(2560, 1600, 2560, 1600, 30, true, "HEVC", true, 1.0, false);
+        let capped = rate_plan(
+            1024, 640, 2560, 1600, 30, true, "HEVC", true, 1.0, false, 100,
+        );
+        let refined = rate_plan(
+            2560, 1600, 2560, 1600, 30, true, "HEVC", true, 1.0, false, 100,
+        );
         assert_eq!(capped.ceiling_bps, refined.ceiling_bps);
     }
 }
