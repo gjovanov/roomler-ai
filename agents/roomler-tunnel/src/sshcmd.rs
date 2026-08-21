@@ -125,6 +125,70 @@ pub async fn run(device: &str, session_secs: u64, args: &[String]) -> Result<i32
         .unwrap_or(if status.success() { 0 } else { 1 }))
 }
 
+/// `roomler proxy <host> <port>` — a stdio↔TCP pipe for OpenSSH's
+/// `ProxyCommand` (P6c).
+///
+/// ```text
+/// Host *.roomler
+///   ProxyCommand roomler proxy %h %p
+/// ```
+///
+/// This is TRANSPORT AND NAME RESOLUTION ONLY, and the distinction matters.
+/// `ProxyCommand` hands the client a byte pipe; it cannot supply an identity
+/// or a host key, because by the time it runs, `ssh` has already decided which
+/// key to offer and which `known_hosts` to check. A roomler grant is a
+/// single-use key with a ~60 s life, so it cannot live in a static
+/// `~/.ssh/config` either — which is exactly why [`run`] exists and why this
+/// is a *different* tool rather than the same one.
+///
+/// So: use this to reach a device **by name** with keys you already manage —
+/// a host running its own `sshd`, or a roomler-SSH device where your key is in
+/// `ssh_authorized_keys` (the break-glass path). Use `roomler ssh` when you
+/// want the grant, the policy-resolved account, and host-key verification
+/// handled for you.
+///
+/// A literal IP passes straight through, so `%h` works whether the user wrote
+/// a device name or an address.
+pub async fn proxy(host: &str, port: u16) -> Result<()> {
+    use tokio::io::{AsyncWriteExt, copy};
+    use tokio::net::TcpStream;
+
+    // An address is already an answer. Only a NAME needs the daemon, so a
+    // proxy to a literal address keeps working when the daemon is busy.
+    let addr = if host.parse::<std::net::IpAddr>().is_ok() {
+        host.to_string()
+    } else {
+        match localclient::resolve_overlay_ip(host).await? {
+            Some(ip) => ip,
+            None => bail!(
+                "no device named {host:?} on this mesh (or it has no overlay address). \
+                 `roomler peers` lists what is reachable."
+            ),
+        }
+    };
+
+    let mut sock = TcpStream::connect((addr.as_str(), port))
+        .await
+        .with_context(|| format!("connecting to {addr}:{port}"))?;
+    // Nagle would add up to 40 ms to every keystroke of an interactive
+    // session riding this pipe.
+    let _ = sock.set_nodelay(true);
+
+    let (mut sr, mut sw) = sock.split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    // Whichever direction ends first ends the proxy: `ssh` closing stdin means
+    // it is done, and the peer closing means the session is over. Waiting for
+    // BOTH would hang on the common case of a half-closed TCP stream.
+    tokio::select! {
+        r = copy(&mut stdin, &mut sw) => { r.context("stdin → peer")?; }
+        r = copy(&mut sr, &mut stdout) => { r.context("peer → stdout")?; }
+    }
+    let _ = stdout.flush().await;
+    Ok(())
+}
+
 fn mint_session_key() -> Result<ssh_key::PrivateKey> {
     use ssh_key::private::{Ed25519Keypair, PrivateKey};
     // Seeded from the OS CSPRNG and constructed from the bytes rather than an
@@ -188,6 +252,41 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn proxy_reports_an_unknown_name_instead_of_dialling_something() {
+        // The failure this prevents: treating an unresolvable name as a
+        // hostname and letting the OS resolver find SOMETHING — a LAN box, a
+        // search-domain match, a wildcard DNS answer. A mesh name that is not
+        // on the mesh must be an error, not a different destination.
+        //
+        // No daemon is running under test, so this exercises the same refusal
+        // path a live-but-unknown name takes: it must fail, and never reach a
+        // connect() to an OS-resolved host.
+        let err = proxy("definitely-not-a-device-9f3a", 22)
+            .await
+            .expect_err("an unknown name must not resolve to anything");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("Name or service not known") && !msg.contains("nodename nor servname"),
+            "the OS resolver must never see a mesh name: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_takes_a_literal_address_without_asking_the_daemon() {
+        // Port 9 (discard) on localhost is almost certainly closed, so this
+        // fails at CONNECT — which is the point: it got past resolution
+        // without a daemon, proving an address short-circuits the lookup.
+        let err = proxy("127.0.0.1", 9)
+            .await
+            .expect_err("nothing listens on :9");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("connecting to 127.0.0.1:9"),
+            "a literal address must go straight to connect, got: {msg}"
+        );
+    }
 
     #[test]
     fn a_session_key_is_ed25519_and_parses_as_a_client_would() {
