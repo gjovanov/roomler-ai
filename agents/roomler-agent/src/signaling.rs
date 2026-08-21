@@ -1428,6 +1428,8 @@ async fn connect_once(
                         rtt_ms: t.rtt_ms,
                         keyframe_requests: t.keyframe_requests,
                         input_events: t.input_events,
+                        shared_seconds: t.shared_seconds,
+                        mixed_dial_seconds: t.mixed_dial_seconds,
                     };
                     // Best-effort: telemetry must never tear down a
                     // working session, so a failed send is only logged —

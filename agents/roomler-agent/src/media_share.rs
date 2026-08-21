@@ -293,6 +293,20 @@ impl Pipeline {
             .any(|f| blocks(f.sink.priority.load(Relaxed)))
     }
 
+    /// P8 Phase 4 (mixed-dial telemetry) — does any follower's dial pair
+    /// (Priority, resolution pick) differ from the owner's? This is the
+    /// share-shape a per-viewer pipeline (SVC / tiered transcode) would
+    /// serve better than the floor-merge; the pumps count it into the
+    /// session stats per heartbeat window so the SVC decision is made on
+    /// field data. False with zero followers (nothing shared).
+    pub fn dials_mixed(&self, own_prio: u8, own_target: TargetResolution) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.followers.iter().any(|f| {
+            f.sink.priority.load(Relaxed) != own_prio
+                || *f.sink.target_resolution.lock().unwrap() != own_target
+        })
+    }
+
     /// Floor-merge of the quality dial (lowest value = most conservative;
     /// the VP9 pump's semantics). The FFmpeg pump ignores quality.
     pub fn min_quality(&self, own: u8) -> u8 {
@@ -830,6 +844,43 @@ mod tests {
         );
         // Quality: min.
         assert_eq!(owner.min_quality(2), 0);
+    }
+
+    // P8 Phase 4 — the mixed-dial predicate: false with no followers,
+    // false when everyone matches the owner, true on either a Priority
+    // or a resolution-pick divergence.
+    #[tokio::test]
+    async fn dials_mixed_detects_any_divergence() {
+        let _s = serial();
+        use crate::encode::priority::{BALANCED, SMOOTHER};
+        let key = PipelineKey::FfmpegDc("TEST-MIXED");
+        let owner = Pipeline::register(key, ObjectId::new());
+        assert!(
+            !owner.dials_mixed(BALANCED, TargetResolution::Native),
+            "no followers = nothing shared, nothing mixed"
+        );
+
+        let s = sink(ObjectId::new());
+        s.priority.store(BALANCED, Relaxed);
+        let _g = try_join(key, s, 60).expect("join");
+        assert!(
+            !owner.dials_mixed(BALANCED, TargetResolution::Native),
+            "identical dials are not mixed"
+        );
+        assert!(
+            owner.dials_mixed(SMOOTHER, TargetResolution::Native),
+            "priority divergence is mixed"
+        );
+        assert!(
+            owner.dials_mixed(
+                BALANCED,
+                TargetResolution::Fixed {
+                    width: 1280,
+                    height: 720
+                }
+            ),
+            "resolution-pick divergence is mixed"
+        );
     }
 
     #[tokio::test]

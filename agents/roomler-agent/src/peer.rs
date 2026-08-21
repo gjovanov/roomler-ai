@@ -245,6 +245,10 @@ pub struct SessionTelemetry {
     pub fps: f32,
     pub keyframe_requests: u32,
     pub input_events: u64,
+    /// P8 Phase 4 — cumulative shared-pipeline seconds (owner session).
+    pub shared_seconds: u64,
+    /// … of which the viewers' dials were not all equal.
+    pub mixed_dial_seconds: u64,
 }
 
 impl AgentPeer {
@@ -1179,6 +1183,8 @@ impl AgentPeer {
         let c = session_telemetry::counters(self.session_id);
         out.keyframe_requests = c.keyframe_requests.load(Ordering::Relaxed);
         out.input_events = c.input_events.load(Ordering::Relaxed);
+        out.shared_seconds = c.shared_seconds.load(Ordering::Relaxed);
+        out.mixed_dial_seconds = c.mixed_dial_seconds.load(Ordering::Relaxed);
         out
     }
 
@@ -3757,6 +3763,15 @@ async fn media_pump_vp9_444_dc(
             let avg_scale_ms = (scale_us / scale_ops.max(1)) as f64 / 1000.0;
             scale_us = 0;
             scale_ops = 0;
+            // P8 Phase 4 — shared / mixed-dial pipeline seconds (SVC
+            // go/no-go dataset; ~1 s window — see the ffmpeg twin).
+            if pipeline.follower_count() > 0 {
+                let mixed = pipeline.dials_mixed(
+                    priority.load(std::sync::atomic::Ordering::Relaxed),
+                    *target_resolution.lock().unwrap(),
+                );
+                crate::session_telemetry::counters(session_id).note_shared_window(1, mixed);
+            }
             // P8 Phase 5 — window QP stats (libvpx qindex scale);
             // None = no report this window.
             let avg_qp = (qp_n > 0).then(|| (qp_sum / qp_n) as u32);
@@ -5111,6 +5126,18 @@ async fn media_pump_ffmpeg_dc(
                     encode_factor = governor.encode_factor(),
                     "encode-bound auto-downscale tier change"
                 );
+            }
+            // P8 Phase 4 — count shared / mixed-dial pipeline seconds
+            // (the SVC go/no-go dataset). Counted on the OWNER session,
+            // whose pump runs the shared pipeline; a heartbeat window is
+            // ~HEARTBEAT_INTERVAL of wall time.
+            if pipeline.follower_count() > 0 {
+                let mixed = pipeline.dials_mixed(
+                    priority.load(std::sync::atomic::Ordering::Relaxed),
+                    *target_resolution.lock().unwrap(),
+                );
+                crate::session_telemetry::counters(session_id)
+                    .note_shared_window(HEARTBEAT_INTERVAL.as_secs(), mixed);
             }
             // P8 Phase 5 — window QP stats. None-valued fields = the
             // encoder reported no QP this window (openh264/MF, or an
