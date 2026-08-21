@@ -353,6 +353,31 @@ thing. Gating them on a prompt would remove the emergency path exactly when it
 is needed. The device owner already consented by listing the key and setting
 `ssh_account_mode`.
 
+### Host-key verification, not TOFU (P6a — shipped)
+
+A client dialling a node needs to know it reached that node. Until rc.444 the
+host key existed only on the device, so the only available answer was
+trust-on-first-use — which for a mesh where addresses are reassigned and
+devices are re-enrolled is not much of an answer.
+
+The agent now reports the **public** half of `ssh_host_key` on every hello;
+the server keeps it on the agent row and hands it back with the grant. That
+placement is deliberate: the grant response is already the one thing that says
+*where to dial*, so whoever has the address has the key, with no second lookup
+and no window holding one without the other. It is **not** in `AgentCaps` —
+caps say what a device can do, and two devices that can do the same things
+must still not be interchangeable to a client checking who it reached.
+
+⚠️ **An absent key means "this device cannot prove itself", never "any key is
+fine."** The API emits `None` rather than `""` precisely so a client cannot
+compare against nothing and always match, and an empty value is omitted from
+the wire so *absent* and *empty* cannot come to mean two things. A client that
+gets no key should say so rather than quietly falling back to TOFU.
+
+It is re-derived on every hello, so rotating the key on the device and
+restarting moves the fleet view with it; and it is rewritten even when empty,
+so a device that switches SSH off stops advertising a key it no longer holds.
+
 ### The audit trail (P3c-1 — shipped)
 
 Every request through `dispatch` — granted **or refused** — lands in
@@ -399,7 +424,9 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P5d | `SshPolicy.consent_mode` honoured — a policy of `prompt` now prompts, and refuses when nobody can be asked | **shipped** |
 | P4a | PTY / interactive shell on **Unix** (`openpty`, login shell, resize, group teardown) | **shipped** |
 | P4b | The same on **Windows** — ConPTY + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`. The platform that needs this most | **shipped** rc.429, field-proven on clk |
-| P6 | `roomler ssh <name>`, netmap-verified host keys (no TOFU), stdio `ProxyCommand` | designed |
+| P6a | Devices publish their SSH host key; the server stores it and returns it with the grant, so a caller has something to verify against | **shipped** rc.444 |
+| P6b | `roomler ssh <name>` — ephemeral keypair → grant → dial → verify against the published key → session | next |
+| P6c | stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync` can ride the mesh | designed |
 | P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
 | P8 | Audit + session recording + admin UI | designed |
 
