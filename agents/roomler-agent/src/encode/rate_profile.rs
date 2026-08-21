@@ -270,11 +270,81 @@ pub fn scale_cq_boost_steps() -> u32 {
         .unwrap_or(4)
 }
 
-/// Apply a CQ bias with the shared global floor (10 — below that is
-/// near-lossless blow-out, see `ffmpeg_cq`). Composes with
-/// [`h264_cq_adjust`]: 22 → 20 (h264) → 16 (deep rung); one shared floor.
-pub fn apply_cq_bias(cq: u32, steps: u32) -> u32 {
-    cq.saturating_sub(steps).max(10)
+/// Apply a SIGNED CQ bias with the shared global bounds ([10, 40] — the
+/// `ffmpeg_cq` clamp: below 10 is near-lossless blow-out, above 40 is
+/// visibly soft). Positive steps SHARPEN (subtract — the P7 deep-rung
+/// posture), negative steps SOFTEN (add — the constrained-motion relief:
+/// on a relay-clamped pipe the rung exists to keep MOTION fluid, and a
+/// softer rung frame is a smaller, faster-arriving one). Composes with
+/// [`h264_cq_adjust`]: 22 → 20 (h264) → 16 (deep rung) / 24 (relief 4);
+/// one shared floor and ceiling.
+pub fn apply_cq_bias(cq: u32, steps: i32) -> u32 {
+    (cq as i32 - steps).clamp(10, 40) as u32
+}
+
+/// Constrained-motion CQ relief, in SOFTENING steps, applied by
+/// `policy::rate_plan` when a constrained (relay) session runs below
+/// native — i.e. exactly the motion phase the resolution rung exists
+/// for. Field 2026-08-21 (pc50045/clk retest of rc.441): the P7
+/// sharpening bias drove the constrained Smoother rung to CQ 18, whose
+/// 25-40 KB deltas each took ~100-160 ms to traverse a ~2 Mbps relay —
+/// bursty arrival the viewer read as decode pressure, parking the
+/// viewer-rate divisor at 3 (the reported "9 fps, not fully smooth").
+/// Softer motion frames are the fluidity lever the dial promises; the
+/// at-rest image is untouched (native ⇒ bias 0 ⇒ base CQ + polish).
+/// Env `ROOMLER_AGENT_CONSTRAINED_CQ_RELIEF` / config
+/// `constrained_cq_relief` (default 4, 0 = no relief, max 12).
+pub fn constrained_cq_relief() -> i32 {
+    tunnel_core::env::node_env("CONSTRAINED_CQ_RELIEF")
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .map(|v| v.clamp(0, 12))
+        .unwrap_or(4)
+}
+
+/// Constrained send-queue byte budget, expressed as milliseconds of the
+/// relay ceiling. The DC pump's send channel is FRAME-count bounded
+/// (depth 4 constrained), which bounds nothing in BYTES: four native
+/// motion frames are ~0.5-1 MB ≈ 2-4 s of a ~2 Mbps relay — the field
+/// "drag starts, ~0.5 s in it freezes, then continues" (the queue is the
+/// freeze) and the "window drags seconds behind" lag. Budgeting the
+/// in-flight bytes to a fraction of a second converts queue-lag into an
+/// immediate production skip the viewer perceives as a lower — but
+/// current — frame rate. Env `ROOMLER_AGENT_CONSTRAINED_QUEUE_MS` /
+/// config `constrained_queue_ms` (default 450, 0 = unbounded, max 2000).
+pub fn constrained_queue_ms() -> u64 {
+    tunnel_core::env::node_env("CONSTRAINED_QUEUE_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.min(2000))
+        .unwrap_or(450)
+}
+
+/// [`constrained_queue_ms`] resolved against a link ceiling into a byte
+/// budget for the pump's backpressure gate. `0` ms disables the gate
+/// (`usize::MAX`).
+pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
+    let ms = constrained_queue_ms();
+    if ms == 0 {
+        return usize::MAX;
+    }
+    ((ceiling_bps as u64).saturating_mul(ms) / 8000) as usize
+}
+
+/// HRD/VBV window for CONSTRAINED sessions, as a percent of `maxrate`.
+/// Direct sessions keep the rc.234 2× window (transients spend real bits
+/// — the "IDR QP-collapse blur" fix). On a relay the same window is a
+/// latency bomb: it authorises a single ~750 KB IDR that then takes
+/// 2-3 s to traverse the clamped pipe — the dominant term of the field
+/// "text takes 4-5 s to crystallize". 75 % of maxrate bounds the refine
+/// IDR to ~280 KB (~1 s of link); the at-rest polish loop (17 fps of
+/// small refreshes, field-measured) repairs any residual IDR softness
+/// within a couple of frames — a repair path rc.234 predates. Env
+/// `ROOMLER_AGENT_CONSTRAINED_HRD_PCT` / config `constrained_hrd_pct`
+/// (default 75, clamp [25, 200]).
+pub fn constrained_hrd_pct() -> usize {
+    tunnel_core::env::node_env("CONSTRAINED_HRD_PCT")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(25, 200))
+        .unwrap_or(75)
 }
 
 /// Real frames since the last settle that make a motion episode "a burst"
@@ -484,14 +554,17 @@ pub const REFINE_SETTLE_TRACKED: Duration = Duration::from_millis(500);
 
 /// Phase B field fix (2026-08-21, pc50045/clk) — the tracked settle on a
 /// CONSTRAINED transport. On a ~3 Mbps relay every Up→Down pair costs two
-/// encoder rebuilds plus two IDRs (~150-400 KB each ≈ 0.5-1 s of link
-/// time apiece); a 500 ms settle fires the Up on ordinary drag PAUSES, so
-/// an interactive session lives in permanent IDR recovery — the field
-/// "freezing / window seconds behind" report. The settle must comfortably
-/// exceed the refined IDR's own transmission time on the link it rides:
-/// 2 s on constrained paths; direct/LAN keeps the crisp 500 ms.
+/// encoder rebuilds plus two IDRs; a 500 ms settle fires the Up on
+/// ordinary drag PAUSES, so an interactive session lives in permanent IDR
+/// recovery — the field "freezing / window seconds behind" report. The
+/// settle must comfortably exceed the refined IDR's own transmission time
+/// on the link it rides. Was 2000 ms when the IDR could be ~750 KB (the
+/// 2× HRD window ≈ 2-3 s of link); with the constrained HRD trim bounding
+/// it to ~280 KB (~1 s of link, see `constrained_hrd_pct`), 1200 ms still
+/// exceeds the transit while reclaiming ~0.8 s of the field "text takes
+/// 4-5 s to crystallize". Direct/LAN keeps the crisp 500 ms.
 /// Env/config `idle_refine_settle_constrained_ms`.
-pub const REFINE_SETTLE_TRACKED_CONSTRAINED: Duration = Duration::from_millis(2000);
+pub const REFINE_SETTLE_TRACKED_CONSTRAINED: Duration = Duration::from_millis(1200);
 
 /// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
 /// a scroll/drag; typing produces 100-200 ms gaps and never chains).
@@ -988,6 +1061,31 @@ mod tests {
         // Nominal cases: 22 → 20 (h264) → 16; HEVC skips the codec adjust.
         assert_eq!(apply_cq_bias(h264_cq_adjust("h264_nvenc", 22), 4), 16);
         assert_eq!(apply_cq_bias(h264_cq_adjust("hevc_nvenc", 22), 4), 18);
+    }
+
+    #[test]
+    fn negative_cq_bias_softens_and_clamps_at_the_ceiling() {
+        // Constrained-motion relief: negative steps ADD (soften).
+        assert_eq!(apply_cq_bias(22, -4), 26);
+        assert_eq!(apply_cq_bias(h264_cq_adjust("h264_qsv", 22), -4), 24);
+        // The shared [10, 40] bounds hold in both directions.
+        assert_eq!(apply_cq_bias(38, -6), 40);
+        assert_eq!(apply_cq_bias(12, 6), 10);
+        assert_eq!(apply_cq_bias(22, 0), 22);
+    }
+
+    #[test]
+    fn constrained_queue_budget_resolves_ms_of_ceiling() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Default 450 ms of a 3 Mbps ceiling = 168,750 bytes.
+        assert_eq!(constrained_queue_budget_bytes(3_000_000), 168_750);
+        // Scales with the ceiling.
+        assert_eq!(constrained_queue_budget_bytes(1_000_000), 56_250);
+        // Default knobs (env-free): relief 4 softening steps, HRD 75 %.
+        assert_eq!(constrained_cq_relief(), 4);
+        assert_eq!(constrained_hrd_pct(), 75);
     }
 
     fn gate() -> SettleKeyframeGate {
@@ -1710,12 +1808,12 @@ mod tests {
         let mut relay = refine();
         let _ = relay.note_real_frame_area(start, 600);
         assert_eq!(
-            relay.on_keepalive(true, true, start + Duration::from_millis(1900)),
+            relay.on_keepalive(true, true, start + Duration::from_millis(1100)),
             None,
-            "a 1.9 s drag pause must not refine on a relay"
+            "a 1.1 s drag pause must not refine on a relay"
         );
         assert_eq!(
-            relay.on_keepalive(true, true, start + Duration::from_millis(2000)),
+            relay.on_keepalive(true, true, start + Duration::from_millis(1200)),
             Some(RefineFlip::Up)
         );
         let mut direct = refine();
