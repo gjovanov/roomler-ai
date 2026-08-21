@@ -106,6 +106,11 @@ pub(crate) mod governor;
 )]
 pub(crate) mod kf_policy;
 
+/// HW-downscale Phase A — the CPU resampler (moved out of peer.rs) with
+/// cached taps + pooled buffers + alpha skip. No feature gate: the RTP
+/// pump uses it too, and its tests run on the default build.
+pub(crate) mod resample;
+
 /// Serialises tests that read/write the shared rate env vars
 /// (RELAY_MAX_KBPS, RATE_FACTOR_*, FFMPEG_MAXRATE_KBPS, SCALE_CQ_BOOST):
 /// cargo's parallel runner interleaved them once the test count grew

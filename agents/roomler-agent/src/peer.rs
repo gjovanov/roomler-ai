@@ -1646,6 +1646,8 @@ async fn media_pump(
     // desktop on unlock), which on a live session can be 1-2 seconds
     // of stale-then-suddenly-correct frames.
     let mut was_locked_last_iter = matches!(*lock_state_rx.borrow(), lock_state::LockState::Locked);
+    // Phase A — pump-local resampler (cached taps + pooled intermediate).
+    let mut resampler = crate::encode::resample::Resampler::new();
     // rc.26 — probe SystemContext once at pump start. Captured into a
     // local bool so the per-frame check is a single comparison.
     // SystemContext capture rebinds to winsta0\Winlogon on lock; the
@@ -2073,7 +2075,11 @@ async fn media_pump(
             pack_dims(frame.width, frame.height),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let frame = apply_target_resolution(frame, *target_resolution.lock().unwrap());
+        let frame = crate::encode::resample::apply_target_resolution(
+            &mut resampler,
+            frame,
+            *target_resolution.lock().unwrap(),
+        );
         // rc.190 — publish the dims we actually encode so the cursor pump
         // scales from truth (this pump's auto-downscale mutates the shared
         // target_resolution, so user-target == effective here).
@@ -2841,9 +2847,12 @@ async fn media_pump_vp9_444_dc(
     // caps, so the field log explains WHY the stream is smaller than asked.
     let mut res_cap_logged: Option<TargetResolution> = None;
     // P7 — downscale-stage timing (this pump has no per-stage accumulators
-    // like the ffmpeg pump's rc.88 trio, so track ops explicitly).
+    // like the ffmpeg pump's rc.88 trio, so track ops explicitly). Phase A —
+    // scale_ops counts REAL resamples only.
     let mut scale_us: u64 = 0;
     let mut scale_ops: u64 = 0;
+    // Phase A — pump-local resampler (cached taps + pooled intermediate).
+    let mut resampler = crate::encode::resample::Resampler::new();
     // P8 Phase 5 — per-window QP telemetry (record-only; libvpx qindex
     // scale). See the ffmpeg pump's twin.
     let mut qp_sum: u64 = 0;
@@ -3234,9 +3243,19 @@ async fn media_pump_vp9_444_dc(
             res_cap_logged = Some(effective_target);
         }
         let scale_start = std::time::Instant::now();
-        let frame = apply_target_resolution(frame, effective_target);
+        let pre_scale_dims = (frame.width, frame.height);
+        let frame = crate::encode::resample::apply_target_resolution(
+            &mut resampler,
+            frame,
+            effective_target,
+        );
         scale_us += scale_start.elapsed().as_micros() as u64;
-        scale_ops += 1;
+        // Phase A metric fix — count only REAL resamples (a passthrough
+        // costs ~0 and used to dilute avg_scale_ms below the true
+        // per-downscale cost the field reads).
+        if (frame.width, frame.height) != pre_scale_dims {
+            scale_ops += 1;
+        }
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the caps can pick a smaller target than
         // the controller asked for, so TargetResolution alone is stale).
@@ -4072,8 +4091,13 @@ async fn media_pump_ffmpeg_dc(
     let mut send_us: u64 = 0;
     // P7 — downscale stage joins the trio: the Lanczos floor now admits the
     // deeper Smoother shrinks, so avg_scale_ms is the field evidence that
-    // the filter fits (or doesn't fit) this host's 30 fps budget.
+    // the filter fits (or doesn't fit) this host's 30 fps budget. Phase A —
+    // averaged over REAL resamples (scale_ops), not window frames.
     let mut scale_us: u64 = 0;
+    let mut scale_ops: u64 = 0;
+    // Phase A — pump-local resampler (cached taps + pooled intermediate);
+    // see encode::resample module docs.
+    let mut resampler = crate::encode::resample::Resampler::new();
     // P8 Phase 5 — per-window QP telemetry (record-only): the encoder's
     // own quantizer reports, next to the rung/ceiling the agent CHOSE.
     // This is the dataset that decides whether a closed quality loop
@@ -4599,8 +4623,18 @@ async fn media_pump_ffmpeg_dc(
         // the CQ bias at the rebuild site is keyed on encode-vs-native area.
         let (native_w, native_h) = (frame.width, frame.height);
         let scale_start = std::time::Instant::now();
-        let frame = apply_target_resolution(frame, effective_target);
+        let frame = crate::encode::resample::apply_target_resolution(
+            &mut resampler,
+            frame,
+            effective_target,
+        );
         scale_us += scale_start.elapsed().as_micros() as u64;
+        // Phase A metric fix — average over REAL resamples only (see the
+        // vp9 twin): pass-through frames used to dilute avg_scale_ms far
+        // below the true per-downscale cost.
+        if (frame.width, frame.height) != (native_w, native_h) {
+            scale_ops += 1;
+        }
         // rc.190 — publish the ACTUAL encoded dims for the cursor pump's
         // native→encoded scaling (the relay cap can pick a smaller target
         // than the controller asked for).
@@ -5001,7 +5035,10 @@ async fn media_pump_ffmpeg_dc(
             let send_errors = send_errors.load(std::sync::atomic::Ordering::Relaxed);
             let window_frames = frames_encoded.saturating_sub(heartbeat_frames_base).max(1);
             let avg_capture_ms = (capture_us / window_frames) as f64 / 1000.0;
-            let avg_scale_ms = (scale_us / window_frames) as f64 / 1000.0;
+            // Phase A — per REAL resample (scale_ops), not per window frame:
+            // pass-through frames used to dilute this far below the true
+            // per-downscale cost (the number Phase C's veto would key on).
+            let avg_scale_ms = (scale_us / scale_ops.max(1)) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
             let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
             // rc.186 — step the encode-pressure controller off this window's
@@ -5062,6 +5099,7 @@ async fn media_pump_ffmpeg_dc(
             heartbeat_frames_base = frames_encoded;
             capture_us = 0;
             scale_us = 0;
+            scale_ops = 0;
             encode_us = 0;
             send_us = 0;
             qp_sum = 0;
@@ -5836,103 +5874,6 @@ fn attach_cursor_handler(
     });
 }
 
-/// Downscale a captured frame to the controller-chosen target
-/// resolution. `TargetResolution::Native` is a no-op; `Fixed` sizes
-/// larger or equal to the capture are also no-ops (upscaling serves
-/// no purpose — the encoder just gets interpolated pixels). Returns
-/// the same `Arc<Frame>` when no work is needed, so idle sessions
-/// don't pay the allocator cost.
-fn apply_target_resolution(
-    frame: std::sync::Arc<crate::capture::Frame>,
-    target: TargetResolution,
-) -> std::sync::Arc<crate::capture::Frame> {
-    let (tw, th) = match target {
-        TargetResolution::Native => return frame,
-        TargetResolution::Fixed { width, height } => (width, height),
-    };
-    if tw >= frame.width && th >= frame.height {
-        // Cap at native — don't upscale.
-        return frame;
-    }
-    if tw == 0 || th == 0 {
-        return frame;
-    }
-    if frame.pixel_format != crate::capture::PixelFormat::Bgra {
-        // Non-BGRA frames shouldn't reach this point today (both scrap
-        // and WGC emit BGRA), but be defensive — pass through rather
-        // than produce a mis-formatted downscale.
-        return frame;
-    }
-    // rc.191 — filter selection by ratio; P7 (2026-08-20) — the floor is now
-    // env-tunable and deep enough to cover the Smoother rungs. Box averaging
-    // blends fractional neighbours into ClearType mush at ANY non-integer
-    // ratio (rc.191 field: relay 0.67× and fit 0.75× "blurred/pixely" — and
-    // the Smoother 1024 cap, 1920→1024 = 0.533×, fell straight through the
-    // old `> 0.55` gate onto box: the exact text-mush case Lanczos was added
-    // for). The Lanczos-3 kernel anti-aliases correctly at any shrink
-    // (support = 3·ratio, see lanczos3_taps) and its cost is ~flat in depth
-    // (the horizontal pass is ≈24·src_area MACs — taps ∝ 1/scale cancels
-    // dst_w ∝ scale), so the real cost driver is SOURCE area, not ratio.
-    // Kill switches: `ROOMLER_AGENT_LANCZOS=0` (box everywhere),
-    // `ROOMLER_AGENT_LANCZOS_MIN_PCT=56` (restore the pre-P7 gate).
-    let scale = (tw as f32 / frame.width as f32).min(th as f32 / frame.height as f32);
-    let downscaled = if use_lanczos_for_scale(scale, lanczos_min_scale(), lanczos_enabled()) {
-        downscale_bgra_lanczos3(&frame.data, frame.width, frame.height, frame.stride, tw, th)
-    } else {
-        downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th)
-    };
-    std::sync::Arc::new(crate::capture::Frame {
-        width: tw,
-        height: th,
-        stride: tw * 4,
-        pixel_format: crate::capture::PixelFormat::Bgra,
-        data: downscaled,
-        monotonic_us: frame.monotonic_us,
-        monitor: frame.monitor,
-        // P8a — damage survives the resample (it used to be dropped
-        // here, which destroyed every tracked rect on the field path).
-        damage: scale_damage(&frame.damage, frame.width, frame.height, tw, th),
-    })
-}
-
-/// P8a — re-project tracked damage through a downscale. Per-EDGE
-/// floor/ceil (`x0=floor(x·r)`, `x1=ceil((x+w)·r)`) so coverage never
-/// shrinks below the true footprint (floor-x/ceil-w under-covers when
-/// the scaled origin lands mid-pixel). `Unknown` passes through.
-fn scale_damage(
-    damage: &crate::capture::Damage,
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> crate::capture::Damage {
-    use crate::capture::{Damage, DirtyRect};
-    let Damage::Tracked(rects) = damage else {
-        return Damage::Unknown;
-    };
-    if src_w == 0 || src_h == 0 {
-        return Damage::Unknown;
-    }
-    let rx = dst_w as f64 / src_w as f64;
-    let ry = dst_h as f64 / src_h as f64;
-    let out = rects
-        .iter()
-        .filter_map(|r| {
-            let x0 = ((r.x as f64 * rx).floor() as u32).min(dst_w);
-            let y0 = ((r.y as f64 * ry).floor() as u32).min(dst_h);
-            let x1 = (((r.x + r.w) as f64 * rx).ceil() as u32).min(dst_w);
-            let y1 = (((r.y + r.h) as f64 * ry).ceil() as u32).min(dst_h);
-            (x1 > x0 && y1 > y0).then_some(DirtyRect {
-                x: x0,
-                y: y0,
-                w: x1 - x0,
-                h: y1 - y0,
-            })
-        })
-        .collect();
-    Damage::Tracked(out)
-}
-
 /// rc.38 — aspect-preserving downscale target: shrink `(src_w, src_h)` so its
 /// LONG edge is ≤ `cap_long_edge`, keeping aspect and rounding DOWN to even
 /// dims (encoders reject odd). Sources already within the cap return
@@ -6199,213 +6140,6 @@ fn cursor_scale_from_dims(native_dims: u64, encoded_dims: u64) -> (f32, f32) {
         return (1.0, 1.0);
     }
     (ew as f32 / nw as f32, eh as f32 / nh as f32)
-}
-
-/// CPU box-filter downscale for BGRA frames. For each destination
-/// pixel, averages the source pixels inside the mapped rectangle.
-/// Handles non-integer ratios (e.g. 3840×2160 → 1920×1200). ~30 ms
-/// on 4K→1080p on a modern laptop CPU; good enough for 30 fps and
-/// tolerable at 60 fps. GPU path via VideoProcessorMFT is the
-/// follow-up (deferred Tier C/1C.3 in the RustDesk-parity plan).
-/// rc.191 — kill switch for the Lanczos-3 near-native downscale path.
-/// `ROOMLER_AGENT_LANCZOS=0` (or `false`) reverts every downscale to the
-/// box filter without a rebuild.
-fn lanczos_enabled() -> bool {
-    !matches!(
-        std::env::var("ROOMLER_AGENT_LANCZOS").ok().as_deref(),
-        Some("0") | Some("false")
-    )
-}
-
-/// P7 (2026-08-20) — minimum linear scale (as percent) at which the
-/// Lanczos-3 downscale engages; shallower shrinks below it fall back to the
-/// box filter. Default 34 covers the Smoother rungs (1920→1024 = 53%,
-/// 2560→1024 = 40%) while leaving 4K sources on box (3840→1024 = 27%,
-/// 3840→1280 = 33%, deliberately just under) — at ≤1/3 scale text is
-/// sub-readable regardless of filter, and the horizontal pass over an
-/// 8.3 MP source (~26–50 ms) would eat the 30 fps capture budget. `0` runs
-/// Lanczos for every downscale; `56` restores the pre-P7 `> 0.55` gate.
-fn lanczos_min_scale() -> f32 {
-    // node_env (not raw std::env) so the `lanczos_min_pct` config-surface
-    // key reaches this read through the fallback map.
-    let pct = node_env("LANCZOS_MIN_PCT")
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(34);
-    (pct.min(100) as f32) / 100.0
-}
-
-/// P7 — the filter decision, extracted for tests. Inclusive floor so a
-/// percent knob maps exactly (scale 0.34 passes a 34 floor).
-fn use_lanczos_for_scale(scale: f32, min_scale: f32, enabled: bool) -> bool {
-    enabled && scale >= min_scale
-}
-
-/// rc.191 — per-output-pixel Lanczos-3 tap table for one axis, in Q12
-/// fixed point. For downscaling the kernel is stretched by `src/dst`
-/// (support = 3·src/dst source pixels per output pixel); weights are
-/// normalised to sum exactly 4096 so flat fields round-trip losslessly.
-fn lanczos3_taps(src: u32, dst: u32) -> Vec<(i32, Vec<i32>)> {
-    const A: f32 = 3.0;
-    let ratio = src as f32 / dst as f32; // > 1 for downscale
-    let support = A * ratio.max(1.0);
-    let mut out = Vec::with_capacity(dst as usize);
-    for i in 0..dst {
-        let center = (i as f32 + 0.5) * ratio - 0.5;
-        let lo = (center - support).ceil() as i32;
-        let hi = (center + support).floor() as i32;
-        let lo_c = lo.max(0);
-        let hi_c = hi.min(src as i32 - 1);
-        let mut weights = Vec::with_capacity((hi_c - lo_c + 1) as usize);
-        let mut sum = 0.0f32;
-        let scale_inv = 1.0 / ratio.max(1.0);
-        for t in lo_c..=hi_c {
-            let x = (t as f32 - center) * scale_inv;
-            let w = if x.abs() < 1e-6 {
-                1.0
-            } else if x.abs() >= A {
-                0.0
-            } else {
-                let pix = std::f32::consts::PI * x;
-                (A * pix.sin() * (pix / A).sin()) / (pix * pix)
-            };
-            weights.push(w);
-            sum += w;
-        }
-        // Normalise → Q12 fixed point; distribute rounding residue onto the
-        // largest tap so the row sums to exactly 4096.
-        let mut fixed: Vec<i32> = weights
-            .iter()
-            .map(|w| ((w / sum) * 4096.0).round() as i32)
-            .collect();
-        let total: i32 = fixed.iter().sum();
-        if let Some(max_idx) = fixed
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, v)| **v)
-            .map(|(i, _)| i)
-        {
-            fixed[max_idx] += 4096 - total;
-        }
-        out.push((lo_c, fixed));
-    }
-    out
-}
-
-/// rc.191 — separable Lanczos-3 downscale for BGRA frames. P7 (2026-08-20):
-/// the kernel is a true scaled Lanczos (support = 3·ratio via lanczos3_taps)
-/// so it anti-aliases correctly at ANY shrink — box is never *more* correct,
-/// only cheaper; box survives below the `lanczos_min_scale` floor purely as
-/// a CPU guard for huge (4K+) sources. Cost model (measured 10-20 ms at
-/// 0.67-0.85× on ~2.3 MP sources; the horizontal pass is ≈24·src_area MACs
-/// independent of ratio, the vertical pass shrinks with scale, total
-/// ≈ 24·src_area·(1+scale)): 1920×1200→1024×640 ≈ 9-17 ms and
-/// 2560×1600→1024×640 ≈ 14-28 ms on a laptop core — inside the 33 ms/30 fps
-/// budget; `avg_scale_ms` in the pump heartbeats is the field evidence.
-/// Q12 integer accumulation (i32), horizontal pass into an i16
-/// intermediate, vertical pass back to u8 with clamping (the kernel has
-/// negative lobes).
-fn downscale_bgra_lanczos3(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    src_stride: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Vec<u8> {
-    let h_taps = lanczos3_taps(src_w, dst_w);
-    let v_taps = lanczos3_taps(src_h, dst_h);
-    // Horizontal pass: src_h rows × dst_w columns, Q12 >> 6 = Q6 stored in
-    // i16 (max |value| ≈ 255·4096·1.15 / 64 ≈ 18.8k — fits i16 with the
-    // ~15% negative-lobe overshoot headroom).
-    let mut mid = vec![0i16; (dst_w as usize) * (src_h as usize) * 4];
-    for y in 0..src_h as usize {
-        let row = y * src_stride as usize;
-        let mid_row = y * (dst_w as usize) * 4;
-        for (x, (lo, ws)) in h_taps.iter().enumerate() {
-            let mut acc = [0i32; 4];
-            for (k, w) in ws.iter().enumerate() {
-                let si = row + ((*lo as usize) + k) * 4;
-                acc[0] += w * src[si] as i32;
-                acc[1] += w * src[si + 1] as i32;
-                acc[2] += w * src[si + 2] as i32;
-                acc[3] += w * src[si + 3] as i32;
-            }
-            let di = mid_row + x * 4;
-            mid[di] = (acc[0] >> 6) as i16;
-            mid[di + 1] = (acc[1] >> 6) as i16;
-            mid[di + 2] = (acc[2] >> 6) as i16;
-            mid[di + 3] = (acc[3] >> 6) as i16;
-        }
-    }
-    // Vertical pass: Q6 · Q12 = Q18 → >> 18 back to u8, clamped.
-    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
-    let mid_stride = (dst_w as usize) * 4;
-    for (y, (lo, ws)) in v_taps.iter().enumerate() {
-        let dst_row = y * mid_stride;
-        for x in 0..dst_w as usize {
-            let mut acc = [0i32; 4];
-            for (k, w) in ws.iter().enumerate() {
-                let si = ((*lo as usize) + k) * mid_stride + x * 4;
-                acc[0] += w * mid[si] as i32;
-                acc[1] += w * mid[si + 1] as i32;
-                acc[2] += w * mid[si + 2] as i32;
-                acc[3] += w * mid[si + 3] as i32;
-            }
-            let di = dst_row + x * 4;
-            dst[di] = ((acc[0] + (1 << 17)) >> 18).clamp(0, 255) as u8;
-            dst[di + 1] = ((acc[1] + (1 << 17)) >> 18).clamp(0, 255) as u8;
-            dst[di + 2] = ((acc[2] + (1 << 17)) >> 18).clamp(0, 255) as u8;
-            dst[di + 3] = ((acc[3] + (1 << 17)) >> 18).clamp(0, 255) as u8;
-        }
-    }
-    dst
-}
-
-fn downscale_bgra_box(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    src_stride: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
-    let src_w_u = src_w as u64;
-    let src_h_u = src_h as u64;
-    for dy in 0..dst_h {
-        let sy_start = (dy as u64 * src_h_u / dst_h as u64) as u32;
-        let sy_end_raw = ((dy as u64 + 1) * src_h_u).div_ceil(dst_h as u64) as u32;
-        let sy_end = sy_end_raw.min(src_h);
-        for dx in 0..dst_w {
-            let sx_start = (dx as u64 * src_w_u / dst_w as u64) as u32;
-            let sx_end_raw = ((dx as u64 + 1) * src_w_u).div_ceil(dst_w as u64) as u32;
-            let sx_end = sx_end_raw.min(src_w);
-            let mut b: u32 = 0;
-            let mut g: u32 = 0;
-            let mut r: u32 = 0;
-            let mut a: u32 = 0;
-            let mut n: u32 = 0;
-            for sy in sy_start..sy_end {
-                let row_base = (sy * src_stride) as usize;
-                for sx in sx_start..sx_end {
-                    let i = row_base + (sx as usize) * 4;
-                    b += src[i] as u32;
-                    g += src[i + 1] as u32;
-                    r += src[i + 2] as u32;
-                    a += src[i + 3] as u32;
-                    n += 1;
-                }
-            }
-            if let Some(divisor) = std::num::NonZeroU32::new(n) {
-                let di = ((dy * dst_w + dx) as usize) * 4;
-                dst[di] = (b / divisor.get()) as u8;
-                dst[di + 1] = (g / divisor.get()) as u8;
-                dst[di + 2] = (r / divisor.get()) as u8;
-                dst[di + 3] = (a / divisor.get()) as u8;
-            }
-        }
-    }
-    dst
 }
 
 /// Placeholder handler for data channels that aren't wired to OS output
@@ -8471,96 +8205,8 @@ mod tests {
         assert_eq!(super::cursor_scale_from_dims(some, 0), (1.0, 1.0));
     }
 
-    // P7 (2026-08-20) — the Lanczos gate must cover the Smoother rungs. The
-    // pre-P7 `scale > 0.55` gate sent the MAIN field case (Priority=Smoother
-    // on a 1920×1200 panel → 1024×640 = 0.533×) to the box filter — the
-    // exact ClearType-mush case Lanczos was added for in rc.191.
-    #[test]
-    fn lanczos_gate_covers_smoother_rungs() {
-        // Default floor 0.34: the Smoother rungs take Lanczos…
-        assert!(super::use_lanczos_for_scale(0.533, 0.34, true)); // 1920→1024
-        assert!(super::use_lanczos_for_scale(0.40, 0.34, true)); // 2560→1024
-        assert!(super::use_lanczos_for_scale(0.34, 0.34, true)); // inclusive floor
-        // …while 4K sources stay on box (a CPU guard, not quality policy).
-        assert!(!super::use_lanczos_for_scale(0.333, 0.34, true)); // 3840→1280
-        assert!(!super::use_lanczos_for_scale(0.267, 0.34, true)); // 3840→1024
-        // Kill switch wins regardless of ratio.
-        assert!(!super::use_lanczos_for_scale(0.75, 0.34, false));
-    }
-
-    // P7 — the Q12 weight normalisation must hold at the newly-admitted
-    // deep ratio: a constant-colour field survives 1920×1200 → 1024×640
-    // exactly (any drift would band flat UI backgrounds).
-    #[test]
-    fn lanczos_flat_field_roundtrip_at_deep_ratio() {
-        let (sw, sh, dw, dh) = (1920u32, 1200u32, 1024u32, 640u32);
-        let mut src = vec![0u8; (sw * sh * 4) as usize];
-        for px in src.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0x20, 0x80, 0xC0, 0xFF]);
-        }
-        let dst = super::downscale_bgra_lanczos3(&src, sw, sh, sw * 4, dw, dh);
-        assert_eq!(dst.len(), (dw * dh * 4) as usize);
-        for px in dst.chunks_exact(4) {
-            assert_eq!(px, [0x20, 0x80, 0xC0, 0xFF]);
-        }
-    }
-
-    // P7 — lock the kernel-stretch behaviour the extended gate relies on:
-    // at ratio r = src/dst the support is 3·r source pixels per side, so an
-    // interior output pixel must see ≈2·3·r taps, and every row must still
-    // sum to exactly 4096 (Q12) — the flat-field guarantee at any ratio.
-    #[test]
-    fn lanczos_taps_support_grows_with_ratio() {
-        let taps = super::lanczos3_taps(1920, 1024); // r = 1.875 → support 5.625
-        let (_lo, ws) = &taps[512]; // interior pixel, no edge clamping
-        let expected = (2.0 * 3.0 * 1.875) as usize; // 11
-        assert!(
-            ws.len() >= expected && ws.len() <= expected + 2,
-            "taps at r=1.875: {} (expected ≈{})",
-            ws.len(),
-            expected
-        );
-        for (_, ws) in &taps {
-            assert_eq!(ws.iter().sum::<i32>(), 4096);
-        }
-    }
-
     // rc.190 — agent-side resolution caps (B1 relay hard / B2 SW soft).
     use super::TargetResolution as TR;
-
-    // P8a — damage re-projection through a downscale.
-    #[test]
-    fn scale_damage_per_edge_covers_and_unknown_passes_through() {
-        use crate::capture::{Damage, DirtyRect};
-        // Per-edge floor/ceil: at ratio 0.1 a rect covering source px
-        // 19..21 (x=19, w=2) maps to scaled px 1..3 — floor-x/ceil-w
-        // (1 + ceil(0.2)=1) would cover px 1 only; per-edge covers 1..3.
-        let d = Damage::Tracked(vec![DirtyRect {
-            x: 19,
-            y: 0,
-            w: 2,
-            h: 10,
-        }]);
-        let scaled = super::scale_damage(&d, 100, 100, 10, 10);
-        let Damage::Tracked(v) = &scaled else {
-            panic!("tracked must stay tracked");
-        };
-        assert_eq!(v.len(), 1);
-        assert_eq!(
-            (v[0].x, v[0].w),
-            (1, 2),
-            "per-edge scaling must not under-cover"
-        );
-        assert_eq!((v[0].y, v[0].h), (0, 1));
-        // Unknown passes through as Unknown.
-        assert!(matches!(
-            super::scale_damage(&Damage::Unknown, 100, 100, 10, 10),
-            Damage::Unknown
-        ));
-        // Tracked-empty stays tracked-empty (provably unchanged).
-        let empty = super::scale_damage(&Damage::Tracked(vec![]), 100, 100, 10, 10);
-        assert!(matches!(empty, Damage::Tracked(ref v) if v.is_empty()));
-    }
 
     #[test]
     fn aspect_preserved_target_shrinks_long_edge_even_dims() {
