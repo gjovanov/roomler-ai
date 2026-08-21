@@ -40,6 +40,9 @@ impl AgentDao {
             machine_id,
             os,
             agent_version,
+            // Unknown until the device's first hello — enrolment does not
+            // reach the machine, so there is nothing to record yet.
+            ssh_host_pubkey: String::new(),
             agent_token_hash,
             status: AgentStatus::Offline,
             last_seen_at: now,
@@ -157,10 +160,15 @@ impl AgentDao {
         displays: &[DisplayInfo],
         capabilities: &AgentCaps,
         advertised_routes: &[String],
+        ssh_host_pubkey: &str,
     ) -> DaoResult<bool> {
         let displays_bson = bson::to_bson(displays).unwrap_or(bson::Bson::Array(vec![]));
         let caps_bson = bson::to_bson(capabilities).unwrap_or(bson::Bson::Null);
         let advertised_bson = bson::to_bson(advertised_routes).unwrap_or(bson::Bson::Array(vec![]));
+        // Written on EVERY hello, including when empty. A device that
+        // switched SSH off, or downgraded to a build without it, must stop
+        // advertising a key it no longer holds — leaving the old value would
+        // have clients verifying against an identity that is gone.
         self.base
             .update_by_id(
                 agent_id,
@@ -170,6 +178,7 @@ impl AgentDao {
                         "displays": displays_bson,
                         "capabilities": caps_bson,
                         "advertised_routes": advertised_bson,
+                        "ssh_host_pubkey": ssh_host_pubkey,
                         "status": bson::to_bson(&AgentStatus::Online).unwrap(),
                         "last_seen_at": DateTime::now(),
                     }
