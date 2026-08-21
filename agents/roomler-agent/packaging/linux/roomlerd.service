@@ -34,7 +34,7 @@ User=root
 # NOT an agent env var and has no config-surface key; the daemon only ever
 # sees `--config`.
 #
-# Since rc.434 the DAEMON agrees with this path on its own: running as root on
+# Since rc.435 the DAEMON agrees with this path on its own: running as root on
 # Linux it resolves `/etc/roomler/config.toml` by default, and it migrates a
 # legacy `/root/.config/roomler/config.toml` here once at startup. That closes
 # the gap that made this unit dangerous — a host enrolled before the convention
