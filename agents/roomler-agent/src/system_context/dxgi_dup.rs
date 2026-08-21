@@ -164,6 +164,9 @@ pub struct DxgiFrame {
     /// backend cannot (scrap's public API drops the frame info) and
     /// always reports `Unknown`.
     pub damage: crate::capture::Damage,
+    /// Phase B — native dims when the backend GPU-scaled before the
+    /// readback; `None` = the frame is native-sized.
+    pub source: Option<(u32, u32)>,
 }
 
 /// Uniform interface over the two DXGI Desktop Duplication backends —
@@ -176,8 +179,12 @@ pub struct DxgiFrame {
 #[cfg(feature = "scrap-capture")]
 pub trait DxgiCapture {
     /// Acquire one frame (non-blocking). `BackendBail::Transient` on a
-    /// static desktop (no new frame this tick).
-    fn frame(&mut self) -> Result<DxgiFrame, BackendBail>;
+    /// static desktop (no new frame this tick). Phase B — `output_cap`
+    /// is the pump's effective encode box: a GPU-capable backend MAY
+    /// scale to it before the CPU readback (delivering `source` = native
+    /// dims + damage in scaled coords); backends without a GPU path
+    /// ignore it and deliver native.
+    fn frame(&mut self, output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail>;
     /// Drop + recreate the duplication after `AccessLost`.
     fn reset(&mut self) -> Result<(), BackendBail>;
     /// Capture dimensions in pixels.
@@ -266,6 +273,7 @@ impl DxgiDupBackend {
                     height: self.height,
                     stride,
                     damage: crate::capture::Damage::Unknown,
+                    source: None,
                 })
             }
             Err(e) => Err(BackendBail::from_io(e)),
@@ -292,7 +300,8 @@ impl DxgiCapture for DxgiDupBackend {
     // Inherent methods win method resolution, so these delegate without
     // recursing. Kept as a thin shim so the capture pump can box this
     // backend behind `dyn DxgiCapture` alongside the adapter-bound one.
-    fn frame(&mut self) -> Result<DxgiFrame, BackendBail> {
+    fn frame(&mut self, _output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail> {
+        // scrap owns the readback — no GPU-scale hook here.
         DxgiDupBackend::frame(self)
     }
     fn reset(&mut self) -> Result<(), BackendBail> {
