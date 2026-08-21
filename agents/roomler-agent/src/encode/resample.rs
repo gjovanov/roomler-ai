@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use tunnel_core::env::node_env;
 
-use crate::capture::{Damage, DirtyRect, Frame, PixelFormat};
+use crate::capture::{Frame, PixelFormat};
 use crate::peer::TargetResolution;
 
 /// Q12 fixed-point scale for the tap weights (each row sums to 4096).
@@ -418,45 +418,12 @@ pub(crate) fn apply_target_resolution(
         monitor: frame.monitor,
         // P8a — damage survives the resample (it used to be dropped
         // here, which destroyed every tracked rect on the field path).
-        damage: scale_damage(&frame.damage, frame.width, frame.height, tw, th),
+        damage: crate::capture::scale_damage(&frame.damage, frame.width, frame.height, tw, th),
+        // Phase B — native-dims truth PROPAGATES: a frame that was
+        // already backend-scaled keeps its original source; a native
+        // frame records its own pre-scale dims.
+        source: Some(frame.native_dims()),
     })
-}
-
-/// P8a — re-project tracked damage through a downscale. Per-EDGE
-/// floor/ceil (`x0=floor(x·r)`, `x1=ceil((x+w)·r)`) so coverage never
-/// shrinks below the true footprint (floor-x/ceil-w under-covers when
-/// the scaled origin lands mid-pixel). `Unknown` passes through.
-pub(crate) fn scale_damage(
-    damage: &Damage,
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Damage {
-    let Damage::Tracked(rects) = damage else {
-        return Damage::Unknown;
-    };
-    if src_w == 0 || src_h == 0 {
-        return Damage::Unknown;
-    }
-    let rx = dst_w as f64 / src_w as f64;
-    let ry = dst_h as f64 / src_h as f64;
-    let out = rects
-        .iter()
-        .filter_map(|r| {
-            let x0 = ((r.x as f64 * rx).floor() as u32).min(dst_w);
-            let y0 = ((r.y as f64 * ry).floor() as u32).min(dst_h);
-            let x1 = (((r.x + r.w) as f64 * rx).ceil() as u32).min(dst_w);
-            let y1 = (((r.y + r.h) as f64 * ry).ceil() as u32).min(dst_h);
-            (x1 > x0 && y1 > y0).then_some(DirtyRect {
-                x: x0,
-                y: y0,
-                w: x1 - x0,
-                h: y1 - y0,
-            })
-        })
-        .collect();
-    Damage::Tracked(out)
 }
 
 #[cfg(test)]
@@ -628,38 +595,5 @@ mod tests {
             single.lanczos3(&src, 192, 120, 192 * 4, 102, 64),
             banded.lanczos3(&src, 192, 120, 192 * 4, 102, 64),
         );
-    }
-
-    // P8a — damage re-projection through a downscale.
-    #[test]
-    fn scale_damage_per_edge_covers_and_unknown_passes_through() {
-        // Per-edge floor/ceil: at ratio 0.1 a rect covering source px
-        // 19..21 (x=19, w=2) maps to scaled px 1..3 — floor-x/ceil-w
-        // (1 + ceil(0.2)=1) would cover px 1 only; per-edge covers 1..3.
-        let d = Damage::Tracked(vec![DirtyRect {
-            x: 19,
-            y: 0,
-            w: 2,
-            h: 10,
-        }]);
-        let scaled = scale_damage(&d, 100, 100, 10, 10);
-        let Damage::Tracked(v) = &scaled else {
-            panic!("tracked must stay tracked");
-        };
-        assert_eq!(v.len(), 1);
-        assert_eq!(
-            (v[0].x, v[0].w),
-            (1, 2),
-            "per-edge scaling must not under-cover"
-        );
-        assert_eq!((v[0].y, v[0].h), (0, 1));
-        // Unknown passes through as Unknown.
-        assert!(matches!(
-            scale_damage(&Damage::Unknown, 100, 100, 10, 10),
-            Damage::Unknown
-        ));
-        // Tracked-empty stays tracked-empty (provably unchanged).
-        let empty = scale_damage(&Damage::Tracked(vec![]), 100, 100, 10, 10);
-        assert!(matches!(empty, Damage::Tracked(ref v) if v.is_empty()));
     }
 }

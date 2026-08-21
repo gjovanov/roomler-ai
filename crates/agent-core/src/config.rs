@@ -466,6 +466,11 @@ pub struct AgentConfig {
     /// Built-in default: ON since P7c (was opt-in at v1).
     #[serde(default)]
     pub idle_refine_balanced: Option<bool>,
+    /// HW-downscale Phase B — GPU scale-before-readback on D3D11 capture
+    /// backends (`ROOMLER_NODE_GPU_SCALE`). Built-in default: ON; off
+    /// reverts to the Phase-A CPU resample (a field A/B in one flip).
+    #[serde(default)]
+    pub gpu_scale: Option<bool>,
     /// P7 — long-edge cap for the refined rung
     /// (`ROOMLER_NODE_IDLE_REFINE_MAX_EDGE`). Built-in default: 0 = full
     /// native.
@@ -1401,6 +1406,7 @@ pub fn test_fixture() -> AgentConfig {
         scale_cq_boost: None,
         idle_refine: None,
         idle_refine_balanced: None,
+        gpu_scale: None,
         idle_refine_max_edge: None,
         idle_refine_min_frame_kb: None,
         idle_refine_major_area_permille: None,
@@ -1517,12 +1523,13 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 42] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 43] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
         ("IDLE_REFINE", cfg.idle_refine),
         ("IDLE_REFINE_BALANCED", cfg.idle_refine_balanced),
+        ("GPU_SCALE", cfg.gpu_scale),
         ("OVERLAY_QUIC", cfg.overlay_quic),
         ("OVERLAY_DIRECT", cfg.overlay_direct),
         ("OVERLAY_DERP", cfg.overlay_derp),
