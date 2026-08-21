@@ -3274,28 +3274,33 @@ async fn media_pump_vp9_444_dc(
         // P5 — resolution + Priority floor-merge across the shared
         // pipeline's viewers (most conservative wins while shared).
         let user_target = pipeline.merged_target(*target_resolution.lock().unwrap());
-        let effective_target = effective_target_resolution(
-            user_target,
-            frame.width,
-            frame.height,
-            // rc.199 — the relay cap is now Priority-resolved: Balanced keeps
-            // the link-physics hard cap on a relay, Sharper lifts it (native
-            // override), Smoother caps harder on every path. The SW soft cap
-            // below is independent (host-CPU protection, always applied).
-            pipeline.merged_priority_cap(
+        // P8b — same `plan_dims` composition as the FFmpeg pump; this SW
+        // pump's divergences are visible as INPUTS (no idle refine, SW CPU
+        // cap in the soft slot) instead of a parallel code path. rc.199
+        // semantics preserved: Priority-resolved relay hard cap + the
+        // always-applied SW soft cap.
+        let dims_plan = crate::encode::policy::plan_dims(&crate::encode::policy::DimsInputs {
+            native_w: frame.width,
+            native_h: frame.height,
+            merged_target: user_target,
+            merged_priority_cap: pipeline.merged_priority_cap(
                 crate::encode::priority_relay_cap(
                     priority.load(std::sync::atomic::Ordering::Relaxed),
                     constrained_transport,
                 ),
                 constrained_transport,
             ),
-            crate::encode::sw_res_cap_long_edge(),
-        );
+            refined: false,
+            refined_cap: None,
+            soft_cap: crate::encode::sw_res_cap_long_edge(),
+        });
+        let effective_target = dims_plan.effective_target;
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
             info!(
                 %session_id,
                 ?user_target,
                 ?effective_target,
+                reason = dims_plan.reason.as_str(),
                 native_w = frame.width,
                 native_h = frame.height,
                 constrained = constrained_transport,
@@ -4547,29 +4552,33 @@ async fn media_pump_ffmpeg_dc(
                     // and the scope check requires every CAP-CONTRIBUTING
                     // dial to be refine-applicable. Single-viewer pipelines
                     // reduce exactly to the pre-P7b expression.
+                    // P8b — the clamp/Native terms now come from the SAME
+                    // `plan_dims` the frame path executes (structurally
+                    // un-divergeable); the scope term stays the P7b
+                    // merged-dial check.
                     {
                         let now = std::time::Instant::now();
                         let prio = priority.load(std::sync::atomic::Ordering::Relaxed);
                         let (nw, nh) = unpack_dims(
                             capture_native_dims.load(std::sync::atomic::Ordering::Relaxed),
                         );
-                        let cap_clamps = pipeline
-                            .merged_priority_cap(
-                                crate::encode::priority_relay_cap(prio, constrained),
-                                constrained,
-                            )
-                            .is_some_and(|c| nw.max(nh) > c);
-                        let user_native = matches!(
-                            resolve_user_box(
-                                pipeline.merged_target(*target_resolution.lock().unwrap()),
-                                nw,
-                                nh
-                            ),
-                            TargetResolution::Native
-                        );
+                        let plan =
+                            crate::encode::policy::plan_dims(&crate::encode::policy::DimsInputs {
+                                native_w: nw,
+                                native_h: nh,
+                                merged_target: pipeline
+                                    .merged_target(*target_resolution.lock().unwrap()),
+                                merged_priority_cap: pipeline.merged_priority_cap(
+                                    crate::encode::priority_relay_cap(prio, constrained),
+                                    constrained,
+                                ),
+                                refined: idle_refine.refined(),
+                                refined_cap: crate::encode::idle_refine_cap_long_edge(),
+                                soft_cap: auto_res_cap,
+                            });
                         let eligible = nw > 0
-                            && cap_clamps
-                            && user_native
+                            && plan.capped_below_native
+                            && plan.user_native
                             && pipeline.merged_refine_eligible(prio, constrained);
                         if let Some(flip) = idle_refine.on_keepalive(eligible, now) {
                             info!(
@@ -4639,51 +4648,38 @@ async fn media_pump_ffmpeg_dc(
         // video pumps in the field.
         let native_dims_packed = pack_dims(frame.width, frame.height);
         capture_native_dims.store(native_dims_packed, std::sync::atomic::Ordering::Relaxed);
-        // rc.190 — compose the controller's request with the B1 relay hard
-        // cap: a constrained TURN-TCP path (~3 Mbps ceiling) cannot carry a
-        // 2560×1600 HEVC stream without the blur↔crystallize AIMD sawtooth
-        // (field NEO16→CORPLAP-1 2026-07-16, target_bps pinned 1.8M↔3.0M).
-        // No SW soft cap here — this pump is HW-encode by construction.
-        // P5 — both dials floor-merge across the pipeline's viewers: the
-        // smallest resolution request and the most conservative Priority cap
-        // win while shared (the badge shows "shared ×N" to explain it).
+        // P8b — the rung decision moved into `encode::policy::plan_dims`:
+        // one composition (P5 merges → refine lift → soft/hard tiers) that
+        // BOTH this frame path and the idle-refine eligibility hook consume,
+        // so the two can never diverge again (the P7b bug class). Semantics
+        // preserved verbatim from rc.190/rc.199/P7: merged target + merged
+        // Priority cap; while refined the cap is REPLACED by the refined
+        // rung; the encode-bound auto rung fills the soft slot (an explicit
+        // controller pick bypasses it by construction).
         let user_target = pipeline.merged_target(*target_resolution.lock().unwrap());
-        // rc.199 — Priority-resolved relay cap (see the VP9-444 pump). This
-        // HW-encode pump has no SW soft cap, so Sharper reaches full native.
-        let mut hard_cap = pipeline.merged_priority_cap(
-            crate::encode::priority_relay_cap(
-                priority.load(std::sync::atomic::Ordering::Relaxed),
+        let dims_plan = crate::encode::policy::plan_dims(&crate::encode::policy::DimsInputs {
+            native_w: frame.width,
+            native_h: frame.height,
+            merged_target: user_target,
+            merged_priority_cap: pipeline.merged_priority_cap(
+                crate::encode::priority_relay_cap(
+                    priority.load(std::sync::atomic::Ordering::Relaxed),
+                    constrained,
+                ),
                 constrained,
             ),
-            constrained,
-        );
-        // P7 — while idle-refined, the cap lifts (default: full native;
-        // ROOMLER_AGENT_IDLE_REFINE_MAX_EDGE bounds the refined rung). The
-        // dims change makes the rebuild below fire, whose first frame is a
-        // guaranteed IDR; scale_cq_bias recomputes to 0 at native so the
-        // refined IDR carries the base CQ (bounded size). Applied AFTER the
-        // P5 floor-merge — a refined settle lifts the SHARED encode (every
-        // viewer gets the crisp still); the first motion burst restores the
-        // merged cap. The encode-bound soft slot below still applies (an
-        // encoder that was saturating keeps its auto-downscale protection).
-        if idle_refine.refined() {
-            hard_cap = crate::encode::idle_refine_cap_long_edge();
-        }
-        let effective_target = effective_target_resolution(
-            user_target,
-            frame.width,
-            frame.height,
-            hard_cap,
-            // 2026-07-27 — encode-bound auto-downscale tier (soft slot: an
-            // explicit controller Fixed pick bypasses it by construction).
-            auto_res_cap,
-        );
+            refined: idle_refine.refined(),
+            refined_cap: crate::encode::idle_refine_cap_long_edge(),
+            soft_cap: auto_res_cap,
+        });
+        let effective_target = dims_plan.effective_target;
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
             info!(
                 %session_id,
                 codec_label,
                 ?user_target,
                 ?effective_target,
+                reason = dims_plan.reason.as_str(),
                 native_w = frame.width,
                 native_h = frame.height,
                 "FFmpeg DC pump: agent-side relay resolution cap engaged"
@@ -4704,47 +4700,30 @@ async fn media_pump_ffmpeg_dc(
 
         // Lazily build / rebuild the encoder when the frame dims change.
         let (w, h) = (frame.width, frame.height);
-        // Phase B — per-resolution, per-session (relay-aware) maxrate ceiling.
-        // Recomputed each frame (cheap) so a dim change or a mid-session env
-        // tweak re-seeds it; the AIMD starts at this ceiling and tracks the
-        // link down from it. Also the initial maxrate the encoder is built
-        // with. P3 — codec-factor-aware: H.264 gets a 150% band (equal text
-        // sharpness needs ~1.5× the bits of HEVC/AV1); the relay clamp still
-        // applies after the factor inside the fn.
-        // P7 — chroma factor composes with the codec factor (4:4:4 carries
-        // 2× the chroma samples; same ×1.5 band as the libvpx VP9-444 pump).
-        // The relay clamp still applies after, inside the fn.
-        let rate_factor_pct = crate::encode::rate_profile::codec_rate_factor_pct(codec.label())
-            * crate::encode::rate_profile::chroma_rate_factor_pct(hevc_444)
-            / 100;
-        let base_ceiling = crate::encode::ffmpeg::encoder::ffmpeg_maxrate_bps_scaled(
+        // P8b — the rate half of the plan (maxrate ceiling chain + deep-rung
+        // CQ bias) also moved into `encode::policy`; semantics verbatim from
+        // Phase B / P3 / P7 / rc.186 (codec × chroma factors, relay clamp
+        // inside the fn, encode-pressure factor floored at MIN_BITRATE_BPS,
+        // CQ bias keyed on encode-vs-native area). Computed from the ACTUAL
+        // post-downscale dims so a passthrough frame keeps ceiling truth.
+        let rate = crate::encode::policy::rate_plan(
             w,
             h,
+            native_w,
+            native_h,
             target_fps,
             constrained,
-            rate_factor_pct,
-        ) as u32;
-        // rc.186 — apply the encode-pressure factor. When the encoder is
-        // saturating (factor < 1.0) this feeds a lower ceiling to both the
-        // encoder rebuild AND the AIMD (which propagates it to the running
-        // encoder via set_bitrate) → smaller frames → faster encode. Floored
-        // at MIN_BITRATE_BPS so we never starve the stream.
-        let ceiling = (((base_ceiling as f32) * encode_factor) as u32).max(encode::MIN_BITRATE_BPS);
+            codec.label(),
+            hevc_444,
+            encode_factor,
+        );
+        let ceiling = rate.ceiling_bps;
         let need_rebuild = match encoder_dims {
             Some((ew, eh)) => ew != w || eh != h,
             None => true,
         };
         if need_rebuild {
-            // P7 — deep-rung CQ sharpening, recomputed at every rebuild from
-            // the encode-vs-native area (0 at/near native, so a native
-            // rebuild keeps the base CQ). Env ROOMLER_AGENT_SCALE_CQ_BOOST.
-            let cq_bias = crate::encode::rate_profile::scale_cq_bias(
-                w,
-                h,
-                native_w,
-                native_h,
-                crate::encode::rate_profile::scale_cq_boost_steps(),
-            );
+            let cq_bias = rate.cq_bias;
             match codec.open(w, h, target_fps, ceiling as usize, cq_bias, hevc_444) {
                 Ok(enc) => {
                     let encoder_name = enc.name();
@@ -6044,7 +6023,7 @@ fn scale_damage(
 /// auto-downscale and the DC pumps' relay/SW resolution caps share the exact
 /// same math (fixed 16:9 targets stretched 16:10 panels — see the rc.38 note
 /// at the media_pump call site).
-fn aspect_preserved_target(src_w: u32, src_h: u32, cap_long_edge: u32) -> (u32, u32) {
+pub(crate) fn aspect_preserved_target(src_w: u32, src_h: u32, cap_long_edge: u32) -> (u32, u32) {
     if src_w == 0 || src_h == 0 {
         return (cap_long_edge, cap_long_edge * 9 / 16);
     }
@@ -6108,7 +6087,11 @@ fn snap_native_scale() -> f32 {
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
-fn resolve_user_box(user: TargetResolution, native_w: u32, native_h: u32) -> TargetResolution {
+pub(crate) fn resolve_user_box(
+    user: TargetResolution,
+    native_w: u32,
+    native_h: u32,
+) -> TargetResolution {
     let TargetResolution::Fixed { width, height } = user else {
         return TargetResolution::Native;
     };
@@ -6140,7 +6123,7 @@ fn resolve_user_box(user: TargetResolution, native_w: u32, native_h: u32) -> Tar
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
-fn effective_target_resolution(
+pub(crate) fn effective_target_resolution(
     user: TargetResolution,
     native_w: u32,
     native_h: u32,
