@@ -1155,10 +1155,17 @@ impl FfmpegEncoder {
                     let is_keyframe = packet.is_key();
                     // duration is in time_base units (1/1000 == ms); convert to us.
                     let duration_us = (packet.duration().max(0) as u64) * 1000;
+                    // P8 Phase 5 — NVENC/QSV report the frame's average
+                    // QP via quality-stats side data; absent = None.
+                    let qp = packet
+                        .side_data()
+                        .find(|sd| sd.kind() == codec::packet::side_data::Type::QualityStats)
+                        .and_then(|sd| crate::encode::qp_from_quality_stats(sd.data()));
                     out.push(EncodedPacket {
                         data,
                         is_keyframe,
                         duration_us,
+                        qp,
                     });
                 }
                 Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {

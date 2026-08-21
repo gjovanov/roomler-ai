@@ -2910,6 +2910,11 @@ async fn media_pump_vp9_444_dc(
     // like the ffmpeg pump's rc.88 trio, so track ops explicitly).
     let mut scale_us: u64 = 0;
     let mut scale_ops: u64 = 0;
+    // P8 Phase 5 — per-window QP telemetry (record-only; libvpx qindex
+    // scale). See the ffmpeg pump's twin.
+    let mut qp_sum: u64 = 0;
+    let mut qp_max: i32 = 0;
+    let mut qp_n: u64 = 0;
     // Unanswered-force retry marker (see [`KEYFRAME_BACKSTOP`]).
     let mut kf_backstop_logged = false;
     // Force-ignored fallback parity (see [`KEYFRAME_FORCE_REBUILD_AFTER`]) —
@@ -3525,6 +3530,15 @@ async fn media_pump_vp9_444_dc(
         };
         frames_encoded += packets.len() as u64;
 
+        // P8 Phase 5 — fold the encoder's QP reports into the window.
+        for pkt in &packets {
+            if let Some(q) = pkt.qp {
+                qp_sum += q.max(0) as u64;
+                qp_max = qp_max.max(q);
+                qp_n += 1;
+            }
+        }
+
         // rc.39 — scene-change detection. Inspect each delta packet's
         // size against the rolling average; on a sufficient spike,
         // arm keyframe_requested so the *next* encode emits an IDR.
@@ -3743,6 +3757,10 @@ async fn media_pump_vp9_444_dc(
             let avg_scale_ms = (scale_us / scale_ops.max(1)) as f64 / 1000.0;
             scale_us = 0;
             scale_ops = 0;
+            // P8 Phase 5 — window QP stats (libvpx qindex scale);
+            // None = no report this window.
+            let avg_qp = (qp_n > 0).then(|| (qp_sum / qp_n) as u32);
+            let max_qp = (qp_n > 0).then_some(qp_max);
             info!(
                 %session_id,
                 target_fps,
@@ -3753,8 +3771,13 @@ async fn media_pump_vp9_444_dc(
                 scene_change_keyframes,
                 avg_scale_ms,
                 target_bps = governor.applied_bps(),
+                avg_qp = ?avg_qp,
+                max_qp = ?max_qp,
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
+            qp_sum = 0;
+            qp_max = 0;
+            qp_n = 0;
         }
     }
 }
@@ -4125,6 +4148,13 @@ async fn media_pump_ffmpeg_dc(
     // deeper Smoother shrinks, so avg_scale_ms is the field evidence that
     // the filter fits (or doesn't fit) this host's 30 fps budget.
     let mut scale_us: u64 = 0;
+    // P8 Phase 5 — per-window QP telemetry (record-only): the encoder's
+    // own quantizer reports, next to the rung/ceiling the agent CHOSE.
+    // This is the dataset that decides whether a closed quality loop
+    // replaces the area ladder. None-reporting backends leave qp_n=0.
+    let mut qp_sum: u64 = 0;
+    let mut qp_max: i32 = 0;
+    let mut qp_n: u64 = 0;
     // rc.93 — count Ok(None) ticks (capturer had no new frame). Replaces
     // the rc.92 floor-sleep accumulator now that the pump floor is gone. A
     // high frames_empty *under motion* would mean the capture backend (not
@@ -4869,6 +4899,14 @@ async fn media_pump_ffmpeg_dc(
         };
         encode_us += encode_start.elapsed().as_micros() as u64;
         frames_encoded += 1;
+        // P8 Phase 5 — fold the encoder's QP reports into the window.
+        for pkt in &packets {
+            if let Some(q) = pkt.qp {
+                qp_sum += q.max(0) as u64;
+                qp_max = qp_max.max(q);
+                qp_n += 1;
+            }
+        }
 
         // P7c — feed the idle-refine machine POST-encode with the frame's
         // wire cost: significance is keyed on encoded bytes (a keystroke
@@ -5074,6 +5112,12 @@ async fn media_pump_ffmpeg_dc(
                     "encode-bound auto-downscale tier change"
                 );
             }
+            // P8 Phase 5 — window QP stats. None-valued fields = the
+            // encoder reported no QP this window (openh264/MF, or an
+            // FFmpeg encoder without quality-stats side data) — an
+            // honest gap, deliberately distinct from a zero QP.
+            let avg_qp = (qp_n > 0).then(|| (qp_sum / qp_n) as u32);
+            let max_qp = (qp_n > 0).then_some(qp_max);
             info!(
                 %session_id,
                 codec_label,
@@ -5088,6 +5132,8 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_backpressure, frames_empty,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 encode_factor = governor.encode_factor(),
+                avg_qp = ?avg_qp,
+                max_qp = ?max_qp,
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
@@ -5095,6 +5141,9 @@ async fn media_pump_ffmpeg_dc(
             scale_us = 0;
             encode_us = 0;
             send_us = 0;
+            qp_sum = 0;
+            qp_max = 0;
+            qp_n = 0;
         }
     }
 }
