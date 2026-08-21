@@ -89,6 +89,8 @@ pub fn produce(width: u32, height: u32, monotonic_us: u64, monitor: u8) -> Arc<F
         // P8a — a synthetic frozen still: provably nothing changes
         // frame-to-frame while the overlay is up.
         damage: crate::capture::Damage::Tracked(Vec::new()),
+        // The overlay is painted at the requested dims — they ARE native.
+        source: None,
     })
 }
 
