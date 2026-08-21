@@ -425,6 +425,37 @@ would defeat the whole point of P6a.
 in one tree means two incompatible `PublicKey` types across the server and
 client halves of the same feature.
 
+### File transfer — `sftp` and `scp` (P7a — shipped)
+
+The `sftp` subsystem spawns OpenSSH's **`sftp-server` as the session's
+account** and splices the channel to its stdio. Modern `scp` speaks SFTP, so
+one path serves both.
+
+⚠️ **This is a privilege decision, not convenience.** Serving SFTP in-process
+(e.g. with `russh-sftp`, which resolves cleanly and adds no crypto) would run
+every read and write as the DAEMON — SYSTEM on Windows, root under systemd. A
+session resolved to `console_user` would silently touch files as root, and
+file transfer is the worst subsystem to get that wrong in. `exec` and the pty
+both drop privilege by handing work to a child; anything else here would be a
+second, weaker privilege story for the one subsystem that exists to touch
+files. Same `apply_run_as`, same consent gate, same identity — and roomler
+never parses an SFTP packet.
+
+⚠️ **Windows non-daemon accounts refuse.** Spawning as another user there needs
+`CreateProcessAsUserW`, whose streaming form currently only exists in the
+pty's pseudoconsole path — there is no pipes variant yet. Running the transfer
+as SYSTEM instead would be the dangerous answer, so it refuses and says so.
+Unix (all modes) and Windows-as-daemon work; **clk does not get scp yet.**
+
+⚠️ **No `sftp-server` binary ⇒ refuse**, naming what to install. The probe
+covers Debian/RHEL/Arch/macOS/Windows layouts; `ROOMLER_SFTP_SERVER` overrides
+for an unusual host. `sftp-server`'s stderr goes to the daemon log, never the
+channel — SFTP is binary and injected text corrupts a transfer.
+
+Field-proven 2026-08-22, mars → jupiter: an `sftp put` landed
+`-rw-r--r-- root root` (matching `ssh_account_mode = daemon`), and `scp`
+round-tripped a file byte-identical in both directions.
+
 ### `roomler proxy` for stock tools (P6c — shipped)
 
 ```
@@ -508,7 +539,8 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P6a | Devices publish their SSH host key; the server stores it and returns it with the grant, so a caller has something to verify against | **shipped** rc.444 |
 | P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, field-proven mars→clk |
 | P6c | `roomler proxy` — stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync`/`git` reach devices BY NAME | **shipped** |
-| P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
+| P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven mars→jupiter |
+| P7b | `-L` / `-R` / `-J` (`direct-tcpip`, `tcpip-forward`) | designed |
 | P8 | Audit + session recording + admin UI | designed |
 
 ## 6. Build
