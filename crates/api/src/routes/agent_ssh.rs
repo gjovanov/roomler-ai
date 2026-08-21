@@ -111,10 +111,11 @@ pub struct SshResponseBody {
     /// use. Carried HERE because this response is already the one thing that
     /// says where to dial; whoever has the address has the key.
     ///
-    /// Absent when the device reported none (SSH off, or a build without
-    /// `ssh-server`). That is not permission to skip the check — it means the
-    /// device cannot prove itself, and a client should say so rather than
-    /// silently fall back to TOFU.
+    /// Absent when the device reported none (never SSH-enabled, or a build
+    /// without `ssh-server`). That is not permission to skip the check — it
+    /// means the device cannot prove itself, and a client should say so rather
+    /// than silently fall back to TOFU. ⚠️ Present does not imply SSH is on:
+    /// the key outlives `ssh_enabled` going false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_pubkey: Option<String>,
     /// Unix ms after which the grant is dead — dial before this.

@@ -227,12 +227,16 @@ pub enum ClientMsg {
         /// and two devices that can do identical things still must not be
         /// interchangeable to a client checking who it reached.
         ///
-        /// Empty when the device has no host key — SSH disabled, or a build
-        /// without the `ssh-server` feature. Empty must therefore never be
-        /// read as "any key is fine"; it means "this device cannot prove
+        /// Empty when the device stores no host key — never SSH-enabled, or a
+        /// build without the `ssh-server` feature. Empty must therefore never
+        /// be read as "any key is fine"; it means "this device cannot prove
         /// itself", and a client that cares should refuse rather than fall
         /// back to TOFU. Absent from an older agent's hello deserialises the
         /// same way.
+        ///
+        /// ⚠️ Non-empty does NOT imply SSH is on: the key survives in the
+        /// config after `ssh_enabled` goes false, so a device that once served
+        /// keeps publishing.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         ssh_host_pubkey: String,
     },
