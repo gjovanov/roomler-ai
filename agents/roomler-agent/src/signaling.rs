@@ -940,6 +940,10 @@ async fn connect_once(
         // server may push `rc:relay.regions` (it never sends the variant to
         // an agent that didn't flag it — our deserializer would error).
         supports_relay_regions: crate::relay_probe::probing_enabled(),
+        // P6 — publish the host key's PUBLIC half so a caller can verify what
+        // it dialled. Empty here is meaningful ("this device cannot prove
+        // itself"), never "trust anything".
+        ssh_host_pubkey: ssh_host_pubkey_for(cfg),
     };
     send_msg(&mut ws, &hello).await.context("sending hello")?;
     // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't
@@ -2831,6 +2835,23 @@ fn pong_rtt(payload: &[u8], epoch: std::time::Instant) -> Option<Duration> {
     let ms = u64::from_be_bytes(payload.try_into().ok()?);
     let now = epoch.elapsed().as_millis() as u64;
     Some(Duration::from_millis(now.saturating_sub(ms)))
+}
+
+/// The device's SSH host public key for the hello, or empty.
+///
+/// Two cfg'd items rather than one function with an inner `#[cfg]` expression:
+/// the `ssh` module is gated on the OVERLAY features (no overlay ⇒ no address
+/// to serve SSH on ⇒ the module does not exist), so the call itself has to
+/// disappear, not just its result. `ssh.rs` then applies the SECOND gate —
+/// `ssh-server` — on top.
+#[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+fn ssh_host_pubkey_for(cfg: &crate::config::AgentConfig) -> String {
+    crate::ssh::host_public_key(cfg)
+}
+
+#[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+fn ssh_host_pubkey_for(_cfg: &crate::config::AgentConfig) -> String {
+    String::new()
 }
 
 fn detect_os() -> OsKind {
