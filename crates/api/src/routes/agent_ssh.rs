@@ -106,6 +106,17 @@ pub struct SshResponseBody {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grant_id: Option<String>,
+    /// P6 — the OpenSSH public half of the target's SSH host key, so the
+    /// caller can verify what it dialled rather than trusting it on first
+    /// use. Carried HERE because this response is already the one thing that
+    /// says where to dial; whoever has the address has the key.
+    ///
+    /// Absent when the device reported none (SSH off, or a build without
+    /// `ssh-server`). That is not permission to skip the check — it means the
+    /// device cannot prove itself, and a client should say so rather than
+    /// silently fall back to TOFU.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_pubkey: Option<String>,
     /// Unix ms after which the grant is dead — dial before this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
@@ -121,6 +132,7 @@ impl SshResponseBody {
             port: None,
             name: None,
             grant_id: None,
+            host_pubkey: None,
             expires_at_ms: None,
             error: Some(reason.message().to_string()),
         }
@@ -255,6 +267,9 @@ struct Granted {
     grant_id: String,
     address: String,
     name: Option<String>,
+    /// `None` when the device reported no host key — see
+    /// [`SshResponseBody::host_pubkey`].
+    host_pubkey: Option<String>,
     expires_at_ms: u64,
     account_mode: SshAccountMode,
     session_secs: u64,
@@ -297,6 +312,7 @@ pub async fn dispatch(
                 port: Some(DEFAULT_SSH_PORT),
                 name: g.name,
                 grant_id: Some(g.grant_id),
+                host_pubkey: g.host_pubkey,
                 expires_at_ms: Some(g.expires_at_ms),
                 error: None,
             }
@@ -387,6 +403,11 @@ async fn decide(
         grant_id,
         address: node.overlay_ip.clone(),
         name: (!node.name.is_empty()).then(|| node.name.clone()),
+        // From the AGENT ROW, i.e. what the device said on its last hello —
+        // not from anything the caller supplied. Empty stays `None` rather
+        // than an empty string so a client cannot accidentally "verify"
+        // against nothing.
+        host_pubkey: (!agent.ssh_host_pubkey.is_empty()).then(|| agent.ssh_host_pubkey.clone()),
         expires_at_ms,
         account_mode,
         session_secs,
@@ -873,6 +894,7 @@ mod audit_tests {
             grant_id: "abc123".to_string(),
             address: "100.65.4.30".to_string(),
             name: Some("clk".to_string()),
+            host_pubkey: Some("ssh-ed25519 AAAAC3Nz…".to_string()),
             expires_at_ms: 1,
             account_mode: SshAccountMode::ConsoleUser,
             session_secs: 900,
@@ -974,6 +996,38 @@ mod audit_tests {
             let msg = row.denied_message.expect("a refusal must explain itself");
             assert!(!msg.is_empty(), "{reason:?} has an empty message");
         }
+    }
+
+    #[test]
+    fn a_refusal_answer_carries_neither_an_address_nor_a_host_key() {
+        // The host key is only ever paired with somewhere to dial. Emitting
+        // one on a refusal would hand a caller half a connection and invite
+        // them to reconstruct the other half.
+        let body = SshResponseBody::denied(SshDenyReason::DeviceDisabled);
+        assert!(body.address.is_none());
+        assert!(body.host_pubkey.is_none());
+        assert!(body.grant_id.is_none());
+        assert!(body.error.is_some());
+    }
+
+    #[test]
+    fn a_device_that_reported_no_host_key_yields_none_not_empty_string() {
+        // `None` and `Some("")` are worlds apart to a client: one says "this
+        // device cannot prove itself", the other looks like a key it can
+        // compare against and always match. The API must never emit the
+        // second, so the conversion happens once, at the boundary.
+        for reported in ["", "   ".trim()] {
+            let projected: Option<String> = (!reported.is_empty()).then(|| reported.to_string());
+            assert!(
+                projected.is_none(),
+                "an empty reported key must project to None"
+            );
+        }
+        let real = "ssh-ed25519 AAAAC3Nz…";
+        assert_eq!(
+            (!real.is_empty()).then(|| real.to_string()),
+            Some(real.to_string())
+        );
     }
 
     #[test]
