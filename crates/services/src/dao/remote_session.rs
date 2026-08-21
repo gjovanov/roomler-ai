@@ -119,6 +119,12 @@ impl RemoteSessionDao {
                         "stats.avg_rtt_ms": f64::from(stats.avg_rtt_ms),
                         "stats.keyframe_requests": stats.keyframe_requests as i64,
                         "stats.input_events": stats.input_events as i64,
+                        // P8 Phase 4 — hand-built doc: a field added to
+                        // SessionStats MUST be added here too or live
+                        // merges silently drop it (mark_ended's whole-
+                        // struct to_bson is the safe twin).
+                        "stats.shared_seconds": stats.shared_seconds as i64,
+                        "stats.mixed_dial_seconds": stats.mixed_dial_seconds as i64,
                     },
                     "$max": { "stats.peak_fps": f64::from(stats.peak_fps) },
                 },
