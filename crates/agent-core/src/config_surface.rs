@@ -415,6 +415,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "P8a-2 - up-flip settle (ms, 100-5000) on capture-tracked backends: the cap lifts this long after the last major-damage frame (damage truth needs no 1s window drain). Empty = built-in 500. Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_MS. Restart required.",
     ),
     (
+        "scale_threads",
+        "string",
+        "HW-downscale Phase A - worker threads (1-8) for the CPU resampler's row-banded passes; a lever for weak hosts where the Smoother rung's downscale eats the frame budget. Empty = built-in 1 (inline, no threads). Env: ROOMLER_NODE_SCALE_THREADS. Restart required.",
+    ),
+    (
         "ice_follow_renomination",
         "enum:auto|always|never",
         "Media-ICE nomination-follow policy. auto (empty) = upward-only + stale-failover (recommended); always = legacy follow-everything (thrash-prone, diagnostics only); never = pin to first nomination. Env: ROOMLER_ICE_FOLLOW_RENOMINATION.",
@@ -576,6 +581,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
             cfg.idle_refine_major_area_permille.map(|p| p.to_string())
         }
         "idle_refine_settle_ms" => cfg.idle_refine_settle_ms.map(|p| p.to_string()),
+        "scale_threads" => cfg.scale_threads.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
             .map(|b| if b { "always" } else { "never" }.to_string()),
@@ -881,6 +887,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "idle_refine_settle_ms" => {
             cfg.idle_refine_settle_ms = parse_u32_range(key, value, 100, 5000)?
         }
+        "scale_threads" => cfg.scale_threads = parse_u32_range(key, value, 1, 8)?,
         "ice_follow_renomination" => {
             cfg.ice_follow_renomination =
                 match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
