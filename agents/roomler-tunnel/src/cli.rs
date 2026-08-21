@@ -306,6 +306,25 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// stdio↔TCP pipe for OpenSSH's `ProxyCommand`, so stock `ssh`, `scp`,
+    /// `rsync` and `git` can reach mesh devices BY NAME.
+    ///
+    ///   # ~/.ssh/config
+    ///   Host *.roomler
+    ///     ProxyCommand roomler proxy %h %p
+    ///
+    ///   scp report.pdf CORPLAP-3.roomler:/tmp/
+    ///
+    /// Transport and name resolution only: `ProxyCommand` cannot supply an
+    /// identity or a host key, so this uses keys YOU manage. For a
+    /// grant-issued session with the account resolved by policy and the host
+    /// key verified for you, use `roomler ssh` instead.
+    Proxy {
+        /// Device name or overlay address (OpenSSH passes `%h`).
+        host: String,
+        /// Port (OpenSSH passes `%p`).
+        port: u16,
+    },
     /// Collect a standard diagnostic bundle from one or two devices and
     /// print it side by side.
     ///
@@ -629,6 +648,7 @@ where
                 code => std::process::exit(code),
             }
         }
+        Command::Proxy { host, port } => crate::sshcmd::proxy(&host, port).await,
         Command::Diag { action } => match action {
             DiagAction::Host { device, fmt } => localclient::diag_bundle(&[device], fmt.json).await,
             DiagAction::Pair { a, b, fmt } => localclient::diag_bundle(&[a, b], fmt.json).await,
