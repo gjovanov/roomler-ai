@@ -1410,6 +1410,63 @@ impl ExecAuditEvent {
     pub const SAMPLE_BYTES: usize = 4096;
 }
 
+/// One roomler-SSH session REQUEST. Written on every attempt, granted or
+/// refused. TTL-expired after 90 days like [`ExecAuditEvent`].
+///
+/// **This records the DECISION, not the session.** The server's involvement
+/// ends when it hands back an address and a grant — the session itself rides
+/// the overlay directly between the caller and the device, and the server
+/// never observes it. So a row here means "a grant was issued", never "a
+/// session happened", and there is deliberately no duration, exit code or
+/// output: the design that keeps the server out of the data path is the same
+/// design that stops it from auditing the data path. What lands on the DEVICE
+/// (which grant authenticated, as whom, when) is the device's own log.
+///
+/// The refused rows are the load-bearing ones. Without them, someone probing
+/// which devices will let them in leaves no trace at all — which is why every
+/// exit from `agent_ssh::dispatch` funnels through one audit write rather than
+/// each refusal site remembering to log itself.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SshAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// The device the session was aimed at.
+    pub agent_id: ObjectId,
+    /// The acting principal. For a device-originated request this is the
+    /// originating device's `owner_user_id`.
+    pub user_id: ObjectId,
+    /// Set when the request came from a device's LocalAPI rather than an
+    /// authenticated HTTP caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_agent_id: Option<ObjectId>,
+    /// The minted grant, absent on refusal. Correlates this row with the
+    /// device-side log line that redeemed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    /// `cli` (device LocalAPI leg) | `api` (authenticated HTTP caller).
+    pub source: String,
+    /// Display name of the principal, as it was pushed to the device.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller: String,
+    /// Which identity the grant authorised — the field that makes this log
+    /// worth reading, since it is the difference between a shell as the
+    /// console user and a shell as SYSTEM/root. Absent on refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_mode: Option<String>,
+    /// Bound placed on the session, in seconds. Absent on refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_secs: Option<u64>,
+    pub at: DateTime,
+    /// Refusal reason; `None` = a grant was issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<SshDenyReason>,
+}
+
+impl SshAuditEvent {
+    pub const COLLECTION: &'static str = "ssh_audit";
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Session
 // ────────────────────────────────────────────────────────────────────────────

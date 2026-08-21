@@ -418,6 +418,21 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Roomler-SSH grant decisions. Same three questions as `exec_audit`, same
+    // 90-day TTL — an SSH session is the bigger power of the two, so its log
+    // must not be the shorter-lived one.
+    create_indexes(
+        db,
+        "ssh_audit",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "agent_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Centralized log batches (rc.58). 7-day TTL on `created_at` so
     // operators have a one-week diagnostic window. The compound
     // tenant+agent+created_at index drives the admin UI query "last N

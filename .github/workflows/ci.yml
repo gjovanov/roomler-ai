@@ -81,6 +81,19 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # `crates/api` unit tests ran in NO lane until now: the clippy step above
+      # is `--workspace` WITHOUT `--all-targets`, so it does not even compile
+      # `#[cfg(test)]` code, and the `cargo test` steps further down name
+      # `roomler-agent` / `roomler-ai-tunnel-core` explicitly. Every policy test
+      # under `routes/` — who may open a session, what a refusal records — was
+      # therefore decorative: a green PR did not mean they had run.
+      #
+      # `--lib` only: the integration suite in `crates/tests` needs MongoDB and
+      # Redis and belongs to a different lane. These are pure in-crate unit
+      # tests and need no services.
+      - name: Run API unit tests
+        run: cargo test -p roomler-ai-api --lib
+
       # Phase Y feature gate. The `vp9-444` feature compiles libvpx
       # via `env-libvpx-sys` (needs pkg-config + libvpx system lib),
       # plus `dcv-color-primitives`. Default workspace clippy never

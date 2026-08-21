@@ -19,6 +19,7 @@ pub mod remote_audit;
 pub mod remote_session;
 pub mod role;
 pub mod room;
+pub mod ssh_audit;
 pub mod stats;
 pub mod tenant;
 pub mod tunnel_audit;
