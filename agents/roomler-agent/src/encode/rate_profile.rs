@@ -153,6 +153,47 @@ pub fn chroma_rate_factor_pct(chroma444: bool) -> usize {
     if chroma444 { 150 } else { 100 }
 }
 
+/// P3 — codec-factor-aware ceiling. `factor_pct` scales the bpp-derived rate
+/// AND the [3, 12] Mbps band proportionally (H.264 needs ~1.5× the bits of
+/// HEVC/AV1 for the same screen-content text sharpness — field 2026-07-26:
+/// P2 H.264-DC "text gets blurred from time to time" at the HEVC-sized
+/// budget). The relay clamp applies AFTER the factor: a constrained pipe's
+/// physics don't grow with the codec, so relayed H.264 stays at
+/// `relay_max_bps` and keeps the known relay softness trade-off.
+///
+/// P8b — lives here (not `ffmpeg/encoder.rs`) because it's pure math with
+/// no ffmpeg types, and `encode::policy` composes it on every build.
+pub(crate) fn ffmpeg_maxrate_bps_scaled(
+    width: u32,
+    height: u32,
+    fps: u32,
+    constrained: bool,
+    factor_pct: usize,
+) -> usize {
+    if let Some(kbps) = tunnel_core::env::node_env("FFMPEG_MAXRATE_KBPS")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|k| *k > 0)
+    {
+        return kbps * 1000;
+    }
+    const SCREEN_BPP_PER_SECOND: f64 = 0.07;
+    let raw = (width as f64 * height as f64 * fps as f64 * SCREEN_BPP_PER_SECOND) as usize;
+    let raw = raw.saturating_mul(factor_pct) / 100;
+    let clamped = raw.clamp(
+        3_000_000_usize.saturating_mul(factor_pct) / 100,
+        12_000_000_usize.saturating_mul(factor_pct) / 100,
+    );
+    // rc.166 freeze fix — on a constrained relay-TCP transport (WSL / corp
+    // UDP-blocked) even the low end of the [3, 12] Mbps HEVC/vp9_qsv maxrate
+    // band overruns the ~1-4 Mbps pipe. Pull it down to relay_max_bps (3 Mbps
+    // default) so the FFmpeg DC pump matches the VP9-444 pump's relay clamp.
+    if constrained {
+        clamped.min(crate::encode::relay_max_bps() as usize)
+    } else {
+        clamped
+    }
+}
+
 /// H.264 constant-quality adjustment: 2 steps sharper than the shared CQ
 /// base, floored at the global minimum (10). No-op for every other encoder.
 pub fn h264_cq_adjust(encoder_name: &str, cq: u32) -> u32 {
