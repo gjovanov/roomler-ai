@@ -88,8 +88,6 @@ impl RungReason {
 /// diverge again (the P7b bug class).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DimsPlan {
-    /// The cap actually in force this tick (refine-aware).
-    pub hard_cap: Option<u32>,
     pub effective_target: TargetResolution,
     pub reason: RungReason,
     /// Would the UN-refined Priority cap clamp the native frame? (Refine
@@ -152,7 +150,6 @@ pub(crate) fn plan_dims(inp: &DimsInputs) -> DimsPlan {
     };
 
     DimsPlan {
-        hard_cap,
         effective_target: effective,
         reason,
         capped_below_native,
