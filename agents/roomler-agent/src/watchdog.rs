@@ -77,7 +77,7 @@ pub const STALL_EXIT_CODE: i32 = 2;
 ///     the host without a manual service restart).
 pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 
-/// rc.438: sentinel for "another process already holds this config's
+/// rc.439: sentinel for "another process already holds this config's
 /// single-instance lock, so this one is redundant — do NOT respawn it."
 ///
 /// **Linux only, deliberately.** Exit 0 means opposite things depending
