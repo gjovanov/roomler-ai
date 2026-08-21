@@ -840,6 +840,7 @@ mod tests {
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,
+            source: None,
         }
     }
 
