@@ -420,6 +420,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "P8a-2 - up-flip settle (ms, 100-5000) on capture-tracked backends: the cap lifts this long after the last major-damage frame (damage truth needs no 1s window drain). Empty = built-in 500. Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_MS. Restart required.",
     ),
     (
+        "idle_refine_settle_constrained_ms",
+        "string",
+        "Phase B - tracked settle (ms, 100-10000) on CONSTRAINED transports: the cap lifts only after this long without major damage, because the refined IDR itself costs ~0.5-1 s of relay link time and a 500 ms settle fired on ordinary drag pauses (field: freezing/lag). Empty = built-in 2000. Env: ROOMLER_NODE_IDLE_REFINE_SETTLE_CONSTRAINED_MS. Restart required.",
+    ),
+    (
         "scale_threads",
         "string",
         "HW-downscale Phase A - worker threads (1-8) for the CPU resampler's row-banded passes; a lever for weak hosts where the Smoother rung's downscale eats the frame budget. Empty = built-in 1 (inline, no threads). Env: ROOMLER_NODE_SCALE_THREADS. Restart required.",
@@ -587,6 +592,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
             cfg.idle_refine_major_area_permille.map(|p| p.to_string())
         }
         "idle_refine_settle_ms" => cfg.idle_refine_settle_ms.map(|p| p.to_string()),
+        "idle_refine_settle_constrained_ms" => {
+            cfg.idle_refine_settle_constrained_ms.map(|p| p.to_string())
+        }
         "scale_threads" => cfg.scale_threads.map(|p| p.to_string()),
         "ice_follow_renomination" => cfg
             .ice_follow_renomination
@@ -893,6 +901,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "idle_refine_settle_ms" => {
             cfg.idle_refine_settle_ms = parse_u32_range(key, value, 100, 5000)?
+        }
+        "idle_refine_settle_constrained_ms" => {
+            cfg.idle_refine_settle_constrained_ms = parse_u32_range(key, value, 100, 10000)?
         }
         "scale_threads" => cfg.scale_threads = parse_u32_range(key, value, 1, 8)?,
         "ice_follow_renomination" => {
