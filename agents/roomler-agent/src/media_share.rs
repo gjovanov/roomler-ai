@@ -46,6 +46,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use webrtc::data_channel::RTCDataChannel;
 
@@ -161,6 +162,34 @@ struct PipelineInner {
     /// Owner marks this when its pump exits; blocks late joins racing the
     /// registry removal.
     closed: bool,
+    /// Millis (process-epoch) of the owner's last loop iteration —
+    /// [`Pipeline::beat`]. Joiners treat a silent owner as DEAD (rc.443):
+    /// field 2026-08-21, clk — an av1_qsv driver hang froze the owner pump
+    /// INSIDE `enc.encode()` (inline-blocking, no await to time out), its
+    /// session was torn down, but the never-returning task never dropped
+    /// its `Pipeline`, so the registry entry survived and every subsequent
+    /// same-profile viewer joined a corpse ("no video after 4 attempts")
+    /// until a daemon restart.
+    last_beat_ms: AtomicU64,
+}
+
+/// Owner silence beyond this ⇒ the pipeline is a corpse a joiner may evict.
+/// The owner beats every pump-loop iteration (including backpressure skips
+/// and empty polls, ≤ ~35 ms apart in a healthy pump), so 10 s of silence
+/// only ever means a wedged task.
+const PIPELINE_STALE: Duration = Duration::from_secs(10);
+
+/// Millis since a process-stable epoch (first use). Monotonic — safe for
+/// staleness arithmetic across tasks. Biased by one minute so values near
+/// process start can still be AGED backwards (`force_stale`'s subtraction
+/// would otherwise saturate at 0 and read as fresh).
+fn now_ms() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    60_000
+        + EPOCH
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
 }
 
 type Registry = Mutex<HashMap<PipelineKey, Arc<Mutex<PipelineInner>>>>;
@@ -196,6 +225,7 @@ impl Pipeline {
     /// is standalone — valid, merge helpers are no-ops, no followers.
     pub fn register(key: PipelineKey, owner_session: bson::oid::ObjectId) -> Self {
         let inner = Arc::new(Mutex::new(PipelineInner::default()));
+        inner.lock().unwrap().last_beat_ms.store(now_ms(), Relaxed);
         let mut reg = registry().lock().unwrap();
         let registered = match reg.entry(key) {
             std::collections::hash_map::Entry::Occupied(_) => false,
@@ -214,6 +244,27 @@ impl Pipeline {
             registered,
             owner_session,
         }
+    }
+
+    /// Owner-liveness beat — call once per pump-loop iteration (any arm:
+    /// real frame, empty poll, backpressure skip). A joiner finding this
+    /// stale by [`PIPELINE_STALE`] evicts the registration (rc.443 — a
+    /// driver-hung owner can never drop its `Pipeline` itself).
+    pub fn beat(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .last_beat_ms
+            .store(now_ms(), Relaxed);
+    }
+
+    /// Test hook: age the beat past the staleness horizon.
+    #[cfg(test)]
+    fn force_stale(&self) {
+        self.inner.lock().unwrap().last_beat_ms.store(
+            now_ms().saturating_sub(PIPELINE_STALE.as_millis() as u64 + 1_000),
+            Relaxed,
+        );
     }
 
     /// Viewers on this pipeline beyond the owner.
@@ -467,7 +518,16 @@ impl Pipeline {
 impl Drop for Pipeline {
     fn drop(&mut self) {
         if self.registered {
-            registry().lock().unwrap().remove(&self.key);
+            // Identity-aware removal (rc.443): a stale-evicted owner's LATE
+            // drop (the wedged driver call finally returning, or process
+            // teardown) must not delete the entry a NEW owner registered
+            // after the eviction — remove only if the entry is still ours.
+            let mut reg = registry().lock().unwrap();
+            if let Some(cur) = reg.get(&self.key)
+                && Arc::ptr_eq(cur, &self.inner)
+            {
+                reg.remove(&self.key);
+            }
         }
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;
@@ -524,6 +584,33 @@ pub fn try_join(
     let inner = registry().lock().unwrap().get(&key)?.clone();
     let mut guard = inner.lock().unwrap();
     if guard.closed {
+        return None;
+    }
+    // rc.443 — stale-owner eviction. An owner whose pump task is wedged
+    // (field: av1_qsv driver hang inside the inline-blocking encode) never
+    // drops its `Pipeline`, so the entry outlives the session and every
+    // joiner becomes a follower of a corpse. A silent beat for
+    // `PIPELINE_STALE` can only mean that wedge (a healthy loop beats every
+    // few ms); evict the entry and refuse the join — the caller then runs
+    // its own pump, which registers freshly as the new owner.
+    let silent_ms = now_ms().saturating_sub(guard.last_beat_ms.load(Relaxed));
+    if silent_ms > PIPELINE_STALE.as_millis() as u64 {
+        guard.closed = true;
+        for f in guard.followers.drain(..) {
+            f.detach(DetachReason::PipelineClosed);
+        }
+        drop(guard);
+        let mut reg = registry().lock().unwrap();
+        if let Some(cur) = reg.get(&key)
+            && Arc::ptr_eq(cur, &inner)
+        {
+            reg.remove(&key);
+        }
+        tracing::warn!(
+            ?key,
+            silent_ms,
+            "media_share: evicted stale pipeline (owner pump silent — wedged encode?); joiner will own a fresh one"
+        );
         return None;
     }
     let session_id = sink.session_id;
@@ -726,6 +813,61 @@ mod tests {
         assert_eq!(guard.detached().await, DetachReason::PipelineClosed);
         // Registry slot is free again.
         assert!(registry().lock().unwrap().get(&key).is_none());
+    }
+
+    /// rc.443 — a joiner finding the owner's beat stale evicts the corpse
+    /// and the key becomes ownable again (field: a driver-hung owner pump
+    /// can never drop its `Pipeline`, so every viewer joined a dead
+    /// pipeline until the daemon restarted).
+    #[tokio::test]
+    async fn stale_owner_is_evicted_and_key_becomes_ownable() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-STALE");
+        let wedged = Pipeline::register(key, ObjectId::new());
+        // A live follower on the corpse must be detached by the eviction.
+        let orphan = try_join(key, sink(ObjectId::new()), 60).expect("join while fresh");
+
+        wedged.force_stale();
+        assert!(
+            try_join(key, sink(ObjectId::new()), 60).is_none(),
+            "stale owner must refuse the join (and evict)"
+        );
+        assert!(
+            registry().lock().unwrap().get(&key).is_none(),
+            "eviction must free the registry slot"
+        );
+        assert_eq!(orphan.detached().await, DetachReason::PipelineClosed);
+
+        // The would-be joiner now registers as a fresh owner...
+        let fresh = Pipeline::register(key, ObjectId::new());
+        assert!(
+            try_join(key, sink(ObjectId::new()), 60).is_some(),
+            "fresh owner is joinable"
+        );
+        // ...and the wedged owner's LATE drop (driver call finally
+        // returning) must NOT delete the fresh registration.
+        drop(wedged);
+        assert!(
+            registry().lock().unwrap().get(&key).is_some(),
+            "late drop of the evicted owner deleted the new registration"
+        );
+        drop(fresh);
+        assert!(registry().lock().unwrap().get(&key).is_none());
+    }
+
+    /// rc.443 — a beating owner is never evicted: the staleness horizon
+    /// only trips on genuine silence.
+    #[tokio::test]
+    async fn beating_owner_is_not_evicted() {
+        let _s = serial();
+        let key = PipelineKey::FfmpegDc("TEST-BEAT");
+        let owner = Pipeline::register(key, ObjectId::new());
+        owner.beat();
+        assert!(
+            try_join(key, sink(ObjectId::new()), 60).is_some(),
+            "fresh beat must admit the join"
+        );
+        drop(owner);
     }
 
     #[tokio::test]
