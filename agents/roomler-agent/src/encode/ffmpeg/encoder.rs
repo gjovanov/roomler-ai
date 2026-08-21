@@ -673,6 +673,34 @@ impl FfmpegEncoder {
         )
     }
 
+    /// rc.445 — single-name open for a REBUILD whose backend is already
+    /// proven this session: skips the cascade's dead prefix (a failed
+    /// tiered open of an absent vendor's encoder costs 100-300 ms — pure
+    /// stall when it precedes every mid-session rebuild). `name` must be
+    /// one of the cascade names; an unknown/failed open just errs and the
+    /// caller falls back to the full cascade.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_preferred(
+        name: &'static str,
+        width: u32,
+        height: u32,
+        fps: u32,
+        maxrate_bps: usize,
+        cq_bias: i32,
+        constrained: bool,
+    ) -> Result<Self> {
+        Self::new_with_dispatch(
+            &[name],
+            width,
+            height,
+            fps.max(1) as i32,
+            maxrate_bps,
+            cq_bias,
+            false,
+            constrained,
+        )
+    }
+
     /// P4 — explicit-config vp9_qsv constructor for the IDR probe. Bypasses
     /// `vp9_qsv_runtime_config` (the probe must not consult the verdict it
     /// is in the middle of producing).
@@ -1203,6 +1231,14 @@ impl FfmpegEncoder {
 }
 
 impl FfmpegEncoder {
+    /// rc.445 — whether `set_bitrate` applies IN PLACE (NVENC) or as a
+    /// blocking rebuild (QSV/AMF). The pump defers rebuild-bound applies
+    /// to quiet moments — a mid-motion QSV open stalls the stream
+    /// 0.65-0.87 s on Iris-Xe-class (field-measured).
+    pub fn supports_dynamic_bitrate(&self) -> bool {
+        self.supports_dynamic_bitrate
+    }
+
     /// P4 — the synchronous encode body (the async trait fn below never
     /// awaits); extracted so the startup vp9_qsv IDR probe can drive the
     /// encoder without an executor.
