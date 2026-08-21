@@ -4466,6 +4466,12 @@ async fn media_pump_ffmpeg_dc(
         // floor); the bytes leg skips those (one note per frame).
         let mut is_real_frame = false;
         let mut area_judged = false;
+        // Did EITHER significance leg count this frame as motion? A real
+        // frame that stays false is QUIET EVIDENCE and feeds the refine
+        // up-flip tick post-encode (field CORPLAP-3: GDI/scrap-class
+        // backends return a frame on EVERY poll — frames_empty=0 — so the
+        // keepalive arm never ran and refine was structurally inert).
+        let mut frame_significant = false;
         let frame: std::sync::Arc<crate::capture::Frame> = match next {
             Ok(Some(f)) => {
                 let arc = std::sync::Arc::new(f);
@@ -4490,17 +4496,19 @@ async fn media_pump_ffmpeg_dc(
                     .area_permille(arc.width as u64 * arc.height as u64)
                 {
                     area_judged = true;
-                    if idle_refine.area_major(area_pm)
-                        && let Some(flip) =
+                    if idle_refine.area_major(area_pm) {
+                        frame_significant = true;
+                        if let Some(flip) =
                             idle_refine.note_real_frame_area(std::time::Instant::now(), area_pm)
-                    {
-                        info!(
-                            %session_id,
-                            codec_label,
-                            ?flip,
-                            area_pm,
-                            "idle refine: motion burst (damage area) — restoring resolution cap"
-                        );
+                        {
+                            info!(
+                                %session_id,
+                                codec_label,
+                                ?flip,
+                                area_pm,
+                                "idle refine: motion burst (damage area) — restoring resolution cap"
+                            );
+                        }
                     }
                 }
                 arc
@@ -4673,6 +4681,16 @@ async fn media_pump_ffmpeg_dc(
             soft_cap: auto_res_cap,
         });
         let effective_target = dims_plan.effective_target;
+        // Quiet-tick eligibility (same terms as the keepalive arm, from the
+        // SAME plan — see the post-encode site). Computed here where the
+        // plan and the frame's native dims are in scope.
+        let refine_eligible_now = frame.width > 0
+            && dims_plan.capped_below_native
+            && dims_plan.user_native
+            && pipeline.merged_refine_eligible(
+                priority.load(std::sync::atomic::Ordering::Relaxed),
+                constrained,
+            );
         if effective_target != user_target && res_cap_logged != Some(effective_target) {
             info!(
                 %session_id,
@@ -4971,16 +4989,42 @@ async fn media_pump_ffmpeg_dc(
             // small-area/high-byte content (PiP video) on tracked ones;
             // frames the area leg already judged never double-note.
             let encode_area = frame.width as u64 * frame.height as u64;
-            if let Some(flip) =
-                idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes, encode_area)
-            {
+            if idle_refine.bytes_significant(wire_bytes, encode_area) {
+                frame_significant = true;
+                if let Some(flip) =
+                    idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes, encode_area)
+                {
+                    info!(
+                        %session_id,
+                        codec_label,
+                        ?flip,
+                        wire_bytes,
+                        encode_area,
+                        "idle refine: motion burst — restoring resolution cap"
+                    );
+                }
+            }
+        }
+        // QUIET tick — a real frame neither leg counted is stillness
+        // evidence (a 48-byte re-encode of an unchanged screen). Field
+        // CORPLAP-3 2026-08-21: its GDI/scrap-class capture returns a
+        // frame on EVERY poll (frames_empty=0), the keepalive arm never
+        // ran, and refine was structurally inert. Judging quiet by the
+        // SIGNAL instead of capture cadence fixes that class — and lets
+        // the up-flip fire DURING sustained sub-major motion on tracked
+        // backends (the un-refined half of the P8a-2 stay-native promise).
+        // The keepalive arm keeps its own tick for the fully-idle case.
+        if is_real_frame && !frame_significant {
+            let now = std::time::Instant::now();
+            if let Some(flip) = idle_refine.on_keepalive(refine_eligible_now, now) {
                 info!(
                     %session_id,
                     codec_label,
                     ?flip,
-                    wire_bytes,
-                    encode_area,
-                    "idle refine: motion burst — restoring resolution cap"
+                    native_w,
+                    native_h,
+                    "idle refine: scene quiet (signal) — lifting resolution cap \
+                     (crisp native IDR incoming)"
                 );
             }
         }
