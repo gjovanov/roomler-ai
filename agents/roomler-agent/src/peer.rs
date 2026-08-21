@@ -3785,6 +3785,12 @@ impl FfmpegDcCodec {
     /// can't book seconds of the clamped pipe). `chroma444`: the viewer's
     /// Rext 4:4:4 request — HEVC-only (nvenc), silently 4:2:0 elsewhere;
     /// read the returned encoder's `chroma444()` for the truth.
+    /// `preferred`: the session's last successfully-opened backend name
+    /// (rc.445) — tried alone first so a REBUILD skips the dead cascade
+    /// prefix (field: every clk rebuild burned ~100-300 ms failing
+    /// av1_nvenc's tiered open before av1_qsv answered). Falls through to
+    /// the full cascade on failure. Skipped for chroma444 sessions (their
+    /// open has its own two-stage fallback).
     #[allow(clippy::too_many_arguments)]
     fn open(
         self,
@@ -3795,8 +3801,16 @@ impl FfmpegDcCodec {
         cq_bias: i32,
         chroma444: bool,
         constrained: bool,
+        preferred: Option<&'static str>,
     ) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
         use crate::encode::ffmpeg::FfmpegEncoder;
+        if !chroma444
+            && let Some(name) = preferred
+            && let Ok(enc) =
+                FfmpegEncoder::new_preferred(name, w, h, fps, maxrate_bps, cq_bias, constrained)
+        {
+            return Ok(enc);
+        }
         match self {
             Self::Hevc => FfmpegEncoder::new_hevc_adaptive(
                 w,
@@ -4173,7 +4187,11 @@ async fn media_pump_ffmpeg_dc(
     // path stays shallow to shed fast rather than build a stale backlog. Input
     // rides a SEPARATE DC, so a deeper video queue adds no input lag.
     let ffmpeg_send_depth = if constrained { 4 } else { 12 };
-    let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(ffmpeg_send_depth);
+    // rc.445 — items carry the send EPOCH they were encoded under; the send
+    // task discards stale-epoch frames so a rebuild's first IDR never waits
+    // behind pre-rebuild deltas (see `send_epoch`).
+    let (send_tx, mut send_rx) =
+        tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(ffmpeg_send_depth);
     // Constrained byte-budget gate (field 2026-08-21, pc50045/clk): the
     // channel's FRAME-count bound bounds nothing in BYTES — four native
     // motion frames are ~0.5-1 MB ≈ 2-4 s of a ~2 Mbps relay, which is
@@ -4210,18 +4228,50 @@ async fn media_pump_ffmpeg_dc(
     // clean pump exit); see `encode::EncodeErrorLadder`.
     let mut err_ladder = crate::encode::EncodeErrorLadder::default();
     let mut rebuild_after_encode_error = false;
+    // rc.445 — motion-deferred bitrate application for rebuild-bound
+    // encoders (QSV/AMF). With the byte gate alive, the AIMD moves DURING
+    // motion — and on QSV every ladder move is a BLOCKING encoder open
+    // (field-measured 0.65-0.87 s on Iris Xe) plus a fresh IDR: the exact
+    // mid-drag freeze the dial-cap removal is killing, re-entering through
+    // the bitrate door. NVENC reconfigures in place and applies
+    // immediately; QSV/AMF applies are HELD here while significant frames
+    // are recent and flushed once the scene quiets (the open then stalls a
+    // STATIC image — invisible). The governor's mirror advances at emit
+    // time, so heartbeat `target_bps` shows the target while the encoder
+    // briefly runs the old maxrate — an accepted, bounded skew.
+    let mut deferred_bps: Option<u32> = None;
+    let mut last_motion_at = std::time::Instant::now() - Duration::from_secs(60);
+    const DEFER_QUIET: Duration = Duration::from_millis(1200);
+    // rc.445 — send-queue epoch: bumped on every encoder rebuild so the
+    // send task discards frames from the OLD encoder still sitting in the
+    // channel. Post-rebuild the first frame is an IDR; making it wait
+    // behind up to 450 ms of stale pre-rebuild frames was a visible chunk
+    // of the flip gap (and a decode-order hazard shrunk to zero cost).
+    let send_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // rc.445 — remember the session's proven encoder so a rebuild skips
+    // the dead cascade prefix (clk field: an av1_nvenc tiered-open attempt
+    // burned ~100-300 ms of every rebuild before av1_qsv opened).
+    let mut last_encoder_name: Option<&'static str> = None;
     {
         let video_bytes_dc = video_bytes_dc.clone();
         let frames_sent = frames_sent.clone();
         let bytes_written = bytes_written.clone();
         let send_errors = send_errors.clone();
         let inflight_bytes = inflight_bytes.clone();
+        let send_epoch = send_epoch.clone();
         let task_session = session_id;
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
-            while let Some(wire) = send_rx.recv().await {
+            while let Some((epoch, wire)) = send_rx.recv().await {
                 let total = wire.len();
+                // rc.445 — a frame from a PREVIOUS encoder epoch is stale
+                // motion the rebuild obsoleted; drop it so the fresh IDR
+                // behind it ships immediately (still settles the ledger).
+                if epoch < send_epoch.load(Relaxed) {
+                    inflight_bytes.fetch_sub(total, Relaxed);
+                    continue;
+                }
                 // Fetch the DC fresh each frame — the same handle the pump's
                 // open-check uses. None means it closed under us (the pump's
                 // open-guard re-requests a keyframe on its side); the frame
@@ -4441,7 +4491,13 @@ async fn media_pump_ffmpeg_dc(
             if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
                 && let Some(enc) = encoder.as_mut()
             {
-                enc.set_bitrate(applied.bps);
+                // rc.445 — congestion here means motion almost surely;
+                // rebuild-bound encoders defer (see `deferred_bps`).
+                if enc.supports_dynamic_bitrate() {
+                    enc.set_bitrate(applied.bps);
+                } else {
+                    deferred_bps = Some(applied.bps);
+                }
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
@@ -4494,6 +4550,11 @@ async fn media_pump_ffmpeg_dc(
                     area_judged = true;
                     if idle_refine.area_major(area_pm) {
                         frame_significant = true;
+                        // rc.445 — the motion clock for the deferred-bitrate
+                        // gate: only SIGNIFICANT frames hold the deferral
+                        // (typing/caret noise must not pin a QSV rebuild
+                        // forever on always-return backends).
+                        last_motion_at = std::time::Instant::now();
                         if let Some(flip) =
                             idle_refine.note_real_frame_area(std::time::Instant::now(), area_pm)
                         {
@@ -4759,6 +4820,9 @@ async fn media_pump_ffmpeg_dc(
                 dims_plan.reason,
                 crate::encode::policy::RungReason::UserPick
             ),
+            crate::encode::dial_rate_factor_pct(
+                priority.load(std::sync::atomic::Ordering::Relaxed),
+            ),
         );
         let ceiling = rate.ceiling_bps;
         let need_rebuild = match encoder_dims {
@@ -4783,9 +4847,15 @@ async fn media_pump_ffmpeg_dc(
                 cq_bias,
                 hevc_444,
                 constrained,
+                last_encoder_name,
             ) {
                 Ok(enc) => {
                     let encoder_name = enc.name();
+                    // rc.445 — the proven backend skips the dead cascade
+                    // prefix on the next rebuild, and stale pre-rebuild
+                    // frames stop delaying the fresh encoder's IDR.
+                    last_encoder_name = Some(encoder_name);
+                    send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // P7 — record the ACTIVE chroma (a 4:4:4 request may have
                     // fallen back to 4:2:0 inside new_hevc_adaptive); feeds
                     // the maxrate chroma factor and the video-info truth.
@@ -4939,16 +5009,40 @@ async fn media_pump_ffmpeg_dc(
         if let Some(applied) =
             governor.pre_encode_tick(ceiling, send_tx.capacity(), std::time::Instant::now())
         {
-            enc.set_bitrate(applied.bps);
+            // rc.445 — QSV/AMF applies are motion-deferred (a ladder move
+            // there is a blocking rebuild + IDR; see `deferred_bps`).
+            if enc.supports_dynamic_bitrate() || last_motion_at.elapsed() >= DEFER_QUIET {
+                deferred_bps = None;
+                enc.set_bitrate(applied.bps);
+            } else {
+                deferred_bps = Some(applied.bps);
+            }
             if applied.changed {
                 info!(
                     %session_id,
                     codec_label,
                     ceiling_bps = ceiling,
                     target_bps = applied.bps,
+                    deferred = deferred_bps.is_some(),
                     "FFmpeg DC pump set_bitrate (AIMD)"
                 );
             }
+        } else if let Some(bps) = deferred_bps
+            && last_motion_at.elapsed() >= DEFER_QUIET
+        {
+            // Quiet flush: the held QSV/AMF target applies now, while the
+            // scene is static — the rebuild stalls a frozen image nobody
+            // can see, and its first-frame IDR doubles as the post-motion
+            // refresh. Jump the (stale) queue for it.
+            deferred_bps = None;
+            send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            enc.set_bitrate(bps);
+            info!(
+                %session_id,
+                codec_label,
+                target_bps = bps,
+                "FFmpeg DC pump: deferred bitrate applied at quiet"
+            );
         }
 
         let encode_start = std::time::Instant::now();
@@ -5028,6 +5122,8 @@ async fn media_pump_ffmpeg_dc(
             let encode_area = frame.width as u64 * frame.height as u64;
             if idle_refine.bytes_significant(wire_bytes, encode_area) {
                 frame_significant = true;
+                // rc.445 — motion clock, bytes leg (untracked backends).
+                last_motion_at = std::time::Instant::now();
                 if let Some(flip) =
                     idle_refine.note_real_frame(std::time::Instant::now(), wire_bytes, encode_area)
                 {
@@ -5130,7 +5226,7 @@ async fn media_pump_ffmpeg_dc(
                 encoded_dims_packed,
             );
             let wire_len = wire.len();
-            match send_tx.try_send(wire) {
+            match send_tx.try_send((send_epoch.load(std::sync::atomic::Ordering::Relaxed), wire)) {
                 Ok(()) => {
                     // Byte-budget ledger (constrained gate): counted on entry,
                     // released by the send task once the frame leaves.
@@ -5154,9 +5250,14 @@ async fn media_pump_ffmpeg_dc(
                     // Phase B — a full channel at try_send (a big IDR / motion
                     // frame the link can't drain) is a secondary congestion
                     // signal; note it to the AIMD (rate-limited MD internally).
-                    // `enc` is in scope from the encode above.
+                    // `enc` is in scope from the encode above. rc.445 — an
+                    // overflow IS motion; rebuild-bound encoders defer.
                     if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
-                        enc.set_bitrate(applied.bps);
+                        if enc.supports_dynamic_bitrate() {
+                            enc.set_bitrate(applied.bps);
+                        } else {
+                            deferred_bps = Some(applied.bps);
+                        }
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
