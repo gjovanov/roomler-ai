@@ -425,6 +425,40 @@ would defeat the whole point of P6a.
 in one tree means two incompatible `PublicKey` types across the server and
 client halves of the same feature.
 
+### `roomler proxy` for stock tools (P6c — shipped)
+
+```
+# ~/.ssh/config
+Host *.roomler
+  ProxyCommand roomler proxy %h %p
+
+scp report.pdf CORPLAP-3.roomler:/tmp/
+```
+
+Resolves a device **name** to its overlay address and pipes stdio. A literal
+IP short-circuits the lookup, so `%h` works either way.
+
+⚠️ **Transport and resolution only, and the two commands are not
+interchangeable.** `ProxyCommand` hands the client a byte pipe; it cannot
+supply an identity or a host key, because by the time it runs `ssh` has
+already chosen which key to offer and which `known_hosts` to check. A grant is
+a single-use key with a ~60 s life, so it could not live in a static
+`~/.ssh/config` either.
+
+| | what it gives you |
+|---|---|
+| `roomler ssh` | the grant, the policy-resolved account, host key verified **for** you |
+| `roomler proxy` | reach it **by name** with keys **you** manage — its own `sshd`, or your key in `ssh_authorized_keys` |
+
+Don't "unify" them: doing so would quietly drop verification from one path.
+
+⚠️ An unresolvable name is an **error, never a fallthrough**. Letting the OS
+resolver see a mesh name invites it to find something else — a LAN host, a
+search-domain match, a wildcard DNS answer.
+
+For rsync with the grant path, `rsync -e 'roomler ssh' src box:/dst` already
+works: the trailing args reach `ssh` verbatim.
+
 ### The audit trail (P3c-1 — shipped)
 
 Every request through `dispatch` — granted **or refused** — lands in
@@ -472,8 +506,8 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P4a | PTY / interactive shell on **Unix** (`openpty`, login shell, resize, group teardown) | **shipped** |
 | P4b | The same on **Windows** — ConPTY + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`. The platform that needs this most | **shipped** rc.429, field-proven on CORPLAP-3 |
 | P6a | Devices publish their SSH host key; the server stores it and returns it with the grant, so a caller has something to verify against | **shipped** rc.444 |
-| P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, not yet field-run |
-| P6c | stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync` can ride the mesh | designed |
+| P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, field-proven mars→CORPLAP-3 |
+| P6c | `roomler proxy` — stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync`/`git` reach devices BY NAME | **shipped** |
 | P7 | SFTP subsystem, `-L`/`-R`/`-J` | designed |
 | P8 | Audit + session recording + admin UI | designed |
 
