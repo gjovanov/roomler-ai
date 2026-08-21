@@ -256,6 +256,21 @@ async fn run_remote(node: &str, shell: &str, command: &str, timeout_ms: u64) -> 
     }
 }
 
+/// Resolve a roomler device NAME to its overlay address (P6c).
+///
+/// Case-insensitive, matching the server's `resolve_exec_target`, because
+/// device names are display strings and nobody types `CLK00017265`.
+/// `Ok(None)` = no such peer — the caller must report that rather than dial
+/// something arbitrary.
+pub async fn resolve_overlay_ip(name: &str) -> Result<Option<String>> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let peers = client.peers().await.map_err(daemon_err)?;
+    Ok(peers
+        .into_iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .and_then(|p| p.overlay_ip))
+}
+
 /// What the server answered about an SSH session request.
 pub struct SshGrant {
     pub address: Option<String>,
