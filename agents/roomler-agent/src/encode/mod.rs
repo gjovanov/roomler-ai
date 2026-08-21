@@ -96,6 +96,16 @@ pub(crate) mod policy;
 )]
 pub(crate) mod governor;
 
+/// P8b stage 2 — the keyframe-force policy machine (pending-force
+/// lifecycle: backstop retry, force-ignored rebuild fallback + churn
+/// cooldown, resync scheduling, lock edge). See `kf_policy.rs` module
+/// docs. Same dead_code rationale as `policy`/`governor`.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) mod kf_policy;
+
 /// Serialises tests that read/write the shared rate env vars
 /// (RELAY_MAX_KBPS, RATE_FACTOR_*, FFMPEG_MAXRATE_KBPS, SCALE_CQ_BOOST):
 /// cargo's parallel runner interleaved them once the test count grew
