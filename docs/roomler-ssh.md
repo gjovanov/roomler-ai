@@ -374,6 +374,15 @@ compare against nothing and always match, and an empty value is omitted from
 the wire so *absent* and *empty* cannot come to mean two things. A client that
 gets no key should say so rather than quietly falling back to TOFU.
 
+⚠️ **The field tracks whether a host KEY is stored — not whether SSH is on**,
+and the converse does not hold. A device that ever had SSH enabled keeps
+`ssh_host_key` in its config afterwards, so it keeps publishing. Field-checked
+2026-08-21: jupiter reads `ssh_enabled = false` and still publishes the key
+minted for the P4a test. That is harmless — a caller who dials a device that
+is not serving gets a connection refusal, not a verification failure — but do
+not read a non-empty value as "SSH is accepting sessions here". Whether a
+session can be opened is the four-gate chain's answer, never this field's.
+
 It is re-derived on every hello, so rotating the key on the device and
 restarting moves the fleet view with it; and it is rewritten even when empty,
 so a device that switches SSH off stops advertising a key it no longer holds.
