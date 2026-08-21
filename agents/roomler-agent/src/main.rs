@@ -119,6 +119,14 @@ enum Command {
         #[arg(long)]
         encoder: Option<String>,
     },
+    /// Run the codec capability probes and print the result as one
+    /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
+    /// invoked by operators — so that a vendor driver faulting inside a
+    /// probe costs a child process instead of crash-looping the daemon.
+    /// Hidden: running it by hand only tells you what `roomler status`
+    /// already reports.
+    #[command(hide = true, name = "caps-probe")]
+    CapsProbe,
     /// Smoke-test the encoder cascade: open the preferred encoder at
     /// a small resolution, feed 10 synthetic frames, assert at least
     /// one IDR output. Exits non-zero if no encoder could be opened or
@@ -776,6 +784,10 @@ async fn main() -> Result<()> {
         }
         Command::Org { action } => org_cmd(&config_path, action),
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
+        Command::CapsProbe => {
+            roomler_agent::encode::caps::print_probe_result();
+            Ok(())
+        }
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
         Command::SystemCaptureSmoke {
             desktop,

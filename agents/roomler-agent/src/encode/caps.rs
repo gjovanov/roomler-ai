@@ -27,6 +27,187 @@ use std::sync::OnceLock;
 
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 
+/// Running the hardware probes in a CHILD PROCESS.
+///
+/// A capability probe is untrusted third-party code by definition — it calls
+/// into vendor drivers and, through them, GPU firmware. In-process, a fault
+/// anywhere in that stack takes the daemon down, and the service manager
+/// restarts it straight back into the same probe: a crash-LOOP, not a
+/// degraded-but-running agent.
+///
+/// Observed on the WSL sibling, 2026-08-20: WSL ships
+/// `/usr/lib/wsl/lib/libcuda.so.1` as a stub with no usable driver, so
+/// `hevc_nvenc` **dlopens successfully** and then segfaults when `cuInit(0)`
+/// fails — the loaded-but-unusable state that no "is it present?" check
+/// catches. Hosts with no libcuda at all take the clean dlopen-failed branch
+/// and were never affected, which is why this stayed latent.
+///
+/// So the probes run behind a process boundary and **"the child died" is read
+/// as "codec unavailable"**. That retires the whole class rather than the one
+/// CUDA symptom: any future driver that faults, hangs, or calls `exit()` costs
+/// this host its HW advertisement and nothing more.
+mod child {
+    use super::AgentCaps;
+
+    /// Marks the line carrying the child's JSON, so log output on the same
+    /// stream cannot be mistaken for the result. Parsing the last line, or
+    /// all of stdout, would break the first time anything logged there.
+    pub(super) const MARKER: &str = "ROOMLER_CAPS_JSON:";
+
+    /// Set in the child's environment. A belt-and-braces recursion guard:
+    /// `detect()` in a process carrying this must never spawn again.
+    const CHILD_ENV: &str = "ROOMLER_AGENT_CAPS_CHILD";
+
+    /// Generous, because a cold GPU driver init on a loaded corp laptop is
+    /// genuinely slow (~300 ms per codec, several codecs, plus process
+    /// start). This is a backstop against a HUNG driver, not a performance
+    /// budget — and even at the ceiling it beats the in-process behaviour it
+    /// replaces, which was to hang forever.
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Probe in a child. `None` = no usable answer, for ANY reason (spawn
+    /// failed, non-zero exit, killed by a signal, timed out, unparseable
+    /// output) — the caller treats every one of them the same way.
+    pub(super) fn probe() -> Option<AgentCaps> {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // We ARE the child (or something re-entered). Probing in-process
+            // is what this process was started to do.
+            return Some(super::compute_caps(true));
+        }
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(%e, "caps probe: cannot resolve our own path — skipping HW probes");
+                return None;
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("caps-probe")
+            .env(CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            // Inherited on purpose: the child's own probe logging is the
+            // diagnostic record of WHICH codec it died on, and it belongs in
+            // the daemon's log next to the verdict.
+            .stderr(std::process::Stdio::inherit());
+        #[cfg(windows)]
+        {
+            // No console window when the daemon runs attended.
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut childp = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(%e, "caps probe: could not spawn the probe child — no HW advertisement");
+                return None;
+            }
+        };
+
+        // Read stdout on this thread while waiting, so a chatty child cannot
+        // fill the pipe and deadlock against our own wait.
+        let stdout = childp.stdout.take();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            if let Some(mut s) = stdout {
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        });
+
+        let status = match wait_bounded(&mut childp) {
+            Some(s) => s,
+            None => {
+                // A hung driver. Kill it and carry on without HW.
+                let _ = childp.kill();
+                let _ = childp.wait();
+                let _ = reader.join();
+                tracing::warn!(
+                    timeout_s = TIMEOUT.as_secs(),
+                    "caps probe: the probe child hung — treating every hardware codec as \
+                     unavailable. The daemon is unaffected; this is the process boundary \
+                     doing its job."
+                );
+                return None;
+            }
+        };
+        let out = reader.join().unwrap_or_default();
+
+        if !status.success() {
+            // THE case this module exists for. A signal death here is a
+            // driver fault that would otherwise have been ours.
+            tracing::error!(
+                status = %status,
+                elapsed_ms = started.elapsed().as_millis(),
+                "caps probe: the probe child DIED — treating every hardware codec as \
+                 unavailable. Before this ran out-of-process the same fault crash-looped \
+                 the daemon; see the child's own log lines above for which codec it was."
+            );
+            return None;
+        }
+
+        let line = out.lines().find_map(|l| l.trim().strip_prefix(MARKER))?;
+        match serde_json::from_str::<AgentCaps>(line) {
+            Ok(caps) => {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    codecs = ?caps.codecs,
+                    hw_encoders = ?caps.hw_encoders,
+                    "caps probe: child reported"
+                );
+                Some(caps)
+            }
+            Err(e) => {
+                tracing::warn!(%e, "caps probe: child output was not parseable — no HW advertisement");
+                None
+            }
+        }
+    }
+
+    /// `wait` with a deadline. `None` = still running when time ran out.
+    ///
+    /// Polling rather than a platform wait-with-timeout: it is a handful of
+    /// wakeups on a path that runs ONCE per process, and it keeps this
+    /// module free of per-platform process APIs.
+    fn wait_bounded(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(s)) => return Some(s),
+                // Treat "cannot ask" as death; the caller's fallback is the
+                // safe answer either way.
+                Err(_) => return None,
+                Ok(None) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// The `caps-probe` child's entire job: probe, print one marked JSON line.
+///
+/// Printing a MARKED line rather than bare JSON so that anything else on
+/// stdout — a library that logs there, a driver that prints a banner — cannot
+/// be mistaken for the result.
+pub fn print_probe_result() {
+    let caps = detect_in_process();
+    match serde_json::to_string(&caps) {
+        Ok(json) => println!("{}{json}", child::MARKER),
+        Err(e) => {
+            tracing::error!(%e, "caps probe: could not serialise caps");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// Probe dimensions for codec activation checks (HEVC, AV1, VP9-444).
 /// Even number, small enough that any encoder accepts it, matching
 /// what the internal `probe_pipeline` uses for MFT output
@@ -45,10 +226,36 @@ const PROBE_HEIGHT: u32 = 270;
 /// <10ms on boxes with no HW encoder); subsequent calls return the
 /// cached result.
 pub fn detect() -> AgentCaps {
-    CACHED_CAPS.get_or_init(compute_caps).clone()
+    CACHED_CAPS
+        .get_or_init(|| match child::probe() {
+            Some(caps) => caps,
+            None => {
+                // The child died, hung, or could not be launched. "Codec
+                // unavailable" is the only honest reading: we have no
+                // evidence this host can encode with any of them, and
+                // advertising one we cannot produce costs a black session.
+                // Everything that needs no driver still stands.
+                compute_caps(false)
+            }
+        })
+        .clone()
 }
 
-fn compute_caps() -> AgentCaps {
+/// Compute caps IN THIS PROCESS, running the hardware probes. This is what
+/// the `caps-probe` child executes; nothing else should call it, because a
+/// vendor driver that faults takes the whole process with it.
+pub fn detect_in_process() -> AgentCaps {
+    compute_caps(true)
+}
+
+/// `run_hw_probes = false` computes everything that needs no driver call —
+/// which is exactly the honest answer when the probe child did not come back.
+///
+/// `unused_variables` is allowed because EVERY consumer of the flag sits
+/// behind a `#[cfg]` (mf-encoder / ffmpeg-encoder / vp9-444); a default-feature
+/// build probes nothing and legitimately never reads it.
+#[allow(unused_variables)]
+fn compute_caps(run_hw_probes: bool) -> AgentCaps {
     // `mut` is only consumed inside the cfg-gated push blocks below
     // (openh264-encoder / mf-encoder). Default-feature builds skip
     // both blocks and the vecs stay empty; silence the unused-mut
@@ -66,7 +273,7 @@ fn compute_caps() -> AgentCaps {
     }
 
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
-    {
+    if run_hw_probes {
         // H.264: enumeration is sufficient. If any H.264 MFT
         // enumerates the cascade always succeeds (at worst it falls
         // through to the default-adapter SW MFT via
@@ -145,7 +352,7 @@ fn compute_caps() -> AgentCaps {
     // confirmed hevc_qsv works on Iris Xe Tiger Lake AND hevc_nvenc
     // works on RTX 5090 Blackwell — the two boxes MF was broken on.
     #[cfg(feature = "ffmpeg-encoder")]
-    if crate::encode::ffmpeg::available() {
+    if run_hw_probes && crate::encode::ffmpeg::available() {
         // `name()` is on the `VideoEncoder` trait — need the trait in
         // scope at the call site for method-resolution.
         use super::VideoEncoder;
@@ -313,7 +520,7 @@ fn compute_caps() -> AgentCaps {
     }
 
     #[cfg(feature = "vp9-444")]
-    {
+    if run_hw_probes {
         // Phase Y.4 caps probe (Y.runtime-encoder rewrite landed,
         // 0.1.47). Try to instantiate the libvpx encoder at a probe
         // resolution; on success advertise both the transport and
@@ -646,6 +853,72 @@ pub fn pick_best_codec(browser_caps: &[String], agent_caps: &[String]) -> String
 mod tests {
     use super::*;
 
+    /// THE property this slice exists for: a host whose hardware probes
+    /// cannot be trusted still produces usable caps, and never claims a codec
+    /// it has no evidence for.
+    ///
+    /// `compute_caps(false)` is exactly what `detect()` falls back to when the
+    /// probe child dies, so this is the shape a driver fault now yields —
+    /// where before it yielded a crash-looping daemon.
+    #[test]
+    fn a_failed_probe_still_yields_usable_caps_and_advertises_no_hardware() {
+        let caps = compute_caps(false);
+
+        // Nothing that required asking a driver.
+        for name in ["mf-h264-hw", "mf-h265-hw", "mf-av1-hw"] {
+            assert!(
+                !caps.hw_encoders.iter().any(|h| h == name),
+                "{name} was advertised without a successful probe: {:?}",
+                caps.hw_encoders
+            );
+        }
+        assert!(
+            !caps.hw_encoders.iter().any(|h| h.starts_with("ffmpeg-")),
+            "an ffmpeg HW encoder was advertised without a successful probe: {:?}",
+            caps.hw_encoders
+        );
+        // Transports are the sharp end — negotiating one the host cannot
+        // fulfil is a black session, not a downgrade.
+        for t in [
+            "data-channel-hevc",
+            "data-channel-av1",
+            "data-channel-h264",
+            "data-channel-vp9-444",
+        ] {
+            assert!(
+                !caps.transports.iter().any(|x| x == t),
+                "{t} was advertised without a successful probe: {:?}",
+                caps.transports
+            );
+        }
+
+        // ...but the agent is still a working agent: the parts that never
+        // depended on a driver survive, so a probe fault degrades the host
+        // rather than disabling it.
+        assert!(
+            caps.files.iter().any(|f| f == "upload"),
+            "file transfer must survive a probe failure: {:?}",
+            caps.files
+        );
+        assert!(caps.max_simultaneous_sessions > 0);
+    }
+
+    /// The child's output has to survive the round trip, or the parent falls
+    /// back on every host and the probe silently stops meaning anything.
+    #[test]
+    fn the_marked_json_line_round_trips() {
+        let caps = compute_caps(false);
+        let line = format!("{}{}", child::MARKER, serde_json::to_string(&caps).unwrap());
+        let payload = line
+            .trim()
+            .strip_prefix(child::MARKER)
+            .expect("the marker must be recoverable");
+        let back: AgentCaps = serde_json::from_str(payload).expect("caps must parse back");
+        assert_eq!(back.codecs, caps.codecs);
+        assert_eq!(back.transports, caps.transports);
+        assert_eq!(back.hw_encoders, caps.hw_encoders);
+    }
+
     #[test]
     fn picks_av1_when_both_sides_support() {
         let chosen = pick_best_codec(
@@ -708,7 +981,10 @@ mod tests {
     #[cfg(not(feature = "vp9-444"))]
     #[test]
     fn detect_omits_vp9_444_transport_when_feature_disabled() {
-        let caps = compute_caps();
+        // Probing ENABLED on purpose: the claim is that a build without the
+        // feature never advertises the transport even when probes run. (The
+        // vp9 probe itself is cfg'd out here, so nothing is actually opened.)
+        let caps = compute_caps(true);
         assert!(
             !caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
             "default-feature build advertised vp9-444 transport: {:?}",
@@ -766,7 +1042,9 @@ mod tests {
     #[cfg(not(feature = "audio"))]
     #[test]
     fn detect_omits_audio_when_feature_disabled() {
-        let caps = compute_caps();
+        // Audio advertisement is feature-gated, never probe-gated, so this
+        // needs no driver call.
+        let caps = compute_caps(false);
         assert!(
             caps.audio.is_empty(),
             "default build must not advertise audio; got {:?}",
@@ -780,7 +1058,8 @@ mod tests {
     /// the resume path for every rc.19+ browser — lock here.
     #[test]
     fn detect_advertises_resume_files_cap() {
-        let caps = compute_caps();
+        // File caps never depended on a probe — and must survive one failing.
+        let caps = compute_caps(false);
         assert!(
             caps.files.iter().any(|s| s == "resume"),
             "rc.19 caps.files must include \"resume\"; got {:?}",
