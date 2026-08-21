@@ -498,10 +498,32 @@ pub struct AgentConfig {
     pub idle_refine_settle_ms: Option<u32>,
     /// Phase B — the tracked settle on CONSTRAINED transports
     /// (`ROOMLER_NODE_IDLE_REFINE_SETTLE_CONSTRAINED_MS`). Built-in
-    /// default: 2000; clamped 100-10000. The Up must outlast its own
+    /// default: 1200 (2000 before the constrained HRD trim bounded the
+    /// refine IDR); clamped 100-10000. The Up must outlast its own
     /// refined IDR's transmission time on the link it rides.
     #[serde(default)]
     pub idle_refine_settle_constrained_ms: Option<u32>,
+    /// Constrained-motion CQ relief (softening steps applied at the
+    /// resolution rung of a RELAY session —
+    /// `ROOMLER_NODE_CONSTRAINED_CQ_RELIEF`). Built-in default: 4;
+    /// 0 = no relief; clamped 0-12. Field 2026-08-21: the P7 sharpening
+    /// bias at the constrained rung produced frames too big for the
+    /// clamped pipe to drain per frame interval — the "9 fps during
+    /// motion" equilibrium.
+    #[serde(default)]
+    pub constrained_cq_relief: Option<u32>,
+    /// Constrained send-queue byte budget, in milliseconds of the relay
+    /// ceiling (`ROOMLER_NODE_CONSTRAINED_QUEUE_MS`). Built-in default:
+    /// 450; 0 = unbounded (pre-rc.442 posture); clamped 0-2000. Bounds
+    /// the viewer lag a relay session can accumulate in queued frames.
+    #[serde(default)]
+    pub constrained_queue_ms: Option<u32>,
+    /// HRD/VBV window for constrained sessions, percent of maxrate
+    /// (`ROOMLER_NODE_CONSTRAINED_HRD_PCT`). Built-in default: 75;
+    /// clamped 25-200 (200 = the direct-path rc.234 window). Bounds the
+    /// single-frame IDR burst a clamped pipe must serialize.
+    #[serde(default)]
+    pub constrained_hrd_pct: Option<u32>,
     /// HW-downscale Phase A — worker threads for the CPU resampler's
     /// row-banded passes (`ROOMLER_NODE_SCALE_THREADS`). Built-in
     /// default: 1 (inline, no threads spawned); clamped 1-8. A lever for
@@ -1418,6 +1440,9 @@ pub fn test_fixture() -> AgentConfig {
         idle_refine_major_area_permille: None,
         idle_refine_settle_ms: None,
         idle_refine_settle_constrained_ms: None,
+        constrained_cq_relief: None,
+        constrained_queue_ms: None,
+        constrained_hrd_pct: None,
         scale_threads: None,
         ice_follow_renomination: None,
         ice_warm_standby: None,
@@ -1583,7 +1608,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 43]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 15] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 18] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1603,6 +1628,9 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 1
             "IDLE_REFINE_SETTLE_CONSTRAINED_MS",
             cfg.idle_refine_settle_constrained_ms,
         ),
+        ("CONSTRAINED_CQ_RELIEF", cfg.constrained_cq_relief),
+        ("CONSTRAINED_QUEUE_MS", cfg.constrained_queue_ms),
+        ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
