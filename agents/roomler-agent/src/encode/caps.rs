@@ -1009,7 +1009,10 @@ mod tests {
     #[cfg(feature = "vp9-444")]
     #[test]
     fn detect_advertises_vp9_444_transport_when_encoder_works() {
-        let caps = compute_caps();
+        // Probing ENABLED: this test's whole claim is that the probe runs and
+        // succeeds. libvpx is our own software encoder, not a vendor driver,
+        // so running it in-process here is safe.
+        let caps = compute_caps(true);
         assert!(
             caps.transports.iter().any(|t| t == "data-channel-vp9-444"),
             "vp9-444 transport must be advertised when libvpx probe succeeds; got {:?}",
@@ -1027,7 +1030,8 @@ mod tests {
     #[cfg(feature = "audio")]
     #[test]
     fn detect_advertises_opus_audio_when_feature_enabled() {
-        let caps = compute_caps();
+        // Feature-gated, never probe-gated — no driver call needed.
+        let caps = compute_caps(false);
         assert!(
             caps.audio.iter().any(|c| c == "opus"),
             "audio-feature build must advertise opus; got {:?}",
