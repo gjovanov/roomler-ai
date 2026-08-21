@@ -525,6 +525,27 @@ pub struct AgentConfig {
     /// Sub-100 values are per-host experiments only.
     #[serde(default)]
     pub constrained_hrd_pct: Option<u32>,
+    /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
+    /// (Smoother 1024 everywhere / Balanced 1280 on relay;
+    /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
+    /// rung flip costs a blocking encoder open (0.65-0.87 s measured on
+    /// Iris Xe) and the field verdict was "never flipping beats the
+    /// rung"; the dial's bit-shedding moved to the rebuild-free ceiling
+    /// factors below.
+    #[serde(default)]
+    pub priority_res_cap: Option<bool>,
+    /// rc.445 — Smoother's bitrate-ceiling factor, percent
+    /// (`ROOMLER_NODE_SMOOTHER_RATE_PCT`). Built-in default: 70; clamped
+    /// 30-100. A lower ceiling makes the HRD raise QP during motion
+    /// continuously (smaller frames, steadier fps) with zero rebuilds;
+    /// at-rest quality is untouched.
+    #[serde(default)]
+    pub smoother_rate_pct: Option<u32>,
+    /// rc.445 — Balanced's bitrate-ceiling factor, percent
+    /// (`ROOMLER_NODE_BALANCED_RATE_PCT`). Built-in default: 85; clamped
+    /// 30-100.
+    #[serde(default)]
+    pub balanced_rate_pct: Option<u32>,
     /// HW-downscale Phase A — worker threads for the CPU resampler's
     /// row-banded passes (`ROOMLER_NODE_SCALE_THREADS`). Built-in
     /// default: 1 (inline, no threads spawned); clamped 1-8. A lever for
@@ -1444,6 +1465,9 @@ pub fn test_fixture() -> AgentConfig {
         constrained_cq_relief: None,
         constrained_queue_ms: None,
         constrained_hrd_pct: None,
+        priority_res_cap: None,
+        smoother_rate_pct: None,
+        balanced_rate_pct: None,
         scale_threads: None,
         ice_follow_renomination: None,
         ice_warm_standby: None,
@@ -1556,9 +1580,10 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 43] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 44] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
+        ("PRIORITY_RES_CAP", cfg.priority_res_cap),
         ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
         ("IDLE_REFINE", cfg.idle_refine),
         ("IDLE_REFINE_BALANCED", cfg.idle_refine_balanced),
@@ -1609,7 +1634,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 43]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 18] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 20] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1632,6 +1657,8 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 1
         ("CONSTRAINED_CQ_RELIEF", cfg.constrained_cq_relief),
         ("CONSTRAINED_QUEUE_MS", cfg.constrained_queue_ms),
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
+        ("SMOOTHER_RATE_PCT", cfg.smoother_rate_pct),
+        ("BALANCED_RATE_PCT", cfg.balanced_rate_pct),
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
