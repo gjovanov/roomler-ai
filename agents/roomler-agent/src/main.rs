@@ -674,6 +674,14 @@ async fn main() -> Result<()> {
     let companion_running = false;
     roomler_agent::appdirs::migrate_legacy_trees(companion_running);
 
+    // Same one-shot, same reason, different axis: a Linux SYSTEM install's
+    // config belongs at `/etc/roomler/config.toml` (what the packaged unit
+    // passes as `--config`), not in root's profile. Before `default_config_path`
+    // or any config read, and before logging::init, so it collects notes the
+    // same way.
+    #[cfg(target_os = "linux")]
+    roomler_agent::appdirs::migrate_system_config();
+
     let cli = Cli::parse();
 
     // S1b — the SCM service host and the SystemContext worker log into the
@@ -705,6 +713,12 @@ async fn main() -> Result<()> {
     logging::init();
     for note in roomler_agent::appdirs::migration_notes() {
         tracing::info!(%note, "appdirs legacy-tree migration");
+    }
+    // WARN, not INFO: this one moves the file that holds this host's identity,
+    // and "where is my config now?" is the first question after an upgrade.
+    #[cfg(target_os = "linux")]
+    for note in roomler_agent::appdirs::system_config_notes() {
+        tracing::warn!(%note, "system-config migration");
     }
     if let Some(dir) = logging::log_dir() {
         tracing::debug!(log_dir = %dir.display(), "persistent file logging active");
