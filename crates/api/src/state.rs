@@ -23,7 +23,7 @@ use roomler_ai_services::{
         overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
         push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
         remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
+        room::RoomDao, ssh_audit::SshAuditDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
         tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
@@ -94,6 +94,8 @@ pub struct AppState {
     pub remote_audit: Arc<RemoteAuditDao>,
     /// Fleet-RPC attempt log — every exec, allowed or denied.
     pub exec_audit: Arc<ExecAuditDao>,
+    /// Roomler-SSH grant log — every session request, granted or refused.
+    pub ssh_audit: Arc<SshAuditDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
     /// Observability sample sinks (`stats_*` collections) — idempotent
@@ -345,6 +347,7 @@ impl AppState {
         let remote_sessions = Arc::new(RemoteSessionDao::new(&db));
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
         let exec_audit = Arc::new(ExecAuditDao::new(&db));
+        let ssh_audit = Arc::new(SshAuditDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
         ));
@@ -816,6 +819,7 @@ impl AppState {
             remote_sessions,
             remote_audit,
             exec_audit,
+            ssh_audit,
             agent_crashes,
             agent_logs,
             stats,
