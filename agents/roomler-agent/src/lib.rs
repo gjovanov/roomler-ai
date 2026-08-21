@@ -76,6 +76,10 @@ pub mod signaling;
 /// [`overlay`]: without an overlay there is no address to serve on.
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod ssh;
+/// The ORIGINATING side of Roomler SSH. Ungated on purpose — [`ssh`] needs an
+/// overlay to serve on, but an answer to a request WE sent arrives on the
+/// plain control WS and must be deliverable in every build.
+pub mod ssh_origin;
 pub mod subnet_detect;
 #[cfg(feature = "system-context")]
 pub mod system_context;

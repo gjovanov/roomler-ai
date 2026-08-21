@@ -182,6 +182,20 @@ web-push = "0.10"
 
 # Misc
 rand = "0.9"
+# `roomler ssh` mints a per-session ephemeral keypair in the CLI process, so
+# the private half never crosses the LocalAPI socket. Version is PINNED to the
+# one russh 0.62 already resolves — a second `ssh-key` generation in the tree
+# would mean two incompatible `PublicKey` types across the server and client
+# halves of the same feature. It is a `-rc`, which this workspace otherwise
+# avoids (see the `rsa`-off note in the agent's Cargo.toml); accepted here
+# because it is the SAME crate already trusted for the SSH server side, not a
+# new pre-release surface.
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = [
+    "ed25519",
+    "alloc",
+    "std",
+    "rand_core",
+] }
 base64 = "0.22"
 futures = "0.3"
 async-trait = "0.1"
