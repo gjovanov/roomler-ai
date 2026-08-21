@@ -507,6 +507,17 @@ pub struct Agent {
     pub machine_id: String,
     pub os: OsKind,
     pub agent_version: String,
+    /// P6 — OpenSSH public half of the device's SSH host key, as reported on
+    /// its last hello. Published so a caller can verify what it dialled
+    /// instead of trusting it on first use.
+    ///
+    /// Empty = the device has no host key (SSH off, or a build without
+    /// `ssh-server`), which is NOT "any key is acceptable" — it means the
+    /// device cannot prove itself, and a client that cares should refuse.
+    /// Refreshed from every hello rather than written once, so rotating the
+    /// key on the device is enough to move the fleet view with it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ssh_host_pubkey: String,
     pub agent_token_hash: String,
     pub status: AgentStatus,
     pub last_seen_at: DateTime,
