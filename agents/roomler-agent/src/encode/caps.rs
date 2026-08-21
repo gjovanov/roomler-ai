@@ -697,17 +697,22 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
 /// kill-switch, the device's policy and the agent-local config key all still
 /// have to say yes before anything happens.
 fn rpc_caps() -> Vec<String> {
-    let mut caps = vec!["exec".to_string(), "originate".to_string()];
+    use roomler_ai_remote_control::models::RpcCap;
+
+    // Named by VARIANT, not by string literal: the wire spelling lives in
+    // exactly one place (`RpcCap::wire`) that both this producer and every
+    // server-side consumer go through, so the two can no longer drift.
+    let mut caps = vec![RpcCap::Exec, RpcCap::Originate];
     if cfg!(feature = "ssh-server") {
-        caps.push("ssh".to_string());
+        caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise
         // `ssh` while silently ignoring `SshPolicy.consent_mode` — the server
         // refuses to store a non-auto consent policy for a device that cannot
         // honour it, rather than hand an admin a rule that reads as enforced
         // and isn't.
-        caps.push("ssh-consent".to_string());
+        caps.push(RpcCap::SshConsent);
     }
-    caps
+    caps.into_iter().map(|c| c.wire().to_string()).collect()
 }
 
 /// Multi-user P3 — how many CONCURRENT remote-control sessions this agent
@@ -852,6 +857,45 @@ pub fn pick_best_codec(browser_caps: &[String], agent_caps: &[String]) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closes the loop the `RpcCap` enum exists to close: every verb this
+    /// agent PUTS ON THE WIRE must be one the server can parse back. A typo
+    /// here used to be invisible — the device would simply look like it lacked
+    /// the feature, which is indistinguishable from an old agent.
+    #[test]
+    fn every_advertised_verb_is_a_known_capability() {
+        use roomler_ai_remote_control::models::RpcCap;
+
+        let advertised = rpc_caps();
+        assert!(
+            !advertised.is_empty(),
+            "every build advertises exec at least"
+        );
+        for verb in &advertised {
+            assert!(
+                RpcCap::from_wire(verb).is_some(),
+                "advertised {verb:?} is not a verb the server knows"
+            );
+        }
+        // Build-independent floor: the exec engine is plain process spawning,
+        // so these hold in every feature configuration.
+        assert!(advertised.iter().any(|v| v == RpcCap::Exec.wire()));
+        assert!(advertised.iter().any(|v| v == RpcCap::Originate.wire()));
+
+        // The SSH pair is feature-gated TOGETHER: advertising `ssh` without
+        // `ssh-consent` is precisely the rc.419 state the server has to refuse
+        // a consent policy for, so they must never drift apart in one build.
+        assert_eq!(
+            advertised.iter().any(|v| v == RpcCap::Ssh.wire()),
+            advertised.iter().any(|v| v == RpcCap::SshConsent.wire()),
+            "ssh and ssh-consent must be advertised together in a single build"
+        );
+        assert_eq!(
+            advertised.iter().any(|v| v == RpcCap::Ssh.wire()),
+            cfg!(feature = "ssh-server"),
+            "the ssh verbs must track the ssh-server feature, not the version"
+        );
+    }
 
     /// THE property this slice exists for: a host whose hardware probes
     /// cannot be trusted still produces usable caps, and never claims a codec
