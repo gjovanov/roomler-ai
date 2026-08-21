@@ -12,6 +12,12 @@ through it in readable form.
 
 ## The big picture
 
+<p align="center">
+  <img src="assets/hero-mesh.svg" alt="Your devices, one encrypted mesh — a laptop, a GPU workstation, a home server and a cloud cluster connected directly, coordinated by roomler.ai" width="620">
+</p>
+
+The same picture with every flow labelled:
+
 ```mermaid
 flowchart LR
     subgraph you["🧑 You"]
