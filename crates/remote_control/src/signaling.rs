@@ -281,6 +281,18 @@ pub enum ClientMsg {
         rtt_ms: f32,
         keyframe_requests: u32,
         input_events: u64,
+        /// P8 Phase 4 (mixed-dial gate) — cumulative seconds this
+        /// session's pipeline served ≥1 follower. `serde(default)`
+        /// so pre-Phase-4 agents' samples still parse.
+        #[serde(default)]
+        shared_seconds: u64,
+        /// … of which the viewers' dials (Priority / resolution pick)
+        /// were NOT all equal — the share-shape a per-viewer pipeline
+        /// (SVC / tiered transcode) would serve better than the
+        /// floor-merge. The 2-4-week aggregate of this field is the
+        /// SVC go/no-go input.
+        #[serde(default)]
+        mixed_dial_seconds: u64,
     },
 
     /// Multi-region DERP: request an EdDSA admission ticket for the regional
