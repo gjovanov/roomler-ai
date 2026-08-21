@@ -106,9 +106,9 @@ Key properties:
 | Intel Iris Xe | MF HW MFT is async-only; the async-unlock path handles it, FFmpeg QSV (`hevc_qsv`, `vp9_qsv`) proven in the field |
 | NVIDIA idle P-states | First seconds of a session encode at ~20 ms/frame until clocks ramp — `gpu_clock.rs` pins graphics clocks via NVML for exactly the session's lifetime (the Parsec "boost" trick) |
 | Windows 11 ACM / HDR desktops | Desktop Duplication hands out FP16 scRGB frames; `fp16.rs` converts scRGB→BGRA8 sRGB so capture doesn't fall back or ship corrupt stripes |
-| WSL (libcuda stub, no driver) | `hevc_nvenc` **dlopens successfully** and then SEGVs when `cuInit(0)` fails. Contained since rc.432 by the child-process probe below — the host loses its HW advertisement, not its daemon |
+| WSL (libcuda stub, no driver) | `hevc_nvenc` **dlopens successfully** and then SEGVs when `cuInit(0)` fails. Contained since rc.433 by the child-process probe below — the host loses its HW advertisement, not its daemon |
 
-### The probe runs in a CHILD PROCESS (rc.432)
+### The probe runs in a CHILD PROCESS (rc.433)
 
 A capability probe is untrusted third-party code by definition — vendor drivers
 and, through them, GPU firmware. It does not belong in the daemon's address
