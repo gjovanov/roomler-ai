@@ -404,6 +404,24 @@ pub mod priority {
     allow(dead_code)
 )]
 pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32> {
+    // rc.445 — the dial dims-caps are OFF BY DEFAULT. Field 2026-08-21 (all
+    // three test hosts, Smoother AND Balanced): every mid-motion rung flip
+    // pays a BLOCKING QSV encoder open on the pump thread — measured
+    // 865 ms for the Down and 654 ms for the Up on Iris-Xe-class (CORPLAP-3,
+    // `resolution cap engaged` → `encoder (re)built` deltas) — plus a
+    // fresh IDR behind the queued frames. The user-felt result was "drag
+    // takes off ~1 s, freezes ~1 s, then continues", and "Sharper is best"
+    // on every host — i.e. never flipping beats the rung's steady-state
+    // benefit. The rung's bit-shedding job moved to the continuous,
+    // rebuild-free dial CEILING factor (`dial_rate_factor_pct` — the HRD
+    // raises QP during motion by itself). `ROOMLER_AGENT_PRIORITY_RES_CAP=1`
+    // / config `priority_res_cap` restores the rc.443 caps for A/B.
+    if !matches!(
+        node_env("PRIORITY_RES_CAP").as_deref().map(str::trim),
+        Some("1") | Some("true")
+    ) {
+        return None;
+    }
     match priority {
         // Sharpness override — native even on a relay.
         self::priority::SHARPER => None,
@@ -418,6 +436,33 @@ pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32>
                 None
             }
         }
+    }
+}
+
+/// rc.445 — the rebuild-free replacement for the dial dims-caps: a
+/// per-dial bitrate-ceiling factor (percent). A lower ceiling makes the
+/// HRD raise QP during motion continuously — smaller frames, steadier
+/// arrival, more fps through a clamped pipe — with ZERO encoder rebuilds
+/// and an untouched at-rest polish (a settled desktop never reaches the
+/// ceiling, so CQ-quality stills are unaffected). Smoother trades the
+/// most bits for fluidity; Sharper none. Env overrides
+/// `ROOMLER_AGENT_SMOOTHER_RATE_PCT` / `ROOMLER_AGENT_BALANCED_RATE_PCT`
+/// (clamped [30, 100]).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn dial_rate_factor_pct(priority: u8) -> usize {
+    let env_pct = |suffix: &str, default: usize| -> usize {
+        node_env(suffix)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(30, 100))
+            .unwrap_or(default)
+    };
+    match priority {
+        self::priority::SHARPER => 100,
+        self::priority::SMOOTHER => env_pct("SMOOTHER_RATE_PCT", 70),
+        _ => env_pct("BALANCED_RATE_PCT", 85),
     }
 }
 
@@ -936,24 +981,53 @@ mod tests {
 
     #[test]
     fn priority_relay_cap_resolves_per_dial() {
+        // rc.445 — PRIORITY_RES_CAP is also toggled by media_share's
+        // eligibility test; serialise via the shared env lock.
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Isolate from any operator env override so the defaults are asserted.
-        // SAFETY: single-threaded test; no other test in this crate reads or
-        // writes these two vars concurrently.
+        // SAFETY: guarded by RELAY_ENV_LOCK against the known writers.
         unsafe {
             std::env::remove_var("ROOMLER_AGENT_RELAY_MAX_EDGE");
             std::env::remove_var("ROOMLER_AGENT_SMOOTH_MAX_EDGE");
+            std::env::remove_var("ROOMLER_AGENT_PRIORITY_RES_CAP");
         }
-        // Balanced: the link-physics hard cap only on a constrained path.
+        // rc.445 DEFAULT: no dial dims-caps on any path — a mid-motion rung
+        // flip costs a blocking encoder open (field-measured 0.65-0.87 s on
+        // Iris Xe) and the field verdict was "never flipping beats the rung".
+        for dial in [
+            priority::BALANCED,
+            priority::SHARPER,
+            priority::SMOOTHER,
+            42,
+        ] {
+            assert_eq!(priority_relay_cap(dial, true), None);
+            assert_eq!(priority_relay_cap(dial, false), None);
+        }
+        // The restore switch brings back the rc.443 caps for A/B.
+        unsafe { std::env::set_var("ROOMLER_AGENT_PRIORITY_RES_CAP", "1") };
         assert_eq!(priority_relay_cap(priority::BALANCED, true), Some(1280));
         assert_eq!(priority_relay_cap(priority::BALANCED, false), None);
-        // Sharper is the override: native long-edge regardless of transport.
         assert_eq!(priority_relay_cap(priority::SHARPER, true), None);
         assert_eq!(priority_relay_cap(priority::SHARPER, false), None);
-        // Smoother sheds pixels on EVERY path.
         assert_eq!(priority_relay_cap(priority::SMOOTHER, true), Some(1024));
         assert_eq!(priority_relay_cap(priority::SMOOTHER, false), Some(1024));
-        // An unknown code is treated as Balanced (never uncapped by accident).
         assert_eq!(priority_relay_cap(42, true), Some(1280));
+        unsafe { std::env::remove_var("ROOMLER_AGENT_PRIORITY_RES_CAP") };
+    }
+
+    #[test]
+    fn dial_rate_factor_defaults_per_dial() {
+        unsafe {
+            std::env::remove_var("ROOMLER_AGENT_SMOOTHER_RATE_PCT");
+            std::env::remove_var("ROOMLER_AGENT_BALANCED_RATE_PCT");
+        }
+        assert_eq!(dial_rate_factor_pct(priority::SHARPER), 100);
+        assert_eq!(dial_rate_factor_pct(priority::SMOOTHER), 70);
+        assert_eq!(dial_rate_factor_pct(priority::BALANCED), 85);
+        // Unknown codes decay to Balanced, mirroring the cap fn.
+        assert_eq!(dial_rate_factor_pct(42), 85);
     }
 
     // P7 — idle-refine scope matrix + the Balanced kill-switch env (P7c

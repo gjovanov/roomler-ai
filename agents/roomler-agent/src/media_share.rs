@@ -1101,8 +1101,17 @@ mod tests {
     #[tokio::test]
     async fn merged_refine_eligible_decision_table() {
         let _s = serial();
+        // rc.445 — the dial caps (and with them this whole merge) exist
+        // only behind the restore switch now; hold the shared env lock
+        // since `encode::tests` also toggles this var.
+        let _env = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // SAFETY: same contract as the sibling env-clearing tests.
-        unsafe { std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED") };
+        unsafe {
+            std::env::remove_var("ROOMLER_AGENT_IDLE_REFINE_BALANCED");
+            std::env::set_var("ROOMLER_AGENT_PRIORITY_RES_CAP", "1");
+        }
         use crate::encode::priority::{BALANCED, SHARPER, SMOOTHER};
         let key = PipelineKey::FfmpegDc("TEST-REFINE");
         let owner = Pipeline::register(key, ObjectId::new());
@@ -1149,6 +1158,13 @@ mod tests {
         drop(guard);
         assert_eq!(owner.follower_count(), 0);
         assert!(owner.merged_refine_eligible(SHARPER, true));
+        drop(owner);
+        // rc.445 default (caps off): nothing can block — eligibility is
+        // vacuous, matching the caller's capped_below_native=false gate.
+        unsafe { std::env::remove_var("ROOMLER_AGENT_PRIORITY_RES_CAP") };
+        let owner = Pipeline::register(key, ObjectId::new());
+        assert!(owner.merged_refine_eligible(SMOOTHER, true));
+        assert!(owner.merged_refine_eligible(BALANCED, true));
         drop(owner);
     }
 
