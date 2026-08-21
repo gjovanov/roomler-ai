@@ -437,7 +437,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "constrained_hrd_pct",
         "string",
-        "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200): bounds the single-frame IDR burst a clamped pipe must serialize (the dominant term of crystallize latency). Direct sessions always use 200 (the rc.234 2x window). Empty = built-in 75. Env: ROOMLER_NODE_CONSTRAINED_HRD_PCT. Restart required.",
+        "HRD/VBV window for CONSTRAINED sessions (percent of maxrate, 25-200). Empty = built-in 200 (the rc.234 2x window; rc.442 defaulted 75 to bound IDR transit and rc.443 reverted it - av1_qsv errors and hangs on a forced IDR that exceeds a sub-1x reservoir). Sub-100 values are per-host experiments only. Env: ROOMLER_NODE_CONSTRAINED_HRD_PCT. Restart required.",
     ),
     (
         "scale_threads",

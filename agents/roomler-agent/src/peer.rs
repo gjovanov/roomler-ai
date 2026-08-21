@@ -3026,6 +3026,10 @@ async fn media_pump_vp9_444_dc(
     }
 
     loop {
+        // rc.443 — owner-liveness beat, FIRST statement of the loop: a
+        // joiner finding this stale evicts the pipeline (a wedged encode
+        // can block this task forever with no way to drop the Pipeline).
+        pipeline.beat();
         // Relay-escape — every TRANSPORT_RECHECK_INTERVAL re-read the
         // selected ICE pair: Chrome renominates mid-session (relay→direct
         // once the mDNS-resolved host pair succeeds; direct→relay on a path
@@ -4202,6 +4206,10 @@ async fn media_pump_ffmpeg_dc(
         ffmpeg_send_depth,
         std::time::Instant::now(),
     );
+    // rc.443 — consecutive-encode-error escalation (retry → rebuild →
+    // clean pump exit); see `encode::EncodeErrorLadder`.
+    let mut err_ladder = crate::encode::EncodeErrorLadder::default();
+    let mut rebuild_after_encode_error = false;
     {
         let video_bytes_dc = video_bytes_dc.clone();
         let frames_sent = frames_sent.clone();
@@ -4251,6 +4259,18 @@ async fn media_pump_ffmpeg_dc(
     }
 
     loop {
+        // rc.443 — owner-liveness beat, FIRST statement of the loop (see
+        // the vp9 twin): a wedged blocking encode is the one failure this
+        // task cannot log or clean up itself; the beat's absence is how
+        // the next joiner detects it and evicts the pipeline.
+        pipeline.beat();
+        // rc.443 — deferred encoder drop from the error ladder (the error
+        // arm holds a live `enc` borrow, so it can't touch `encoder`).
+        if rebuild_after_encode_error {
+            rebuild_after_encode_error = false;
+            encoder = None;
+            encoder_dims = None;
+        }
         // Relay-escape — twin of the VP9 pump's loop-top block: re-read the
         // selected ICE pair every TRANSPORT_RECHECK_INTERVAL and follow a
         // mid-session renomination. A flip flows into `ceiling` (recomputed
@@ -4933,9 +4953,38 @@ async fn media_pump_ffmpeg_dc(
 
         let encode_start = std::time::Instant::now();
         let packets = match enc.encode(frame.clone()).await {
-            Ok(p) => p,
+            Ok(p) => {
+                err_ladder.on_success();
+                p
+            }
             Err(e) => {
-                tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: encode error");
+                // rc.443 — escalate instead of retrying forever: the old
+                // bare `continue` turned a persistently-failing HW encoder
+                // into a silently frozen stream (field: CORPLAP-3 av1_qsv
+                // rejecting a forced IDR). `encoder` can't be dropped here
+                // (`enc` borrow is live past this match) — defer to the
+                // loop top.
+                match err_ladder.on_error() {
+                    crate::encode::EncodeErrorAction::Retry => {
+                        tracing::warn!(%session_id, codec_label, %e, "FFmpeg DC pump: encode error");
+                    }
+                    crate::encode::EncodeErrorAction::Rebuild => {
+                        tracing::warn!(
+                            %session_id, codec_label, %e,
+                            consecutive = err_ladder.consecutive(),
+                            "FFmpeg DC pump: encode error — rebuilding the encoder (fresh open, first frame IDR)"
+                        );
+                        rebuild_after_encode_error = true;
+                    }
+                    crate::encode::EncodeErrorAction::ExitPump => {
+                        tracing::error!(
+                            %session_id, codec_label, %e,
+                            consecutive = err_ladder.consecutive(),
+                            "FFmpeg DC pump: encoder unrecoverable after rebuilds — exiting pump (pipeline reaps, viewer renegotiates)"
+                        );
+                        return;
+                    }
+                }
                 continue;
             }
         };
