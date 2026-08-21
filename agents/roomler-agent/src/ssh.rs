@@ -251,6 +251,41 @@ async fn serve_conn(mut stream: tunnel_core::overlay::netstack::NsTcpStream, _ct
 /// constructed from those bytes rather than through an RNG-generic API so this
 /// never has to agree with russh about which `rand_core` generation is in the
 /// tree.
+/// The OpenSSH **public** half of this device's host key, for the server to
+/// publish so callers can verify what they dialled instead of trusting it on
+/// first use (P6).
+///
+/// Empty when there is nothing to prove — no key stored, or a build without
+/// `ssh-server`. Deliberately NOT an error: a device with SSH switched off is
+/// in a perfectly normal state, and the empty value already means "cannot
+/// prove itself" on the wire.
+///
+/// Derived on every hello rather than cached, so rotating `ssh_host_key` in
+/// the config and restarting is all it takes for the fleet view to follow —
+/// a cache here would leave the server advertising a key the device no longer
+/// holds, which is worse than advertising none.
+#[cfg(feature = "ssh-server")]
+pub fn host_public_key(cfg: &crate::config::AgentConfig) -> String {
+    let Some(pem) = cfg.ssh_host_key.as_deref() else {
+        return String::new();
+    };
+    match russh::keys::ssh_key::PrivateKey::from_openssh(pem) {
+        Ok(k) => k.public_key().to_openssh().unwrap_or_default(),
+        Err(e) => {
+            // Same unreadable-key case `Ctx::build` refuses to serve on; say
+            // so once here too, because the symptom a user sees is remote
+            // (their client cannot verify the host) and the cause is local.
+            warn!(%e, "ssh: stored host key is unreadable — publishing no host pubkey");
+            String::new()
+        }
+    }
+}
+
+#[cfg(not(feature = "ssh-server"))]
+pub fn host_public_key(_cfg: &crate::config::AgentConfig) -> String {
+    String::new()
+}
+
 #[cfg(feature = "ssh-server")]
 pub fn generate_host_key() -> anyhow::Result<String> {
     use russh::keys::ssh_key::LineEnding;
@@ -1347,6 +1382,48 @@ mod tests {
         cfg.ssh_host_key = Some(super::generate_host_key().unwrap());
         cfg.ssh_authorized_keys = authorized;
         cfg
+    }
+
+    #[test]
+    fn host_public_key_is_the_public_half_of_the_stored_key() {
+        // The point of publishing this is that a client can compare what it
+        // dialled against it, so it has to be the SAME key the server will
+        // actually present — not merely a well-formed one.
+        let cfg = cfg_with(vec![]);
+        let published = super::host_public_key(&cfg);
+        assert!(
+            !published.is_empty(),
+            "an SSH-enabled device must publish one"
+        );
+
+        let served = PrivateKey::from_openssh(cfg.ssh_host_key.as_deref().unwrap())
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap();
+        assert_eq!(published, served);
+
+        // And it must be parseable BY A CLIENT, since that is the only thing
+        // that ever consumes it.
+        let parsed = russh::keys::ssh_key::PublicKey::from_openssh(&published).unwrap();
+        assert_eq!(parsed.algorithm().as_str(), "ssh-ed25519");
+    }
+
+    #[test]
+    fn a_device_with_no_host_key_publishes_nothing_rather_than_junk() {
+        // Empty is a meaningful answer on the wire ("cannot prove itself").
+        // Returning a placeholder, or panicking, would both be worse: one
+        // invites a false verify, the other takes the hello down over a
+        // device that is simply not serving SSH.
+        let mut cfg = cfg_with(vec![]);
+        cfg.ssh_host_key = None;
+        assert_eq!(super::host_public_key(&cfg), "");
+
+        // Same for a corrupted key — `Ctx::build` already refuses to serve on
+        // it, and publishing an identity the device cannot back would be the
+        // one genuinely dangerous outcome.
+        cfg.ssh_host_key = Some("-----BEGIN OPENSSH PRIVATE KEY-----\nnope\n".into());
+        assert_eq!(super::host_public_key(&cfg), "");
     }
 
     struct TestClient;
