@@ -330,21 +330,29 @@ pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
 }
 
 /// HRD/VBV window for CONSTRAINED sessions, as a percent of `maxrate`.
-/// Direct sessions keep the rc.234 2× window (transients spend real bits
-/// — the "IDR QP-collapse blur" fix). On a relay the same window is a
-/// latency bomb: it authorises a single ~750 KB IDR that then takes
-/// 2-3 s to traverse the clamped pipe — the dominant term of the field
-/// "text takes 4-5 s to crystallize". 75 % of maxrate bounds the refine
-/// IDR to ~280 KB (~1 s of link); the at-rest polish loop (17 fps of
-/// small refreshes, field-measured) repairs any residual IDR softness
-/// within a couple of frames — a repair path rc.234 predates. Env
-/// `ROOMLER_AGENT_CONSTRAINED_HRD_PCT` / config `constrained_hrd_pct`
-/// (default 75, clamp [25, 200]).
+/// Default 200 (the rc.234 2× window — transients spend real bits, the
+/// "IDR QP-collapse blur" fix), same as direct sessions.
+///
+/// ⚠ rc.442 shipped this at 75 % to bound the refine IDR's relay transit
+/// (the crystallize-latency lever) and rc.443 REVERTED it the same day:
+/// field 2026-08-21, clk00017265 (Iris Xe) — the FIRST session whose
+/// av1_qsv ran with a sub-1× window died on its first settle IDR with
+/// `send_frame: Invalid data found when processing input` (a quality-
+/// floored native AV1 IDR is ~2 Mbit, larger than the whole 1.5 Mbit
+/// reservoir; Intel's AV1 VDENC apparently ERRORS on an over-budget
+/// forced IDR rather than QP-clamping), and the follow-on encode call
+/// hung in the driver. clk had run av1_qsv all day on rc.441's 2×
+/// window with zero errors. Sub-100 values remain available per-host
+/// for experiments (env `ROOMLER_AGENT_CONSTRAINED_HRD_PCT` / config
+/// `constrained_hrd_pct`, clamp [25, 200]) but the DEFAULT must not
+/// undercut a codec's forced-IDR floor; bounding IDR transit properly
+/// is the measured-rate program's job (derive the window per codec
+/// from measured goodput, with a keyframe-size floor).
 pub fn constrained_hrd_pct() -> usize {
     tunnel_core::env::node_env("CONSTRAINED_HRD_PCT")
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|v| v.clamp(25, 200))
-        .unwrap_or(75)
+        .unwrap_or(200)
 }
 
 /// Real frames since the last settle that make a motion episode "a burst"
@@ -557,13 +565,15 @@ pub const REFINE_SETTLE_TRACKED: Duration = Duration::from_millis(500);
 /// encoder rebuilds plus two IDRs; a 500 ms settle fires the Up on
 /// ordinary drag PAUSES, so an interactive session lives in permanent IDR
 /// recovery — the field "freezing / window seconds behind" report. The
-/// settle must comfortably exceed the refined IDR's own transmission time
-/// on the link it rides. Was 2000 ms when the IDR could be ~750 KB (the
-/// 2× HRD window ≈ 2-3 s of link); with the constrained HRD trim bounding
-/// it to ~280 KB (~1 s of link, see `constrained_hrd_pct`), 1200 ms still
-/// exceeds the transit while reclaiming ~0.8 s of the field "text takes
-/// 4-5 s to crystallize". Direct/LAN keeps the crisp 500 ms.
-/// Env/config `idle_refine_settle_constrained_ms`.
+/// settle should comfortably cover the refined IDR's own transmission
+/// time on the link it rides. 2000 ms → 1200 ms in rc.442: the byte-
+/// budget send gate now keeps the queue drained, so the IDR's transit
+/// starts immediately instead of behind a motion backlog, and a typical
+/// (non-worst-case) native IDR is ~250-400 KB ≈ 1-1.6 s of a ~2 Mbps
+/// relay — an occasional Up during a long drag pause costs one wasted
+/// IDR, accepted for the ~0.8 s crystallize win. Deriving this from
+/// measured goodput is the measured-rate program's job. Direct/LAN
+/// keeps the crisp 500 ms. Env/config `idle_refine_settle_constrained_ms`.
 pub const REFINE_SETTLE_TRACKED_CONSTRAINED: Duration = Duration::from_millis(1200);
 
 /// Inter-arrival gap that CHAINS a motion run (≤80 ms ⇒ ≥12.5 fps damage —
@@ -1083,9 +1093,11 @@ mod tests {
         assert_eq!(constrained_queue_budget_bytes(3_000_000), 168_750);
         // Scales with the ceiling.
         assert_eq!(constrained_queue_budget_bytes(1_000_000), 56_250);
-        // Default knobs (env-free): relief 4 softening steps, HRD 75 %.
+        // Default knobs (env-free): relief 4 softening steps; HRD default
+        // 200 (rc.443 — a sub-1× window killed av1_qsv on its settle IDR,
+        // see `constrained_hrd_pct`).
         assert_eq!(constrained_cq_relief(), 4);
-        assert_eq!(constrained_hrd_pct(), 75);
+        assert_eq!(constrained_hrd_pct(), 200);
     }
 
     fn gate() -> SettleKeyframeGate {

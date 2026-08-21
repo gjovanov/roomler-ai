@@ -197,13 +197,13 @@ fn encoder_options(
     // spend real bits; the AVERAGE stays bounded by `maxrate`, and actual
     // congestion is owned by the DC send channel + AIMD, not the HRD.
     //
-    // Constrained-transport trim (field 2026-08-21, pc50045/clk): on a
-    // relay the 2× window is a latency bomb — it authorises a single
-    // ~750 KB refine IDR that then takes 2-3 s to cross the clamped pipe
-    // (the dominant term of "text takes 4-5 s to crystallize"). Relay
-    // sessions get `constrained_hrd_pct` (default 75 % ⇒ IDR ≤ ~280 KB ≈
-    // 1 s of link); the at-rest polish loop repairs residual IDR softness
-    // within a couple of refreshes — a repair path rc.234 predates.
+    // Constrained-transport window (rc.442/rc.443): rc.442 trimmed relay
+    // sessions to 75 % of maxrate to bound the refine IDR's transit; the
+    // SAME DAY the first av1_qsv session under the trimmed window died on
+    // its settle IDR (`send_frame: Invalid data` then a driver hang — a
+    // quality-floored AV1 IDR exceeds a sub-1× reservoir and Intel's AV1
+    // VDENC errors rather than clamping). The default is back to 200 %
+    // both ways; `constrained_hrd_pct` remains a per-host experiment knob.
     let hrd_pct: usize = if constrained {
         crate::encode::rate_profile::constrained_hrd_pct()
     } else {
@@ -1429,12 +1429,14 @@ mod tests {
         );
     }
 
-    /// Constrained-transport HRD trim (field 2026-08-21): relay sessions
-    /// get the `constrained_hrd_pct` window (default 75 % of maxrate)
-    /// instead of the rc.234 2×, bounding the single-frame IDR burst the
-    /// clamped pipe must then serialize. Direct sessions keep 2×.
+    /// Constrained-transport HRD default is UNTRIMMED (rc.443): rc.442's
+    /// 75 % window made av1_qsv error out (`Invalid data`) on its first
+    /// settle IDR and then hang the driver — see
+    /// `rate_profile::constrained_hrd_pct` for the field evidence. Both
+    /// transports must default to the rc.234 2× window; the env/config
+    /// knob remains for per-host experiments.
     #[test]
-    fn constrained_hrd_window_is_trimmed() {
+    fn constrained_hrd_window_defaults_untrimmed() {
         let (_, _, summary) = encoder_options("hevc_qsv", 3_000_000, 22, true, false, false);
         assert!(
             summary.contains("bufsize=6000000"),
@@ -1442,8 +1444,8 @@ mod tests {
         );
         let (_, _, summary) = encoder_options("hevc_qsv", 3_000_000, 22, true, false, true);
         assert!(
-            summary.contains("bufsize=2250000"),
-            "constrained must trim the HRD to 75% of maxrate, got: {summary}"
+            summary.contains("bufsize=6000000"),
+            "constrained must ALSO default to the 2x window (rc.443 av1_qsv IDR kill), got: {summary}"
         );
     }
 
