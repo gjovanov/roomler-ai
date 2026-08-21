@@ -62,6 +62,53 @@
     </v-card>
 
     <ExecAuditSection :tenant-id="tenantId" />
+
+    <!-- Roomler SSH gate 1. A SEPARATE card from remote execution above, and
+         a separate switch server-side: allowing bounded diagnostic commands
+         is not the same decision as allowing interactive sessions, and one
+         control must never read as the other. -->
+    <v-card>
+      <v-card-title class="d-flex align-center">
+        <v-icon icon="mdi-console-network-outline" color="primary" class="mr-2" />
+        Roomler SSH
+      </v-card-title>
+      <v-card-text>
+        <v-alert
+          type="warning"
+          variant="tonal"
+          density="compact"
+          class="mb-4"
+          icon="mdi-shield-alert-outline"
+        >
+          When enabled, users holding the <strong>SSH_DEVICE</strong>
+          permission can open an interactive shell on devices that
+          individually opt in. A session lasts, unlike a single command — and
+          which account it runs as is set per device.
+        </v-alert>
+
+        <v-switch
+          :model-value="agentStore.orgSshEnabled === true"
+          :loading="savingSsh"
+          :disabled="savingSsh || agentStore.orgSshEnabled === null"
+          color="primary"
+          density="compact"
+          hide-details
+          label="Allow SSH sessions in this organization"
+          @update:model-value="onToggleSsh"
+        />
+        <div class="text-caption text-medium-emphasis mt-1">
+          Off by default. Turning it on does not enable any device on its own —
+          each device must also be allowed individually, and the device's own
+          <code>ssh_enabled</code> setting must permit it.
+        </div>
+
+        <v-alert v-if="sshError" type="error" variant="tonal" density="compact" class="mt-3">
+          {{ sshError }}
+        </v-alert>
+      </v-card-text>
+    </v-card>
+
+    <SshAuditSection :tenant-id="tenantId" />
   </div>
 </template>
 
@@ -70,6 +117,7 @@ import { onMounted, ref } from 'vue'
 import { useTenantStore } from '@/stores/tenant'
 import { useAgentStore } from '@/stores/agents'
 import ExecAuditSection from './ExecAuditSection.vue'
+import SshAuditSection from './SshAuditSection.vue'
 
 const props = defineProps<{ tenantId: string }>()
 const tenantStore = useTenantStore()
@@ -77,6 +125,11 @@ const agentStore = useAgentStore()
 
 const saving = ref(false)
 const error = ref<string | null>(null)
+
+// Tracked separately from the exec pair on purpose: a failure to flip one
+// switch must not render as an error under the other.
+const savingSsh = ref(false)
+const sshError = ref<string | null>(null)
 
 async function onToggle(v: boolean | null) {
   saving.value = true
@@ -90,7 +143,20 @@ async function onToggle(v: boolean | null) {
   }
 }
 
+async function onToggleSsh(v: boolean | null) {
+  savingSsh.value = true
+  sshError.value = null
+  try {
+    await agentStore.setOrgSshEnabled(props.tenantId, v === true)
+  } catch (e) {
+    sshError.value = (e as Error).message
+  } finally {
+    savingSsh.value = false
+  }
+}
+
 onMounted(() => {
   void agentStore.fetchOrgExecEnabled(props.tenantId)
+  void agentStore.fetchOrgSshEnabled(props.tenantId)
 })
 </script>

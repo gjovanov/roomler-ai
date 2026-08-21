@@ -140,6 +140,9 @@ export interface Agent {
   /** Fleet RPC gate 3. Absent on API bodies that predate the feature —
    *  consumers must treat that as `mode: 'off'`, never as permissive. */
   exec_policy?: ExecPolicy
+  /** Roomler SSH gate 3. Same rule as `exec_policy`: absent means OFF, never
+   *  permissive. */
+  ssh_policy?: SshPolicy
   /** Multi-region relay PoPs: the agent's nearest relay region id (derived
    *  server-side from its STUN probe reports), e.g. "us-east". Absent/null =
    *  never probed or all probes timed out — the default region serves it. */
@@ -171,6 +174,38 @@ export interface ExecPolicy {
   consent_mode: ConsentMode | null
   /** Empty = any shell the host supports. */
   shells: string[]
+}
+
+/** Roomler SSH — whether a device accepts interactive sessions at all.
+ *  Mirrors the Rust `SshMode`. Default `off` everywhere. */
+export type SshMode = 'off' | 'on'
+
+/** Which local account a session runs as. Mirrors the Rust
+ *  `SshAccountMode`. `daemon` means SYSTEM on Windows and root under
+ *  systemd — the dialog says so in those words rather than leaving an admin
+ *  to infer it. */
+export type SshAccountMode = 'daemon' | 'console_user' | 'named'
+
+/** Roomler SSH gate 3 — the per-device session policy.
+ *
+ *  Deliberately separate from {@link ExecPolicy}, mirroring the server's
+ *  separate `SSH_DEVICE` bit: an SSH session is strictly more than a bounded
+ *  command — it is interactive, it lasts, and it grows file transfer and port
+ *  forwarding as later slices land. "May run one clamped diagnostic" and "may
+ *  hold a live session" have to be grantable independently. */
+export interface SshPolicy {
+  mode: SshMode
+  /** May this device ORIGINATE sessions against others? Default false, for
+   *  the same reason as {@link ExecPolicy.can_originate}. */
+  can_originate: boolean
+  allowed_user_ids: string[]
+  allowed_role_ids: string[]
+  account_mode: SshAccountMode
+  /** The account for `account_mode: 'named'`. Ignored otherwise. */
+  account: string | null
+  /** Only `auto` (unattended) and `prompt` are honoured. `null` = prompt —
+   *  an absent directive means ask, the fail-safe the agent also applies. */
+  consent_mode: ConsentMode | null
 }
 
 /** One remote command's result. `exit_code: null` together with a non-null
@@ -222,6 +257,46 @@ export interface ExecAuditEntry {
   output_sha256?: string
   output_bytes?: number
   truncated?: boolean
+}
+
+/** Why a roomler-SSH request was refused. Mirrors the Rust `SshDenyReason`. */
+export type SshDenyReason =
+  | 'org_disabled'
+  | 'no_permission'
+  | 'device_disabled'
+  | 'caller_not_allowed'
+  | 'origin_not_allowed'
+  | 'unsupported'
+  | 'offline'
+  | 'no_overlay_address'
+  | 'rate_limited'
+  | 'bad_public_key'
+
+/** One SSH grant DECISION.
+ *
+ *  Not one session: the server hands back an address and a grant and then
+ *  steps out of the way — the session rides the overlay directly and the
+ *  server never observes it. So there is no duration, exit status or output
+ *  here, and a row means "a grant was issued", never "a session happened". */
+export interface SshAuditEntry {
+  id?: string
+  tenant_id: string
+  agent_id: string
+  user_id: string
+  origin_agent_id?: string | null
+  grant_id?: string | null
+  source: string
+  caller: string
+  /** Which identity the grant authorised — the field worth reading, since it
+   *  is the difference between a shell as the signed-in user and one as
+   *  SYSTEM/root. Absent on a refusal. */
+  account_mode?: string | null
+  session_secs?: number | null
+  at: string
+  denied?: SshDenyReason | null
+  /** The refusal in the words the caller was given, straight from the server
+   *  so the UI never has to keep its own copy of the enum's meanings. */
+  denied_message?: string | null
 }
 
 /** A tenant member as returned by `GET /tenant/{id}/member` — enough to populate
@@ -534,6 +609,51 @@ export const useAgentStore = defineStore('agents', () => {
     if (idx !== -1) agents.value[idx]!.exec_policy = policy
   }
 
+  // ── Roomler SSH ──────────────────────────────────────────────────
+  //
+  // A separate org switch and a separate per-device policy from exec's, all
+  // the way down — allowing bounded diagnostic commands is not the same
+  // decision as allowing interactive sessions, so the UI must not let one
+  // control read as the other.
+
+  /** Whether the ORG allows SSH at all (gate 1). `null` until fetched, and
+   *  left `null` on a 403 — "not an admin" is not "disabled", and claiming
+   *  the org is off would send an admin hunting through device settings. */
+  const orgSshEnabled = ref<boolean | null>(null)
+
+  async function fetchOrgSshEnabled(tenantId: string) {
+    try {
+      const resp = await api.get<{ remote_ssh_enabled: boolean }>(
+        `/tenant/${tenantId}/ssh-settings`,
+      )
+      orgSshEnabled.value = resp.remote_ssh_enabled
+    } catch {
+      orgSshEnabled.value = null
+    }
+  }
+
+  /** Flip gate 1. MANAGE_TENANT server-side. */
+  async function setOrgSshEnabled(tenantId: string, enabled: boolean) {
+    const resp = await api.put<{ remote_ssh_enabled: boolean }>(
+      `/tenant/${tenantId}/ssh-settings`,
+      { remote_ssh_enabled: enabled },
+    )
+    orgSshEnabled.value = resp.remote_ssh_enabled
+  }
+
+  /** Replace a device's SSH policy (gate 3). MANAGE_AGENTS server-side.
+   *
+   *  The server REFUSES a non-auto `consent_mode` for a device whose agent
+   *  predates P5d — such an agent accepts the field and ignores it, and a
+   *  policy that reads as enforced while doing nothing is worse than no
+   *  policy. That refusal surfaces here as a thrown error, deliberately: the
+   *  caller must not report "saved". */
+  async function updateSshPolicy(tenantId: string, agentId: string, policy: SshPolicy) {
+    await api.put(`/tenant/${tenantId}/agent/${agentId}/ssh-policy`, policy)
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) agents.value[idx]!.ssh_policy = policy
+  }
+
   /** Run a command on one device.
    *
    *  Resolves even when the command was REFUSED — the server answers 200 with
@@ -586,6 +706,23 @@ export const useAgentStore = defineStore('agents', () => {
     return { items: resp.items, total: resp.total }
   }
 
+  /** Read the SSH grant log. Requires `VIEW_SSH_AUDIT` — a separate bit from
+   *  `VIEW_EXEC_AUDIT`, so an admin can hold one view and not the other. */
+  async function fetchSshAudit(
+    tenantId: string,
+    opts: { agentId?: string; userId?: string; page?: number; perPage?: number } = {},
+  ): Promise<{ items: SshAuditEntry[]; total: number }> {
+    const q = new URLSearchParams()
+    if (opts.agentId) q.set('agent_id', opts.agentId)
+    if (opts.userId) q.set('user_id', opts.userId)
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: SshAuditEntry[]; total: number }>(
+      `/tenant/${tenantId}/ssh-audit?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
   return {
     agents,
     total,
@@ -611,6 +748,11 @@ export const useAgentStore = defineStore('agents', () => {
     fetchOrgExecEnabled,
     setOrgExecEnabled,
     updateExecPolicy,
+    orgSshEnabled,
+    fetchOrgSshEnabled,
+    setOrgSshEnabled,
+    updateSshPolicy,
+    fetchSshAudit,
     execOnAgent,
     execOnFleet,
     cancelExec,
