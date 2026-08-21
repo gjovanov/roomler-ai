@@ -676,6 +676,13 @@ impl IdleRefine {
         area_permille > 0 && area_permille >= self.major_area_permille
     }
 
+    /// Whether `encoded_bytes` at `encode_area` clears the (rung-scaled)
+    /// bytes floor — the pump uses this to route a frame to the bytes
+    /// leg vs the QUIET tick (see the field note on `on_keepalive`).
+    pub fn bytes_significant(&self, encoded_bytes: usize, encode_area: u64) -> bool {
+        encoded_bytes >= self.scaled_min_bytes(encode_area)
+    }
+
     /// Shared core of both significance legs: chain the run, fill the
     /// window, and Down-flip a refined session under sustained motion.
     fn note_significant(&mut self, now: Instant, kind: SigKind) -> Option<RefineFlip> {
@@ -701,7 +708,16 @@ impl IdleRefine {
         None
     }
 
-    /// An idle-keepalive tick. `eligible` = a cap below native is currently
+    /// A QUIET tick: an idle keepalive, OR a real frame that neither
+    /// significance leg noted (field clk00017265, 2026-08-21: GDI/scrap-
+    /// class backends return a "real" frame on EVERY poll — `frames_empty=0`
+    /// — so the keepalive arm never ran and refine was structurally inert;
+    /// judging quiet by the SIGNAL — 48-byte encodes of a still screen —
+    /// instead of capture cadence also lets the up-flip fire DURING
+    /// sustained sub-major motion on tracked backends, completing the
+    /// P8a-2 stay-native promise in the un-refined direction).
+    ///
+    /// `eligible` = a cap below native is currently
     /// in force AND the scope rules allow refinement (see
     /// `encode::idle_refine_applies`; the pump also requires the controller
     /// to have left resolution at Native — an explicit pick is the user's).
@@ -1521,6 +1537,41 @@ mod tests {
             t += Duration::from_millis(33);
         }
         assert!(downed, "bytes leg must keep the untracked PiP Down-guard");
+    }
+
+    #[test]
+    fn bytes_significant_matches_the_scaled_floor() {
+        // The pump routes frames on this predicate (significant → bytes
+        // leg; else → QUIET tick), so it must mirror note_real_frame's
+        // internal gate exactly.
+        let r = refine();
+        assert!(!r.bytes_significant(4_000, REFINE_REF_AREA));
+        assert!(r.bytes_significant(13_000, REFINE_REF_AREA));
+        // Rung-scaled: 14 KB is motion at 1024×640 but stillness-noise
+        // at native (floor 43 200 there).
+        assert!(!r.bytes_significant(14_000, 1920 * 1200));
+        assert!(r.bytes_significant(50_000, 1920 * 1200));
+    }
+
+    #[test]
+    fn quiet_ticks_from_insignificant_frames_refine_an_always_some_backend() {
+        // Field clk00017265: the capture returns a "real" frame on every
+        // poll, so the keepalive arm never runs. The pump now feeds
+        // on_keepalive after every insignificant frame — a stream of
+        // 48-byte still-screen re-encodes must reach Up purely through
+        // those quiet ticks.
+        let mut r = refine();
+        let mut now = t0();
+        let mut upped = false;
+        for _ in 0..30 {
+            assert!(!r.bytes_significant(48, REFINE_REF_AREA));
+            if r.on_keepalive(true, now) == Some(RefineFlip::Up) {
+                upped = true;
+                break;
+            }
+            now += Duration::from_millis(54);
+        }
+        assert!(upped, "quiet ticks alone must refine");
     }
 
     #[test]
