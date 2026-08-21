@@ -3774,28 +3774,44 @@ impl FfmpegDcCodec {
     /// Phase B — `fps` + `maxrate_bps` are the pump's per-session values
     /// (real `target_fps`, relay-aware ceiling), threaded into the encoder so
     /// its framerate + burst cap match the actual link instead of a fixed 30.
-    /// P7 — `cq_bias`: CQ sharpening steps for deep resolution rungs,
-    /// computed at each rebuild from encode-vs-native area
-    /// (`rate_profile::scale_cq_bias`). `chroma444`: the viewer's Rext
-    /// 4:4:4 request — HEVC-only (nvenc), silently 4:2:0 elsewhere; read
-    /// the returned encoder's `chroma444()` for the truth.
+    /// `cq_bias`: SIGNED quality bias from `policy::rate_plan` (positive =
+    /// the P7 deep-rung sharpening, negative = the constrained-motion
+    /// relief), applied at open. `constrained`: this session's transport
+    /// verdict — sizes the HRD window (relay ⇒ trimmed, so a single IDR
+    /// can't book seconds of the clamped pipe). `chroma444`: the viewer's
+    /// Rext 4:4:4 request — HEVC-only (nvenc), silently 4:2:0 elsewhere;
+    /// read the returned encoder's `chroma444()` for the truth.
+    #[allow(clippy::too_many_arguments)]
     fn open(
         self,
         w: u32,
         h: u32,
         fps: u32,
         maxrate_bps: usize,
-        cq_bias: u32,
+        cq_bias: i32,
         chroma444: bool,
+        constrained: bool,
     ) -> anyhow::Result<crate::encode::ffmpeg::FfmpegEncoder> {
         use crate::encode::ffmpeg::FfmpegEncoder;
         match self {
-            Self::Hevc => {
-                FfmpegEncoder::new_hevc_adaptive(w, h, fps, maxrate_bps, cq_bias, chroma444)
+            Self::Hevc => FfmpegEncoder::new_hevc_adaptive(
+                w,
+                h,
+                fps,
+                maxrate_bps,
+                cq_bias,
+                chroma444,
+                constrained,
+            ),
+            Self::Vp9 => {
+                FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps, cq_bias, constrained)
             }
-            Self::Vp9 => FfmpegEncoder::new_vp9_adaptive(w, h, fps, maxrate_bps, cq_bias),
-            Self::Av1 => FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps, cq_bias),
-            Self::H264 => FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps, cq_bias),
+            Self::Av1 => {
+                FfmpegEncoder::new_av1_adaptive(w, h, fps, maxrate_bps, cq_bias, constrained)
+            }
+            Self::H264 => {
+                FfmpegEncoder::new_h264_adaptive(w, h, fps, maxrate_bps, cq_bias, constrained)
+            }
         }
     }
 
@@ -4154,6 +4170,19 @@ async fn media_pump_ffmpeg_dc(
     // rides a SEPARATE DC, so a deeper video queue adds no input lag.
     let ffmpeg_send_depth = if constrained { 4 } else { 12 };
     let (send_tx, mut send_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(ffmpeg_send_depth);
+    // Constrained byte-budget gate (field 2026-08-21, CORPLAP-1/CORPLAP-3): the
+    // channel's FRAME-count bound bounds nothing in BYTES — four native
+    // motion frames are ~0.5-1 MB ≈ 2-4 s of a ~2 Mbps relay, which is
+    // both the "drag starts, ~0.5 s in it freezes" lump (the pre-rung
+    // native flood queues here + in SCTP) and the "window drags seconds
+    // behind" lag. Track the bytes handed to the send task and skip
+    // production while more than `constrained_queue_ms` (default 450 ms)
+    // of the relay ceiling is still in flight — lag becomes an immediate,
+    // small fps reduction instead. Budget resolved once (env/config are
+    // process-stable); the gate only engages while `constrained`.
+    let inflight_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let constrained_queue_budget =
+        crate::encode::rate_profile::constrained_queue_budget_bytes(crate::encode::relay_max_bps());
 
     // P8c — the rate governor owns the four rate controllers this pump
     // previously threaded by hand (see `encode::governor` module docs):
@@ -4178,38 +4207,44 @@ async fn media_pump_ffmpeg_dc(
         let frames_sent = frames_sent.clone();
         let bytes_written = bytes_written.clone();
         let send_errors = send_errors.clone();
+        let inflight_bytes = inflight_bytes.clone();
         let task_session = session_id;
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
             while let Some(wire) = send_rx.recv().await {
+                let total = wire.len();
                 // Fetch the DC fresh each frame — the same handle the pump's
                 // open-check uses. None means it closed under us (the pump's
-                // open-guard re-requests a keyframe on its side).
-                let Some(dc) = video_bytes_dc.lock().await.clone() else {
-                    continue;
-                };
-                let total = wire.len();
-                let mut off = 0usize;
-                let mut ok = true;
-                while off < total {
-                    let end = (off + SCTP_CHUNK_SIZE).min(total);
-                    // `wire.slice` is zero-copy (shares the Bytes buffer).
-                    if let Err(e) = dc.send(&wire.slice(off..end)).await {
-                        let n = send_errors.fetch_add(1, Relaxed) + 1;
-                        tracing::warn!(
-                            session = %task_session, %e, send_errors = n,
-                            "FFmpeg DC pump send task: DC send failed"
-                        );
-                        ok = false;
-                        break;
+                // open-guard re-requests a keyframe on its side); the frame
+                // is dropped but must still leave the in-flight ledger below.
+                if let Some(dc) = video_bytes_dc.lock().await.clone() {
+                    let mut off = 0usize;
+                    let mut ok = true;
+                    while off < total {
+                        let end = (off + SCTP_CHUNK_SIZE).min(total);
+                        // `wire.slice` is zero-copy (shares the Bytes buffer).
+                        if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                            let n = send_errors.fetch_add(1, Relaxed) + 1;
+                            tracing::warn!(
+                                session = %task_session, %e, send_errors = n,
+                                "FFmpeg DC pump send task: DC send failed"
+                            );
+                            ok = false;
+                            break;
+                        }
+                        off = end;
                     }
-                    off = end;
+                    if ok {
+                        frames_sent.fetch_add(1, Relaxed);
+                        bytes_written.fetch_add(total as u64, Relaxed);
+                    }
                 }
-                if ok {
-                    frames_sent.fetch_add(1, Relaxed);
-                    bytes_written.fetch_add(total as u64, Relaxed);
-                }
+                // Byte-budget ledger: the frame left the queue (delivered
+                // into SCTP, failed, or dropped on a closed DC). Increments
+                // strictly precede the frame's entry into the channel, so
+                // this can't underflow.
+                inflight_bytes.fetch_sub(total, Relaxed);
             }
             tracing::debug!(session = %task_session, "FFmpeg DC pump send task exiting (channel closed)");
         });
@@ -4364,7 +4399,12 @@ async fn media_pump_ffmpeg_dc(
             );
             return;
         }
-        if send_tx.capacity() == 0 || pipeline.followers_congested() {
+        if send_tx.capacity() == 0
+            || pipeline.followers_congested()
+            || (constrained
+                && inflight_bytes.load(std::sync::atomic::Ordering::Relaxed)
+                    >= constrained_queue_budget)
+        {
             frames_skipped_backpressure += 1;
             // Phase B — a FULL send channel is the real DC backpressure signal.
             // Drive the multiplicative decrease HERE, before the `continue`, so
@@ -4374,6 +4414,10 @@ async fn media_pump_ffmpeg_dc(
             // P5 — a congested FOLLOWER gates production the same way: the
             // shared stream paces to the slowest link (the pre-encode floor;
             // per-viewer delta drops would break that viewer's ref chain).
+            // The constrained BYTE budget (third arm) is the same congestion
+            // semantic judged in bytes: frame-count depth bounds nothing when
+            // native motion frames are 20× rung size, and the queue it allows
+            // is pure viewer lag on a clamped pipe.
             if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
                 && let Some(enc) = encoder.as_mut()
             {
@@ -4691,6 +4735,10 @@ async fn media_pump_ffmpeg_dc(
             codec.label(),
             hevc_444,
             governor.encode_factor(),
+            matches!(
+                dims_plan.reason,
+                crate::encode::policy::RungReason::UserPick
+            ),
         );
         let ceiling = rate.ceiling_bps;
         let need_rebuild = match encoder_dims {
@@ -4699,7 +4747,23 @@ async fn media_pump_ffmpeg_dc(
         };
         if need_rebuild {
             let cq_bias = rate.cq_bias;
-            match codec.open(w, h, target_fps, ceiling as usize, cq_bias, hevc_444) {
+            // Open at the AIMD's current target when it sits below the
+            // ceiling — a fresh encoder at the full ceiling would be
+            // rebuilt AGAIN one frame later by the governor's forced
+            // reapply (two QSV rebuilds back-to-back at a rung flip).
+            let open_rate = match governor.applied_bps() {
+                0 => ceiling,
+                applied => ceiling.min(applied),
+            };
+            match codec.open(
+                w,
+                h,
+                target_fps,
+                open_rate as usize,
+                cq_bias,
+                hevc_444,
+                constrained,
+            ) {
                 Ok(enc) => {
                     let encoder_name = enc.name();
                     // P7 — record the ACTIVE chroma (a 4:4:4 request may have
@@ -5016,8 +5080,12 @@ async fn media_pump_ffmpeg_dc(
                 native_dims_packed,
                 encoded_dims_packed,
             );
+            let wire_len = wire.len();
             match send_tx.try_send(wire) {
                 Ok(()) => {
+                    // Byte-budget ledger (constrained gate): counted on entry,
+                    // released by the send task once the frame leaves.
+                    inflight_bytes.fetch_add(wire_len, std::sync::atomic::Ordering::Relaxed);
                     // A key frame that actually entered the send queue
                     // answers any pending forced-keyframe request (the
                     // force-ignored fallback and the retry stand down).
@@ -5126,6 +5194,7 @@ async fn media_pump_ffmpeg_dc(
                 encode_factor = governor.encode_factor(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
+                bytes_inflight = inflight_bytes.load(std::sync::atomic::Ordering::Relaxed),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
