@@ -4520,7 +4520,7 @@ async fn media_pump_ffmpeg_dc(
                             && plan.capped_below_native
                             && plan.user_native
                             && pipeline.merged_refine_eligible(prio, constrained);
-                        if let Some(flip) = idle_refine.on_keepalive(eligible, now) {
+                        if let Some(flip) = idle_refine.on_keepalive(eligible, constrained, now) {
                             info!(
                                 %session_id,
                                 codec_label,
@@ -4940,7 +4940,7 @@ async fn media_pump_ffmpeg_dc(
         // The keepalive arm keeps its own tick for the fully-idle case.
         if is_real_frame && !frame_significant {
             let now = std::time::Instant::now();
-            if let Some(flip) = idle_refine.on_keepalive(refine_eligible_now, now) {
+            if let Some(flip) = idle_refine.on_keepalive(refine_eligible_now, constrained, now) {
                 info!(
                     %session_id,
                     codec_label,
