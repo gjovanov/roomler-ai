@@ -96,6 +96,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Serve SSH in-process on this node's overlay address (intercepted before the OS; sessions inherit the daemon's SYSTEM/root identity). Default: OFF.",
     ),
     (
+        "ssh_activity_log",
+        "bool",
+        "Report SSH session activity to the org: commands and their exit codes, and that a shell / SFTP / forward happened. NEVER session content — no pty stream, no command output. Default: OFF.",
+    ),
+    (
         "ssh_port",
         "string",
         "TCP port intercepted on the overlay address when ssh_enabled is on (1-65535). Empty = built-in default (2222).",
@@ -553,6 +558,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
         "ssh_account_mode" => cfg.ssh_account_mode.clone(),
+        "ssh_activity_log" => Some(fmt_bool(cfg.ssh_activity_log)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
                 EncoderPreferenceChoice::Auto => "auto",
@@ -674,6 +680,8 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
+        // Clearing it means OFF, like every other reporting/capability switch.
+        "ssh_activity_log" => cfg.ssh_activity_log = parse_bool_or(value, false)?,
         "ssh_port" => {
             cfg.ssh_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
                 None => None,

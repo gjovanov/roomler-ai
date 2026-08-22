@@ -170,6 +170,24 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ssh_account_mode: Option<String>,
 
+    /// Report SSH session activity to the org (P8). Default **off**.
+    ///
+    /// When on, the device tells the server what it did inside a session —
+    /// commands and their exit codes, that a shell or SFTP subsystem opened,
+    /// which forwards it allowed or refused. It never reports session
+    /// CONTENT: no pty byte stream, no command output. Recording those would
+    /// ship whatever the operator typed, passwords included, off this host,
+    /// which is the property this whole subsystem is built not to have.
+    ///
+    /// Off by default because it is the DEVICE that decides what it says
+    /// about itself, exactly as `ssh_enabled` and `exec_enabled` are the
+    /// device's last word. That is not a weakening: a server can never force
+    /// a host to self-report honestly, so making the switch explicit says out
+    /// loud what was always true. The org's own record of who was ALLOWED in
+    /// lives in `ssh_audit` and does not depend on this key.
+    #[serde(default)]
+    pub ssh_activity_log: bool,
+
     // ─── S2: env-bridged operator knobs ──────────────────────────────────
     // Each mirrors an env var read through `tunnel_core::env::node_env`
     // (precedence: env — either prefix — > this config key > built-in
@@ -1407,6 +1425,7 @@ pub fn test_fixture() -> AgentConfig {
         ssh_authorized_keys: Vec::new(),
         ssh_host_key: None,
         ssh_account_mode: None,
+        ssh_activity_log: false,
         overlay_quic: None,
         overlay_direct: None,
         overlay_derp: None,
