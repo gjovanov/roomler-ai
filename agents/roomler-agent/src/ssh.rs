@@ -61,7 +61,8 @@
 //!
 //! [`ssh_authorized_keys`]: crate::config::AgentConfig::ssh_authorized_keys
 
-use tracing::warn;
+use roomler_ai_remote_control::models::{SshActivityEvent, SshActivityKind};
+use tracing::{debug, warn};
 
 /// Process services a session depends on, threaded EXPLICITLY from the daemon
 /// into the SSH server instead of discovered through process globals.
@@ -77,6 +78,77 @@ pub struct SessionServices {
     /// The operator-consent broker — the same instance the tray and the
     /// LocalAPI decide through, so an SSH prompt resolves from any of them.
     pub consent: crate::consent::ConsentBroker,
+    /// Where P8 activity reports go: this WS session's outbound queue.
+    ///
+    /// Scoped to the connection on purpose — a report belongs to the org
+    /// whose control channel carried the grant, and a multi-org daemon must
+    /// not leak one org's session activity onto another's WS. A reconnect
+    /// builds a new sink; reports that raced the teardown are dropped, which
+    /// is the right trade for a log line that must never block a session.
+    pub activity: Option<ActivitySink>,
+}
+
+/// Fire-and-forget reporter for [`SshActivityKind`] events (P8).
+///
+/// Holds the gate as well as the channel so no call site has to remember to
+/// check it: with `ssh_activity_log = false` the constructor returns `None`
+/// and every `report` becomes a no-op at the type level.
+#[derive(Clone)]
+pub struct ActivitySink {
+    tx: tokio::sync::mpsc::Sender<roomler_ai_remote_control::signaling::ClientMsg>,
+}
+
+impl ActivitySink {
+    /// `None` when the device has not opted in — the default.
+    pub fn new(
+        cfg: &crate::config::AgentConfig,
+        tx: tokio::sync::mpsc::Sender<roomler_ai_remote_control::signaling::ClientMsg>,
+    ) -> Option<Self> {
+        cfg.ssh_activity_log.then_some(Self { tx })
+    }
+
+    /// Report one event. Never blocks and never fails a session: a full
+    /// outbound queue means the connection is already struggling, and losing
+    /// a log line is strictly better than stalling the shell that produced it.
+    pub fn report(
+        &self,
+        grant_id: Option<String>,
+        caller: &str,
+        kind: SshActivityKind,
+        detail: Option<String>,
+        exit_code: Option<i32>,
+        allowed: bool,
+    ) {
+        use roomler_ai_remote_control::signaling::ClientMsg;
+
+        let msg = ClientMsg::SshActivity {
+            grant_id,
+            caller: caller.to_string(),
+            kind,
+            detail: detail.map(|d| redact_and_cap(&d)),
+            exit_code,
+            allowed,
+        };
+        if self.tx.try_send(msg).is_err() {
+            debug!("ssh: activity report dropped (outbound queue full or closed)");
+        }
+    }
+}
+
+/// Redact known secrets and bound the length BEFORE anything leaves the host.
+///
+/// A command line is operator-controlled text that we are about to ship off
+/// the machine, so it gets the same treatment `exec` gives its output: the
+/// registered-secret redactor (agent token, `Bearer …`, JWT-shaped strings),
+/// then a hard cap. Truncation is MARKED — a silently shortened command would
+/// read in the audit log as a different command from the one that ran.
+fn redact_and_cap(detail: &str) -> String {
+    let mut s = crate::exec::redactor().apply(detail);
+    if s.chars().count() > SshActivityEvent::MAX_DETAIL {
+        s = s.chars().take(SshActivityEvent::MAX_DETAIL).collect();
+        s.push('…');
+    }
+    s
 }
 
 /// Decorate a TUN factory so TCP to `<overlay ip>:<ssh_port>` terminates in the
@@ -302,10 +374,13 @@ mod sshd {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use roomler_ai_remote_control::models::SshActivityKind;
     use russh::keys::ssh_key::{self, PublicKey};
     use russh::server::{Auth, Msg, Session};
     use russh::{Channel, ChannelId};
     use tracing::{info, warn};
+
+    use super::ActivitySink;
 
     /// Everything a session needs, resolved once when the overlay device is
     /// built rather than per connection.
@@ -465,6 +540,11 @@ mod sshd {
         pub deadline: Option<tokio::time::Instant>,
         /// Who to attribute every action to, in every log line.
         pub caller: String,
+        /// The grant this session redeemed, for P8 activity reports —
+        /// correlating a reported action back to the server's own decision
+        /// row in `ssh_audit`. `None` for a key-list session, which no grant
+        /// backs and which therefore has nothing to correlate to.
+        pub grant_id: Option<String>,
     }
 
     impl ResolvedSessionPolicy {
@@ -502,8 +582,9 @@ mod sshd {
                 // grant id doubles as the sentinel the decision arrives on.
                 consent_sentinel: match consent_mode {
                     Some(ConsentMode::Auto) => None,
-                    _ => Some(grant_id),
+                    _ => Some(grant_id.clone()),
                 },
+                grant_id: Some(grant_id),
                 // A grant session is ALWAYS time-bounded. `record_grant`
                 // already clamped this, but resolving is total on its own:
                 // 0 means the ceiling, never "forever".
@@ -537,6 +618,11 @@ mod sshd {
                 // All a key-list session can honestly claim: the username the
                 // client typed, and the overlay address WireGuard proved.
                 caller: format!("ssh:{user}@{peer} (key-list)"),
+                // No grant, so nothing to correlate to. Its activity is still
+                // reported (it is the path most worth watching), just without
+                // a decision row to join against — the `(key-list)` suffix on
+                // `caller` is what identifies it.
+                grant_id: None,
             }
         }
     }
@@ -613,6 +699,32 @@ mod sshd {
         /// exec still in flight is bounded by the engine's own wall-clock
         /// ceiling. Key-list sessions have no deadline (see
         /// [`ResolvedSessionPolicy::from_key_list`]) and never arm this.
+        /// Report one P8 activity event for this session, if the device opted
+        /// in AND the session has resolved a policy.
+        ///
+        /// Both conditions are checked HERE rather than at each call site, so
+        /// adding a new kind of session action cannot accidentally report
+        /// from a device that never consented to reporting.
+        fn report(
+            &self,
+            kind: SshActivityKind,
+            detail: Option<String>,
+            exit_code: Option<i32>,
+            allowed: bool,
+        ) {
+            let (Some(sink), Some(policy)) = (&self.ctx.services.activity, &self.policy) else {
+                return;
+            };
+            sink.report(
+                policy.grant_id.clone(),
+                &policy.caller,
+                kind,
+                detail,
+                exit_code,
+                allowed,
+            );
+        }
+
         fn arm_session_deadline(&mut self, session: &mut Session) {
             if self.deadline_armed {
                 return;
@@ -938,6 +1050,23 @@ mod sshd {
         }
     }
 
+    /// Close the P8 activity envelope (see [`SshActivityKind::SessionClose`]).
+    ///
+    /// `Drop` rather than a disconnect hook because a session ends in many
+    /// ways — clean exit, client vanishing, the `session_secs` deadline firing,
+    /// a consent refusal — and only one of those is a code path anyone would
+    /// remember to annotate. Dropping the handler is the single event they all
+    /// share.
+    ///
+    /// Reporting is `try_send`, so this is safe in a destructor: no await, no
+    /// runtime needed, and a full queue drops the line rather than blocking
+    /// teardown.
+    impl Drop for Handler {
+        fn drop(&mut self) {
+            self.report(SshActivityKind::SessionClose, None, None, true);
+        }
+    }
+
     impl russh::server::Handler for Handler {
         type Error = russh::Error;
 
@@ -963,6 +1092,7 @@ mod sshd {
                 // design: one place turns a grant into what a session may do,
                 // and the request handlers can only read the result.
                 self.policy = Some(ResolvedSessionPolicy::from_grant(grant, self.peer));
+                self.report(SshActivityKind::SessionOpen, None, None, true);
                 return Ok(Auth::Accept);
             }
 
@@ -983,6 +1113,7 @@ mod sshd {
                 self.policy = Some(ResolvedSessionPolicy::from_key_list(
                     &self.ctx, user, self.peer,
                 ));
+                self.report(SshActivityKind::SessionOpen, None, None, true);
                 Ok(Auth::Accept)
             } else {
                 warn!(
@@ -1057,6 +1188,15 @@ mod sshd {
                 // destination. The *reason* stays here, next to the operator
                 // who can act on it — it names internal topology.
                 warn!(peer = %self.peer, %caller, %host, port, %why, "ssh: forward refused");
+                // Reported as DENIED. A refused forward is the row an operator
+                // most wants to see — it is someone probing what this device
+                // can reach.
+                self.report(
+                    SshActivityKind::Forward,
+                    Some(format!("{host}:{port}")),
+                    None,
+                    false,
+                );
                 reply
                     .reject(ChannelOpenFailure::AdministrativelyProhibited)
                     .await;
@@ -1089,6 +1229,12 @@ mod sshd {
 
             reply.accept().await;
             info!(peer = %self.peer, %caller, %host, port, "ssh: forward opened");
+            self.report(
+                SshActivityKind::Forward,
+                Some(format!("{host}:{port}")),
+                None,
+                true,
+            );
             tokio::spawn(async move {
                 let mut stream = channel.into_stream();
                 let mut target = target;
@@ -1154,8 +1300,19 @@ mod sshd {
             let caller = policy.caller.clone();
             let consent = policy.consent_sentinel.clone();
             let broker = self.ctx.services.consent.clone();
+            // Captured here, where the policy is still borrowed, and reported
+            // from inside the task once the exit code exists.
+            let activity = self
+                .ctx
+                .services
+                .activity
+                .clone()
+                .map(|s| (s, policy.grant_id.clone()));
             tokio::spawn(async move {
-                run_exec(handle, channel, command, caller, run_as, consent, broker).await;
+                run_exec(
+                    handle, channel, command, caller, run_as, consent, broker, activity,
+                )
+                .await;
             });
             Ok(())
         }
@@ -1170,6 +1327,9 @@ mod sshd {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             if self.pty_req.is_some() {
+                // The shell's CONTENTS are never recorded; this row exists so
+                // a reader can see that an interactive session happened.
+                self.report(SshActivityKind::Shell, None, None, true);
                 self.start_pty_session(channel, None, session).await
             } else {
                 refuse(
@@ -1271,6 +1431,9 @@ mod sshd {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             if name == "sftp" {
+                // File operations happen inside `sftp-server`; this records
+                // only that a transfer channel was opened.
+                self.report(SshActivityKind::Sftp, None, None, true);
                 return self.start_sftp_session(channel, session).await;
             }
             refuse(
@@ -1439,6 +1602,11 @@ mod sshd {
     /// The cost is that output is delivered when the command finishes rather
     /// than as it is produced — the engine buffers to enforce its ceiling.
     /// P4's PTY path is what makes long-running output live.
+    // 8 params: each is a distinct decision resolved at authentication
+    // (identity, consent, bound, reporting) and bundling them into a struct
+    // would only move the same fields behind a name that hides which of them
+    // a reader must check.
+    #[allow(clippy::too_many_arguments)]
     async fn run_exec(
         handle: russh::server::Handle,
         channel: ChannelId,
@@ -1447,6 +1615,7 @@ mod sshd {
         run_as: crate::exec::RunAs,
         consent: Option<String>,
         broker: crate::consent::ConsentBroker,
+        activity: Option<(ActivitySink, Option<String>)>,
     ) {
         use roomler_ai_remote_control::models::exec_limits;
 
@@ -1472,7 +1641,7 @@ mod sshd {
             request_id,
             // Empty = the host's own default shell, matching `roomler exec`.
             shell: String::new(),
-            command,
+            command: command.clone(),
             timeout_ms: exec_limits::MAX_TIMEOUT_MS,
             max_output_bytes: exec_limits::MAX_OUTPUT_BYTES,
             cwd: None,
@@ -1527,6 +1696,21 @@ mod sshd {
             bytes = outcome.output_bytes(), truncated = outcome.truncated,
             "ssh: exec finished"
         );
+
+        // P8 — reported AFTER the run, so the row carries the real exit code
+        // rather than "a command was accepted". The command text is the only
+        // thing recorded; its OUTPUT stays on this host, which is the whole
+        // distinction this feature is built around.
+        if let Some((sink, grant_id)) = activity {
+            sink.report(
+                grant_id,
+                &caller,
+                SshActivityKind::Exec,
+                Some(command),
+                outcome.exit_code,
+                true,
+            );
+        }
     }
 }
 
@@ -1732,6 +1916,7 @@ fn clear_grants() {
 
 #[cfg(all(test, feature = "ssh-server"))]
 mod tests {
+    use roomler_ai_remote_control::models::{SshActivityEvent, SshActivityKind};
     use std::sync::Arc;
 
     use russh::keys::ssh_key::private::{Ed25519Keypair, PrivateKey};
@@ -1819,6 +2004,9 @@ mod tests {
         super::SessionServices {
             consent: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
                 .expect("a temp sentinel dir"),
+            // Reporting off in tests unless a case opts in — the default a
+            // device ships with.
+            activity: None,
         }
     }
 
@@ -2880,5 +3068,100 @@ mod tests {
         // conversion lives in the handler, so this locks the reasoning
         // rather than the call.
         assert!(u16::try_from(65_536u32 + 22).is_err());
+    }
+
+    // ── P8: activity reporting ───────────────────────────────────────────
+
+    /// Reporting is the DEVICE's decision and it is off unless asked for.
+    /// `ActivitySink::new` returning `None` is what makes that structural —
+    /// with the gate here, no call site can report from a device that never
+    /// opted in, however many new event kinds get added later.
+    #[test]
+    fn a_device_that_did_not_opt_in_has_no_sink_at_all() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.ssh_activity_log, "off must be the shipped default");
+        assert!(
+            super::ActivitySink::new(&cfg, tx.clone()).is_none(),
+            "no sink unless the device opted in"
+        );
+
+        cfg.ssh_activity_log = true;
+        assert!(super::ActivitySink::new(&cfg, tx).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_report_carries_the_grant_id_and_the_command() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut cfg = crate::config::test_fixture();
+        cfg.ssh_activity_log = true;
+        let sink = super::ActivitySink::new(&cfg, tx).expect("opted in");
+
+        sink.report(
+            Some("grant-7".into()),
+            "ssh:Someone@100.65.4.2:1",
+            SshActivityKind::Exec,
+            Some("uptime".into()),
+            Some(0),
+            true,
+        );
+
+        let msg = rx.try_recv().expect("a frame was queued");
+        match msg {
+            roomler_ai_remote_control::signaling::ClientMsg::SshActivity {
+                grant_id,
+                kind,
+                detail,
+                exit_code,
+                allowed,
+                ..
+            } => {
+                assert_eq!(grant_id.as_deref(), Some("grant-7"));
+                assert_eq!(kind, SshActivityKind::Exec);
+                assert_eq!(detail.as_deref(), Some("uptime"));
+                assert_eq!(exit_code, Some(0));
+                assert!(allowed);
+            }
+            other => panic!("expected SshActivity, got {other:?}"),
+        }
+    }
+
+    /// A command line is about to leave the host, so it gets the same
+    /// treatment `exec` gives its output. Without this, `curl -H 'Authorization:
+    /// Bearer …'` would put a live token in the org's audit log.
+    #[test]
+    fn a_reported_command_is_redacted_before_it_leaves_the_host() {
+        let out = super::redact_and_cap("curl -H 'Authorization: Bearer sk-not-a-real-token'");
+        assert!(
+            !out.contains("sk-not-a-real-token"),
+            "the bearer token survived redaction: {out}"
+        );
+    }
+
+    /// Truncation must be VISIBLE. A silently shortened command reads in the
+    /// log as a different command from the one that ran.
+    #[test]
+    fn an_overlong_command_is_capped_and_marked() {
+        let long = "x".repeat(SshActivityEvent::MAX_DETAIL * 2);
+        let out = super::redact_and_cap(&long);
+        assert_eq!(out.chars().count(), SshActivityEvent::MAX_DETAIL + 1);
+        assert!(out.ends_with('…'), "truncation must be marked: {out}");
+    }
+
+    /// A full outbound queue must lose the log line, never block the session
+    /// that produced it. `report` takes `&self` and cannot await, so this is
+    /// really a lock on `try_send` never becoming `send`.
+    #[test]
+    fn a_full_queue_drops_the_report_instead_of_blocking() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut cfg = crate::config::test_fixture();
+        cfg.ssh_activity_log = true;
+        let sink = super::ActivitySink::new(&cfg, tx).expect("opted in");
+
+        // Two reports into a 1-slot channel nobody is draining. The second has
+        // nowhere to go; the call must still return.
+        for _ in 0..2 {
+            sink.report(None, "c", SshActivityKind::Shell, None, None, true);
+        }
     }
 }
