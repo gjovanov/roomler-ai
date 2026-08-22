@@ -3,8 +3,15 @@ name: Release roomler-tunnel
 # Builds the `roomler-tunnel` CLI binary for the three desktop targets the
 # operator might run on — Linux x86_64, macOS (universal — x86_64 + aarch64),
 # and Windows x86_64. Outputs a plain archive (tar.gz / zip) per target, plus
-# a `.deb` for Debian / Ubuntu installs. MSI / .pkg signing land in a follow-
-# up — for v1 we ship usable artifacts every operator can run.
+# a `.deb` for Debian / Ubuntu installs.
+#
+# The Windows `roomler.exe` is Authenticode-signed via
+# ./.github/actions/sign-windows (the signing job carries `environment:
+# release` — the federated credential is bound to that GitHub environment);
+# the macOS universal binary is Developer-ID-signed + notarised (NOT stapled
+# — Apple cannot staple a bare Mach-O; the curl|tar install paths never set
+# the quarantine attribute, so this only matters for browser downloads on
+# offline Macs). See docs/code-signing.md.
 #
 # Triggered by:
 #  - `git push` of a tag matching `tunnel-v*` → publishes a GitHub Release
@@ -26,6 +33,15 @@ on:
         required: true
       publish_release:
         description: 'Create a GitHub Release with the artifacts'
+        type: boolean
+        default: false
+      signing_mode:
+        description: 'Windows signing: auto (azure if configured) | azure | local (self-signed rehearsal) | off'
+        type: choice
+        options: [auto, local, azure, 'off']
+        default: auto
+      require_signing:
+        description: 'Fail the job if artifacts end up unsigned (rehearses the release-tag gate)'
         type: boolean
         default: false
 
@@ -201,6 +217,26 @@ jobs:
             target/aarch64-apple-darwin/release/roomler
           strip target/release-universal/roomler
           file target/release-universal/roomler
+      # Sign + notarise the bare CLI. NOT stapled -- Apple only staples
+      # bundles/.dmg/.pkg, never a loose Mach-O. That is acceptable here
+      # because the CLI's install paths (`curl … | tar`, scripts/install.sh,
+      # `roomler self-update`) never set the quarantine attribute, so
+      # Gatekeeper does not evaluate those copies at all; signing +
+      # notarisation covers the browser-download case on ONLINE Macs and
+      # satisfies `spctl` policy on managed fleets. If offline validation is
+      # ever needed, add a second stapled .pkg asset + a `macos-pkg` platform
+      # key in tunnel_release.rs (the linux-deb precedent).
+      - name: Sign + notarise roomler (universal)
+        uses: ./.github/actions/sign-macos
+        with:
+          binary-path:          target/release-universal/roomler
+          require:              ${{ needs.validate-version.outputs.is_release == 'true' }}
+          app-p12-base64:       ${{ secrets.APPLE_DEVELOPER_ID_APP_P12_BASE64 }}
+          installer-p12-base64: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          cert-password:        ${{ secrets.APPLE_CERT_PASSWORD }}
+          api-key-id:           ${{ secrets.APPLE_API_KEY_ID }}
+          api-issuer-id:        ${{ secrets.APPLE_API_ISSUER_ID }}
+          api-key-p8-base64:    ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
       - name: Pack tarball
         id: tar
         shell: bash
@@ -234,6 +270,12 @@ jobs:
     needs: validate-version
     runs-on: windows-latest
     timeout-minutes: 45
+    # The signing federated credential is bound to this GitHub environment
+    # (the tenant rejects wildcard tag subjects) — do not remove.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write     # azure/login OIDC inside ./.github/actions/sign-windows
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -259,6 +301,26 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build -p roomler-tunnel --release
+      # Sign before zipping so the EXE the operator extracts is signed. A zip
+      # cannot itself carry an Authenticode signature, so the binary inside is
+      # the only thing that can vouch for the download.
+      - name: Sign roomler.exe
+        id: sign
+        uses: ./.github/actions/sign-windows
+        with:
+          files:                    target\release\roomler.exe
+          description:              'Roomler CLI'
+          mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
+          require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
+          expect-subject-contains:  ${{ vars.AZURE_SIGNING_EXPECT_SUBJECT }}
+          endpoint:                 ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name:     ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          azure-client-id:          ${{ vars.AZURE_CLIENT_ID }}
+          azure-tenant-id:          ${{ vars.AZURE_TENANT_ID }}
+          azure-subscription-id:    ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          local-pfx-base64:         ${{ secrets.WIN_TEST_PFX_BASE64 }}
+          local-pfx-password:       ${{ secrets.WIN_TEST_PFX_PASSWORD }}
       - name: Pack zip
         id: zip
         shell: pwsh
@@ -296,6 +358,10 @@ jobs:
     needs: [validate-version, build-linux, build-macos, build-windows]
     if: needs.validate-version.outputs.is_release == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sigstore identity for the provenance attestation
+      attestations: write  # actions/attest-build-provenance
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -308,6 +374,29 @@ jobs:
           mkdir -p release
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.sha256' \) -exec cp {} release/ \;
           ls -la release/
+      # GPG + provenance: same pattern as release-agent.yml -- .asc detached
+      # signatures when the key is configured, SLSA provenance always.
+      - name: GPG-sign release artifacts
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::notice::GPG_PRIVATE_KEY not configured -- publishing without .asc signatures."
+            exit 0
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          for f in release/*; do
+            case "$f" in *.asc|*.sha256) continue ;; esac
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+                --armor --detach-sign "$f"
+          done
+          gpg --batch --armor --export > release/roomler-release-pubkey.asc
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'release/*'
       - name: Create / update Release
         uses: softprops/action-gh-release@v2
         with:
