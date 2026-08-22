@@ -1,31 +1,37 @@
 # Roomler AI — documentation index
 
-Roomler is three products on one platform: **collaboration** (chat + conferencing),
-**remote desktop**, and an **overlay network with tunnels**. The map below shows how
-the docs hang together; the tables list every document with its audience.
+Roomler is three products on one platform, in this order: **1 · desktop sharing &
+remote control**, **2 · your own secure private network** (WireGuard overlay,
+tunnels, SOCKS5), and — as the included bonus — **video conferencing & team
+collaboration**. The map below shows how the docs hang together; the tables list
+every document with its audience.
+
+> **Not an engineer?** Start with [use-cases.md](use-cases.md) — plain-language,
+> scenario by scenario, with pictures. The main [README](../README.md) has the
+> product tour.
 
 ```mermaid
 flowchart TB
     subgraph entry["Start here"]
-        ARCH["architecture.md"]
-        ATA["agent-tunnel-architecture.md"]
         UC["use-cases.md"]
+        ATA["agent-tunnel-architecture.md"]
+        ARCH["architecture.md"]
     end
 
-    subgraph collab["💬 Collaboration"]
-        RT["real-time.md"]
-        UIX["ui.md"]
-    end
-
-    subgraph rd["🖥️ Remote desktop"]
+    subgraph rd["🖥️ 1 · Remote desktop"]
         RC["remote-control.md"]
         ENC["encoders.md"]
     end
 
-    subgraph net["🌐 Overlay & tunnels"]
+    subgraph net["🔐 2 · Private network & tunnels"]
         OC["overlay-communication.md"]
         TUN["tunnels.md"]
         MO["multi-org.md"]
+    end
+
+    subgraph collab["💬 Bonus · Collaboration"]
+        RT["real-time.md"]
+        UIX["ui.md"]
     end
 
     subgraph ops["🔧 Install & operate"]
@@ -35,29 +41,25 @@ flowchart TB
 
     REF["api.md · data-model.md · testing.md"]
 
-    ARCH --> collab & rd & net
+    UC --> rd & net & collab
     ATA --> rd & net
-    UC --> collab & rd & net
+    ARCH --> rd & net & collab
     rd & net --> ops
-    collab & rd & net --> REF
+    rd & net & collab --> REF
 ```
 
 ## Start here
 
 | Doc | What it covers |
 |---|---|
-| [architecture.md](architecture.md) | The whole system: control plane vs the three data planes, workspace crate map, deployment topology |
+| [use-cases.md](use-cases.md) | Scenario walkthroughs across all three pillars in plain language, plus the permission model |
 | [agent-tunnel-architecture.md](agent-tunnel-architecture.md) | The remote-access stack (daemon + CLI + coordination) in five minutes — written for end users and operators |
-| [use-cases.md](use-cases.md) | Scenario walkthroughs across all three pillars, plus the permission model |
+| [architecture.md](architecture.md) | The whole system: control plane vs the three data planes, workspace crate map, deployment topology |
 
-## 💬 Collaboration (chat · rooms · conferencing)
+## 🖥️ 1 · Desktop sharing & remote control
 
-| Doc | What it covers |
-|---|---|
-| [real-time.md](real-time.md) | The WebSocket surfaces: user events, presence, mediasoup signalling, the `rc:*` agent protocol, DERP |
-| [ui.md](ui.md) | Frontend map: views, stores, composables, the remote-desktop viewer, observability components |
-
-## 🖥️ Remote desktop
+*Any of your machines, live in a browser tab — nothing to install on the viewing
+side, consent-gated, end-to-end encrypted.*
 
 | Doc | What it covers |
 |---|---|
@@ -65,7 +67,10 @@ flowchart TB
 | [encoders.md](encoders.md) | Codec × platform × backend matrix, the hardware-encoder cascade, rate control, capture backends, viewer decode paths |
 | [rate-control.md](rate-control.md) | How a session spends its bits: the Priority dial, the per-session control loops, why resolution never flips mid-motion (rc.445), crisp-at-rest, config reference |
 
-## 🌐 Overlay network & tunnels
+## 🔐 2 · Your own secure private network
+
+*All your devices on one private, encrypted network with stable names — plus
+port forwards, SOCKS5, SSH without sshd, and exit nodes on top.*
 
 | Doc | What it covers |
 |---|---|
@@ -78,6 +83,16 @@ flowchart TB
 | [tunnel-install.md](tunnel-install.md) | Step-by-step runbook: install, enroll, ACL policy, open and test a forward from a corporate network |
 | [fleet-rpc.md](fleet-rpc.md) | `roomler exec` remote command execution: transport, the four default-deny gates, audit |
 | [roomler-ssh.md](roomler-ssh.md) | SSH into any node by overlay address with no `sshd` and no bound port — why the packets are intercepted, the gates, the roadmap |
+
+## 💬 Bonus · Video conferencing & team collaboration
+
+*Rooms, threaded chat, and HD calls — included with the platform, running on the
+same accounts and server.*
+
+| Doc | What it covers |
+|---|---|
+| [real-time.md](real-time.md) | The WebSocket surfaces: user events, presence, mediasoup signalling, the `rc:*` agent protocol, DERP |
+| [ui.md](ui.md) | Frontend map: views, stores, composables, the remote-desktop viewer, observability components |
 
 ## 🔧 Install & operate
 
