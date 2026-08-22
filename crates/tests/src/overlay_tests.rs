@@ -89,6 +89,9 @@ impl Ipam {
                 false,
                 false,
                 false,
+                false,
+                false,
+                false,
                 vec![],
             )
             .await
@@ -721,6 +724,9 @@ async fn agent_delete_releases_the_overlay_node() {
             false,
             false,
             false,
+            false,
+            false,
+            false,
             vec![],
         )
         .await
@@ -800,6 +806,9 @@ async fn a_re_enrolled_removed_machine_gets_a_fresh_overlay_node() {
             "pk".to_string(),
             0,
             vec![],
+            false,
+            false,
+            false,
             false,
             false,
             false,
@@ -920,6 +929,9 @@ async fn tunnel_client_delete_releases_the_overlay_node() {
             false,
             false,
             false,
+            false,
+            false,
+            false,
             vec![],
         )
         .await
@@ -991,6 +1003,9 @@ async fn agent_delete_does_not_release_a_tunnel_clients_node() {
             "pk".to_string(),
             0,
             vec![],
+            false,
+            false,
+            false,
             false,
             false,
             false,
@@ -1306,6 +1321,9 @@ async fn renumber_refuses_a_fleet_below_the_version_floor() {
             "pk".to_string(),
             0,
             vec![],
+            false,
+            false,
+            false,
             false,
             false,
             false,
