@@ -1484,6 +1484,89 @@ impl SshAuditEvent {
     pub const COLLECTION: &'static str = "ssh_audit";
 }
 
+/// What a device reported doing inside an SSH session (P8).
+///
+/// Deliberately coarse. Recording session CONTENT — a pty byte stream — would
+/// mean shipping whatever the operator typed, including passwords typed into
+/// `sudo` or `mysql -p`, off the host and into the server, which is the exact
+/// property [`SshAuditEvent`]'s doc says this system does not have. These
+/// answer "what was run", not "what was on the screen".
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SshActivityKind {
+    /// A session authenticated. The envelope for everything that follows.
+    SessionOpen,
+    /// A session ended.
+    SessionClose,
+    /// A one-shot `ssh <node> <cmd>`. `detail` is the command, `exit_code`
+    /// its status.
+    Exec,
+    /// An interactive shell started. **Its contents are not recorded** — this
+    /// row exists so a reader can see that a shell happened at all.
+    Shell,
+    /// The SFTP subsystem started. File operations happen inside
+    /// `sftp-server` and are not visible here.
+    Sftp,
+    /// A `direct-tcpip` forward was requested. `detail` is `host:port`,
+    /// `allowed` says whether the device's `forward_acl` permitted it.
+    Forward,
+}
+
+/// One thing a device reported doing inside an SSH session (P8).
+///
+/// ⚠️ **These rows are REPORTED BY THE DEVICE, not observed by the server** —
+/// which is why they live in their own collection rather than alongside
+/// [`SshAuditEvent`]. An audit row is the server's own decision and is
+/// authoritative; an activity row is a claim by a host that could be
+/// compromised or simply have reporting switched off. Mixing them would leave
+/// a reader unable to tell which is which.
+///
+/// ⚠️ **Absence of rows is not evidence of inactivity.** A device with
+/// `ssh_activity_log = false` (the default) reports nothing at all, and that
+/// is indistinguishable from a device nobody used. Read this log together
+/// with `ssh_audit`, which records every *grant* regardless of what the device
+/// chooses to say afterwards.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SshActivityEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    /// From the authenticated WS, never from the frame — a device must not be
+    /// able to write rows against another tenant.
+    pub tenant_id: ObjectId,
+    /// Likewise from the connection: the device doing the reporting.
+    pub agent_id: ObjectId,
+    /// Correlates with the [`SshAuditEvent`] that authorised the session, and
+    /// therefore with the authoritative `user_id`. `None` for a key-list
+    /// session, which no grant backs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    /// Principal as the DEVICE saw it. Unverified; join on `grant_id` for the
+    /// server's own record of who asked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller: String,
+    pub kind: SshActivityKind,
+    /// The command for `Exec`, `host:port` for `Forward`. Redacted and
+    /// length-capped on the device before it leaves the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// `false` when the DEVICE refused the action — a forward its
+    /// `forward_acl` did not permit. Those are the rows worth reading.
+    pub allowed: bool,
+    /// Stamped by the SERVER. A device clock is not evidence.
+    pub at: DateTime,
+}
+
+impl SshActivityEvent {
+    pub const COLLECTION: &'static str = "ssh_activity";
+
+    /// Longest `detail` a device may report. A command line is the only
+    /// attacker-influenced field here, and an unbounded one would let a single
+    /// session bloat the collection.
+    pub const MAX_DETAIL: usize = 512;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Session
 // ────────────────────────────────────────────────────────────────────────────

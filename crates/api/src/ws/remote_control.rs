@@ -459,6 +459,36 @@ pub async fn handle_agent_socket(
                                     });
                                     continue;
                                 }
+                                // P8: a device reporting what happened inside
+                                // an SSH session. Fire-and-forget — nothing
+                                // awaits it, so a failed insert must never
+                                // disturb the connection.
+                                //
+                                // `tenant_id` / `agent_id` come from THIS
+                                // authenticated connection and are never read
+                                // off the frame, so a device can only write
+                                // rows about itself. Everything else in the
+                                // row is the device's unverified claim, which
+                                // is why it lands in `ssh_activity` and not in
+                                // the server-authored `ssh_audit`.
+                                ClientMsg::SshActivity {
+                                    grant_id,
+                                    caller,
+                                    kind,
+                                    detail,
+                                    exit_code,
+                                    allowed,
+                                } => {
+                                    let state = state.clone();
+                                    tokio::spawn(async move {
+                                        record_ssh_activity(
+                                            &state, tenant_id, agent_id, grant_id, caller, kind,
+                                            detail, exit_code, allowed,
+                                        )
+                                        .await;
+                                    });
+                                    continue;
+                                }
                                 other => other,
                             };
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
@@ -773,6 +803,54 @@ async fn handle_agent_exec_request(
     let res = crate::routes::agent_exec::dispatch(state, tenant_id, &agent, &caller, &body).await;
     if reply_tx.try_send(reply(res.outcome)).is_err() {
         warn!(%origin_agent_id, %request_id, "rc:rpc.response undeliverable — origin WS gone");
+    }
+}
+
+/// Persist one device-reported SSH activity row (P8).
+///
+/// Everything trustworthy in the row — which tenant, which device — is taken
+/// from the authenticated connection by the caller and passed in here;
+/// everything else is the device's claim. Best-effort by design: a log line
+/// must never be able to disturb a live session, so a failed insert is warned
+/// and dropped.
+///
+/// `detail` is re-clamped server-side. The device already caps it, but a
+/// length bound that only exists on the reporting side is not a bound.
+#[allow(clippy::too_many_arguments)]
+async fn record_ssh_activity(
+    state: &AppState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    grant_id: Option<String>,
+    caller: String,
+    kind: roomler_ai_remote_control::models::SshActivityKind,
+    detail: Option<String>,
+    exit_code: Option<i32>,
+    allowed: bool,
+) {
+    use roomler_ai_remote_control::models::SshActivityEvent;
+
+    let detail = detail.map(|mut d| {
+        if d.chars().count() > SshActivityEvent::MAX_DETAIL {
+            d = d.chars().take(SshActivityEvent::MAX_DETAIL).collect();
+            d.push('…');
+        }
+        d
+    });
+    let event = SshActivityEvent {
+        id: None,
+        tenant_id,
+        agent_id,
+        grant_id,
+        caller,
+        kind,
+        detail,
+        exit_code,
+        allowed,
+        at: bson::DateTime::now(),
+    };
+    if let Err(e) = state.ssh_activity.record(event).await {
+        warn!(%agent_id, %e, "ssh_activity insert failed");
     }
 }
 
