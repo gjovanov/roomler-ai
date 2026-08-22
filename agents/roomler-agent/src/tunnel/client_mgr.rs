@@ -60,6 +60,27 @@ const SESSION_SOURCE_DEPTH: usize = 256;
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// How long a session must last before its end counts as "it ran, then
+/// dropped" and earns the near-instant re-open.
+///
+/// Field 2026-08-22 (neo16): several flows were opening successfully and
+/// ending almost at once. `Ok(())` reset the backoff unconditionally, so the
+/// ladder could never climb — the supervisor sat at the 1 s floor
+/// indefinitely, re-establishing a full WebRTC peer every cycle. The escalating
+/// ladder was already there; what was missing is the condition the comment
+/// above already assumes, that the session actually **ran**. A flow that dies
+/// on arrival is indistinguishable from an unreachable target and belongs on
+/// the same ladder.
+const SESSION_RAN_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Did a cleanly-ended session last long enough to earn a backoff reset?
+///
+/// Split out so the rule is stated once and can be tested without standing up
+/// a hub, a WS and a peer — the loop it guards is a 60-line async supervisor.
+fn session_ran(elapsed: Duration) -> bool {
+    elapsed >= SESSION_RAN_THRESHOLD
+}
+
 // ---------------------------------------------------------------------------
 // The hub — shared demux + flow registry
 // ---------------------------------------------------------------------------
@@ -582,6 +603,7 @@ async fn run_flow_supervisor(
             None => return, // hub dropped — the daemon is shutting down
         };
 
+        let started = std::time::Instant::now();
         let result = run_session_with_fallback(
             &hub,
             &flow_id,
@@ -598,8 +620,22 @@ async fn run_flow_supervisor(
         *live.status.lock().unwrap() = FlowStatus::Down;
         match result {
             Ok(()) => {
-                info!(flow = %flow_id, "tunnel session ended; reconnecting");
-                backoff = RECONNECT_BACKOFF_MIN;
+                let ran = started.elapsed();
+                if session_ran(ran) {
+                    info!(flow = %flow_id, ran_s = ran.as_secs(), "tunnel session ended; reconnecting");
+                    backoff = RECONNECT_BACKOFF_MIN;
+                } else {
+                    // Opened, then died on arrival. Reported at WARN because
+                    // it is indistinguishable from a broken target and used to
+                    // be invisible: the old code logged this at INFO as a
+                    // normal reconnect while silently pinning the ladder to
+                    // its floor. See `SESSION_RAN_THRESHOLD`.
+                    warn!(
+                        flow = %flow_id, ran_ms = ran.as_millis(),
+                        backoff_s = backoff.as_secs(),
+                        "tunnel session ended immediately; backing off rather than re-opening at once"
+                    );
+                }
             }
             Err(e) => {
                 // P6: a PERMANENT failure (enrollment revoked, cross-tenant)
@@ -1163,5 +1199,37 @@ mod tests {
             sink_rx.borrow_and_update().is_none(),
             "the guard clears the sink on drop"
         );
+    }
+
+    /// Field 2026-08-22: a flow that opened and died at once reset the
+    /// backoff every cycle, pinning the supervisor to its 1 s floor forever
+    /// and rebuilding a full WebRTC peer each time. The ladder existed; the
+    /// missing part was requiring that the session actually ran.
+    #[test]
+    fn a_session_that_dies_on_arrival_does_not_earn_a_backoff_reset() {
+        assert!(
+            !super::session_ran(Duration::from_millis(200)),
+            "a 200 ms session is a failure, not a healthy reconnect"
+        );
+        assert!(
+            !super::session_ran(super::SESSION_RAN_THRESHOLD - Duration::from_millis(1)),
+            "just under the threshold must still back off"
+        );
+        assert!(
+            super::session_ran(super::SESSION_RAN_THRESHOLD),
+            "at the threshold the session ran"
+        );
+        assert!(
+            super::session_ran(Duration::from_secs(3600)),
+            "a long-lived session that drops earns the near-instant re-open"
+        );
+    }
+
+    /// The floor must stay below the threshold, or a session could never both
+    /// fail fast AND be retried promptly — the ladder would be all-or-nothing.
+    #[test]
+    fn the_backoff_ladder_is_ordered() {
+        assert!(super::RECONNECT_BACKOFF_MIN < super::RECONNECT_BACKOFF_MAX);
+        assert!(super::RECONNECT_BACKOFF_MIN < super::SESSION_RAN_THRESHOLD);
     }
 }
