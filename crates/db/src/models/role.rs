@@ -132,21 +132,12 @@ pub mod permissions {
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
     pub const ALL: u64 = (1 << 31) - 1;
 
-    pub fn has(permissions: u64, flag: u64) -> bool {
-        permissions & ADMINISTRATOR != 0 || permissions & flag == flag
-    }
-}
-
-impl Role {
-    pub const COLLECTION: &'static str = "roles";
-}
-
-#[cfg(test)]
-mod tests {
-    use super::permissions::*;
-
-    /// Every named bit, so the checks below cannot silently skip one.
-    const NAMED: &[(&str, u64)] = &[
+    /// Every named bit, with its wire name. Lives here rather than in the test
+    /// module because two callers need it: `all_contains_every_named_permission`
+    /// (so a new bit cannot be added without bumping `ALL`), and the escalation
+    /// guard's 403, which has to be able to SAY which permission it refused —
+    /// "you may not grant 0x8000000" is not an actionable error.
+    pub const NAMED: &[(&str, u64)] = &[
         ("VIEW_CHANNELS", VIEW_CHANNELS),
         ("MANAGE_CHANNELS", MANAGE_CHANNELS),
         ("MANAGE_ROLES", MANAGE_ROLES),
@@ -180,6 +171,36 @@ mod tests {
         ("VIEW_SSH_AUDIT", VIEW_SSH_AUDIT),
     ];
 
+    /// Names of every named bit set in `mask`, for error messages. An
+    /// unnamed bit is rendered as its hex value rather than dropped — a mask
+    /// that refuses something the table forgot must still say so.
+    pub fn names(mask: u64) -> Vec<String> {
+        let mut out: Vec<String> = NAMED
+            .iter()
+            .filter(|(_, bit)| mask & bit == *bit)
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        let named_mask = NAMED.iter().fold(0u64, |a, (_, b)| a | b);
+        let unnamed = mask & !named_mask;
+        if unnamed != 0 {
+            out.push(format!("{unnamed:#x}"));
+        }
+        out
+    }
+
+    pub fn has(permissions: u64, flag: u64) -> bool {
+        permissions & ADMINISTRATOR != 0 || permissions & flag == flag
+    }
+}
+
+impl Role {
+    pub const COLLECTION: &'static str = "roles";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permissions::*;
+
     #[test]
     fn all_contains_every_named_permission() {
         // `ALL` is a hand-maintained `(1 << N) - 1` and it is what the Owner
@@ -211,8 +232,16 @@ mod tests {
     fn admins_can_read_the_audits_without_gaining_the_powers() {
         // The deliberate asymmetry: an admin sees every session and command
         // the fleet served without silently acquiring the ability to open one.
-        assert!(DEFAULT_ADMIN & VIEW_EXEC_AUDIT != 0);
-        assert!(DEFAULT_ADMIN & VIEW_SSH_AUDIT != 0);
+        assert_ne!(
+            DEFAULT_ADMIN & VIEW_EXEC_AUDIT,
+            0,
+            "admins must be able to read the exec audit"
+        );
+        assert_ne!(
+            DEFAULT_ADMIN & VIEW_SSH_AUDIT,
+            0,
+            "admins must be able to read the ssh audit"
+        );
         assert_eq!(
             DEFAULT_ADMIN & EXEC_DEVICE,
             0,
