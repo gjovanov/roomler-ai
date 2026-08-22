@@ -843,6 +843,9 @@ async fn derp_split_rehomes_toward_newest_registration() {
                 false,
                 true,
                 false,
+                false,
+                false,
+                false,
                 vec![],
             )
             .await
@@ -1026,6 +1029,9 @@ async fn shutdown_releases_tunnel_and_derp_records() {
             false,
             false,
             true,
+            false,
+            false,
+            false,
             false,
             vec![],
         )
