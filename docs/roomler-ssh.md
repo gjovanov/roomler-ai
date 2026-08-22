@@ -110,14 +110,17 @@ can be pinned out of band.
   process-tree kill. An SSH transport is not a reason to reimplement any of
   that. The cost: output arrives when the command finishes rather than
   streaming, because the engine buffers to enforce its ceiling.
-- **`ssh <node>` — a real interactive shell on a real terminal (P4a, Unix).**
+- **`ssh <node>` — a real interactive shell on a real terminal**, on both
+  platforms (P4a Unix, P4b Windows ConPTY). See below.
+- **`sftp` and `scp`** (P7a) — see below.
+- **`ssh -L`, `-J` and `-W`** (P7b) — `direct-tcpip` channels, **default-deny**.
   See below.
-- Still **refused with a stated reason on stderr**: PTY and shell on *Windows*
-  (P4b), SFTP — and therefore `scp` — (P7). A bare channel failure reads as
-  "administratively prohibited", which is indistinguishable from a policy
-  denial; `scp` silently hanging is a much worse diagnostic than "not
-  implemented yet". Port forwarding (`-L`, `-R`) is rejected by russh's own
-  defaults, promptly and cleanly.
+- Still **refused with a stated reason on stderr**: any other subsystem. A bare
+  channel failure reads as "administratively prohibited", which is
+  indistinguishable from a policy denial; a tool silently hanging is a much
+  worse diagnostic than "not implemented yet".
+- **`ssh -R` is not implemented** and is refused by russh's own default,
+  promptly and cleanly. That is a decision, not a gap — see P7b below.
 
 ### Interactive sessions (P4a Unix, P4b Windows)
 
@@ -456,6 +459,70 @@ Field-proven 2026-08-22, mars → jupiter: an `sftp put` landed
 `-rw-r--r-- root root` (matching `ssh_account_mode = daemon`), and `scp`
 round-tripped a file byte-identical in both directions.
 
+### Port forwarding — `-L`, `-J`, `-W` (P7b — shipped)
+
+`ssh -L 5432:db.intranet:5432 <node>`, `ssh -J <node> <target>` and
+`ssh -W host:port <node>` all arrive as one channel type, `direct-tcpip`: the
+client asks the device to connect somewhere and splice the socket to the
+channel. One handler serves all three.
+
+**The gate is the device's `forward_acl`, and it is DEFAULT-DENY here** — the
+same struct the tunnel subsystem reads, deliberately read with the opposite
+sense for an empty allowlist:
+
+| | tunnel forward | SSH `direct-tcpip` |
+|---|---|---|
+| who authorized the destination | the **server**, before the agent ever sees it | **nobody** — roomler hands over a socket and never sees the bytes |
+| `forward_acl.allowlist = []` means | "no extra local restriction" | **"nowhere"** |
+
+That asymmetry is the whole point. A tunnel flow has already passed the
+server-side ACL, so an empty local list sensibly means "trust that decision".
+An SSH forward has no prior decision to trust; if empty meant "anywhere", every
+SSH session would silently be an open pivot into whatever the device can reach —
+which on a corp laptop is the corporate network. So the operator opts in per
+destination:
+
+```bash
+roomler config set forward_acl '{"enabled":true,"allowlist":[
+  {"host_pattern":{"Exact":"db.intranet"},"port_range":{"low":5432,"high":5432},"proto":"Tcp"}]}'
+```
+
+⚠️ **`-J` needs the *jump host* to allowlist the final target**, not the other
+way round — the jump host is the one making the connection. Expect a confused
+first attempt otherwise.
+
+`ssh -D` (dynamic SOCKS) works too — it is `direct-tcpip` with a destination
+the client picks per connection, so every one of them is checked against the
+allowlist individually. It is also the reason forwards are **capped at 64
+concurrent, process-wide**: a browser opens one channel per connection, and
+hundreds of live sockets is a resource story the operator never agreed to when
+they allowlisted one destination. The cap **refuses rather than queues**
+(`ResourceShortage`), matching the exec engine — a forward that opens two
+minutes late is worse than one that fails now and says so.
+
+Refusals name a cause the client can act on: a policy denial rejects with
+`AdministrativelyProhibited` ("administratively prohibited"), an unreachable
+destination with `ConnectFailed` ("connect failed"). Which one it was matters —
+"your operator hasn't allowed this" and "the database is down" are different
+problems. The *reason string* stays in the daemon log rather than going on the
+wire, because it names internal topology; the operator who can act on it is the
+one reading that log.
+
+⚠️ **No consent prompt on a forward, deliberately.** The channel is not open
+yet — we are deciding whether to open it — so there is no stderr to announce a
+wait on, and a silent 30 s block ending in an unexplained failure is exactly
+what P5d rejected for grants. The operator's consent for a forward *is* the
+allowlist entry: given in advance, naming the destination, default-deny until
+they write it. That is a more considered act than a prompt, not a weaker one.
+
+**`-R` is not implemented, and that is a decision.** Reverse forwarding asks
+the *device* to bind a listening socket — the one thing this whole design
+exists to avoid (§1), and the thing a corp firewall or EDR agent objects to
+most. It is also largely redundant: the client is itself a mesh node, so
+reaching a service on it from the device is what the tunnel subsystem already
+does, server-authorized. russh's default refuses it cleanly, so `ssh -R` fails
+immediately with "remote port forwarding failed" rather than hanging.
+
 ### `roomler proxy` for stock tools (P6c — shipped)
 
 ```
@@ -540,7 +607,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, field-proven mars→clk |
 | P6c | `roomler proxy` — stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync`/`git` reach devices BY NAME | **shipped** |
 | P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven mars→jupiter |
-| P7b | `-L` / `-R` / `-J` (`direct-tcpip`, `tcpip-forward`) | designed |
+| P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8 | Audit + session recording + admin UI | designed |
 
 ## 6. Build
