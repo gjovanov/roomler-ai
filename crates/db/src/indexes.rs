@@ -433,6 +433,24 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Roomler-SSH session activity (P8) — what devices REPORT doing inside a
+    // session, as opposed to `ssh_audit`'s record of what the server DECIDED.
+    // Separate collection on purpose (see `SshActivityEvent`): one is
+    // authoritative, the other is a claim by the host. Same 90-day TTL, and
+    // `grant_id` is indexed because correlating a reported action back to the
+    // authoritative decision row is the main thing a reader does here.
+    create_indexes(
+        db,
+        "ssh_activity",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "agent_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "grant_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Centralized log batches (rc.58). 7-day TTL on `created_at` so
     // operators have a one-week diagnostic window. The compound
     // tenant+agent+created_at index drives the admin UI query "last N

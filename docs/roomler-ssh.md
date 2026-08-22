@@ -5,10 +5,12 @@ without distributing `authorized_keys`, and without opening a port on the host.
 The roomler answer to [Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh)
 — with one capability theirs does not have: **it works on Windows.**
 
-Status: **P1, P2, P3, P5a-d and P4a shipped** — transport, server, the full
-four-gate authorization path, the privilege model on both Windows and Unix,
-operator consent, and interactive shells on Unix. **P4b (PTY on Windows)** is
-next; P6 (client) and P7 (SFTP) are designed, not built.
+Status: **P1–P7 shipped and field-proven, plus P8a** — transport, server, the
+full four-gate authorization path, the privilege model and interactive shells
+on **both** Windows and Unix, operator consent, the audit log and admin UI,
+host-key verification, the `roomler ssh` / `roomler proxy` clients, SFTP/scp,
+port forwarding, and the device-reported session-activity log. Remaining:
+**P8b**, an admin UI for the activity feed.
 
 **Field-proven on `CORPLAP-3`** (a corp-managed laptop with no `sshd`, all
 three firewall profiles enabled, and WSL holding loopback `:22`): a session
@@ -542,6 +544,54 @@ reaching a service on it from the device is what the tunnel subsystem already
 does, server-authorized. russh's default refuses it cleanly, so `ssh -R` fails
 immediately with "remote port forwarding failed" rather than hanging.
 
+### Session activity (P8a — shipped)
+
+`ssh_audit` records the server's **decision**. P8 adds what the device says it
+**did**: `ssh_activity`, fed by `rc:ssh.activity` over the agent's existing
+control WS, read at `GET …/ssh-activity` behind the same `VIEW_SSH_AUDIT` bit.
+
+Six kinds: `session_open`, `session_close`, `exec` (with the command and its
+exit code), `shell`, `sftp`, `forward` (with `host:port` and whether the
+device's `forward_acl` allowed it).
+
+**What it deliberately does NOT record is session content** — no pty byte
+stream, no command output. That is not a scoping shortcut. Recording a
+terminal means shipping whatever the operator typed off the host, passwords
+into `sudo` and `mysql -p` included, and §1's whole claim is that the session
+rides a path nobody else observes. "What was run" is answerable without
+breaking that; "what was on the screen" is not.
+
+Two properties worth understanding before relying on this log:
+
+|  | `ssh_audit` | `ssh_activity` |
+|---|---|---|
+| written by | the **server**, from its own decision | the **device**, reporting on itself |
+| authority | authoritative | a claim by a host that may be compromised |
+| answers | who was allowed in | what they did once inside |
+
+⚠️ **They are separate collections on purpose.** Folded together, a reader
+could not tell which rows the server stands behind. Join them on `grant_id`
+(`?grant_id=` on the activity route returns one session's actions in order).
+
+⚠️ **An empty result is not evidence of inactivity.** `ssh_activity_log` is a
+device config key and defaults to **off**, so a device that never opted in
+reports nothing and looks exactly like an idle one. That the device gets the
+last word is the same rule as `ssh_enabled` and `exec_enabled` — a server can
+never force a host to describe itself honestly, so the switch says out loud
+what was already true. The grant record in `ssh_audit` is what survives a
+device that lies or goes quiet.
+
+Commands are redacted with the same registered-secret redactor `exec` uses
+(agent token, `Bearer …`, JWT-shaped strings) and capped at 512 chars with a
+visible `…`, **on the device, before the report leaves the host**. The server
+re-clamps the length, because a bound that only exists on the reporting side
+is not a bound.
+
+Reports are fire-and-forget: a full outbound queue drops the line rather than
+stalling the session that produced it, and `session_close` is emitted from the
+handler's `Drop` so it fires however the session ended — clean exit, dropped
+client, `session_secs` deadline, consent refusal.
+
 ### `roomler proxy` for stock tools (P6c — shipped)
 
 ```
@@ -627,7 +677,8 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P6c | `roomler proxy` — stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync`/`git` reach devices BY NAME | **shipped** |
 | P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven mars→jupiter |
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
-| P8 | Audit + session recording + admin UI | designed |
+| P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
+| P8b | Admin UI for the activity feed | designed |
 
 ## 6. Build
 
