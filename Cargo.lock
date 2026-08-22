@@ -7866,6 +7866,7 @@ dependencies = [
  "dashmap",
  "dcv-color-primitives",
  "directories",
+ "embed-resource",
  "enigo",
  "env-libvpx-sys",
  "ffmpeg-next",
@@ -8164,6 +8165,7 @@ dependencies = [
 name = "roomler-cli-shim"
 version = "0.3.0-rc.450"
 dependencies = [
+ "embed-resource",
  "libc",
  "windows-sys 0.59.0",
 ]
@@ -8238,6 +8240,7 @@ dependencies = [
  "bson",
  "clap",
  "directories",
+ "embed-resource",
  "futures",
  "hex",
  "ipnet",
