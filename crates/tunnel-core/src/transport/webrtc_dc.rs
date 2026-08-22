@@ -23,6 +23,7 @@ use webrtc::api::APIBuilder;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::ice::mdns::MulticastDnsMode;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -78,6 +79,17 @@ impl TunnelPeer {
         // round-trips. If the API ever drops, this line stops
         // compiling — caught at build time, not at runtime.
         setting_engine.set_sctp_max_receive_buffer_size(SCTP_RECV_BUFFER_BYTES);
+        // mDNS is a BROWSER privacy feature: Chrome hides its LAN host
+        // candidates behind `.local` names so a page can't learn your private
+        // IP. Both ends of a tunnel are our own agents exchanging real
+        // addresses, so we neither publish nor need to resolve those — and
+        // `MulticastDnsMode` defaults to `QueryOnly`, which still binds
+        // `0.0.0.0:5353` per agent. Disabling it removes ~2/3 of the sockets
+        // an agent holds (see the `Drop` impl for the leak this compounded)
+        // and stops us contending for a port the OS resolver already owns on
+        // Windows — the same unreliability `roomler-agent`'s
+        // `mdns_resolve` module exists to route around.
+        setting_engine.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
 
         let api = APIBuilder::new()
             .with_setting_engine(setting_engine)
@@ -229,6 +241,55 @@ impl TunnelPeer {
             + 'static,
     {
         self.pc.on_ice_candidate(Box::new(move |c| handler(c)));
+    }
+
+    /// Release the peer connection and everything the ICE agent owns.
+    ///
+    /// **Dropping a `TunnelPeer` is not enough.** An `RTCPeerConnection`'s
+    /// UDP sockets — one host candidate per local address, plus the
+    /// webrtc-ice mDNS listener on `0.0.0.0:5353` — are owned by tasks the
+    /// agent spawned, not by this struct, so they outlive the `Arc` and are
+    /// only freed by `close()`. See the `Drop` impl below for what that cost
+    /// in the field.
+    ///
+    /// Idempotent: webrtc-rs `close()` on an already-closed PC is a no-op,
+    /// so the explicit call and the `Drop` net can both fire.
+    pub async fn close(&self) {
+        if let Err(e) = self.pc.close().await {
+            tracing::debug!(%e, "tunnel peer close failed (already closed?)");
+        }
+    }
+}
+
+/// Field fix (2026-08-22) — **the peer connection MUST be closed, and Drop is
+/// the only place every path funnels through.**
+///
+/// `TunnelPeer` is built inside `run_tunnel_session`, which has many `?`
+/// early returns; a session that fails during ICE or the DC-pool wait never
+/// reaches an explicit teardown. Nothing closed the PC on those paths, and
+/// because the ICE agent's sockets belong to spawned tasks rather than to
+/// this struct, dropping the `Arc` freed nothing.
+///
+/// Measured on neo16 the day this was found: `roomlerd` held **15,446 UDP
+/// sockets** after 12 h — 10,367 of them on `0.0.0.0:5353`, the rest one per
+/// local address per leaked agent — which is the entire 16,384-port ephemeral
+/// range. Every socket allocation on the host then failed with `WSAENOBUFS`,
+/// so **the whole machine lost DNS** (`ping 1.1.1.1` fine, every name
+/// unresolvable). With flows retrying at ~1 s backoff the observed rate was
+/// ~1 socket/second, i.e. a host wedged in under five hours. The blast radius
+/// is every application on the box, not just roomler.
+///
+/// `Drop` cannot await, so this spawns the close. Outside a runtime there is
+/// nothing to spawn onto — that only happens in teardown paths where the
+/// process is going away anyway, so the sockets die with it.
+impl Drop for TunnelPeer {
+    fn drop(&mut self) {
+        let pc = Arc::clone(&self.pc);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = pc.close().await;
+            });
+        }
     }
 }
 
