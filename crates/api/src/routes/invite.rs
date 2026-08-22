@@ -242,13 +242,18 @@ pub async fn create_invite(
     Json(body): Json<CreateInviteRequest>,
 ) -> Result<(StatusCode, Json<InviteResponse>), ApiError> {
     let tid = parse_oid(&tenant_id)?;
-    require_invite_permission(&state, tid, auth.user_id).await?;
+    let held = require_invite_permission(&state, tid, auth.user_id).await?;
 
     let assign_role_ids: Vec<ObjectId> = body
         .assign_role_ids
         .iter()
         .map(|s| parse_oid(s))
         .collect::<Result<Vec<_>, _>>()?;
+
+    // An invite is a DEFERRED grant — whatever it carries lands on whoever
+    // redeems it. Gate it where the intent is written, because at redemption
+    // the actor is the invitee, who is granting themselves nothing.
+    super::role::check_grant_roles(&state, tid, held, &assign_role_ids).await?;
 
     let expires_in_hours = body.expires_in_hours.or(Some(168)); // default 7 days
 
@@ -299,7 +304,7 @@ pub async fn batch_create_invite(
     Json(body): Json<BatchCreateInviteRequest>,
 ) -> Result<(StatusCode, Json<BatchCreateInviteResponse>), ApiError> {
     let tid = parse_oid(&tenant_id)?;
-    require_invite_permission(&state, tid, auth.user_id).await?;
+    let held = require_invite_permission(&state, tid, auth.user_id).await?;
 
     if body.invites.is_empty() {
         return Err(ApiError::BadRequest("No invites provided".to_string()));
@@ -318,6 +323,17 @@ pub async fn batch_create_invite(
 
         match assign_role_ids {
             Ok(role_ids) => {
+                // Same deferred-grant rule as the single-invite route. Reported
+                // per item rather than aborting the batch, matching how this
+                // endpoint already reports a bad role id.
+                if let Err(e) = super::role::check_grant_roles(&state, tid, held, &role_ids).await {
+                    results.push(BatchInviteResult {
+                        invite: None,
+                        error: Some(e.to_string()),
+                        target_email: item.target_email,
+                    });
+                    continue;
+                }
                 let expires_in_hours = item.expires_in_hours.or(Some(168));
                 match state
                     .invites
@@ -389,7 +405,7 @@ pub async fn add_member(
     Json(body): Json<AddMemberRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let tid = parse_oid(&tenant_id)?;
-    require_invite_permission(&state, tid, auth.user_id).await?;
+    let held = require_invite_permission(&state, tid, auth.user_id).await?;
 
     let user_id = parse_oid(&body.user_id)?;
 
@@ -407,6 +423,12 @@ pub async fn add_member(
             .map(|s| parse_oid(s))
             .collect::<Result<Vec<_>, _>>()?
     };
+
+    // Adding a member WITH roles is a grant, and this route is behind
+    // `INVITE_MEMBERS` — a much weaker bit than `MANAGE_ROLES`. Without this
+    // check the role guard is trivially bypassed: invite a fresh account
+    // carrying the `owner` role and log in as it.
+    super::role::check_grant_roles(&state, tid, held, &role_ids).await?;
 
     let member = state
         .tenants
@@ -429,11 +451,13 @@ fn parse_oid(s: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(s).map_err(|_| ApiError::BadRequest(format!("Invalid ObjectId: {}", s)))
 }
 
+/// Returns the caller's own combined mask, so the callers can pass it to
+/// `role::check_grant_roles` without a second lookup.
 async fn require_invite_permission(
     state: &AppState,
     tenant_id: ObjectId,
     user_id: ObjectId,
-) -> Result<(), ApiError> {
+) -> Result<u64, ApiError> {
     let perms = state
         .tenants
         .get_member_permissions(tenant_id, user_id)
@@ -443,7 +467,7 @@ async fn require_invite_permission(
             "Missing INVITE_MEMBERS permission".to_string(),
         ));
     }
-    Ok(())
+    Ok(perms)
 }
 
 fn invite_to_response(invite: roomler_ai_db::models::Invite) -> InviteResponse {
