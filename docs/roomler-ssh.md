@@ -484,8 +484,27 @@ destination:
 
 ```bash
 roomler config set forward_acl '{"enabled":true,"allowlist":[
-  {"host_pattern":{"Exact":"db.intranet"},"port_range":{"low":5432,"high":5432},"proto":"Tcp"}]}'
+  {"host_pattern":{"kind":"exact","value":"db.intranet"},"port_range":{"low":5432,"high":5432},"proto":"tcp"}]}'
 ```
+
+⚠️ `HostPattern` is **adjacently tagged** — `{"kind":"exact","value":…}`, not
+`{"Exact":…}` — and `proto` is lower-case. Getting this wrong is a parse
+error at `config set`, not a silent no-op, but the message won't tell you the
+shape.
+
+Field-proven 2026-08-22, neo16 → zeus (both rc.451), all four paths:
+
+| attempt | result |
+|---|---|
+| `-L …:127.0.0.1:22`, allowlist EMPTY | refused — `administratively prohibited` |
+| same, after allowlisting `127.0.0.1:22` | **`SSH-2.0-OpenSSH_9.6p1`** through the tunnel |
+| `-L …:127.0.0.1:80` (not listed) | refused — `administratively prohibited` |
+| `-L …:127.0.0.1:23` (listed, nothing listening) | refused — **`connect failed`** |
+
+The last two are the pair that matters: same host, and the caller can tell a
+policy decision from a dead destination. Device-side each logged its reason
+with the caller attributed, e.g. `ssh: forward refused … why=127.0.0.1:80 is
+not in this device's forward_acl.allowlist`. All gates reverted afterwards.
 
 ⚠️ **`-J` needs the *jump host* to allowlist the final target**, not the other
 way round — the jump host is the one making the connection. Expect a confused
