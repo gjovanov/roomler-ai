@@ -328,7 +328,25 @@ mod sshd {
         /// Daemon services a session depends on — the consent broker, threaded
         /// from `run_cmd` so it provably exists wherever a server does.
         pub services: super::SessionServices,
+        /// The operator's forward allowlist, snapshotted at server start —
+        /// the ONLY gate on `direct-tcpip` (P7b), since no server authorizes
+        /// an SSH forward. See [`forward_allowed`].
+        pub forward_acl: crate::tunnel::acl::AgentForwardAcl,
+        /// Ceiling on concurrent forwards, process-wide (P7b).
+        ///
+        /// `exec` caps its concurrency; a forward is the other thing a session
+        /// can start unboundedly, and `ssh -D` opens one channel per browser
+        /// connection — hundreds of live sockets is a resource story the
+        /// operator never agreed to when they allowlisted one destination.
+        /// Refuses rather than queues, matching `exec`: a forward that opens
+        /// two minutes late is worse than one that fails now and says so.
+        pub forwards: Arc<tokio::sync::Semaphore>,
     }
+
+    /// Process-wide ceiling on live `direct-tcpip` channels. Generous enough
+    /// for `-D` against a browser (which is the heaviest legitimate use),
+    /// small enough that a runaway client cannot exhaust the device's fds.
+    pub(super) const MAX_CONCURRENT_FORWARDS: usize = 64;
 
     impl Ctx {
         /// Returns `None` when the node has no usable host key — the caller
@@ -410,6 +428,8 @@ mod sshd {
                 authorized,
                 key_list_run_as,
                 services,
+                forward_acl: cfg.forward_acl.clone(),
+                forwards: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FORWARDS)),
             }))
         }
     }
@@ -985,6 +1005,102 @@ mod sshd {
             Ok(())
         }
 
+        /// `ssh -L`, `-J` and `-W` all arrive here (P7b): the client asks this
+        /// device to connect somewhere and splice the socket to the channel.
+        ///
+        /// Deliberately NOT gated on the session's account: a TCP connect runs
+        /// no code and takes on no user identity, so `RunAs` has nothing to
+        /// say about it. The gate is the operator's forward allowlist —
+        /// default-deny, for the reason in [`forward_allowed`].
+        ///
+        /// **No interactive consent prompt here, on purpose.** The channel is
+        /// not open yet — we are deciding whether to open it — so there is no
+        /// stderr to announce a wait on, and a silent 30 s block ending in an
+        /// unexplained failure is precisely what P5d rejected for grants. The
+        /// operator's consent for a forward is the allowlist entry itself:
+        /// given in advance, naming the destination, and default-deny until
+        /// they write it. That is a more considered act than a prompt, not a
+        /// weaker one.
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: Channel<Msg>,
+            host_to_connect: &str,
+            port_to_connect: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            use russh::ChannelOpenFailure;
+
+            let host = host_to_connect.to_string();
+            // A u32 on the wire; anything above 65535 is a malformed request,
+            // not a port we should try.
+            let Ok(port) = u16::try_from(port_to_connect) else {
+                warn!(peer = %self.peer, port_to_connect, "ssh: forward refused — port out of range");
+                reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                return Ok(());
+            };
+
+            let Some(policy) = &self.policy else {
+                warn!(peer = %self.peer, "ssh: forward refused — no session policy");
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
+            };
+            let caller = policy.caller.clone();
+
+            if let Err(why) = forward_allowed(&self.ctx.forward_acl, &host, port) {
+                // `ssh` renders this as "administratively prohibited", which
+                // tells the caller it was a policy decision and not a dead
+                // destination. The *reason* stays here, next to the operator
+                // who can act on it — it names internal topology.
+                warn!(peer = %self.peer, %caller, %host, port, %why, "ssh: forward refused");
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
+            }
+
+            // Held for the life of the splice, released when the task ends.
+            let Ok(permit) = self.ctx.forwards.clone().try_acquire_owned() else {
+                warn!(
+                    peer = %self.peer, %caller, %host, port,
+                    cap = MAX_CONCURRENT_FORWARDS,
+                    "ssh: forward refused — concurrent-forward ceiling reached"
+                );
+                reply.reject(ChannelOpenFailure::ResourceShortage).await;
+                return Ok(());
+            };
+
+            // Connect BEFORE accepting, so a dead destination is reported as
+            // `ConnectFailed` rather than an accepted channel that immediately
+            // hangs up — which the client can only present as a mystery.
+            let target = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(peer = %self.peer, %host, port, %e, "ssh: forward could not connect");
+                    reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                    return Ok(());
+                }
+            };
+            let _ = target.set_nodelay(true);
+
+            reply.accept().await;
+            info!(peer = %self.peer, %caller, %host, port, "ssh: forward opened");
+            tokio::spawn(async move {
+                let mut stream = channel.into_stream();
+                let mut target = target;
+                // Bidirectional until either side closes — `copy_bidirectional`
+                // already half-closes correctly, which is the thing a
+                // hand-rolled select! gets wrong (see `sshcmd::pump`).
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+                drop(permit);
+            });
+            Ok(())
+        }
+
         async fn exec_request(
             &mut self,
             channel: ChannelId,
@@ -1164,6 +1280,50 @@ mod sshd {
                 name,
                 "only the `sftp` subsystem is implemented.",
             )
+        }
+    }
+
+    /// May this session open a forward to `host:port`? (P7b)
+    ///
+    /// **Default-DENY, unlike the tunnel path that shares this ACL**, and the
+    /// difference is not an oversight. For a tunnel the SERVER has already
+    /// authorized the destination, so an empty `forward_acl.allowlist` sensibly
+    /// means "no extra local restriction — trust that decision". A
+    /// `direct-tcpip` channel has no server in the path at all: roomler hands
+    /// the client a socket and never sees the bytes. The local allowlist is
+    /// therefore the ONLY gate, and an empty one has to mean *nothing*, or
+    /// every SSH session would silently be an open pivot into whatever the
+    /// device can reach.
+    ///
+    /// So the operator opts in per destination, and the refusal names the key
+    /// to set — an unexplained "administratively prohibited" is how `-L` turns
+    /// into a mystery.
+    pub(super) fn forward_allowed(
+        acl: &crate::tunnel::acl::AgentForwardAcl,
+        host: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        if !acl.enabled {
+            return Err("port forwarding is switched off on this device \
+                        (`forward_acl.enabled = false`)."
+                .into());
+        }
+        if acl.allowlist.is_empty() {
+            return Err(format!(
+                "this device forwards nowhere by default. To allow {host}:{port}, add a rule \
+                 to `forward_acl.allowlist` in its config. (Tunnels may still work: those are \
+                 authorized by the server, and an SSH forward is not.)"
+            ));
+        }
+        match acl.check(
+            host,
+            port,
+            roomler_ai_remote_control::models::ProtocolKind::Tcp,
+        ) {
+            d if d.is_allow() => Ok(()),
+            _ => Err(format!(
+                "{host}:{port} is not in this device's `forward_acl.allowlist`."
+            )),
         }
     }
 
@@ -2629,5 +2789,96 @@ mod tests {
         let taken = super::take_grant_for(&parsed).expect("the grant is redeemable");
         assert_eq!(taken.consent_mode, Some(ConsentMode::Prompt));
         let _ = key;
+    }
+
+    // ── P7b: the forward gate ────────────────────────────────────────────
+    //
+    // These lock the ONE thing that distinguishes an SSH forward from a
+    // tunnel forward: the empty allowlist. Both read the same struct, and
+    // the tunnel side treats empty as "trust the server" — so if someone
+    // ever "unifies" the two readers, `an_empty_allowlist_forwards_nowhere`
+    // is what fails, and it says why in its name.
+
+    use crate::tunnel::acl::AgentForwardAcl;
+    use roomler_ai_remote_control::models::{
+        DestinationRule, HostPattern, PortRange, ProtocolKind,
+    };
+
+    fn acl_allowing(host: &str, low: u16, high: u16) -> AgentForwardAcl {
+        AgentForwardAcl {
+            enabled: true,
+            allowlist: vec![DestinationRule {
+                host_pattern: HostPattern::Exact(host.into()),
+                port_range: PortRange { low, high },
+                proto: ProtocolKind::Any,
+            }],
+        }
+    }
+
+    #[test]
+    fn an_empty_allowlist_forwards_nowhere() {
+        // The DEFAULT config. A tunnel would be allowed here (the server
+        // already authorized it); an SSH forward has no such prior decision,
+        // so it must be refused or every session is an open pivot.
+        let acl = AgentForwardAcl::default();
+        assert!(acl.allowlist.is_empty() && acl.enabled, "test premise");
+        let why = super::sshd::forward_allowed(&acl, "db.intranet", 5432)
+            .expect_err("default config must not forward");
+        assert!(
+            why.contains("forward_acl.allowlist"),
+            "the refusal must name the key to set, got {why:?}"
+        );
+    }
+
+    #[test]
+    fn a_listed_destination_is_allowed_and_only_that_one() {
+        let acl = acl_allowing("db.intranet", 5432, 5432);
+        assert!(super::sshd::forward_allowed(&acl, "db.intranet", 5432).is_ok());
+        // Same host, different port.
+        assert!(super::sshd::forward_allowed(&acl, "db.intranet", 22).is_err());
+        // Different host, listed port.
+        assert!(super::sshd::forward_allowed(&acl, "other.intranet", 5432).is_err());
+    }
+
+    #[test]
+    fn the_master_switch_beats_a_populated_allowlist() {
+        let mut acl = acl_allowing("db.intranet", 5432, 5432);
+        acl.enabled = false;
+        let why = super::sshd::forward_allowed(&acl, "db.intranet", 5432)
+            .expect_err("`enabled = false` must refuse everything");
+        assert!(
+            why.contains("forward_acl.enabled"),
+            "the refusal must name the switch that closed it, got {why:?}"
+        );
+    }
+
+    #[test]
+    fn the_forward_ceiling_refuses_rather_than_queues() {
+        // Matches `exec`'s semantics deliberately: a forward that opens two
+        // minutes late is worse than one that fails now and says so. If this
+        // ever becomes `acquire().await`, a wedged forward silently becomes a
+        // wedged *session*.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            super::sshd::MAX_CONCURRENT_FORWARDS,
+        ));
+        let held: Vec<_> = (0..super::sshd::MAX_CONCURRENT_FORWARDS)
+            .map(|_| sem.clone().try_acquire_owned().expect("under the cap"))
+            .collect();
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "the {}th concurrent forward must be refused, not queued",
+            super::sshd::MAX_CONCURRENT_FORWARDS + 1
+        );
+        // …and a finished splice returns its permit.
+        drop(held);
+        assert!(sem.try_acquire_owned().is_ok(), "permits must be released");
+    }
+
+    #[test]
+    fn a_port_above_the_u16_range_is_not_silently_truncated() {
+        // The wire carries a u32. 65536+22 must not become 22 — the
+        // conversion lives in the handler, so this locks the reasoning
+        // rather than the call.
+        assert!(u16::try_from(65_536u32 + 22).is_err());
     }
 }
