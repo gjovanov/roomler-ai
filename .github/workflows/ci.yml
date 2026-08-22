@@ -107,6 +107,19 @@ jobs:
       - name: Run API unit tests
         run: cargo test -p roomler-ai-api --lib
 
+      # The integration crate cannot RUN here (it needs MongoDB + Redis), but
+      # it can still be compiled — and compiling it is what was missing. It sat
+      # broken for an unknown stretch because `OverlayNodeDao::create` grew
+      # three fields and its 8 test callers didn't: `--workspace` clippy skips
+      # `#[cfg(test)]` bodies, and no step named this crate, so all 288
+      # integration tests were unrunnable while every PR went green.
+      #
+      # A type-check needs no services and catches that whole class on the
+      # commit that introduces it. It does NOT tell you the tests pass — only
+      # that they still build. Running them remains a separate lane.
+      - name: Type-check the integration test crate
+        run: cargo check -p roomler-ai-tests --all-targets
+
       # Phase Y feature gate. The `vp9-444` feature compiles libvpx
       # via `env-libvpx-sys` (needs pkg-config + libvpx system lib),
       # plus `dcv-color-primitives`. Default workspace clippy never
