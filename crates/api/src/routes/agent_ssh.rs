@@ -64,8 +64,8 @@ use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
     models::{
-        Agent, ConsentMode, RpcCap, SshAccountMode, SshAuditEvent, SshDenyReason, SshGates,
-        SshGrantSpec, SshMode, SshPolicy, ssh_limits,
+        Agent, ConsentMode, RpcCap, SshAccountMode, SshActivityEvent, SshActivityKind,
+        SshAuditEvent, SshDenyReason, SshGates, SshGrantSpec, SshMode, SshPolicy, ssh_limits,
     },
     signaling::ServerMsg,
 };
@@ -871,6 +871,123 @@ pub async fn audit(
         (None, None) => state.ssh_audit.list_for_tenant(tid, &pg).await?,
     };
     Ok(Json(SshAuditResponse {
+        items: page.items.into_iter().map(Into::into).collect(),
+        total: page.total,
+        page: page.page,
+        per_page: page.per_page,
+    }))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// P8 — session activity
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Projected activity row. Same reason for existing as [`SshAuditRow`]: bson
+/// renders `ObjectId`/`DateTime` as extended JSON that no client parses.
+#[derive(Debug, Serialize)]
+pub struct SshActivityRow {
+    pub id: String,
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    pub caller: String,
+    pub kind: SshActivityKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub allowed: bool,
+    pub at: String,
+}
+
+impl From<SshActivityEvent> for SshActivityRow {
+    fn from(e: SshActivityEvent) -> Self {
+        Self {
+            id: e.id.map(|i| i.to_hex()).unwrap_or_default(),
+            agent_id: e.agent_id.to_hex(),
+            grant_id: e.grant_id,
+            caller: e.caller,
+            kind: e.kind,
+            detail: e.detail,
+            exit_code: e.exit_code,
+            allowed: e.allowed,
+            at: e.at.try_to_rfc3339_string().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SshActivityResponse {
+    pub items: Vec<SshActivityRow>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SshActivityQuery {
+    #[serde(default = "default_audit_page")]
+    pub page: u64,
+    #[serde(default = "default_audit_per_page")]
+    pub per_page: u64,
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Narrow to one device — "what has been run on this machine?"
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Narrow to one session — the join back from an `ssh_audit` decision row
+    /// to everything that followed it.
+    #[serde(default)]
+    pub grant_id: Option<String>,
+}
+
+impl SshActivityQuery {
+    fn pagination(&self) -> PaginationParams {
+        PaginationParams {
+            page: self.page,
+            per_page: self.per_page,
+            before: self.before.clone(),
+        }
+    }
+}
+
+/// `GET /api/tenant/{tenant_id}/ssh-activity`
+///
+/// Behind the SAME `VIEW_SSH_AUDIT` bit as the decision log rather than a new
+/// one: reviewing what a session did and reviewing who was let in are the same
+/// job, done by the same person, and a fresh permission bit would mean
+/// rewriting every admin role's mask for no separation anyone asked for.
+///
+/// ⚠️ These rows are the DEVICE's account of itself, not the server's — see
+/// [`SshActivityEvent`]. A quiet device produces an empty page whether it was
+/// idle, has reporting switched off (the default), or has been compromised.
+pub async fn activity(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Query(q): Query<SshActivityQuery>,
+) -> Result<Json<SshActivityResponse>, ApiError> {
+    let tid = tenant_of(&tenant_id).await?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::VIEW_SSH_AUDIT,
+        "VIEW_SSH_AUDIT",
+    )
+    .await?;
+
+    let pg = q.pagination();
+    let page = match (&q.agent_id, &q.grant_id) {
+        (Some(a), _) => {
+            let aid = ObjectId::parse_str(a)
+                .map_err(|_| ApiError::BadRequest("Invalid agent_id".into()))?;
+            state.ssh_activity.list_for_agent(tid, aid, &pg).await?
+        }
+        (None, Some(g)) => state.ssh_activity.list_for_grant(tid, g, &pg).await?,
+        (None, None) => state.ssh_activity.list_for_tenant(tid, &pg).await?,
+    };
+    Ok(Json(SshActivityResponse {
         items: page.items.into_iter().map(Into::into).collect(),
         total: page.total,
         page: page.page,
