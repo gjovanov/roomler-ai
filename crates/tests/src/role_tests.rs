@@ -39,8 +39,13 @@ async fn create_custom_role() {
             &format!("/api/tenant/{}/role", tenant.tenant_id),
             &tenant.admin.access_token,
         )
+        // NOT "moderator": `roles` carries a unique index on
+        // {tenant_id, name} and tenant seeding creates owner/admin/moderator/
+        // member, so this test 409'd from the day `moderator` joined the
+        // seeded set — the "role dedup" entry in CLAUDE.md's known-failures
+        // list. It is a test-data collision, never a product bug.
         .json(&serde_json::json!({
-            "name": "moderator",
+            "name": "curator",
             "description": "Can moderate messages",
             "color": 0xFF5500,
             "permissions": 42,
@@ -52,7 +57,7 @@ async fn create_custom_role() {
 
     assert_eq!(resp.status().as_u16(), 200);
     let role: Value = resp.json().await.unwrap();
-    assert_eq!(role["name"], "moderator");
+    assert_eq!(role["name"], "curator");
     assert_eq!(role["description"], "Can moderate messages");
     assert_eq!(role["color"], 0xFF5500);
     assert_eq!(role["permissions"], 42);
@@ -396,4 +401,172 @@ async fn an_admin_cannot_grant_permissions_it_does_not_hold() {
         403,
         "the refused assign must not have granted anything"
     );
+}
+
+/// The escalation's fourth and fifth doors: `INVITE_MEMBERS`, not
+/// `MANAGE_ROLES`.
+///
+/// Gating the three role routes is not enough. Handing someone a role is
+/// handing them its permissions, and three other paths write
+/// `tenant_members.role_ids` from caller-supplied ids behind the much weaker
+/// `INVITE_MEMBERS` bit. Adding a FRESH account carrying the seeded `owner`
+/// role — or mailing it an invite that does — is the same takeover by another
+/// route.
+#[tokio::test]
+async fn invite_paths_cannot_grant_roles_the_caller_does_not_hold() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("inviteesc").await;
+
+    let roles: Vec<Value> = app
+        .auth_get(
+            &format!("/api/tenant/{}/role", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id_of = |name: &str| {
+        roles
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("seeded role {name} not found"))["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (admin_role, owner_role, member_role) = (id_of("admin"), id_of("owner"), id_of("member"));
+
+    // Promote the seeded member to `admin` (holds INVITE_MEMBERS, not
+    // ADMINISTRATOR), then act as them.
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/role/{}/assign/{}",
+                tenant.tenant_id, admin_role, tenant.member.id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let admin_token = &tenant.member.access_token;
+
+    let outsider = app
+        .register_user(
+            "outsider@inviteesc.test",
+            "outsider_inviteesc",
+            "Outsider",
+            "Outsider123!",
+            None,
+            None,
+        )
+        .await;
+
+    // 1. add_member with the owner role: refused.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/member", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "user_id": outsider.id, "role_ids": [owner_role] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "add_member must not grant a role the caller cannot grant"
+    );
+
+    // 2. ...but adding them with a role the caller DOES hold still works.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/member", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "user_id": outsider.id, "role_ids": [member_role] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "inviting with a held role must keep working"
+    );
+
+    // 3. An invite carrying the owner role: refused at CREATION, because at
+    //    redemption the actor is the invitee, granting themselves nothing.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/invite", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "assign_role_ids": [owner_role] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "an invite is a deferred grant and must answer to the same rule"
+    );
+
+    // 4. An invite with no roles at all stays unprivileged and allowed.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/invite", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "assign_role_ids": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "a plain invite must still work"
+    );
+
+    // 5. The owner is unaffected — ADMINISTRATOR bypasses, as everywhere else.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/invite", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .json(&serde_json::json!({ "assign_role_ids": [owner_role] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "the owner may still delegate ownership"
+    );
+
+    // 6. Batch invites report the refusal per item rather than aborting.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/invite/batch", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({
+            "invites": [
+                { "target_email": "ok@inviteesc.test", "assign_role_ids": [member_role] },
+                { "target_email": "bad@inviteesc.test", "assign_role_ids": [owner_role] },
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["created"], 1,
+        "the grantable invite is created: {body}"
+    );
+    assert_eq!(body["failed"], 1, "the escalating one is refused: {body}");
 }
