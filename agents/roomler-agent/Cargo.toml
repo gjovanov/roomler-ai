@@ -506,6 +506,20 @@ overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack", "roomler-agent-co
 # price of the feature and the reason it is opt-in per build.
 ssh-server = ["dep:russh", "overlay-netstack"]
 
+# build.rs embeds a Windows VERSIONINFO resource into roomlerd.exe.
+# `[target.'cfg(windows)'.build-dependencies]` resolves against the HOST
+# (build scripts compile for the host), matching build.rs's #[cfg(windows)]
+# gate -- a Linux/macOS build pulls nothing extra.
+#
+# embed-resource, NOT winres/winresource: only embed-resource's compile_for()
+# scopes the resource to a single binary (`cargo:rustc-link-arg-bin=`).
+# winresource emits `cargo:rustc-link-lib=dylib=resource`, which propagates
+# into every downstream binary -- and this crate is a path dependency of both
+# Tauri crates, which already embed their own VS_VERSION_INFO. Already in the
+# graph via tauri-build 2.x, so no new supply-chain surface. See build.rs.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
@@ -525,8 +539,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 #   cargo deb -p roomler-agent --no-build
 # Produces target/debian/roomler-agent_<version>_amd64.deb
 [package.metadata.deb]
-maintainer = "Goran Jovanov <goran.jovanov@gmail.com>"
-copyright = "2026, Goran Jovanov <goran.jovanov@gmail.com>"
+maintainer = "G ROX LTD <goran.jovanov@gmail.com>"
+copyright = "2026, G ROX LTD"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 Roomler Daemon — keeps this device on your private Roomler mesh network \
