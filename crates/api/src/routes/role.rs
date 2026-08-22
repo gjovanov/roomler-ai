@@ -8,14 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 
-/// Require `MANAGE_ROLES` for role administration. Doubles as the membership
-/// check — `get_member_permissions` returns `Forbidden` for a non-member;
-/// `owner`/admin pass via the `ADMINISTRATOR` bypass in `has`.
+/// Require `MANAGE_ROLES` for role administration, returning the caller's own
+/// combined mask so the escalation guard below doesn't re-query it. Doubles as
+/// the membership check — `get_member_permissions` returns `Forbidden` for a
+/// non-member; `owner`/admin pass via the `ADMINISTRATOR` bypass in `has`.
 async fn require_manage_roles(
     state: &AppState,
     tenant_id: ObjectId,
     user_id: ObjectId,
-) -> Result<(), ApiError> {
+) -> Result<u64, ApiError> {
     let perms = state
         .tenants
         .get_member_permissions(tenant_id, user_id)
@@ -24,6 +25,36 @@ async fn require_manage_roles(
         return Err(ApiError::Forbidden(
             "Missing MANAGE_ROLES permission".to_string(),
         ));
+    }
+    Ok(perms)
+}
+
+/// "You cannot grant a permission you do not hold."
+///
+/// `MANAGE_ROLES` is part of `DEFAULT_ADMIN`, so without this every admin can
+/// mint a role carrying `ADMINISTRATOR` / `EXEC_DEVICE` / `SSH_DEVICE` and
+/// assign it to themselves. That would make gate 2 of the exec and SSH chains
+/// decorative: those bits are deliberately withheld from `DEFAULT_ADMIN`
+/// precisely so that running a root shell on a fleet device stays an explicit
+/// grant, and a bit anyone can hand themselves is not a grant.
+///
+/// Only bits being **added** are checked. Renaming, recolouring, or narrowing a
+/// role that already carries a permission the caller lacks keeps working —
+/// widening is the privileged operation, not touching. `ADMINISTRATOR` holders
+/// pass everything, mirroring the bypass in `permissions::has`.
+///
+/// Pure and synchronous on purpose: the interesting behaviour is bit algebra,
+/// and it should be testable without a database.
+fn check_grant(held: u64, current: u64, requested: u64) -> Result<(), ApiError> {
+    if held & permissions::ADMINISTRATOR != 0 {
+        return Ok(());
+    }
+    let missing = requested & !current & !held;
+    if missing != 0 {
+        return Err(ApiError::Forbidden(format!(
+            "Cannot grant permissions you do not hold: {}",
+            permissions::names(missing).join(", ")
+        )));
     }
     Ok(())
 }
@@ -87,7 +118,9 @@ pub async fn create(
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
 
-    require_manage_roles(&state, tid, auth.user_id).await?;
+    let held = require_manage_roles(&state, tid, auth.user_id).await?;
+    let perms = body.permissions.unwrap_or(0);
+    check_grant(held, 0, perms)?;
 
     let role = state
         .roles
@@ -96,7 +129,7 @@ pub async fn create(
             body.name,
             body.description,
             body.color,
-            body.permissions.unwrap_or(0),
+            perms,
             false,
             false,
             body.position.unwrap_or(100),
@@ -117,7 +150,14 @@ pub async fn update(
     let rid = ObjectId::parse_str(&role_id)
         .map_err(|_| ApiError::BadRequest("Invalid role_id".to_string()))?;
 
-    require_manage_roles(&state, tid, auth.user_id).await?;
+    let held = require_manage_roles(&state, tid, auth.user_id).await?;
+
+    // Read the role's CURRENT mask so only the delta is gated. Tenant-scoped,
+    // so a role id from another org is a 404 rather than a cross-tenant read.
+    if let Some(requested) = body.permissions {
+        let existing = state.roles.base.find_by_id_in_tenant(tid, rid).await?;
+        check_grant(held, existing.permissions, requested)?;
+    }
 
     state
         .roles
@@ -164,7 +204,16 @@ pub async fn assign(
     let uid = ObjectId::parse_str(&user_id)
         .map_err(|_| ApiError::BadRequest("Invalid user_id".to_string()))?;
 
-    require_manage_roles(&state, tid, auth.user_id).await?;
+    let held = require_manage_roles(&state, tid, auth.user_id).await?;
+
+    // The most direct escalation of the three: permissions are purely
+    // role-derived (`get_member_permissions` ORs the member's role masks, with
+    // no owner special case), so the seeded Owner role carries `ALL` including
+    // `ADMINISTRATOR`. Without this, one POST assigning Owner to yourself is a
+    // full tenant takeover — and gating only `create`/`update` would leave it
+    // wide open, since the powerful role already exists.
+    let role = state.roles.base.find_by_id_in_tenant(tid, rid).await?;
+    check_grant(held, 0, role.permissions)?;
 
     state.tenants.assign_role(tid, uid, rid).await?;
 
@@ -202,5 +251,95 @@ fn to_response(r: roomler_ai_db::models::Role) -> RoleResponse {
         is_default: r.is_default,
         is_managed: r.is_managed,
         is_mentionable: r.is_mentionable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use permissions::*;
+
+    fn err(r: Result<(), ApiError>) -> String {
+        match r {
+            Err(ApiError::Forbidden(m)) => m,
+            Err(other) => panic!("expected Forbidden, got {other:?}"),
+            Ok(()) => panic!("expected a refusal"),
+        }
+    }
+
+    #[test]
+    fn an_admin_cannot_hand_itself_exec_or_ssh() {
+        // The whole point of the fix. `MANAGE_ROLES` is in `DEFAULT_ADMIN`;
+        // `EXEC_DEVICE` and `SSH_DEVICE` deliberately are not.
+        for bit in [EXEC_DEVICE, SSH_DEVICE, ADMINISTRATOR] {
+            let msg = err(check_grant(DEFAULT_ADMIN, 0, DEFAULT_ADMIN | bit));
+            assert!(
+                msg.contains(names(bit)[0].as_str()),
+                "refusal should name the bit: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigning_the_owner_role_is_refused() {
+        // Permissions are role-derived with no owner special case, so the
+        // seeded Owner role (`ALL`) is a full takeover in one request.
+        let msg = err(check_grant(DEFAULT_ADMIN, 0, ALL));
+        assert!(msg.contains("ADMINISTRATOR"), "{msg}");
+    }
+
+    #[test]
+    fn administrator_may_grant_anything() {
+        check_grant(ADMINISTRATOR, 0, ALL).unwrap();
+        check_grant(DEFAULT_ADMIN | ADMINISTRATOR, 0, ALL).unwrap();
+    }
+
+    #[test]
+    fn granting_a_subset_of_what_you_hold_is_allowed() {
+        check_grant(DEFAULT_ADMIN, 0, DEFAULT_MEMBER).unwrap();
+        check_grant(DEFAULT_ADMIN, 0, DEFAULT_ADMIN).unwrap();
+        check_grant(DEFAULT_ADMIN | EXEC_DEVICE, 0, EXEC_DEVICE).unwrap();
+    }
+
+    #[test]
+    fn touching_a_role_that_already_outranks_you_still_works() {
+        // Only the delta is gated. An admin must still be able to rename or
+        // recolour the Owner role, or narrow it — otherwise the guard turns
+        // into "roles above you are frozen", which is a different feature.
+        check_grant(DEFAULT_ADMIN, ALL, ALL).unwrap();
+        check_grant(DEFAULT_ADMIN, ALL, DEFAULT_MEMBER).unwrap();
+        check_grant(DEFAULT_ADMIN, EXEC_DEVICE | SSH_DEVICE, EXEC_DEVICE).unwrap();
+    }
+
+    #[test]
+    fn adding_one_bit_to_a_role_that_outranks_you_is_still_refused() {
+        // The role already carries SSH_DEVICE (which the caller lacks) — that
+        // part is grandfathered. Adding EXEC_DEVICE on top is not.
+        let msg = err(check_grant(
+            DEFAULT_ADMIN,
+            SSH_DEVICE,
+            SSH_DEVICE | EXEC_DEVICE,
+        ));
+        assert!(msg.contains("EXEC_DEVICE"), "{msg}");
+        assert!(
+            !msg.contains("SSH_DEVICE"),
+            "a pre-existing bit must not be reported as refused: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_no_op_mask_is_never_refused() {
+        check_grant(0, 0, 0).unwrap();
+        check_grant(0, ALL, ALL).unwrap();
+    }
+
+    #[test]
+    fn an_unnamed_bit_is_still_refused_and_still_reported() {
+        // Masks arrive over the wire as an arbitrary u64. A bit above the
+        // named range must not slip through unmentioned just because the
+        // table has no name for it.
+        let rogue = 1u64 << 40;
+        let msg = err(check_grant(DEFAULT_ADMIN, 0, rogue));
+        assert!(msg.contains(&format!("{rogue:#x}")), "{msg}");
     }
 }

@@ -256,3 +256,144 @@ async fn non_member_cannot_list_roles() {
         "Non-member should get 403 Forbidden when listing roles"
     );
 }
+
+/// The privilege-escalation guard, end to end.
+///
+/// `MANAGE_ROLES` ships inside `DEFAULT_ADMIN`, so before this guard any admin
+/// could mint or assign a role carrying bits the org deliberately withheld —
+/// `EXEC_DEVICE`, `SSH_DEVICE`, `ADMINISTRATOR`. The unit tests in
+/// `crates/api/src/routes/role.rs` lock the bit algebra; this locks the WIRING,
+/// which is the part that can silently regress: a handler that stops calling
+/// `check_grant` still passes every unit test.
+#[tokio::test]
+async fn an_admin_cannot_grant_permissions_it_does_not_hold() {
+    // Mirrors `roomler_ai_db::models::role::permissions`, spelled out here so a
+    // rename over there is a visible break rather than a silently skipped test.
+    const ADMINISTRATOR: u64 = 1 << 23;
+    const EXEC_DEVICE: u64 = 1 << 27;
+    const SEND_MESSAGES: u64 = 1 << 7;
+
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("roleesc").await;
+
+    let roles: Vec<Value> = app
+        .auth_get(
+            &format!("/api/tenant/{}/role", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id_of = |name: &str| {
+        roles
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap_or_else(|| panic!("seeded role {name} not found"))["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (admin_role, owner_role) = (id_of("admin"), id_of("owner"));
+
+    // The owner promotes the seeded member to `admin` — allowed, because the
+    // owner holds ADMINISTRATOR. From here on we act AS that admin.
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/role/{}/assign/{}",
+                tenant.tenant_id, admin_role, tenant.member.id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "owner may assign admin");
+    let admin_token = &tenant.member.access_token;
+
+    // 1. Minting a role that carries a bit the admin lacks: refused.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/role", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "name": "sneaky", "permissions": EXEC_DEVICE }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "an admin must not be able to mint EXEC_DEVICE"
+    );
+
+    // 2. A subset of what the admin holds: allowed. The guard blocks widening,
+    //    not role administration.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/role", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "name": "greeter", "permissions": SEND_MESSAGES }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "granting a held bit is fine");
+    let created: Value = resp.json().await.unwrap();
+    let greeter = created["id"].as_str().unwrap().to_string();
+
+    // 3. Widening that role afterwards: refused. (Same bit, second door.)
+    let resp = app
+        .auth_put(
+            &format!("/api/tenant/{}/role/{}", tenant.tenant_id, greeter),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "permissions": SEND_MESSAGES | EXEC_DEVICE }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "an admin must not be able to widen a role past its own mask"
+    );
+
+    // 4. The takeover: assigning the pre-existing `owner` role (ALL, including
+    //    ADMINISTRATOR) to itself. Gating create/update alone would leave this
+    //    wide open, because the powerful role already exists.
+    let resp = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/role/{}/assign/{}",
+                tenant.tenant_id, owner_role, tenant.member.id
+            ),
+            admin_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "an admin must not be able to assign itself owner"
+    );
+
+    // ...and prove it did not take effect: still refused afterwards.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/role", tenant.tenant_id),
+            admin_token,
+        )
+        .json(&serde_json::json!({ "name": "after", "permissions": ADMINISTRATOR }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "the refused assign must not have granted anything"
+    );
+}
