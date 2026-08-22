@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Roomler Setup",
-  "version": "0.3.0-rc.197",
   "identifier": "ai.roomler.setup",
   "build": {
     "frontendDist": "src/front"
@@ -31,6 +30,8 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
+    "publisher": "G ROX LTD",
+    "copyright": "Copyright (C) 2026 G ROX LTD",
     "category": "Productivity",
     "shortDescription": "Roomler setup + onboarding wizard",
     "longDescription": "Unified installer for the Roomler node stack. Pick the device's role (be accessed as a background service, per-user, attended — or reach others only as a tunnel client); the wizard detects existing installs, downloads the matching artifact through roomler.ai's proxy, installs it, and enrolls the device against the configured Roomler server. No terminal commands required."

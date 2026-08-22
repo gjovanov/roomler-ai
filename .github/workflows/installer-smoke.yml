@@ -17,7 +17,13 @@
 #     called this risk out — see commit message.
 #   * Per-Machine MSI. Same install/uninstall flow but admin-elevated.
 #     Add when this per-User flow is green + we want to widen coverage.
-#   * Code signing. Skipped because the smoke doesn't ship anywhere.
+#   * REAL code signing. The smoke doesn't ship anywhere, so it never
+#     touches Azure Artifact Signing. It DOES exercise the sign-windows
+#     action in `local` mode when the WIN_TEST_PFX_* secrets exist, which
+#     gives the release path free per-push regression coverage: the
+#     "assert install payload" step below then proves a SIGNED payload
+#     still installs. Without the secrets the step skips, so forks and
+#     unconfigured repos stay green.
 name: installer-smoke
 
 on:
@@ -39,6 +45,10 @@ jobs:
     name: per-User MSI install + uninstall (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # Mirrored so the payload-signing step's `if:` can test it -- secrets
+      # are not available in step-level `if:` conditions.
+      WIN_TEST_PFX_BASE64: ${{ secrets.WIN_TEST_PFX_BASE64 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -113,6 +123,29 @@ jobs:
           }
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
+
+      # Mirrors release-agent.yml's payload-signing placement exactly: after
+      # the binaries are built, BEFORE the third-party DLLs (wintun, VC-CRT)
+      # are staged so they cannot be caught up in it, and before cargo-wix
+      # harvests. Skipped entirely when the test cert is not configured --
+      # `mode: local` is a hard error without a PFX by design (an explicit
+      # request to sign must never silently degrade), so the gate is here.
+      # `mode` is pinned to local rather than auto so a configured repo does
+      # not burn real Azure signing quota on every master push.
+      - name: Sign MSI payload binaries (local rehearsal)
+        if: env.WIN_TEST_PFX_BASE64 != ''
+        uses: ./.github/actions/sign-windows
+        with:
+          files: |
+            target\release\roomlerd.exe
+            target\release\roomler-shim.exe
+          mode:               local
+          require:            'true'
+          # The action imports the self-signed cert into the runner's Root +
+          # TrustedPublisher stores, so strict verification genuinely applies
+          # here -- this is the same code path a release run takes.
+          local-pfx-base64:   ${{ secrets.WIN_TEST_PFX_BASE64 }}
+          local-pfx-password: ${{ secrets.WIN_TEST_PFX_PASSWORD }}
 
       - name: Stage wintun.dll for the MSI bundle
         shell: pwsh
