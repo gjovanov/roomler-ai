@@ -24,3 +24,18 @@ ui/e2e/video/output/
 dist/
 # Operator-supplied GeoLite2 databases — licensed data, never committed.
 files/geoip/*.mmdb
+
+# Code-signing operator state + local key material (scripts/signing/).
+# The state file holds only public identifiers, but dev-cert/ holds a real
+# private key -- never commit either.
+scripts/signing/.roomler-signing.json
+scripts/signing/dev-cert/
+scripts/signing/apple/
+# gpg/: everything is secret EXCEPT the public key, which must be committed
+# so the API can serve it (include_str! in setup_release.rs).
+scripts/signing/gpg/*
+!scripts/signing/gpg/roomler-release-pubkey.asc
+*.pfx
+*.p12
+*.key
+*.p8

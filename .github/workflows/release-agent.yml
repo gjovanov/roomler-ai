@@ -5,9 +5,22 @@ name: Release roomler-agent
 # tag matching `agent-v*` (publishes a GitHub Release) or manually via
 # workflow_dispatch (uploads workflow artifacts for 30-day retention).
 #
-# Signing is *opt-in via secrets* — if the relevant secret is missing, the
-# job emits an `-unsigned` artifact and a ::warning:: annotation, but does
-# not fail. This lets us iterate on packaging before certs are in place.
+# Windows signing goes through ./.github/actions/sign-windows (Azure Artifact
+# Signing over GitHub OIDC — no key material is stored in this repository).
+# Signedness is a VERIFIED property of the bytes, never a filename suffix and
+# never "a secret happened to be set": the action re-reads every signature
+# with `signtool verify /pa /all` and, on a release run, FAILS the job rather
+# than publishing unsigned. Dispatch runs without credentials still succeed
+# with a ::warning:: so packaging can be iterated.
+#
+# The signing jobs carry `environment: release` — the Entra federated
+# credential is bound to that GitHub environment (this tenant rejects
+# wildcard tag-subject credentials), so removing the environment line breaks
+# the OIDC exchange for azure-mode signing.
+#
+# Rehearse for free with `signing_mode: local` and the self-signed cert from
+# scripts/signing/50-selfsigned-dev-cert.ps1. Setup + background:
+# docs/code-signing.md.
 
 on:
   push:
@@ -30,6 +43,15 @@ on:
         required: true
       publish_release:
         description: 'Create a GitHub Release with the artifacts'
+        type: boolean
+        default: false
+      signing_mode:
+        description: 'Windows signing: auto (azure if configured) | azure | local (self-signed rehearsal) | off'
+        type: choice
+        options: [auto, local, azure, 'off']
+        default: auto
+      require_signing:
+        description: 'Fail the job if artifacts end up unsigned (rehearses the release-tag gate)'
         type: boolean
         default: false
 
@@ -614,14 +636,27 @@ jobs:
           shared-key: agent-linux-arm64
 
   # ---------------------------------------------------------------------------
-  # 2. Windows — MSI via cargo-wix. Unsigned unless WIN_CODESIGN_PFX_BASE64
-  #    secret is present.
+  # 2. Windows — MSI via cargo-wix. The MSI PAYLOAD (roomlerd.exe + the
+  #    roomler.exe shim) is signed before the harvest and the MSIs themselves
+  #    afterwards; see ./.github/actions/sign-windows. On a release tag,
+  #    unsigned fails the job.
   # ---------------------------------------------------------------------------
   build-windows:
     name: Build .msi (Windows x86_64)
     needs: validate-version
     runs-on: windows-latest
     timeout-minutes: 90
+    # The Entra federated credential for azure-mode signing is bound to this
+    # GitHub environment (the tenant rejects wildcard tag subjects) — removing
+    # the environment line breaks the OIDC exchange. No protection rules are
+    # configured on it, so it adds no approval friction.
+    environment: release
+    # Workflow-level permissions make every unlisted scope `none`, so id-token
+    # must be granted explicitly. Per-job to keep the OIDC blast radius small.
+    permissions:
+      contents: read      # `gh release download` for the vendored FFmpeg/libvpx
+      id-token: write     # azure/login OIDC inside ./.github/actions/sign-windows
+      actions: write      # seed-cache-save retires old cache generations via `gh api DELETE`
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
       # Monotonic MSI ProductVersion (rc in the 3rd/build field) so
@@ -1008,6 +1043,50 @@ jobs:
           # re-vendor via vendor-ffmpeg-windows.yml.
           & "target\release\roomlerd.exe" encoder-smoke --encoder hardware
 
+      # Sign the MSI PAYLOAD, before cargo-wix harvests it.
+      #
+      # Signing only the .msi leaves roomlerd.exe + the shim unsigned ON DISK
+      # after install -- and the on-disk binaries are what AV scans, what Task
+      # Manager shows a publisher for, and what an AppLocker/WDAC publisher
+      # rule matches. An MSI-only signature buys none of that.
+      #
+      # Both wxs files reference target\release\{roomlerd,roomler-shim}.exe by
+      # literal path and BOTH cargo-wix runs are --no-build, so signing once
+      # here covers the perUser AND perMachine MSIs.
+      #
+      # Placement is load-bearing on both sides:
+      #   * AFTER encoder-smoke, so a broken FFmpeg link fails the job before
+      #     it spends a signature.
+      #   * BEFORE the wintun + VC-CRT staging steps, so the THIRD-PARTY
+      #     Microsoft/WireGuard-signed DLLs are not even on disk yet.
+      #     Authenticode `sign` REPLACES rather than appends, and AV
+      #     allow-lists key off the original publishers -- ordering makes
+      #     re-signing them structurally impossible rather than merely
+      #     unintended.
+      #
+      # INVARIANT: no step after this one may run `cargo build` in this job.
+      # A relink silently drops these signatures and only the outer MSI
+      # signature would survive.
+      - name: Sign MSI payload binaries
+        id: sign_payload
+        uses: ./.github/actions/sign-windows
+        with:
+          files: |
+            target\release\roomlerd.exe
+            target\release\roomler-shim.exe
+          description:              'Roomler Daemon'
+          mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
+          require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
+          expect-subject-contains:  ${{ vars.AZURE_SIGNING_EXPECT_SUBJECT }}
+          endpoint:                 ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name:     ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          azure-client-id:          ${{ vars.AZURE_CLIENT_ID }}
+          azure-tenant-id:          ${{ vars.AZURE_TENANT_ID }}
+          azure-subscription-id:    ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          local-pfx-base64:         ${{ secrets.WIN_TEST_PFX_BASE64 }}
+          local-pfx-password:       ${{ secrets.WIN_TEST_PFX_PASSWORD }}
+
       - name: Stage wintun.dll for the overlay TUN (overlay-l3 MSI bundle)
         shell: pwsh
         run: |
@@ -1080,14 +1159,16 @@ jobs:
         run: |
           $msi = Get-ChildItem "target/wix/*.msi" | Select-Object -First 1
           if (-not $msi) { throw "per-User MSI not produced" }
-          $suffix = "-unsigned"
-          $signed = $env:WIN_CODESIGN_PFX_BASE64
-          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
-          $dst = "roomler-agent-$env:VERSION-x86_64-pc-windows-msvc$suffix.msi"
+          # No `-unsigned` suffix. It used to be derived from whether a secret
+          # was set, computed BEFORE signtool ran, so it described the repo's
+          # configuration rather than the bytes. Signedness now comes from the
+          # sign-windows action's verify step, which fails the job on a
+          # release run. Consumers are suffix-agnostic in both directions
+          # (agent_release.rs / updater.rs match on ".msi" + the
+          # "-permachine-" infix), so older published releases keep resolving.
+          $dst = "roomler-agent-$env:VERSION-x86_64-pc-windows-msvc.msi"
           Move-Item $msi.FullName $dst
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
       - name: Build MSI (per-Machine)
         shell: pwsh
@@ -1117,14 +1198,55 @@ jobs:
         run: |
           $msi = Get-ChildItem "target/wix/*.msi" | Select-Object -First 1
           if (-not $msi) { throw "per-Machine MSI not produced" }
-          $suffix = "-unsigned"
-          $signed = $env:WIN_CODESIGN_PFX_BASE64
-          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
-          $dst = "roomler-agent-$env:VERSION-perMachine-x86_64-pc-windows-msvc$suffix.msi"
+          # Suffix-free -- see the per-User rename above.
+          $dst = "roomler-agent-$env:VERSION-perMachine-x86_64-pc-windows-msvc.msi"
           Move-Item $msi.FullName $dst
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+
+      # Sign the finished MSIs. Deliberately BEFORE the size-budget step so
+      # the number the guard reports is the number that actually ships, and
+      # before the SHA256 step so the checksums cover the signed bytes.
+      # Cost is ~10 KB per file (high-entropy, so it does not compress) --
+      # noise against the 13 MB baseline.
+      - name: Sign MSIs
+        id: sign_msi
+        uses: ./.github/actions/sign-windows
+        with:
+          files: |
+            ${{ steps.locate.outputs.artifact }}
+            ${{ steps.locate_pm.outputs.artifact }}
+          description:              'Roomler Agent installer'
+          mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
+          require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
+          expect-subject-contains:  ${{ vars.AZURE_SIGNING_EXPECT_SUBJECT }}
+          endpoint:                 ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name:     ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          azure-client-id:          ${{ vars.AZURE_CLIENT_ID }}
+          azure-tenant-id:          ${{ vars.AZURE_TENANT_ID }}
+          azure-subscription-id:    ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          local-pfx-base64:         ${{ secrets.WIN_TEST_PFX_BASE64 }}
+          local-pfx-password:       ${{ secrets.WIN_TEST_PFX_PASSWORD }}
+
+      # Regression detector for the payload-signing ordering above: if either
+      # third-party DLL ever stops carrying its ORIGINAL publisher, something
+      # re-signed it and broke every AV allow-list keyed to that publisher.
+      - name: Assert third-party DLLs keep their original signatures
+        shell: pwsh
+        run: |
+          $checks = @(
+            @{ Path = 'target\release\wintun.dll';        Want = '*WireGuard*' },
+            @{ Path = 'target\release\vcruntime140.dll';  Want = '*Microsoft*' }
+          )
+          foreach ($c in $checks) {
+            $sig = Get-AuthenticodeSignature $c.Path
+            $cn = if ($sig.SignerCertificate.Subject -match 'CN=([^,]+)') { $Matches[1].Trim() } else { '<none>' }
+            Write-Host "$(Split-Path -Leaf $c.Path) signer: $cn (status=$($sig.Status))"
+            if ($cn -notlike $c.Want) {
+              Write-Host "::error::$($c.Path) is no longer signed by its original publisher (got '$cn'). The MSI payload-signing step must never include third-party DLLs."
+              exit 1
+            }
+          }
 
       - name: 'Verify MSI size budget (P4b: MSI carries the tunnel CLI)'
         # Budget history: rc.63 baseline 8 MB (pre-ffmpeg); rc.65's
@@ -1180,35 +1302,6 @@ jobs:
       # DEFAULT feature graph — no vcpkg/FFmpeg/libvpx — and used to add
       # ~9 min of serial tail here).
 
-      - name: Authenticode sign (per-User + per-Machine MSIs)
-        if: env.WIN_CODESIGN_PFX_BASE64 != ''
-        shell: pwsh
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
-          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
-        run: |
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
-
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
-                      Sort-Object FullName -Descending | Select-Object -First 1
-          & $signtool.FullName sign `
-              /f $pfxPath `
-              /p $env:WIN_CODESIGN_PASSWORD `
-              /fd SHA256 `
-              /tr http://timestamp.digicert.com `
-              /td SHA256 `
-              "${{ steps.locate.outputs.artifact }}" `
-              "${{ steps.locate_pm.outputs.artifact }}"
-
-          Remove-Item $pfxPath -Force
-
-      - name: Warn on unsigned build
-        if: env.WIN_CODESIGN_PFX_BASE64 == ''
-        shell: bash
-        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — MSIs are unsigned. SmartScreen will flag 'Unknown publisher'."
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
       - name: SHA256 checksum (both MSIs)
         shell: pwsh
@@ -1266,6 +1359,12 @@ jobs:
     needs: validate-version
     runs-on: windows-latest
     timeout-minutes: 60
+    # See build-windows: the signing FIC is bound to this environment.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write     # azure/login OIDC inside ./.github/actions/sign-windows
+      actions: write      # seed-cache-save generation retirement
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
     steps:
@@ -1316,45 +1415,33 @@ jobs:
           # released artifact is renamed to match.
           $exe = "target/release/roomler-desktop.exe"
           if (-not (Test-Path $exe)) { throw "roomler-desktop EXE not produced" }
-          $suffix = "-unsigned"
-          $signed = $env:WIN_CODESIGN_PFX_BASE64
-          if ($signed -and $signed.Length -gt 0) { $suffix = "" }
-          $dst = "roomler-desktop-$env:VERSION-x86_64-pc-windows-msvc$suffix.exe"
+          # Suffix-free: signedness is verified, not encoded in the filename.
+          # install.ps1's `-like 'roomler-desktop-*-x86_64-pc-windows-msvc*.exe'`
+          # and asset_resolver.rs's contains/ends_with both still match.
+          $dst = "roomler-desktop-$env:VERSION-x86_64-pc-windows-msvc.exe"
           Copy-Item $exe $dst
           "artifact=$dst" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
 
-      - name: Authenticode sign (desktop companion)
-        if: env.WIN_CODESIGN_PFX_BASE64 != ''
-        shell: pwsh
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
-          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
-        run: |
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
-
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
-                      Sort-Object FullName -Descending | Select-Object -First 1
-          # The desktop companion ships signed so SmartScreen / corporate
-          # AV don't flag an "Unknown publisher" EXE (signed since rc.28).
-          & $signtool.FullName sign `
-              /f $pfxPath `
-              /p $env:WIN_CODESIGN_PASSWORD `
-              /fd SHA256 `
-              /tr http://timestamp.digicert.com `
-              /td SHA256 `
-              "${{ steps.locate_tray.outputs.artifact }}"
-
-          Remove-Item $pfxPath -Force
-
-      - name: Warn on unsigned build
-        if: env.WIN_CODESIGN_PFX_BASE64 == ''
-        shell: bash
-        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — the desktop companion EXE is unsigned. SmartScreen will flag 'Unknown publisher' and corporate AV may quarantine it."
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
+      # The desktop companion is the one EXE a user double-clicks straight
+      # from a browser download, so it is the most exposed to SmartScreen and
+      # to corporate AV quarantine.
+      - name: Sign desktop companion
+        id: sign_desktop
+        uses: ./.github/actions/sign-windows
+        with:
+          files:                    ${{ steps.locate_tray.outputs.artifact }}
+          description:              'Roomler desktop'
+          mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
+          require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
+          expect-subject-contains:  ${{ vars.AZURE_SIGNING_EXPECT_SUBJECT }}
+          endpoint:                 ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name:     ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          azure-client-id:          ${{ vars.AZURE_CLIENT_ID }}
+          azure-tenant-id:          ${{ vars.AZURE_TENANT_ID }}
+          azure-subscription-id:    ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          local-pfx-base64:         ${{ secrets.WIN_TEST_PFX_BASE64 }}
+          local-pfx-password:       ${{ secrets.WIN_TEST_PFX_PASSWORD }}
 
       - name: SHA256 checksum (desktop companion)
         shell: pwsh
@@ -1415,6 +1502,48 @@ jobs:
       APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
     steps:
       - uses: actions/checkout@v4
+
+      # Apple signing is ALL-OR-NOTHING, and this runs first so a
+      # misconfiguration fails in seconds rather than after a 90-minute build.
+      #
+      # The old two-gate arrangement had two failure modes. Loud one: the
+      # import step was gated on APP_P12 but `security import`ed the INSTALLER
+      # p12 unconditionally under `set -euo pipefail`, so a half-configured
+      # run died with an opaque keychain error. Silent one, and much worse:
+      # `Warn on unsigned` only fired when signed != 'yes', so a .pkg that was
+      # correctly Developer-ID-signed but NEVER NOTARISED published with no
+      # warning at all -- and Gatekeeper refuses those on every end-user Mac.
+      - name: Resolve Apple signing mode
+        id: apple
+        shell: bash
+        run: |
+          set -euo pipefail
+          req=(APP_P12_BASE64 INSTALLER_P12_BASE64 CERT_PASSWORD
+               APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64)
+          have=(); miss=()
+          for v in "${req[@]}"; do
+            if [[ -n "${!v:-}" ]]; then have+=("$v"); else miss+=("$v"); fi
+          done
+
+          if [[ ${#miss[@]} -eq 0 ]]; then
+            mode=full
+          elif [[ ${#have[@]} -eq 0 ]]; then
+            mode=none
+          else
+            echo "::error::Apple credentials are PARTIALLY configured (missing: ${miss[*]}). Signing is all-or-nothing: a half-configured run can only produce a signed-but-unnotarised or an unsigned-but-pkg-signed artifact, both of which Gatekeeper rejects. Run scripts/signing/60-apple-setup.sh check."
+            exit 1
+          fi
+
+          if [[ "$mode" == none ]]; then
+            if [[ "${{ needs.validate-version.outputs.is_release }}" == "true" ]]; then
+              echo "::error::Apple signing credentials absent and this is a RELEASE run. An unsigned .pkg is blocked by Gatekeeper on every end-user Mac. Configure the six APPLE_* secrets (scripts/signing/60-apple-setup.sh) or dispatch with publish_release=false."
+              exit 1
+            fi
+            echo "::warning::Apple credentials absent -- the .pkg will be unsigned and unnotarised (artifacts-only run, so this is allowed)."
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Apple signing mode: $mode"
 
       - name: Install Rust toolchain (aarch64-apple-darwin)
         uses: dtolnay/rust-toolchain@1.95.0
@@ -1547,7 +1676,7 @@ jobs:
           PLIST
 
       - name: Import signing certs
-        if: env.APP_P12_BASE64 != ''
+        if: steps.apple.outputs.mode == 'full'
         run: |
           set -euo pipefail
           KEYCHAIN=build.keychain
@@ -1575,12 +1704,11 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN"
 
       - name: Codesign binary
-        if: env.APP_P12_BASE64 != ''
+        if: steps.apple.outputs.mode == 'full'
         run: |
           set -euo pipefail
           # Sign the bundled FFmpeg dylibs FIRST (inside-out) — the hardened
-          # runtime + notarisation reject unsigned nested code. (No-op on the
-          # current unsigned builds; correct once Apple secrets are configured.)
+          # runtime + notarisation reject unsigned nested code.
           find stage/roomler-agent.app/Contents/Frameworks -type f -name '*.dylib' -print0 \
             | while IFS= read -r -d '' dylib; do
                 codesign --sign "Developer ID Application" --options runtime --timestamp "$dylib"
@@ -1604,11 +1732,6 @@ jobs:
           cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
 
-          signed=""
-          if [[ -n "${INSTALLER_P12_BASE64:-}" ]]; then
-            signed="yes"
-          fi
-
           pkgbuild \
             --root payload \
             --scripts scripts \
@@ -1617,25 +1740,22 @@ jobs:
             --install-location / \
             component.pkg
 
-          if [[ -n "$signed" ]]; then
-            productbuild \
-              --package component.pkg \
-              --sign "Developer ID Installer" \
-              "dist/roomler-agent-$VERSION-aarch64-apple-darwin.pkg"
-            suffix=""
+          # Suffix-free name in both branches: signedness is VERIFIED by the
+          # step below, not encoded in a filename. install.sh's
+          # `aarch64-apple-darwin[^"]*\.pkg` regex matches either way, so
+          # already-published `-unsigned` releases keep resolving too.
+          artifact="dist/roomler-agent-$VERSION-aarch64-apple-darwin.pkg"
+
+          if [[ "${{ steps.apple.outputs.mode }}" == "full" ]]; then
+            productbuild --package component.pkg --sign "Developer ID Installer" "$artifact"
           else
-            productbuild \
-              --package component.pkg \
-              "dist/roomler-agent-$VERSION-aarch64-apple-darwin-unsigned.pkg"
-            suffix="-unsigned"
+            productbuild --package component.pkg "$artifact"
           fi
 
-          artifact=$(ls dist/*.pkg | head -n1)
           echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
-          echo "signed=$signed"     >> "$GITHUB_OUTPUT"
 
       - name: Notarise
-        if: steps.pkg.outputs.signed == 'yes' && env.APPLE_API_KEY_P8_BASE64 != ''
+        if: steps.apple.outputs.mode == 'full'
         run: |
           set -euo pipefail
           mkdir -p ~/.appstoreconnect/private_keys
@@ -1650,9 +1770,38 @@ jobs:
 
           xcrun stapler staple "${{ steps.pkg.outputs.artifact }}"
 
-      - name: Warn on unsigned / unnotarised build
-        if: steps.pkg.outputs.signed != 'yes'
-        run: echo "::warning::Apple signing secrets missing — .pkg is unsigned and will be blocked by Gatekeeper on end-user machines."
+      # Verify rather than assume. `spctl -a -t install` exercises the exact
+      # Gatekeeper path an end user hits and is the ONLY check that
+      # distinguishes "signed" from "signed AND notarised" -- the distinction
+      # that used to be able to ship silently.
+      - name: Verify signature + notarisation
+        if: steps.apple.outputs.mode == 'full'
+        run: |
+          set -euo pipefail
+          PKG="${{ steps.pkg.outputs.artifact }}"
+
+          echo "=== codesign (app bundle, strict) ==="
+          codesign --verify --strict --verbose=2 stage/roomler-agent.app
+
+          echo "=== hardened runtime ==="
+          codesign -d --verbose=2 stage/roomler-agent.app 2>&1 | grep -q 'flags=.*runtime' \
+            || { echo "::error::hardened runtime is NOT enabled on the app bundle -- notarisation would reject it"; exit 1; }
+
+          echo "=== pkg signature ==="
+          pkgutil --check-signature "$PKG"
+
+          echo "=== stapled notarisation ticket ==="
+          xcrun stapler validate "$PKG"
+
+          echo "=== Gatekeeper (authoritative end-to-end check) ==="
+          out="$(spctl -a -vvv -t install "$PKG" 2>&1 || true)"
+          echo "$out"
+          echo "$out" | grep -q 'source=Notarized Developer ID' \
+            || { echo "::error::spctl did not report 'source=Notarized Developer ID'. The .pkg would be refused on end-user Macs."; exit 1; }
+
+      - name: Warn on unsigned build
+        if: steps.apple.outputs.mode != 'full'
+        run: echo "::warning::Apple signing credentials absent — the .pkg is unsigned and unnotarised, and Gatekeeper will block it on every end-user Mac. Artifacts-only run, so not fatal."
 
       - name: SHA256 checksum
         run: shasum -a 256 "${{ steps.pkg.outputs.artifact }}" > "${{ steps.pkg.outputs.artifact }}.sha256"
@@ -1696,6 +1845,10 @@ jobs:
     if: needs.validate-version.outputs.is_release == 'true'
     needs: [validate-version, build-linux, build-linux-arm64, build-windows, build-windows-companions, build-macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sigstore identity for the provenance attestation
+      attestations: write  # actions/attest-build-provenance
     steps:
       - uses: actions/checkout@v4
 
@@ -1718,6 +1871,44 @@ jobs:
           find dist -type f \( -name '*.msi' -o -name '*.pkg' -o -name '*.deb' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.sha256' \) \
             -exec mv {} release/ \;
           ls -la release/
+
+      # Detached .asc signatures over every asset. What this actually buys
+      # (and what it doesn't): dpkg -i does NOT verify signatures and apt
+      # verifies a repo's InRelease, not per-package sigs -- so this is NOT
+      # apt-level trust. It is an integrity check a human or a script can run
+      # that does not depend on GitHub being honest, which is exactly the gap
+      # the .sha256 sidecars leave (they are served by the same host they
+      # attest). Key setup: scripts/signing/70-gpg-release-key.sh. Absent key
+      # => skip with a notice (attestations below still cover provenance).
+      - name: GPG-sign release artifacts
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::notice::GPG_PRIVATE_KEY not configured -- publishing without .asc signatures."
+            exit 0
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          for f in release/*; do
+            case "$f" in *.asc|*.sha256) continue ;; esac
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+                --armor --detach-sign "$f"
+            echo "signed: $f"
+          done
+          # Republish the public key alongside the assets so verification
+          # never depends on a checkout of this repo.
+          gpg --batch --armor --export > release/roomler-release-pubkey.asc
+
+      # SLSA build provenance for EVERY asset (all platforms in one step) --
+      # ties each artifact to this exact workflow run + commit, verifiable
+      # with `gh attestation verify <file> --repo gjovanov/roomler-ai`
+      # independently of GitHub's per-asset digest field.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'release/*'
 
       - name: Create release
         uses: softprops/action-gh-release@v2
