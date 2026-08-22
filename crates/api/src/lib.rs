@@ -500,6 +500,7 @@ pub fn build_router(state: AppState) -> Router {
     // and the log is the org-wide "what ran on my fleet?" view.
     let exec_audit_routes = Router::new().route("/", get(routes::agent_exec::audit));
     let ssh_audit_routes = Router::new().route("/", get(routes::agent_ssh::audit));
+    let ssh_activity_routes = Router::new().route("/", get(routes::agent_ssh::activity));
     let exec_settings_routes = Router::new().route(
         "/",
         get(routes::agent_exec::get_org_settings).put(routes::agent_exec::set_org_settings),
@@ -674,6 +675,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/tenant/{tenant_id}/stats", tenant_stats_routes)
         .nest("/tenant/{tenant_id}/exec-audit", exec_audit_routes)
         .nest("/tenant/{tenant_id}/ssh-audit", ssh_audit_routes)
+        .nest("/tenant/{tenant_id}/ssh-activity", ssh_activity_routes)
         .nest("/tenant/{tenant_id}/exec-settings", exec_settings_routes)
         .nest("/tenant/{tenant_id}/ssh-settings", ssh_settings_routes)
         .nest("/tenant/{tenant_id}/session", remote_session_routes);

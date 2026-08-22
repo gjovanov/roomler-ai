@@ -393,6 +393,35 @@ pub enum ClientMsg {
         session_secs: u64,
     },
 
+    /// Device reports one thing that happened inside an SSH session (P8).
+    ///
+    /// Fire-and-forget: no reply, and the server drops it silently if the
+    /// device is not entitled to report. A caller never awaits this, so unlike
+    /// `rc:rpc.exec` it needs no capability gate — an older server that has
+    /// never heard of the frame just ignores it, which is the correct
+    /// behaviour for a log line.
+    ///
+    /// ⚠️ `tenant_id` / `agent_id` are taken from the authenticated WS, NOT
+    /// from this frame, so a device can only ever write rows about itself.
+    #[serde(rename = "rc:ssh.activity")]
+    SshActivity {
+        /// The grant this session redeemed; absent for a key-list session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_id: Option<String>,
+        /// Principal as the device saw it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        caller: String,
+        kind: crate::models::SshActivityKind,
+        /// Command for `Exec`, `host:port` for `Forward`. Already redacted and
+        /// length-capped by the device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        /// `false` when the device itself refused the action.
+        allowed: bool,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {
@@ -2119,6 +2148,80 @@ mod tests {
                 advertised_routes.is_empty(),
                 "a hello without advertised_routes must default to none"
             ),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// P8 wire lock. The tag and the `kind` spellings are a compatibility
+    /// surface with every deployed agent: renaming one doesn't fail loudly,
+    /// it makes a fleet's activity reports silently unparseable — the same
+    /// class the `RpcCap` wire test exists to prevent.
+    #[test]
+    fn ssh_activity_wire_shape_is_locked() {
+        use crate::models::SshActivityKind;
+
+        let m = ClientMsg::SshActivity {
+            grant_id: Some("g1".into()),
+            caller: "ssh:Someone@100.65.4.2:1".into(),
+            kind: SshActivityKind::Exec,
+            detail: Some("uptime".into()),
+            exit_code: Some(0),
+            allowed: true,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["t"], "rc:ssh.activity");
+        assert_eq!(v["kind"], "exec");
+        assert_eq!(v["allowed"], true);
+
+        for (k, want) in [
+            (SshActivityKind::SessionOpen, "session_open"),
+            (SshActivityKind::SessionClose, "session_close"),
+            (SshActivityKind::Exec, "exec"),
+            (SshActivityKind::Shell, "shell"),
+            (SshActivityKind::Sftp, "sftp"),
+            (SshActivityKind::Forward, "forward"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(k).unwrap(),
+                serde_json::Value::String(want.into()),
+                "activity kind wire spelling changed"
+            );
+        }
+    }
+
+    /// The optional fields must all be omissible: a `session_open` carries no
+    /// command, no exit code and no grant (key-list sessions). If any of them
+    /// stopped defaulting, the commonest row on the wire would fail to parse.
+    #[test]
+    fn a_minimal_activity_report_round_trips() {
+        use crate::models::SshActivityKind;
+
+        let m = ClientMsg::SshActivity {
+            grant_id: None,
+            caller: String::new(),
+            kind: SshActivityKind::SessionOpen,
+            detail: None,
+            exit_code: None,
+            allowed: true,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        let obj = v.as_object().unwrap();
+        for absent in ["grant_id", "caller", "detail", "exit_code"] {
+            assert!(!obj.contains_key(absent), "{absent} should be skipped");
+        }
+        match serde_json::from_value::<ClientMsg>(v).unwrap() {
+            ClientMsg::SshActivity {
+                grant_id,
+                caller,
+                kind,
+                detail,
+                exit_code,
+                allowed,
+            } => {
+                assert!(grant_id.is_none() && detail.is_none() && exit_code.is_none());
+                assert!(caller.is_empty() && allowed);
+                assert_eq!(kind, SshActivityKind::SessionOpen);
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }
