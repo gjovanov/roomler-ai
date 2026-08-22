@@ -161,7 +161,10 @@ describe('api client', () => {
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
 
-    it('should redirect to login on 403 for non-auth paths', async () => {
+    it('should redirect to login on a 403 GET for non-auth paths', async () => {
+      // The navigation case the logout exists for: membership revoked or the
+      // tenant switched underneath, so every read 403s and the UI would
+      // otherwise sit there broken.
       localStorage.setItem('access_token', 'old-token')
       mockFetch.mockResolvedValueOnce(mockJsonResponse(403, {}, false))
 
@@ -169,6 +172,50 @@ describe('api client', () => {
 
       expect(localStorage.getItem('access_token')).toBeNull()
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
+    })
+
+    // A 403 on a MUTATION is a policy verdict on a perfectly valid session —
+    // e.g. the role editor refusing to grant a permission the caller does not
+    // hold. Logging the user out would make a deliberate, expected refusal
+    // look like a crash, and would swallow the explanation with it.
+    it.each(['post', 'put', 'delete'] as const)(
+      'should NOT log out or redirect on a 403 %s',
+      async (verb) => {
+        localStorage.setItem('access_token', 'still-valid')
+        mockFetch.mockResolvedValueOnce(
+          mockJsonResponse(
+            403,
+            {
+              error: 'forbidden',
+              message: 'Cannot grant permissions you do not hold: EXEC_DEVICE',
+            },
+            false,
+          ),
+        )
+
+        await expect(api[verb]('/tenant/123/role')).rejects.toThrow(
+          'Cannot grant permissions you do not hold: EXEC_DEVICE',
+        )
+
+        expect(localStorage.getItem('access_token')).toBe('still-valid')
+        expect(mockRouter.push).not.toHaveBeenCalled()
+      },
+    )
+
+    it('surfaces the server message as the error message', async () => {
+      // Call sites render `(e as Error).message` straight into a form error,
+      // so a generic "API error 403" would hide the server's explanation.
+      mockFetch.mockResolvedValueOnce(
+        mockJsonResponse(409, { error: 'conflict', message: 'Role name taken' }, false),
+      )
+
+      await expect(api.post('/tenant/123/role', {})).rejects.toThrow('Role name taken')
+    })
+
+    it('falls back to the status when the body carries no message', async () => {
+      mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {}, false))
+
+      await expect(api.post('/tenant/123/role', {})).rejects.toThrow('API error 409')
     })
 
     // Regression guard for the 2026-07-28 prod incident: `/api` was rate

@@ -17,23 +17,30 @@ import {
 // composite value changes and this fails loudly.
 
 describe('permission catalog', () => {
-  it('defines all 27 flags with unique bits and keys', () => {
-    expect(PERMISSION_FLAGS).toHaveLength(27)
+  it('defines all 31 flags with unique bits and keys', () => {
+    expect(PERMISSION_FLAGS).toHaveLength(31)
     const bits = PERMISSION_FLAGS.map((f) => f.bit)
-    expect(new Set(bits).size).toBe(27)
+    expect(new Set(bits).size).toBe(31)
     const keys = PERMISSION_FLAGS.map((f) => f.key)
-    expect(new Set(keys).size).toBe(27)
-    // Every bit is a single power of two inside the defined range.
+    expect(new Set(keys).size).toBe(31)
+    // Every bit is a single power of two inside the defined range. Bit 30 is
+    // the ceiling: `1 << 31` is NEGATIVE under JS int32 coercion, so a bit
+    // that high cannot be represented here at all.
     for (const bit of bits) {
       expect(bit & (bit - 1)).toBe(0)
-      expect(bit).toBeLessThanOrEqual(1 << 26)
+      expect(bit).toBeGreaterThan(0)
+      expect(bit).toBeLessThanOrEqual(1 << 30)
     }
   })
 
   it('OR of every flag equals ALL', () => {
     const all = PERMISSION_FLAGS.reduce((m, f) => m | f.bit, 0)
     expect(all).toBe(ALL_PERMISSIONS)
-    expect(ALL_PERMISSIONS).toBe((1 << 27) - 1)
+    // `(1 << 31) - 1` — the Rust spelling — is −2147483649 in JS. Assert the
+    // POSITIVE value so a copy-paste of the Rust expression fails here.
+    expect(ALL_PERMISSIONS).toBe(2147483647)
+    expect(ALL_PERMISSIONS).toBe(2 ** 31 - 1)
+    expect(ALL_PERMISSIONS).toBeGreaterThan(0)
   })
 
   it('mirrors the server shift assignments for the load-bearing flags', () => {
@@ -45,6 +52,38 @@ describe('permission catalog', () => {
     expect(bit('MANAGE_AGENTS')).toBe(1 << 24)
     expect(bit('REMOTE_CONTROL')).toBe(1 << 25)
     expect(bit('VIEW_REMOTE_AUDIT')).toBe(1 << 26)
+    expect(bit('EXEC_DEVICE')).toBe(1 << 27)
+    expect(bit('VIEW_EXEC_AUDIT')).toBe(1 << 28)
+    expect(bit('SSH_DEVICE')).toBe(1 << 29)
+    expect(bit('VIEW_SSH_AUDIT')).toBe(1 << 30)
+  })
+
+  it('withholds the fleet-access grants from the admin preset', () => {
+    // Mirrors `ssh_and_exec_are_independently_grantable` +
+    // `admins_can_read_the_audits_without_gaining_the_powers` on the server.
+    // The preset buttons in RolesSection OVERWRITE the mask, so if these ever
+    // crept into DEFAULT_ADMIN, one click would hand every admin a root shell
+    // on every device in the fleet.
+    expect(DEFAULT_ADMIN & (1 << 27)).toBe(0) // EXEC_DEVICE
+    expect(DEFAULT_ADMIN & (1 << 29)).toBe(0) // SSH_DEVICE
+    // ...while the audit views ARE granted: reviewing what the fleet served
+    // is a different job from being able to serve it.
+    expect(DEFAULT_ADMIN & (1 << 28)).not.toBe(0) // VIEW_EXEC_AUDIT
+    expect(DEFAULT_ADMIN & (1 << 30)).not.toBe(0) // VIEW_SSH_AUDIT
+  })
+
+  it('a preset round-trip preserves every bit the preset claims to set', () => {
+    // The regression this file failed to catch: the catalog lagged the server
+    // by four bits, so `applyPreset` — which assigns the composite wholesale —
+    // silently dropped them. Any bit in a preset must survive being described
+    // and re-derived from the catalog.
+    for (const preset of [DEFAULT_MEMBER, DEFAULT_ADMIN, ALL_PERMISSIONS]) {
+      const covered = PERMISSION_FLAGS.reduce(
+        (m, f) => ((preset & f.bit) !== 0 ? m | f.bit : m),
+        0,
+      )
+      expect(covered).toBe(preset)
+    }
   })
 
   it('DEFAULT_MEMBER matches the server composite', () => {
@@ -63,7 +102,7 @@ describe('permission catalog', () => {
     expect(DEFAULT_MEMBER).toBe(249729)
   })
 
-  it('DEFAULT_ADMIN matches the server composite (everything except ADMINISTRATOR)', () => {
+  it('DEFAULT_ADMIN matches the server composite', () => {
     const expected =
       DEFAULT_MEMBER |
       (1 << 1) | // MANAGE_CHANNELS
@@ -80,13 +119,17 @@ describe('permission catalog', () => {
       (1 << 22) | // MANAGE_DOCUMENTS
       (1 << 24) | // MANAGE_AGENTS
       (1 << 25) | // REMOTE_CONTROL
-      (1 << 26) // VIEW_REMOTE_AUDIT
+      (1 << 26) | // VIEW_REMOTE_AUDIT
+      (1 << 28) | // VIEW_EXEC_AUDIT   (the grant, EXEC_DEVICE, is withheld)
+      (1 << 30) // VIEW_SSH_AUDIT    (the grant, SSH_DEVICE, is withheld)
     expect(DEFAULT_ADMIN).toBe(expected)
     expect(DEFAULT_ADMIN & ADMINISTRATOR).toBe(0)
     // Historical cross-check: the pre-remote-perms admin composite was
     // 8388599 (still live on old tenants); the current one appends the
-    // three remote-control bits.
-    expect(DEFAULT_ADMIN).toBe(8388599 | (1 << 24) | (1 << 25) | (1 << 26))
+    // three remote-control bits plus the two fleet AUDIT views.
+    expect(DEFAULT_ADMIN).toBe(
+      8388599 | (1 << 24) | (1 << 25) | (1 << 26) | (1 << 28) | (1 << 30),
+    )
   })
 
   it('hasPermission mirrors the server ADMINISTRATOR bypass', () => {
@@ -110,6 +153,7 @@ describe('permission catalog', () => {
       'Voice & video',
       'Moderation',
       'Remote control',
+      'Fleet access',
     ])
   })
 })
