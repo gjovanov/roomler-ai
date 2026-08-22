@@ -1,10 +1,18 @@
 /**
  * The tenant permission catalog — a TS mirror of the server's bitfield in
- * `crates/db/src/models/role.rs::permissions`. Bits are ≤ 26, so plain JS
- * 32-bit bitwise ops are safe (the wire carries the mask as a number).
+ * `crates/db/src/models/role.rs::permissions`.
  *
  * Keep this file in lockstep with the Rust module: the unit test locks the
  * composite values so drift is caught at `bun run test:unit`, not in prod.
+ * Drift is not cosmetic — the role editor writes back the mask it built from
+ * THIS catalog, so a bit missing here is a bit silently stripped from any
+ * role that gets saved.
+ *
+ * ⚠️ JS bitwise operands are coerced to **signed int32**. Bits 0–30 are safe
+ * (`1 << 30` is positive), but composites must not be built with a shift:
+ * `(1 << 31) - 1` is −2147483649 in JS, not 2147483647. Hence `2 ** 31 - 1`
+ * below. A future bit 31 would make `1 << 31` negative and break every mask
+ * operation in this file — it needs BigInt or string masks, not a new entry.
  */
 
 export interface PermissionFlag {
@@ -19,7 +27,7 @@ export interface PermissionFlag {
 
 export const ADMINISTRATOR = 1 << 23
 
-/** All 27 defined flags, grouped for the role-editor UI. */
+/** All 31 defined flags, grouped for the role-editor UI. */
 export const PERMISSION_FLAGS: PermissionFlag[] = [
   // ── General ──────────────────────────────────────────────────────
   { key: 'VIEW_CHANNELS', bit: 1 << 0, label: 'View channels', group: 'General' },
@@ -77,6 +85,41 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     group: 'Remote control',
     description: 'Read the remote-control session audit trail.',
   },
+  // ── Fleet access ─────────────────────────────────────────────────
+  // Deliberately NOT implied by "Manage devices", and deliberately not part
+  // of the admin preset: managing a device's metadata and holding a root
+  // shell on it are different powers. Both run as SYSTEM/root with nobody
+  // at the machine watching, which is why the audit views are separate bits.
+  {
+    key: 'EXEC_DEVICE',
+    bit: 1 << 27,
+    label: 'Run commands on devices',
+    group: 'Fleet access',
+    description:
+      'Run a command on a device via Fleet RPC. Commands execute as SYSTEM (Windows) or root (Linux). Also requires the org switch, the device policy, and the device-local key.',
+  },
+  {
+    key: 'VIEW_EXEC_AUDIT',
+    bit: 1 << 28,
+    label: 'View command audit log',
+    group: 'Fleet access',
+    description: 'Read the Fleet-RPC audit trail — who ran what, where.',
+  },
+  {
+    key: 'SSH_DEVICE',
+    bit: 1 << 29,
+    label: 'SSH to devices',
+    group: 'Fleet access',
+    description:
+      'Open an interactive roomler SSH session to a device. Strictly more than a single command: it lasts, and it carries file transfer.',
+  },
+  {
+    key: 'VIEW_SSH_AUDIT',
+    bit: 1 << 30,
+    label: 'View SSH audit log',
+    group: 'Fleet access',
+    description: 'Read the roomler-SSH audit trail — who was granted, or refused, a session.',
+  },
 ]
 
 /** Group names in display order (insertion order of the flags above). */
@@ -104,7 +147,13 @@ export const DEFAULT_MEMBER = byKeys([
   'STREAM_VIDEO',
 ])
 
-/** Server `DEFAULT_ADMIN` composite — everything except ADMINISTRATOR. */
+/**
+ * Server `DEFAULT_ADMIN` composite. NOT "everything except ADMINISTRATOR":
+ * `EXEC_DEVICE` and `SSH_DEVICE` are withheld on purpose so that opening a
+ * root shell on a fleet device stays an explicit grant. The matching audit
+ * views ARE included — seeing what the fleet served is a different job from
+ * being able to serve it.
+ */
 export const DEFAULT_ADMIN =
   DEFAULT_MEMBER |
   byKeys([
@@ -123,10 +172,16 @@ export const DEFAULT_ADMIN =
     'MANAGE_AGENTS',
     'REMOTE_CONTROL',
     'VIEW_REMOTE_AUDIT',
+    'VIEW_EXEC_AUDIT',
+    'VIEW_SSH_AUDIT',
   ])
 
-/** Every defined bit — server `ALL = (1 << 27) - 1`. */
-export const ALL_PERMISSIONS = (1 << 27) - 1
+/**
+ * Every defined bit — server `ALL = (1 << 31) - 1` = bits 0–30.
+ * Written as `2 ** 31 - 1` because the Rust spelling evaluates to a NEGATIVE
+ * number in JS (see the int32 note at the top of this file).
+ */
+export const ALL_PERMISSIONS = 2 ** 31 - 1
 
 /**
  * Mirror of the server check: ADMINISTRATOR bypasses everything, else the

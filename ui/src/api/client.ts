@@ -16,7 +16,12 @@ class ApiError extends Error {
     public status: number,
     public data: unknown,
   ) {
-    super(`API error ${status}`)
+    // Prefer the server's explanation. Every ApiError variant serialises as
+    // `{error, message}` (crates/api/src/error.rs), and call sites almost
+    // universally render `(e as Error).message` straight into a form error —
+    // so without this the user sees "API error 403" where the server took the
+    // trouble to say WHICH permission it refused.
+    super((data as Record<string, string> | null)?.message || `API error ${status}`)
   }
 }
 
@@ -149,8 +154,19 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
     if (
       resp.status === 403 &&
+      method === 'GET' &&
       !AUTH_PATHS.some((p) => path.startsWith(p))
     ) {
+      // 403 is an AUTHORIZATION verdict, not an authentication one — the
+      // token was accepted and the server then made a policy decision. The
+      // logout exists for the navigation case (membership revoked, tenant
+      // switched under you ⇒ every GET 403s and the UI would sit there
+      // broken), so it stays on GET only.
+      //
+      // On a MUTATION it is actively wrong: the role editor refusing to
+      // grant a permission the caller doesn't hold is a normal, expected
+      // answer that the dialog already knows how to display. Logging the
+      // user out instead would make a deliberate refusal look like a crash.
       localStorage.removeItem('access_token')
       localStorage.removeItem('refresh_token')
       router.push({ name: 'login' })
