@@ -23,8 +23,9 @@ use roomler_ai_services::{
         overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
         push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
         remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, ssh_audit::SshAuditDao, tenant::TenantDao, tunnel_audit::TunnelAuditDao,
-        tunnel_client::TunnelClientDao, tunnel_policy::TunnelPolicyDao, user::UserDao,
+        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
+        tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
+        tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
     media::{room_manager::RoomManager, worker_pool::WorkerPool},
 };
@@ -96,6 +97,10 @@ pub struct AppState {
     pub exec_audit: Arc<ExecAuditDao>,
     /// Roomler-SSH grant log — every session request, granted or refused.
     pub ssh_audit: Arc<SshAuditDao>,
+    /// P8 — device-reported session activity. Separate from `ssh_audit`
+    /// because one is the server's decision and the other is a claim by the
+    /// device; see `SshActivityEvent`.
+    pub ssh_activity: Arc<SshActivityDao>,
     pub agent_crashes: Arc<roomler_ai_services::dao::agent_crash::AgentCrashDao>,
     pub agent_logs: Arc<roomler_ai_services::dao::agent_log::AgentLogDao>,
     /// Observability sample sinks (`stats_*` collections) — idempotent
@@ -348,6 +353,7 @@ impl AppState {
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
         let exec_audit = Arc::new(ExecAuditDao::new(&db));
         let ssh_audit = Arc::new(SshAuditDao::new(&db));
+        let ssh_activity = Arc::new(SshActivityDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
         ));
@@ -820,6 +826,7 @@ impl AppState {
             remote_audit,
             exec_audit,
             ssh_audit,
+            ssh_activity,
             agent_crashes,
             agent_logs,
             stats,

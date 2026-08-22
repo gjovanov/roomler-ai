@@ -989,6 +989,7 @@ async fn connect_once(
         derp_ticket_slot.clone(),
         crate::ssh::SessionServices {
             consent: consent_broker.clone(),
+            activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
         },
     )
     .await;
@@ -1180,6 +1181,7 @@ async fn connect_once(
                         derp_ticket_slot.clone(),
                         crate::ssh::SessionServices {
                             consent: consent_broker.clone(),
+                            activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
                         },
                     )
                     .await;
