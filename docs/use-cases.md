@@ -1,23 +1,23 @@
 # Use Cases
 
-What people run Roomler for, followed by the key flows (permissions, lifecycles)
-that make those scenarios work. Scenarios first — no internals required; flows
-second — for operators and developers.
+What people run Roomler for — in plain language, scenario by scenario — followed
+by the key flows (permissions, lifecycles) that make those scenarios work.
+Scenarios first, no engineering background required; technical flows second, for
+operators and developers.
 
-## Scenarios
+## 🖥️ 1 · Desktop sharing & remote control
 
-### A team hub — chat, calls, files
-
-The classic pillar: hierarchical rooms (text + voice/video), threads, reactions,
-mentions, per-room calls on the mediasoup SFU, recordings, file library with AI
-document recognition, full-text search. One org = one tenant; roles gate
-everything (see [permission system](#permission-system)).
+<p align="center">
+  <img src="assets/remote-desktop.svg" alt="A laptop anywhere showing the live desktop of an office PC inside a browser tab" width="720">
+</p>
 
 ### Remote support with consent
 
 Help a family member or a colleague: they enroll their PC once (a 10-minute
 token), you connect from a browser tab. The session is consent-gated on their
-side and every event is audit-logged.
+side and every event is audit-logged. What that means in practice: **only the
+person at the desk can let you in**, and there is always a record of who
+controlled what, when.
 
 ```mermaid
 sequenceDiagram
@@ -34,13 +34,20 @@ sequenceDiagram
     Note over S: sees only signalling + audit events
 ```
 
-### Unattended fleet access
+### Unattended access to your own machines
 
-Your own machines: office PC from home, headless cloud servers (virtual-desktop
-mode gives them a screen), a GPU workstation driven from a thin laptop over a
-hardware-encoded, low-latency stream. On Windows the SystemContext service
-controls the lock screen, UAC prompts, and pre-logon — a reboot doesn't lock you
-out. Auto-consent is the default for self-controlled hosts.
+Your office PC from home, headless cloud servers (virtual-desktop mode gives them
+a screen), a GPU workstation driven from a thin laptop over a hardware-encoded,
+low-latency stream. On Windows the SystemContext service controls the lock
+screen, UAC prompts, and pre-logon — a reboot doesn't lock you out. Auto-consent
+is the default for self-controlled hosts, so your own machines never make you
+wait.
+
+## 🔐 2 · Your own secure private network
+
+<p align="center">
+  <img src="assets/private-network.svg" alt="A laptop, GPU box, home server and cloud cluster joined in a private WireGuard mesh with stable names" width="720">
+</p>
 
 ### The database behind the office firewall
 
@@ -65,8 +72,10 @@ E2E tests from a real customer vantage. Mesh mode (`--agent` omitted) reaches th
 Every daemon is an overlay-mesh node: stable private IP (`100.64.0.0/10`),
 MagicDNS name (`gpu-1.<your-domain>`), direct LAN paths when possible, NAT
 hole-punching and relays when not ([overlay-communication.md](overlay-communication.md)).
-Optional [exit nodes](overlay-exit-nodes.md) route a laptop's entire internet
-egress through a trusted machine — hotel Wi-Fi looks like your home connection.
+`roomler ssh gpu-1` opens a shell on any node with **no `sshd` and no open
+port** ([roomler-ssh.md](roomler-ssh.md)). Optional
+[exit nodes](overlay-exit-nodes.md) route a laptop's entire internet egress
+through a trusted machine — hotel Wi-Fi looks like your home connection.
 
 ### A harness for AI agents
 
@@ -83,6 +92,19 @@ The Devices, Network, and Observability views show every machine, the live mesh
 graph with carrier types, relay usage, and per-org activity.
 `roomler exec` / the device console run commands on trusted devices through four
 independent default-deny gates with a full audit trail ([fleet-rpc.md](fleet-rpc.md)).
+
+## 💬 Bonus · Video conferencing & team collaboration
+
+<p align="center">
+  <img src="assets/collaboration.svg" alt="A four-person video call with screen sharing next to a chat room with threads and reactions" width="720">
+</p>
+
+### A team hub — chat, calls, files
+
+The included pillar: hierarchical rooms (text + voice/video), threads, reactions,
+mentions, per-room calls on the mediasoup SFU, recordings, file library with AI
+document recognition, full-text search. One org = one tenant; roles gate
+everything (see [permission system](#permission-system)).
 
 ---
 
