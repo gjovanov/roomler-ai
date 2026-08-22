@@ -36,6 +36,43 @@ use crate::transport::relay;
 use crate::transport::webrtc_dc::TunnelPeer;
 use crate::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
+/// A `JoinHandle` that aborts its task when dropped.
+///
+/// **Dropping a bare `JoinHandle` DETACHES the task — it keeps running.** That
+/// is the trap this type exists to close. The session drivers below spawn a
+/// dispatcher that holds `Arc<TunnelPeer>` and a `sink` clone; the explicit
+/// `abort()` at the end of each driver (the "F1" fix) covers the *normal* exit,
+/// but every `?` between the spawn and that line returned without it, leaving
+/// a detached task pinning the peer — and therefore its ICE agent's UDP
+/// sockets, the WS and the TURN allocation — for the life of the process.
+///
+/// Field 2026-08-22 (neo16): failing flows take exactly those early returns, so
+/// `roomlerd` accumulated **15,446 UDP sockets in 12 h**, exhausted the host's
+/// 16,384-port ephemeral range, and every process on the machine lost DNS with
+/// `WSAENOBUFS`. The bug was not the missing abort *call* — one was already
+/// there and correct — it was that the rule lived in a call site instead of in
+/// the type. Wrapping the handle makes "aborted on every path" structural.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::ops::Deref for AbortOnDrop<T> {
+    type Target = tokio::task::JoinHandle<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for AbortOnDrop<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Per-flow open round-trip cap: `TcpForwardRequest` / `UdpForwardRequest` →
 /// `Accept` / `Reject`. Server-side ACL eval is local, but the request rides the
 /// agent's dial timeout in the relay case. Shared by the TCP session driver and
@@ -424,7 +461,7 @@ async fn run_webrtc_session(
     let peer_for_dispatch = Arc::new(peer);
     let pool_ready = Arc::new(tokio::sync::Notify::new());
 
-    let mut dispatcher_task = {
+    let mut dispatcher_task = AbortOnDrop({
         let peer = Arc::clone(&peer_for_dispatch);
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
@@ -442,7 +479,7 @@ async fn run_webrtc_session(
             )
             .await
         })
-    };
+    });
 
     // ────────────── Wait for pool open ─────────────────────────────
     tokio::time::timeout(PEER_READY_TIMEOUT, peer_for_dispatch.wait_pool_open())
@@ -501,7 +538,7 @@ async fn run_webrtc_session(
             // The WS dispatcher exited — the control channel is gone, so new
             // flows can't be requested. End the session so `run_forward`
             // reconnects instead of accepting into a dead socket.
-            _ = &mut dispatcher_task => {
+            _ = &mut *dispatcher_task => {
                 warn!("control channel closed; ending session to reconnect");
                 break;
             }
@@ -646,6 +683,9 @@ async fn run_webrtc_session(
     // alive, so an un-aborted dispatcher would pin the old WS + peer + TURN
     // allocation open forever, leaking one set per re-open (F1). A no-op when
     // the dispatcher already exited (the control-channel-closed arm).
+    // Redundant since the handle became an `AbortOnDrop` (it would fire a
+    // few lines later anyway), but kept: it aborts at the exact point the
+    // comment above describes, rather than at end of scope.
     dispatcher_task.abort();
     Ok(())
 }
@@ -1102,14 +1142,14 @@ async fn run_quic_session(
     // per-flow accept/reject + teardown signals.
     let reply_registry: ReplyRegistry = Arc::new(Mutex::new(HashMap::new()));
     let active_flows: ActiveFlows = Arc::new(Mutex::new(HashMap::new()));
-    let mut dispatcher_task = {
+    let mut dispatcher_task = AbortOnDrop({
         let reply_registry = Arc::clone(&reply_registry);
         let active_flows = Arc::clone(&active_flows);
         let sink = sink.clone();
         tokio::spawn(async move {
             quic_dispatch_loop(source, session_id, reply_registry, active_flows, sink).await
         })
-    };
+    });
 
     // Keep the endpoint + connection alive for the session lifetime
     // (dropping the endpoint closes quinn; dropping the last `conn`
@@ -1139,7 +1179,7 @@ async fn run_quic_session(
             },
             // WS dispatcher exited (control channel gone) — end the session so
             // `run_forward` reconnects instead of accepting into a dead socket.
-            _ = &mut dispatcher_task => {
+            _ = &mut *dispatcher_task => {
                 warn!("control channel closed; ending quic session to reconnect");
                 break;
             }
@@ -1273,6 +1313,7 @@ async fn run_quic_session(
     // `sink` clone — else the standalone CLI's WS keepalive pins the old WS +
     // peer + TURN allocation open per re-open (F1). No-op when the
     // control-channel-closed arm already ended it.
+    // As above: `AbortOnDrop` guarantees it; this pins the timing.
     dispatcher_task.abort();
     Ok(SessionOutcome::Completed)
 }
@@ -1702,6 +1743,42 @@ mod tests {
     use crate::signaling_link::TunnelSignalingSink;
     use async_trait::async_trait;
     use tokio::sync::mpsc;
+
+    /// The whole point of [`AbortOnDrop`]: a bare `JoinHandle` DETACHES on
+    /// drop, so an early `?` left the dispatcher running and pinning the peer
+    /// — which is how neo16 accumulated 15,446 UDP sockets and lost DNS.
+    #[tokio::test]
+    async fn a_dropped_guard_aborts_its_task_rather_than_detaching_it() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Simulate a driver that returns early: the guard goes out of scope
+        // while the task is still parked.
+        {
+            let flag = Arc::clone(&flag);
+            let _guard = AbortOnDrop(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                flag.store(true, Ordering::SeqCst);
+            }));
+        }
+
+        // Well past the task's own sleep. A detached task would have fired.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the task kept running after its guard was dropped — \
+             this is the detach that leaked the peer"
+        );
+    }
+
+    /// Sanity: the guard is transparent, so `select!`ing on it and calling
+    /// `abort()` through it keep working (both are live call sites).
+    #[tokio::test]
+    async fn the_guard_derefs_to_its_handle() {
+        let mut guard = AbortOnDrop(tokio::spawn(async { 7u8 }));
+        let got = (&mut *guard).await.expect("task completed");
+        assert_eq!(got, 7);
+        guard.abort(); // already finished — must not panic
+    }
 
     /// Test sink that forwards every emitted `ClientMsg` onto an unbounded
     /// channel the test drains, standing in for the CLI's `WsSink`. Replaces
