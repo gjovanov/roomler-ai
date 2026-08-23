@@ -66,26 +66,50 @@ fn ignore_ctrl_c() {
 #[cfg(not(any(target_os = "windows", unix)))]
 fn ignore_ctrl_c() {}
 
+/// Where the daemon might be, in priority order.
+///
+/// A sibling `roomlerd` covers the Linux .deb and the Windows MSI, which
+/// install both binaries into one directory. macOS cannot: the daemon lives
+/// inside an .app bundle (its executable is named after the bundle, and
+/// renaming it would change the binary's TCC identity and void every existing
+/// Screen Recording / Accessibility grant), while a CLI has to be on PATH. So
+/// there the two are genuinely in different places and the bundle path is the
+/// fallback.
+fn daemon_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        out.push(dir.join(DAEMON_FILE_NAME));
+    }
+    #[cfg(target_os = "macos")]
+    out.push(std::path::PathBuf::from(MACOS_BUNDLE_DAEMON));
+    out
+}
+
 // Exits via `std::process::exit` rather than returning `ExitCode`, because
 // `ExitCode: From<u8>` would TRUNCATE the child's code — a script checking for
 // a specific nonzero exit must see exactly what the standalone CLI would have
 // returned.
 fn main() -> ! {
-    let daemon = match std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(DAEMON_FILE_NAME)))
-    {
-        Some(p) if p.is_file() => p,
-        Some(p) => {
-            eprintln!(
-                "roomler: the daemon binary is missing at {} — reinstall the Roomler MSI, \
-                 or use the standalone tunnel CLI on hosts without a daemon.",
-                p.display()
-            );
+    let candidates = daemon_candidates();
+    let daemon = match candidates.iter().find(|p| p.is_file()) {
+        Some(p) => p.clone(),
+        None if candidates.is_empty() => {
+            eprintln!("roomler: could not resolve this executable's own path");
             std::process::exit(EXIT_NO_DAEMON);
         }
         None => {
-            eprintln!("roomler: could not resolve this executable's own path");
+            eprintln!(
+                "roomler: the daemon binary is missing (looked in: {}) — reinstall the \
+                 Roomler package, or use the standalone tunnel CLI on hosts without a daemon.",
+                candidates
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             std::process::exit(EXIT_NO_DAEMON);
         }
     };
@@ -134,3 +158,10 @@ fn main() -> ! {
 const DAEMON_FILE_NAME: &str = "roomlerd.exe";
 #[cfg(not(target_os = "windows"))]
 const DAEMON_FILE_NAME: &str = "roomlerd";
+
+/// The macOS bundle's executable. Named `roomler-agent`, not `roomlerd`:
+/// `CFBundleExecutable` conventionally matches the bundle, CI asserts the two
+/// plists point here, and renaming it would invalidate the TCC grants keyed to
+/// this binary.
+#[cfg(target_os = "macos")]
+const MACOS_BUNDLE_DAEMON: &str = "/Applications/roomler-agent.app/Contents/MacOS/roomler-agent";
