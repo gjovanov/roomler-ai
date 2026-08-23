@@ -575,18 +575,32 @@ jobs:
           chmod 755 payload/usr/local/bin/roomler
           cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
+          # pkgbuild THEN productbuild — the same two steps release-agent.yml
+          # runs, and not an optimisation to skip.
+          #
+          # `pkgbuild` infers the .app as a relocatable BUNDLE COMPONENT
+          # ("Inferring bundle components from contents of payload"). Installing
+          # that raw component package directly does not put the payload at its
+          # final path before the top-level postinstall runs, so the script
+          # fails on a bundle that is demonstrably IN the payload — verified
+          # here with `pkgutil --payload-files`. Wrapping it in a product
+          # archive is what the shipped artifact is, and it installs correctly
+          # on a real Mac.
+          #
+          # The general rule this cost three CI cycles to relearn: an installer
+          # smoke must build its artifact EXACTLY as the release does, or it
+          # tests something nobody ships.
           pkgbuild --root payload --scripts scripts --identifier com.roomler.agent \
-            --version "$VERSION" --install-location / dist/smoke.pkg
+            --version "$VERSION" --install-location / component.pkg
+          productbuild --package component.pkg dist/smoke.pkg
 
-          # Prove what is actually IN the package before installing it. The
-          # postinstall reads a plist out of the installed bundle, so a payload
-          # missing it fails the install with PackageKit's one opaque sentence
-          # and no clue whether the fault is the script or the staging.
+          # Prove what is actually IN the package before installing it, so a
+          # script failure can never again be confused with a staging failure.
           echo "=== payload ==="
-          pkgutil --payload-files dist/smoke.pkg | sed -n '1,40p'
-          pkgutil --payload-files dist/smoke.pkg | grep -q 'Contents/Resources/com.roomler.agent.plist' \
+          pkgutil --payload-files component.pkg | sed -n '1,40p'
+          pkgutil --payload-files component.pkg | grep -q 'Contents/Resources/com.roomler.agent.plist' \
             || { echo "::error::the LaunchAgent plist is not in the payload"; exit 1; }
-          pkgutil --payload-files dist/smoke.pkg | grep -q 'usr/local/bin/roomler' \
+          pkgutil --payload-files component.pkg | grep -q 'usr/local/bin/roomler' \
             || { echo "::error::the CLI is not in the payload"; exit 1; }
 
       - name: Install it
