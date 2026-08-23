@@ -47,7 +47,7 @@
         Id='*'
         Name='Roomler Agent'
         UpgradeCode='1F2D7B1C-8B2F-4D2E-B1A3-6B1E2C7E4D91'
-        Manufacturer='Goran Jovanov'
+        Manufacturer='G ROX LTD'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -56,7 +56,7 @@
             Id='*'
             Keywords='Installer'
             Description='Roomler Daemon — private mesh network + secure remote control'
-            Manufacturer='Goran Jovanov'
+            Manufacturer='G ROX LTD'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'
