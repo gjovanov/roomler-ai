@@ -181,8 +181,14 @@ jobs:
           echo "--- container state ---"
           docker inspect -f 'Status={{.State.Status}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Restarts={{.RestartCount}}' \
             roomler-test-mongo || true
-          echo "--- last mongo logs ---"
-          docker logs --tail 60 roomler-test-mongo 2>&1 || true
+          echo "--- mongod fatal/error lines (the CAUSE) ---"
+          # ⚠️ Grep for severity first. A plain `--tail` catches only the
+          # BACKTRACE frames mongod prints on its way out — which says it died
+          # but not why. That happened on run 32672829603: 59 `Frame` lines and
+          # no assertion, because the fatal message had already scrolled past.
+          docker logs roomler-test-mongo 2>&1 | grep -E '"s":"[FE]"' | tail -20 || true
+          echo "--- last 120 lines ---"
+          docker logs --tail 120 roomler-test-mongo 2>&1 || true
 
       - name: Upload the log on failure
         if: failure()
