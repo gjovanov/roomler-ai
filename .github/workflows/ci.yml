@@ -318,6 +318,13 @@ jobs:
       - name: cargo check agent BINARY (macOS cfg arms in main.rs)
         run: cargo check -p roomler-agent --bins --features scrap-capture
 
+      # The desktop companion ships on macOS from rc.455 and owns the
+      # permissions panel — the one surface that tells an operator why their
+      # remote screen is blank. Its macOS arms (the TCC probes, `open` for the
+      # Settings pane) exist on exactly this target.
+      - name: cargo check the desktop companion
+        run: cargo check -p roomler-agent-tray
+
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
         # someone's Mac, with launchctl's famously unhelpful diagnostics.
