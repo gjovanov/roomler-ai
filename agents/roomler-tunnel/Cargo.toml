@@ -85,6 +85,13 @@ socket2 = "0.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# build.rs embeds a Windows VERSIONINFO resource into roomler.exe. See
+# agents/roomler-agent/Cargo.toml for why this is embed-resource rather than
+# winres/winresource (per-binary scoping vs. a link-lib that leaks into
+# roomler-setup.exe, which depends on this crate).
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
@@ -97,8 +104,8 @@ tempfile = { workspace = true }
 # cargo-deb (Linux .deb)
 #   cargo deb -p roomler-tunnel --no-build
 [package.metadata.deb]
-maintainer = "Goran Jovanov <goran.jovanov@gmail.com>"
-copyright = "2026, Goran Jovanov <goran.jovanov@gmail.com>"
+maintainer = "G ROX LTD <goran.jovanov@gmail.com>"
+copyright = "2026, G ROX LTD"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
 Native tunnel client for the Roomler AI platform. Runs on the \
