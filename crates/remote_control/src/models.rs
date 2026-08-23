@@ -581,6 +581,20 @@ pub struct Agent {
     /// deserialises to [`SshMode::Off`].
     #[serde(default)]
     pub ssh_policy: SshPolicy,
+    /// Device config an operator has ASKED for, reconciled by the agent when
+    /// it next connects (`docs/remote-config.md` step 2).
+    ///
+    /// Desired state, not applied state: writing here records an intent, and
+    /// the device remains free to refuse it — a device without
+    /// `remote_config_enabled` ignores this entirely, which is the property
+    /// that keeps `exec_enabled`/`ssh_enabled` refusable by a compromised
+    /// server. Never read this to decide whether a device HAS exec or SSH on;
+    /// the device's own heartbeat is the only truth for that.
+    ///
+    /// `#[serde(default)]` → every pre-feature row deserialises to "nothing
+    /// requested", which is also what an operator clearing the form leaves.
+    #[serde(default)]
+    pub desired_config: DesiredConfig,
     /// Subnet-router CIDRs this agent is a gateway for (Phase 2). The SOCKS
     /// mesh longest-prefix-matches a LAN-IP target against these to pick the
     /// covering agent, which then dials the real IP (still gated by the
@@ -687,6 +701,72 @@ pub enum SshAccountMode {
     ConsoleUser,
     /// A named local account (Unix only; requires the P5 privilege drop).
     Named,
+}
+
+/// Device config an operator has requested, for the agent to reconcile
+/// (`docs/remote-config.md`).
+///
+/// Every field is `Option`, and the distinction is load-bearing: `None` means
+/// **not managed** — the device keeps whatever it has locally — while `Some`
+/// means "this is what it should be". A struct of plain values could not say
+/// "leave the rest alone", so an operator toggling exec would silently assert a
+/// value for every other key on the surface.
+///
+/// ⚠️ `remote_config_enabled` is deliberately ABSENT and must never be added.
+/// It is the device's opt-in to accepting anything here at all; a server able
+/// to set it could opt a device in and then open every other key, which is the
+/// one move the whole design exists to prevent.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct DesiredConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_authorized_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_account_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_port: Option<u16>,
+    /// Bumped on every write. The agent reports the revision it has applied,
+    /// so "asked for" and "actually running" can be told apart in the UI —
+    /// without it, a device that refused the config and one that never heard
+    /// about it look identical.
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime>,
+}
+
+impl DesiredConfig {
+    /// Whether anything is actually requested. A cleared form is `revision`
+    /// plus provenance and no keys — still "nothing to reconcile".
+    pub fn is_empty(&self) -> bool {
+        self.exec_enabled.is_none()
+            && self.ssh_enabled.is_none()
+            && self.ssh_authorized_keys.is_none()
+            && self.ssh_account_mode.is_none()
+            && self.ssh_port.is_none()
+    }
+
+    /// Whether this request touches the Fleet-RPC grant. Drives the
+    /// `EXEC_DEVICE` requirement — see `remote_config::decide`.
+    pub fn touches_exec(&self) -> bool {
+        self.exec_enabled.is_some()
+    }
+
+    /// Whether this request touches the SSH grant. Every `ssh_*` key counts,
+    /// not just `ssh_enabled`: authorized keys decide WHO may connect, and
+    /// `ssh_account_mode` decides what a key-list session may run — handing
+    /// those out is granting SSH just as much as flipping the switch is.
+    pub fn touches_ssh(&self) -> bool {
+        self.ssh_enabled.is_some()
+            || self.ssh_authorized_keys.is_some()
+            || self.ssh_account_mode.is_some()
+            || self.ssh_port.is_some()
+    }
 }
 
 /// Per-device roomler-SSH policy — gate 3 of four, the exact shape of
@@ -1503,6 +1583,41 @@ pub struct SshAuditEvent {
 
 impl SshAuditEvent {
     pub const COLLECTION: &'static str = "ssh_audit";
+}
+
+/// A desired-config write, granted or refused (`docs/remote-config.md`).
+///
+/// The refused rows are the point, as in [`SshAuditEvent`]: an admin probing
+/// which devices they can open exec on should not be able to do so silently.
+///
+/// ⚠️ A row records what was **ASKED FOR**, not what the device did. The
+/// device may be offline, may not have opted in, and may refuse — so reading
+/// these to answer "does this device have exec on?" is wrong in the same way
+/// reading `ssh_audit` to answer "how long was that session?" is wrong. The
+/// device's own heartbeat is the only truth for applied state.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ConfigAuditEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub tenant_id: ObjectId,
+    /// The device the change was aimed at.
+    pub agent_id: ObjectId,
+    /// Who asked.
+    pub user_id: ObjectId,
+    pub at: DateTime,
+    /// The requested state. Serialised whole so the row explains itself
+    /// without a join against a row that has since been overwritten.
+    pub requested: DesiredConfig,
+    /// `None` on a granted write; the [`ConfigDenyReason`] wire string on a
+    /// refusal.
+    ///
+    /// [`ConfigDenyReason`]: https://docs.rs/  (api crate, routes::remote_config)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied: Option<String>,
+}
+
+impl ConfigAuditEvent {
+    pub const COLLECTION: &'static str = "config_audit";
 }
 
 /// What a device reported doing inside an SSH session (P8).
