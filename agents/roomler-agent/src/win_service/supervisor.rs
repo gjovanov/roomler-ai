@@ -707,6 +707,25 @@ pub enum ExitReaction {
     /// Worker exited with a non-zero code. Increment the counter and
     /// wait `Duration` before respawning (exponential backoff).
     Backoff(Duration),
+    /// Worker refused to run because it is REDUNDANT — another process
+    /// already holds this config's single-instance lock. Stop supervising
+    /// and let the service exit cleanly.
+    ///
+    /// This is the only reaction that does not eventually respawn, and it
+    /// needs its own variant precisely because neither existing one is
+    /// survivable here:
+    ///
+    ///   * `Respawn` is what the bug was. The worker loses the lock check
+    ///     in ~milliseconds, so "respawn immediately, no backoff" is a hot
+    ///     loop with no upper bound.
+    ///   * `Backoff` would spin the ladder to its 60 s cap forever and,
+    ///     worse, bank a `SupervisorDetected` crash on every iteration —
+    ///     fleet crash metrics filling up with a *correct refusal*.
+    ///
+    /// Retrying cannot help: the other instance is not going away because
+    /// we asked. Whoever installed two daemon flavours has to remove one,
+    /// and a service that quietly stopped is the signal that says so.
+    Stop,
 }
 
 /// Cross-feature wrapper for [`crate::system_context::peer_presence::is_signaled`].
@@ -800,6 +819,11 @@ pub const SESSION_TEARDOWN_EXIT_CODE: u32 = 0x4001_0004;
 pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReaction, u32) {
     if code == 0 {
         (ExitReaction::Respawn, 0)
+    } else if code == crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32 {
+        // The worker is redundant, not broken. Checked BEFORE the generic
+        // non-zero arm below, which would otherwise put a correct refusal
+        // on the crash ladder. Counter reset because nothing failed.
+        (ExitReaction::Stop, 0)
     } else if code == SESSION_TEARDOWN_EXIT_CODE {
         // Counter reset (not a crash) but a 2 s floor, never zero-delay: an
         // external tool spamming this exit code must not create a
@@ -828,10 +852,16 @@ pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReacti
 ///     not the worker; recording every logon/VPN session flap as a
 ///     `SupervisorDetected` crash buried real crashes in the fleet
 ///     dashboard (CORPLAP-1 logged several per day).
+///   * `ALREADY_RUNNING_EXIT_CODE` — the worker declined to start because
+///     another instance already holds the lock. That is the single-instance
+///     guard working, not a crash; banking it would mean a host with two
+///     daemon flavours installed reporting a crash on every supervisor
+///     cycle forever.
 pub fn should_record_supervisor_crash(code: u32) -> bool {
     code != 0
         && code != crate::watchdog::STALL_EXIT_CODE as u32
         && code != crate::watchdog::AGENT_DELETED_EXIT_CODE as u32
+        && code != crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32
         && code != SESSION_TEARDOWN_EXIT_CODE
 }
 
@@ -1182,6 +1212,32 @@ pub fn run(
                                 "supervisor: worker exited cleanly (code=0); respawning without backoff"
                             );
                             respawn_at = None;
+                        }
+                        ExitReaction::Stop => {
+                            // At ERROR, not WARN: this needs an operator, and
+                            // it is the only thing that will resolve it. The
+                            // service stops cleanly rather than idling —
+                            // "Running" while supervising nothing is the
+                            // green-but-dead reading that hides the problem.
+                            //
+                            // A clean stop does NOT trigger SCM recovery
+                            // actions; those fire on unexpected termination.
+                            tracing::error!(
+                                pid = w.process.pid,
+                                code,
+                                "supervisor: another roomler daemon already holds this config's \
+                                 single-instance lock — this one is redundant. Stopping instead of \
+                                 respawning. Uninstall the duplicate daemon flavour (perMachine \
+                                 service vs perUser task) to clear this."
+                            );
+                            // No `terminate()` here, unlike the shutdown path
+                            // above: we are in the REAP arm, so the worker has
+                            // already exited. netd is a separate child and is
+                            // still running, so it does need stopping.
+                            if let Some(n) = netd.as_mut() {
+                                n.shutdown();
+                            }
+                            return Ok(());
                         }
                         ExitReaction::Backoff(backoff) => {
                             tracing::warn!(
@@ -2010,6 +2066,66 @@ mod tests {
         assert_eq!(
             decide_exit_reaction(1, 10),
             (ExitReaction::Backoff(RESPAWN_BACKOFF_CAP), 11)
+        );
+    }
+
+    /// The bug this fixes: a redundant worker loses the instance-lock check
+    /// in milliseconds, so mapping its exit to `Respawn` (no backoff) is an
+    /// unbounded hot loop, and mapping it to `Backoff` would climb the crash
+    /// ladder forever for a correct refusal. It must STOP.
+    #[test]
+    fn already_running_stops_the_supervisor() {
+        let code = crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32;
+        assert_eq!(
+            decide_exit_reaction(code, 0),
+            (ExitReaction::Stop, 0),
+            "a redundant worker must stop the supervisor, never respawn"
+        );
+        // Mid-ladder too: arriving with failures banked must not turn this
+        // into a Backoff, and must reset the counter — nothing failed.
+        assert_eq!(
+            decide_exit_reaction(code, 7),
+            (ExitReaction::Stop, 0),
+            "the reaction must not depend on the ladder state"
+        );
+    }
+
+    /// A correct refusal is not a crash. Without this, a host with two
+    /// daemon flavours installed would bank a `SupervisorDetected` crash on
+    /// every supervisor cycle and bury real crashes in the fleet dashboard —
+    /// the same failure `SESSION_TEARDOWN_EXIT_CODE` was excluded for.
+    #[test]
+    fn already_running_is_not_recorded_as_a_crash() {
+        assert!(!should_record_supervisor_crash(
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32
+        ));
+        // Guard the guard: an ordinary non-zero code still records, so this
+        // exclusion cannot silently widen.
+        assert!(should_record_supervisor_crash(1));
+    }
+
+    /// The sentinel is shared with the Linux units, which list it in
+    /// `RestartPreventExitStatus` (asserted in `watchdog`'s tests). Nothing
+    /// couples the three sites, so pin the value here as well — renumbering
+    /// it restores the respawn loop on BOTH platforms, silently.
+    #[test]
+    fn the_already_running_sentinel_is_pinned() {
+        assert_eq!(crate::watchdog::ALREADY_RUNNING_EXIT_CODE, 8);
+        // It must not collide with any other code the supervisor special-cases,
+        // or one meaning would shadow the other.
+        for (other, name) in [
+            (crate::watchdog::STALL_EXIT_CODE, "STALL"),
+            (crate::watchdog::AGENT_DELETED_EXIT_CODE, "AGENT_DELETED"),
+        ] {
+            assert_ne!(
+                crate::watchdog::ALREADY_RUNNING_EXIT_CODE,
+                other,
+                "ALREADY_RUNNING collides with {name}"
+            );
+        }
+        assert_ne!(
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32,
+            SESSION_TEARDOWN_EXIT_CODE
         );
     }
 

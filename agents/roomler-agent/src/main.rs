@@ -1567,13 +1567,19 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
 }
 
 /// How `run` terminates when another process already owns the
-/// single-instance lock. Linux exits with a sentinel its units list in
-/// `RestartPreventExitStatus`; every other platform exits 0, which is
-/// already the "don't respawn me" signal for launchd. The full
-/// per-platform reasoning lives on [`watchdog::ALREADY_RUNNING_EXIT_CODE`]
-/// — read it before changing either arm, because the two platforms want
-/// literally opposite exit codes here.
-#[cfg(target_os = "linux")]
+/// single-instance lock.
+///
+/// Linux and Windows exit with a sentinel their supervisor recognises
+/// (`RestartPreventExitStatus` in the units; `ExitReaction::Stop` in
+/// `win_service::supervisor`). macOS exits 0, which is already the
+/// "don't relaunch me" signal for launchd's
+/// `KeepAlive{SuccessfulExit:false}` — emitting the sentinel there would
+/// *create* the loop it fixes elsewhere.
+///
+/// The full per-platform reasoning lives on
+/// [`watchdog::ALREADY_RUNNING_EXIT_CODE`] — read it before changing an
+/// arm, because the platforms want literally opposite exit codes here.
+#[cfg(any(target_os = "linux", windows))]
 fn already_running_exit() -> Result<()> {
     // Diverges. The `eprintln!` above and the sync stdout tracing layer
     // have already emitted; only the non-blocking FILE layer can lose
@@ -1582,7 +1588,7 @@ fn already_running_exit() -> Result<()> {
     std::process::exit(watchdog::ALREADY_RUNNING_EXIT_CODE)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn already_running_exit() -> Result<()> {
     Ok(())
 }
