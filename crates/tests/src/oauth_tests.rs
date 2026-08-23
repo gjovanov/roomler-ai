@@ -227,21 +227,23 @@ async fn oauth_user_dao_does_not_duplicate_provider() {
 /// multi-tenant endpoint returns a tenant-settable `mail`, so treating it as
 /// an account key was an account-takeover path.
 ///
-/// When the address is free it gets its own account; when the address is
-/// already taken it is REFUSED, because `users.email` is uniquely indexed and
-/// a second account for one address cannot exist. Either way the identity is
-/// never linked to the existing user, which is the takeover-relevant property.
+/// When the address is free it gets its own account — holding a `.invalid`
+/// placeholder, never the asserted address. When the address is already taken
+/// it is REFUSED at step 2c: a parallel account is *possible* now that the
+/// placeholder removed the collision, but it would be invisible to whoever owns
+/// the address. Either way the identity is never linked to the existing user,
+/// which is the takeover-relevant property.
 #[tokio::test]
 async fn unverified_oauth_email_never_links_into_an_existing_account() {
     let app = TestApp::spawn().await;
     let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
 
     // Victim signs up normally AND completes activation, so the account has
-    // actually proven the address. Without the activation this test used to
-    // die in setup: the attacker's insert collided with the victim's row on
-    // the unique `users.email` index, and the create loop re-rolls only the
-    // username, so it burned five inserts and returned DuplicateKey before
-    // ever reaching an assertion.
+    // actually PROVEN the address. The activation is load-bearing for the last
+    // assertion in this test: step 2a links a verified identity only into an
+    // account that is itself verified, and an unactivated one would be evicted
+    // at 2b instead (see
+    // `an_unactivated_signup_cannot_hold_an_address_against_a_proven_identity`).
     let victim = dao
         .create(
             "victim@corp.example".to_string(),
@@ -265,6 +267,12 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
     //
     // Refusal is the correct outcome and was always the effective one: a
     // takeover needs the identity to be LINKED to the victim, and it never is.
+    //
+    // It is now a CHOICE rather than a forced outcome — #613's placeholder
+    // means the create could succeed — so this assertion is pinning a policy,
+    // not a mechanism. If someone deliberately changes 2c to mint the parallel
+    // account, this is the test to update; the two below are the ones that
+    // must not move.
     let err = dao
         .find_or_create_by_oauth(
             "microsoft",
