@@ -44,3 +44,42 @@ export function codecChips(a: Agent): CodecChip[] {
     }
   })
 }
+
+export interface PermissionWarning {
+  label: string
+  tooltip: string
+}
+
+/**
+ * Host permissions the agent is MISSING, as operator-facing warnings.
+ *
+ * macOS gates screen capture and input injection, and it never errors when a
+ * grant is absent: capture returns wallpaper-only frames and injected events
+ * are silently dropped. Without this the product's only symptom is a black
+ * screen or a dead mouse with a clean log — so the device list says it.
+ *
+ * ⚠️ `undefined` and `[]` mean OPPOSITE things and must not be collapsed:
+ * `undefined` is a pre-rc.454 agent that cannot report (no information — warn
+ * about nothing), `[]` is an agent reporting it holds NEITHER permission (warn
+ * about both). A falsy check would silence exactly the case that matters.
+ */
+export function permissionWarnings(a: Agent): PermissionWarning[] {
+  const perms = a.capabilities?.permissions
+  if (perms === undefined) return []
+  const out: PermissionWarning[] = []
+  if (!perms.includes('screen-capture')) {
+    out.push({
+      label: 'No screen access',
+      tooltip:
+        'The OS has not granted this device screen-capture permission, so the remote screen will be blank. On macOS: System Settings → Privacy & Security → Screen Recording.',
+    })
+  }
+  if (!perms.includes('input')) {
+    out.push({
+      label: 'No input access',
+      tooltip:
+        'The OS has not granted this device input-injection permission, so remote keyboard and mouse will do nothing. On macOS: System Settings → Privacy & Security → Accessibility.',
+    })
+  }
+  return out
+}
