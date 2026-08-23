@@ -83,6 +83,20 @@ enum Command {
         /// flavour passes this automatically.
         #[arg(long)]
         machine_global: bool,
+        /// Join the overlay mesh from the first start, instead of leaving
+        /// `overlay_enabled` off for the operator to flip afterwards.
+        ///
+        /// The alternative is a round trip through the running daemon
+        /// (`roomler config set overlay_enabled true`), which at INSTALL time
+        /// means racing the daemon's socket before it exists. This writes the
+        /// key with the rest of the enrolled config, so the very first start
+        /// is already correct.
+        ///
+        /// Default-off elsewhere is unchanged: this is opt-in per enrollment,
+        /// and the caller asking for it has already chosen to install
+        /// something privileged enough to bring up a TUN.
+        #[arg(long)]
+        overlay: bool,
     },
     /// Refresh this machine's agent token using a fresh enrollment JWT.
     /// Preserves `server_url` and `machine_name` from the existing
@@ -788,15 +802,19 @@ async fn main() -> Result<()> {
             machine_global,
             label,
             replace,
+            overlay,
         } => {
             enroll_cmd(
                 &config_path,
-                &server,
-                &token,
-                &name,
-                machine_global,
-                label.as_deref(),
-                replace,
+                EnrollOptions {
+                    server: &server,
+                    enrollment_token: &token,
+                    machine_name: &name,
+                    machine_global,
+                    label: label.as_deref(),
+                    replace,
+                    overlay,
+                },
             )
             .await
         }
@@ -1112,15 +1130,33 @@ fn resolve_encoder_preference(
     }
 }
 
-async fn enroll_cmd(
-    config_path: &Path,
-    server: &str,
-    enrollment_token: &str,
-    machine_name: &str,
+/// What `enroll` was asked to do.
+///
+/// A struct rather than eight positionals because three of them are bools:
+/// `enroll_cmd(.., true, false, true)` says nothing at the call site and a
+/// transposition compiles perfectly. Same reasoning as `OverlayNodeDao::create`
+/// (#621). Destructured exhaustively below, so a new field has to be given a
+/// meaning rather than silently ignored.
+struct EnrollOptions<'a> {
+    server: &'a str,
+    enrollment_token: &'a str,
+    machine_name: &'a str,
     machine_global: bool,
-    label: Option<&str>,
+    label: Option<&'a str>,
     replace: bool,
-) -> Result<()> {
+    overlay: bool,
+}
+
+async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
+    let EnrollOptions {
+        server,
+        enrollment_token,
+        machine_name,
+        machine_global,
+        label,
+        replace,
+        overlay,
+    } = opts;
     // rc.52: --machine-global retargets the write to
     // %PROGRAMDATA%\roomler\roomler-agent\config.toml so a perMachine
     // + SystemContext host's LocalSystem worker can load it pre-logon.
@@ -1177,7 +1213,7 @@ async fn enroll_cmd(
     // (operator state preserved — rc.204 semantics); a NEW pair → APPEND a
     // secondary org (with its own freshly minted WG key); `--replace` →
     // legacy whole-primary rebind.
-    let (cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
+    let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
 
     // rc.52: a machine-global write needs admin (%PROGRAMDATA% +, on
     // the installer path, an ACL-restricted parent dir). On a
@@ -1186,6 +1222,16 @@ async fn enroll_cmd(
     // think they enrolled. We must NOT fall back to %APPDATA%: a
     // SystemContext worker would never find the config there and
     // would crash-loop pre-logon (rc.51 Finding 3).
+    // `--overlay`: set BEFORE the save, so the first start already has it.
+    // Deliberately only ever turns it ON — an enrollment refresh on a host
+    // that already joined the mesh must not silently drop it back out (the
+    // same invariant `enrollment.rs` protects when merging an existing
+    // config).
+    if overlay && !cfg.overlay_enabled {
+        cfg.overlay_enabled = true;
+        tracing::info!("overlay participation enabled by --overlay");
+    }
+
     config::save(&target_path, &cfg).map_err(|e| {
         if machine_global {
             anyhow::anyhow!(
