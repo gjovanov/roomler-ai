@@ -80,9 +80,9 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 /// rc.439: sentinel for "another process already holds this config's
 /// single-instance lock, so this one is redundant — do NOT respawn it."
 ///
-/// **Linux only, deliberately.** Exit 0 means opposite things depending
-/// on who is supervising, and this path needs the opposite of what a
-/// self-update needs:
+/// **Linux and Windows; NOT macOS.** Exit 0 means opposite things
+/// depending on who is supervising, and this path needs the opposite of
+/// what a self-update needs:
 ///
 ///   * **Linux** `Restart=always` restarts even on a *successful* exit —
 ///     it has to, because a self-update exits 0 on purpose and must come
@@ -97,12 +97,35 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 ///     UNsuccessful exit, so plain 0 is already correct there — emitting
 ///     this code would *create* the very loop it fixes on Linux.
 ///   * **Windows** `decide_exit_reaction` maps 0 to an immediate respawn
-///     with no backoff, so it has the same bug in a worse shape; fixing
-///     it needs a new `ExitReaction`, not this constant (a non-zero code
-///     there would respawn on the backoff ladder AND record a crash
-///     sidecar). Tracked separately.
+///     with NO backoff — the same bug in a worse shape than Linux's 5 s
+///     spacing. Fixed by emitting this code here too and giving the
+///     supervisor an `ExitReaction::Stop` arm for it, plus a
+///     `should_record_supervisor_crash` exclusion. Both were required:
+///     without the arm a non-zero code lands in the generic `else` and
+///     respawns on the escalating ladder, and without the exclusion every
+///     iteration banks a `SupervisorDetected` crash for what is a correct
+///     refusal.
+///
+/// ⚠️ **Windows side-effect, accepted deliberately.** Nothing distinguishes
+/// a supervisor-spawned worker from a directly launched one — both run
+/// `Command::Run` — so the perUser *Scheduled Task* flavour now also exits
+/// non-zero when it loses the lock, which trips its `<RestartOnFailure>`
+/// (10 attempts, 1 min apart, then it stops for good). That is bounded and
+/// self-terminating, unlike the supervisor loop this fixes, and it is
+/// arguably the better signal: exiting 0 left the task reporting SUCCESS
+/// while doing nothing, so an operator who had installed two conflicting
+/// flavours got no indication at all. A "last run failed" task is a
+/// visible, actionable state. If the 10 launches ever matter, the fix is a
+/// supervised-worker marker on the spawn — not reverting to 0, which is
+/// ambiguous with a self-update.
 ///
 /// Emitted by the `AcquireOutcome::AlreadyRunning` arm in `main.rs`.
+/// ⚠️ Three places must agree, in three different files, with nothing
+/// coupling them: this constant, the Linux units'
+/// `RestartPreventExitStatus`, and the Windows supervisor's `Stop` arm.
+/// Renumbering it alone silently restores the loop on BOTH platforms.
+/// The tests below assert the units; `already_running_stops_the_supervisor`
+/// in `win_service::supervisor` asserts the Windows half.
 pub const ALREADY_RUNNING_EXIT_CODE: i32 = 8;
 
 /// Process-wide singleton. Set by `install`; read by the free
