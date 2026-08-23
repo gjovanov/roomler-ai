@@ -2996,30 +2996,42 @@ async fn media_pump_vp9_444_dc(
         let bytes_written = bytes_written.clone();
         let send_errors = send_errors.clone();
         let task_session = session_id;
+        let goodput_sink = governor.goodput_sink();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
-            while let Some(wire) = send_rx.recv().await {
-                let Some(dc) = video_bytes_dc.lock().await.clone() else {
-                    continue;
-                };
-                let total = wire.len();
-                let mut off = 0usize;
-                let mut ok = true;
-                while off < total {
-                    let end = (off + SCTP_CHUNK_SIZE).min(total);
-                    if let Err(e) = dc.send(&wire.slice(off..end)).await {
-                        let n = send_errors.fetch_add(1, Relaxed) + 1;
-                        tracing::warn!(session = %task_session, %e, send_errors = n, "VP9-444 DC send task: DC send failed");
-                        ok = false;
-                        break;
+            // Measured-rate stage 0 — see the twin in the FFmpeg pump for
+            // why the loop brackets busy periods rather than timing each
+            // frame: a frame handed to a buffer with headroom measures the
+            // buffer, not the pipe (`encode::goodput`).
+            while let Some(first) = send_rx.recv().await {
+                let busy_start = std::time::Instant::now();
+                let mut busy_bytes = 0u64;
+                let mut next = Some(first);
+                while let Some(wire) = next.take() {
+                    if let Some(dc) = video_bytes_dc.lock().await.clone() {
+                        let total = wire.len();
+                        let mut off = 0usize;
+                        let mut ok = true;
+                        while off < total {
+                            let end = (off + SCTP_CHUNK_SIZE).min(total);
+                            if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                                let n = send_errors.fetch_add(1, Relaxed) + 1;
+                                tracing::warn!(session = %task_session, %e, send_errors = n, "VP9-444 DC send task: DC send failed");
+                                ok = false;
+                                break;
+                            }
+                            off = end;
+                        }
+                        if ok {
+                            frames_sent.fetch_add(1, Relaxed);
+                            bytes_written.fetch_add(total as u64, Relaxed);
+                            busy_bytes += total as u64;
+                        }
                     }
-                    off = end;
+                    next = send_rx.try_recv().ok();
                 }
-                if ok {
-                    frames_sent.fetch_add(1, Relaxed);
-                    bytes_written.fetch_add(total as u64, Relaxed);
-                }
+                goodput_sink.record(busy_bytes, busy_start.elapsed());
             }
             tracing::debug!(session = %task_session, "VP9-444 DC send task exiting (channel closed)");
         });
@@ -4260,49 +4272,74 @@ async fn media_pump_ffmpeg_dc(
         let inflight_bytes = inflight_bytes.clone();
         let send_epoch = send_epoch.clone();
         let task_session = session_id;
+        let goodput_sink = governor.goodput_sink();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
-            while let Some((epoch, wire)) = send_rx.recv().await {
-                let total = wire.len();
-                // rc.445 — a frame from a PREVIOUS encoder epoch is stale
-                // motion the rebuild obsoleted; drop it so the fresh IDR
-                // behind it ships immediately (still settles the ledger).
-                if epoch < send_epoch.load(Relaxed) {
-                    inflight_bytes.fetch_sub(total, Relaxed);
-                    continue;
-                }
-                // Fetch the DC fresh each frame — the same handle the pump's
-                // open-check uses. None means it closed under us (the pump's
-                // open-guard re-requests a keyframe on its side); the frame
-                // is dropped but must still leave the in-flight ledger below.
-                if let Some(dc) = video_bytes_dc.lock().await.clone() {
-                    let mut off = 0usize;
-                    let mut ok = true;
-                    while off < total {
-                        let end = (off + SCTP_CHUNK_SIZE).min(total);
-                        // `wire.slice` is zero-copy (shares the Bytes buffer).
-                        if let Err(e) = dc.send(&wire.slice(off..end)).await {
-                            let n = send_errors.fetch_add(1, Relaxed) + 1;
-                            tracing::warn!(
-                                session = %task_session, %e, send_errors = n,
-                                "FFmpeg DC pump send task: DC send failed"
-                            );
-                            ok = false;
-                            break;
+            // Measured-rate stage 0 — bracket BUSY PERIODS. The outer
+            // `recv().await` is by definition the queue running dry, so a
+            // period runs from the frame that ends an idle wait until
+            // `try_recv` misses. Only across such a stretch does
+            // bytes/time mean the pipe's drain rate; a lone frame handed
+            // to a buffer with headroom serialises instantly and measures
+            // nothing (see `encode::goodput`).
+            //
+            // Equivalent to the previous `while let Some(..) = recv()`:
+            // same frames, same order, same awaits. The inner loop only
+            // takes what `recv().await` would have returned immediately.
+            while let Some(first) = send_rx.recv().await {
+                let busy_start = std::time::Instant::now();
+                let mut busy_bytes = 0u64;
+                let mut next = Some(first);
+                while let Some((epoch, wire)) = next.take() {
+                    let total = wire.len();
+                    // rc.445 — a frame from a PREVIOUS encoder epoch is stale
+                    // motion the rebuild obsoleted; drop it so the fresh IDR
+                    // behind it ships immediately (still settles the ledger).
+                    let stale = epoch < send_epoch.load(Relaxed);
+                    // Fetch the DC fresh each frame — the same handle the pump's
+                    // open-check uses. None means it closed under us (the pump's
+                    // open-guard re-requests a keyframe on its side); the frame
+                    // is dropped but must still leave the in-flight ledger below.
+                    if !stale && let Some(dc) = video_bytes_dc.lock().await.clone() {
+                        let mut off = 0usize;
+                        let mut ok = true;
+                        while off < total {
+                            let end = (off + SCTP_CHUNK_SIZE).min(total);
+                            // `wire.slice` is zero-copy (shares the Bytes buffer).
+                            if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                                let n = send_errors.fetch_add(1, Relaxed) + 1;
+                                tracing::warn!(
+                                    session = %task_session, %e, send_errors = n,
+                                    "FFmpeg DC pump send task: DC send failed"
+                                );
+                                ok = false;
+                                break;
+                            }
+                            off = end;
                         }
-                        off = end;
+                        if ok {
+                            frames_sent.fetch_add(1, Relaxed);
+                            bytes_written.fetch_add(total as u64, Relaxed);
+                            // Only bytes that reached the wire measure the
+                            // pipe. A stale-dropped or failed frame did not.
+                            busy_bytes += total as u64;
+                        }
                     }
-                    if ok {
-                        frames_sent.fetch_add(1, Relaxed);
-                        bytes_written.fetch_add(total as u64, Relaxed);
-                    }
+                    // Byte-budget ledger: the frame left the queue (delivered
+                    // into SCTP, failed, or dropped on a closed DC). Increments
+                    // strictly precede the frame's entry into the channel, so
+                    // this can't underflow.
+                    inflight_bytes.fetch_sub(total, Relaxed);
+                    // Stay in the busy period only while the queue never
+                    // emptied. `try_recv` takes exactly what `recv().await`
+                    // would have returned immediately, so this is a
+                    // measurement boundary and not a scheduling change.
+                    // Disconnected falls out here too — the outer `recv`
+                    // then returns None and the task exits as before.
+                    next = send_rx.try_recv().ok();
                 }
-                // Byte-budget ledger: the frame left the queue (delivered
-                // into SCTP, failed, or dropped on a closed DC). Increments
-                // strictly precede the frame's entry into the channel, so
-                // this can't underflow.
-                inflight_bytes.fetch_sub(total, Relaxed);
+                goodput_sink.record(busy_bytes, busy_start.elapsed());
             }
             tracing::debug!(session = %task_session, "FFmpeg DC pump send task exiting (channel closed)");
         });
@@ -5353,6 +5390,13 @@ async fn media_pump_ffmpeg_dc(
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
                 bytes_inflight = inflight_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                // Measured-rate stage 0 — OBSERVED, not applied. Read
+                // against `target_bps` above: the gap between them is the
+                // open-loop error stage 1 exists to close. None = no
+                // confidence (expected on unbound/direct links); the
+                // sample counts distinguish that from a wiring fault.
+                goodput_bps = ?governor.measured_goodput_bps(std::time::Instant::now()),
+                goodput_samples = ?governor.goodput_samples(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
