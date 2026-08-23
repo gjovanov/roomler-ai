@@ -173,6 +173,13 @@ async fn oauth_user_dao_links_existing_user() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 201);
 
+    // Complete the sign-up. Registration alone leaves `is_verified: false` —
+    // an address typed into a form, not a proven one — and OAuth deliberately
+    // refuses to link into an account in that state (see the eviction test
+    // below). This is the ordinary "user finished activation, then adds a
+    // social login" case.
+    app.activate_user("existing@test.com").await;
+
     // Now use OAuth with the same email
     let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
     let user = dao
@@ -225,7 +232,12 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
     let app = TestApp::spawn().await;
     let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
 
-    // Victim signs up normally.
+    // Victim signs up normally AND completes activation, so the account has
+    // actually proven the address. Without the activation this test used to
+    // die in setup: the attacker's insert collided with the victim's row on
+    // the unique `users.email` index, and the create loop re-rolls only the
+    // username, so it burned five inserts and returned DuplicateKey before
+    // ever reaching an assertion.
     let victim = dao
         .create(
             "victim@corp.example".to_string(),
@@ -235,6 +247,7 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
         )
         .await
         .unwrap();
+    app.activate_user("victim@corp.example").await;
 
     // Attacker signs in via a provider asserting the SAME address with no
     // verification claim — must NOT resolve to the victim.
@@ -293,4 +306,139 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
         .await
         .unwrap();
     assert_eq!(linked.id.unwrap(), victim.id.unwrap());
+}
+
+/// Refusing to *link* an unverified assertion is only half of it: `users.email`
+/// is a UNIQUE index, so writing the claimed address there at all would let a
+/// hostile tenant RESERVE an address it does not own — blocking the real
+/// owner's sign-up and collecting invites addressed to them. Same takeover,
+/// one step further back.
+#[tokio::test]
+async fn an_unverified_identity_does_not_reserve_the_asserted_address() {
+    let app = TestApp::spawn().await;
+    let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
+
+    // Attacker gets there first, asserting an address it does not own.
+    let attacker = dao
+        .find_or_create_by_oauth(
+            "microsoft",
+            "ms-attacker-oid",
+            "victim@corp.example",
+            "Not The Victim",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        attacker.email, "victim@corp.example",
+        "an unproven claim must never land in the unique key"
+    );
+    assert!(
+        attacker.email.ends_with("@unverified.invalid"),
+        "placeholder must be undeliverable, got {}",
+        attacker.email
+    );
+    assert_eq!(
+        attacker.unverified_email.as_deref(),
+        Some("victim@corp.example"),
+        "the claim is still recorded — just not as ownership"
+    );
+    assert!(!attacker.is_verified);
+
+    // So the address is still free, and its real owner can sign up.
+    let victim = dao
+        .create(
+            "victim@corp.example".to_string(),
+            "victim".to_string(),
+            "Victim".to_string(),
+            "hash".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(victim.id.unwrap(), attacker.id.unwrap());
+
+    // The unverified identity still signs in, stably, to its own account —
+    // the promise the old code broke as soon as the address was taken.
+    let again = dao
+        .find_or_create_by_oauth(
+            "microsoft",
+            "ms-attacker-oid",
+            "victim@corp.example",
+            "Not The Victim",
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.id.unwrap(), attacker.id.unwrap());
+}
+
+/// The mirror image, and the reason the verified side needs a check too: a
+/// password sign-up that never activated has not proven its address either, so
+/// it cannot hold it against an identity that has.
+///
+/// Left merged, an attacker who registers `victim@corp` with a password of
+/// their choosing and simply waits would end up sharing the victim's account —
+/// and could password-log-in the moment the victim clicked the activation mail
+/// that lands in the victim's OWN inbox.
+#[tokio::test]
+async fn an_unactivated_signup_cannot_hold_an_address_against_a_proven_identity() {
+    let app = TestApp::spawn().await;
+    let dao = roomler_ai_services::dao::user::UserDao::new(&app.db);
+
+    // Registered, password known to the attacker, never activated.
+    let squatter = dao
+        .create(
+            "victim@corp.example".to_string(),
+            "squatter".to_string(),
+            "Squatter".to_string(),
+            "attacker-known-hash".to_string(),
+        )
+        .await
+        .unwrap();
+    assert!(!squatter.is_verified);
+
+    // The real owner arrives with an address the provider verified.
+    let victim = dao
+        .find_or_create_by_oauth(
+            "google",
+            "g-victim",
+            "victim@corp.example",
+            "Victim",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(
+        victim.id.unwrap(),
+        squatter.id.unwrap(),
+        "a proven identity must not be merged into an unproven claim"
+    );
+    assert_eq!(victim.email, "victim@corp.example");
+    assert!(victim.is_verified);
+    assert!(
+        victim.password_hash.is_none(),
+        "the attacker's password must not come attached to the account"
+    );
+
+    // The claim is evicted, not deleted — the row survives, it just no longer
+    // owns the address, and says what it used to claim.
+    let evicted = dao.base.find_by_id(squatter.id.unwrap()).await.unwrap();
+    assert!(
+        evicted.email.ends_with("@unverified.invalid"),
+        "evicted claim must release the address, got {}",
+        evicted.email
+    );
+    assert_eq!(
+        evicted.unverified_email.as_deref(),
+        Some("victim@corp.example")
+    );
+
+    // And the address now resolves to the account that proved it.
+    let owner = dao.find_by_email("victim@corp.example").await.unwrap();
+    assert_eq!(owner.id.unwrap(), victim.id.unwrap());
 }
