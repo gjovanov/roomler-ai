@@ -17,6 +17,34 @@ pub struct TestApp {
     pub state: AppState,
 }
 
+/// Install a tracing subscriber ONCE per test binary, only when `RUST_LOG`
+/// is set.
+///
+/// Without this the harness has no subscriber at all, so every `info!` and
+/// `warn!` the server emits is discarded — and several of those lines exist
+/// precisely to explain a refusal. `/derp` registration is the worst case: it
+/// refuses with `info!` and returns, so the symptom is a directory record that
+/// silently never appears, and `RUST_LOG=info` does nothing to help you (it
+/// cost a long diagnosis in #612). Failures like that are meant to be readable.
+///
+/// Opt-in rather than always-on: the suite is chatty and most runs don't want
+/// it. `with_test_writer` routes through the harness capture, so output shows
+/// up under `--nocapture` and stays attached to the failing test otherwise.
+fn init_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if std::env::var("RUST_LOG").is_ok() {
+            // `try_init` because a global default may already exist; a second
+            // install must never abort a test run.
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_test_writer()
+                .try_init();
+        }
+    });
+}
+
 impl TestApp {
     /// Spawn a new test server connected to the test MongoDB.
     ///
@@ -24,6 +52,7 @@ impl TestApp {
     /// Set ROOMLER__DATABASE__URL env var to override the connection string.
     /// Each test gets a unique database name for isolation.
     pub async fn spawn() -> Self {
+        init_tracing();
         let db_name = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
 
         let mut settings = Settings::load().unwrap_or_else(|_| {
@@ -91,6 +120,7 @@ impl TestApp {
     /// pass a `mutator` applied to BOTH apps' settings for e.g. short
     /// liveness deadlines.
     pub async fn spawn_pair(mutator: fn(&mut Settings)) -> (Self, Self) {
+        init_tracing();
         let shared_db = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
         let run = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let (db1, pod1) = (shared_db.clone(), format!("testpod1-{run}"));
@@ -117,6 +147,7 @@ impl TestApp {
     /// The `mutator` closure receives a `&mut Settings` after defaults are applied,
     /// allowing tests to tweak specific fields (e.g., TURN config).
     pub async fn spawn_with_settings(mutator: impl FnOnce(&mut Settings)) -> Self {
+        init_tracing();
         let db_name = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
 
         let mut settings = Settings::load().unwrap_or_else(|_| test_settings());
@@ -180,6 +211,7 @@ impl TestApp {
     /// Spawn a test server with OAuth providers configured (fake client IDs).
     /// Uses a no-redirect reqwest client so we can inspect the 302/307 Location header.
     pub async fn spawn_with_oauth() -> Self {
+        init_tracing();
         let db_name = format!("roomler_ai_test_{}", uuid::Uuid::new_v4().simple());
 
         let mut settings = Settings::load().unwrap_or_else(|_| test_settings());
