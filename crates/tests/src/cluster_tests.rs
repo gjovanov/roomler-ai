@@ -822,9 +822,17 @@ async fn derp_split_rehomes_toward_newest_registration() {
     let network_id = networks.get_or_create(tid).await.unwrap().id.unwrap();
     let pk_a: [u8; 32] = [0xa1; 32];
     let pk_b: [u8; 32] = [0xb2; 32];
-    for (aid, pk, ip, name) in [
-        (&aid_a, pk_a, "100.64.0.1", "derp-node-a"),
-        (&aid_b, pk_b, "100.64.0.2", "derp-node-b"),
+    // ⚠️ `machine_id` MUST be the id the agent enrolled with. `/derp`
+    // resolves the socket's node via `current_node` →
+    // agent_id → `agent.machine_id` → node by {tenant_id, machine_id}; a node
+    // row keyed to any other machine is invisible to it, the registration is
+    // refused with only an INFO line, and the directory record never appears.
+    // Production cannot produce that mismatch (`rc:overlay.join` writes the
+    // agent's own machine id), so it is purely a fixture hazard — and this
+    // fixture had `mach-{name}` against agents enrolled as `derp-mach-{a,b}`.
+    for (aid, machine, pk, ip, name) in [
+        (&aid_a, "derp-mach-a", pk_a, "100.64.0.1", "derp-node-a"),
+        (&aid_b, "derp-mach-b", pk_b, "100.64.0.2", "derp-node-b"),
     ] {
         nodes
             .create(
@@ -833,7 +841,7 @@ async fn derp_split_rehomes_toward_newest_registration() {
                     agent_id: bson::oid::ObjectId::parse_str(aid).unwrap(),
                 },
                 network_id,
-                format!("mach-{name}"),
+                machine.to_string(),
                 name.to_string(),
                 ip.to_string(),
                 B64.encode(pk),
@@ -920,13 +928,28 @@ async fn cluster_status_reports_pod_counters_and_gauges() {
     let tenant = app.seed_tenant("clstat").await;
 
     // Unauthenticated → 401.
-    let resp = app
-        .client
+    //
+    // ⚠️ Must NOT reuse `app.client`: it is built with `.cookie_store(true)`,
+    // and `seed_tenant` above registers/logs in, so the jar is holding the
+    // `access_token` cookie that `/api/auth/{register,login}` set. `AuthUser`
+    // accepts a cookie as well as a bearer header, so this "anonymous" request
+    // was quietly authenticated and came back 200 — the test was asserting
+    // against a request it never actually made. A fresh jarless client is the
+    // only way to probe the anonymous path.
+    let anon = reqwest::Client::builder()
+        .cookie_store(false)
+        .build()
+        .unwrap();
+    let resp = anon
         .get(app.url("/api/cluster/status"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 401);
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "cluster status must refuse an anonymous caller"
+    );
 
     let body: serde_json::Value = app
         .auth_get("/api/cluster/status", &tenant.admin.access_token)
@@ -1020,7 +1043,10 @@ async fn shutdown_releases_tunnel_and_derp_records() {
                 agent_id: bson::oid::ObjectId::parse_str(&aid).unwrap(),
             },
             network_id,
-            "mach-shut".into(),
+            // Must match the enrolled machine id (see the note in
+            // `derp_split_rehomes_toward_newest_registration`) — this said
+            // "mach-shut" against an agent enrolled as "shut-mach".
+            "shut-mach".into(),
             "shut-node".into(),
             "100.64.0.9".into(),
             B64.encode(pk),
