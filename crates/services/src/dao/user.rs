@@ -134,6 +134,30 @@ impl UserDao {
             return Ok(user);
         }
 
+        // 2b. Reaching here with the address already taken means step 2
+        //     DECLINED to link it — i.e. the provider did not verify it.
+        //
+        //     The nOAuth doc comment says such an identity "must get its OWN
+        //     account", but that is not reachable: `users.email` is uniquely
+        //     indexed, so the create below inserts a second row with the same
+        //     address, collides on EMAIL, and the retry loop — which assumes
+        //     every duplicate key is a username clash — burns all five attempts
+        //     and reports "Failed to generate unique username after retries".
+        //     An error about the wrong field entirely, for a condition that can
+        //     never succeed.
+        //
+        //     Refusing is the correct answer and always was the effective one:
+        //     linking is what a takeover needs, and we still never link. What
+        //     changes here is only that the refusal says what happened, so the
+        //     caller can tell the user to sign in with their existing
+        //     credentials or via a provider that asserts `email_verified`.
+        if self.find_by_email(email).await.is_ok() {
+            return Err(DaoError::DuplicateKey(format!(
+                "an account already exists for {email} and {provider} did not \
+                 verify the address — sign in with your existing credentials"
+            )));
+        }
+
         // 3. Create new user — generate unique username with retry on collision
         let now = DateTime::now();
         let base_username: String = display_name
