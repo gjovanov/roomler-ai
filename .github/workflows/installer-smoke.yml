@@ -600,7 +600,22 @@ jobs:
           # The general rule this cost three CI cycles to relearn: an installer
           # smoke must build its artifact EXACTLY as the release does, or it
           # tests something nobody ships.
-          pkgbuild --root payload --scripts scripts --identifier com.roomler.agent \
+          # Pin the bundle to its payload path — see the same block in
+          # release-agent.yml. Without it PackageKit relocates the .app to
+          # whatever copy LaunchServices already knows about, which on this
+          # runner is the staging directory this pkg was built from, and the
+          # postinstall then finds nothing at /Applications.
+          pkgbuild --analyze --root payload component.plist
+          i=0
+          while /usr/libexec/PlistBuddy -c "Print :$i:BundleIsRelocatable" component.plist >/dev/null 2>&1; do
+            /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" component.plist
+            i=$((i + 1))
+          done
+          [ "$i" -gt 0 ] || { echo "::error::pkgbuild --analyze found no bundle component to pin"; exit 1; }
+          plutil -p component.plist
+
+          pkgbuild --root payload --component-plist component.plist \
+            --scripts scripts --identifier com.roomler.agent \
             --version "$VERSION" --install-location / component.pkg
           productbuild --package component.pkg dist/smoke.pkg
 
