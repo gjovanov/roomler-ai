@@ -579,7 +579,22 @@ jobs:
             --version "$VERSION" --install-location / dist/smoke.pkg
 
       - name: Install it
-        run: sudo installer -pkg dist/smoke.pkg -target /
+        run: sudo installer -verbose -pkg dist/smoke.pkg -target /
+
+      # `installer` reports script failures as one opaque sentence ("An error
+      # occurred while running scripts from the package") and puts the actual
+      # stderr in the system log. Without this the only way to find out why a
+      # postinstall failed is to guess.
+      - name: Why the install failed
+        if: failure()
+        run: |
+          echo "=== console user ==="
+          stat -f "%Su" /dev/console || true
+          echo "=== install.log (roomler + script lines) ==="
+          sudo tail -200 /var/log/install.log | grep -iE "roomler|script|error|fail" || true
+          echo "=== what landed anyway ==="
+          ls -la /Applications/roomler-agent.app/Contents/MacOS/ 2>&1 || true
+          ls -la /usr/local/bin/roomler 2>&1 || true
 
       - name: Assert the payload landed where everything expects it
         run: |
