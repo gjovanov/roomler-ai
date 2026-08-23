@@ -52,6 +52,7 @@ jobs:
             --disable-gpl --disable-nonfree \
             --enable-videotoolbox \
             --disable-programs --disable-doc --disable-debug \
+            --disable-xlib --disable-libxcb \
             --install-name-dir=@rpath \
             --enable-pic
           make -j"$(sysctl -n hw.ncpu)"
@@ -68,6 +69,26 @@ jobs:
           otool -D lib/libavcodec.*.dylib | tail -1
           echo "=== libavcodec sibling deps (want @rpath/libav*) ==="
           otool -L lib/libavcodec.*.dylib | grep -E '@rpath|/opt|/usr/local' || true
+
+          echo "=== no dylib may depend on Homebrew ==="
+          # This check used to print `/opt` hits and swallow them with `|| true`,
+          # and the 2026-08-22 artifact did contain them: configure autodetected
+          # the runner's Homebrew X11, baking /opt/homebrew/opt/libx11/... into
+          # six of the seven dylibs (and four libxcb* into libavdevice). Nothing
+          # on an end-user Mac provides those, so the agent that bundled them
+          # was killed by dyld at launch. `--disable-xlib --disable-libxcb`
+          # above prevents it; this makes the prevention enforceable.
+          bad=0
+          for so in lib/*.dylib; do
+            refs="$(otool -L "$so" | tail -n +2 | awk '{print $1}' \
+                    | grep -E '^/(opt|usr/local)/' || true)"
+            if [ -n "$refs" ]; then
+              echo "::error::$so depends on a non-system path:"; echo "$refs" | sed 's/^/    /'
+              bad=1
+            fi
+          done
+          [ "$bad" -eq 0 ] || exit 1
+          echo "  clean — system frameworks and @rpath siblings only."
           echo "=== confirm NO GPL encoders linked (no libx264/libx265) ==="
           if otool -L lib/libavcodec.*.dylib | grep -Ei 'x264|x265'; then
             echo "::error::GPL codec linked — build is not LGPL-clean"; exit 1
