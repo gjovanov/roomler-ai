@@ -4,6 +4,40 @@ use roomler_ai_db::models::{NotificationPrefs, OAuthProvider, Presence, User, Us
 
 use super::base::{BaseDao, DaoError, DaoResult};
 
+/// Domain for addresses that are recorded but **not owned**.
+///
+/// `.invalid` is reserved by RFC 2606 precisely so it can never be delegated,
+/// so nothing here can collide with, or be mistaken for, a real address — and
+/// mail to it cannot leave the building.
+const UNPROVEN_EMAIL_DOMAIN: &str = "unverified.invalid";
+
+/// Placeholder `email` for an account created from an OAuth identity whose
+/// address the provider did not verify.
+///
+/// Deterministic in the provider identity so the same identity maps to the
+/// same row rather than accumulating one per sign-in (step 1 catches it first
+/// in practice; this makes the index agree).
+fn unverified_placeholder_email(provider: &str, provider_id: &str) -> String {
+    let id: String = provider_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{provider}-{id}@{UNPROVEN_EMAIL_DOMAIN}")
+}
+
+/// Placeholder `email` for an account whose unproven claim on a real address
+/// was evicted in favour of an identity that proved it. Keyed on the account's
+/// own id, which is unique by construction.
+fn evicted_placeholder_email(user_id: &ObjectId) -> String {
+    format!("unclaimed-{}@{UNPROVEN_EMAIL_DOMAIN}", user_id.to_hex())
+}
+
 pub struct UserDao {
     pub base: BaseDao<User>,
 }
@@ -26,6 +60,7 @@ impl UserDao {
         let user = User {
             id: None,
             email,
+            unverified_email: None,
             username,
             display_name,
             avatar: None,
@@ -86,6 +121,29 @@ impl UserDao {
     /// arbitrary address, so treating it as an account key let a hostile
     /// tenant claim someone else's account. An unverified identity still
     /// signs in — it just gets its own account instead of inheriting one.
+    ///
+    /// The one invariant everything here serves:
+    ///
+    /// > **`users.email` holds an address only if that account proved it.**
+    ///
+    /// It is a unique index, so it is not merely a contact field — it is a
+    /// *reservation*, and it is what invites and account-linking key off.
+    /// Three consequences, all of which used to be violated:
+    ///
+    /// - An unverified assertion never lands in `email`; it goes to
+    ///   `unverified_email` and the row takes a `.invalid` placeholder
+    ///   ([`unverified_placeholder_email`]). Otherwise a hostile tenant could
+    ///   reserve an address it does not own, block the real owner's sign-up,
+    ///   and collect invites addressed to it.
+    /// - Linking (step 2) requires the *target* account to be verified too. A
+    ///   one-sided check is not enough: an attacker who registers with a
+    ///   password as `victim@corp` and never activates leaves an unproven
+    ///   account holding the address, and the victim's later Google sign-in
+    ///   would be merged straight into it — password included.
+    /// - When a proven identity meets an unproven claim on the same address,
+    ///   the claim is **evicted**, not merged (step 2b). Safe by construction:
+    ///   an unverified account cannot have been used, because password login
+    ///   refuses it and it owns no verified provider identity.
     pub async fn find_or_create_by_oauth(
         &self,
         provider: &str,
@@ -108,30 +166,65 @@ impl UserDao {
             return Ok(user);
         }
 
-        // 2. Try to find user by email and link the OAuth provider —
-        //    ONLY for a provider-verified address (see the doc comment).
-        if email_verified && let Ok(mut user) = self.find_by_email(email).await {
-            let already_linked = user
-                .oauth_providers
-                .iter()
-                .any(|p| p.provider == provider && p.provider_id == provider_id);
-            if !already_linked {
-                let oauth = OAuthProvider {
-                    provider: provider.to_string(),
-                    provider_id: provider_id.to_string(),
-                    access_token: None,
-                    refresh_token: None,
-                };
-                let oauth_bson = bson::to_bson(&oauth)?;
-                self.base
-                    .update_by_id(
-                        user.id.unwrap(),
-                        doc! { "$push": { "oauth_providers": oauth_bson } },
-                    )
-                    .await?;
-                user.oauth_providers.push(oauth);
+        // 2. Resolve by address — ONLY for one the provider proved.
+        if email_verified {
+            match self.find_by_email(email).await {
+                // 2a. Held by an account that proved it: link and sign in.
+                Ok(mut user) if user.is_verified => {
+                    let already_linked = user
+                        .oauth_providers
+                        .iter()
+                        .any(|p| p.provider == provider && p.provider_id == provider_id);
+                    if !already_linked {
+                        let oauth = OAuthProvider {
+                            provider: provider.to_string(),
+                            provider_id: provider_id.to_string(),
+                            access_token: None,
+                            refresh_token: None,
+                        };
+                        let oauth_bson = bson::to_bson(&oauth)?;
+                        self.base
+                            .update_by_id(
+                                user.id.unwrap(),
+                                doc! { "$push": { "oauth_providers": oauth_bson } },
+                            )
+                            .await?;
+                        user.oauth_providers.push(oauth);
+                    }
+                    return Ok(user);
+                }
+                // 2b. Held WITHOUT proof. The arriving identity has proof and
+                //     this one does not, so the claim is evicted rather than
+                //     inherited, and we fall through to create a clean
+                //     account. Nothing is destroyed: an unverified account
+                //     cannot have been signed into (password login refuses it,
+                //     and any verified provider identity would have made it
+                //     verified), so there is no session or content to lose.
+                Ok(squatter) => {
+                    let holder = squatter.id.unwrap();
+                    self.base
+                        .update_by_id(
+                            holder,
+                            doc! { "$set": {
+                                "email": evicted_placeholder_email(&holder),
+                                "unverified_email": &squatter.email,
+                            }},
+                        )
+                        .await?;
+                    tracing::warn!(
+                        evicted_user = %holder,
+                        provider,
+                        "oauth: address was held by an unverified account; \
+                         evicted the unproven claim in favour of the \
+                         provider-verified identity"
+                    );
+                }
+                Err(DaoError::NotFound) => {}
+                // A real read failure must NOT be read as "nobody has this
+                // address" — that would create a duplicate account for
+                // someone who already has one.
+                Err(e) => return Err(e),
             }
-            return Ok(user);
         }
 
         // 3. Create new user — generate unique username with retry on collision
@@ -143,9 +236,24 @@ impl UserDao {
             .filter(|c| c.is_alphanumeric() || *c == '_')
             .collect();
 
+        // The unproven address never reaches the unique index. Note this also
+        // makes the doc comment's promise true when the address is already
+        // taken: before, the retry loop below re-rolled only the *username*,
+        // so an unverified identity whose asserted address collided burned
+        // five inserts and then failed to sign in at all.
+        let (stored_email, unverified_email) = if email_verified {
+            (email.to_string(), None)
+        } else {
+            (
+                unverified_placeholder_email(provider, provider_id),
+                Some(email.to_string()),
+            )
+        };
+
         let user_template = |uname: String| User {
             id: None,
-            email: email.to_string(),
+            email: stored_email.clone(),
+            unverified_email: unverified_email.clone(),
             username: uname,
             display_name: display_name.to_string(),
             avatar: avatar_url.map(|s| s.to_string()),
@@ -155,7 +263,10 @@ impl UserDao {
             presence: Presence::Offline,
             locale: "en-US".to_string(),
             timezone: "UTC".to_string(),
-            is_verified: true,
+            // "This account's address is proven", the same meaning the
+            // password path gives it — not "this account may sign in".
+            // OAuth sign-in never consulted it and still doesn't.
+            is_verified: email_verified,
             is_mfa_enabled: false,
             last_active_at: None,
             oauth_providers: vec![OAuthProvider {
@@ -264,5 +375,72 @@ impl UserDao {
         self.base
             .update_by_id(user_id, doc! { "$set": update })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of the placeholder: it satisfies the unique index
+    /// without reserving anything a real person could ever hold.
+    #[test]
+    fn placeholders_land_in_the_reserved_invalid_tld() {
+        let ms = unverified_placeholder_email("microsoft", "00000000-1111-2222-3333-444444444444");
+        assert!(
+            ms.ends_with("@unverified.invalid"),
+            "placeholder must be undeliverable: {ms}"
+        );
+        let evicted = evicted_placeholder_email(&ObjectId::new());
+        assert!(evicted.ends_with("@unverified.invalid"), "{evicted}");
+    }
+
+    /// A hostile provider controls `provider_id`. If it could smuggle an `@`
+    /// or a domain separator through, it could aim the placeholder at a real
+    /// address and re-open exactly the reservation this prevents.
+    #[test]
+    fn a_hostile_provider_id_cannot_escape_the_placeholder_domain() {
+        for hostile in [
+            "victim@corp.example",
+            "x@corp.example#",
+            "a\"b@c",
+            "..@..",
+            "sub.domain",
+        ] {
+            let got = unverified_placeholder_email("microsoft", hostile);
+            assert_eq!(
+                got.matches('@').count(),
+                1,
+                "exactly one @ separator, got {got}"
+            );
+            assert!(
+                got.ends_with("@unverified.invalid"),
+                "must stay in the reserved domain, got {got}"
+            );
+        }
+    }
+
+    /// Deterministic per identity — a re-sign-in must map to the same row
+    /// rather than pile up one account per visit.
+    #[test]
+    fn the_same_identity_always_yields_the_same_placeholder() {
+        let a = unverified_placeholder_email("microsoft", "oid-1");
+        let b = unverified_placeholder_email("microsoft", "oid-1");
+        assert_eq!(a, b);
+    }
+
+    /// Distinct identities must not collide, or the second one's insert fails
+    /// against the unique index and that user simply cannot sign in.
+    #[test]
+    fn distinct_identities_do_not_collide() {
+        let seen = [
+            unverified_placeholder_email("microsoft", "oid-1"),
+            unverified_placeholder_email("microsoft", "oid-2"),
+            unverified_placeholder_email("github", "oid-1"),
+            evicted_placeholder_email(&ObjectId::new()),
+            evicted_placeholder_email(&ObjectId::new()),
+        ];
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "placeholders collided: {seen:?}");
     }
 }
