@@ -1639,6 +1639,50 @@ fn already_running_exit() -> Result<()> {
     Ok(())
 }
 
+/// Probe the two macOS grants AT STARTUP and say what is missing.
+///
+/// Both checks already existed but were lazy — Screen Recording fired when a
+/// controller first connected, Accessibility on the first injected event. By
+/// then the operator is already staring at a black screen or a dead mouse, and
+/// the explanation is in a log file under /tmp that nothing points them at.
+/// Neither failure produces an OS error: macOS returns wallpaper-only frames
+/// and swallows CGEventPost, silently, forever.
+///
+/// Requesting (rather than only probing) has a side effect worth having: it
+/// registers the app in the relevant Settings pane, so granting is one toggle
+/// instead of hunting for a "+" button. The answer lands asynchronously, hence
+/// "restart" rather than "retry".
+#[cfg(target_os = "macos")]
+fn macos_permission_preflight() {
+    let capture = tcc::screen_recording_granted() || tcc::request_screen_recording();
+    let input = tcc::accessibility_trusted() || tcc::request_accessibility();
+
+    if capture && input {
+        tracing::info!("macOS permissions: Screen Recording + Accessibility both granted");
+        return;
+    }
+
+    if !capture {
+        tracing::warn!(
+            "macOS Screen Recording is NOT granted — the remote screen will be blank \
+             (macOS delivers wallpaper-only frames rather than failing). Grant it under \
+             System Settings → Privacy & Security → Screen Recording."
+        );
+        tcc::open_settings_pane(tcc::PANE_SCREEN_RECORDING);
+    }
+    if !input {
+        tracing::warn!(
+            "macOS Accessibility is NOT granted — remote keyboard and mouse will do nothing \
+             (macOS drops injected events rather than failing). Grant it under \
+             System Settings → Privacy & Security → Accessibility."
+        );
+        tcc::open_settings_pane(tcc::PANE_ACCESSIBILITY);
+    }
+    tracing::warn!(
+        "after granting, restart the agent: launchctl kickstart -k gui/$(id -u)/com.roomler.agent"
+    );
+}
+
 async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()> {
     if !config_path.exists() {
         bail!(
@@ -1667,6 +1711,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             }
         };
     let mut cfg = config::load(config_path).context("loading config")?;
+
+    #[cfg(target_os = "macos")]
+    macos_permission_preflight();
 
     // S2 — env→config bridge: publish the config-backed fallbacks for the
     // operator-grade env knobs BEFORE anything reads them (the auto-update
