@@ -82,7 +82,7 @@ port forwards, SOCKS5, SSH without sshd, and exit nodes on top.*
 | [tunnels.md](tunnels.md) | Concepts & protocol: forwards, SOCKS5 (TCP+UDP), mesh mode, declared routes, transports, LocalAPI, CLI |
 | [tunnel-install.md](tunnel-install.md) | Step-by-step runbook: install, enroll, ACL policy, open and test a forward from a corporate network |
 | [fleet-rpc.md](fleet-rpc.md) | `roomler exec` remote command execution: transport, the four default-deny gates, audit |
-| [roomler-ssh.md](roomler-ssh.md) | SSH into any node by overlay address with no `sshd` and no bound port — why the packets are intercepted, the gates, the roadmap |
+| [roomler-ssh.md](roomler-ssh.md) | SSH into any node by overlay address with no `sshd` and no bound port — why the packets are intercepted below the OS, the four default-deny gates, interactive shells on Unix and Windows, `sftp`/`scp`, port forwarding, and the audit + activity records |
 
 ## 💬 Bonus · Video conferencing & team collaboration
 
@@ -99,6 +99,7 @@ same accounts and server.*
 | Doc | What it covers |
 |---|---|
 | [installation.md](installation.md) | Every install path: wizard, MSI flavours, `.deb`/`.pkg`, terminal installers, enrollment, service modes, self-update |
+| [code-signing.md](code-signing.md) | How every published artifact is signed: Azure Artifact Signing over GitHub OIDC, macOS notarisation, GPG + build provenance, and the operator scripts that (re)establish the credentials |
 | [linux-self-update.md](linux-self-update.md) | Design of the Linux self-update path (tarball as the universal artifact) |
 | [deployment.md](deployment.md) | Deploying the server: Docker image, dev compose stack, environment, health, release pipelines |
 | [multi-pod-scale-out.md](multi-pod-scale-out.md) | The settled multi-pod architecture: identity, tenant-affinity routing, mediasoup scale ladder |
