@@ -8,7 +8,7 @@
 use bson::{Document, doc, oid::ObjectId};
 
 use crate::fixtures::test_app::TestApp;
-use roomler_ai_api::stats_rollup::run_stats_rollup_once;
+use roomler_ai_api::stats_rollup::{pass_count, run_stats_rollup_once};
 use roomler_ai_services::dao::stats::{RelaySample, bucket_start};
 
 fn unix_now() -> i64 {
@@ -216,7 +216,17 @@ async fn rollup_builds_hourly_and_daily_buckets_idempotently() {
     }
 
     let first = run_stats_rollup_once(&app.state).await;
-    assert_eq!(first, 6, "all six merge passes should run");
+    // Against the table, not a literal. This asserted `6` from the day it was
+    // written and stayed there when the `call_user` usage ledger took the real
+    // count to 8 — a stale expectation, never a rollup bug, and invisible
+    // because `crates/tests` had stopped compiling. `pass_count()` keeps the
+    // check honest (a pass that silently fails still trips it) while a new
+    // family updates it automatically.
+    assert_eq!(
+        first,
+        pass_count(),
+        "every merge pass in the rollup table should run"
+    );
 
     let mid = format!("{}:{}", agent.to_hex(), hour);
     let m1h = find_one(&app, "stats_machine_1h", doc! { "_id": &mid })
@@ -255,7 +265,7 @@ async fn rollup_builds_hourly_and_daily_buckets_idempotently() {
 
     // Re-running must not drift any counter (whole-bucket replace).
     let second = run_stats_rollup_once(&app.state).await;
-    assert_eq!(second, 6);
+    assert_eq!(second, pass_count());
     let m1h_again = find_one(&app, "stats_machine_1h", doc! { "_id": &mid })
         .await
         .expect("machine 1h after rerun");
@@ -661,6 +671,13 @@ async fn uptime_intervals_reconstruct_presence_and_admit_ignorance() {
             .collection::<Document>("agents")
             .insert_one(doc! {
                 "_id": id, "tenant_id": tid, "name": name,
+                // `machine_id` is REQUIRED here even though nothing in this
+                // test reads it: `agents` carries a plain (non-partial) unique
+                // index on {tenant_id, machine_id}, so two rows omitting the
+                // field both index as null and the second insert 11000s.
+                // Enrollment always sets one, so a row without it is not a
+                // shape the product ever produces.
+                "machine_id": format!("machine-{name}"),
                 "last_presence": presence, "deleted_at": bson::Bson::Null,
             })
             .await
