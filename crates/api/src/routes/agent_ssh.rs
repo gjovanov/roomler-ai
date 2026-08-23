@@ -60,6 +60,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::oid::ObjectId;
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
@@ -501,7 +502,41 @@ fn is_supported_public_key(line: &str) -> bool {
     let Some(blob) = parts.next() else {
         return false;
     };
-    algo == "ssh-ed25519" && blob.len() >= 32 && blob.chars().all(|c| c.is_ascii_graphic())
+    if algo != "ssh-ed25519" {
+        return false;
+    }
+
+    // Actually PARSE the blob rather than eyeballing its shape. The previous
+    // check accepted any run of >=32 graphic characters, so a malformed key
+    // passed here, a grant was minted and pushed, and the AGENT then rejected
+    // it at redemption (it does a real `from_openssh`) — the caller dialled
+    // and failed authentication with no stated reason, and `ssh_audit` gained
+    // a "granted" row for a grant no device could ever redeem.
+    //
+    // OpenSSH ed25519 wire format, decoded: a length-prefixed algorithm name
+    // that must repeat the one in the text prefix, then the 32-byte key.
+    //   u32(11) "ssh-ed25519" u32(32) <32 bytes>  = 51 bytes total
+    let Ok(raw) = BASE64.decode(blob) else {
+        return false;
+    };
+    const ALGO: &[u8] = b"ssh-ed25519";
+    if raw.len() != 4 + ALGO.len() + 4 + 32 {
+        return false;
+    }
+    if u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize != ALGO.len() {
+        return false;
+    }
+    if &raw[4..4 + ALGO.len()] != ALGO {
+        return false;
+    }
+    let key_len_at = 4 + ALGO.len();
+    let key_len = u32::from_be_bytes([
+        raw[key_len_at],
+        raw[key_len_at + 1],
+        raw[key_len_at + 2],
+        raw[key_len_at + 3],
+    ]);
+    key_len == 32
 }
 
 /// What the grant tells the device about consent. Only an explicit `Auto`
@@ -1269,18 +1304,22 @@ mod tests {
 
     #[test]
     fn only_ed25519_keys_are_accepted() {
-        assert!(is_supported_public_key(
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterialHere00 goran@devbox"
-        ));
+        // A REAL blob: u32(11) "ssh-ed25519" u32(32) + 32 key bytes, which is
+        // the 68-char form `ssh-keygen` emits. The fixtures here used to be
+        // plausible-looking but undecodable, which is exactly what the old
+        // shape-only check could not tell apart.
+        const KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g";
+
+        assert!(is_supported_public_key(&format!(
+            "ssh-ed25519 {KEY} someone@example.com"
+        )));
         // No comment is fine — `ssh-keygen -y` emits exactly this.
-        assert!(is_supported_public_key(
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterialHere00"
-        ));
+        assert!(is_supported_public_key(&format!("ssh-ed25519 {KEY}")));
 
         // RSA is refused on purpose: the `rsa` feature is off in the agent, so
         // accepting one here would mint a grant no device could ever redeem.
         assert!(!is_supported_public_key(
-            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQExampleKeyMaterial00 goran@devbox"
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQExampleKeyMaterial00 someone@example.com"
         ));
         assert!(!is_supported_public_key("ssh-ed25519"));
         assert!(!is_supported_public_key(""));
@@ -1289,6 +1328,24 @@ mod tests {
         // agent's config-shaped parsing; reject rather than pass through.
         assert!(!is_supported_public_key(
             "ssh-ed25519 AAAA\u{7f}BBBB0000000000000000000000000000"
+        ));
+
+        // The cases the old shape-only check WAVED THROUGH, each of which the
+        // agent rejects at redemption — so the grant was minted, pushed, and
+        // then failed to authenticate with no stated reason.
+        // 1. Long enough and all-graphic, but not valid base64.
+        assert!(!is_supported_public_key(
+            "ssh-ed25519 ****not-base64-but-graphic-and-long-enough****"
+        ));
+        // 2. Valid base64, correct algorithm prefix, but a 31-byte key.
+        assert!(!is_supported_public_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAHwECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        ));
+        // 3. Valid base64 of the right length whose EMBEDDED algorithm name
+        //    disagrees with the text prefix — the mismatch a parser catches
+        //    and a length check does not.
+        assert!(!is_supported_public_key(
+            "ssh-ed25519 AAAAB3NzaC1yc2EAAAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g"
         ));
     }
 

@@ -100,6 +100,22 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # The step above is deliberately NOT `--all-targets`, so it never
+      # compiles `#[cfg(test)]` bodies — the same blind spot the API-unit-test
+      # and integration-type-check steps below exist to cover, but for LINTS
+      # rather than compilation. It hid two real things at once: two
+      # `items after a test module` errors, and a security control that was
+      # dead code (the exec/SSH per-caller rate limit — its constants had no
+      # readers and its deny reason was constructed only in tests, which
+      # `--all-targets` would have surfaced as unused).
+      #
+      # Scoped to the two server crates rather than `--workspace`: those are
+      # verified green, while the wider workspace has not been audited under
+      # `--all-targets` and must not be flipped blind. Widen it per crate as
+      # each is checked.
+      - name: Run clippy on the server crates (incl. test targets)
+        run: cargo clippy -p roomler-ai-api -p roomler-ai-services --all-targets -- -D warnings
+
       # `crates/api` unit tests ran in NO lane until now: the clippy step above
       # is `--workspace` WITHOUT `--all-targets`, so it does not even compile
       # `#[cfg(test)]` code, and the `cargo test` steps further down name
