@@ -81,6 +81,33 @@
           </div>
         </div>
 
+        <!--
+          macOS only, and hidden entirely elsewhere. Without these two grants
+          the product looks broken rather than blocked: the remote screen is
+          wallpaper-only and every injected click vanishes, with no error
+          anywhere. This is the one place that says so before you find out.
+        -->
+        <div id="ov-permissions" class="banner banner-warn" hidden>
+          <div>
+            <strong>macOS permissions needed</strong>
+            <p class="muted small" style="margin: 4px 0 8px">
+              macOS does not report an error when these are missing — the screen
+              streams as wallpaper only, and remote clicks and keys do nothing.
+            </p>
+            <div id="ov-perm-screen" class="row" hidden style="margin-bottom: 6px">
+              <span>Screen Recording — the remote screen will be blank</span>
+              <button type="button" class="primary" id="ov-btn-perm-screen">Grant</button>
+            </div>
+            <div id="ov-perm-input" class="row" hidden>
+              <span>Accessibility — remote keyboard and mouse will do nothing</span>
+              <button type="button" class="primary" id="ov-btn-perm-input">Grant</button>
+            </div>
+            <p class="muted small" style="margin: 8px 0 0">
+              After enabling a toggle, restart the agent for it to take effect.
+            </p>
+          </div>
+        </div>
+
         <div id="ov-attention" class="banner banner-error" hidden>
           <strong>Attention required</strong>
           <p class="small" id="ov-attention-msg" style="margin: 4px 0; white-space: pre-wrap"></p>
