@@ -140,9 +140,54 @@
     show(el);
   }
 
+  /*
+   * macOS permission banner.
+   *
+   * Re-read on every window focus rather than polled: the grant is made in
+   * System Settings, in another app, and the user comes straight back here to
+   * see whether it took. Polling would either lag that or burn a timer on a
+   * question whose answer only changes when the user leaves and returns.
+   */
+  async function refreshPermissions() {
+    let p;
+    try {
+      p = await invoke('cmd_permissions');
+    } catch {
+      return; // never let a probe failure break the overview
+    }
+    const banner = $('ov-permissions');
+    if (!banner) return;
+    if (!p.applicable || (p.screen_recording && p.accessibility)) {
+      hide(banner);
+      return;
+    }
+    const screenRow = $('ov-perm-screen');
+    const inputRow = $('ov-perm-input');
+    if (screenRow) screenRow.hidden = p.screen_recording;
+    if (inputRow) inputRow.hidden = p.accessibility;
+    show(banner);
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     on('status', paintStatus);
     on('deviceView', paintDeviceView);
+
+    refreshPermissions();
+    window.addEventListener('focus', refreshPermissions);
+    for (const [id, which] of [
+      ['ov-btn-perm-screen', 'screen'],
+      ['ov-btn-perm-input', 'input'],
+    ]) {
+      const btn = $(id);
+      if (!btn) continue;
+      btn.addEventListener('click', async () => {
+        try {
+          await invoke('cmd_request_permission', { which });
+        } catch (e) {
+          pushOutput('Could not open the permission pane: ' + e);
+        }
+      });
+    }
 
     $('ov-btn-onboard').addEventListener('click', () => navigate('onboarding'));
     $('ov-attention-reenroll').addEventListener('click', () => navigate('onboarding'));
