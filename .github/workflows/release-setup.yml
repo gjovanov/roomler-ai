@@ -79,6 +79,12 @@ jobs:
       - name: Resolve version + tag
         id: resolve
         shell: bash
+        # Dispatch inputs reach the script through the environment, never via
+        # `${{ }}` interpolation into the shell — interpolation pastes the raw
+        # value into the script text, so it would EXECUTE. See release-agent.yml.
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PUBLISH_RELEASE: ${{ github.event.inputs.publish_release }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
@@ -86,9 +92,13 @@ jobs:
             version="${tag#setup-v}"
             is_release=true
           else
-            version="${{ github.event.inputs.version }}"
+            version="${INPUT_VERSION:-}"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+              echo "::error::Invalid version input: '${version}' (expected N.N.N or N.N.N-rc.N)"
+              exit 1
+            fi
             tag="setup-v${version}"
-            if [[ "${{ github.event.inputs.publish_release }}" == "true" ]]; then
+            if [[ "${INPUT_PUBLISH_RELEASE:-}" == "true" ]]; then
               is_release=true
             else
               is_release=false
