@@ -71,6 +71,12 @@ jobs:
       - name: Vendored wintun-bindings drift check
         run: bash scripts/revendor-wintun-bindings.sh --check
 
+      # Same invariant for the scrap fork (the macOS IOSurface row-pitch
+      # accessor). The patched arms compile only on a Mac, so this content
+      # gate is the part that can run here.
+      - name: Vendored scrap drift check
+        run: bash scripts/revendor-scrap.sh --check
+
       # Belt for the cold path of the cached-apt steps below: apt retries
       # transient mirror failures instead of stalling into the job timeout.
       - name: Configure apt retries
@@ -276,6 +282,15 @@ jobs:
       # compile and not a link.
       - name: cargo check agent (ssh-server — the raw-libc surface)
         run: cargo check -p roomler-agent --lib --features ssh-server
+
+      # The capture path is the OTHER macOS-only surface, and until rc.454 it
+      # compiled nowhere but a release tag either. It now calls
+      # `Frame::bytes_per_row()` from the vendored scrap fork behind
+      # `#[cfg(target_os = "macos")]` — a cfg arm that exists on exactly this
+      # target. `scrap-capture` also pulls in the quartz backend itself, so
+      # this is the only lane that type-checks the fork at all.
+      - name: cargo check agent (scrap-capture — the macOS capture surface)
+        run: cargo check -p roomler-agent --lib --features scrap-capture
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
