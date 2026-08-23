@@ -2436,6 +2436,53 @@ async fn handle_server_msg(
             }
         }
 
+        // Remote config (docs/remote-config.md) — step 3 lands the WIRE only.
+        // This arm decides and SAYS what it decided; applying, persisting and
+        // the staggered restart are step 4, deliberately separate because
+        // mutating a device's config and restarting its daemon deserves its
+        // own review rather than riding in on a transport change.
+        ServerMsg::ConfigPush { revision, desired } => {
+            // Machine-wide keys, so only the PRIMARY enrollment may drive
+            // them — the identical rule `UpdateNow` applies to the
+            // machine-wide self-updater. `AgentConfig::for_org` scopes none
+            // of exec_enabled/ssh_*, so a secondary org's push would change
+            // what EVERY org on this host can reach.
+            if !ctx.is_primary {
+                warn!(
+                    org = %ctx.label,
+                    revision,
+                    "rc:agent.config ignored — only the primary enrollment may \
+                     change machine-wide config"
+                );
+                return Ok(());
+            }
+            // Gate 4, and the reason this feature does not erode it: the
+            // device decides whether it accepts pushed config at all, and the
+            // server can never set this key.
+            if !agent_cfg.remote_config_enabled {
+                info!(
+                    revision,
+                    "rc:agent.config ignored — this device has not opted in \
+                     (set remote_config_enabled=true locally to accept pushed config)"
+                );
+                return Ok(());
+            }
+            // Opted in and primary: step 4 will reconcile and persist. Logged
+            // rather than silently dropped so the wire can be verified in the
+            // field BEFORE anything mutates a device — and so an operator
+            // reading the daemon log can see the frame arrived.
+            info!(
+                revision,
+                exec_enabled = ?desired.exec_enabled,
+                ssh_enabled = ?desired.ssh_enabled,
+                ssh_keys = desired.ssh_authorized_keys.as_ref().map(|k| k.len()),
+                ssh_account_mode = ?desired.ssh_account_mode,
+                ssh_port = ?desired.ssh_port,
+                "rc:agent.config received and accepted for reconciliation \
+                 (apply lands in step 4; nothing changed yet)"
+            );
+        }
+
         // Fleet RPC — run one bounded command and answer with rc:rpc.result.
         //
         // The server has already cleared gates 1–3 (org kill-switch, caller
