@@ -43,6 +43,7 @@ use roomler_ai_remote_control::{
     worker_pick::pick_worker_fnv1a,
 };
 use roomler_ai_services::dao::base::DaoError;
+use roomler_ai_services::dao::overlay_node::NewOverlayNode;
 use tokio::net::lookup_host;
 use tracing::{debug, warn};
 use tunnel_core::policy::{
@@ -315,16 +316,16 @@ async fn handle_overlay_join(
                 };
                 match state
                     .overlay_nodes
-                    .create(
+                    .create(NewOverlayNode {
                         tenant_id,
-                        node_ref.clone(),
+                        node_ref: node_ref.clone(),
                         network_id,
-                        machine_id.clone(),
-                        name.clone(),
-                        ip.clone(),
-                        wg_public_key.clone(),
+                        machine_id: machine_id.clone(),
+                        name: name.clone(),
+                        overlay_ip: ip.clone(),
+                        wg_public_key: wg_public_key.clone(),
                         key_epoch,
-                        endpoints.clone(),
+                        endpoints: endpoints.clone(),
                         supports_quic,
                         supports_relay_single,
                         supports_derp,
@@ -332,8 +333,8 @@ async fn handle_overlay_join(
                         supports_server_relay_strategy,
                         supports_derp_floor,
                         supports_overlay_echo,
-                        advertised_routes.clone(),
-                    )
+                        advertised_routes: advertised_routes.clone(),
+                    })
                     .await
                 {
                     Ok(n) => {
