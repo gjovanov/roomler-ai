@@ -15,6 +15,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "windows")]
 use roomler_agent::dpi;
+#[cfg(target_os = "macos")]
+use roomler_agent::tcc;
 #[cfg(target_os = "linux")]
 use roomler_agent::virtual_desktop;
 #[cfg(target_os = "windows")]
