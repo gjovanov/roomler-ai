@@ -90,6 +90,12 @@ export function enrollCommands(
     command: `curl -fsSL ${base}/api/setup/install.sh | sh -s -- --role ${shRole}${os === 'linux' && machineWide ? ' --system' : ''} --token ${tok} --server ${base} --name ${manualName}`,
   })
 
+  // macOS installs the daemon inside an .app bundle whose executable keeps the
+  // legacy name (renaming it would void the TCC grants keyed to that binary),
+  // and there is no `roomlerd` anywhere on the box — so the generic
+  // `roomlerd enroll` this used to print could not work on a Mac.
+  const macAgentBin = '/Applications/roomler-agent.app/Contents/MacOS/roomler-agent'
+
   const manual = (os: EnrollOs): CommandBlock => ({
     id: `${kind}-${os}-manual`,
     label: 'Already installed? Enroll manually',
@@ -98,7 +104,9 @@ export function enrollCommands(
     command:
       os === 'linux' && machineWide
         ? `sudo roomlerd --config /etc/roomler/config.toml enroll --server ${base} --token ${tok} --name ${manualName}`
-        : `${manualBin} enroll --server ${base} --token ${tok} --name ${manualName}`,
+        : os === 'macos' && kind === 'agent'
+          ? `${macAgentBin} enroll --server ${base} --token ${tok} --name ${manualName}`
+          : `${manualBin} enroll --server ${base} --token ${tok} --name ${manualName}`,
   })
 
   const wizard = (os: EnrollOs, platform: string): CommandBlock => ({
@@ -140,9 +148,17 @@ export function enrollCommands(
     {
       os: 'macos',
       title: 'macOS',
-      note: machineWide
-        ? 'macOS installs per-user (LaunchAgent) — the commands below are the per-user flow.'
-        : undefined,
+      // macOS needs TWO processes for full functionality and cannot merge
+      // them: capture and input only work inside a GUI login session, while
+      // creating a utun for the overlay needs root. They also cannot share one
+      // enrollment — the hub keys on agent_id, so the second control-WS
+      // connection displaces the first — hence a second token and a second
+      // device row. Say so here rather than letting someone discover that
+      // their Mac never appears in the mesh.
+      note:
+        kind === 'agent'
+          ? 'Installs the per-user half (screen sharing + input). To also join the overlay mesh, mint a second enrollment token and append --daemon-token <token> — that adds a root LaunchDaemon and a second device row for this Mac.'
+          : undefined,
       blocks: [shOneLiner('macos'), wizard('macos', 'macos'), manual('macos')],
     },
   ]
