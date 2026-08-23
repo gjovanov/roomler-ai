@@ -1535,11 +1535,30 @@ jobs:
           fi
 
           if [[ "$mode" == none ]]; then
+            # Deliberately a WARNING, not a failure, until Apple enrolment
+            # completes (blocked on D-U-N-S — scripts/signing/60-apple-setup.sh).
+            #
+            # This gate hard-failed release tags when it landed with #599, and
+            # the cost was out of all proportion to the risk: agent-v0.3.0-rc.453
+            # died here after 10 seconds, and because `Publish GitHub Release`
+            # needs every build job, it took the four HEALTHY lanes with it —
+            # the .deb x86_64, the .deb aarch64, the .msi and the companion EXE
+            # had all built successfully and none of them was published. One
+            # unconfigured platform must not be able to stop the fleet's releases.
+            #
+            # The premise was also too strong. Gatekeeper's assessment is
+            # triggered by the com.apple.quarantine xattr, which a browser sets
+            # and `curl` does not, so the path our own installer uses —
+            # `curl … | sh` → `sudo installer -pkg` — installs an unsigned .pkg
+            # without complaint. Verified on a brand-new MacBook on 2026-08-23
+            # ("The install was successful"). What notarisation actually buys is
+            # the Finder double-click path, plus tamper-evidence — worth having,
+            # not worth blocking every Linux and Windows release for.
             if [[ "${{ needs.validate-version.outputs.is_release }}" == "true" ]]; then
-              echo "::error::Apple signing credentials absent and this is a RELEASE run. An unsigned .pkg is blocked by Gatekeeper on every end-user Mac. Configure the six APPLE_* secrets (scripts/signing/60-apple-setup.sh) or dispatch with publish_release=false."
-              exit 1
+              echo "::warning::RELEASING AN UNSIGNED, UNNOTARISED .pkg. It installs fine via install.sh (curl sets no quarantine xattr) but Finder double-click will be refused, and the download has no tamper-evidence. Configure the six APPLE_* secrets to fix: scripts/signing/60-apple-setup.sh."
+            else
+              echo "::warning::Apple credentials absent -- the .pkg will be unsigned and unnotarised (artifacts-only run, so this is allowed)."
             fi
-            echo "::warning::Apple credentials absent -- the .pkg will be unsigned and unnotarised (artifacts-only run, so this is allowed)."
           fi
 
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
@@ -1573,34 +1592,33 @@ jobs:
         # Windows is upstream-only-on-1.16, so brew's 1.15 works).
         run: brew install cmake libvpx pkg-config
 
-      - name: Fetch vendored FFmpeg 8.1.2 (for the ffmpeg-encoder HEVC backend)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Prebuilt LGPL FFmpeg 8.1.2 for Apple Silicon (HEVC via
-          # hevc_videotoolbox; no GPL libx264/x265 → the MIT agent stays
-          # license-clean). Built once by vendor-ffmpeg-macos.yml and fetched
-          # here — the macOS counterpart to the Linux BtbN vendored build.
-          gh release download vendored-ffmpeg-8.1.2 \
-            --repo "${{ github.repository }}" \
-            --pattern 'ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz' \
-            --dir "$RUNNER_TEMP/ffdl"
-          FFPREFIX="$RUNNER_TEMP/roomler-ffmpeg"
-          mkdir -p "$FFPREFIX"
-          # Tarball root is lib/ + include/ (no top dir) — no --strip-components.
-          tar xf "$RUNNER_TEMP/ffdl/ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz" -C "$FFPREFIX"
-          # .pc prefix is baked to the builder's path; rewrite it (BSD sed).
-          sed -i '' "s|^prefix=.*|prefix=$FFPREFIX|" "$FFPREFIX"/lib/pkgconfig/*.pc
-          {
-            echo "FFMPEG_DIR=$FFPREFIX"
-            # Prepend ffmpeg but KEEP the default pc_path so brew's libvpx.pc
-            # (vp9-444) still resolves.
-            echo "PKG_CONFIG_PATH=$FFPREFIX/lib/pkgconfig:$(pkg-config --variable pc_path pkg-config)"
-            echo "FFPREFIX=$FFPREFIX"
-          } >> "$GITHUB_ENV"
-
-      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen + ffmpeg-encoder)
+      # NO `ffmpeg-encoder` ON macOS -- deliberately, since rc.453.
+      #
+      # It never did anything here. `encode/ffmpeg/encoder.rs` dispatches by
+      # NAME, and every name in the four tables is NVIDIA/Intel/AMD
+      # (hevc_nvenc/hevc_qsv/hevc_amf, h264_*, av1_*, vp9_qsv) -- none of
+      # which exists on Apple Silicon, and none of which the vendored LGPL
+      # build even contains. `find_encoder_by_name` therefore returned None
+      # for all of them and the caps probe advertised nothing extra. The
+      # step's own comment claimed "HEVC via hevc_videotoolbox", but that
+      # name is not in HEVC_ENCODER_NAMES; CLAUDE.md's P3e note has called
+      # this dead weight since the size program measured it.
+      #
+      # It was not merely useless, it was ACTIVELY BREAKING the product: the
+      # six FFmpeg dylibs were built on a runner with Homebrew present, so
+      # configure autodetected X11 and baked
+      # /opt/homebrew/opt/libx11/lib/libX11.6.dylib into libavutil, libavcodec,
+      # libavformat, libavfilter, libswscale and libswresample (plus four
+      # libxcb* into libavdevice). None of those exist on an end-user Mac, so
+      # dyld aborted the process at launch. Field-hit on a brand-new MacBook,
+      # 2026-08-23, on rc.452.
+      #
+      # To bring it back, BOTH halves are required: add the *_videotoolbox
+      # names to the dispatch tables (a feature decision -- see CLAUDE.md),
+      # AND re-run vendor-ffmpeg-macos.yml, which now configures
+      # --disable-xlib --disable-libxcb so the artifact carries no Homebrew
+      # dependency to begin with.
+      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen, no ffmpeg-encoder)
         # `vp9-444-bindgen` runs bindgen against brew's libvpx 1.16
         # headers — env-libvpx-sys's pre-generated bindings only cover
         # 1.13.0, so without bindgen the build script panics looking
@@ -1610,14 +1628,15 @@ jobs:
         # `overlay-l3` (Phase 3b): the overlay mesh (WireGuard + TUN, utun
         # on macOS — in-kernel, no extra dep). Default-OFF (config
         # `overlay_enabled`), inert until an operator opts a host in.
-        # `ffmpeg-encoder`: HEVC via the vendored FFmpeg fetched above
-        # (hevc_videotoolbox on Apple Silicon) — the macOS counterpart to the
-        # Linux/Windows HEVC path.
         # `full` includes `audio` → cpal CoreAudio (in the OS SDK, no extra
         # lib) + audiopus (bundled libopus via CMake).
+        # Video on macOS is therefore SW-only: openh264 (statically linked,
+        # compiled from C source) for RTP H.264, libvpx for VP9-4:4:4 over
+        # the data channel. libvpx is the ONE dynamic non-system dependency,
+        # and the staging step below bundles it into the .app.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server" --target aarch64-apple-darwin
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server" --target aarch64-apple-darwin
 
       - name: Stage .app bundle
         shell: bash
@@ -1632,21 +1651,93 @@ jobs:
           APP=stage/roomler-agent.app
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp "$BIN" "$APP/Contents/MacOS/roomler-agent"
-          # Bundle the vendored FFmpeg dylibs into the .app so it's
-          # self-contained (macOS ships no FFmpeg). They carry @rpath install
-          # names (built --install-name-dir=@rpath), so a single LC_RPATH of
-          # @executable_path/../Frameworks on the binary resolves BOTH the
-          # binary's FFmpeg deps and the dylibs' siblings — the macOS analog of
-          # the Linux $ORIGIN patchelf.
-          mkdir -p "$APP/Contents/Frameworks"
-          cp -a "$FFPREFIX"/lib/*.dylib "$APP/Contents/Frameworks/"
+          # Bundle every non-system dylib the binary loads into the .app, so
+          # it is self-contained on a Mac that has never seen Homebrew.
+          #
+          # This is BY DEPENDENCY WALK, not by a hand-written list of libraries
+          # we expect. The hand-written version is what shipped rc.452 broken:
+          # it copied the FFmpeg dylibs (which someone remembered) and missed
+          # libvpx (which nobody did), and dyld aborted at launch on the first
+          # end-user Mac. A walk cannot miss one, and it keeps working when a
+          # future feature links something new.
+          #
+          # A brew dylib's install name is an ABSOLUTE path
+          # (/opt/homebrew/opt/<f>/lib/…), so an LC_RPATH alone cannot redirect
+          # it — each reference has to be rewritten to @rpath explicitly.
+          # Deps of deps are rewritten too: dyld resolves the whole graph at
+          # launch, so one unrewritten leaf is still a crash.
+          FW="$APP/Contents/Frameworks"
+          mkdir -p "$FW"
+          bundle_deps() {
+            local target="$1" dep base
+            # otool -L: line 1 is the file itself; field 1 of the rest is the path.
+            otool -L "$target" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+              case "$dep" in
+                /usr/lib/*|/System/*|@*) continue ;;   # OS-provided or already relative
+              esac
+              base="$(basename "$dep")"
+              if [ ! -f "$FW/$base" ]; then           # on-disk presence = the "seen" set
+                echo "    bundling $dep"
+                cp -L "$dep" "$FW/$base"              # -L: brew's opt path is a symlink into the Cellar
+                chmod u+w "$FW/$base"
+                install_name_tool -id "@rpath/$base" "$FW/$base"
+                bundle_deps "$FW/$base"               # recurse into the copy's own deps
+              fi
+              install_name_tool -change "$dep" "@rpath/$base" "$target"
+            done
+          }
+          echo "=== bundling non-system dylibs ==="
           install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomler-agent"
-          echo "=== FFmpeg load commands (want @rpath/libav*) ==="
-          otool -L "$APP/Contents/MacOS/roomler-agent" | grep -E '@rpath/lib(av|sw)' || true
-          echo "=== self-containment check: staged arm64 binary loads its bundled FFmpeg? ==="
-          # macos-14 is arm64, so the aarch64 binary runs here; if the rpath +
-          # bundled dylibs are wrong, dyld fails and this step (set -e) fails.
-          "$APP/Contents/MacOS/roomler-agent" --version
+          bundle_deps "$APP/Contents/MacOS/roomler-agent"
+          ls -1 "$FW" 2>/dev/null || echo "    (none needed)"
+
+          # install_name_tool invalidates the linker's ad-hoc signature, and an
+          # arm64 Mach-O with a broken signature is killed by the kernel at
+          # exec. Xcode's tool re-signs automatically, but do it explicitly so
+          # the artifact does not depend on that behaviour. In `full` mode the
+          # codesign steps below replace these with the Developer ID identity.
+          find "$APP" -type f \( -name '*.dylib' -o -name 'roomler-agent' \) \
+            -exec codesign --force --sign - {} \;
+
+          echo "=== GATE: no Mach-O in the .app may reference a non-system path ==="
+          # The `--version` run below is NOT sufficient on its own and never
+          # was: the runner has Homebrew, so a binary that depends on it starts
+          # here and dies on the user's machine. That is precisely how rc.452
+          # shipped. This scan reads the load commands themselves, so it is
+          # independent of what happens to be installed on the builder.
+          bad=0
+          # Process substitution, NOT a pipe: a `while` on the right of a pipe
+          # runs in a subshell and `bad` would be lost on the way out.
+          while IFS= read -r f; do
+            refs="$(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' \
+                    | grep -E '^/(opt|usr/local)/' || true)"
+            if [ -n "$refs" ]; then
+              echo "::error::$f loads paths absent from a clean Mac:"
+              echo "$refs" | sed 's/^/    /'
+              bad=1
+            fi
+          done < <(find "$APP" -type f)
+          [ "$bad" -eq 0 ] || exit 1
+          echo "  clean — every load command is /usr/lib, /System or @rpath."
+
+          echo "=== self-containment check: run it with Homebrew HIDDEN ==="
+          # macos-14 is arm64, so the staged binary runs here. Hiding the brew
+          # prefix for the duration makes this an honest end-user simulation
+          # rather than a check the builder's own environment can satisfy.
+          # Restore BEFORE acting on the result, so a failure cannot leave the
+          # runner without its Homebrew tree.
+          hidden=0
+          if [ -d /opt/homebrew/opt ]; then
+            mv /opt/homebrew/opt /opt/homebrew/opt.hidden
+            hidden=1
+          fi
+          rc=0
+          "$APP/Contents/MacOS/roomler-agent" --version || rc=$?
+          [ "$hidden" -eq 1 ] && mv /opt/homebrew/opt.hidden /opt/homebrew/opt
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the staged binary does not start without Homebrew (exit $rc) — it is not self-contained"
+            exit 1
+          fi
           cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
           # The privileged half's plist rides along in Resources; the
           # postinstall only installs it into /Library/LaunchDaemons when the
@@ -1707,18 +1798,25 @@ jobs:
         if: steps.apple.outputs.mode == 'full'
         run: |
           set -euo pipefail
-          # Sign the bundled FFmpeg dylibs FIRST (inside-out) — the hardened
-          # runtime + notarisation reject unsigned nested code.
+          # Sign the bundled dylibs FIRST (inside-out) — the hardened runtime +
+          # notarisation reject unsigned nested code.
+          #
+          # `--force` throughout: everything here already carries a signature.
+          # arm64 Mach-Os are ad-hoc signed by the linker, and the staging step
+          # re-signs whatever install_name_tool rewrote. Without --force,
+          # codesign refuses with "is already signed" — and since the Apple
+          # secrets have never been configured, this whole branch has never
+          # executed, so nothing would have caught it but a release.
           find stage/roomler-agent.app/Contents/Frameworks -type f -name '*.dylib' -print0 \
             | while IFS= read -r -d '' dylib; do
-                codesign --sign "Developer ID Application" --options runtime --timestamp "$dylib"
+                codesign --force --sign "Developer ID Application" --options runtime --timestamp "$dylib"
               done
-          codesign --sign "Developer ID Application" \
+          codesign --force --sign "Developer ID Application" \
                    --options runtime --timestamp \
                    --entitlements agents/roomler-agent/packaging/macos/entitlements.plist \
                    "stage/roomler-agent.app/Contents/MacOS/roomler-agent"
 
-          codesign --sign "Developer ID Application" \
+          codesign --force --sign "Developer ID Application" \
                    --options runtime --timestamp \
                    "stage/roomler-agent.app"
 
