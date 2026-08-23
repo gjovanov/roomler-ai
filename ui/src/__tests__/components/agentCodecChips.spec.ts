@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { codecChips } from '@/components/admin/agentCodecChips'
+import { codecChips, permissionWarnings } from '@/components/admin/agentCodecChips'
 import type { Agent } from '@/stores/agents'
 
 function makeAgent(caps?: Agent['capabilities']): Agent {
@@ -101,5 +101,47 @@ describe('codecChips', () => {
       }),
     )
     expect(chips).toEqual([])
+  })
+})
+
+describe('permissionWarnings', () => {
+  const caps = (permissions?: string[]): Agent['capabilities'] => ({
+    codecs: [],
+    hw_encoders: [],
+    has_input_permission: true,
+    supports_clipboard: false,
+    supports_file_transfer: false,
+    max_simultaneous_sessions: 1,
+    permissions,
+  })
+
+  // The distinction this whole field exists for. A pre-rc.454 agent cannot
+  // report, so it must produce NO warnings; an agent that reports an empty
+  // list is saying it holds neither permission, which is the loudest case
+  // there is. A falsy check would treat them identically and silence it.
+  it('says nothing about an agent too old to report', () => {
+    expect(permissionWarnings(makeAgent(caps(undefined)))).toEqual([])
+  })
+
+  it('warns about BOTH when the agent reports an empty list', () => {
+    const w = permissionWarnings(makeAgent(caps([])))
+    expect(w.map((x) => x.label)).toEqual(['No screen access', 'No input access'])
+  })
+
+  it('warns only about what is actually missing', () => {
+    expect(permissionWarnings(makeAgent(caps(['screen-capture']))).map((w) => w.label)).toEqual([
+      'No input access',
+    ])
+    expect(permissionWarnings(makeAgent(caps(['input']))).map((w) => w.label)).toEqual([
+      'No screen access',
+    ])
+  })
+
+  it('is silent when both are granted', () => {
+    expect(permissionWarnings(makeAgent(caps(['screen-capture', 'input'])))).toEqual([])
+  })
+
+  it('says nothing when the agent has no capabilities at all', () => {
+    expect(permissionWarnings(makeAgent(undefined))).toEqual([])
   })
 })

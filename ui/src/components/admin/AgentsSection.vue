@@ -305,6 +305,21 @@
                   {{ codec.label }}
                 </v-chip>
               </div>
+              <!-- A device the OS has muzzled looks identical to a healthy one
+                   until you connect and get a black screen, because macOS
+                   reports success either way. Say it here instead. -->
+              <div v-if="permissionWarnings(a).length" class="d-flex flex-wrap gap-1 mt-1">
+                <v-chip
+                  v-for="w in permissionWarnings(a)"
+                  :key="w.label"
+                  size="x-small"
+                  color="warning"
+                  variant="tonal"
+                  :title="w.tooltip"
+                >
+                  {{ w.label }}
+                </v-chip>
+              </div>
             </td>
             <td class="text-caption" :title="fmtDate(a.last_seen_at)">{{ fmtRelative(a.last_seen_at) }}</td>
           </tr>
@@ -1069,7 +1084,7 @@ import {
   type ConsentMode,
   type EnrollmentToken,
 } from '@/stores/agents'
-import { codecChips } from './agentCodecChips'
+import { codecChips, permissionWarnings } from './agentCodecChips'
 import AgentCrashesDialog from './AgentCrashesDialog.vue'
 import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
