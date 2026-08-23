@@ -90,7 +90,7 @@ pub fn parse_xor_mapped_address(resp: &[u8]) -> Option<SocketAddr> {
 /// relay churn a single `recv_from` per attempt read three foreign packets
 /// and gave up (`transaction-id mismatch` ×3) while the genuine reply sat
 /// unread — silently killing the srflx tier for the daemon lifetime (field
-/// NEO16 + WINHOST-C: every WAN peer relay-locked; raw STUN to the
+/// DEVBOX + WINHOST-C: every WAN peer relay-locked; raw STUN to the
 /// same workers answered in 40 ms).
 pub async fn srflx_query(
     socket: &UdpSocket,
@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(srflx, SocketAddr::from(([198, 51, 100, 7], 5000)));
     }
 
-    /// The field bug (2026-07-27, NEO16/WINHOST-C WAN relay-lock): the
+    /// The field bug (2026-07-27, DEVBOX/WINHOST-C WAN relay-lock): the
     /// gather socket is shared with the TURN dialer, whose responses are
     /// STUN-format with foreign transaction ids. One foreign datagram per
     /// attempt used to consume the WHOLE attempt (three churn packets = dead

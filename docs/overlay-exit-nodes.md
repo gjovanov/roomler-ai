@@ -74,7 +74,7 @@ re-reads a node when it (re-)joins.
 
 ```toml
 overlay_enabled  = true
-overlay_exit_node = "mars"   # the exit node's name (or wg-pubkey hex)
+overlay_exit_node = "buildhost"   # the exit node's name (or wg-pubkey hex)
 ```
 
 This is distinct from the offer flag: `overlay_exit_node` is the client saying
@@ -96,8 +96,8 @@ admin-approved** (its netmap carries `/0`).
 ```
 exit:   overlay_exit_node_enabled=true  ──advertise /0──▶  roomler.ai
 admin:  PUT …/exit-node  ──is_exit_node=true, approved_routes+=/0──▶ hub
-client: overlay_exit_node="mars"
-          │  resolve peer "mars" in netmap (name|hex)
+client: overlay_exit_node="buildhost"
+          │  resolve peer "buildhost" in netmap (name|hex)
           │  peer present + has a live carrier + /0 in approved routes?     ──no──▶ WITHHOLD (egress stays local)
           │  pin carrier/control exemptions (/32 + /128 via original gw)    ──any fail──▶ WITHHOLD
           ▼  all exemptions pinned →

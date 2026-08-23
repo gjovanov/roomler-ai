@@ -215,7 +215,7 @@ fn migrate_dir(old: &Path, new: &Path) -> Option<String> {
             new.display()
         )),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // Field finding (NEO16, 2026-07-27): renaming the TOP dir was
+            // Field finding (DEVBOX, 2026-07-27): renaming the TOP dir was
             // denied by an external ROOT-handle (an AV / indexer
             // directory-watch — no roomler process held anything, ACLs
             // were Full, and every CHILD renamed fine). Fall back to
@@ -240,7 +240,7 @@ fn migrate_dir(old: &Path, new: &Path) -> Option<String> {
 /// in root's profile (`/root/.config/roomler/config.toml`) — so the FIRST
 /// systemd-mediated start after the packaging change died `no config found`
 /// and `Restart=always` turned it into a crash-loop. Field-hit on three nodes
-/// (mars, zeus, and the WSL sibling, the last one from a plain `dpkg -i`, with
+/// (buildhost, fleet-host-2, and the WSL sibling, the last one from a plain `dpkg -i`, with
 /// no operator restart involved at all).
 ///
 /// One canonical location fixes that for good: [`migrate_system_config`] moves
@@ -455,7 +455,7 @@ mod tests {
     /// The rollback copy carries the agent token and the WG secret key, so it
     /// has to travel with the config — leaving it behind strands a second,
     /// credential-bearing copy at a path something may later be pointed at
-    /// (exactly how a cleared SSH key came back on jupiter).
+    /// (exactly how a cleared SSH key came back on fleet-host-1).
     #[cfg(target_os = "linux")]
     #[test]
     fn the_prev_sibling_is_the_config_path_plus_prev() {

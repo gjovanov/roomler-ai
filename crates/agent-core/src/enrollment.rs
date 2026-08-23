@@ -361,7 +361,7 @@ fn unique_org_label(
 /// node dropped out of the overlay mesh on its next restart), dropped
 /// `overlay_wg_secret_key` (forcing a WG key rotation on the next
 /// overlay-enabled start), and wiped `tunnel_routes` / forward ACLs /
-/// advertised routes / encoder preference (field-observed on NEO16,
+/// advertised routes / encoder preference (field-observed on DEVBOX,
 /// 2026-07-21: the P4 wizard field-proofs re-enrolled the box and it fell out
 /// of the mesh unnoticed). Keep the EXISTING config as the base — it carries
 /// every operator-owned knob, including ones this function has never heard of

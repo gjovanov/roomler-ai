@@ -52,12 +52,31 @@ const ALLOWED_TAGS = [
   'td',
 ]
 
-const ALLOWED_ATTR = ['href', 'target', 'rel', 'src', 'alt', 'title', 'class', 'data-mention-id', 'width', 'height', 'style']
+// NOTE: `style` is deliberately NOT allowed. Author-controlled inline CSS on
+// message content lets a chat message paint a full-viewport `position:fixed`
+// overlay inside the trusted origin (credential-phishing/clickjacking that no
+// framing header stops) and fire a render-time `background:url()` beacon on
+// every viewer. Message formatting needs none of it.
+const ALLOWED_ATTR = ['href', 'target', 'rel', 'src', 'alt', 'title', 'class', 'data-mention-id', 'width', 'height']
+
+// HTML-escape untrusted text before it is interpolated into a raw HTML string.
+// Without this a mention's label/id can break out of the attribute/tag (e.g.
+// `@[x](y"><img src=x onerror=…>)`). DOMPurify below is the backstop, but the
+// safety of this string-concatenation step must not rest on the allowlist
+// happening to exclude event handlers.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
 
 // Convert @[Name](id) mention syntax to styled HTML spans
 function preprocessMentions(content: string): string {
   return content.replace(/@\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, id) => {
-    return `<span class="mention" data-mention-id="${id}">@${label}</span>`
+    return `<span class="mention" data-mention-id="${escapeHtml(id)}">@${escapeHtml(label)}</span>`
   })
 }
 

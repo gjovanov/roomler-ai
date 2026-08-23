@@ -27,9 +27,7 @@ pub async fn export_conversation(
     let rid = ObjectId::parse_str(&body.room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     // Create background task
     let task = state

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_db::models::MediaSettings;
+use roomler_ai_db::models::role::permissions;
 use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +98,20 @@ pub async fn join(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
+    // Previously ungated ENTIRELY: any authenticated user could join ANY room
+    // in ANY tenant by id, and then received that room's live WS fan-out —
+    // cross-tenant eavesdropping. Binding the room to the path tenant closes
+    // that.
+    //
+    // Deliberately NOT gated on `room.is_open`: whether a tenant member may
+    // self-join a CLOSED room is a product policy question, not a security
+    // one, and rooms created through the API default to `is_open: false`
+    // (`CreateRoomRequest` derives it from `#[serde(default)]`), so requiring
+    // it would stop members joining most channels. If closed rooms should be
+    // invite-only, that belongs with a room-membership model — the same
+    // decision as room-level read authorization — not bolted on here.
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+
     state.rooms.join(tid, rid, auth.user_id).await?;
 
     Ok(Json(serde_json::json!({ "joined": true })))
@@ -111,6 +126,8 @@ pub async fn leave(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
+
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     state.rooms.leave(tid, rid, auth.user_id).await?;
 
@@ -157,9 +174,15 @@ pub async fn update(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    super::remote_control::require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_CHANNELS,
+        "MANAGE_CHANNELS",
+    )
+    .await?;
 
     state
         .rooms
@@ -188,9 +211,15 @@ pub async fn delete(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    super::remote_control::require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_CHANNELS,
+        "MANAGE_CHANNELS",
+    )
+    .await?;
 
     state.rooms.cascade_delete(tid, rid).await?;
 
@@ -208,9 +237,7 @@ pub async fn members(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let result = state.rooms.list_members(rid, &params).await?;
 
@@ -299,9 +326,7 @@ pub async fn call_start(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     // Stats PR-2 — transition-gated: only the caller that actually flips
     // the room to in_progress mints the call instance; a re-invoked
@@ -412,9 +437,7 @@ pub async fn call_join(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let connection_id = body.and_then(|Json(b)| b.connection_id);
     let user = state.users.base.find_by_id(auth.user_id).await?;
@@ -474,9 +497,7 @@ pub async fn call_leave(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let connection_id = body.and_then(|Json(b)| b.connection_id);
     close_call_media(&state, rid, auth.user_id, connection_id.as_deref()).await;
@@ -677,9 +698,7 @@ pub async fn call_end(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let ended_call = state.rooms.end_call(rid).await?;
     if let Some(call_id) = ended_call
@@ -731,9 +750,7 @@ pub async fn participants(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let parts = state.rooms.list_participants(rid).await?;
     let items: Vec<serde_json::Value> = parts

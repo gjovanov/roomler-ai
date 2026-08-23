@@ -226,7 +226,7 @@ fn worker_main(
     // a backend, so a single rc:logs-fetch shows which adapter owns the
     // primary output and whether a render-only dGPU exposes zero outputs
     // (the Optimus signature behind the GDI-fallback / ~85ms-capture bug
-    // on hybrid hosts like CORPLAP-2). Best-effort; never blocks capture.
+    // on hybrid hosts like WINHOST-B). Best-effort; never blocks capture.
     #[cfg(feature = "mf-encoder")]
     super::dxgi_util::log_adapters_and_outputs();
 
@@ -270,7 +270,7 @@ fn worker_main(
     // (≥30 s between logs), not call-count-gated — pointer-only frames
     // now return Transient, so empty polls dominate the call rate
     // (~250-500/s) and the old every-150-calls gate flooded the log at
-    // ~1.7 lines/s (field CORPLAP-2, rc.428 rollout evening).
+    // ~1.7 lines/s (field winhost-b, rc.428 rollout evening).
     let mut worker_capture_us: u64 = 0;
     let mut worker_capture_calls: u64 = 0;
     let mut worker_timing_logged_at = Instant::now();

@@ -358,51 +358,6 @@ fn sanitize_content_disposition_filename(raw: &str) -> (String, String) {
     (ascii, encoded)
 }
 
-#[cfg(test)]
-mod content_disposition_tests {
-    use super::sanitize_content_disposition_filename;
-
-    #[test]
-    fn strips_crlf_and_quotes() {
-        // Hostile name: CR/LF would split the header; embedded quote
-        // would terminate the quoted-string early.
-        let raw = "evil\r\nX-Injected: 1\"\".txt";
-        let (ascii, _) = sanitize_content_disposition_filename(raw);
-        assert!(!ascii.contains('\r'));
-        assert!(!ascii.contains('\n'));
-        assert!(!ascii.contains('"'));
-    }
-
-    #[test]
-    fn empty_falls_back_to_download() {
-        let (ascii, encoded) = sanitize_content_disposition_filename("");
-        assert_eq!(ascii, "download");
-        assert_eq!(encoded, "download");
-    }
-
-    #[test]
-    fn unicode_preserved_in_rfc5987_dropped_in_ascii() {
-        // 'é' is 0xC3 0xA9 in UTF-8 → percent-encoded as %C3%A9.
-        let (ascii, encoded) = sanitize_content_disposition_filename("résumé.pdf");
-        assert!(!ascii.is_empty());
-        // ASCII fallback replaces non-ASCII with `_` so the legacy
-        // `filename=` token stays HTTP-safe.
-        assert!(ascii.contains('_'));
-        assert!(encoded.contains("%C3%A9"));
-    }
-
-    #[test]
-    fn percent_itself_is_encoded() {
-        // `%` is NOT an RFC 5987 attr-char, so a literal `%` in the
-        // source filename must come out as `%25` — a name that LOOKS
-        // pre-encoded ("%50off.txt") double-encodes to "%2550off.txt"
-        // and round-trips back to the literal, closing the
-        // smuggle-a-percent-sequence hole.
-        let (_, encoded) = sanitize_content_disposition_filename("%50off.txt");
-        assert!(encoded.contains("%2550off"));
-    }
-}
-
 pub async fn delete(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -464,4 +419,49 @@ pub async fn upload_room(
 
     let resp = do_upload(&state, tid, rid, auth.user_id, data).await?;
     Ok(Json(resp))
+}
+
+#[cfg(test)]
+mod content_disposition_tests {
+    use super::sanitize_content_disposition_filename;
+
+    #[test]
+    fn strips_crlf_and_quotes() {
+        // Hostile name: CR/LF would split the header; embedded quote
+        // would terminate the quoted-string early.
+        let raw = "evil\r\nX-Injected: 1\"\".txt";
+        let (ascii, _) = sanitize_content_disposition_filename(raw);
+        assert!(!ascii.contains('\r'));
+        assert!(!ascii.contains('\n'));
+        assert!(!ascii.contains('"'));
+    }
+
+    #[test]
+    fn empty_falls_back_to_download() {
+        let (ascii, encoded) = sanitize_content_disposition_filename("");
+        assert_eq!(ascii, "download");
+        assert_eq!(encoded, "download");
+    }
+
+    #[test]
+    fn unicode_preserved_in_rfc5987_dropped_in_ascii() {
+        // 'é' is 0xC3 0xA9 in UTF-8 → percent-encoded as %C3%A9.
+        let (ascii, encoded) = sanitize_content_disposition_filename("résumé.pdf");
+        assert!(!ascii.is_empty());
+        // ASCII fallback replaces non-ASCII with `_` so the legacy
+        // `filename=` token stays HTTP-safe.
+        assert!(ascii.contains('_'));
+        assert!(encoded.contains("%C3%A9"));
+    }
+
+    #[test]
+    fn percent_itself_is_encoded() {
+        // `%` is NOT an RFC 5987 attr-char, so a literal `%` in the
+        // source filename must come out as `%25` — a name that LOOKS
+        // pre-encoded ("%50off.txt") double-encodes to "%2550off.txt"
+        // and round-trips back to the literal, closing the
+        // smuggle-a-percent-sequence hole.
+        let (_, encoded) = sanitize_content_disposition_filename("%50off.txt");
+        assert!(encoded.contains("%2550off"));
+    }
 }

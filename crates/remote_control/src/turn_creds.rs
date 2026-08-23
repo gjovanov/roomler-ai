@@ -561,7 +561,7 @@ mod tests {
         );
         // Unknown region + None both degrade to the default.
         assert_eq!(
-            map.cfg_for(Some("mars")).unwrap().urls[0],
+            map.cfg_for(Some("buildhost")).unwrap().urls[0],
             "turn:coturn.example:3478"
         );
         assert_eq!(
@@ -668,7 +668,7 @@ mod tests {
             None
         );
         assert_eq!(
-            pick_region_with_load(&map, &no_load(), Some("mars"), &prefs),
+            pick_region_with_load(&map, &no_load(), Some("buildhost"), &prefs),
             None
         );
 
