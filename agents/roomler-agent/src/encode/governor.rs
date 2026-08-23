@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use super::aimd::AimdController;
 use super::encode_pressure::{DownscaleTier, EncodePressure};
+use super::goodput::{GoodputEstimator, GoodputSink};
 use super::viewer_rate::{self, ViewerRateController};
 
 /// A bitrate target the pump must apply to the live encoder
@@ -100,6 +101,14 @@ pub struct RateGovernor {
     encode_factor: f32,
     tier: DownscaleTier,
     auto_res_cap: Option<u32>,
+
+    // Measured-rate stage 0 — OBSERVE ONLY. Nothing above reads this
+    // yet; it is folded on the viewer-window tick and reported in the
+    // heartbeat so the estimate can be checked against known truth
+    // (relay sessions ≈ 2 Mbps, direct ⇒ None) before stage 1 derives
+    // the ceiling from it.
+    goodput: GoodputEstimator,
+    goodput_sink: GoodputSink,
 }
 
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
@@ -120,7 +129,33 @@ impl RateGovernor {
             encode_factor: 1.0,
             tier: DownscaleTier::new(),
             auto_res_cap: None,
+            goodput: GoodputEstimator::new(),
+            goodput_sink: GoodputSink::new(),
         }
+    }
+
+    /// Hand to the send task at spawn. It records one busy period per
+    /// unbroken run of frames; the governor folds them on the viewer
+    /// window tick.
+    pub fn goodput_sink(&self) -> GoodputSink {
+        self.goodput_sink.clone()
+    }
+
+    /// The measured delivered rate, or `None` for no confidence.
+    ///
+    /// ⚠ Stage 0: **reported, never consumed.** When stage 1 wires this
+    /// into the budgets, the rule is `B = min(nominal, 0.85 × G)` —
+    /// measurement may only ever LOWER the clamp, because the clamp also
+    /// protects the TURN path.
+    pub fn measured_goodput_bps(&self, now: Instant) -> Option<u32> {
+        self.goodput.estimate_bps(now)
+    }
+
+    /// `(accepted, rejected)` busy periods — heartbeat telemetry. A high
+    /// rejected count with zero accepted is the healthy signature of an
+    /// unbound link, not a wiring fault.
+    pub fn goodput_samples(&self) -> (u64, u64) {
+        (self.goodput.accepted(), self.goodput.rejected())
     }
 
     /// Backpressure-gate arm: the send channel is FULL (or a shared-
@@ -217,6 +252,13 @@ impl RateGovernor {
             return None;
         }
         self.viewer_window_at = now;
+        // Stage 0: fold whatever the send task observed since the last
+        // window. Deliberately inside the window gate rather than per
+        // frame — the send task is a different task, and this is the
+        // existing once-a-second rendezvous.
+        for period in self.goodput_sink.drain() {
+            self.goodput.observe(period, now);
+        }
         let (reported_fps, struggling) = viewer_rate::unpack_report(take_report());
         let own_div = self
             .viewer_rate

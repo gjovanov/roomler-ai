@@ -69,6 +69,17 @@ pub mod viewer_rate;
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub mod encode_pressure;
 
+// Measured-rate stage 0 — the per-session delivered-rate estimate. Pure
+// and unit-tested on the default build; the DC pumps feed it and the
+// heartbeat reports it. Stage 0 DERIVES NOTHING from it: the number is
+// observed and logged so it can be checked against known truth in the
+// field before any ceiling depends on it.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub mod goodput;
+
 // P3 (Parsec-class plan) — transport/codec-aware rate-profile helpers:
 // persisted-flip rebuild decision (FlipTracker), per-codec maxrate factor
 // (H.264 ×1.5 — text-sharpness field fix), H.264 CQ adjustment. Pure
