@@ -418,6 +418,22 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     )
     .await?;
 
+    // Remote-config decisions (`docs/remote-config.md`) — who asked for what
+    // on which device, granted or refused. Same 90-day TTL as the other three
+    // audit logs: a config change that opens exec is the same class of event
+    // as using it, so it must not age out sooner.
+    create_indexes(
+        db,
+        "config_audit",
+        vec![
+            index(bson::doc! { "tenant_id": 1, "at": -1 }),
+            index(bson::doc! { "agent_id": 1, "at": -1 }),
+            index(bson::doc! { "tenant_id": 1, "user_id": 1, "at": -1 }),
+            index_ttl(bson::doc! { "at": 1 }, 90 * 24 * 60 * 60),
+        ],
+    )
+    .await?;
+
     // Roomler-SSH grant decisions. Same three questions as `exec_audit`, same
     // 90-day TTL — an SSH session is the bigger power of the two, so its log
     // must not be the shorter-lived one.

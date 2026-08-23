@@ -17,13 +17,14 @@ use roomler_ai_services::{
     AuthService, EmailService, GiphyService, OAuthService, PushService, RecognitionService,
     TaskService,
     dao::{
-        activation_code::ActivationCodeDao, agent::AgentDao, consent_request::ConsentRequestDao,
-        exec_audit::ExecAuditDao, file::FileDao, invite::InviteDao, message::MessageDao,
-        notification::NotificationDao, overlay_network::OverlayNetworkDao,
-        overlay_node::OverlayNodeDao, overlay_policy::OverlayPolicyDao,
-        push_subscription::PushSubscriptionDao, reaction::ReactionDao, recording::RecordingDao,
-        remote_audit::RemoteAuditDao, remote_session::RemoteSessionDao, role::RoleDao,
-        room::RoomDao, ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
+        activation_code::ActivationCodeDao, agent::AgentDao, config_audit::ConfigAuditDao,
+        consent_request::ConsentRequestDao, exec_audit::ExecAuditDao, file::FileDao,
+        invite::InviteDao, message::MessageDao, notification::NotificationDao,
+        overlay_network::OverlayNetworkDao, overlay_node::OverlayNodeDao,
+        overlay_policy::OverlayPolicyDao, push_subscription::PushSubscriptionDao,
+        reaction::ReactionDao, recording::RecordingDao, remote_audit::RemoteAuditDao,
+        remote_session::RemoteSessionDao, role::RoleDao, room::RoomDao,
+        ssh_activity::SshActivityDao, ssh_audit::SshAuditDao, tenant::TenantDao,
         tunnel_audit::TunnelAuditDao, tunnel_client::TunnelClientDao,
         tunnel_policy::TunnelPolicyDao, user::UserDao,
     },
@@ -97,6 +98,9 @@ pub struct AppState {
     pub exec_audit: Arc<ExecAuditDao>,
     /// Roomler-SSH grant log — every session request, granted or refused.
     pub ssh_audit: Arc<SshAuditDao>,
+    /// Remote-config decisions (`docs/remote-config.md`): what was ASKED for
+    /// on a device, granted or refused — never what the device did.
+    pub config_audit: Arc<ConfigAuditDao>,
     /// P8 — device-reported session activity. Separate from `ssh_audit`
     /// because one is the server's decision and the other is a claim by the
     /// device; see `SshActivityEvent`.
@@ -353,6 +357,7 @@ impl AppState {
         let remote_audit = Arc::new(RemoteAuditDao::new(&db));
         let exec_audit = Arc::new(ExecAuditDao::new(&db));
         let ssh_audit = Arc::new(SshAuditDao::new(&db));
+        let config_audit = Arc::new(ConfigAuditDao::new(&db));
         let ssh_activity = Arc::new(SshActivityDao::new(&db));
         let agent_crashes = Arc::new(roomler_ai_services::dao::agent_crash::AgentCrashDao::new(
             &db,
@@ -826,6 +831,7 @@ impl AppState {
             remote_audit,
             exec_audit,
             ssh_audit,
+            config_audit,
             ssh_activity,
             agent_crashes,
             agent_logs,
