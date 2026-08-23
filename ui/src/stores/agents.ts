@@ -43,6 +43,16 @@ export interface AgentCapabilities {
    *  `hw_encoders` for older agent rows. */
   transports?: string[]
   has_input_permission: boolean
+  /** Host permissions the OS has actually GRANTED (rc.454+):
+   *  'screen-capture', 'input'. macOS is the only platform that gates
+   *  them, and it never errors when one is missing — capture returns
+   *  wallpaper-only frames and injected input is silently dropped.
+   *
+   *  ⚠️ `undefined` and `[]` mean OPPOSITE things: undefined is a
+   *  pre-rc.454 agent that cannot report (say nothing), `[]` is an
+   *  agent reporting it holds NEITHER (warn loudly). Never collapse
+   *  them with a falsy check. */
+  permissions?: string[]
   supports_clipboard: boolean
   supports_file_transfer: boolean
   max_simultaneous_sessions: number
