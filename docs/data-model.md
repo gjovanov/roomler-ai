@@ -35,7 +35,7 @@ erDiagram
 | Collection | Purpose · key fields / indexes |
 |---|---|
 | `tenants` | Organizations. Unique `slug`; `owner_id`; plan + Stripe linkage |
-| `users` | Accounts. Unique `email`, `username`; text index on `display_name`+`username` |
+| `users` | Accounts. Unique `email`, `username`; text index on `display_name`+`username`. ⚠️ Unique `email` is a **reservation**, so it holds only an address the account has *proven* (activation, or a provider that verified it) — an unproven claim goes to the non-indexed `unverified_email` and the row takes a `.invalid` placeholder |
 | `tenant_members` | Membership + role assignment. Unique `(tenant_id, user_id)` |
 | `roles` | 24-bit permission bitfield. Unique `(tenant_id, name)`, ordered by `position` |
 | `rooms` | Hierarchical tree (text + voice/video): `parent_id`, unique `(tenant_id, path)`, sparse-unique `meeting_code`; text index on `name`+`purpose`+`tags` |
