@@ -303,7 +303,7 @@ fn ws_upgrade_agent(
             // text frame + a Close frame BEFORE dropping the socket so
             // the agent can log a useful "your row was deleted, re-enrol"
             // line instead of an opaque `ws read` (the failure mode
-            // PC55331 wedged on for hours pre-rc.53). The agent's
+            // WINHOST-B wedged on for hours pre-rc.53). The agent's
             // `handle_server_msg::ServerMsg::Goodbye` arm decides this is
             // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
             // the SCM supervisor's rc.53 code-7 fast-alarm fires on the

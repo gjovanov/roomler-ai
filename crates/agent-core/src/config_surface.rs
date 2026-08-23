@@ -397,7 +397,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "idle_refine_balanced",
         "tribool",
-        "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the pc55331 relay); off restores the un-refined Balanced rung. Env: ROOMLER_NODE_IDLE_REFINE_BALANCED. Restart required.",
+        "P7 - idle refinement on Balanced+relay sessions (lifts the B1 physics cap at idle). Built-in default: on since P7c (field-proven on the winhost-b relay); off restores the un-refined Balanced rung. Env: ROOMLER_NODE_IDLE_REFINE_BALANCED. Restart required.",
     ),
     (
         "gpu_scale",

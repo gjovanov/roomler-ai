@@ -401,11 +401,11 @@ mod tests {
     #[test]
     fn hash_hostname_is_stable() {
         // Same input → same hash; trim + lowercase normalisation.
-        assert_eq!(hash_hostname("PC50045"), hash_hostname("pc50045"));
-        assert_eq!(hash_hostname("PC50045"), hash_hostname("  PC50045  "));
-        assert_ne!(hash_hostname("PC50045"), hash_hostname("PC50046"));
+        assert_eq!(hash_hostname("WINHOST-A"), hash_hostname("winhost-a"));
+        assert_eq!(hash_hostname("WINHOST-A"), hash_hostname("  WINHOST-A  "));
+        assert_ne!(hash_hostname("WINHOST-A"), hash_hostname("WINHOST-D"));
         // Output length is the SHA256 hex (64 chars).
-        assert_eq!(hash_hostname("PC50045").len(), 64);
+        assert_eq!(hash_hostname("WINHOST-A").len(), 64);
     }
 
     #[test]

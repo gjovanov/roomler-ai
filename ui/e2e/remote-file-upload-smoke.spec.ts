@@ -1,6 +1,6 @@
 /**
  * Phase 3 — file-DC upload smoke against the Phase 1 `agent-e2e`
- * harness. Promotes the env-gated `remote-upload-pc50045.spec.ts`
+ * harness. Promotes the env-gated `remote-upload-winhost-a.spec.ts`
  * (which targets PROD with a `.cred` file + an externally-supplied
  * `E2E_UPLOAD_FILE`) into a CI spec that drives the in-cluster
  * fixture agents with a synthesised payload.
@@ -154,7 +154,7 @@ test.describe('Remote file-DC upload smoke against the agent-e2e harness', () =>
         'transfer row never appeared in Transfers panel'
       ).toBeVisible({ timeout: 30_000 })
 
-      // Poll for completion. Per remote-upload-pc50045.spec.ts there's
+      // Poll for completion. Per remote-upload-winhost-a.spec.ts there's
       // no terminal `exhausted` state any more — only `complete` or
       // `error`. With a 1 MiB payload over in-cluster network the
       // expected dwell is well under 30 s; 2 min ceiling absorbs

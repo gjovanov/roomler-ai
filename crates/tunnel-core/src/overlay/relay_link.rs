@@ -1,7 +1,7 @@
 //! Coturn-relay carrier coordination for the overlay runtime (Phase 3b).
 //!
 //! **Deterministic worker (rc.127).** The relay-to-relay leg must hairpin on
-//! ONE coturn worker: cross-worker relay traffic drops under mars's
+//! ONE coturn worker: cross-worker relay traffic drops under buildhost's
 //! dual-public-IP SNAT (the issue the QUIC tunnel fixed in rc.112). rc.125
 //! pinned the *responder* onto the *initiator's* worker by reading the
 //! initiator's advertised relayed address — but that read is racy: on
@@ -62,7 +62,7 @@ const DERP_REGRADE_COOLDOWN: Duration = Duration::from_secs(600);
 /// How soon after a regrade a server force-DERP pin still counts as the server
 /// OVERRULING that regrade (see [`RelayCoordinator::note_regrade_overruled`]).
 ///
-/// Field-measured: every overruled regrade on NEO16 drew its pin 2m45s–4m14s
+/// Field-measured: every overruled regrade on DEVBOX drew its pin 2m45s–4m14s
 /// later — the churn has to happen before the server can see it. Ten minutes
 /// covers that with margin without swallowing an unrelated later escalation.
 const REGRADE_OVERRULE_WINDOW: Duration = Duration::from_secs(600);
@@ -74,7 +74,7 @@ const REGRADE_OVERRULE_WINDOW: Duration = Duration::from_secs(600);
 /// pin, because the pin (1800 s) always outlives it: the pin expires, the
 /// regrade re-fires seconds later, TURN churns again, the server re-pins —
 /// a permanent ~30-minute cycle on pairs that were previously STABLE on DERP.
-/// Observed on NEO16 2026-08-07: neo16-wsl's pin lapsed at 09:32:01 and the
+/// Observed on DEVBOX 2026-08-07: devbox-wsl's pin lapsed at 09:32:01 and the
 /// regrade re-fired at 09:32:16, 15 s later.
 ///
 /// Historically the first rung therefore had to exceed the pin TTL (40 min).
@@ -200,7 +200,7 @@ pub struct ReadyLink {
     /// `relay_parts.1`, that the ANCHOR must open coturn permissions for.
     /// Permissions are IP-scoped; the anchor's `\x00` bootstrap used to
     /// target only the FIRST advertised srflx, so a multi-homed dialer
-    /// (mars: 94.130.141.74 + .98 — one plane sock per local IP, several
+    /// (buildhost: 94.130.141.74 + .98 — one plane sock per local IP, several
     /// srflx adverts) whose fresh raw dial socket egressed from another of
     /// its addresses was silently dropped at coturn (field 2026-08-15:
     /// QUIC rendezvous rx=0 on both sides, raw fallback fine). Distinct
@@ -418,8 +418,8 @@ pub struct RelayCoordinator {
     /// Unresponsive-peer re-request backoff — consecutive relay-carrier
     /// deaths for a peer with NO intervening completed handshake, plus the
     /// instant our OWN next `request` for it is allowed. Field 2026-08-15:
-    /// mars ground a fresh allocation + 89 s QUIC rendezvous window against
-    /// SLEEPING pc50045 (zombie server registration) every ~45-90 s all
+    /// buildhost ground a fresh allocation + 89 s QUIC rendezvous window against
+    /// SLEEPING winhost-a (zombie server registration) every ~45-90 s all
     /// evening — the reap→re-request loop has no memory, and the resulting
     /// TURN churn kept re-triggering the server's 30-min force-DERP pins,
     /// which then delayed direct upgrades after the peer WOKE. Deferral is
@@ -655,7 +655,7 @@ impl RelayCoordinator {
         // 12 s deadline every ~65 s walk) then re-armed the 300 s hold
         // faster than it could expire — the relay re-request starved
         // FOREVER while the pair sat carrier-less (field 2026-08-17,
-        // rc.398 post-roll: clk/pc50045 pairs wedged fleet-wide once the
+        // rc.398 post-roll: corplap/winhost-a pairs wedged fleet-wide once the
         // storm-era force-DERP pins expired and stopped masking it). A
         // direct-tier death says nothing about grinding allocations —
         // #496's whole point — so it must not feed this streak.
@@ -682,7 +682,7 @@ impl RelayCoordinator {
 
     /// #22 — a peer we can HEAR is not asleep, so the defer's premise is
     /// void: `relay_death_backoff` exists to stop hammering allocations at a
-    /// SLEEPING peer, but the 08-18 neo16↔pc50045 wedge showed the other
+    /// SLEEPING peer, but the 08-18 devbox↔winhost-a wedge showed the other
     /// face — one end's replacement legs kept dying (rebirthing floor) while
     /// it deferred "because their own request still pairs us instantly", and
     /// the peer, whose OWN leg round-tripped fine, never had a reason to
@@ -732,7 +732,7 @@ impl RelayCoordinator {
     ///   — with the permanent floor mux the Arc always exists, so Arc absence
     ///   alone would never fire again and the server's U1 silent-veto healer
     ///   would go blind for the WSS-down-while-control-WS-works class
-    ///   (pc50045, Check Point). The hysteresis keeps a reconnect blip from
+    ///   (winhost-a, Check Point). The hysteresis keeps a reconnect blip from
     ///   clearing force-DERP pins.
     fn derp_evidence_failed(&self) -> bool {
         self.derp_mux_failed
@@ -1103,8 +1103,8 @@ impl RelayCoordinator {
     /// Without this the two mechanisms fight forever: the pin (1800 s) outlives
     /// the 600 s cooldown, so the instant it lapses the regrade re-fires,
     /// re-churns, and is re-pinned — a ~30-minute cycle that makes a pair which
-    /// was STABLE on DERP permanently unstable. Field-observed on NEO16
-    /// (neo16-wsl, regal, clk00017265) within an hour of the rc.314 rollout.
+    /// was STABLE on DERP permanently unstable. Field-observed on DEVBOX
+    /// (devbox-wsl, regal, corplap-01) within an hour of the rc.314 rollout.
     ///
     /// Called from [`force_derp`](Self::force_derp), which is the only place a
     /// pin is applied; a pin for a peer we did NOT just regrade is left alone.
@@ -1246,7 +1246,7 @@ impl RelayCoordinator {
             && self.warm_committed.is_none()
             && let Some(conn) = self.warm_leg.clone()
         {
-            // PR-B2 (field 2026-08-16, pc55331↔clk) — the server must still
+            // PR-B2 (field 2026-08-16, winhost-b↔corplap) — the server must still
             // SEE this establishment: P7's force-DERP escalation counts relay
             // requests, and a fast path that skips the wire made a churning
             // pair (dialer whose corp egress drops raw UDP to ephemeral relay
@@ -1322,7 +1322,7 @@ impl RelayCoordinator {
     /// Got coturn creds + `pair_key` — the SYNC half of the old `on_grant`
     /// (rc.218). Stash them into the pending slot and return the inputs the
     /// runtime needs to run [`allocate_for_pair`] OFF-LOOP (the DNS + TURN
-    /// allocate takes seconds on a hostile corp path — pc50045's rc.213-216
+    /// allocate takes seconds on a hostile corp path — winhost-a's rc.213-216
     /// logs still showed `stalled the data plane` from exactly this await).
     /// `None` for a grant we never requested (or already tore down). The peer
     /// STAYS in `pending` while the spawned allocate runs, so `is_tracking`
@@ -1649,7 +1649,7 @@ impl RelayCoordinator {
     fn try_build_derp(&mut self, node_id: &ObjectId) -> Option<ReadyLink> {
         let peer = self.derping.get(node_id)?.clone();
         let mux = self.mux_for(node_id)?;
-        // Field 2026-08-15/16 (pc50045 under a Check Point capture): the mux
+        // Field 2026-08-15/16 (winhost-a under a Check Point capture): the mux
         // Arc EXISTS while its `/derp` WS is down and slowly reconnecting
         // through the throttled TLS path — and a carrier built over it is born
         // dead, convicts as "one-way" on the next sweep, and rebuilds every
@@ -1713,7 +1713,7 @@ impl RelayCoordinator {
         // appeared, so three separate diagnosis rounds had to infer it from
         // peers-table shapes. A carrier-less peer is precisely the state the
         // floor exists to prevent, so the refusal is operator-relevant by
-        // definition — see the field wedges on pc50045 / pc55331 / clk under
+        // definition — see the field wedges on winhost-a / winhost-b / corplap under
         // corp VPN, 2026-08-19.
         let reason = if !self.derp_floor {
             Some("the overlay_derp_floor flag is off on THIS node")
@@ -1816,7 +1816,7 @@ impl RelayCoordinator {
     /// With no srflx and no dialer role — a corp VPN connecting — the
     /// fallback ladder can't build either, so the pair sat "blocked"
     /// indefinitely: exactly the state the floor exists to make impossible
-    /// (field: pc50045's secondary org, 2026-08-19, four peers wedged from
+    /// (field: winhost-a's secondary org, 2026-08-19, four peers wedged from
     /// the moment its VPN came up and killed their direct carriers).
     ///
     /// Returns whether anything was cleared (for the caller's log).
@@ -1838,7 +1838,7 @@ impl RelayCoordinator {
     /// wire message and nothing that can time out, so `is_tracking` stays
     /// true forever if the anchor never advertises. Gating the floor on
     /// `!is_tracking` therefore starved precisely those pairs (field:
-    /// pc50045's secondary org under corp VPN, 2026-08-19).
+    /// winhost-a's secondary org under corp VPN, 2026-08-19).
     pub fn is_derping(&self, node_id: &ObjectId) -> bool {
         self.derping.contains_key(node_id)
     }
@@ -1985,8 +1985,8 @@ async fn pick_worker(pair_key: &str, ice: &[IceServer]) -> Option<IpAddr> {
 /// "first coturn match" sent EVERY dialer to the SAME R: the one pair owning
 /// it worked, every other dialer hit an allocation holding no permission for
 /// it — silently dropped by coturn, one-way, convicted, rebuilt to the same
-/// wrong R forever. Field 2026-08-17 ~00:45Z: pc50045 (anchor on VPN)
-/// advertised two pair-Rs; jupiter AND zeus both dialed the same one and
+/// wrong R forever. Field 2026-08-17 ~00:45Z: winhost-a (anchor on VPN)
+/// advertised two pair-Rs; fleet-host-1 AND fleet-host-2 both dialed the same one and
 /// both looped one-way at ~50 s/cycle — the persistent `blocked` set.
 /// Rotating by the death streak makes each failing dialer walk the
 /// candidates; the correct R completes a handshake, which CLEARS the streak
@@ -2190,8 +2190,8 @@ mod tests {
     /// Multi-R ambiguity — an anchor serving several single-relay pairs
     /// advertises ALL its pair allocations in one flat list, and nothing on
     /// the wire says which R belongs to which pair. A fixed first-match sent
-    /// every dialer to the same R (field 2026-08-17: jupiter AND zeus both
-    /// one-way-looping on pc50045's first R at ~50 s/cycle — the persistent
+    /// every dialer to the same R (field 2026-08-17: fleet-host-1 AND fleet-host-2 both
+    /// one-way-looping on winhost-a's first R at ~50 s/cycle — the persistent
     /// `blocked` set). The death-streak rotation walks the candidates; the
     /// working R clears the streak (#496) and the pick pins there.
     #[test]
@@ -2202,7 +2202,7 @@ mod tests {
             "94.130.141.74".parse().unwrap(),
             "5.9.157.226".parse().unwrap(),
         ];
-        // The live pc50045 shape: LAN + two pair-Rs on different workers.
+        // The live winhost-a shape: LAN + two pair-Rs on different workers.
         let eps = vec![
             "192.168.68.106:43650".to_string(), // LAN — skipped
             "94.130.141.74:11259".to_string(),  // pair-R #1
@@ -2362,7 +2362,7 @@ mod tests {
 
     /// Unresponsive-peer backoff ladder: deaths 1-2 re-request immediately
     /// (transients stay snappy), the 3rd defers 60 s, doubling to the 5-min
-    /// cap — the mars-vs-sleeping-pc50045 grind (one allocation + QUIC
+    /// cap — the buildhost-vs-sleeping-winhost-a grind (one allocation + QUIC
     /// window every ~45-90 s for HOURS, feeding the server's force-DERP
     /// pins) becomes ~12 attempts/h.
     #[test]
@@ -2622,7 +2622,7 @@ mod tests {
         assert!(lan("169.254.1.2")); // link-local
         assert!(lan("100.64.0.2")); // overlay/CGNAT
         // coturn-relayed publics → false (these ARE the relay address).
-        assert!(!lan("94.130.141.74")); // mars
+        assert!(!lan("94.130.141.74")); // buildhost
         assert!(!lan("5.9.157.221")); // hetzner coturn
         assert!(!lan("5.9.157.226"));
     }
@@ -2747,7 +2747,7 @@ mod tests {
 
         // UDP-capability OVERRIDES pubkey: the UDP-blocked side always anchors,
         // even when its pubkey is the LARGER one (would be dialer under the old
-        // rule) — this is the PC50045 corp-host path.
+        // rule) — this is the WINHOST-A corp-host path.
         assert_eq!(
             coord(large, false).single_relay_role(&test_nid(), &peer(small, true, true)),
             Some(true),
@@ -2776,7 +2776,7 @@ mod tests {
         assert_eq!(b_blocked_anchor, Some(true));
     }
 
-    /// Dialer honesty (field 2026-08-16, CLK00017265): a srflx candidate only
+    /// Dialer honesty (field 2026-08-16, CORPLAP-01): a srflx candidate only
     /// proves UDP to a well-known port — a host whose raw dials toward the
     /// coturn relay band never land must ANCHOR, and the verdict only applies
     /// when the peer carries the honesty field at all (mixed-version pairs
@@ -2805,7 +2805,7 @@ mod tests {
             Some(false)
         );
 
-        // The clk fix: we latched not-dialer-capable ⇒ we ANCHOR against an
+        // The corplap fix: we latched not-dialer-capable ⇒ we ANCHOR against an
         // honesty-capable peer, pubkey order be damned.
         let mut latched = coord(large);
         latched.set_udp_dialer_ok(false);
@@ -2893,7 +2893,7 @@ mod tests {
             c
         };
 
-        // The clk case, measured: srflx PRESENT + latch clear, but the probe
+        // The corplap case, measured: srflx PRESENT + latch clear, but the probe
         // proved the relay band is dropped ⇒ we ANCHOR (peer measured-capable
         // dials), pubkey order be damned.
         assert_eq!(
@@ -3103,7 +3103,7 @@ mod tests {
         assert!(c.derp_regrade_due(&nid, &udp_ok, t0 + DERP_REGRADE_COOLDOWN));
     }
 
-    /// The regrade↔pin churn loop measured on NEO16 on 2026-08-07: the P7 pin
+    /// The regrade↔pin churn loop measured on DEVBOX on 2026-08-07: the P7 pin
     /// (1800 s) outlives the flat 600 s cooldown, so the moment it lapsed the
     /// regrade re-fired (15 s later, in the field), re-churned TURN, and was
     /// re-pinned — forever, on pairs that had been STABLE on DERP.
@@ -3597,7 +3597,7 @@ mod tests {
         assert!(
             coord.build_floor(node, &peer).is_some(),
             "the floor MUST rebuild after a direct carrier dies — this is the \
-             regression that wedged pc50045's secondary org on 2026-08-19"
+             regression that wedged winhost-a's secondary org on 2026-08-19"
         );
         assert!(coord.is_floored(&node));
         // Idempotent: clearing twice is harmless (the death path is allowed

@@ -58,7 +58,7 @@ const WS_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
 /// inbound frame at least every `WS_KEEPALIVE`. Send-success alone proves
 /// nothing: a TLS-inspecting corp middlebox (Check Point et al.) terminates
 /// TCP locally and keeps ACKing our Pings after its upstream leg has died —
-/// field case PC50045 2026-08-02 (agent twin of this loop sat half-open for
+/// field case WINHOST-A 2026-08-02 (agent twin of this loop sat half-open for
 /// 45+ min after a server pod roll). `WsSource::recv` treats the deadline as
 /// link-gone (`None`), which drives the normal reconnect path.
 const WS_RX_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);

@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn public_v4_classifier() {
-        // Real public IPs (mars eth0, a DNS server) → public.
+        // Real public IPs (buildhost eth0, a DNS server) → public.
         assert!(is_public_v4(&Ipv4Addr::new(94, 130, 141, 98)));
         assert!(is_public_v4(&Ipv4Addr::new(8, 8, 8, 8)));
         // NAT / private hosts (the relay-pin cases) → NOT public.

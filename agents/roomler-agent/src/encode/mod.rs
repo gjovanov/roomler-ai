@@ -188,7 +188,7 @@ pub const MAX_BITRATE_BPS: u32 = 40_000_000;
 /// rc.443 — consecutive-encode-error escalation for the FFmpeg DC pump.
 /// The historical arm was `warn + continue` forever, which turned a
 /// persistently-failing HW encoder into a silent frozen stream (field
-/// 2026-08-21, clk: av1_qsv returned `Invalid data` on a forced IDR — the
+/// 2026-08-21, corplap: av1_qsv returned `Invalid data` on a forced IDR — the
 /// error alone would have looped; the driver then hung, which the
 /// pipeline-staleness eviction covers). The ladder retries transient
 /// errors, REBUILDS the encoder at 3 and 6 consecutive failures (a fresh
@@ -294,7 +294,7 @@ pub(crate) fn relay_max_bps() -> u32 {
 /// rc.190 (B1) — long-edge RESOLUTION cap for a constrained relay-TCP
 /// transport. `relay_max_bps` caps the bitrate at ~3 Mbps, but a 2560×1600
 /// stream at 3 Mbps starves into the blur↔crystallize AIMD sawtooth (field
-/// NEO16→PC50045 2026-07-16) — fewer pixels per bit is the actual fix, so the
+/// DEVBOX→WINHOST-A 2026-07-16) — fewer pixels per bit is the actual fix, so the
 /// DC pumps also cap the encode resolution. Default 1280 long edge (≈1280×800
 /// at 3 Mbps is smooth); env `ROOMLER_AGENT_RELAY_MAX_EDGE`, `0` disables.
 /// Hard cap: clamps even an explicit controller pick (it's link physics).
@@ -418,7 +418,7 @@ pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32>
     // rc.445 — the dial dims-caps are OFF BY DEFAULT. Field 2026-08-21 (all
     // three test hosts, Smoother AND Balanced): every mid-motion rung flip
     // pays a BLOCKING QSV encoder open on the pump thread — measured
-    // 865 ms for the Down and 654 ms for the Up on Iris-Xe-class (clk,
+    // 865 ms for the Down and 654 ms for the Up on Iris-Xe-class (corplap,
     // `resolution cap engaged` → `encoder (re)built` deltas) — plus a
     // fresh IDR behind the queued frames. The user-felt result was "drag
     // takes off ~1 s, freezes ~1 s, then continues", and "Sharper is best"
@@ -485,7 +485,7 @@ pub(crate) fn dial_rate_factor_pct(priority: u8) -> usize {
 /// pixels for motion smoothness, and a settled still costs neither, so
 /// crisp-at-rest is pure win. **Balanced+relay** lifts the B1 *physics*
 /// cap at idle (a native IDR is ~150-400 KB through a 3 Mbps pipe) —
-/// opt-in at v1, default ON since P7c: a full field day on the pc55331
+/// opt-in at v1, default ON since P7c: a full field day on the winhost-b
 /// relay (2026-08-20) showed clean refine cycles at exactly this IDR
 /// cost, and the un-refined Balanced rung was the user-visible "still
 /// blurred" report. `ROOMLER_AGENT_IDLE_REFINE_BALANCED=0` restores the

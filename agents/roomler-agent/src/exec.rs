@@ -254,7 +254,7 @@ fn mask_jwt_shaped(input: &str) -> String {
 ///
 /// PowerShell writes its pipe in the host's ANSI/OEM codepage, not UTF-8. On a
 /// German-locale host `whoami` returns `nt-autorität\system`, which arrives as
-/// `nt-autorit<?>t\system` after our lossy decode — field-caught on PC50045,
+/// `nt-autorit<?>t\system` after our lossy decode — field-caught on WINHOST-A,
 /// 2026-08-06. Setting the console output encoding per-process is the standard
 /// fix; it does not leak outside this child, and an assignment before the
 /// caller's command does not affect the exit code PowerShell reports.
@@ -1298,7 +1298,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn non_ascii_output_survives_a_non_utf8_console_codepage() {
-        // Field-caught on PC50045 (German locale): `whoami` returns
+        // Field-caught on WINHOST-A (German locale): `whoami` returns
         // `nt-autorität\system`, which PowerShell wrote in the host ANSI
         // codepage and our lossy decode turned into `nt-autorit<?>t\system`.
         // A diagnostic that garbles the machine's own output is worse than
@@ -1341,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_shell_is_a_clean_error_not_a_panic() {
         let mut r = req("whatever");
-        r.shell = "zsh-from-mars".into();
+        r.shell = "zsh-from-buildhost".into();
         let out = engine().run(r, &Redactor::default()).await;
         assert!(
             out.error

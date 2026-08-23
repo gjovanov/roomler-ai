@@ -40,7 +40,7 @@ const FOLLOW_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3
 /// - the new pair's REMOTE parses to a real-path (non-overlay-range) IP AND
 ///   the new pair's priority is STRICTLY greater than the current one —
 ///   upgrading onto srflx/public pairs is safe, but equal-priority siblings
-///   are not a migration. Field (rc.267, DESKTOP-69T5HUD): the agent gathers
+///   are not a migration. Field (rc.267, WINHOST-C): the agent gathers
 ///   one srflx candidate per STUN server (7 sockets, equal priority); Chrome
 ///   aggressively nominated each in turn and v2 followed every one — 7
 ///   selection switches in one second, each changing the sending socket
@@ -91,7 +91,7 @@ fn follow_renomination_policy(
 /// Roomler patch (warm standby, 2026-07-28): cadence for pinging validated
 /// pairs that are NOT the selected one. Upstream keepalives only the selected
 /// pair, so every other validated pair's NAT mapping expires minutes after it
-/// goes idle (field, DESKTOP-69T5HUD: the agent's srflx mapping died within
+/// goes idle (field, WINHOST-C: the agent's srflx mapping died within
 /// ~4–13 min of media settling on the overlay-host pair — killing the exact
 /// real-path fallback needed when the overlay carrier stalls). A controlled
 /// binding request never carries USE-CANDIDATE, so a warm ping can't change
@@ -723,7 +723,7 @@ impl ControlledSelector for AgentInternal {
                     // agent's most recent nomination so both directions ride
                     // the pair it chose; without this the browser switches its
                     // send path while the agent keeps streaming media over the
-                    // stale pair (field 2026-07-27, NEO16→69T5HUD: video pinned
+                    // stale pair (field 2026-07-27, DEVBOX→WINHOST-C: video pinned
                     // to the overlay pair through carrier churn while the
                     // nominated srflx pair sat idle).
                     // Default-OFF (2026-07-27 field): following renominations let

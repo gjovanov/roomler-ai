@@ -13,7 +13,7 @@
 //! no handshake-timeout fallback). Peers NOT on a shared subnet still use the
 //! relay exactly as before. rc.131 advertised one interface (a connect-trick);
 //! **rc.132 enumerates ALL interfaces** (a multi-homed host advertises every
-//! LAN IP — field host PC50045 routes the internet via corporate Ethernet but
+//! LAN IP — field host WINHOST-A routes the internet via corporate Ethernet but
 //! its peer is on the Wi-Fi). srflx hole-punch + an AP-isolation relay-fallback
 //! are later follow-ups. See `docs/overlay-wfp.md` siblings.
 
@@ -48,7 +48,7 @@ pub fn direct_enabled() -> bool {
 /// ⚠️ Chosen ABOVE the Hyper-V / WSL2-mirrored / HNS reservation zone. Those
 /// stacks reserve large port pools that are invisible to BOTH `netstat` AND
 /// `netsh interface ipv4 show excludedportrange` — the same trap
-/// `rc_local_turn`'s fallback band documents. Field-measured on NEO16
+/// `rc_local_turn`'s fallback band documents. Field-measured on DEVBOX
 /// (WSL-mirrored) 2026-08-05: **41000–41800+ all unbindable**, 41989 and up
 /// free — which swallowed the original 41648 default whole. The zones are
 /// allocated dynamically and MOVE between boots, so the band walk below is
@@ -119,7 +119,7 @@ pub fn direct_port_candidates(base: u16) -> impl Iterator<Item = u16> + Clone {
 /// specific-IP bind fails without SO_REUSEADDR). `0` = ephemeral ports, the
 /// pre-rc.307 behavior.
 ///
-/// Why a stable port: stateful corp firewalls (Check Point on pc50045)
+/// Why a stable port: stateful corp firewalls (Check Point on winhost-a)
 /// GRANDFATHER UDP flows that predate the VPN's session table — direct
 /// carriers established before the VPN connects keep working, but any
 /// rebuild (agent update, control-WS reconnect on a server deploy) used to
@@ -173,9 +173,9 @@ pub const MAX_DIRECT_PORT_BASE: u16 =
 /// whichever is on its subnet.
 ///
 /// rc.132 — replaces the rc.131 connect-trick (default-route IP only), which
-/// picked the WRONG interface on a multi-homed host: field host PC50045 routes
+/// picked the WRONG interface on a multi-homed host: field host WINHOST-A routes
 /// the internet via its corporate Ethernet (`172.30.x`) but its overlay peer
-/// (NEO16) is on the Wi-Fi (`192.168.68.x`), so the single default-route IP it
+/// (DEVBOX) is on the Wi-Fi (`192.168.68.x`), so the single default-route IP it
 /// advertised was unreachable by the peer → no same-subnet match → fell back
 /// to the (failing) relay. Enumerating all interfaces advertises both, so the
 /// peer finds the `192.168.68.x` one.
@@ -202,7 +202,7 @@ pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
     // them is actively harmful, not merely useless —
     //
     //   * the guest binds `(host_lan_ip, port)` and STARVES the host agent's
-    //     own socket. Field 2026-08-14: neo16 went 8/8 direct → 0/8, every
+    //     own socket. Field 2026-08-14: devbox went 8/8 direct → 0/8, every
     //     peer `saw_inbound=false`, until the guest's agent was stopped. A
     //     different port did NOT help; the address is what matters.
     //   * the host, seeing the guest advertise the host's own address, gets a
@@ -221,7 +221,7 @@ pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
                 && !out.iter().any(|(existing, _)| *existing == ip)
             {
                 // rc.275 hygiene — skip virtual / host-only / other-VPN
-                // interfaces (see `lan_iface_denied`). Field: pc50045
+                // interfaces (see `lan_iface_denied`). Field: winhost-a
                 // advertised its WSL vEthernet `172.31.176.1` (a host-only
                 // NAT address no peer can ever reach) and its Check Point
                 // VPN `172.30.x` as "LAN" endpoints, each with a pinned
@@ -260,7 +260,7 @@ pub fn gather_lan_interfaces() -> Vec<(Ipv4Addr, Option<u32>)> {
 /// An UNSPECIFIED-bound socket source-selects the captured default route and
 /// its UDP dies inside the tunnel; binding this IP (+ the `IP_UNICAST_IF` pin
 /// when the index is known) escapes the capture exactly like the direct socks
-/// do. Field 2026-08-15 pc55331: srflx `cone via 5.9.157.221:3478` from the
+/// do. Field 2026-08-15 winhost-b: srflx `cone via 5.9.157.221:3478` from the
 /// bound direct sock while the unbound warm TURN allocate to the SAME host
 /// failed every candidate. `None` when the gather is empty (enumeration
 /// failure or a WSL-mirrored guest) — callers then keep the unbound behaviour.
@@ -336,7 +336,7 @@ fn wsl2_mirrored_from_parts(osrelease: &str, has_host_access_alias: bool) -> boo
 ///
 /// Mirrored mode gives the guest the HOST's adapters verbatim, so every
 /// non-overlay address it can see belongs to the Windows host, not to it.
-/// Field 2026-08-14, neo16's guest:
+/// Field 2026-08-14, devbox's guest:
 ///
 /// ```text
 /// lo    10.255.255.254/32   ← the marker
@@ -538,12 +538,12 @@ pub fn bind_by_route_enabled() -> bool {
 /// has its egress pinned (`IP_UNICAST_IF`) to the host's real PHYSICAL uplink,
 /// forcing the overlay's own transport out the physical NIC instead of a
 /// full-tunnel corporate VPN's captured default route. Confirmed on ÖBB
-/// pc50045 (2026-07-30): a Check Point full-tunnel VPN captured ALL egress
+/// winhost-a (2026-07-30): a Check Point full-tunnel VPN captured ALL egress
 /// (`Find-NetRoute` → every dst via `172.30.x/Ethernet`), so its carriers rode
 /// the VPN one-way; pinning to the physical Wi-Fi bypasses it. This is
 /// Tailscale's `net/netns` "bind to the physical interface, not another VPN's
 /// tunnel" applied to the whole underlay. Mirrors the `public_direct` opt-in
-/// arc; flips default-ON after the pc50045 field-proof.
+/// arc; flips default-ON after the winhost-a field-proof.
 pub fn vpn_bypass_enabled() -> bool {
     match crate::env::node_env("OVERLAY_VPN_BYPASS") {
         Some(v) => {
@@ -692,7 +692,7 @@ pub fn public_direct_enabled() -> bool {
 /// Gate for **make-before-break** carrier upgrades
 /// (`ROOMLER_NODE_OVERLAY_MBB`; legacy `ROOMLER_AGENT_…` alias honoured).
 /// **Default ON since rc.210** — field-proven 2026-07-25 on the netns NAT lab
-/// (mars↔zeus, the false-same-/24-LAN-match freeze scenario): MBB=1 held the
+/// (buildhost↔fleet-host-2, the false-same-/24-LAN-match freeze scenario): MBB=1 held the
 /// relay while a doomed direct upgrade was probed then dropped it ("kept relay
 /// (no stall)"), where MBB=0 tore the relay down ("upgrading relay peer to
 /// direct LAN carrier"). Disable per-host with `ROOMLER_NODE_OVERLAY_MBB=0`
@@ -727,7 +727,7 @@ pub fn make_before_break_enabled() -> bool {
 /// NAT-traversal Phase B/C — gate for the **srflx** carrier tier
 /// (`ROOMLER_NODE_OVERLAY_SRFLX`; legacy `ROOMLER_AGENT_…` alias honoured).
 /// **Default ON** since 2026-07-20 (field-proven: a cone↔cone pair hole-punches
-/// to a DIRECT carrier — mars↔zeus netns lab, 0% loss, ~0.6 ms, half the relay
+/// to a DIRECT carrier — buildhost↔fleet-host-2 netns lab, 0% loss, ~0.6 ms, half the relay
 /// RTT). Turns on the whole srflx tier: gathering + advertising this node's own
 /// server-reflexive candidates (via STUN), AND dialing a peer's advertised srflx
 /// (a 1:1/cone-NAT node whose NIC IP is private). The tier FALLS THROUGH — a
@@ -755,7 +755,7 @@ pub fn srflx_enabled() -> bool {
 /// the DIALER (larger pubkey) sends raw UDP to the anchor's relayed address as a
 /// plain TURN peer (no allocation). This avoids the both-allocate coturn hairpin
 /// (the open REKEY_TIMEOUT relay bug) and carries symmetric NAT (permissions are
-/// IP-only). Field-proven in the full runtime (sym↔sym mars↔zeus netns lab,
+/// IP-only). Field-proven in the full runtime (sym↔sym buildhost↔fleet-host-2 netns lab,
 /// 2026-07-20: `single_relay=true` → QUIC-over-TURN up both ways → WG 0% loss);
 /// default-ON is net-positive since both-allocate was already broken cross-NAT.
 /// v1 serves BOTH-UDP-OK pairs; a UDP-blocked dialer (raw UDP can't reach
@@ -816,7 +816,7 @@ pub fn relay_tls_forced() -> bool {
 /// advertise `supports_derp` AND both are UDP-blocked (the single-relay
 /// `(false,false)` arm), so a UDP-capable pair never touches it — default-ON
 /// just means an overlay node keeps a `/derp` WS available in case a
-/// both-UDP-blocked peer appears. Field-proven 2026-07-21 (mars↔zeus netns,
+/// both-UDP-blocked peer appears. Field-proven 2026-07-21 (buildhost↔fleet-host-2 netns,
 /// both UDP+coturn-TCP-blocked → WG over `/derp` at 0% loss, ~2.7 ms). Set
 /// `0`/`false`/`no`/`off` to disable. (Follow-up: open the `/derp` WS lazily —
 /// only when this node is itself UDP-blocked — so UDP-capable nodes don't hold
@@ -848,7 +848,7 @@ pub fn derp_enabled() -> bool {
 /// transcription of the client rules (locked by the parity matrix), its
 /// inputs are the measured vectors (B3) with D0's reverse fan keeping both
 /// ends on one verdict generation, and the flip was soaked on
-/// neo16+clk+zeus (relay + direct pair classes) before landing. The env
+/// devbox+corplap+fleet-host-2 (relay + direct pair classes) before landing. The env
 /// var / config key `overlay_server_relay_strategy` remains the per-host
 /// off-switch; the server still withholds stamps unless BOTH ends
 /// advertise, so one opted-out host cleanly reverts its pairs.
@@ -861,8 +861,8 @@ pub fn server_relay_strategy_enabled() -> bool {
 /// came up empty), advertise `supports_derp_floor`, and (A2) install the
 /// DERP carrier as every fresh pair's floor while better tiers upgrade over
 /// it MBB-style. `ROOMLER_NODE_OVERLAY_DERP_FLOOR`, config-surface key
-/// `overlay_derp_floor`. **Default-ON since rc.400** (neo16+clk soak
-/// 08-17: floor pairs carried straight through clk's latch re-earn windows
+/// `overlay_derp_floor`. **Default-ON since rc.400** (devbox+corplap soak
+/// 08-17: floor pairs carried straight through corplap's latch re-earn windows
 /// — the class that used to block ~2 min per 30 — and the rc.398 post-roll
 /// carrier-less wedge is structurally impossible with a floor); explicit
 /// `false` is the per-host off-switch. The floor is additionally gated
@@ -947,7 +947,7 @@ pub fn pick_public_endpoint(my_ips: &[Ipv4Addr], candidates: &[String]) -> Optio
 /// A2 — [`pick_public_endpoint`] with dial-attempt ROTATION: viable candidate
 /// `attempt % viable.len()` instead of always the first. A multi-homed peer
 /// advertises several public/srflx candidates, but the dialer only ever tried
-/// `[0]` — the rest were dead candidate space (field 2026-08-10: mars's
+/// `[0]` — the rest were dead candidate space (field 2026-08-10: buildhost's
 /// second public IP was advertised and never dialed). The caller passes the
 /// PathMonitor's per-(peer, tier) strike count as `attempt`, so each failed
 /// probe advances to the peer's next candidate and a success (strikes reset)
@@ -996,7 +996,7 @@ pub fn same_subnet_24(a: Ipv4Addr, b: Ipv4Addr) -> bool {
 /// trivially against ourselves. Dialling it cannot work by construction — the
 /// packet is delivered to this host's own stack and never reaches the peer.
 ///
-/// Field 2026-08-14, neo16: `dst=192.168.68.126:43648` (its OWN Wi-Fi address)
+/// Field 2026-08-14, devbox: `dst=192.168.68.126:43648` (its OWN Wi-Fi address)
 /// probed every 90 s for 14 days across two WSL peers — 12 684 consecutive
 /// failures, zero successes. The wasted probes were the visible half. The
 /// expensive half was silent: [`srflx_hairpin_pointless`] takes "a LAN
@@ -1098,7 +1098,7 @@ pub async fn gather_srflx(
 /// the coturn worker-pinning that the relay hairpin does.
 pub async fn resolve_stun_server(stun_urls: &[String], exclude: &[Ipv4Addr]) -> Option<SocketAddr> {
     // Never STUN a coturn worker that is one of THIS host's own IPs: on the
-    // fleet the coturn workers ARE the hosts (mars `.74`, jupiter `.221`, zeus
+    // fleet the coturn workers ARE the hosts (buildhost `.74`, fleet-host-1 `.221`, fleet-host-2
     // `.226`), so a co-located host STUNning its own worker hairpins on the
     // local host DNAT and gets no public mapping back → the node falsely reads
     // as UDP-blocked (empty srflx). Real clients are never co-located with
@@ -1200,7 +1200,7 @@ pub fn roam_enabled() -> bool {
 /// periodically re-gathers (backoff 20 s → ×3 → 300 s cap, plus an
 /// immediate poke on interface events). Before this, a NONE gather returned
 /// the STUN sink and NOTHING ever re-queried — `srflx NONE` was sticky for
-/// the daemon's lifetime (field 2026-08-14: pc50045 on the corp VPN stayed
+/// the daemon's lifetime (field 2026-08-14: winhost-a on the corp VPN stayed
 /// NONE across VPN cycles, which also made it the universal relay ANCHOR).
 /// The B4 watchdog stays INERT in SEEKING (there is no advertised mapping
 /// to defend; on a genuinely UDP-blocked host it would otherwise force a
@@ -1223,7 +1223,7 @@ pub fn warm_relay_enabled() -> bool {
 /// R2 (corp-laptop program) — rescue the srflx gather via the wildcard
 /// PUBLIC-DIAL socket when every LAN-bound vantage yields nothing
 /// (`ROOMLER_NODE_OVERLAY_VPN_VANTAGE`; default **ON**). A full-tunnel
-/// endpoint VPN (field 2026-08-15: clk00017265, Cisco AnyConnect with
+/// endpoint VPN (field 2026-08-15: corplap-01, Cisco AnyConnect with
 /// local-LAN access disabled) filters the physical NICs BOTH directions
 /// while the tunnel itself passes UDP — so the LAN-bound socks are dead but
 /// the UNSPECIFIED-bound public dialer (routed via the captured default =
@@ -1254,7 +1254,7 @@ pub fn quic_async_enabled() -> bool {
 /// both orgs' sessions arrive from the SAME remote `ip:port`, and the
 /// shortcut deterministically delivered the second org's inits into the
 /// first org's `Tunn` — the dual-org direct mutual-exclusion lockout (field
-/// 2026-08-14: mars/jupiter/zeus direct on exactly one org each, the loser
+/// 2026-08-14: buildhost/fleet-host-1/fleet-host-2 direct on exactly one org each, the loser
 /// pinned to relay until a restart swapped the winner). Single-engine planes
 /// keep the shortcut either way. The kill switch restores the legacy
 /// shortcut on multi-org planes too. Read once at plane construction.
@@ -1275,7 +1275,7 @@ pub(crate) const ROAM_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// different /16 (another datacenter) > different IP > different port — because
 /// a NAT whose mapping is stable toward one subnet but per-destination
 /// elsewhere classifies as cone when every vantage shares that subnet (field
-/// 2026-08-10: pc50045 advertised `:51668` learned via the 5.9.157.x workers,
+/// 2026-08-10: winhost-a advertised `:51668` learned via the 5.9.157.x workers,
 /// while its REAL mapping toward a 94.130.141.x worker was `:43648` — the
 /// 2-same-/24-vantage probe said "cone" and every peer punched a dead port).
 /// v4 only. 0-3 results; fewer than 2 ⇒ the caller can't classify (→
@@ -1803,14 +1803,14 @@ mod tests {
     }
 
     /// rc.275 hygiene — the LAN-gather deny-list over the field-observed
-    /// interface inventory: pc50045's WSL vEthernet + Check Point adapter
+    /// interface inventory: winhost-a's WSL vEthernet + Check Point adapter
     /// (whose friendly name is just "Ethernet" — only the DESCRIPTION gives
     /// it away) must be denied; every real physical NIC stays allowed.
     #[test]
     fn lan_iface_denied_matrix() {
         // (name, description, denied) — descriptions verbatim from the field.
         let cases: &[(&str, &str, bool)] = &[
-            // pc50045's poison trio (2026-07-30):
+            // winhost-a's poison trio (2026-07-30):
             (
                 "vEthernet (WSL (Hyper-V firewall))",
                 "Hyper-V Virtual Ethernet Adapter",
@@ -2015,7 +2015,7 @@ mod tests {
         let eth: Ipv4Addr = "172.30.224.45".parse().unwrap();
         let ours = [wifi, eth]; // a multi-homed host's real LAN sockets
         // On-link /24 wins over the VPN default → the OS sources from the WiFi
-        // NIC → Use it (the pc50045-through-VPN happy path).
+        // NIC → Use it (the winhost-a-through-VPN happy path).
         assert_eq!(classify_egress(Some(wifi), &ours), Egress::Use(wifi));
         // Multi-homed: whichever real interface the OS picks is used verbatim.
         assert_eq!(classify_egress(Some(eth), &ours), Egress::Use(eth));
@@ -2066,7 +2066,7 @@ mod tests {
         let a: Ipv4Addr = "192.168.68.103".parse().unwrap();
         let b: Ipv4Addr = "192.168.68.110".parse().unwrap();
         let c: Ipv4Addr = "192.168.69.110".parse().unwrap();
-        assert!(same_subnet_24(a, b), "PC50045 + NEO16 are same /24");
+        assert!(same_subnet_24(a, b), "WINHOST-A + DEVBOX are same /24");
         assert!(!same_subnet_24(a, c), "different /24");
     }
 
@@ -2106,7 +2106,7 @@ mod tests {
     /// is what WSL adds specifically for mirrored host access.
     #[test]
     fn wsl2_mirrored_needs_both_the_kernel_and_the_host_access_alias() {
-        let wsl = "6.6.87.2-microsoft-standard-WSL2"; // neo16's guest, verbatim
+        let wsl = "6.6.87.2-microsoft-standard-WSL2"; // devbox's guest, verbatim
         assert!(
             wsl2_mirrored_from_parts(wsl, true),
             "WSL2 kernel + host-access alias = mirrored"
@@ -2155,7 +2155,7 @@ mod tests {
     /// A peer advertising OUR OWN address is not a LAN candidate — dialling it
     /// never leaves this host.
     ///
-    /// Field 2026-08-14, neo16 (192.168.68.126 on Wi-Fi): both WSL peers run in
+    /// Field 2026-08-14, devbox (192.168.68.126 on Wi-Fi): both WSL peers run in
     /// mirrored mode, which shares the host's NICs, so each advertised the
     /// host's own address on its own port. The /24 test passed against
     /// ourselves and the LAN probe ran every 90 s for 14 days — 12 684
@@ -2166,7 +2166,7 @@ mod tests {
     fn our_own_address_is_never_a_lan_candidate() {
         let me: [Ipv4Addr; 1] = ["192.168.68.126".parse().unwrap()];
 
-        // Exactly what neo16 probed 12 684 times. Different port, same host.
+        // Exactly what devbox probed 12 684 times. Different port, same host.
         let wsl_mirrored = vec!["192.168.68.126:43648".to_string()];
         assert!(
             pick_same_subnet_endpoint(&me, &wsl_mirrored).is_none(),
@@ -2265,7 +2265,7 @@ mod tests {
 
     #[test]
     fn multi_homed_host_matches_on_the_right_interface() {
-        // rc.132 regression guard: PC50045's bug. The node is multi-homed —
+        // rc.132 regression guard: WINHOST-A's bug. The node is multi-homed —
         // corporate Ethernet 172.30.x (the default route) + Wi-Fi 192.168.68.x.
         // The peer is on the Wi-Fi; we must match the 192.168.68 endpoint even
         // though 172.30 is "primary".
@@ -2273,7 +2273,7 @@ mod tests {
             "172.30.239.96".parse().unwrap(), // corporate Ethernet (default route)
             "192.168.68.103".parse().unwrap(), // Wi-Fi (where the peer lives)
         ];
-        // The peer (NEO16) advertises only ITS interfaces — a far srflx and its
+        // The peer (DEVBOX) advertises only ITS interfaces — a far srflx and its
         // Wi-Fi host. We must match the Wi-Fi endpoint against our SECONDARY
         // (non-default-route) Wi-Fi IP — the rc.131 connect-trick advertised
         // only 172.30 and so never matched.
@@ -2523,7 +2523,7 @@ mod tests {
             .collect();
         let t = |s: &str| -> SocketAddr { s.parse().unwrap() };
         let targets = [
-            t("94.130.141.74:3478"), // self (mars-style co-hosted PoP)
+            t("94.130.141.74:3478"), // self (buildhost-style co-hosted PoP)
             t("5.9.157.221:3478"),
             t("10.10.20.11:3478"), // self (pod IP)
             t("5.9.157.226:3478"),
@@ -2572,7 +2572,7 @@ mod tests {
         );
     }
 
-    /// A1 — the pc50045 case: with three vantages available, the second pick
+    /// A1 — the winhost-a case: with three vantages available, the second pick
     /// must be the CROSS-DC one (different /16), not the same-/24 sibling —
     /// otherwise a per-destination-subnet NAT looks cone.
     #[tokio::test]
@@ -2596,7 +2596,7 @@ mod tests {
 
     /// A1 — three vantages: one dead vantage is tolerated (2 answers still
     /// classify), and a mapping that only differs toward the THIRD vantage
-    /// (per-destination-subnet NAT, the pc50045 signature) is caught.
+    /// (per-destination-subnet NAT, the winhost-a signature) is caught.
     #[tokio::test]
     async fn probe_nat_type_third_vantage_tolerance_and_detection() {
         // Dead middle vantage, agreeing outer two → cone (tolerated).

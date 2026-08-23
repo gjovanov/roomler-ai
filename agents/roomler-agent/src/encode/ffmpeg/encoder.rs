@@ -37,7 +37,7 @@ use tunnel_core::env::node_env;
 /// serve no transport purpose — every needed key (DC-open, browser resync,
 /// lock transition) is forced on demand — and each routine IDR QP-starves
 /// under the maxrate cap, painting the field-reported "text blurs every few
-/// seconds then re-sharpens" pulse (2026-07-25, NEO16 viewing PC50045 /
+/// seconds then re-sharpens" pulse (2026-07-25, DEVBOX viewing WINHOST-A /
 /// REGAL; the old value was 240 ≈ 4-6 s at real rates, stacked on the 4 s
 /// pump backstop metronome removed in the same round). 64800 stays under
 /// Intel Media SDK's u16 `GopPicSize` ceiling (65535) — at 60 fps that is
@@ -46,7 +46,7 @@ use tunnel_core::env::node_env;
 /// openh264/MF) don't come through here; the caps probe doesn't care.
 const KEYFRAME_INTERVAL: i32 = 64800;
 
-/// rc.219 — vp9_qsv-only SHORT GOP. Field-proven (2026-07-24, PC50045 Iris
+/// rc.219 — vp9_qsv-only SHORT GOP. Field-proven (2026-07-24, WINHOST-A Iris
 /// Xe): vp9_qsv CANNOT force keyframes at runtime — `frame.set_kind(I)` is
 /// ignored AND the `forced_idr=1` option is accepted-but-ineffective
 /// (rc.217 logs: the option in the accepted dict, yet every browser resync
@@ -254,8 +254,8 @@ fn encoder_options(
         // false → our framer marks the chunk `delta` → the browser's
         // WebCodecs decoder rejects the first frame with "A key frame is
         // required after configure() or flush()" → black screen (field:
-        // GORAN-XMG-NEO16, hevc_nvenc; hevc_qsv flags forced-I correctly,
-        // which is why PC50054 rendered and this didn't). `forced-idr=1`
+        // DEVBOX, hevc_nvenc; hevc_qsv flags forced-I correctly,
+        // which is why WINHOST-E rendered and this didn't). `forced-idr=1`
         // makes pict_type=I a true, key-flagged IDR.
         base.push(("rc".into(), "vbr".into()));
         base.push(("cq".into(), cq_s.clone()));
@@ -315,7 +315,7 @@ fn encoder_options(
         }
         // rc.217 — `forced_idr=1` (NOTE: underscore — qsv spelling, vs
         // nvenc's `forced-idr`): the qsv mirror of the rc.98 NVENC fix.
-        // Field 2026-07-24 (NEO16 viewing PC50045): vp9_qsv IGNORED runtime
+        // Field 2026-07-24 (DEVBOX viewing WINHOST-A): vp9_qsv IGNORED runtime
         // keyframe forcing via `frame.set_kind(I)` — browser resync requests
         // and the 4 s backstop produced NO key-flagged packet, wedging the
         // viewer's keyframe gate until an encoder rebuild happened to emit a

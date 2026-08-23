@@ -50,7 +50,7 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// long (3 keepalive periods + margin) without SOME inbound frame. Send
 /// success alone proves nothing: a TLS-inspecting corp middlebox terminates
 /// TCP locally and keeps ACKing our Pings after its upstream leg has died —
-/// field case PC50045 2026-08-02, where the agent sat "connected" for 45+
+/// field case WINHOST-A 2026-08-02, where the agent sat "connected" for 45+
 /// minutes after a server pod roll while registered on no pod (heartbeats,
 /// log uploads and overlay all fine; rc/tunnel dead). Reconnect must key on
 /// frames RECEIVED, not frames sent.
@@ -59,7 +59,7 @@ const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
 /// Hard bound on a single WS frame WRITE on the established connection.
 /// Every select arm awaits its sends inline, so one wedged `ws.send`
 /// freezes the whole loop: no arm runs, no `watchdog::tick`, and at 90 s
-/// the process watchdog kills the worker. Field case PC50045 2026-08-15
+/// the process watchdog kills the worker. Field case WINHOST-A 2026-08-15
 /// 13:42:47Z — a corp-VPN connect captured the default route mid-flight,
 /// the kernel kept retransmitting the WS TCP stream into the void, the
 /// loop froze on a send and `stalled=signaling=92s` turned a routing
@@ -76,7 +76,7 @@ const WS_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 /// webrtc-rs stats await internal ICE locks; on a peer whose network was
 /// just captured (corp-VPN connect mid-RC-session) those locks are held by
 /// tasks retransmitting into the void, and the await blocks for MINUTES —
-/// field PC50045 2026-08-15, FOUR `stalled=signaling=9xs` process deaths
+/// field WINHOST-A 2026-08-15, FOUR `stalled=signaling=9xs` process deaths
 /// in one day (09:48, 13:42, 18:22, 19:13), the last two AFTER the WS
 /// writes were bounded: the freeze was never only the socket. Telemetry is
 /// decorative — a wedged peer forfeits its stats round, the loop moves on.
@@ -91,7 +91,7 @@ const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
 /// unreachable anyway.
 const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
-/// Pong-RTT degradation bound for the control WS. Field pc50045 2026-08-15
+/// Pong-RTT degradation bound for the control WS. Field winhost-a 2026-08-15
 /// ~20:00Z: a WS that SURVIVED a corp-VPN route capture kept "working"
 /// with application round-trips over 60 s — every send completed into the
 /// local TCP
@@ -129,7 +129,7 @@ const WS_PING_RETRY_ACCEL: Duration = Duration::from_secs(10);
 /// connection escapes a zombie (field 2026-08-15: the secondary org
 /// reconnected fresh after a capture and relayed fine while the primary's
 /// grandfathered WS crawled). But the OPPOSITE regime is just as real
-/// (field 2026-08-17, pc50045 in-VPN morning): Check Point throttled EVERY
+/// (field 2026-08-17, winhost-a in-VPN morning): Check Point throttled EVERY
 /// connection to ~41 s RTTs, so each cycle bought a fresh WS that
 /// re-convicted within 2-3 min — a treadmill whose collateral was worse
 /// than the slowness itself (each cycle flaps server presence
@@ -685,7 +685,7 @@ pub async fn run(
                     std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
                 }
 
-                // W4(d) — NO process exit by default. Field (pc50045, every
+                // W4(d) — NO process exit by default. Field (winhost-a, every
                 // VPN transition): displacement storms on TLS-inspected paths
                 // are ZOMBIE half-open WSes — self-limiting once the server's
                 // receive-liveness reaps them — and each exit tore down the
@@ -2906,7 +2906,7 @@ fn stub_caps(multi_org_tun: bool) -> AgentCaps {
     // does not mux a TUN the primary loop already opened un-muxed, so the
     // server keeps being told "no" until a real daemon restart. That's
     // what lets `join-org` answer `restart_required` instead of promising
-    // a mesh that would fail its bring-up (field 2026-08-07, PC50045).
+    // a mesh that would fail its bring-up (field 2026-08-07, WINHOST-A).
     if multi_org_tun {
         caps.multi_org.push("tun".into());
     }
@@ -2923,7 +2923,7 @@ pub(crate) fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Slowness-cycle treadmill (field pc50045 2026-08-17): cycling on RTT
+    /// Slowness-cycle treadmill (field winhost-a 2026-08-17): cycling on RTT
     /// degradation is allowed twice; a THIRD young-connection conviction
     /// holds instead — but a connection that ran healthy past the fresh
     /// window re-arms the counter (the 2026-08-15 escape-the-zombie regime
@@ -2962,7 +2962,7 @@ mod tests {
 
     /// The keepalive ping payload must round-trip through [`pong_rtt`] as a
     /// near-zero RTT, and foreign pong shapes must abstain rather than
-    /// vote — the zombie-slow-WS detector (field pc50045 2026-08-15) only
+    /// vote — the zombie-slow-WS detector (field winhost-a 2026-08-15) only
     /// ever acts on pongs that echo OUR stamp.
     #[test]
     fn pong_rtt_round_trips_and_rejects_foreign_payloads() {
@@ -3072,7 +3072,7 @@ mod tests {
         // TWO bounded sends back-to-back (heartbeat + first session-stats
         // frame — the stats loop breaks on its first error), so
         // 2×WS_SEND_TIMEOUT must leave the watchdog real headroom, or
-        // the PC50045 2026-08-15 failure comes back: wedged send →
+        // the WINHOST-A 2026-08-15 failure comes back: wedged send →
         // stalled=signaling → exit(2) → full overlay teardown on a mere
         // VPN route capture. The lower bound keeps a slow-but-alive
         // link (a few missed RTOs) from being cycled spuriously.

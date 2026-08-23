@@ -106,7 +106,7 @@ const HEADER_BYTES = 13
 const FLAG_KEYFRAME = 0x01
 /** Default codec — HEVC Main, Level **5.1**, no decoder description.
  *  rc.94 — bumped from L3.1 (`L93`). L3.1 maxes at 983,040 luma
- *  samples (~1280×720); the field SystemContext host (PC50054)
+ *  samples (~1280×720); the field SystemContext host (WINHOST-E)
  *  captures 1920×1200 = 2,304,000 samples, which exceeds even L4.1
  *  (2,228,224) — so Chromium's HW HEVC decoder rejected the stream
  *  and rendered a BLACK screen. The pre-flight spike only validated a
@@ -136,7 +136,7 @@ let framesReceived = 0
 // instant the DC reaches Open, the packet draining is a buffered delta
 // from earlier in the encoder queue — it ships ahead of the freshly-forced
 // IDR (rc.97 force-kf-on-open), so the browser's first ASSEMBLED frame is
-// sometimes a delta. Field LAPTOP-P2TU89GB (hevc_qsv) hit exactly this:
+// sometimes a delta. Field WINHOST-G (hevc_qsv) hit exactly this:
 // "hevc DC opened" → "decode-error: A key frame is required" → permanent
 // <video> fallback. The libvpx VP9-444 path never hit it because libvpx is
 // synchronous (request_keyframe → the very next packet IS the IDR). Drop
@@ -376,7 +376,7 @@ function initDecoder() {
         pendingDecodeAt.delete(frame.timestamp)
       }
       // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
-      // geometry for our hevc_nvenc stream (field GORAN-XMG-NEO16, RTX 5090):
+      // geometry for our hevc_nvenc stream (field DEVBOX, RTX 5090):
       // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
       // pump heartbeat: w=2560 h=1600 enc=hevc_nvenc, ~3 MB/window), but the
       // decoded VideoFrame carries a SPURIOUS conformance window —
@@ -389,7 +389,7 @@ function initDecoder() {
       //
       // A SMALL top-left crop is NOT that bug, though — it is a legitimate
       // encoder alignment crop, and the rewrap must NOT override it. Field
-      // DESKTOP-V6FJE58 (hevc_qsv, 1920×1080 — the first non-mod-16-height
+      // WINHOST-F (hevc_qsv, 1920×1080 — the first non-mod-16-height
       // sender): QSV pads HEVC to its row alignment, coding 1920×1088 with a
       // conformance window hiding 8 rows of pooled-surface junk that changes
       // per frame. Rendering the coded rect painted the junk — a purple/blue
@@ -576,7 +576,7 @@ function emitFrame(): void {
     // because the viewer-rate cap shed the encode rate (240-frame GOP at
     // 12 fps = 20 s) or the screen went static (frame-counted GOP never
     // advances) — the decoder sat wedged on a stale frame indefinitely
-    // (field: "old screen for 30+ s", NEO16 viewing PC50045). The 250 ms
+    // (field: "old screen for 30+ s", DEVBOX viewing WINHOST-A). The 250 ms
     // debounce + the agent's MIN_KF_GAP clamp bound this to ~4 req/s.
     requestKeyframeResync()
     // One-shot + periodic diagnostic so the field log shows the gate
@@ -767,7 +767,7 @@ export function isKeyframe(flags: number): boolean {
  *  once a keyframe has already been seen; a keyframe is always decodable.
  *  This is the guard that stops the HW HEVC decoder throwing "A key frame
  *  is required after configure() or flush()" on a leading delta — the
- *  field LAPTOP-P2TU89GB hevc_qsv failure (async-encoder DC-open race). */
+ *  field WINHOST-G hevc_qsv failure (async-encoder DC-open race). */
 export function shouldDecodeFrame(hasSeenKeyframe: boolean, isKey: boolean): boolean {
   return hasSeenKeyframe || isKey
 }
@@ -781,12 +781,12 @@ export function shouldDecodeFrame(hasSeenKeyframe: boolean, isKey: boolean): boo
  *    encoders pad the picture to their block alignment and crop the excess:
  *    Intel QSV codes a 1920×1080 desktop as 1920×1088 with an 8-row bottom
  *    crop whose padding rows are pooled-surface junk. TRUST it — `drawImage`
- *    honours the visibleRect natively. (Field DESKTOP-V6FJE58: painting the
+ *    honours the visibleRect natively. (Field WINHOST-F: painting the
  *    coded rect instead showed the junk as a purple/blue band flickering on
  *    every frame while dragging windows.)
  *  - `spurious`: anything else — a drastically smaller visible rect or an
  *    offset origin is the Chrome NVDEC misreported-geometry bug (field
- *    GORAN-XMG-NEO16: coded 2560×1600, visible 1280×720). The coded pixels
+ *    DEVBOX: coded 2560×1600, visible 1280×720). The coded pixels
  *    are the whole desktop → re-wrap and render the full coded rect.
  *
  *  An alignment pad can never reach 64: aligning to any of 8/16/32/64 pads

@@ -644,12 +644,12 @@ mod tests {
         );
     }
 
-    /// PC50045 layout regression check — primary monitor at virtual
+    /// WINHOST-A layout regression check — primary monitor at virtual
     /// origin (1920, 0): a click at centre-screen (0.5, 0.5) must land
     /// inside the primary monitor's virtual rect, not on the secondary
     /// monitor sitting at (0, 0).
     #[test]
-    fn pc50045_primary_offset_layout_lands_correct_monitor() {
+    fn winhost_a_primary_offset_layout_lands_correct_monitor() {
         // Secondary 1920×1080 at (0, 0); primary 1920×1200 at (1920, 0).
         // We map against primary's MonitorInfo.
         let (px, py) = map_normalised_to_virtual(0.5, 0.5, 1920, 0, 1920, 1200);

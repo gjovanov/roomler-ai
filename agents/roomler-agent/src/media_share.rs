@@ -164,7 +164,7 @@ struct PipelineInner {
     closed: bool,
     /// Millis (process-epoch) of the owner's last loop iteration —
     /// [`Pipeline::beat`]. Joiners treat a silent owner as DEAD (rc.443):
-    /// field 2026-08-21, clk — an av1_qsv driver hang froze the owner pump
+    /// field 2026-08-21, corplap — an av1_qsv driver hang froze the owner pump
     /// INSIDE `enc.encode()` (inline-blocking, no await to time out), its
     /// session was torn down, but the never-returning task never dropped
     /// its `Pipeline`, so the registry entry survived and every subsequent
@@ -324,7 +324,7 @@ impl Pipeline {
     /// Viewers contributing NO cap (Sharper; Balanced on direct) never block
     /// — they asked for native anyway. Vacuously true when nothing caps (the
     /// caller's merged-cap-clamps check already gates that case). Field
-    /// 2026-08-20 (pc55331): owner=Sharper + follower=Smoother parked the
+    /// 2026-08-20 (winhost-b): owner=Sharper + follower=Smoother parked the
     /// shared stream at 1024 with refine dead — the floor-merge took the
     /// follower's cap while eligibility read only the owner's dial, giving
     /// the worst combination (capped AND never crisp at rest). With a single
@@ -1126,7 +1126,7 @@ mod tests {
         assert!(owner.merged_refine_eligible(BALANCED, true));
         assert!(owner.merged_refine_eligible(BALANCED, false));
 
-        // THE field case (pc55331 2026-08-20): owner=Sharper +
+        // THE field case (winhost-b 2026-08-20): owner=Sharper +
         // follower=Smoother — the follower's liftable cap clamps, Sharper
         // contributes none ⇒ eligible.
         let s = sink(ObjectId::new());

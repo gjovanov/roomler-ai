@@ -56,7 +56,7 @@ use windows_sys::core::GUID;
 /// filters via WFP, that adapter falls back under the stateful filter:
 /// outbound-initiated flows still work, inbound-initiated flows are dropped.
 ///
-/// Field 2026-08-12 (pc50045, grox + jovanov): exactly ONE org reachable
+/// Field 2026-08-12 (winhost-a, grox + jovanov): exactly ONE org reachable
 /// inbound from every peer, flipping across restarts, while the host reached
 /// everyone on both orgs. `netsh wfp show filters` showed **4** permit filters
 /// — one adapter's worth ([`LAYERS`] is 4) — on a two-adapter host.
@@ -336,7 +336,7 @@ mod tests {
     /// other adapter's filters with it — leaving one org silently without a
     /// hard-permit while its guard still reports success.
     ///
-    /// Field 2026-08-12 (pc50045): exactly one org reachable inbound, flipping
+    /// Field 2026-08-12 (winhost-a): exactly one org reachable inbound, flipping
     /// per boot; `netsh wfp show filters` showed 4 permit filters — one
     /// adapter's worth — on a two-adapter host.
     #[test]

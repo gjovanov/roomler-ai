@@ -313,12 +313,12 @@ impl AgentPeer {
         // reflected as the node's own overlay address, and webrtc-rs offers
         // it as a perfectly ordinary `typ=srflx` candidate.
         //
-        // Field 2026-08-07 (pc50045, Check Point profile blocking STUN on the
+        // Field 2026-08-07 (winhost-a, Check Point profile blocking STUN on the
         // physical NIC): the ONLY srflx it gathered was
         // `typ=srflx address=100.64.0.28` — its own overlay IP. That masked
         // the fact it had no public reflexive candidate at all, so every
         // session negotiated, "started", and then died at a constant ~10.9 s
-        // when media never flowed (388 sessions in 24 h). pc55331, same LAN
+        // when media never flowed (388 sessions in 24 h). winhost-b, same LAN
         // and same Check Point build, offered a real `37.63.112.129` and
         // worked. The filter does not FIX a host that cannot reach STUN — it
         // stops that failure from disguising itself as a usable candidate.
@@ -662,7 +662,7 @@ impl AgentPeer {
         // forwarded with no record, so "which candidates did this host
         // actually produce?" could only be answered from the far end's
         // `chrome://webrtc-internals` — and only if a browser was involved at
-        // all. Field 2026-08-02 (CLK00017265, Cisco AnyConnect full tunnel):
+        // all. Field 2026-08-02 (CORPLAP-01, Cisco AnyConnect full tunnel):
         // the agent contributed ONLY an overlay host candidate and a relay —
         // no srflx — even though a hand-run STUN Binding from its VPN adapter
         // reached coturn fine (40-byte reply). Nothing in the log could say
@@ -824,7 +824,7 @@ impl AgentPeer {
             });
         }
 
-        // rc.190 (B3) — stuck-session watchdog. Field incident NEO16
+        // rc.190 (B3) — stuck-session watchdog. Field incident DEVBOX
         // 2026-07-16: ICE never nominated a pair ("pingAllCandidates called
         // with no candidate pairs"), the PC sat in Connecting FOREVER (never
         // transitioning to Failed), the hub kept the session row alive → the
@@ -1297,7 +1297,7 @@ impl AgentPeer {
 /// every exit path.
 ///
 /// The arbiter registration and the display-match ownership were both
-/// released from the control DC's `on_close`. Field-observed on zeus: that
+/// released from the control DC's `on_close`. Field-observed on fleet-host-2: that
 /// callback does NOT fire when the whole PeerConnection is torn down, so
 /// arbiter entries LEAKED (server reported 0 open sessions while a fresh
 /// registration logged `sessions=3`). A leaked entry inflates the
@@ -1496,7 +1496,7 @@ async fn current_pair_is_relay(
     Some(relay)
 }
 
-/// Overlay-aware constrained detection (2026-07-27, DESKTOP-69T5HUD field): a
+/// Overlay-aware constrained detection (2026-07-27, WINHOST-C field): a
 /// nominated pair whose REMOTE lives on the overlay is only as good as the
 /// overlay CARRIER underneath it. A relay-tier carrier (coturn / DERP) has
 /// WAN RTT + churn but masquerades as a "direct" host↔host pair — the pump
@@ -2775,7 +2775,7 @@ async fn media_pump_vp9_444_dc(
     // MOTION BURST settles forces a keyframe so a viewer that dropped frames
     // mid-motion resyncs. Isolated blips no longer qualify — a blinking text
     // caret (~530 ms toggle) counted as "motion" and forced a ~2 Hz IDR
-    // metronome (field NEO16→PC55331 2026-07-27: text pulsing blur→crystal
+    // metronome (field DEVBOX→WINHOST-B 2026-07-27: text pulsing blur→crystal
     // every half second on all codecs).
     let mut settle_kf = crate::encode::rate_profile::SettleKeyframeGate::from_env();
     // rc.130 — 60 ms (was 1 s), matching the FFmpeg pump. libvpx is synchronous
@@ -3799,7 +3799,7 @@ impl FfmpegDcCodec {
     /// read the returned encoder's `chroma444()` for the truth.
     /// `preferred`: the session's last successfully-opened backend name
     /// (rc.445) — tried alone first so a REBUILD skips the dead cascade
-    /// prefix (field: every clk rebuild burned ~100-300 ms failing
+    /// prefix (field: every corplap rebuild burned ~100-300 ms failing
     /// av1_nvenc's tiered open before av1_qsv answered). Falls through to
     /// the full cascade on failure. Skipped for chroma444 sessions (their
     /// open has its own two-stage fallback).
@@ -4092,7 +4092,7 @@ async fn media_pump_ffmpeg_dc(
     // during the motion (backpressure / decode backlog) can resync to the
     // settled state. Isolated blips no longer qualify — a blinking caret
     // (~530 ms) counted as "motion" and forced a ~2 Hz IDR metronome (field
-    // NEO16→PC55331 2026-07-27: blur→crystal text pulse on all codecs,
+    // DEVBOX→WINHOST-B 2026-07-27: blur→crystal text pulse on all codecs,
     // most visible on av1_nvenc).
     let mut settle_kf = crate::encode::rate_profile::SettleKeyframeGate::from_env();
     // P7 — idle native-rung refinement ("crisp at rest"): when the only
@@ -4124,7 +4124,7 @@ async fn media_pump_ffmpeg_dc(
     // heartbeat can still read them. Moving the chunked DC send off the
     // pump's hot path stops a big (IDR / motion) frame from stalling
     // capture+encode on `send().await` — the "hangs every few seconds"
-    // under window movement (field GORAN-XMG-NEO16: 46 fps with periodic
+    // under window movement (field DEVBOX: 46 fps with periodic
     // freezes; the inline send blocked the loop ~tens of ms per multi-MB
     // frame).
     let frames_sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -4186,7 +4186,7 @@ async fn media_pump_ffmpeg_dc(
     // rc.106 — dedicated DC send task. The chunked `dc.send().await` is
     // flow-controlled by SCTP; on a multi-MB frame (HEVC IDR / high-motion
     // delta) it blocks for tens of ms. Doing that inline in the pump (rc.88)
-    // stalled capture+encode → the periodic freeze (field GORAN-XMG-NEO16).
+    // stalled capture+encode → the periodic freeze (field DEVBOX).
     // Hand framed frames to this task over a small bounded channel instead;
     // the pump never blocks on the link (see the `try_send` below). A SINGLE
     // consumer keeps the 16 KiB chunk order intact (the browser reassembler
@@ -4204,7 +4204,7 @@ async fn media_pump_ffmpeg_dc(
     // behind pre-rebuild deltas (see `send_epoch`).
     let (send_tx, mut send_rx) =
         tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(ffmpeg_send_depth);
-    // Constrained byte-budget gate (field 2026-08-21, pc50045/clk): the
+    // Constrained byte-budget gate (field 2026-08-21, winhost-a/corplap): the
     // channel's FRAME-count bound bounds nothing in BYTES — four native
     // motion frames are ~0.5-1 MB ≈ 2-4 s of a ~2 Mbps relay, which is
     // both the "drag starts, ~0.5 s in it freezes" lump (the pre-rung
@@ -4261,7 +4261,7 @@ async fn media_pump_ffmpeg_dc(
     // of the flip gap (and a decode-order hazard shrunk to zero cost).
     let send_epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // rc.445 — remember the session's proven encoder so a rebuild skips
-    // the dead cascade prefix (clk field: an av1_nvenc tiered-open attempt
+    // the dead cascade prefix (corplap field: an av1_nvenc tiered-open attempt
     // burned ~100-300 ms of every rebuild before av1_qsv opened).
     let mut last_encoder_name: Option<&'static str> = None;
     {
@@ -4480,7 +4480,7 @@ async fn media_pump_ffmpeg_dc(
         // at `try_send` (frames_dropped_backpressure) + scheduled a resync
         // keyframe — wasting GPU encode and, worse, the resync IDRs (the
         // LARGEST frames) piled MORE bytes onto an already-congested link,
-        // amplifying the stall. Field GORAN-XMG-NEO16 (RTX 5090, 2560×1600):
+        // amplifying the stall. Field DEVBOX (RTX 5090, 2560×1600):
         // capture 6 ms + encode 8 ms (fast) but ~37% of encoded frames dropped
         // + resync churn → stutter.
         //
@@ -4557,7 +4557,7 @@ async fn media_pump_ffmpeg_dc(
         let mut area_judged = false;
         // Did EITHER significance leg count this frame as motion? A real
         // frame that stays false is QUIET EVIDENCE and feeds the refine
-        // up-flip tick post-encode (field clk00017265: GDI/scrap-class
+        // up-flip tick post-encode (field corplap-01: GDI/scrap-class
         // backends return a frame on EVERY poll — frames_empty=0 — so the
         // keepalive arm never ran and refine was structurally inert).
         let mut frame_significant = false;
@@ -4639,7 +4639,7 @@ async fn media_pump_ffmpeg_dc(
                     // refined native IDR follows ~1 s later.
                     //
                     // P7b — every term is MERGE-AWARE (field 2026-08-20,
-                    // pc55331: owner=Sharper + follower=Smoother — the P5
+                    // winhost-b: owner=Sharper + follower=Smoother — the P5
                     // floor-merge applied the follower's 1024 cap while
                     // eligibility read only the owner's dial, so the shared
                     // stream parked at the low rung with refine dead). The
@@ -4701,7 +4701,7 @@ async fn media_pump_ffmpeg_dc(
                     // round-trips/session (frames_empty ≫ frames_encoded),
                     // saturating the runtime so the real-frame round-trip
                     // latency spikes intermittently → fps swings (field
-                    // GORAN-XMG-NEO16 2560×1600 SystemContext: cap 7↔117ms,
+                    // DEVBOX 2560×1600 SystemContext: cap 7↔117ms,
                     // fps 9↔67, stuttery). A 2 ms sleep paces empties to
                     // ~500/s (vs millions) — precise at 1 ms timer resolution
                     // (win_timer rc.92) — WITHOUT capping the Some-rate (this
@@ -5086,7 +5086,7 @@ async fn media_pump_ffmpeg_dc(
             Err(e) => {
                 // rc.443 — escalate instead of retrying forever: the old
                 // bare `continue` turned a persistently-failing HW encoder
-                // into a silently frozen stream (field: clk av1_qsv
+                // into a silently frozen stream (field: corplap av1_qsv
                 // rejecting a forced IDR). `encoder` can't be dropped here
                 // (`enc` borrow is live past this match) — defer to the
                 // loop top.
@@ -5119,7 +5119,7 @@ async fn media_pump_ffmpeg_dc(
         // rc.446 — the deferred-bitrate motion clock, ONE site: any real
         // frame whose encoded cost exceeds trivial-delta size marks motion.
         // rc.445 armed it only on SIGNIFICANCE-floor frames (42 KB scaled),
-        // which let light motion slip through — field clk (GDI + av1):
+        // which let light motion slip through — field corplap (GDI + av1):
         // 5-30 KB window-move frames never armed the clock, so two AIMD
         // ladder rebuilds (each a blocking QSV open) landed mid-burst
         // anyway. 4 KB sits above caret/keystroke deltas (0.5-3 KB, which
@@ -5144,7 +5144,7 @@ async fn media_pump_ffmpeg_dc(
         // wire cost: significance is keyed on encoded bytes (a keystroke
         // delta is ~0.5-3 KB, a scroll frame tens-to-hundreds), which is
         // what made interactive terminals hold the blurry rung under the
-        // old capture-time frame COUNTING (field pc55331 2026-08-20 —
+        // old capture-time frame COUNTING (field winhost-b 2026-08-20 —
         // every Up died within ~1-2 s of caret/typing frames). Keepalive
         // re-encodes never count (unchanged). A Down here lands one frame
         // later than the old capture-time hook — one extra native frame
@@ -5185,7 +5185,7 @@ async fn media_pump_ffmpeg_dc(
         }
         // QUIET tick — a real frame neither leg counted is stillness
         // evidence (a 48-byte re-encode of an unchanged screen). Field
-        // clk00017265 2026-08-21: its GDI/scrap-class capture returns a
+        // corplap-01 2026-08-21: its GDI/scrap-class capture returns a
         // frame on EVERY poll (frames_empty=0), the keepalive arm never
         // ran, and refine was structurally inert. Judging quiet by the
         // SIGNAL instead of capture cadence fixes that class — and lets
@@ -5219,7 +5219,7 @@ async fn media_pump_ffmpeg_dc(
             // encoder proceeds along its GOP and the first delivered frame is
             // a delta → the browser's WebCodecs decoder rejects it with "A key
             // frame is required after configure() or flush()" → black screen
-            // (field: GORAN-XMG-NEO16 HEVC). media_pump_vp9_444_dc already
+            // (field: DEVBOX HEVC). media_pump_vp9_444_dc already
             // does this; the FFmpeg pump didn't, so it only rendered when the
             // DC happened to open at a GOP boundary (timing luck). Covers both
             // HEVC and vp9_qsv DC paths.
@@ -6205,7 +6205,7 @@ pub(crate) fn aspect_preserved_target(src_w: u32, src_h: u32, cap_long_edge: u32
 /// Two cap tiers with different override semantics:
 /// - `hard_cap_long_edge` (the relay-TCP bandwidth cap, B1): PHYSICS. A
 ///   ~3 Mbps TURN-TCP relay cannot carry a 2560×1600 stream without the
-///   blur↔crystallize AIMD sawtooth (field NEO16→PC50045 2026-07-16), so it
+///   blur↔crystallize AIMD sawtooth (field DEVBOX→WINHOST-A 2026-07-16), so it
 ///   clamps EVERYTHING — including an explicit controller pick — by taking
 ///   whichever target has the smaller area.
 /// - `soft_cap_long_edge` (the SW-encoder speed cap, B2): a performance
@@ -8567,7 +8567,7 @@ mod tests {
 
     #[test]
     fn hard_cap_clamps_native_and_oversized_picks() {
-        // B1: relay cap 1280 clamps Native on a 2560×1600 panel (the NEO16
+        // B1: relay cap 1280 clamps Native on a 2560×1600 panel (the DEVBOX
         // blur↔crystallize field case).
         assert_eq!(
             super::effective_target_resolution(TR::Native, 2560, 1600, Some(1280), None),
@@ -8741,7 +8741,7 @@ mod tests {
 
     #[test]
     fn watchdog_kills_never_connected_after_deadline() {
-        // The NEO16 field case: ICE wedged in Connecting, no Failed ever.
+        // The DEVBOX field case: ICE wedged in Connecting, no Failed ever.
         assert_eq!(
             super::session_watchdog_verdict(
                 PS::Connecting,

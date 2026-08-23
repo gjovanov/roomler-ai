@@ -58,7 +58,7 @@ pub struct LiveSession {
     /// no offer within the window means the controller never heard back
     /// (its socket died, or its reply raced a teardown) — the session would
     /// otherwise sit in `Negotiating` forever while the browser shows
-    /// "awaiting consent" (2026-08-05 pc50045 incident).
+    /// "awaiting consent" (2026-08-05 winhost-a incident).
     pub offer_seen: bool,
 
     /// The exact `ServerMsg::Request` pushed to the agent at create, kept

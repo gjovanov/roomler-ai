@@ -118,8 +118,8 @@ axes:
   tarball member assertion.
 - **CI**: both Linux jobs must emit and upload the tarball; the existing
   stock-Ubuntu-24.04 load check already proves the payload runs.
-- **Field, x86_64 Debian (no regression)**: the cluster nodes (`mars`, `zeus`,
-  `jupiter`, all Ubuntu) must keep taking `.deb` updates — they are the
+- **Field, x86_64 Debian (no regression)**: the cluster nodes (`buildhost`, `fleet-host-2`,
+  `fleet-host-1`, all Ubuntu) must keep taking `.deb` updates — they are the
   regression canary for the preference logic.
 - **Field, aarch64 non-Debian (the target)**: `scw-m2-asahi` installs from the
   tarball and then takes an `Update all` end-to-end. That host is currently a

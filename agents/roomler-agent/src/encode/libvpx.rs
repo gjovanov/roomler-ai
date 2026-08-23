@@ -247,8 +247,8 @@ impl Vp9Encoder {
         cfg.g_input_bit_depth = 8;
         // rc.234 — periodic IDRs are OFF by default. The rc.171 theory was
         // that a short periodic IDR (~3 s) "re-sharpens" screen-content text;
-        // the field showed the exact inverse (2026-07-25, NEO16 viewing
-        // PC50045/REGAL: "text blurs every ~3 s then stabilizes"): under the
+        // the field showed the exact inverse (2026-07-25, DEVBOX viewing
+        // WINHOST-A/REGAL: "text blurs every ~3 s then stabilizes"): under the
         // rate cap each periodic keyframe QP-starves and IS the blur event,
         // while the deltas are what progressively re-sharpen static text.
         // The reliable SCTP DataChannel needs no periodic IDRs — first frame,

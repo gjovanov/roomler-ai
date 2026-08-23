@@ -39,7 +39,7 @@ pub const DEFAULT_PROXY_URL: &str = "https://roomler.ai/api/agent/latest-release
 /// A5 (2026-08-02): 24 h → **4 h**. The 24 h default was the fleet's
 /// wedge-heal ceiling: an agent whose control WS was wedged/split missed
 /// the server-pushed `rc:agent.update` (it rides that WS) and then sat
-/// broken for up to a day (field: pc50045/pc55331 ran a 4-day-old build
+/// broken for up to a day (field: winhost-a/winhost-b ran a 4-day-old build
 /// through the S6 split because their next check was hours away). The
 /// original 24 h choice guarded GitHub's 60-req/IP/h unauthenticated
 /// quota (field 2026-04-27: 8 MSI installs across 5 NAT'd boxes hit 403)
@@ -1023,7 +1023,7 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
 /// `%PROGRAMDATA%\roomler\roomler-agent\config.toml` path. Net
 /// effect: every SystemContext-enabled host that auto-updates
 /// loses pre-logon capability and crash-loops until an operator
-/// re-runs the wizard. Field-reproduced 2026-05-24 on PC50045
+/// re-runs the wizard. Field-reproduced 2026-05-24 on WINHOST-A
 /// (rc.55 → reinstall).
 ///
 /// Fix: detect the env var BEFORE invoking msiexec and pass
@@ -2835,7 +2835,7 @@ mod tests {
         // THE headline rc.56 case: perMachine + service env var "1" ⇒
         // pass `ENABLE_SYSTEM_CONTEXT=1`. Without this assertion the
         // WiX DisableSystemContext CA would strip the env var on every
-        // auto-update (field-repro PC50045 2026-05-24, rc.55 self-update).
+        // auto-update (field-repro WINHOST-A 2026-05-24, rc.55 self-update).
         let result = preserve_system_context_property_for(
             WindowsInstallFlavour::PerMachine,
             Ok(Some("1".into())),

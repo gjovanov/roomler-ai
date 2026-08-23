@@ -109,8 +109,8 @@ pub struct AgentConfig {
     ///
     /// The default is deliberately not 22: four of the seven hosts in the first
     /// field survey already had something on `:22` (`sshd` on `0.0.0.0:22` on
-    /// the Linux boxes, `sshd` bound to the overlay address on `neo16`, WSL's
-    /// relay on `clk`'s loopback). 2222 lets roomler SSH and an existing `sshd`
+    /// the Linux boxes, `sshd` bound to the overlay address on `devbox`, WSL's
+    /// relay on `corplap`'s loopback). 2222 lets roomler SSH and an existing `sshd`
     /// coexist while the fleet migrates; set it to 22 per device once the
     /// in-process server is the one you want peers to reach.
     #[serde(default)]
@@ -275,7 +275,7 @@ pub struct AgentConfig {
     /// R2 — srflx gather falls back to the wildcard public-dial socket when
     /// every LAN-bound vantage is dead (full-tunnel VPN rescue: AnyConnect-
     /// class clients filter the physical NICs while the tunnel passes UDP;
-    /// field clk00017265 2026-08-15). Built-in default: on
+    /// field corplap-01 2026-08-15). Built-in default: on
     /// (`ROOMLER_NODE_OVERLAY_VPN_VANTAGE`).
     #[serde(default)]
     pub overlay_vpn_vantage: Option<bool>,
@@ -415,7 +415,7 @@ pub struct AgentConfig {
     /// VPN's session table — with a stable port a rebuilt carrier (agent
     /// update, control-WS reconnect) reproduces the SAME 5-tuple and keeps
     /// riding the grandfathered session instead of relay-locking until the
-    /// next VPN-off window (pc50045, 2026-08-05). A bind conflict falls
+    /// next VPN-off window (winhost-a, 2026-08-05). A bind conflict falls
     /// back to an ephemeral port with a WARN, restoring the old behavior.
     #[serde(default)]
     pub overlay_direct_port: Option<u32>,
@@ -1570,7 +1570,7 @@ mod derived_port_tests {
     /// churn every grandfathered corp-firewall flow at once.
     #[test]
     fn derived_port_is_stable_in_range_and_spreads_siblings() {
-        for id in ["", "a", "machine-1", "5C-80-B6-AA-BB-CC", "pc50045-mid"] {
+        for id in ["", "a", "machine-1", "5C-80-B6-AA-BB-CC", "winhost-a-mid"] {
             let p = derived_default_direct_port(id);
             assert_eq!(p, derived_default_direct_port(id), "stable per id");
             assert!(
@@ -1788,7 +1788,7 @@ pub fn load(path: &PathBuf) -> Result<AgentConfig> {
         Err(e) => e,
     };
 
-    // SELF-HEAL (2026-08-12): the live file is unreadable — on neo16 an
+    // SELF-HEAL (2026-08-12): the live file is unreadable — on devbox an
     // unclean shutdown left it the right length and entirely NUL, and the
     // worker then exit-1'd every 60 s for hours because a bricked config
     // has no recovery path but re-enrollment. If the `.prev` rotation
@@ -1864,7 +1864,7 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
     // but not file data, so a rename can land while the temp file's bytes
     // are still in the page cache; the post-crash file then has the right
     // name and the right LENGTH but is entirely NUL. That is not a
-    // hypothetical: neo16 lost power mid-save and came back with a
+    // hypothetical: devbox lost power mid-save and came back with a
     // 2995-byte all-NUL config.toml, which crash-looped the worker
     // (exit 1 immediately after "resolved load path") until re-enrolled.
     // `sync_all()` before the rename is what makes the guarantee real:
@@ -1956,12 +1956,12 @@ agent_token = "tok"
 agent_id = "aid"
 tenant_id = "tid"
 machine_id = "mid"
-machine_name = "neo16"
+machine_name = "devbox"
 "#
         .to_string()
     }
 
-    /// Locks the neo16 incident (2026-08-12): an unclean shutdown left
+    /// Locks the devbox incident (2026-08-12): an unclean shutdown left
     /// config.toml the right LENGTH and entirely NUL, and the worker exit-1'd
     /// every 60 s for hours because a bricked config had no recovery path.
     /// Two properties: the corruption is named rather than reported as a
@@ -1991,7 +1991,7 @@ machine_name = "neo16"
 
         // And the host heals instead of crash-looping.
         let healed = load(&path).expect("must recover from .prev");
-        assert_eq!(healed.machine_name, "neo16");
+        assert_eq!(healed.machine_name, "devbox");
         assert_eq!(healed.agent_token, "tok");
         // The recovered copy is reinstated, so the next boot is clean.
         assert_eq!(

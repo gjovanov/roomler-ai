@@ -1,5 +1,5 @@
 //! Dialer honesty — process-wide "can this HOST raw-UDP-dial relay-band
-//! ports?" latch (field 2026-08-16, CLK00017265).
+//! ports?" latch (field 2026-08-16, CORPLAP-01).
 //!
 //! A srflx candidate only proves UDP reached a WELL-KNOWN port (STUN:3478);
 //! a corp egress that whitelists STUN still drops the coturn relay band
@@ -7,7 +7,7 @@
 //! single-relay DIALER role — its raw dial toward the anchor's relay port
 //! never lands, the pair churns, P7 pins it to DERP, and the pair parks
 //! "blocked" while an anchor-role pair on the same host runs perfectly
-//! (clk↔jupiter, turn/udp 46 ms).
+//! (corplap↔fleet-host-1, turn/udp 46 ms).
 //!
 //! The measurement is the failure itself: a dialer-role TURN link that dies
 //! at its HANDSHAKE deadline (never completed — the only death class that
@@ -27,7 +27,7 @@
 //! The first cut latched on ANY dialer-role TURN death — and the rc.393
 //! rolling fleet update proved that wrong within minutes: every host's
 //! restart killed its peers' dialer links mid-wave, every host saw ≥2
-//! distinct-peer deaths, and jupiter/zeus/neo16-class hosts on OPEN
+//! distinct-peer deaths, and fleet-host-1/fleet-host-2/devbox-class hosts on OPEN
 //! networks declared themselves not-dialer-capable (degrading their relay
 //! pairs to both-allocate). Three guards make the evidence honest:
 //!

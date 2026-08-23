@@ -126,7 +126,7 @@ let framesReceived = 0
 // this worker is synchronous (the first emitted packet is already the
 // IDR) so the gate normally passes immediately — but the FFmpeg vp9_qsv
 // path is async (pipeline depth) and can drain a buffered delta ahead of
-// the DC-open IDR, exactly like the HEVC failure on LAPTOP-P2TU89GB. Drop
+// the DC-open IDR, exactly like the HEVC failure on WINHOST-G. Drop
 // leading deltas until the first keyframe so neither feeder can wedge the
 // decode path into a permanent <video> fallback.
 let sawKeyframe = false
@@ -156,7 +156,7 @@ function requestKeyframeResync(): void {
   workerScope.postMessage({ type: 'request-keyframe' })
 }
 
-// 2026-07-24 decode-stall telemetry — field: NEO16 viewing PC50045 hits 3-5 s
+// 2026-07-24 decode-stall telemetry — field: DEVBOX viewing WINHOST-A hits 3-5 s
 // mid-session stalls where bytes keep ARRIVING (Mbps > 0) but the decoder
 // produces NO output, then a catch-up burst (queued frames flushing) — on
 // both HEVC and VP9, with the agent proven healthy. That shape points at the

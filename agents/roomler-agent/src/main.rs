@@ -656,7 +656,7 @@ async fn main() -> Result<()> {
     // process. Windows defaults to a 15.6 ms timer; that quantized the
     // FFmpeg DC pump's per-frame capture round-trip + `tokio::time::sleep`
     // floor up to 15.6 ms ticks → ~12 fps under motion on the
-    // SystemContext path (field PC50054). Held for the process lifetime;
+    // SystemContext path (field WINHOST-E). Held for the process lifetime;
     // the guard's Drop restores the previous resolution. Logged below
     // (after logging::init) alongside the DPI diagnostic. See win_timer.rs.
     #[cfg(target_os = "windows")]
@@ -1239,7 +1239,7 @@ async fn enroll_cmd(
     println!("Config written to: {}", target_path.display());
     println!("Run `roomler-agent run` (or restart the service) to connect.");
 
-    // rc.53 Phase 7: PC55331's recurring pain — operator runs
+    // rc.53 Phase 7: WINHOST-B's recurring pain — operator runs
     // `enroll --machine-global` from a user PowerShell, the config
     // lands in %PROGRAMDATA% (where the LocalSystem service reads
     // it), but then `roomler-agent run` from THAT SAME user shell
@@ -3425,7 +3425,7 @@ mod tests {
     }
 
     /// rc.53 Phase 7: the stderr warning for the
-    /// `%APPDATA% / %PROGRAMDATA%` same-session asymmetry that PC55331
+    /// `%APPDATA% / %PROGRAMDATA%` same-session asymmetry that WINHOST-B
     /// burned hours on. Locks the marker phrases so a refactor that
     /// drops "sc start roomler-agent" or "%APPDATA%" or "without
     /// --machine-global" trips the test before it ships.

@@ -15,7 +15,7 @@
 //! sustained congestion (the send channel chronically full) the loop
 //! `continue`d at the gate and the multiplicative-decrease NEVER ran —
 //! the encoder stayed pinned at its 12.4 Mbps target while the DC drained
-//! ~7 Mbps, collapsing to ~2 fps (field: GORAN-XMG-NEO16-WSL, 2026-07-12,
+//! ~7 Mbps, collapsing to ~2 fps (field: DEVBOX-WSL, 2026-07-12,
 //! 69k backpressure skips with `target_bps` never dropping).
 //!
 //! # The real signal: send-channel occupancy
