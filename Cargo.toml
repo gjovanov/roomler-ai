@@ -41,6 +41,9 @@ exclude = [
     # Vendored upstream minus the on-drop NetworkList registry deletion —
     # see the wintun-bindings patch note above [patch.crates-io].
     "crates/vendored/wintun-bindings",
+    # Vendored upstream plus an accessor for the macOS IOSurface row pitch —
+    # see the scrap patch note below [patch.crates-io].
+    "crates/vendored/scrap",
 ]
 
 # Patch webrtc-rs's rtp-0.12.0 dependency with our local vendored copy
@@ -80,11 +83,24 @@ exclude = [
 # vendored copy removes the deletion; the feature flag stays declared so
 # `tun`'s dependency request resolves. One canonical diff:
 # crates/vendored/wintun-bindings.patch (scripts/revendor-wintun-bindings.sh).
+#
+# scrap-0.5.0 (macOS): upstream's quartz `Frame` derefs to a slice whose
+# length is `IOSurfaceGetAllocSize` — the page-rounded TOTAL allocation — and
+# it binds no accessor for the surface's row pitch. A consumer therefore
+# cannot learn the stride and is forced to guess it as `len() / height`, which
+# overshoots the true `bytes_per_row` and is usually not even a multiple of
+# the pixel size, so every captured frame shears progressively. Field-hit on a
+# MacBook Pro 2026-08-23 ("totally distorted screen"); invisible on X11 (the
+# buffer is exactly w*h*4) and on DXGI (len is height * Pitch), which is why
+# it survived this long. Our vendored copy binds `IOSurfaceGetBytesPerRow` and
+# exposes `Frame::bytes_per_row()`. One canonical diff:
+# crates/vendored/scrap.patch (scripts/revendor-scrap.sh).
 [patch.crates-io]
 rtp = { path = "crates/vendored/rtp" }
 webrtc-ice = { path = "crates/vendored/webrtc-ice" }
 webrtc = { path = "crates/vendored/webrtc" }
 wintun-bindings = { path = "crates/vendored/wintun-bindings" }
+scrap = { path = "crates/vendored/scrap" }
 
 [workspace.package]
 version = "0.3.0-rc.453"
