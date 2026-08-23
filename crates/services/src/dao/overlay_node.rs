@@ -46,29 +46,70 @@ impl OverlayNodeDao {
             })
             .await
     }
+}
 
+/// Everything [`OverlayNodeDao::create`] needs, by NAME.
+///
+/// This was 17 positional arguments and it went wrong twice, in ways a
+/// struct makes unrepresentable:
+///
+/// - it grew three `bool`s and its eight test callers were not updated, which
+///   stopped `crates/tests` compiling for months (#603). Named fields do not
+///   prevent that, but they make the fix mechanical instead of a matter of
+///   counting commas across seven consecutive `false`s;
+/// - a fixture passed `mach-shut` where the agent had enrolled as `shut-mach`
+///   (#612). `machine_id` and `name` are ADJACENT and both `String`, so the
+///   transposition compiled cleanly and cost a long diagnosis. It cannot now.
+///
+/// Deliberately NO `Default`: a new field must break every call site, because
+/// the whole point is that someone decides what it should be there. A default
+/// would restore the silent-drift class this replaces.
+pub struct NewOverlayNode {
+    pub tenant_id: ObjectId,
+    pub node_ref: NodeRef,
+    pub network_id: ObjectId,
+    /// MUST be the id the agent/tunnel-client enrolled with — `current_node`
+    /// resolves a socket to its node by `{tenant_id, machine_id}`, so a row
+    /// under any other machine id is invisible to the overlay and `/derp`.
+    pub machine_id: String,
+    /// Display name. NOT an identity — see `machine_id`.
+    pub name: String,
+    pub overlay_ip: String,
+    pub wg_public_key: String,
+    pub key_epoch: u32,
+    pub endpoints: Vec<String>,
+    pub supports_quic: bool,
+    pub supports_relay_single: bool,
+    pub supports_derp: bool,
+    pub supports_forced_derp: bool,
+    pub supports_server_relay_strategy: bool,
+    pub supports_derp_floor: bool,
+    pub supports_overlay_echo: bool,
+    pub advertised_routes: Vec<String>,
+}
+
+impl OverlayNodeDao {
     /// Insert a fresh node with a freshly-allocated overlay IP.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create(
-        &self,
-        tenant_id: ObjectId,
-        node_ref: NodeRef,
-        network_id: ObjectId,
-        machine_id: String,
-        name: String,
-        overlay_ip: String,
-        wg_public_key: String,
-        key_epoch: u32,
-        endpoints: Vec<String>,
-        supports_quic: bool,
-        supports_relay_single: bool,
-        supports_derp: bool,
-        supports_forced_derp: bool,
-        supports_server_relay_strategy: bool,
-        supports_derp_floor: bool,
-        supports_overlay_echo: bool,
-        advertised_routes: Vec<String>,
-    ) -> DaoResult<OverlayNode> {
+    pub async fn create(&self, new: NewOverlayNode) -> DaoResult<OverlayNode> {
+        let NewOverlayNode {
+            tenant_id,
+            node_ref,
+            network_id,
+            machine_id,
+            name,
+            overlay_ip,
+            wg_public_key,
+            key_epoch,
+            endpoints,
+            supports_quic,
+            supports_relay_single,
+            supports_derp,
+            supports_forced_derp,
+            supports_server_relay_strategy,
+            supports_derp_floor,
+            supports_overlay_echo,
+            advertised_routes,
+        } = new;
         let now = DateTime::now();
         let node = OverlayNode {
             id: None,
