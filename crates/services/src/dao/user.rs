@@ -322,20 +322,39 @@ impl UserDao {
             deleted_at: None,
         };
 
-        // Retry up to 5 times with different suffixes on username collision
+        // Retry up to 5 times with different suffixes on username collision.
+        //
+        // ⚠️ The retry is only legitimate for a USERNAME collision, because the
+        // username is the only thing this loop changes between attempts. Any
+        // other duplicate is unresolvable by repetition, and swallowing it here
+        // is how a real defect hid: the loop used to accept every
+        // `DuplicateKey`, burn all five attempts on an EMAIL collision, and
+        // then report "Failed to generate unique username after retries" — an
+        // error naming a field that was never the problem. That message made
+        // `unverified_oauth_email_never_links_into_an_existing_account` look
+        // like fixture noise for two sessions (#613).
+        let mut last_duplicate: Option<String> = None;
         for _ in 0..5 {
             let username = format!("{}_{}", base_username, &ObjectId::new().to_hex()[..6]);
             let user = user_template(username);
             match self.base.insert_one(&user).await {
                 Ok(id) => return self.base.find_by_id(id).await,
-                Err(DaoError::DuplicateKey(_)) => continue,
+                Err(DaoError::DuplicateKey(msg)) => {
+                    if !super::base::duplicate_key_is_on(&msg, "username") {
+                        // Not ours to fix by re-rolling — surface Mongo's own
+                        // message, which names the colliding field.
+                        return Err(DaoError::DuplicateKey(msg));
+                    }
+                    last_duplicate = Some(msg);
+                }
                 Err(e) => return Err(e),
             }
         }
 
-        Err(DaoError::DuplicateKey(
-            "Failed to generate unique username after retries".to_string(),
-        ))
+        Err(DaoError::DuplicateKey(format!(
+            "could not generate a unique username after 5 attempts; last collision: {}",
+            last_duplicate.as_deref().unwrap_or("<no detail>")
+        )))
     }
 
     /// Batch-fetch display names for a list of user IDs.
