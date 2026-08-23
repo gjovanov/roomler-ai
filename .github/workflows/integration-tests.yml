@@ -94,7 +94,16 @@ jobs:
         # docker-compose both use 27019, so the tests need no override.
         run: |
           set -euo pipefail
+          # --ulimit nofile is the load-bearing flag. Each test uses its OWN
+          # database and WiredTiger holds files open per collection AND index
+          # — 18 collections with several indexes each, across ~289 databases.
+          # Docker's default nofile is nowhere near that, and mongod does not
+          # degrade: run 32673736740 died on
+          #   "couldn't open [/proc/1/stat] Too many open files"
+          #   WiredTiger error 24 (EMFILE) -> fatal assertion 50853 -> abort
+          # 64000 is MongoDB's own documented production minimum.
           docker run -d --name roomler-test-mongo -p 27019:27017 \
+            --ulimit nofile=64000:64000 \
             --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'" \
             --health-interval 5s --health-timeout 5s --health-retries 20 \
             mongo:7 --wiredTigerCacheSizeGB 0.5
