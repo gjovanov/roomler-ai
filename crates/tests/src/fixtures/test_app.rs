@@ -30,6 +30,22 @@ pub struct TestApp {
 /// Opt-in rather than always-on: the suite is chatty and most runs don't want
 /// it. `with_test_writer` routes through the harness capture, so output shows
 /// up under `--nocapture` and stays attached to the failing test otherwise.
+/// Keep each `TestApp`'s connection pool tiny.
+///
+/// Every test builds its OWN `Client` against its OWN database, and the
+/// driver's default pool is 10 connections — so a full suite run can ask one
+/// mongod for a couple of thousand sockets. The build host absorbs that; a
+/// 2-core CI runner does not. The CI lane saw it twice: once as mid-suite
+/// `Connection refused` (26 tests failing on one process going away), then as
+/// mongod exiting 14 with a backtrace on `conn1333`.
+///
+/// A test needs ~1 connection at a time, so 2 is generous. This shortens the
+/// local suite too — the pools were never doing anything for us.
+fn cap_pool(opts: &mut ClientOptions) {
+    opts.max_pool_size = Some(2);
+    opts.min_pool_size = Some(0);
+}
+
 fn init_tracing() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -65,9 +81,10 @@ impl TestApp {
         }
         settings.database.name = db_name.clone();
 
-        let client_options = ClientOptions::parse(&settings.database.url)
+        let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
             .expect("Failed to parse MongoDB URL");
+        cap_pool(&mut client_options);
         let mongo_client =
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         let db = mongo_client.database(&db_name);
@@ -159,9 +176,10 @@ impl TestApp {
         // Apply caller's customizations
         mutator(&mut settings);
 
-        let client_options = ClientOptions::parse(&settings.database.url)
+        let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
             .expect("Failed to parse MongoDB URL");
+        cap_pool(&mut client_options);
         let mongo_client =
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         // Phase A-1: honor a mutator-overridden db name — `spawn_pair`
@@ -233,9 +251,10 @@ impl TestApp {
         settings.oauth.microsoft.client_id = "test-microsoft-id".to_string();
         settings.oauth.microsoft.client_secret = "test-microsoft-secret".to_string();
 
-        let client_options = ClientOptions::parse(&settings.database.url)
+        let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
             .expect("Failed to parse MongoDB URL");
+        cap_pool(&mut client_options);
         let mongo_client =
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         let db = mongo_client.database(&db_name);
