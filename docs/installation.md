@@ -94,11 +94,95 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
 
 ## macOS
 
-Same `install.sh` one-liner. The daemon ships as an **arm64 `.pkg`** (Apple
-Silicon) and registers a **LaunchAgent** (`com.roomler.agent.plist`); the tunnel
-CLI and the wizard are universal binaries. Remote-audio capture and multi-org
-per-org adapters are not available on macOS today; hardware encode falls back to
-software (no VideoToolbox wiring).
+Same `install.sh` one-liner, but macOS is the one platform that needs **two
+processes**, and it is worth knowing why before you install:
+
+| Half | Runs as | Does | Why it cannot do the other's job |
+|------|---------|------|----------------------------------|
+| LaunchAgent `com.roomler.agent` | you, inside your GUI login session | screen capture, input, clipboard | a root LaunchDaemon in session 0 has no WindowServer — capture and `CGEvent` injection do not work there |
+| LaunchDaemon `com.roomler.daemon` | root, from boot | overlay mesh, tunnels | creating a `utun` and installing routes require root |
+
+They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
+second control-WS connection displaces the first. **Each half is its own
+enrollment, so a Mac appears as two devices** — the second named
+`<name>-daemon`.
+
+```bash
+# Screen sharing only (one token, one device row):
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --token <token> --server https://roomler.ai --name "$(hostname)"
+
+# Screen sharing AND the overlay mesh — mint a SECOND enrollment token:
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --token <token> --daemon-token <second-token> \
+  --server https://roomler.ai --name "$(hostname)"
+```
+
+`--daemon-token` also turns the overlay on (`enroll --overlay`) — installing a
+root daemon is itself the opt-in, and the overlay is the only reason that half
+exists. Without it the Mac never sends `rc:overlay.join`, so it is **absent
+from `roomler peers` entirely** rather than showing as offline.
+
+Running the one-liner under `sudo` is fine: the script resolves the console
+user itself and enrolls the per-user half as them.
+
+### Grant the two permissions — nothing works until you do
+
+macOS gates capture and input, and **it never reports an error when a grant is
+missing**: the screen streams as wallpaper only, and injected keys and clicks
+are silently dropped.
+
+- System Settings → Privacy & Security → **Screen Recording** → enable `roomler-agent`
+- System Settings → Privacy & Security → **Accessibility** → enable `roomler-agent`
+
+The agent probes both at startup, says what is missing in its log, opens the
+right pane, and reports the state to the server — the device list shows "No
+screen access" / "No input access" instead of letting you discover it by
+connecting to a black screen.
+
+Then restart it: `launchctl kickstart -k gui/$(id -u)/com.roomler.agent`
+
+⚠️ Grants are keyed to the binary's code signature. Until Apple notarisation is
+finished the `.pkg` is unsigned, so **an agent update invalidates them** and
+both toggles need re-enabling.
+
+### The CLI
+
+The `.pkg` installs `/usr/local/bin/roomler` (a small shim onto the daemon's
+own command surface). `roomler peers` / `status` reach the **per-user** half;
+`sudo roomler …` reaches the **root** half, because the two listen on different
+LocalAPI sockets (`$TMPDIR/roomler/roomler.sock` vs `/var/run/roomler/roomler.sock`).
+If a command reports "daemon not running", you are probably asking the wrong
+half.
+
+### Paths, logs, limits
+
+| | Path |
+|---|---|
+| App bundle | `/Applications/roomler-agent.app` (executable is `roomler-agent`, not `roomlerd` — renaming it would void the TCC grants) |
+| Per-user config | `~/Library/Application Support/live.roomler.roomler/config.toml` |
+| Root config | `/etc/roomler-agent/config.toml` |
+| Per-user log | `/tmp/roomler-agent.err.log` |
+| Root log | `/var/log/roomler-agent/daemon.log` |
+
+Video is software-only on Apple Silicon (openh264 for H.264, libvpx for
+VP9-4:4:4): the encoder dispatch tables contain only NVIDIA/Intel/AMD names, so
+VideoToolbox is not wired up. Remote-audio capture and multi-org per-org
+adapters are also unavailable on macOS today.
+
+### Uninstall
+
+```bash
+launchctl bootout "gui/$(id -u)/com.roomler.agent"
+sudo launchctl bootout system/com.roomler.daemon          # if the root half is installed
+rm -f ~/Library/LaunchAgents/com.roomler.agent.plist
+sudo rm -f /Library/LaunchDaemons/com.roomler.daemon.plist
+sudo rm -rf /Applications/roomler-agent.app /usr/local/bin/roomler /etc/roomler-agent
+rm -rf ~/Library/Application\ Support/live.roomler.roomler
+```
+
+Remove the device row(s) in the admin UI too — deletion there releases the
+overlay lease.
 
 ## Keeping it updated
 
@@ -132,8 +216,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
   `roomlerd service uninstall` removes a manually-installed service/task.
 - **Linux**: `apt remove roomler-agent` (or delete the tarball install) and
   `systemctl --user disable --now roomler.service`.
-- **macOS**: `launchctl unload -w ~/Library/LaunchAgents/com.roomler.agent.plist`
-  and remove the package payload.
+- **macOS**: see [Uninstall](#uninstall) above — there may be TWO halves to
+  remove (the per-user LaunchAgent and, if installed, the root LaunchDaemon).
 - Server side, delete the device (**Devices → remove**): this revokes its
   credential and releases its overlay address back to the pool.
 
