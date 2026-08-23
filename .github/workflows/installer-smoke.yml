@@ -630,6 +630,18 @@ jobs:
           echo "=== what landed anyway ==="
           ls -la /Applications/roomler-agent.app/Contents/MacOS/ 2>&1 || true
           ls -la /usr/local/bin/roomler 2>&1 || true
+          echo "=== is /Applications what we think it is? ==="
+          ls -ld /Applications 2>&1 || true
+          echo "=== did the bundle land SOMEWHERE else? ==="
+          # pkgbuild infers the .app as a bundle component, and bundle
+          # components are RELOCATABLE by default: PackageKit may install one
+          # wherever it finds an existing copy rather than at the payload path.
+          sudo find / -maxdepth 6 -name 'roomler-agent.app' -not -path '*/work/*' 2>/dev/null || true
+          echo "=== component metadata (relocatable? install-location?) ==="
+          rm -rf /tmp/pkgexp
+          pkgutil --expand dist/smoke.pkg /tmp/pkgexp 2>&1 || true
+          find /tmp/pkgexp -maxdepth 2 -name PackageInfo -o -maxdepth 2 -name Distribution 2>/dev/null \
+            | while read -r f; do echo "--- $f"; cat "$f"; echo; done
 
       - name: Assert the payload landed where everything expects it
         run: |
