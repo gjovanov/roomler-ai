@@ -257,6 +257,17 @@ pub enum RpcCap {
     /// "does it know the feature exists". Expect that distinction to recur —
     /// it is why a verb is finer-grained than a version check.
     SshConsent,
+    /// `rc:agent.config` — the agent understands a pushed desired-config and
+    /// will reconcile against it (`docs/remote-config.md`).
+    ///
+    /// ⚠️ Advertising this says only that the frame is UNDERSTOOD, never that
+    /// it will be obeyed. A device still refuses unless it has opted in with
+    /// `remote_config_enabled`, and a secondary org's push is ignored
+    /// regardless. The server needs the distinction because an older agent
+    /// drops an unknown frame SILENTLY — the parse-error arm logs at `debug!`
+    /// and carries on — so without this verb a dashboard would show a change
+    /// that simply evaporated.
+    Config,
 }
 
 impl RpcCap {
@@ -272,11 +283,18 @@ impl RpcCap {
             Self::Originate => "originate",
             Self::Ssh => "ssh",
             Self::SshConsent => "ssh-consent",
+            Self::Config => "config",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 4] = [Self::Exec, Self::Originate, Self::Ssh, Self::SshConsent];
+    pub const ALL: [RpcCap; 5] = [
+        Self::Exec,
+        Self::Originate,
+        Self::Ssh,
+        Self::SshConsent,
+        Self::Config,
+    ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
     /// [`AgentCaps::has_rpc`] for why that is not an error.
@@ -2474,6 +2492,31 @@ mod tests {
         assert_eq!(RpcCap::Originate.wire(), "originate");
         assert_eq!(RpcCap::Ssh.wire(), "ssh");
         assert_eq!(RpcCap::SshConsent.wire(), "ssh-consent");
+        assert_eq!(RpcCap::Config.wire(), "config");
+    }
+
+    /// `config` must not ENLARGE the prefix hazard.
+    ///
+    /// A blanket "no verb is a prefix of another" would be false and always
+    /// has been: `ssh` is deliberately a prefix of `ssh-consent`, which is
+    /// exactly why matching is equality everywhere and why
+    /// `ssh_does_not_imply_ssh_consent` exists. So the useful claim is the
+    /// narrow one — the verb added here shares no prefix relationship with
+    /// any existing verb, so it contributes no new way for a sloppy
+    /// `starts_with` to be accidentally right.
+    #[test]
+    fn the_config_verb_adds_no_new_prefix_hazard() {
+        let config = RpcCap::Config.wire();
+        for other in RpcCap::ALL {
+            if other == RpcCap::Config {
+                continue;
+            }
+            assert!(
+                !other.wire().starts_with(config) && !config.starts_with(other.wire()),
+                "`{config}` and `{}` are prefix-related",
+                other.wire()
+            );
+        }
     }
 
     #[test]
