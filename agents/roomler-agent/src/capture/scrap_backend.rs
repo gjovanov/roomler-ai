@@ -155,6 +155,40 @@ impl ScrapCapture {
 /// missed them because QHD width=2560 fell under the 2561 cutoff.
 const DOWNSCALE_TRIGGER_PIXELS: u64 = 3_500_000;
 
+/// Bytes between the starts of two consecutive rows in a captured frame.
+///
+/// Deliberately NOT `buf.len() / height` everywhere. That division is exact on
+/// two of the three backends and silently wrong on the third, and the failure
+/// mode is a progressive shear rather than an error:
+///
+/// * **X11** allocates exactly `width * height * 4` and **DXGI** reports
+///   `height * Pitch`, so on both the quotient IS the pitch.
+/// * **macOS** hands back an IOSurface whose slice length is
+///   `IOSurfaceGetAllocSize` — the PAGE-ROUNDED TOTAL ALLOCATION. Dividing it
+///   by the height overshoots the real pitch, and the result is usually not a
+///   multiple of 4, so the BGRA channel phase rotates row to row on top of the
+///   shear. It is wrong even when the surface has no row padding at all: the
+///   16 KiB page rounding alone is enough. The true value is
+///   `IOSurfaceGetBytesPerRow`, which upstream scrap does not bind — hence the
+///   vendored patch (`crates/vendored/scrap.patch`).
+fn frame_stride(buf: &scrap::Frame<'_>, width: u32, height: u32) -> u32 {
+    #[cfg(target_os = "macos")]
+    let stride = {
+        let bpr = buf.bytes_per_row() as u32;
+        debug_assert!(
+            u64::from(bpr) * u64::from(height) <= buf.len() as u64,
+            "bytes_per_row * height exceeds the surface allocation"
+        );
+        bpr
+    };
+    #[cfg(not(target_os = "macos"))]
+    let stride = (buf.len() as u32) / height.max(1);
+
+    // A stride under one packed row would read past the end of every row.
+    // Clamp instead of trusting the backend blindly.
+    stride.max(width.saturating_mul(4))
+}
+
 fn capture_one_blocking(
     cap: &mut Capturer,
     width: u32,
@@ -168,7 +202,7 @@ fn capture_one_blocking(
     loop {
         match cap.frame() {
             Ok(buf) => {
-                let stride = (buf.len() as u32) / height.max(1);
+                let stride = frame_stride(&buf, width, height);
                 let monotonic_us = start.elapsed().as_micros() as u64;
                 let pixel_count = u64::from(width) * u64::from(height);
                 let should_downscale = match downscale {
@@ -316,6 +350,32 @@ mod tests {
             frame.data.len() >= (frame.width * frame.height * 3) as usize,
             "unexpectedly small capture buffer"
         );
-        assert!(frame.stride >= frame.width * 4);
+
+        // `stride >= width * 4` alone was the ONLY stride assertion here, and
+        // it is far too weak: the invented macOS stride (allocSize / height)
+        // satisfied it while shearing every frame. These three do not.
+        assert!(
+            frame.stride >= frame.width * 4,
+            "stride {} is under one packed row of {} px",
+            frame.stride,
+            frame.width
+        );
+        // A BGRA row pitch is a whole number of pixels. `allocSize / height`
+        // generally is not — that mismatch is what rotates the channel phase
+        // row to row on top of the shear.
+        assert_eq!(
+            frame.stride % 4,
+            0,
+            "stride {} is not a whole number of BGRA pixels — it was derived, not read",
+            frame.stride
+        );
+        // Every row the encoder will read has to be inside the buffer.
+        assert!(
+            (frame.stride as u64) * u64::from(frame.height) <= frame.data.len() as u64,
+            "stride {} x height {} overruns the {}-byte buffer",
+            frame.stride,
+            frame.height,
+            frame.data.len()
+        );
     }
 }
