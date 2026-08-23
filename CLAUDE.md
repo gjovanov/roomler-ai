@@ -173,8 +173,14 @@ MongoDB native driver (not Mongoose). Models live in `crates/db/src/models/` exc
 - Each test gets a unique UUID-named database, auto-dropped on teardown
 - Tests spawn real Axum servers on random ports
 - Requires MongoDB on `localhost:27019` and Redis on `localhost:6379`
-- 163+ tests across 24 modules: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call, pagination, rate_limit, cors, billing, multi_tenancy, channel_crud, pdf_export, conference_message, **remote_control, agent** (full rc:* round-trip drives the agent library in-process against a TestApp)
-- 7 known pre-existing failures on the build host (CORS tower-http upgrade ×2, role dedup, rate-limit timing, agent_e2e concurrent_sessions + terminate_clears, conference call_leave) — reproducible on pristine master and unrelated to recent work; the last three are environmental to that box
+- 291 tests across 25 modules: auth, tenant, room, message, reaction, recording, file, invite, role, notification, push, giphy, oauth, call, pagination, rate_limit, cors, billing, multi_tenancy, channel_crud, pdf_export, conference_message, stats, cluster, **remote_control, agent** (full rc:* round-trip drives the agent library in-process against a TestApp)
+- **Known failures, re-measured on the build host 2026-08-23 (288 pass / 3 fail, ~46 min).** The previous list here named 7 and was wrong in both directions — 4 of them had started passing, and 6 real failures were missing. It went stale because **`crates/tests` did not compile for months** and nothing runs it (see below), so nobody could have checked. Current three:
+  - `conference_tests::call_leave_cleans_up_participant_media` — `media:error` where `media:router_capabilities` expected; environmental to that box (no mediasoup worker).
+  - `rate_limit_tests::rate_limit_returns_429_after_burst` — timing-sensitive.
+  - `agent_presence_tests::rehome_race_keeps_newest_claim` — **load-dependent flake, not a regression**: passes 5/5 in isolation, fails only inside the full parallel run. A cross-pod presence race with a bounded wait.
+- ⚠️ **CI runs this lane in NO job** — `ci.yml` has no mongo/redis services. Since #603 it at least `cargo check`s the crate (`--all-targets`), which is what catches the "a DAO grew a field and 8 test callers didn't" breakage that had silently stranded all 288 tests. **A green PR still does not mean these tests ran.** Run them yourself on the build host or via the WSL+docker recipe before trusting a change here.
+- ⚠️ `--workspace` clippy compiles only `pub mod fixtures` from this crate (every test module is `#[cfg(test)]`-gated), so `Checking roomler-ai-tests` in a build log is **not** evidence the tests build.
+- ⚠️ `RUST_LOG` did nothing here until #615 — the harness installed no subscriber, so every `info!`/`warn!` explaining a refusal was discarded (a `/derp` registration refusal in particular looks like an unexplained missing record). Set `RUST_LOG` and use `--nocapture`.
 
 **E2E tests** (`ui/e2e/`):
 - Playwright 1.58 with Chromium (fake media stream devices for WebRTC)
