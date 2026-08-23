@@ -308,6 +308,16 @@ jobs:
       - name: cargo check agent (scrap-capture — the macOS capture surface)
         run: cargo check -p roomler-agent --lib --features scrap-capture
 
+      # `--bins`, because `--lib` alone was not enough. main.rs is a SEPARATE
+      # crate root: a `#[cfg(target_os = "macos")]` block there referring to a
+      # lib module needs `roomler_agent::`, and a bare path compiles nowhere —
+      # but nothing on this lane ever built the binary, so rc.454's startup
+      # permission preflight passed every check and then failed on master.
+      # Same "invisible until a Mac compiles it" class this whole job exists
+      # for, one crate root over.
+      - name: cargo check agent BINARY (macOS cfg arms in main.rs)
+        run: cargo check -p roomler-agent --bins --features scrap-capture
+
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
         # someone's Mac, with launchctl's famously unhelpful diagnostics.
