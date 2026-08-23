@@ -852,9 +852,9 @@ pub async fn check_once() -> CheckOutcome {
 ///   plus sudo-equivalent; a non-interactive fallback uses
 ///   `dpkg --install` directly (works when run as the user who
 ///   owns /usr/bin, e.g. in a cargo-installed dev env).
-/// - **macOS**: `installer -pkg <path> -target CurrentUserHomeDirectory`
-///   runs the receipt-based install; prompts for auth if the pkg
-///   uses /Library paths.
+/// - **macOS**: `installer -pkg <path> -target /` — the same target
+///   `scripts/install.sh` uses. It must be the volume root: the payload
+///   paths are absolute and the launchd plists name them literally.
 pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
     spawn_installer_with_watch(installer_path, None)
 }
@@ -1456,8 +1456,18 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
     #[cfg(target_os = "macos")]
     {
         let path_str = installer_path.to_string_lossy().into_owned();
+        // `-target /`, NOT `CurrentUserHomeDirectory`.
+        //
+        // The pkg's payload is absolute: /Applications/roomler-agent.app plus
+        // /usr/local/bin/roomler, and BOTH launchd plists name the bundle path
+        // literally. A home-directory install relocates the payload under
+        // ~/Applications, so the update "succeeds" and launchd keeps starting
+        // the OLD binary at the path it still points to — an update that
+        // silently does nothing, on the one platform whose grants are keyed to
+        // the binary. `/` is also what scripts/install.sh uses, so the update
+        // path and the install path finally agree.
         let child = std::process::Command::new("installer")
-            .args(["-pkg", &path_str, "-target", "CurrentUserHomeDirectory"])
+            .args(["-pkg", &path_str, "-target", "/"])
             .spawn()
             .context("spawning installer(8)")?;
         Ok(child.id())
