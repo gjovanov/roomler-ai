@@ -781,6 +781,77 @@ pub fn cmd_service_status(as_service: bool) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The host permissions the agent needs, and whether the OS has granted them.
+///
+/// Only macOS gates these, and it does so SILENTLY: without Screen Recording
+/// the remote screen is wallpaper-only, and without Accessibility every
+/// injected key and click is dropped — neither reports an error to anyone.
+/// That is the entire reason this panel exists.
+#[derive(serde::Serialize)]
+pub struct PermissionState {
+    /// False on platforms with no permission model, so the UI can hide the
+    /// whole panel rather than showing two permanently-green rows.
+    pub applicable: bool,
+    pub screen_recording: bool,
+    pub accessibility: bool,
+}
+
+#[tauri::command]
+pub fn cmd_permissions() -> PermissionState {
+    #[cfg(target_os = "macos")]
+    {
+        use roomler_agent_core::tcc;
+        PermissionState {
+            applicable: true,
+            screen_recording: tcc::screen_recording_granted(),
+            accessibility: tcc::accessibility_trusted(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PermissionState {
+            applicable: false,
+            screen_recording: true,
+            accessibility: true,
+        }
+    }
+}
+
+/// Ask for a permission: pop the system prompt if it has never been answered,
+/// and open the Settings pane either way.
+///
+/// Both are needed. The prompt only ever appears ONCE per binary — after a
+/// denial macOS never shows it again — and the pane is the only route back,
+/// but landing the user on the right pane with the app already listed is the
+/// difference between one toggle and a hunt through Settings.
+///
+/// `which` is `"screen"` or `"input"`.
+#[tauri::command]
+pub fn cmd_request_permission(which: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use roomler_agent_core::tcc;
+        match which.as_str() {
+            "screen" => {
+                let _ = tcc::request_screen_recording();
+                tcc::open_settings_pane(tcc::PANE_SCREEN_RECORDING);
+                Ok(())
+            }
+            "input" => {
+                let _ = tcc::request_accessibility();
+                tcc::open_settings_pane(tcc::PANE_ACCESSIBILITY);
+                Ok(())
+            }
+            other => Err(format!("unknown permission {other:?}")),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = which;
+        Err("this platform does not gate capture or input permissions".into())
+    }
+}
+
 /// Open the daemon's log directory in the OS file manager. ASYNC because
 /// resolving the directory probes the service flavour (shells out to the
 /// daemon CLI) — that must stay off the UI thread.
