@@ -115,9 +115,11 @@ to a running `roomlerd` without any token:
 
 ## CLI
 
-`roomler` is the tunnel CLI everywhere; on daemon hosts the installed `roomler`
-binary is a ~150 KB shim that re-execs `roomlerd cli` — one command surface, no
-version skew. Highlights (run `roomler --help` for the full set):
+`roomler` is the tunnel CLI on every platform; on daemon hosts the installed
+`roomler` binary is a ~150 KB shim that re-execs `roomlerd cli` — one command
+surface, no version skew. On macOS the shim lands at `/usr/local/bin/roomler`
+and resolves the daemon inside the `.app` bundle, since there the two binaries
+cannot be siblings. (Before rc.454 the macOS `.pkg` shipped **no** CLI at all.) Highlights (run `roomler --help` for the full set):
 
 | Verb | Purpose |
 |---|---|
