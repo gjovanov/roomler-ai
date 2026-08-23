@@ -109,6 +109,8 @@
     </v-card>
 
     <SshAuditSection :tenant-id="tenantId" />
+
+    <SshActivitySection :tenant-id="tenantId" />
   </div>
 </template>
 
@@ -118,6 +120,7 @@ import { useTenantStore } from '@/stores/tenant'
 import { useAgentStore } from '@/stores/agents'
 import ExecAuditSection from './ExecAuditSection.vue'
 import SshAuditSection from './SshAuditSection.vue'
+import SshActivitySection from './SshActivitySection.vue'
 
 const props = defineProps<{ tenantId: string }>()
 const tenantStore = useTenantStore()
