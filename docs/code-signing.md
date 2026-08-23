@@ -192,6 +192,21 @@ gh workflow run release-tunnel.yml -f version=<v> -f publish_release=false -f si
 gh workflow run release-agent.yml -f version=<v> -f publish_release=false -f signing_mode=off -f require_signing=true
 ```
 
+> ⚠️ **A green `publish_release=false` dispatch proves the BUILD, not the
+> PUBLISH path.** Several gates only arm on a release run and are deliberately
+> a tolerated warning on a dispatch — the Apple-credentials check is one. On
+> 2026-08-23 an `azure`/`require_signing=true` dispatch went green on all five
+> platforms; the tag cut minutes later **died in 10 s** on the Apple gate, and
+> because `Publish GitHub Release` needs every build job, four healthy
+> artifacts (both `.deb`, the `.msi`, the companion EXE) were built, signed,
+> and published nowhere.
+>
+> So a dispatch cannot answer "will the tag publish?". Either accept that the
+> tag is the first real test of the gates, or read the workflow for
+> `github.ref_type == 'tag'` conditions and check each one by hand first.
+> Corollary for anyone adding a gate: **make it observable on a dispatch**
+> (warn with the same message it would fail with) so the rehearsal can see it.
+
 Do **not** rehearse with throwaway `agent-v*` tags: a tag push publishes a
 non-prerelease Release that the field fleet's 6-hourly `/releases/latest`
 poll picks up immediately. `installer-smoke.yml` additionally runs the
