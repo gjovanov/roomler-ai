@@ -144,6 +144,11 @@ impl UserDao {
     ///   the claim is **evicted**, not merged (step 2b). Safe by construction:
     ///   an unverified account cannot have been used, because password login
     ///   refuses it and it owns no verified provider identity.
+    ///
+    /// On top of those three, step 2c refuses an UNVERIFIED identity whose
+    /// asserted address already belongs to someone — a UX choice rather than a
+    /// security control, since the placeholder already makes that case safe.
+    /// See the comment there before touching it.
     pub async fn find_or_create_by_oauth(
         &self,
         provider: &str,
@@ -229,23 +234,33 @@ impl UserDao {
             }
         }
 
-        // 2b. Reaching here with the address already taken means step 2
-        //     DECLINED to link it — i.e. the provider did not verify it.
+        // 2c. The address is taken and nothing above claimed the sign-in, so
+        //     the provider did not verify it — a verified one would have linked
+        //     at 2a or evicted at 2b.
         //
-        //     The nOAuth doc comment says such an identity "must get its OWN
-        //     account", but that is not reachable: `users.email` is uniquely
-        //     indexed, so the create below inserts a second row with the same
-        //     address, collides on EMAIL, and the retry loop — which assumes
-        //     every duplicate key is a username clash — burns all five attempts
-        //     and reports "Failed to generate unique username after retries".
-        //     An error about the wrong field entirely, for a condition that can
-        //     never succeed.
+        //     ⚠️ Refusing here is a UX POLICY, not the security control, and the
+        //     distinction matters if you ever edit this. It ARRIVED as a
+        //     mechanical necessity (#610): the create below used to write the
+        //     asserted address, so a second row for one address collided on
+        //     EMAIL, and the retry loop — which assumes every duplicate key is a
+        //     username clash — burned five attempts and blamed a username the
+        //     user never chose. The placeholder at step 3 removed that
+        //     collision, so this branch COULD now mint a parallel account and
+        //     succeed.
         //
-        //     Refusing is the correct answer and always was the effective one:
-        //     linking is what a takeover needs, and we still never link. What
-        //     changes here is only that the refusal says what happened, so the
-        //     caller can tell the user to sign in with their existing
-        //     credentials or via a provider that asserts `email_verified`.
+        //     It still refuses, because that account would be invisible to the
+        //     person who owns the address: they would sign in, land somewhere
+        //     that is not their account, and have no way to tell. An error
+        //     naming the reason is the more useful answer.
+        //
+        //     What stops the takeover is 2a/2b plus the placeholder — NOT this.
+        //     Deleting this guard costs UX; deleting either of those costs
+        //     security.
+        //
+        //     (The message confirms an address is registered. That oracle
+        //     already exists at /api/auth/register, which 409s on the same
+        //     unique index, so this adds no new exposure — but don't extend the
+        //     pattern to a surface where it would.)
         if self.find_by_email(email).await.is_ok() {
             return Err(DaoError::DuplicateKey(format!(
                 "an account already exists for {email} and {provider} did not \
