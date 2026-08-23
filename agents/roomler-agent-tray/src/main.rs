@@ -85,6 +85,8 @@ fn main() {
             commands::cmd_service_install,
             commands::cmd_service_uninstall,
             commands::cmd_service_status,
+            commands::cmd_permissions,
+            commands::cmd_request_permission,
             commands::cmd_open_log_dir,
             commands::cmd_open_config_dir,
             commands::cmd_consent_approve,
