@@ -88,6 +88,27 @@ pub struct AgentCaps {
     /// Empty / unset = a pre-P6 agent → the P3 single-holder rule stays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    /// Host permissions the OS has actually GRANTED this agent, as opposed to
+    /// what it was compiled with. Recognised values:
+    ///
+    /// * `screen-capture` — the agent may capture the screen. On macOS this
+    ///   is the Screen Recording TCC grant; elsewhere there is no such gate
+    ///   and it is always present.
+    /// * `input` — the agent may inject keyboard/mouse events. On macOS this
+    ///   is the Accessibility grant.
+    ///
+    /// ⚠️ `None` and `Some([])` mean OPPOSITE things and must never be
+    /// collapsed: `None` is a pre-rc.454 agent that cannot report (no
+    /// information — say nothing), `Some([])` is an agent reporting that it
+    /// holds NEITHER permission (a Mac that will show a blank screen and
+    /// swallow every click). Same rule as `NetmapPeer.ingress_rules`.
+    ///
+    /// This exists because macOS never ERRORS on a missing grant: capture
+    /// silently returns wallpaper-only frames and injected input is silently
+    /// dropped, so without this the product's only symptom is "it doesn't
+    /// work" with a clean log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Vec<String>>,
     /// Multi-org capabilities. Recognised values:
     ///
     /// * `join` — the agent honours `rc:agent.join_org`: it enrolls itself
