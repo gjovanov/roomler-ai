@@ -321,6 +321,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",                   # OVERLAPPED, which ReadFile's signature references
     "Win32_UI_Shell",                    # ShellExecuteExW for UAC-elevated msiexec (rc.18 self-update fix)
     "Win32_System_Registry",             # SHELLEXECUTEINFOW carries an HKEY field; struct gated on this
+    "Win32_Security_WinTrust",           # WinVerifyTrust — the self-updater refuses to run an installer it cannot attribute to us
+    "Win32_Security_Cryptography",       # CryptQueryObject/CertGetNameStringW — WHO signed it, which WinVerifyTrust alone does not tell you
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
