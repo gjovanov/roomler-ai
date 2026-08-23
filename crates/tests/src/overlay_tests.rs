@@ -15,7 +15,7 @@ use bson::{doc, oid::ObjectId};
 use roomler_ai_remote_control::models::{NodeRef, OverlayNetwork, OverlayNode};
 use roomler_ai_services::dao::base::DaoError;
 use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
-use roomler_ai_services::dao::overlay_node::OverlayNodeDao;
+use roomler_ai_services::dao::overlay_node::{NewOverlayNode, OverlayNodeDao};
 use serde_json::Value;
 
 use crate::fixtures::test_app::TestApp;
@@ -73,27 +73,27 @@ impl Ipam {
         overlay_ip: &str,
     ) -> Result<OverlayNode, DaoError> {
         self.nodes
-            .create(
-                self.tenant_id,
-                NodeRef::Agent {
+            .create(NewOverlayNode {
+                tenant_id: self.tenant_id,
+                node_ref: NodeRef::Agent {
                     agent_id: ObjectId::new(),
                 },
-                self.network_id,
-                machine_id.to_string(),
-                name.to_string(),
-                overlay_ip.to_string(),
-                "pk-base64".to_string(),
-                0,
-                vec![],
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                vec![],
-            )
+                network_id: self.network_id,
+                machine_id: machine_id.to_string(),
+                name: name.to_string(),
+                overlay_ip: overlay_ip.to_string(),
+                wg_public_key: "pk-base64".to_string(),
+                key_epoch: 0,
+                endpoints: vec![],
+                supports_quic: false,
+                supports_relay_single: false,
+                supports_derp: false,
+                supports_forced_derp: false,
+                supports_server_relay_strategy: false,
+                supports_derp_floor: false,
+                supports_overlay_echo: false,
+                advertised_routes: vec![],
+            })
             .await
     }
 }
@@ -708,27 +708,27 @@ async fn agent_delete_releases_the_overlay_node() {
     ipam.alloc().await.unwrap();
     let node = ipam
         .nodes
-        .create(
-            ipam.tenant_id,
-            NodeRef::Agent {
+        .create(NewOverlayNode {
+            tenant_id: ipam.tenant_id,
+            node_ref: NodeRef::Agent {
                 agent_id: tid(&agent_id),
             },
-            ipam.network_id,
-            "mach-cascade".to_string(),
-            "testbox".to_string(),
-            "100.64.0.1".to_string(),
-            "pk".to_string(),
-            0,
-            vec![],
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            vec![],
-        )
+            network_id: ipam.network_id,
+            machine_id: "mach-cascade".to_string(),
+            name: "testbox".to_string(),
+            overlay_ip: "100.64.0.1".to_string(),
+            wg_public_key: "pk".to_string(),
+            key_epoch: 0,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            supports_overlay_echo: false,
+            advertised_routes: vec![],
+        })
         .await
         .unwrap();
 
@@ -794,27 +794,27 @@ async fn a_re_enrolled_removed_machine_gets_a_fresh_overlay_node() {
     ipam.alloc().await.unwrap();
     let first = ipam
         .nodes
-        .create(
-            ipam.tenant_id,
-            NodeRef::Agent {
+        .create(NewOverlayNode {
+            tenant_id: ipam.tenant_id,
+            node_ref: NodeRef::Agent {
                 agent_id: tid(&agent_id),
             },
-            ipam.network_id,
-            "mach-rejoin".to_string(),
-            "rejoiner".to_string(),
-            "100.64.0.1".to_string(),
-            "pk".to_string(),
-            0,
-            vec![],
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            vec![],
-        )
+            network_id: ipam.network_id,
+            machine_id: "mach-rejoin".to_string(),
+            name: "rejoiner".to_string(),
+            overlay_ip: "100.64.0.1".to_string(),
+            wg_public_key: "pk".to_string(),
+            key_epoch: 0,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            supports_overlay_echo: false,
+            advertised_routes: vec![],
+        })
         .await
         .unwrap();
 
@@ -913,27 +913,27 @@ async fn tunnel_client_delete_releases_the_overlay_node() {
     ipam.alloc().await.unwrap();
     let node = ipam
         .nodes
-        .create(
-            ipam.tenant_id,
-            NodeRef::TunnelClient {
+        .create(NewOverlayNode {
+            tenant_id: ipam.tenant_id,
+            node_ref: NodeRef::TunnelClient {
                 tunnel_client_id: tid(&client_id),
             },
-            ipam.network_id,
-            "mach-tc".to_string(),
-            "laptop".to_string(),
-            "100.64.0.1".to_string(),
-            "pk".to_string(),
-            0,
-            vec![],
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            vec![],
-        )
+            network_id: ipam.network_id,
+            machine_id: "mach-tc".to_string(),
+            name: "laptop".to_string(),
+            overlay_ip: "100.64.0.1".to_string(),
+            wg_public_key: "pk".to_string(),
+            key_epoch: 0,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            supports_overlay_echo: false,
+            advertised_routes: vec![],
+        })
         .await
         .unwrap();
 
@@ -991,27 +991,27 @@ async fn agent_delete_does_not_release_a_tunnel_clients_node() {
     ipam.alloc().await.unwrap();
     let node = ipam
         .nodes
-        .create(
-            ipam.tenant_id,
-            NodeRef::TunnelClient {
+        .create(NewOverlayNode {
+            tenant_id: ipam.tenant_id,
+            node_ref: NodeRef::TunnelClient {
                 tunnel_client_id: ObjectId::new(),
             },
-            ipam.network_id,
-            "mach-shared".to_string(),
-            "shared".to_string(),
-            "100.64.0.1".to_string(),
-            "pk".to_string(),
-            0,
-            vec![],
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            vec![],
-        )
+            network_id: ipam.network_id,
+            machine_id: "mach-shared".to_string(),
+            name: "shared".to_string(),
+            overlay_ip: "100.64.0.1".to_string(),
+            wg_public_key: "pk".to_string(),
+            key_epoch: 0,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            supports_overlay_echo: false,
+            advertised_routes: vec![],
+        })
         .await
         .unwrap();
 
@@ -1309,27 +1309,27 @@ async fn renumber_refuses_a_fleet_below_the_version_floor() {
         .unwrap();
     ipam.alloc().await.unwrap();
     ipam.nodes
-        .create(
-            ipam.tenant_id,
-            NodeRef::Agent {
+        .create(NewOverlayNode {
+            tenant_id: ipam.tenant_id,
+            node_ref: NodeRef::Agent {
                 agent_id: ObjectId::parse_str(&agent_id).unwrap(),
             },
-            ipam.network_id,
-            "floor-machine".to_string(),
-            "oldbox".to_string(),
-            "100.64.0.1".to_string(),
-            "pk".to_string(),
-            0,
-            vec![],
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            false,
-            vec![],
-        )
+            network_id: ipam.network_id,
+            machine_id: "floor-machine".to_string(),
+            name: "oldbox".to_string(),
+            overlay_ip: "100.64.0.1".to_string(),
+            wg_public_key: "pk".to_string(),
+            key_epoch: 0,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: false,
+            supports_forced_derp: false,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            supports_overlay_echo: false,
+            advertised_routes: vec![],
+        })
         .await
         .unwrap();
 
