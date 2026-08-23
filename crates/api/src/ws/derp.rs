@@ -216,7 +216,9 @@ pub async fn derp_upgrade(
                 .unwrap();
         }
     };
-    ws.on_upgrade(move |socket| handle_derp_socket(state, socket, agent_id))
+    ws.max_message_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_derp_socket(state, socket, agent_id))
 }
 
 /// Drive one DERP connection: resolve the agent's node, validate its
