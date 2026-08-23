@@ -569,6 +569,16 @@ jobs:
           </dict></plist>
           PLIST
 
+          # Seal the bundle LAST, mirroring the release lane. Signing the main
+          # executable earlier seals the whole bundle, and everything written
+          # after that (both plists, Info.plist) falsifies the seal — which is
+          # what shipped in rc.453/rc.454 and what this job kept failing on.
+          codesign --force --sign - "$APP"
+          codesign --verify --strict "$APP" || {
+            echo "::error::the .app's signature does not match its contents"
+            exit 1
+          }
+
           mkdir -p payload/Applications payload/usr/local/bin scripts dist
           cp -R "$APP" payload/Applications/
           cp target/aarch64-apple-darwin/release/roomler-shim payload/usr/local/bin/roomler
