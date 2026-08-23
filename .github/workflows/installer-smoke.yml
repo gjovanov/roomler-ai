@@ -410,7 +410,9 @@ jobs:
           $mustBeAppLocal = '^(msvcp|vcruntime|concrt|mfc|vcomp|msvcr)'
 
           function Audit-Imports {
-            $found = @()
+            param([switch]$Quiet)
+            $found    = @()
+            $appLocal = @()
             foreach ($exe in @('roomlerd.exe', 'roomler.exe')) {
               $path = Join-Path $installDir $exe
               if (-not (Test-Path $path)) { $found += "$exe missing"; continue }
@@ -418,9 +420,9 @@ jobs:
                 Select-String -Pattern '^\s{4}(\S+\.dll)$' |
                 ForEach-Object { $_.Matches[0].Groups[1].Value }
               if (-not $imports) { $found += "$exe : dumpbin listed no imports (parse broke?)"; continue }
-              Write-Host "$exe imports $($imports.Count) DLLs"
+              if (-not $Quiet) { Write-Host "$exe imports $($imports.Count) DLLs" }
               foreach ($dll in $imports) {
-                if (Test-Path (Join-Path $installDir $dll)) { continue }
+                if (Test-Path (Join-Path $installDir $dll)) { $appLocal += $dll; continue }
                 if ($dll -match $mustBeAppLocal) {
                   $found += "$exe -> $dll is a REDISTRIBUTABLE and is not app-local"
                   continue
@@ -431,32 +433,44 @@ jobs:
                 $found += "$exe -> $dll is neither app-local nor an OS DLL"
               }
             }
-            return ,$found
+            [pscustomobject]@{
+              Problems = @($found)
+              AppLocal = @($appLocal | Sort-Object -Unique)
+            }
           }
 
           Write-Host '--- 1/2: the real install must be clean ---'
-          $problems = Audit-Imports
-          if ($problems.Count -gt 0) {
-            $problems | ForEach-Object { Write-Host "::error::$_" }
+          $r = Audit-Imports
+          if ($r.Problems.Count -gt 0) {
+            $r.Problems | ForEach-Object { Write-Host "::error::$_" }
             throw "install is not self-contained"
           }
           Write-Host "OK: every import is app-local or shipped by Windows"
+          Write-Host "app-local imports: $($r.AppLocal -join ', ')"
 
           # ⚠️ A gate proven only on the passing case is the failure mode this
           # step exists to fix — "it printed OK" is not evidence it can say
-          # anything else. Hide one redistributable and require a complaint.
-          # This is also the only way to catch the audit silently degrading:
-          # if dumpbin's output format shifts, part 1 goes quiet and green.
-          Write-Host '--- 2/2: negative control — it must FAIL when a CRT DLL is absent ---'
-          $victim = Join-Path $installDir 'msvcp140.dll'
+          # anything else. Hide a bundled DLL and require a complaint.
+          #
+          # The victim is chosen from what the binaries ACTUALLY import, not
+          # named up front: this job builds a minimal feature set, so the C++
+          # deps that pull in msvcp140 may be absent, and hiding a DLL nothing
+          # imports proves nothing. (First attempt did exactly that and the
+          # control caught it — which is the argument for having one.)
+          Write-Host '--- 2/2: negative control — hiding a bundled import must FAIL the audit ---'
+          if ($r.AppLocal.Count -eq 0) {
+            throw "NEGATIVE CONTROL IMPOSSIBLE: no imported DLL is app-local, so this audit has nothing to detect. Either the bundle is unnecessary in this build, or the dumpbin parse is wrong — both need a human."
+          }
+          $victim = Join-Path $installDir $r.AppLocal[0]
           $stash  = "$victim.hidden"
+          Write-Host "hiding $($r.AppLocal[0])"
           Move-Item $victim $stash
           try {
-            $negative = Audit-Imports
-            if ($negative.Count -eq 0) {
-              throw "NEGATIVE CONTROL FAILED: msvcp140.dll was removed and the audit still passed — this check cannot detect what it claims to."
+            $neg = Audit-Imports -Quiet
+            if ($neg.Problems.Count -eq 0) {
+              throw "NEGATIVE CONTROL FAILED: $($r.AppLocal[0]) was removed and the audit still passed — this check cannot detect what it claims to."
             }
-            Write-Host "OK: audit reported $($negative.Count) problem(s) with msvcp140.dll removed"
+            Write-Host "OK: audit reported $($neg.Problems.Count) problem(s): $($neg.Problems[0])"
           } finally {
             Move-Item $stash $victim
           }
