@@ -1,0 +1,289 @@
+//! `PUT /api/tenant/{tenant_id}/agent/{agent_id}/desired-config` — record the
+//! device config an operator wants, for the agent to reconcile when it next
+//! connects. Step 2 of `docs/remote-config.md`.
+//!
+//! This route writes an INTENT, never a fact. The device is free to ignore it
+//! (and does, unless it has opted in via `remote_config_enabled`), so nothing
+//! here may be read back as "this device has exec on".
+
+use axum::{
+    Json,
+    extract::{Path, State},
+};
+use bson::{DateTime, doc, oid::ObjectId};
+use roomler_ai_db::models::role::permissions;
+use roomler_ai_remote_control::models::DesiredConfig;
+use serde::{Deserialize, Serialize};
+
+use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+
+#[derive(Debug, Deserialize)]
+pub struct DesiredConfigBody {
+    #[serde(default)]
+    pub exec_enabled: Option<bool>,
+    #[serde(default)]
+    pub ssh_enabled: Option<bool>,
+    #[serde(default)]
+    pub ssh_authorized_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub ssh_account_mode: Option<String>,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DesiredConfigResponse {
+    pub revision: u64,
+    pub desired: DesiredConfig,
+}
+
+/// Why a desired-config write was refused. Enumerated rather than stringly
+/// typed for the same reason `SshDenyReason` is: every arm has to be auditable,
+/// and a refusal nobody can query is a refusal nobody will notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigDenyReason {
+    /// Not a member, or missing `MANAGE_AGENTS`.
+    NotDeviceAdmin,
+    /// Asked to change exec without holding `EXEC_DEVICE`.
+    CannotGrantExec,
+    /// Asked to change SSH without holding `SSH_DEVICE`.
+    CannotGrantSsh,
+}
+
+impl ConfigDenyReason {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::NotDeviceAdmin => "not_device_admin",
+            Self::CannotGrantExec => "cannot_grant_exec",
+            Self::CannotGrantSsh => "cannot_grant_ssh",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotDeviceAdmin => "Missing MANAGE_AGENTS permission",
+            Self::CannotGrantExec => {
+                "Enabling exec on a device requires EXEC_DEVICE — you cannot open a door you \
+                 cannot walk through"
+            }
+            Self::CannotGrantSsh => {
+                "Changing SSH access on a device requires SSH_DEVICE — you cannot open a door \
+                 you cannot walk through"
+            }
+        }
+    }
+}
+
+/// The whole policy, as one pure function so it can be tested without a
+/// database and so every refusal has exactly one place to come from.
+///
+/// `MANAGE_AGENTS` alone is NOT enough. Enabling exec or SSH on a device is
+/// *granting a power*, and #600/#605 established the rule that governs
+/// granting: **you cannot grant a permission you do not hold.** An admin who
+/// lacks `EXEC_DEVICE` must not be able to open exec on a fleet device for
+/// somebody else — that is the same escalation those PRs closed, one level of
+/// indirection away.
+///
+/// Both bits are deliberately absent from `DEFAULT_ADMIN`, which is what makes
+/// this a real constraint rather than a formality. `ADMINISTRATOR` bypasses, as
+/// everywhere else.
+pub fn decide(caller_permissions: u64, requested: &DesiredConfig) -> Result<(), ConfigDenyReason> {
+    if !permissions::has(caller_permissions, permissions::MANAGE_AGENTS) {
+        return Err(ConfigDenyReason::NotDeviceAdmin);
+    }
+    if requested.touches_exec() && !permissions::has(caller_permissions, permissions::EXEC_DEVICE) {
+        return Err(ConfigDenyReason::CannotGrantExec);
+    }
+    if requested.touches_ssh() && !permissions::has(caller_permissions, permissions::SSH_DEVICE) {
+        return Err(ConfigDenyReason::CannotGrantSsh);
+    }
+    Ok(())
+}
+
+pub async fn set_desired_config(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+    Json(body): Json<DesiredConfigBody>,
+) -> Result<Json<DesiredConfigResponse>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+
+    // Membership first: `get_member_permissions` is the membership check too,
+    // so a non-member never reaches the policy below.
+    let perms = state
+        .tenants
+        .get_member_permissions(tid, auth.user_id)
+        .await?;
+
+    // Tenant-scoped, so an agent id from another org is a 404 rather than a
+    // cross-tenant read.
+    let agent = state.agents.base.find_by_id_in_tenant(tid, aid).await?;
+
+    let requested = DesiredConfig {
+        exec_enabled: body.exec_enabled,
+        ssh_enabled: body.ssh_enabled,
+        ssh_authorized_keys: body.ssh_authorized_keys,
+        ssh_account_mode: body.ssh_account_mode,
+        ssh_port: body.ssh_port,
+        revision: agent.desired_config.revision + 1,
+        updated_by: Some(auth.user_id),
+        updated_at: Some(DateTime::now()),
+    };
+
+    // ONE call site records both arms. `decide` returning a Result rather than
+    // a bool is what makes "a new refusal that forgets to audit itself"
+    // unrepresentable — the same shape as `agent_ssh::dispatch`.
+    let verdict = decide(perms, &requested);
+    if let Err(e) = state
+        .config_audit
+        .record(
+            tid,
+            aid,
+            auth.user_id,
+            &requested,
+            verdict.as_ref().err().map(|r| r.wire()),
+        )
+        .await
+    {
+        // Best-effort, exactly like ssh_audit: an audit insert must never be
+        // what stops a legitimate config change.
+        tracing::warn!(%e, "config audit write failed");
+    }
+
+    if let Err(reason) = verdict {
+        return Err(ApiError::Forbidden(reason.message().to_string()));
+    }
+
+    let bson = bson::to_bson(&requested)
+        .map_err(|e| ApiError::Internal(format!("serialising desired_config: {e}")))?;
+    state
+        .agents
+        .base
+        .update_by_id(aid, doc! { "$set": { "desired_config": bson } })
+        .await?;
+
+    Ok(Json(DesiredConfigResponse {
+        revision: requested.revision,
+        desired: requested,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use permissions::*;
+
+    fn exec_req() -> DesiredConfig {
+        DesiredConfig {
+            exec_enabled: Some(true),
+            ..Default::default()
+        }
+    }
+    fn ssh_req() -> DesiredConfig {
+        DesiredConfig {
+            ssh_enabled: Some(true),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_non_device_admin_is_refused_before_anything_else() {
+        assert_eq!(
+            decide(DEFAULT_MEMBER, &exec_req()),
+            Err(ConfigDenyReason::NotDeviceAdmin)
+        );
+        // Even an empty request: managing a device's desired config at all is
+        // a MANAGE_AGENTS action.
+        assert_eq!(
+            decide(0, &DesiredConfig::default()),
+            Err(ConfigDenyReason::NotDeviceAdmin)
+        );
+    }
+
+    #[test]
+    fn manage_agents_alone_cannot_open_exec_or_ssh() {
+        // The whole point. `DEFAULT_ADMIN` carries MANAGE_AGENTS but neither
+        // grant bit — so a default admin may rename a device and may not open
+        // a root shell on it.
+        assert_eq!(
+            decide(DEFAULT_ADMIN, &exec_req()),
+            Err(ConfigDenyReason::CannotGrantExec)
+        );
+        assert_eq!(
+            decide(DEFAULT_ADMIN, &ssh_req()),
+            Err(ConfigDenyReason::CannotGrantSsh)
+        );
+    }
+
+    #[test]
+    fn holding_the_matching_grant_is_enough() {
+        decide(DEFAULT_ADMIN | EXEC_DEVICE, &exec_req()).unwrap();
+        decide(DEFAULT_ADMIN | SSH_DEVICE, &ssh_req()).unwrap();
+        decide(ADMINISTRATOR, &exec_req()).unwrap();
+        decide(ADMINISTRATOR, &ssh_req()).unwrap();
+    }
+
+    #[test]
+    fn the_grants_do_not_substitute_for_each_other() {
+        // EXEC_DEVICE and SSH_DEVICE are separate bits precisely because an
+        // SSH session is strictly more than a bounded command.
+        assert_eq!(
+            decide(DEFAULT_ADMIN | EXEC_DEVICE, &ssh_req()),
+            Err(ConfigDenyReason::CannotGrantSsh)
+        );
+        assert_eq!(
+            decide(DEFAULT_ADMIN | SSH_DEVICE, &exec_req()),
+            Err(ConfigDenyReason::CannotGrantExec)
+        );
+    }
+
+    #[test]
+    fn every_ssh_key_counts_as_granting_ssh() {
+        // Not just `ssh_enabled`: authorized keys decide WHO may connect and
+        // `ssh_account_mode` decides what a key-list session may RUN. Handing
+        // either out is granting SSH.
+        for req in [
+            DesiredConfig {
+                ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA…".into()]),
+                ..Default::default()
+            },
+            DesiredConfig {
+                ssh_account_mode: Some("daemon".into()),
+                ..Default::default()
+            },
+            DesiredConfig {
+                ssh_port: Some(2222),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                decide(DEFAULT_ADMIN, &req),
+                Err(ConfigDenyReason::CannotGrantSsh),
+                "{req:?} must require SSH_DEVICE"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untouched_surface_needs_only_manage_agents() {
+        // Clearing the form is a legitimate MANAGE_AGENTS action and must not
+        // demand grant bits the caller never uses.
+        decide(DEFAULT_ADMIN, &DesiredConfig::default()).unwrap();
+        assert!(DesiredConfig::default().is_empty());
+    }
+
+    #[test]
+    fn the_opt_in_is_not_expressible_here() {
+        // `DesiredConfig` has no `remote_config_enabled` field, so the server
+        // cannot ask for it. This test exists to fail loudly if someone adds
+        // one: serialising a request must never mention it.
+        let json = serde_json::to_string(&exec_req()).unwrap();
+        assert!(
+            !json.contains("remote_config"),
+            "the device opt-in must not be server-settable: {json}"
+        );
+    }
+}

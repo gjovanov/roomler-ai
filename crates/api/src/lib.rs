@@ -386,7 +386,13 @@ pub fn build_router(state: AppState) -> Router {
         // outcome the caller must read, not a transport failure.
         .route("/{agent_id}/ssh", post(routes::agent_ssh::request_session))
         // Gate 3's twin, and the same MANAGE_AGENTS-not-SSH_DEVICE split.
-        .route("/{agent_id}/ssh-policy", put(routes::agent_ssh::set_policy));
+        .route("/{agent_id}/ssh-policy", put(routes::agent_ssh::set_policy))
+        // Remote config — records an INTENT for the device to reconcile; the
+        // device may refuse it (docs/remote-config.md).
+        .route(
+            "/{agent_id}/desired-config",
+            put(routes::remote_config::set_desired_config),
+        );
 
     // Remote-control session routes (tenant-scoped)
     let remote_session_routes = Router::new()
