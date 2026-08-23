@@ -24,6 +24,59 @@ pub enum DaoError {
 
 pub type DaoResult<T> = Result<T, DaoError>;
 
+/// Which index a `DuplicateKey` actually collided on.
+///
+/// MongoDB's E11000 text names it — `…collection: db.users index: email_1 dup
+/// key: {…}` — and [`BaseDao::insert_one`] preserves that message verbatim.
+/// The information is therefore always present; what goes wrong is callers
+/// discarding it and then *asserting* a cause.
+///
+/// That is not hypothetical. `find_or_create_by_oauth` retried five times on
+/// the assumption that every duplicate was a username clash, and reported
+/// "Failed to generate unique username after retries" for a collision that was
+/// really on `email` — which is why a genuine account-takeover defect read as
+/// fixture noise for two sessions (#613). **A retry loop must confirm it is
+/// retrying the thing it can actually change.**
+///
+/// Returns `None` when the message carries no index name (older servers and
+/// some mongos paths phrase it differently); callers must treat `None` as
+/// "unknown", never as "not this index".
+pub fn duplicate_key_index(message: &str) -> Option<&str> {
+    let rest = message.split_once(" index: ")?.1;
+    let name = match rest.split_once(" dup key") {
+        Some((name, _)) => name,
+        None => rest.split_whitespace().next()?,
+    }
+    .trim();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Whether a `DuplicateKey` collided on `field`.
+///
+/// Reads the **dup key document** (`dup key: { email: "…" }`), not the index
+/// name. The name is ambiguous: Mongo builds it by joining `<key>_<direction>`
+/// pairs with `_`, and our own field names contain underscores, so
+/// `tenant_id_1_machine_id_1` cannot be split back into fields without
+/// guessing — and `email_verified_1` would match a naive search for "email".
+/// The dup-key document names the fields outright.
+///
+/// Conservative by construction: an unparseable message returns `false`, so a
+/// caller asking "is this MY field?" never gets a false yes and never retries
+/// a collision it cannot resolve.
+pub fn duplicate_key_is_on(message: &str, field: &str) -> bool {
+    let Some(doc) = message
+        .split_once(" dup key: {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(doc, _)| doc)
+    else {
+        return false;
+    };
+    doc.split(',').any(|pair| {
+        pair.split_once(':')
+            .is_some_and(|(key, _)| key.trim().trim_matches('"') == field)
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaginationParams {
     #[serde(default = "default_page")]
@@ -292,5 +345,71 @@ where
 
     pub async fn count(&self, filter: Document) -> DaoResult<u64> {
         Ok(self.collection.count_documents(filter).await?)
+    }
+}
+
+#[cfg(test)]
+mod duplicate_key_tests {
+    use super::*;
+
+    /// The exact string MongoDB 7 produces for a single-field unique index.
+    const EMAIL: &str = "E11000 duplicate key error collection: roomler.users \
+index: email_1 dup key: { email: \"victim@corp.example\" }";
+    const USERNAME: &str = "E11000 duplicate key error collection: roomler.users \
+index: username_1 dup key: { username: \"victim_a1b2c3\" }";
+    const COMPOUND: &str = "E11000 duplicate key error collection: roomler.agents \
+index: tenant_id_1_machine_id_1 dup key: { tenant_id: ObjectId('68a1'), machine_id: \"m-1\" }";
+
+    #[test]
+    fn names_the_index() {
+        assert_eq!(duplicate_key_index(EMAIL), Some("email_1"));
+        assert_eq!(
+            duplicate_key_index(COMPOUND),
+            Some("tenant_id_1_machine_id_1")
+        );
+        assert_eq!(duplicate_key_index("something else entirely"), None);
+    }
+
+    /// The regression that matters: an EMAIL collision must not read as a
+    /// username one. This is the check the retry loop was missing.
+    #[test]
+    fn an_email_collision_is_not_a_username_collision() {
+        assert!(duplicate_key_is_on(EMAIL, "email"));
+        assert!(
+            !duplicate_key_is_on(EMAIL, "username"),
+            "retrying this would burn attempts and then blame the wrong field"
+        );
+        assert!(duplicate_key_is_on(USERNAME, "username"));
+        assert!(!duplicate_key_is_on(USERNAME, "email"));
+    }
+
+    #[test]
+    fn compound_indexes_name_every_field() {
+        assert!(duplicate_key_is_on(COMPOUND, "tenant_id"));
+        assert!(duplicate_key_is_on(COMPOUND, "machine_id"));
+        assert!(!duplicate_key_is_on(COMPOUND, "username"));
+    }
+
+    /// ⚠️ Reading the index NAME instead of the dup-key document would answer
+    /// yes here, because `email_verified_1` contains "email". Underscores are
+    /// legal in our field names, so the name cannot be split back into fields.
+    #[test]
+    fn a_field_that_merely_prefixes_another_does_not_match() {
+        let msg = "E11000 duplicate key error collection: roomler.users \
+index: email_verified_1 dup key: { email_verified: true }";
+        assert!(duplicate_key_is_on(msg, "email_verified"));
+        assert!(!duplicate_key_is_on(msg, "email"));
+    }
+
+    /// Unknown must never read as "not my field" — a caller that retries on
+    /// `false` would loop forever on an unparseable message, so `false` here
+    /// has to mean "don't retry", which is what the callers do.
+    #[test]
+    fn an_unparseable_message_is_conservative() {
+        assert!(!duplicate_key_is_on(
+            "E11000 duplicate key error",
+            "username"
+        ));
+        assert!(!duplicate_key_is_on("", "username"));
     }
 }
