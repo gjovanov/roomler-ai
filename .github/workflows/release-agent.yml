@@ -1792,6 +1792,29 @@ jobs:
           </plist>
           PLIST
 
+          # SEAL THE BUNDLE LAST — after every file is in place.
+          #
+          # The per-file signing above is what lets the binary exec for the
+          # self-containment check, but signing a bundle's MAIN EXECUTABLE makes
+          # codesign seal the whole BUNDLE: it writes
+          # Contents/_CodeSignature/CodeResources covering the files present at
+          # that moment. Both plists and Info.plist are written afterwards, so
+          # that seal was false the instant it was created.
+          #
+          # rc.453 and rc.454 shipped exactly that; rc.452, which predates the
+          # ad-hoc signing, carries no _CodeSignature at all and installed
+          # cleanly on a real Mac. Re-sealing after the last write is the fix,
+          # and it is what the Developer ID path below already does by running
+          # last.
+          codesign --force --sign - "$APP"
+          # A seal that does not match its contents is exactly the bug above, so
+          # assert rather than assume. `--strict` makes codesign check the
+          # sealed resources instead of only the signature's own integrity.
+          codesign --verify --strict --verbose=2 "$APP" || {
+            echo "::error::the .app's signature does not match its contents"
+            exit 1
+          }
+
       - name: Import signing certs
         if: steps.apple.outputs.mode == 'full'
         run: |
