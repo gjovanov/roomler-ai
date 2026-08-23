@@ -1,0 +1,74 @@
+diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/quartz.rs
+--- upstream/src/common/quartz.rs	2018-01-03 06:28:23.000000000 +0100
++++ vendored/src/common/quartz.rs	2026-08-23 21:12:25.528485571 +0200
+@@ -66,6 +66,17 @@
+     PhantomData<&'a [u8]>
+ );
+ 
++impl<'a> Frame<'a> {
++    /// ROOMLER PATCH: the surface's true row pitch, in bytes.
++    ///
++    /// `Deref`'s slice is `IOSurfaceGetAllocSize` bytes long (page-rounded),
++    /// so `len() / height` is NOT the stride. Callers that walk rows must use
++    /// this instead.
++    pub fn bytes_per_row(&self) -> usize {
++        self.0.bytes_per_row()
++    }
++}
++
+ impl<'a> ops::Deref for Frame<'a> {
+     type Target = [u8];
+     fn deref(&self) -> &[u8] {
+diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi.rs
+--- upstream/src/quartz/ffi.rs	2018-01-03 06:28:23.000000000 +0100
++++ vendored/src/quartz/ffi.rs	2026-08-23 21:12:25.488486093 +0200
+@@ -174,6 +174,12 @@
+     // IOSurface
+ 
+     pub fn IOSurfaceGetAllocSize(buffer: IOSurfaceRef) -> usize;
++    // ROOMLER PATCH: the surface's true row pitch. Upstream binds only
++    // GetAllocSize, which is the page-rounded TOTAL allocation — a consumer
++    // that divides it by the height to recover a stride gets a number that is
++    // too large and usually not even a multiple of 4. There is no other way
++    // to learn the pitch through this crate's API.
++    pub fn IOSurfaceGetBytesPerRow(buffer: IOSurfaceRef) -> usize;
+     pub fn IOSurfaceGetBaseAddress(buffer: IOSurfaceRef) -> *mut c_void;
+     pub fn IOSurfaceIncrementUseCount(buffer: IOSurfaceRef);
+     pub fn IOSurfaceDecrementUseCount(buffer: IOSurfaceRef);
+diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/frame.rs
+--- upstream/src/quartz/frame.rs	2018-01-03 06:28:23.000000000 +0100
++++ vendored/src/quartz/frame.rs	2026-08-23 21:12:25.496485989 +0200
+@@ -3,7 +3,9 @@
+ 
+ pub struct Frame {
+     surface: IOSurfaceRef,
+-    inner: &'static [u8]
++    inner: &'static [u8],
++    // ROOMLER PATCH: see `bytes_per_row` below.
++    bytes_per_row: usize
+ }
+ 
+ impl Frame {
+@@ -22,7 +24,21 @@
+             IOSurfaceGetAllocSize(surface)
+         );
+ 
+-        Frame { surface, inner }
++        let bytes_per_row = IOSurfaceGetBytesPerRow(surface);
++
++        Frame { surface, inner, bytes_per_row }
++    }
++
++    /// ROOMLER PATCH: bytes between the starts of two consecutive rows.
++    ///
++    /// This is NOT derivable from the slice: `len()` is
++    /// `IOSurfaceGetAllocSize`, the page-rounded total allocation, so
++    /// `len() / height` overshoots the real pitch (and is usually not a
++    /// multiple of the pixel size). Reading rows at that spacing shears the
++    /// image progressively — which is what a consumer forced to guess ends up
++    /// doing, because upstream exposes no accessor for the real value.
++    pub fn bytes_per_row(&self) -> usize {
++        self.bytes_per_row
+     }
+ }
+ 
