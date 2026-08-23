@@ -255,6 +255,40 @@ pub fn detect_in_process() -> AgentCaps {
 /// behind a `#[cfg]` (mf-encoder / ffmpeg-encoder / vp9-444); a default-feature
 /// build probes nothing and legitimately never reads it.
 #[allow(unused_variables)]
+/// Whether the OS will let this process capture the screen.
+///
+/// macOS is the only platform with a gate, and it is a silent one:
+/// `CGDisplayStream` opens successfully without the Screen Recording grant
+/// and delivers wallpaper-only frames forever. Probed rather than assumed so
+/// the server can be told the truth. Cheap — a preflight call, no prompt.
+fn capture_permission_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::tcc::screen_recording_granted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Whether the OS will let this process inject input.
+///
+/// Same shape as [`capture_permission_granted`]: macOS drops every
+/// `CGEventPost` on the floor without the Accessibility grant and reports
+/// success. Uses the TCC probe directly rather than constructing an injector,
+/// which is lazy by design (first injected event) and has side effects.
+fn input_permission_granted() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::tcc::accessibility_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 fn compute_caps(run_hw_probes: bool) -> AgentCaps {
     // `mut` is only consumed inside the cfg-gated push blocks below
     // (openh264-encoder / mf-encoder). Default-feature builds skip
@@ -652,10 +686,26 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
         Vec::new()
     };
 
+    // What the OS has actually granted, not what we were compiled with.
+    // See `AgentCaps::permissions`: `None` (a pre-rc.454 agent) and
+    // `Some([])` mean opposite things, so this is always `Some` here.
+    let mut permissions: Vec<String> = Vec::new();
+    if capture_permission_granted() {
+        permissions.push("screen-capture".into());
+    }
+    if input_permission_granted() {
+        permissions.push("input".into());
+    }
+
     AgentCaps {
         hw_encoders,
         codecs,
-        has_input_permission: cfg!(feature = "enigo-input"),
+        // Was `cfg!(feature = "enigo-input")` — a COMPILE-TIME constant, so a
+        // Mac with Accessibility denied still advertised working input while
+        // silently dropping every event. The feature must be compiled in AND
+        // the OS must have granted it.
+        has_input_permission: cfg!(feature = "enigo-input") && input_permission_granted(),
+        permissions: Some(permissions),
         supports_clipboard: cfg!(feature = "clipboard"),
         supports_file_transfer: true,
         max_simultaneous_sessions: rc_max_sessions(),
@@ -901,6 +951,53 @@ mod tests {
     /// cannot be trusted still produces usable caps, and never claims a codec
     /// it has no evidence for.
     ///
+    /// Permissions are always REPORTED, even when everything is granted.
+    ///
+    /// `None` means "this agent is too old to know", and a server or UI must
+    /// be able to tell that apart from "this agent holds nothing" — so a
+    /// current agent must never send `None`. The list itself is
+    /// platform-dependent (only macOS actually gates these), which is why this
+    /// asserts the reporting contract rather than the contents.
+    #[test]
+    fn caps_always_report_permission_state() {
+        let caps = compute_caps(false);
+        let perms = caps
+            .permissions
+            .expect("a current agent must report permissions, so None can keep meaning 'unknown'");
+        for p in &perms {
+            assert!(
+                matches!(p.as_str(), "screen-capture" | "input"),
+                "unrecognised permission {p:?} — readers skip unknown values, so a typo \
+                 here silently reads as 'not granted'"
+            );
+        }
+        // Platforms with no permission model must not look muzzled.
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            perms,
+            vec!["screen-capture".to_string(), "input".to_string()],
+            "a platform that does not gate these must report both granted"
+        );
+    }
+
+    /// `has_input_permission` must track the OS, not the build.
+    ///
+    /// It was `cfg!(feature = "enigo-input")` — a compile-time constant — so a
+    /// Mac with Accessibility denied advertised working input while silently
+    /// dropping every event. Without the feature it must stay false regardless.
+    #[test]
+    fn input_permission_is_not_merely_a_compile_flag() {
+        let caps = compute_caps(false);
+        if !cfg!(feature = "enigo-input") {
+            assert!(!caps.has_input_permission);
+        }
+        assert_eq!(
+            caps.has_input_permission,
+            cfg!(feature = "enigo-input") && input_permission_granted(),
+            "the advertised bool must agree with the runtime probe"
+        );
+    }
+
     /// `compute_caps(false)` is exactly what `detect()` falls back to when the
     /// probe child dies, so this is the shape a driver fault now yields —
     /// where before it yielded a crash-looping daemon.
