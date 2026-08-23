@@ -1186,6 +1186,35 @@ pub enum ServerMsg {
         pin: Option<String>,
     },
 
+    /// The device config an operator has asked for, for the agent to
+    /// reconcile against its own (`docs/remote-config.md`).
+    ///
+    /// A REQUEST, not an instruction. Three independent things can make the
+    /// agent decline it, and all three are the point rather than edge cases:
+    /// the device may not have opted in (`remote_config_enabled`, default
+    /// off), the frame may have arrived on a SECONDARY org's WS (these keys
+    /// are machine-wide, so only the primary enrollment may drive them —
+    /// the same rule `UpdateNow` applies to the machine-wide updater), and a
+    /// device is always free to be running an older build.
+    ///
+    /// ⚠️ Unlike `Goodbye`/`UpdateNow`, the server must NOT send this
+    /// blind. Those are fire-and-forget, so a pre-feature agent dropping the
+    /// unknown tag in its `Err(e) => debug!` branch costs nothing. Here the
+    /// dashboard is showing an operator that a change is pending, so a
+    /// silently-evaporated frame becomes a lie on a screen. Gate on
+    /// [`RpcCap::Config`] and surface "device too old" instead.
+    ///
+    /// [`RpcCap::Config`]: crate::models::RpcCap::Config
+    #[serde(rename = "rc:agent.config")]
+    ConfigPush {
+        /// The `desired_config.revision` this frame carries. The agent echoes
+        /// it back once applied, which is what lets the UI tell "refused" from
+        /// "never heard" — two states that otherwise look identical.
+        revision: u64,
+        /// Only the keys under management; absent keys mean "leave alone".
+        desired: crate::models::DesiredConfig,
+    },
+
     /// Multi-org — join an ADDITIONAL org from the admin UI ("Add to another
     /// organization"), so a device that can't be reached for a hands-on
     /// `roomler enroll` still gets a second enrollment.

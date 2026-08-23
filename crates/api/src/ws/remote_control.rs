@@ -139,6 +139,8 @@ pub async fn handle_agent_socket(
     // deserializer would error on the unknown variant otherwise) and only
     // when regions are actually configured+enabled.
     let mut device_name = machine_name.clone();
+    // Remote config — read off the row we are already fetching, pushed below.
+    let mut desired_config = None;
     if let Ok(row) = state.agents.find_in_tenant(tenant_id, agent_id).await {
         // Prefs = the persisted probe table ordered by RTT (nearest first) —
         // the load-aware fallback ladder until a fresh report replaces it.
@@ -148,6 +150,9 @@ pub async fn handle_agent_socket(
             .set_agent_relay_home(agent_id, row.relay_home.clone(), prefs);
         // The row name wins over the hello machine_name — admins rename devices.
         device_name = row.name;
+        if !row.desired_config.is_empty() {
+            desired_config = Some(row.desired_config);
+        }
     }
     // P4 — announce the online transition (`agents.last_presence` ledger
     // CAS: a reconnect that was already broadcast as online stays silent).
@@ -161,6 +166,30 @@ pub async fn handle_agent_socket(
     .await;
     if supports_relay_regions && let Some((regions, rev)) = relay_regions_wire(&state.turn_map) {
         let _ = registered_tx.try_send(ServerMsg::RelayRegions { regions, rev });
+    }
+
+    // Remote config (docs/remote-config.md) — RECONCILE-ON-CONNECT is the only
+    // delivery path, deliberately: a device that was offline for a week and one
+    // that was online when an admin hit save converge through the same code,
+    // so the offline case is exercised on every connect rather than only when
+    // nobody is watching.
+    if let Some(desired) = desired_config {
+        if caps.has_rpc(RpcCap::Config) {
+            let _ = registered_tx.try_send(ServerMsg::ConfigPush {
+                revision: desired.revision,
+                desired,
+            });
+        } else {
+            // Unlike `Goodbye`/`UpdateNow`, this one must not be sent blind.
+            // A pre-feature agent drops the unknown tag in its `debug!` branch
+            // and the admin is left looking at a pending change that quietly
+            // evaporated — so say so here instead.
+            info!(
+                %agent_id, %device_name, revision = desired.revision,
+                "desired config not pushed — this device's agent predates \
+                 rc:agent.config; update it or apply the config locally"
+            );
+        }
     }
 
     // Phase A-1 — mirror the registration into the cross-pod presence
