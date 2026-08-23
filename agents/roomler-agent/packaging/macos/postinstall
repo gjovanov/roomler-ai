@@ -12,6 +12,27 @@
 set -euo pipefail
 
 CONSOLE_USER=$(stat -f "%Su" /dev/console)
+
+# No GUI session — installed over SSH, at the login window, or on a runner.
+# There is no `gui/<uid>` domain to bootstrap into, and `root` has no Aqua
+# domain either.
+#
+# This must NOT fail the install. The payload is already on disk by the time
+# scripts run, so aborting here leaves a HALF-APPLIED install reported as a
+# failure ("An error occurred while running scripts") with nothing saying why —
+# which is what `set -euo pipefail` plus an unguarded `bootstrap` used to do.
+# The plist cannot be placed without a home directory to place it in, so the
+# honest outcome is: payload installed, autostart deferred to the next login,
+# said plainly.
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
+  echo "roomler-agent: payload installed, but NO GUI session is logged in"
+  echo "  (console user is '${CONSOLE_USER:-unknown}'), so the LaunchAgent was"
+  echo "  not registered. Log in on this Mac and re-run the installer, or:"
+  echo "    sudo installer -pkg <the .pkg> -target /"
+  echo "  Screen capture and input need a login session and cannot run without one."
+  exit 0
+fi
+
 CONSOLE_UID=$(id -u "$CONSOLE_USER")
 CONSOLE_HOME=$(dscl . -read /Users/"$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')
 
@@ -26,10 +47,21 @@ chmod 644 "$PLIST_TARGET"
 
 # Load the agent into the user's launchd domain. `bootstrap` is idempotent
 # only if the agent isn't already loaded; we unload first to handle upgrades.
+#
+# A failure here is reported, not fatal: the plist is in ~/Library/LaunchAgents,
+# so launchd starts it at the next login regardless. Trading a working install
+# for a launchctl edge case (a session that exists but will not accept a
+# bootstrap) is the wrong way round.
 launchctl bootout "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null || true
-launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST_TARGET"
+if launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST_TARGET" 2>/tmp/roomler-bootstrap.err; then
+  echo "roomler-agent installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
+else
+  echo "roomler-agent installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
+  echo "  bootstrap failed: $(cat /tmp/roomler-bootstrap.err 2>/dev/null)"
+  echo "  The plist is in place, so it will start at the next login."
+fi
+rm -f /tmp/roomler-bootstrap.err
 
-echo "roomler-agent installed for user $CONSOLE_USER (uid=$CONSOLE_UID)"
 echo "Grant Screen Recording + Accessibility permissions in System Settings, then:"
 echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
 
