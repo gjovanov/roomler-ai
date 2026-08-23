@@ -86,9 +86,15 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // deliberate act by whoever holds the box, never a side effect of
         // joining an org.
         exec_enabled: false,
+        // Same rule, one level up: accepting PUSHED config is the opt-in that
+        // makes the two flags above refusable by a compromised control plane
+        // (`docs/remote-config.md`). Joining an org must never turn it on —
+        // that would let enrollment itself hand the server the local veto.
+        remote_config_enabled: false,
         // Same rule for SSH, which grants strictly more than a bounded command.
-        // `preserve_operator_config` keeps both across a RE-enrollment (they sit
-        // in the `..existing` tail), so a device that opted in stays opted in.
+        // `preserve_operator_config` keeps all three across a RE-enrollment
+        // (they sit in the `..existing` tail), so a device that opted in stays
+        // opted in.
         ssh_enabled: false,
         ssh_port: None,
         ssh_authorized_keys: Vec::new(),
@@ -533,6 +539,16 @@ mod tests {
         fresh.config_schema_version = Some("9".into());
 
         let merged = preserve_operator_config(fresh, existing);
+
+        // The remote-config opt-in rides the `..existing` tail, and BOTH
+        // directions matter: a device that opted in must not silently opt out
+        // when it re-enrolls, and — the security-relevant half — re-enrolling
+        // must never be a way to opt a device IN. `existing` was left at the
+        // fixture default (off) above, so this also pins the default.
+        assert!(
+            !merged.remote_config_enabled,
+            "re-enrollment must not opt a device into accepting pushed config"
+        );
 
         // Identity comes from the fresh enrollment…
         assert_eq!(merged.server_url, "https://roomler.ai");
