@@ -84,8 +84,11 @@ pub mod ssh_origin;
 pub mod subnet_detect;
 #[cfg(feature = "system-context")]
 pub mod system_context;
+/// Re-export, not a module: the TCC probes live in `agent-core` so the desktop
+/// companion can use them without depending on the agent (P3e lever E). Every
+/// `crate::tcc::…` call site here is unchanged.
 #[cfg(target_os = "macos")]
-pub mod tcc;
+pub use roomler_agent_core::tcc;
 pub mod telemetry;
 pub mod tunnel;
 pub mod updater;

@@ -29,3 +29,10 @@ pub mod logging;
 pub mod logs_upload;
 pub mod machine;
 pub mod notify;
+/// macOS privacy-permission probes. Here rather than in `roomler-agent`
+/// because the desktop companion needs them too and deliberately does NOT
+/// depend on the agent (P3e lever E) — the whole point of that split is that
+/// the tray links no transport crates. Re-exported by `roomler-agent` under
+/// `crate::tcc`, so existing call sites are unchanged.
+#[cfg(target_os = "macos")]
+pub mod tcc;
