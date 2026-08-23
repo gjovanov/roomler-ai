@@ -34,13 +34,18 @@ pub struct TestApp {
 ///
 /// Every test builds its OWN `Client` against its OWN database, and the
 /// driver's default pool is 10 connections — so a full suite run can ask one
-/// mongod for a couple of thousand sockets. The build host absorbs that; a
-/// 2-core CI runner does not. The CI lane saw it twice: once as mid-suite
-/// `Connection refused` (26 tests failing on one process going away), then as
-/// mongod exiting 14 with a backtrace on `conn1333`.
+/// mongod for a couple of thousand sockets, each of which is a file
+/// descriptor on the server.
 ///
-/// A test needs ~1 connection at a time, so 2 is generous. This shortens the
-/// local suite too — the pools were never doing anything for us.
+/// ⚠️ This is a contributing factor, NOT the cause of the CI failures that
+/// prompted it. I inferred "conn1333 in the crash log ⇒ too many connections"
+/// and capped the pool; the next run failed identically, and a wider log grep
+/// gave the real answer — `EMFILE`, from WiredTiger holding files open per
+/// collection and index across ~289 per-test databases. The fix is the
+/// `--ulimit nofile` in `.github/workflows/integration-tests.yml`.
+///
+/// The cap stays because it is genuinely free: a test needs ~1 connection at
+/// a time, so 2 is generous, and fewer sockets is fewer descriptors.
 fn cap_pool(opts: &mut ClientOptions) {
     opts.max_pool_size = Some(2);
     opts.min_pool_size = Some(0);
