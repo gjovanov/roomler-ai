@@ -282,6 +282,19 @@ pub async fn authorize(
         }
     }
 
+    // Ceiling, enforced LAST so a refusal is attributable to an identity that
+    // already passed the gates (and is audited by `dispatch`) rather than an
+    // anonymous throttle. This is the one place both the HTTP route and the
+    // device's `rc:rpc.request` leg pass through — the WS leg never touches
+    // the per-IP HTTP governor, so without this it had no ceiling at all.
+    if !state.exec_rate_limiter.check(
+        caller.user_id,
+        agent.id.unwrap_or_default(),
+        exec_limits::RATE_LIMIT_PER_MINUTE,
+    ) {
+        return Err(ExecDenyReason::RateLimited);
+    }
+
     Ok(())
 }
 

@@ -195,7 +195,7 @@ pub async fn join_org(
             // shared mux. Restarting only the secondary would send it to
             // `SystemTun::up` on an adapter whose Wintun session the primary
             // still holds, and Wintun refuses a second session on one
-            // adapter — field 2026-08-07 on CORPLAP-1:
+            // adapter — field 2026-08-07 on WINHOST-A:
             // `WintunStartSession failed "Failed to register rings"`, the
             // secondary's overlay aborting on every reconnect while the
             // primary stayed happily single-org.
@@ -413,7 +413,7 @@ mod tests {
         assert!(!no_flag.for_org(&org).overlay_enabled, "flag is required");
     }
 
-    /// Field 2026-08-07 (CORPLAP-1): turning `overlay_multi_org` ON must NOT
+    /// Field 2026-08-07 (WINHOST-A): turning `overlay_multi_org` ON must NOT
     /// live-restart the org loop. The flag decides who owns the host's TUN —
     /// without it the PRIMARY holds a plain `SystemTun`, and a secondary
     /// restarted into the mux calls `SystemTun::up` on an adapter whose

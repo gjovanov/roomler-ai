@@ -572,7 +572,7 @@ maintainer-scripts = "packaging/linux/debian"
 #   dpkg: trying to overwrite '/usr/bin/roomler', which is also in package
 #         roomler-tunnel 0.3.0~rc.205-1
 #
-# Field-caught on jupiter, 2026-08-06 — rc.312 would not install anywhere the
+# Field-caught on fleet-host-1, 2026-08-06 — rc.312 would not install anywhere the
 # old tunnel package was present, which is exactly the set of hosts carrying
 # the stale CLI this change exists to fix.
 #
@@ -592,7 +592,7 @@ assets = [
     #
     # History that shapes this entry: `roomler` was MISSING from this list, so
     # every .deb upgrade replaced the daemon and left whatever CLI the host
-    # happened to have. Field-caught 2026-08-06: zeus and mars ran a rc.205
+    # happened to have. Field-caught 2026-08-06: fleet-host-2 and buildhost ran a rc.205
     # CLI from Jul 22 against an rc.311 daemon — `roomler config set` did not
     # exist and `roomler peers --json` silently misrendered newer fields. The
     # shim RETIRES that failure class structurally: the command surface lives

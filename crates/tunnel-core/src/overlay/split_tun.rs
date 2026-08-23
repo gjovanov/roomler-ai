@@ -7,10 +7,10 @@
 //! `<self overlay ip>:<port>`. The obvious implementation — bind a listener on
 //! that address — fails on most of the fleet, as the 2026-08-19 survey showed:
 //!
-//! * `mars` / `zeus` / `jupiter` run `sshd` on `0.0.0.0:22`, which *covers* the
+//! * `buildhost` / `fleet-host-2` / `fleet-host-1` run `sshd` on `0.0.0.0:22`, which *covers* the
 //!   overlay address. A second bind is impossible.
-//! * `neo16` runs `sshd` bound to `100.65.4.2:22` — the overlay address itself.
-//! * `CORPLAP-3` has no `sshd` at all (the OpenSSH capability is `NotPresent`
+//! * `devbox` runs `sshd` bound to `100.65.4.2:22` — the overlay address itself.
+//! * `corplap-3` has no `sshd` at all (the OpenSSH capability is `NotPresent`
 //!   and corp policy owns the box) AND its loopback `:22` is held by WSL's
 //!   `wslrelay`. It also runs with all three firewall profiles enabled, so a new
 //!   listener would need a rule an unprivileged corp user cannot add.
@@ -327,8 +327,8 @@ impl TunIo for SplitTun {
 }
 
 /// Warn when an OS daemon already answers on the address+port we are about to
-/// take over, so flipping `ssh_enabled` on `neo16` (sshd bound to the overlay
-/// IP) or `mars` (sshd on `0.0.0.0:22`) is a logged decision rather than a
+/// take over, so flipping `ssh_enabled` on `devbox` (sshd bound to the overlay
+/// IP) or `buildhost` (sshd on `0.0.0.0:22`) is a logged decision rather than a
 /// silent change of who serves SSH.
 ///
 /// Best-effort and non-fatal: a bind probe that fails for any other reason must

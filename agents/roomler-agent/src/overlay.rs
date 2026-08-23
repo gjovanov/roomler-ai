@@ -920,7 +920,7 @@ mod ifname_tests {
     use super::per_org_ifname;
 
     /// The per-org adapter name must never exceed Linux's 15-char IFNAMSIZ
-    /// limit — the bug the zeus canary caught: `roomler0-<7hex>` = 16.
+    /// limit — the bug the fleet-host-2 canary caught: `roomler0-<7hex>` = 16.
     #[test]
     fn per_org_ifname_fits_ifnamsiz_on_every_platform() {
         let tenant = "6a712a572ceed780ac1ccbce";

@@ -113,7 +113,14 @@ async function handleLogin() {
     if (pendingInvite) {
       sessionStorage.removeItem('pending_invite_code')
       router.push({ name: 'invite', params: { code: pendingInvite } })
-    } else if (pendingRedirect && pendingRedirect.startsWith('/')) {
+    } else if (
+      // Same-origin paths ONLY: `startsWith('/')` alone also admits the
+      // protocol-relative `//evil.com` / `/\evil.com` open-redirect forms.
+      pendingRedirect &&
+      pendingRedirect.startsWith('/') &&
+      !pendingRedirect.startsWith('//') &&
+      !pendingRedirect.startsWith('/\\')
+    ) {
       sessionStorage.removeItem('pending_redirect')
       router.push(pendingRedirect)
     } else {

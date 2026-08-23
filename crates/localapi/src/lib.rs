@@ -411,7 +411,7 @@ pub struct PeerInfo {
 }
 
 /// rc.276 — per-carrier forensic fields (see [`PeerInfo::debug`]). Built for
-/// the CORPLAP-1-class corp-VPN investigations: two `peers --json` snapshots
+/// the winhost-a-class corp-VPN investigations: two `peers --json` snapshots
 /// 30 s apart show exactly which carriers move which counters, which flows
 /// were initiated by whom, and whether the WG session ever completed —
 /// one-shot field captures instead of multi-session log archaeology.
@@ -721,7 +721,7 @@ pub enum Request {
     /// device must also carry `ExecPolicy::can_originate` server-side.
     /// Returns [`Response::ExecResult`].
     ExecRemote {
-        /// Target device: a name (e.g. `CORPLAP-1`) or a hex agent id.
+        /// Target device: a name (e.g. `winhost-a`) or a hex agent id.
         node: String,
         /// `pwsh` | `powershell` | `cmd` | `bash` | `sh`; empty ⇒ host default.
         #[serde(default)]
@@ -745,7 +745,7 @@ pub enum Request {
     ///
     /// Returns [`Response::SshSession`].
     SshSession {
-        /// Target device: a name (e.g. `CORPLAP-1`) or a hex agent id.
+        /// Target device: a name (e.g. `winhost-a`) or a hex agent id.
         node: String,
         /// OpenSSH public key of the caller's EPHEMERAL, single-session
         /// keypair (`ssh-ed25519 AAAA… comment`).
@@ -1981,7 +1981,7 @@ mod tests {
         fn status(&self) -> NodeStatus {
             NodeStatus {
                 node_id: "n1".into(),
-                name: "neo16".into(),
+                name: "devbox".into(),
                 version: "0.3.0-rc.154".into(),
                 mode: DaemonMode::Service,
                 tenant_id: Some("t1".into()),
@@ -2004,7 +2004,7 @@ mod tests {
             vec![
                 PeerInfo {
                     node_id: "n2".into(),
-                    name: "CORPLAP-1".into(),
+                    name: "winhost-a".into(),
                     org: String::new(),
                     overlay_ip: Some("100.64.0.1".into()),
                     overlay_ip6: None,
@@ -2050,7 +2050,7 @@ mod tests {
                 kind: FlowKind::Socks5,
                 local_addr: "127.0.0.1:1080".into(),
                 target: None,
-                node: Some("CORPLAP-1".into()),
+                node: Some("winhost-a".into()),
                 transport: "quic-v1".into(),
                 active_flows: 2,
                 bytes_in: 4096,
@@ -2418,7 +2418,7 @@ mod tests {
 
         // Wire shape — locks the discriminators the CLI + desktop depend on.
         let route = RouteDescriptor {
-            id: "pg-mars".into(),
+            id: "pg-buildhost".into(),
             kind: FlowKind::Forward,
             node: "aabbcc".into(),
             local: 15432,
@@ -2432,22 +2432,22 @@ mod tests {
                 route: route.clone()
             })
             .unwrap(),
-            r#"{"t":"route_add","d":{"route":{"id":"pg-mars","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
+            r#"{"t":"route_add","d":{"route":{"id":"pg-buildhost","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
         );
         assert_eq!(
             serde_json::to_string(&Request::RouteSetEnabled {
-                id: "pg-mars".into(),
+                id: "pg-buildhost".into(),
                 enabled: false,
             })
             .unwrap(),
-            r#"{"t":"route_set_enabled","d":{"id":"pg-mars","enabled":false}}"#
+            r#"{"t":"route_set_enabled","d":{"id":"pg-buildhost","enabled":false}}"#
         );
         assert_eq!(
             serde_json::to_string(&Response::RouteAdded {
                 route: route.clone()
             })
             .unwrap(),
-            r#"{"t":"route_added","d":{"route":{"id":"pg-mars","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
+            r#"{"t":"route_added","d":{"route":{"id":"pg-buildhost","kind":"forward","node":"aabbcc","local":15432,"remote":"db:5432","transport":"auto","enabled":true}}}"#
         );
         let info = RouteInfo {
             route,
@@ -2634,7 +2634,7 @@ mod tests {
         let mut client = client.expect("connect to the LocalAPI pipe");
 
         let status = client.status().await.unwrap();
-        assert_eq!(status.name, "neo16");
+        assert_eq!(status.name, "devbox");
         assert!(status.connected);
         let peers = client.peers().await.unwrap();
         assert_eq!(peers.len(), 2);
@@ -2704,7 +2704,7 @@ mod tests {
         let mut client = connect_unix_at(path.clone())
             .await
             .expect("connect to the LocalAPI socket");
-        assert_eq!(client.status().await.unwrap().name, "neo16");
+        assert_eq!(client.status().await.unwrap().name, "devbox");
         assert_eq!(client.peers().await.unwrap().len(), 2);
 
         // The control socket must be private to the owner.

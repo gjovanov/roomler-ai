@@ -155,7 +155,7 @@ pub(crate) fn shared_secret(secret: &StaticSecret, peer_public: &PublicKey) -> [
 // discarding everything that was not an Answer. It has been DELETED rather
 // than kept for convenience: the device-demux seam switched on it, so every
 // PONG that arrived there was silently dropped, and any path served by that
-// socket measured `loss=100%` while carrying WG data perfectly (zeus→jupiter
+// socket measured `loss=100%` while carrying WG data perfectly (fleet-host-2→fleet-host-1
 // on grox, 0 % by ping, 2026-08-12). A helper that answers half the protocol
 // is a trap for the next seam; with it gone, a caller must handle the whole
 // [`Verdict`] and the two seams cannot drift apart again.
@@ -322,7 +322,7 @@ pub(crate) struct PathStats {
     pub rtt_ms: Option<f64>,
     /// W6 — the last [`LOSS_WINDOW`] raw RTT samples, oldest first. The
     /// EWMA above hides spikes by design; judging "large ping variability"
-    /// (field 2026-08-14: CORPLAP-1→zeus 42 ms baseline, 374 ms spikes on a
+    /// (field 2026-08-14: winhost-a→fleet-host-2 42 ms baseline, 374 ms spikes on a
     /// TCP relay) needs the tail of the distribution, not the mean.
     recent_rtts: std::collections::VecDeque<f64>,
     /// The nonce of the round currently outstanding, if any.
@@ -515,7 +515,7 @@ impl Prober {
     /// `label` names the peer behind a path — pass the overlay IP. Without it
     /// the digest is endpoint-only, and attributing a loss figure to a named
     /// host means reverse-engineering public IPs by hand (2026-08-12: working
-    /// out which of four Hetzner addresses was mars took longer than reading
+    /// out which of four Hetzner addresses was buildhost took longer than reading
     /// the number). The overlay IP also discriminates the ORG for free, since
     /// each org engine logs its own line with no other marker: `100.65.4.x`
     /// is one org's block, `100.65.0.x` the other's.
@@ -572,8 +572,8 @@ impl Prober {
     /// reading forever, and the digest reports a dead endpoint that nothing
     /// is probing as though it were a live lossy path.
     ///
-    /// Field 2026-08-12: zeus reported `100.65.0.5@37.63.112.129:62349
-    /// loss=47%` for 25 minutes after CORPLAP-1 had rebound to `:59669` —
+    /// Field 2026-08-12: fleet-host-2 reported `100.65.0.5@37.63.112.129:62349
+    /// loss=47%` for 25 minutes after winhost-a had rebound to `:59669` —
     /// indistinguishable, in the digest, from a genuinely failing carrier.
     /// `forget` only covers peers that LEFT the mesh; this covers a peer that
     /// stayed and moved.
@@ -777,7 +777,7 @@ mod tests {
     /// The device demux used to switch on a ping-only `respond()` helper, so
     /// every PONG that landed on that socket was dropped: the peer answered,
     /// the reply arrived, the prober never saw it, and a healthy carrier read
-    /// `loss=100%` (zeus→jupiter on grox, 0 % by ping, 2026-08-12). The helper
+    /// `loss=100%` (fleet-host-2→fleet-host-1 on grox, 0 % by ping, 2026-08-12). The helper
     /// is gone; this pins what replaced it — ONE entry point that surfaces a
     /// ping and a pong distinguishably, so a seam cannot silently serve half.
     #[test]
@@ -820,7 +820,7 @@ mod tests {
     /// A carrier that MOVES must not leave its old endpoint in the table
     /// reading as a live lossy path.
     ///
-    /// Field 2026-08-12: CORPLAP-1 rebound from `:62349` to `:59669`; zeus kept
+    /// Field 2026-08-12: winhost-a rebound from `:62349` to `:59669`; fleet-host-2 kept
     /// reporting `100.65.0.5@…:62349 loss=47%` for 25 minutes afterwards.
     /// `forget` only prunes peers that LEFT the mesh — a peer that stays and
     /// moves accumulates a permanent dead row, which is indistinguishable in

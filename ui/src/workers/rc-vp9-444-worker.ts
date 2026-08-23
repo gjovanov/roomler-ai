@@ -156,7 +156,7 @@ function requestKeyframeResync(): void {
   workerScope.postMessage({ type: 'request-keyframe' })
 }
 
-// 2026-07-24 decode-stall telemetry — field: NEO16 viewing CORPLAP-1 hits 3-5 s
+// 2026-07-24 decode-stall telemetry — field: DEVBOX viewing WINHOST-A hits 3-5 s
 // mid-session stalls where bytes keep ARRIVING (Mbps > 0) but the decoder
 // produces NO output, then a catch-up burst (queued frames flushing) — on
 // both HEVC and VP9, with the agent proven healthy. That shape points at the

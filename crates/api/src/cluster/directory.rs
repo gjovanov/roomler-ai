@@ -276,21 +276,6 @@ pub fn pod_alive_key(pod_id: &str) -> String {
     format!("roomler:pod-alive:{pod_id}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn owner_record_roundtrip() {
-        let r = OwnerRecord::parse("10.10.30.11/ab12cd34/conn-9/1754160000000").unwrap();
-        assert_eq!(r.pod_id, "10.10.30.11");
-        assert_eq!(r.epoch, "ab12cd34");
-        assert_eq!(r.extra, "conn-9");
-        assert_eq!(r.since_ms, 1_754_160_000_000);
-        assert!(OwnerRecord::parse("garbage").is_none());
-    }
-}
-
 /// C-3 — tunnel session ownership records (observability + the C-6
 /// metrics; liveness is the session map, TTL reaps ≤90 s after teardown).
 pub fn tunnel_key(session_hex: &str) -> String {
@@ -314,4 +299,19 @@ pub fn derp_key(net_hex: &str, pubkey_hex: &str) -> String {
 }
 pub fn derpnet_key(net_hex: &str) -> String {
     format!("roomler:own:derpnet:{net_hex}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_record_roundtrip() {
+        let r = OwnerRecord::parse("10.10.30.11/ab12cd34/conn-9/1754160000000").unwrap();
+        assert_eq!(r.pod_id, "10.10.30.11");
+        assert_eq!(r.epoch, "ab12cd34");
+        assert_eq!(r.extra, "conn-9");
+        assert_eq!(r.since_ms, 1_754_160_000_000);
+        assert!(OwnerRecord::parse("garbage").is_none());
+    }
 }

@@ -94,9 +94,7 @@ pub async fn list(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let result = state.messages.find_in_room(rid, &params).await?;
 
@@ -134,9 +132,7 @@ pub async fn create(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let thread_id = body
         .thread_id
@@ -329,17 +325,18 @@ pub async fn update(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
 
     state
         .messages
         .update_content(tid, mid, auth.user_id, body.content.clone())
         .await?;
 
-    // Re-fetch the updated message for the full response
-    let updated = state.messages.base.find_by_id(mid).await?;
+    // Re-fetch the updated message for the full response. MUST be
+    // tenant-scoped: a bare `find_by_id(mid)` here returned ANY tenant's
+    // message content in the response even though `update_content` is
+    // tenant-scoped and modified nothing (cross-tenant read via edit).
+    let updated = state.messages.base.find_by_id_in_tenant(tid, mid).await?;
     let names = state
         .users
         .find_display_names(&[updated.author_id])
@@ -422,9 +419,7 @@ pub async fn pinned(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let messages = state.messages.find_pinned(rid).await?;
     let author_ids = collect_author_ids(&messages);
@@ -496,9 +491,7 @@ pub async fn thread_replies(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
 
     let result = state.messages.find_thread_replies(mid, &params).await?;
 
@@ -611,9 +604,7 @@ pub async fn mark_read(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let message_ids: Vec<ObjectId> = body
         .message_ids
@@ -642,9 +633,7 @@ pub async fn read_all(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let modified = state.messages.mark_all_read(rid, auth.user_id).await?;
 
@@ -661,9 +650,7 @@ pub async fn unread_count(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let count = state.messages.unread_count(rid, auth.user_id).await?;
 

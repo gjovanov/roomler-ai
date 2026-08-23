@@ -82,7 +82,7 @@ pub(super) struct DirectCandidates {
     /// coturn-RELAYED addresses, and on this fleet the coturn workers ride
     /// the hosts' own public IPs, so a fleet host same-/24-matched a peer's
     /// *relay allocation* and "LAN"-dialed coturn forever (field-observed
-    /// 2026-07-21: mars dialing NEO16's relayed 94.130.141.74:* as a LAN
+    /// 2026-07-21: buildhost dialing DEVBOX's relayed 94.130.141.74:* as a LAN
     /// endpoint).
     pub(super) lan: Option<(Ipv4Addr, std::net::SocketAddr)>,
     /// Phase A — the peer's PUBLIC NIC endpoint (its join-time bucket),
@@ -459,7 +459,7 @@ impl OverlayRuntime {
                 // revalidate every established DIRECT carrier NOW. A healthy
                 // carrier answers within a handshake round; a captured-route
                 // casualty dies at the tier's handshake deadline instead of
-                // ~90 s later (CORPLAP-1 CP-connect, 2026-08-15). Relay
+                // ~90 s later (winhost-a CP-connect, 2026-08-15). Relay
                 // carriers are exempt — they ride TCP/TLS and have their own
                 // refresh logic.
                 let forced =
@@ -597,7 +597,7 @@ impl OverlayRuntime {
                     // active proof instead of the 90 s rx-stale wait — and
                     // caught EVEN when the peer's own inbound traffic keeps
                     // rx moving (the one-way class no passive rule can see;
-                    // field 2026-08-08, CORPLAP-1→neo16 via a raw-dialed srflx).
+                    // field 2026-08-08, winhost-a→devbox via a raw-dialed srflx).
                     warn!(
                         peer = %nid, kind = ?e.relay_kind,
                         "overlay: relay carrier failed active revalidation (forced rekey unanswered — one-way or dead allocation) — re-allocating"
@@ -1523,7 +1523,7 @@ impl OverlayRuntime {
                     // (the relay-installed arm never inspects relay_kind).
                     // Placement is load-bearing: the fresh walk short-circuits
                     // at the first dialable direct tier — field 2026-08-17,
-                    // rc.398: CORPLAP-3's dead srflx punch looped 12 s deadlines
+                    // rc.398: corplap's dead srflx punch looped 12 s deadlines
                     // forever, the relay arm was never reached, and the pair
                     // sat carrier-less. The floor must come FIRST so a wrong
                     // direct guess costs an upgrade-probe, never the carrier.
@@ -1542,7 +1542,7 @@ impl OverlayRuntime {
                     // inserts into `dialing` and returns — no allocation, no
                     // wire message, nothing that can time out — so a peer
                     // whose anchor never advertises `R` stayed tracked, and
-                    // therefore floor-less, forever (CORPLAP-1's secondary org
+                    // therefore floor-less, forever (winhost-a's secondary org
                     // under corp VPN, 2026-08-19: four peers blocked from the
                     // moment the VPN killed their direct carriers, while the
                     // one peer on a Derp strategy stayed healthy). A DERPING
@@ -1558,7 +1558,7 @@ impl OverlayRuntime {
                     // `install_ready` that did not take, a teardown path that
                     // bypassed `forget`/`clear_floor`, …). Treating it as
                     // authoritative is what stranded peers permanently:
-                    // rc.413's field probe on CORPLAP-1 found peers `blocked`
+                    // rc.413's field probe on winhost-a found peers `blocked`
                     // with ZERO "floor WITHHELD" lines and 111 successful
                     // floor installs, i.e. `build_floor` was never even
                     // CALLED for them — they were skipped by this gate.
@@ -1578,14 +1578,14 @@ impl OverlayRuntime {
                     // rc.415 (#25) — an in-flight TURN grant no longer blocks
                     // the floor. This was the LAST gate standing between a
                     // carrier-less peer and its floor, and the field convicted
-                    // it directly: rc.414 on CORPLAP-1 + CORPLAP-2 logged
+                    // it directly: rc.414 on winhost-a + winhost-b logged
                     // `repairs=0` (so stale bookkeeping was NOT the cause) and
                     // every single withhold line read "a TURN grant is already
                     // in flight for it".
                     //
                     // Under a corp VPN that grant CHURNS — UDP allocations to
                     // the relay band time out and retry for tens of seconds at
-                    // a time (CORPLAP-1: repeated "pinned UDP TURN allocate timed
+                    // a time (winhost-a: repeated "pinned UDP TURN allocate timed
                     // out" against :3478 AND :443 before TLS:443 finally took)
                     // — so `in_flight` is occupied on essentially every walk
                     // and the peer waits out the entire churn with NO carrier.
@@ -1608,7 +1608,7 @@ impl OverlayRuntime {
                     // just does `derping.insert(...)` and returns, and the
                     // entry is cleared only by `maybe_complete`/`forget`. When
                     // the trickle that would drive `maybe_complete` never
-                    // arrives, the peer starves — field: CORPLAP-1 → neo16 sat
+                    // arrives, the peer starves — field: winhost-a → devbox sat
                     // blocked for 70+ min on rc.415 while this very branch
                     // logged "coordinating a DERP link of its own" every 5 min.
                     //
@@ -1933,7 +1933,7 @@ impl OverlayRuntime {
                 //           windows are not aligned (a cadence/phase problem);
                 //   true  ⇒ the far end answered but no session latched — the
                 //           handshake deadline is too tight for this path.
-                // Field 2026-08-13: CORPLAP-1 took 4 attempts / ~4.7 min to
+                // Field 2026-08-13: winhost-a took 4 attempts / ~4.7 min to
                 // promote a 4 ms LAN path and the log could not say which.
                 let saw_inbound = wg.probe_saw_inbound(&p.pubkey);
                 let waited_ms = now.saturating_duration_since(p.since).as_millis() as u64;
@@ -2242,7 +2242,7 @@ impl OverlayRuntime {
             let tx = relay_bq.tx.clone();
             // W6 phase 3 — RAW-FIRST (default): commit the already-built raw
             // carrier NOW and run the rendezvous in the background with the
-            // 90 s window. Field 2026-08-15 (CORPLAP-1 on VPN): health-sweep
+            // 90 s window. Field 2026-08-15 (winhost-a on VPN): health-sweep
             // REBUILDS are not netmap-synchronized, so two independent 8 s
             // windows on ~60 s retry clocks overlapped ~11% of the time
             // (22/201 carrier-ups) — and the pair sat DARK for the whole

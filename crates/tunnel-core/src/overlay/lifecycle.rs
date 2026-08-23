@@ -109,7 +109,7 @@ impl DirectTier {
             DirectTier::Lan => LAN_HANDSHAKE_DEADLINE,
             // rc.223 — the RELAY tier gets one as well. A relay carrier that
             // never completes its handshake evaded EVERY detector (field
-            // 2026-07-24, neo16 on a UDP-hostile network): `punch_dead` was
+            // 2026-07-24, devbox on a UDP-hostile network): `punch_dead` was
             // direct-only, `rx_stale` requires a latched handshake,
             // `hard_dead` needs a send error (sends into a TURNS/TCP
             // allocation "succeed"), and the pre-handshake one-way counter
@@ -131,7 +131,7 @@ impl DirectTier {
     ///
     /// * a **direct** carrier dies the instant its path is filtered — a
     ///   full-tunnel VPN connecting drops every off-tunnel datagram at once
-    ///   (field 2026-08-08, CORPLAP-1/Check Point: `ping` went from a steady
+    ///   (field 2026-08-08, winhost-a/Check Point: `ping` went from a steady
     ///   75 ms to total loss, and the mesh stayed dark for MINUTES waiting out
     ///   this deadline). 60 s still tolerates two consecutive lost keepalives,
     ///   and a false trip only forces a rebuild that re-establishes if the
@@ -222,7 +222,7 @@ pub(crate) const POKE_SILENCE_AFTER: Duration = Duration::from_secs(30);
 /// Stage 2 — ALSO poke when no INITIATOR-role handshake has completed within
 /// this window (counting from install). This is the detector for the carrier
 /// class the rx-anchored rules are structurally blind to (field 2026-08-08,
-/// CORPLAP-1→neo16): our tx dead while the peer's own traffic keeps arriving —
+/// winhost-a→devbox): our tx dead while the peer's own traffic keeps arriving —
 /// `rx_any` advances (so rx-staleness never fires) and `rx` trickles (so the
 /// one-way counter resets), yet 100 % of our sends are lost. Only a completed
 /// handshake WE initiated proves the round trip. ≈ WireGuard's own
@@ -480,7 +480,7 @@ pub(crate) fn should_poke(
 /// Net-change acceleration — should a FORCED revalidation poke arm for this
 /// carrier right now, given an OS route/iface event just fired? Same
 /// contract as [`should_poke`] minus the silence/proof waits: the event IS
-/// the suspicion. Field 2026-08-15 CORPLAP-1: a Check Point connect killed
+/// the suspicion. Field 2026-08-15 winhost-a: a Check Point connect killed
 /// every UDP flow within seconds (REKEY_TIMEOUT at +1 s), but the first
 /// pair failover took ~92 s — the poke sat behind `POKE_SILENCE_AFTER`
 /// (30 s) plus the passive rx-stale race. Arming on the event collapses
@@ -531,7 +531,7 @@ pub(crate) fn probe_tick(handshake_done: bool, since: Duration, tier: DirectTier
 /// * **no completed WG handshake ever** — the pre-handshake zombie. Its
 ///   `tx`/`rx` counters stay flat (handshake packets touch neither), so the
 ///   rx-flat heuristic can't see it; only the handshake latch can. Field:
-///   CORPLAP-1 behind its corp VPN — every tier "installed", `roomler peers`
+///   winhost-a behind its corp VPN — every tier "installed", `roomler peers`
 ///   said `direct`/`relay` with fresh LAST SEEN (inbound worked!) while 100 %
 ///   of its own pings died for hours. This fn is what makes that visible.
 /// * **the rc.137 one-way strike counter** (`bad_sweeps`) — an established
@@ -562,7 +562,7 @@ mod tests {
         // Warm-up: never stalled, whatever the evidence.
         assert!(!carrier_stalled(young, false, 0));
         assert!(!carrier_stalled(young, false, 9));
-        // The CORPLAP-1 shape: installed for ages, handshake never completed.
+        // The winhost-a shape: installed for ages, handshake never completed.
         assert!(carrier_stalled(old, false, 0));
         // Established + healthy: not stalled.
         assert!(!carrier_stalled(old, true, 0));
@@ -988,7 +988,7 @@ mod tests {
     /// Net-change forced pokes: established + no in-flight poke arms;
     /// pre-handshake carriers and pending pokes never double-arm. The
     /// silence/proof waits are deliberately absent — the OS event is the
-    /// suspicion (CORPLAP-1 2026-08-15: 92 s failover waiting out the gates).
+    /// suspicion (winhost-a 2026-08-15: 92 s failover waiting out the gates).
     #[test]
     fn should_poke_on_netchange_matrix() {
         assert!(should_poke_on_netchange(true, false));

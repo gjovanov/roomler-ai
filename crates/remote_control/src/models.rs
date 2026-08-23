@@ -517,7 +517,7 @@ pub struct Agent {
     ///
     /// ⚠️ The converse does NOT hold. `ssh_host_key` stays in the config after
     /// SSH is switched back off, so a NON-empty value here does not mean the
-    /// device is accepting sessions (field-checked: jupiter, `ssh_enabled =
+    /// device is accepting sessions (field-checked: fleet-host-1, `ssh_enabled =
     /// false`, still publishing its P4a key). Whether a session can be opened
     /// is the gate chain's answer, never this field's.
     /// Refreshed from every hello rather than written once, so rotating the

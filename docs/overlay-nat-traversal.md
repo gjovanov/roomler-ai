@@ -30,7 +30,7 @@ order, and demotes to the next tier if it can't establish:
 LAN direct and the relay predate this work (rc.131–rc.135; the relay is the
 original path). **Phases A / C / D** are the NAT-traversal cascade. **C (srflx
 punch) and D (single-relay) shipped default-ON in agent rc.200** after being
-field-proven in a mars↔zeus netns NAT lab (cone↔cone → direct punch 0% loss
+field-proven in a buildhost↔fleet-host-2 netns NAT lab (cone↔cone → direct punch 0% loss
 ~0.6 ms; sym↔sym → single-relay 0% loss ~1.3 ms). A is still default-OFF
 (public-on-NIC is rare and its own field arc). Each gate takes
 `0`/`false`/`no`/`off` to disable. Single-relay needs the QUIC carrier
@@ -290,7 +290,7 @@ optimisation, for two reasons:
    is one A record per worker, so each side resolving independently routinely
    lands the two allocations of one pair on different workers. Relay↔relay
    traffic between workers then straddles their public interfaces — and the
-   dual-public-IP worker's SNAT asymmetry (mars answers from a different
+   dual-public-IP worker's SNAT asymmetry (buildhost answers from a different
    source IP than the one dialed) breaks it outright: that is the
    both-allocate `REKEY_TIMEOUT` above, and the same failure seen on
    corp↔corp double-relay remote-control sessions (2026-07-14 stall-bursts).
@@ -318,13 +318,13 @@ Agreement is byte-pinned: the shared module and every consumer carry
 **golden-vector tests** asserting the same literal picks (grep
 `worker-pick golden vector`), so a drifted or re-localised implementation
 fails CI rather than splitting pairs in the field. Ops note: source-routing
-mars's dual-IP SNAT would de-risk failure mode 1 but not obsolete the
+buildhost's dual-IP SNAT would de-risk failure mode 1 but not obsolete the
 invariant — the extra hop (reason 2) remains.
 
 ## NAT lab (for field-validating Phase C)
 
 The direct-tier failure modes only reproduce behind real NATs. The lab uses two
-throwaway libvirt VMs on the **mars** utility host (never a prod cluster node),
+throwaway libvirt VMs on the **buildhost** utility host (never a prod cluster node),
 each behind its own nftables NAT gateway:
 
 - `masquerade` ≈ endpoint-independent mapping + address-and-port-dependent

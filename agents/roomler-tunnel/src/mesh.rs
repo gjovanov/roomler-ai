@@ -9,7 +9,7 @@
 //!
 //! Address an agent by its **friendly name** (from the server roster) or its
 //! **24-hex agent-id** as the SOCKS hostname
-//! (`curl --socks5-hostname neo16:3389` or `<agent-id>:3389`).
+//! (`curl --socks5-hostname devbox:3389` or `<agent-id>:3389`).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

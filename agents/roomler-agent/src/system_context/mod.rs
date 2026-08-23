@@ -66,7 +66,7 @@ pub mod dxgi_dup;
 // capture stays on fast DXGI instead of falling to GDI BitBlt. Needs both
 // the `windows` crate (`mf-encoder`) and the scrap fallback / DxgiFrame
 // surface (`scrap-capture`) — i.e. the production `full-hw,system-context`
-// MSI. See the module header for the CORPLAP-2 motivation.
+// MSI. See the module header for the WINHOST-B motivation.
 #[cfg(all(feature = "mf-encoder", feature = "scrap-capture"))]
 pub mod dxgi_direct;
 // rc.105 Phase 0 — DXGI adapter/output enumeration for the hybrid-GPU

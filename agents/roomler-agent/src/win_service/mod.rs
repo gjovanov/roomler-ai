@@ -150,7 +150,7 @@ pub fn install(exe_path: &std::path::Path) -> Result<()> {
     // Clean slate BEFORE creating. Retire any prior NEW service (a leftover from
     // an interrupted upgrade) AND the LEGACY service first, so create_service
     // always writes a fresh registry entry — reusing a half-broken / marked-for-
-    // deletion NEW entry is what wedged the P3d neo16 smoke (StartServiceW then
+    // deletion NEW entry is what wedged the P3d devbox smoke (StartServiceW then
     // returned error 87). Deleting LEGACY first also frees its display name so
     // the create can't hit ERROR_DUPLICATE_SERVICE_NAME during the migration
     // overlap. Both tolerate "absent" (1060) / "marked-for-deletion" (1072).
@@ -175,7 +175,7 @@ pub fn install(exe_path: &std::path::Path) -> Result<()> {
     };
     // Do NOT start the service from inside this deferred MSI custom action.
     // StartServiceW mid-transaction wedged the service (error 87) in the P3d
-    // neo16 smoke. The service is AutoStart and is brought up by the
+    // devbox smoke. The service is AutoStart and is brought up by the
     // `DisableSystemContext` -> `environment::restart_service` action (a fresh
     // SCM handle on a now-clean service — the proven rc.190 path) or on next boot.
     Ok(())

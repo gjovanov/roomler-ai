@@ -63,7 +63,7 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long a session must last before its end counts as "it ran, then
 /// dropped" and earns the near-instant re-open.
 ///
-/// Field 2026-08-22 (neo16): several flows were opening successfully and
+/// Field 2026-08-22 (devbox): several flows were opening successfully and
 /// ending almost at once. `Ok(())` reset the backoff unconditionally, so the
 /// ladder could never climb — the supervisor sat at the 1 s floor
 /// indefinitely, re-establishing a full WebRTC peer every cycle. The escalating

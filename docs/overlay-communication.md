@@ -395,7 +395,7 @@ sequenceDiagram
     Note over A,B: traffic flows both ways over TCP-443 only
 ```
 
-**Field-proven 2026-07-21**: mars↔zeus network namespaces with *all* UDP and
+**Field-proven 2026-07-21**: buildhost↔fleet-host-2 network namespaces with *all* UDP and
 *all* coturn TCP blocked — only `roomler.ai:443` reachable. Both nodes reached
 `/derp`, `relay_strategy` chose `Derp`, the WG handshake completed over the relay
 (INIT 148 B → RESP 92 B → data), and ping ran **0 % packet loss, ~2.7 ms RTT**
@@ -630,10 +630,10 @@ feature.
 |---|---|---|
 | LAN direct | 4-node single-Wi-Fi mesh | fully direct, ~3–9 ms, zero coturn |
 | direct-to-public | NAT'd netns ↔ public host | 0 % loss, ~0.9 ms |
-| srflx punch | mars↔zeus netns, cone↔cone | 0 % loss, ~0.6 ms |
-| single-relay | mars↔zeus netns, sym↔sym | 0 % loss, ~1.3 ms |
+| srflx punch | buildhost↔fleet-host-2 netns, cone↔cone | 0 % loss, ~0.6 ms |
+| single-relay | buildhost↔fleet-host-2 netns, sym↔sym | 0 % loss, ~1.3 ms |
 | single-relay, UDP-aware anchor | UDP-blocked ↔ UDP-capable | 0 % loss, ~1–6 ms |
-| **DERP** | mars↔zeus, both UDP **and** coturn-TCP blocked | **0 % loss, ~2.7 ms** |
+| **DERP** | buildhost↔fleet-host-2, both UDP **and** coturn-TCP blocked | **0 % loss, ~2.7 ms** |
 
 Every tier in the cascade has now carried real WireGuard traffic between two
 genuinely separated hosts. The cascade is complete: there is no longer a network

@@ -20,7 +20,7 @@
 //! 2. **Codec rate factor** ([`codec_rate_factor_pct`]): the maxrate
 //!    ceiling was codec-agnostic (0.07 bpp/s for everyone), but H.264
 //!    needs ~1.5× the bits of HEVC/AV1 for the same screen-content text
-//!    sharpness. Field 2026-07-26 (P2 rollout, CORPLAP-1/WINHOST-H/CORPLAP-2):
+//!    sharpness. Field 2026-07-26 (P2 rollout, WINHOST-A/WINHOST-H/WINHOST-B):
 //!    H.264-DC motion "very smooth" but "text gets blurred from time to
 //!    time" — transients exhausting the HEVC-sized budget. H.264 gets a
 //!    150% ceiling; the relay clamp still applies AFTER the factor (pipe
@@ -111,7 +111,7 @@ impl FlipTracker {
 /// Per-codec maxrate ceiling factor, in percent. Keyed by the pump's
 /// `FfmpegDcCodec::label()` vocabulary ("HEVC" / "VP9" / "AV1" / "H264").
 ///
-/// Built-ins (2026-07-28 field, NEO16→WINHOST-C/UHD 620): H264 keeps
+/// Built-ins (2026-07-28 field, DEVBOX→WINHOST-C/UHD 620): H264 keeps
 /// its 150 % band (equal text sharpness genuinely needs ~1.5× the bits);
 /// HEVC moves 100 → **125** — the "HEVC needs ⅔ the bits of H.264"
 /// efficiency assumption fails for desktop drag-motion on realtime QSV
@@ -285,7 +285,7 @@ pub fn apply_cq_bias(cq: u32, steps: i32) -> u32 {
 /// Constrained-motion CQ relief, in SOFTENING steps, applied by
 /// `policy::rate_plan` when a constrained (relay) session runs below
 /// native — i.e. exactly the motion phase the resolution rung exists
-/// for. Field 2026-08-21 (CORPLAP-1/CORPLAP-3 retest of rc.441): the P7
+/// for. Field 2026-08-21 (winhost-a/corplap retest of rc.441): the P7
 /// sharpening bias drove the constrained Smoother rung to CQ 18, whose
 /// 25-40 KB deltas each took ~100-160 ms to traverse a ~2 Mbps relay —
 /// bursty arrival the viewer read as decode pressure, parking the
@@ -335,13 +335,13 @@ pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
 ///
 /// ⚠ rc.442 shipped this at 75 % to bound the refine IDR's relay transit
 /// (the crystallize-latency lever) and rc.443 REVERTED it the same day:
-/// field 2026-08-21, CORPLAP-3 (Iris Xe) — the FIRST session whose
+/// field 2026-08-21, corplap-3 (Iris Xe) — the FIRST session whose
 /// av1_qsv ran with a sub-1× window died on its first settle IDR with
 /// `send_frame: Invalid data found when processing input` (a quality-
 /// floored native AV1 IDR is ~2 Mbit, larger than the whole 1.5 Mbit
 /// reservoir; Intel's AV1 VDENC apparently ERRORS on an over-budget
 /// forced IDR rather than QP-clamping), and the follow-on encode call
-/// hung in the driver. CORPLAP-3 had run av1_qsv all day on rc.441's 2×
+/// hung in the driver. corplap had run av1_qsv all day on rc.441's 2×
 /// window with zero errors. Sub-100 values remain available per-host
 /// for experiments (env `ROOMLER_AGENT_CONSTRAINED_HRD_PCT` / config
 /// `constrained_hrd_pct`, clamp [25, 200]) but the DEFAULT must not
@@ -366,8 +366,8 @@ pub const SETTLE_KF_MIN_BURST: u32 = 10;
 /// re-settles every second or two and shouldn't pay an IDR each time.
 pub const SETTLE_KF_MIN_GAP: Duration = Duration::from_secs(5);
 
-/// Gate for the rc.187 idle-settle keyframe (field 2026-07-27, NEO16 viewing
-/// CORPLAP-2): the settle IDR fired 60 ms after EVERY real frame, and a
+/// Gate for the rc.187 idle-settle keyframe (field 2026-07-27, DEVBOX viewing
+/// WINHOST-B): the settle IDR fired 60 ms after EVERY real frame, and a
 /// blinking text caret (Windows default ~530 ms toggle) produces a real frame
 /// per toggle — a ~2 Hz forced-IDR metronome, visible as text pulsing
 /// blur→crystal on every codec (worst on av1_nvenc, whose budget-capped IDRs
@@ -461,7 +461,7 @@ impl SettleKeyframeGate {
 /// main field path. `Instant`s are passed in (the FlipTracker pattern) so
 /// every behaviour below is unit-tested.
 ///
-/// P7c (field 2026-08-20, CORPLAP-2): frame COUNTING alone made interactive
+/// P7c (field 2026-08-20, winhost-b): frame COUNTING alone made interactive
 /// terminals permanently blurry — every Enter scrolls output (a genuine
 /// burst → Down), then caret blinks + keystrokes produced just enough
 /// frames to hold the up-block, and the 10 s any-flip cooldown finished
@@ -501,7 +501,7 @@ pub const REFINE_SPARSE_MAX: u32 = 2;
 ///
 /// P7c-2 — the threshold is defined AT the reference rung below and
 /// scaled by the CURRENT encode area (`scaled_min_bytes`). A fixed byte
-/// floor is a rung-dependent OSCILLATOR: field CORPLAP-2 2026-08-20
+/// floor is a rung-dependent OSCILLATOR: field winhost-b 2026-08-20
 /// (rc.425, ~15 fps of small-animation deltas — a corp-VPN dialog's
 /// countdown + page motion): the same content encoded ~4 KB at 1024×640
 /// (below the floor ⇒ "quiet" ⇒ Up) and 12-16 KB at native 1920×1200
@@ -560,7 +560,7 @@ pub const REFINE_MAJOR_AREA_PERMILLE: u32 = 400;
 /// cooldown bounds what remains. Env/config `idle_refine_settle_ms`.
 pub const REFINE_SETTLE_TRACKED: Duration = Duration::from_millis(500);
 
-/// Phase B field fix (2026-08-21, CORPLAP-1/CORPLAP-3) — the tracked settle on a
+/// Phase B field fix (2026-08-21, winhost-a/corplap) — the tracked settle on a
 /// CONSTRAINED transport. On a ~3 Mbps relay every Up→Down pair costs two
 /// encoder rebuilds plus two IDRs; a 500 ms settle fires the Up on
 /// ordinary drag PAUSES, so an interactive session lives in permanent IDR
@@ -818,7 +818,7 @@ impl IdleRefine {
     }
 
     /// A QUIET tick: an idle keepalive, OR a real frame that neither
-    /// significance leg noted (field CORPLAP-3, 2026-08-21: GDI/scrap-
+    /// significance leg noted (field corplap-3, 2026-08-21: GDI/scrap-
     /// class backends return a "real" frame on EVERY poll — `frames_empty=0`
     /// — so the keepalive arm never ran and refine was structurally inert;
     /// judging quiet by the SIGNAL — 48-byte encodes of a still screen —
@@ -867,7 +867,7 @@ impl IdleRefine {
         // the refined IDR itself costs ~0.5-1 s of link time, so a 500 ms
         // settle fired on ordinary drag pauses and kept the session in
         // permanent IDR recovery (field 2026-08-21: "freezing / window
-        // seconds behind" on CORPLAP-1/CORPLAP-3).
+        // seconds behind" on winhost-a/corplap).
         let settle = if constrained {
             self.settle_tracked_constrained
         } else {
@@ -1499,7 +1499,7 @@ mod tests {
 
     #[test]
     fn borderline_animation_does_not_oscillate_across_rungs() {
-        // P7c-2 field lock (CORPLAP-2, rc.425): ~15 fps of small-animation
+        // P7c-2 field lock (winhost-b, rc.425): ~15 fps of small-animation
         // deltas (a corp-VPN dialog's ticking countdown + page motion)
         // encoded ~4 KB at the 1024×640 rung (sub-floor ⇒ "quiet" ⇒ Up)
         // and ~14 KB at native 1920×1200 (over the FIXED 12 KiB floor ⇒
@@ -1728,7 +1728,7 @@ mod tests {
 
     #[test]
     fn quiet_ticks_from_insignificant_frames_refine_an_always_some_backend() {
-        // Field CORPLAP-3: the capture returns a "real" frame on every
+        // Field corplap-3: the capture returns a "real" frame on every
         // poll, so the keepalive arm never runs. The pump now feeds
         // on_keepalive after every insignificant frame — a stream of
         // 48-byte still-screen re-encodes must reach Up purely through
@@ -1812,7 +1812,7 @@ mod tests {
     // Phase B field fix — the settle is transport-aware: on a constrained
     // relay every Up costs its own ~0.5-1 s IDR of link time, so firing on
     // ordinary drag pauses (500 ms) kept the field session in permanent
-    // IDR recovery ("freezing / window seconds behind", CORPLAP-1/CORPLAP-3
+    // IDR recovery ("freezing / window seconds behind", winhost-a/corplap
     // 2026-08-21). Direct paths keep the crisp 500 ms.
     #[test]
     fn constrained_settle_outlasts_drag_pauses() {

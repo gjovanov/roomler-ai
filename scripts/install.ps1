@@ -163,7 +163,7 @@ if ($machineRole -and -not $DownloadOnly -and -not $Uninstall -and -not (Test-El
 # a standard user's UAC prompt, the norm on corp boxes) BOTH land in the
 # ADMIN's profile: the interactive user's Settings > Apps never shows the
 # install and the Scheduled Task autostart belongs to the wrong account.
-# Field report 2026-07-31 (CORPLAP-1): invisible daemon-user install ->
+# Field report 2026-07-31 (winhost-a): invisible daemon-user install ->
 # blind re-install -> two flavours on one box. -AllowElevated overrides for
 # UAC-disabled boxes where every shell is unavoidably full-token.
 if (-not $machineRole -and -not $DownloadOnly -and -not $Uninstall -and -not $AllowElevated -and (Test-Elevated)) {

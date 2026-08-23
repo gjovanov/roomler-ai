@@ -1,7 +1,7 @@
 //! HW-downscale Phase A — the CPU resampler, extracted from peer.rs and
 //! de-wasted.
 //!
-//! Field data (2026-08-21, CORPLAP-3 h264_qsv + CORPLAP-1 hevc_qsv): the
+//! Field data (2026-08-21, corplap-3 h264_qsv + WINHOST-A hevc_qsv): the
 //! Smoother rung's native→1024×640 downscale measured **26-45 ms/frame**
 //! against a 3-8 ms hardware encode — and since P8a-2 the rung engages
 //! only DURING motion, so the bill lands at the worst moment. The

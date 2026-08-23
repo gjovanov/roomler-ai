@@ -233,6 +233,11 @@ pub struct AppState {
     /// keyed by the symmetric `pair_key`. Manual TTL (checked on access) +
     /// a size-capped retain sweep — see [`crate::ws::overlay::PairChurn`].
     pub relay_pair_churn: Arc<DashMap<String, crate::ws::overlay::PairChurn>>,
+    /// Per-(caller, device) ceilings for the exec / SSH control planes. Shared
+    /// by the HTTP routes and the device-originated WS legs — both funnel
+    /// through the same `authorize`, so neither transport is unlimited.
+    pub exec_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub ssh_rate_limiter: Arc<crate::rate_limit::RateLimiter>,
 
     /// The one GitHub-releases cache, shared by `/api/agent/*`,
     /// `/api/tunnel/*` and `/api/setup/*` — they all read the same
@@ -862,6 +867,8 @@ impl AppState {
             derp_presence_tokens: derp_presence_tokens.clone(),
             derp_rehome_cooldowns: Arc::new(DashMap::new()),
             relay_pair_churn: Arc::new(DashMap::new()),
+            exec_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
+            ssh_rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new()),
             releases_cache,
         };
 

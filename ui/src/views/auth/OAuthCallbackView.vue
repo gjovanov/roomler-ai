@@ -60,7 +60,14 @@ onMounted(async () => {
     // S2: honor a protected deep-link stashed by the router guard
     // (parity with the password login path).
     const pendingRedirect = sessionStorage.getItem('pending_redirect')
-    if (pendingRedirect && pendingRedirect.startsWith('/')) {
+    if (
+      // Same-origin paths ONLY: `startsWith('/')` alone also admits the
+      // protocol-relative `//evil.com` / `/\evil.com` open-redirect forms.
+      pendingRedirect &&
+      pendingRedirect.startsWith('/') &&
+      !pendingRedirect.startsWith('//') &&
+      !pendingRedirect.startsWith('/\\')
+    ) {
       sessionStorage.removeItem('pending_redirect')
       router.push(pendingRedirect)
     } else {
