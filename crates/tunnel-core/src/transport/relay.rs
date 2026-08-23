@@ -402,7 +402,7 @@ pub async fn allocate_turn_relay(
 /// route was captured by a full-tunnel VPN, an unbound underlay
 /// source-selects the VPN adapter and the allocate dies in the tunnel —
 /// while the overlay's direct socks, bound to the physical NIC, reach
-/// the SAME coturn host fine. Field 2026-08-15 CORPLAP-2: srflx `cone via
+/// the SAME coturn host fine. Field 2026-08-15 winhost-b: srflx `cone via
 /// 5.9.157.221:3478` from the bound direct sock, warm TURN/UDP allocate
 /// to 5.9.157.221 "all attempted candidates failed" from the unbound
 /// one — same machine, same minute.
@@ -809,7 +809,7 @@ pub async fn allocate_turn_relay_tls(
     // middlebox reaps an idle TCP → the next refresh hits a dead socket (os
     // error 10054 "connection reset") → the relay carrier dies + churns + the
     // overlay peer flaps to Blocked (fleet diag 2026-07-13: 870× "refresh
-    // allocation failed" on the corp host CORPLAP-1, while it kept re-allocating
+    // allocation failed" on the corp host winhost-a, while it kept re-allocating
     // TURNS/TCP fine — a persistence, not a reachability, failure). A ~30 s TCP
     // keepalive holds the 5-tuple open across the refresh gap AND surfaces a
     // genuinely-dead path fast. Best-effort: a keepalive-set failure must never

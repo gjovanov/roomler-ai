@@ -213,7 +213,7 @@ mod windows {
             // Decide that by asking whether the task is STILL THERE, not by
             // reading schtasks' complaint: its messages are localized, and the
             // English-only equivalent of this check is exactly what took
-            // CORPLAP-1's overlay down on a German host (#373 — netsh answered
+            // winhost-a's overlay down on a German host (#373 — netsh answered
             // "Das Objekt ist bereits vorhanden." to an idempotent add and the
             // runtime aborted). Here the same miss would fail an uninstall that
             // had nothing left to do. The English match is kept as a fast path

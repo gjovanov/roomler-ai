@@ -2177,7 +2177,7 @@ describe('deadAirDelayMs', () => {
 
   it('backs off to minutes once dead air is clearly the steady state', () => {
     // From the 3rd consecutive frameless session the pair almost certainly has
-    // no media path at all (CORPLAP-1: 388 sessions in 24 h, each ~10.9 s of
+    // no media path at all (winhost-a: 388 sessions in 24 h, each ~10.9 s of
     // dead air). Retrying every ~19 s buys nothing.
     expect(deadAirDelayMs(3)).toBe(30_000)
     expect(deadAirDelayMs(4)).toBe(60_000)
@@ -2324,7 +2324,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     ...over,
   })
 
-  it('NEO16→capable-viewer pair picks AV1 (HW on both ends)', () => {
+  it('DEVBOX→capable-viewer pair picks AV1 (HW on both ends)', () => {
     const r = pickAutoTransport(
       base({
         agentTransports: ['data-channel-vp9-444', 'data-channel-hevc', 'data-channel-av1'],
@@ -2338,7 +2338,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     expect(r.transport).toBe('data-channel-av1')
   })
 
-  it('WINHOST-H→CORPLAP-1 pair picks HEVC (agent has NO AV1/VP9 HW encode)', () => {
+  it('WINHOST-H→WINHOST-A pair picks HEVC (agent has NO AV1/VP9 HW encode)', () => {
     // UHD 630 + GTX 1650: hevc_nvenc is the only HW DC encoder.
     const r = pickAutoTransport(
       base({

@@ -243,7 +243,7 @@ enum Command {
     /// the OS-free reachability probe. Only meaningful when the local daemon runs
     /// in netstack mode (a locked-down host with no OS route to the mesh).
     Ping {
-        /// Overlay peer to ping — a name (e.g. `neo16`) or an overlay IP
+        /// Overlay peer to ping — a name (e.g. `devbox`) or an overlay IP
         /// (either family; `fd72:6f6f:6d6c::<v4>` is the derived overlay IPv6).
         target: String,
         /// Round-trip timeout in milliseconds.
@@ -267,7 +267,7 @@ enum Command {
     /// Commands run as the target daemon's identity (SYSTEM on Windows,
     /// root under systemd) and every attempt is audited.
     Exec {
-        /// Target device — a name (e.g. `CORPLAP-1`) or a hex agent id.
+        /// Target device — a name (e.g. `winhost-a`) or a hex agent id.
         device: String,
         /// `pwsh` | `powershell` | `cmd` | `bash` | `sh`. Default: the
         /// target host's own default shell.
@@ -279,7 +279,7 @@ enum Command {
         #[command(flatten)]
         fmt: OutputFmt,
         /// The command. Put it after `--` so its own flags aren't parsed
-        /// by roomler: `roomler exec CORPLAP-1 -- Get-NetRoute -AddressFamily IPv4`
+        /// by roomler: `roomler exec winhost-a -- Get-NetRoute -AddressFamily IPv4`
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
@@ -293,10 +293,10 @@ enum Command {
     /// The host key is VERIFIED, never trusted on first use. If the server has
     /// no key for the device, this refuses to connect.
     ///
-    ///   roomler ssh CORPLAP-1
-    ///   roomler ssh CORPLAP-1 -- uptime
+    ///   roomler ssh winhost-a
+    ///   roomler ssh winhost-a -- uptime
     Ssh {
-        /// Target device — a name (e.g. `CORPLAP-1`) or a hex agent id.
+        /// Target device — a name (e.g. `winhost-a`) or a hex agent id.
         device: String,
         /// Session lifetime in seconds. 0 = the server's ceiling.
         #[arg(long, default_value_t = 0)]
@@ -313,7 +313,7 @@ enum Command {
     ///   Host *.roomler
     ///     ProxyCommand roomler proxy %h %p
     ///
-    ///   scp report.pdf CORPLAP-3.roomler:/tmp/
+    ///   scp report.pdf corplap-3.roomler:/tmp/
     ///
     /// Transport and name resolution only: `ProxyCommand` cannot supply an
     /// identity or a host key, so this uses keys YOU manage. For a
@@ -483,7 +483,7 @@ where
 {
     // Rust starts with SIGPIPE ignored, so `roomler peers | head` PANICS with
     // "failed printing to stdout: Broken pipe" the moment `head` closes the
-    // pipe (field-hit on mars, rc.368, via `roomlerd cli`). Restore the
+    // pipe (field-hit on buildhost, rc.368, via `roomlerd cli`). Restore the
     // normal Unix CLI contract — die quietly on EPIPE — for BOTH callers:
     // this entry is only ever a CLI invocation (the daemon's `run` path never
     // comes through here), so the process-wide reset is exactly scoped.

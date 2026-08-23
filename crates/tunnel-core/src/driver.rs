@@ -46,7 +46,7 @@ use crate::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 /// a detached task pinning the peer — and therefore its ICE agent's UDP
 /// sockets, the WS and the TURN allocation — for the life of the process.
 ///
-/// Field 2026-08-22 (neo16): failing flows take exactly those early returns, so
+/// Field 2026-08-22 (devbox): failing flows take exactly those early returns, so
 /// `roomlerd` accumulated **15,446 UDP sockets in 12 h**, exhausted the host's
 /// 16,384-port ephemeral range, and every process on the machine lost DNS with
 /// `WSAENOBUFS`. The bug was not the missing abort *call* — one was already
@@ -1746,7 +1746,7 @@ mod tests {
 
     /// The whole point of [`AbortOnDrop`]: a bare `JoinHandle` DETACHES on
     /// drop, so an early `?` left the dispatcher running and pinning the peer
-    /// — which is how neo16 accumulated 15,446 UDP sockets and lost DNS.
+    /// — which is how devbox accumulated 15,446 UDP sockets and lost DNS.
     #[tokio::test]
     async fn a_dropped_guard_aborts_its_task_rather_than_detaching_it() {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));

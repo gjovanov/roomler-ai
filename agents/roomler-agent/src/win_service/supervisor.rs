@@ -802,7 +802,7 @@ fn system_swap_enabled() -> bool {
 
 /// W4 — the exit code Windows session teardown delivers to processes in a
 /// dying session (`DBG_TERMINATE_PROCESS`, 0x40010004). Field 2026-08-14
-/// (CORPLAP-1): logon-screen transitions and Check-Point-VPN session flaps
+/// (winhost-a): logon-screen transitions and Check-Point-VPN session flaps
 /// killed the worker with this code, and each death escalated the backoff
 /// ladder (a flapping session keeps uptime under the 30 s healthy
 /// threshold) — a multi-minute mesh outage manufactured from a
@@ -851,7 +851,7 @@ pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReacti
 ///   * `SESSION_TEARDOWN_EXIT_CODE` (W4) — Windows killed the session,
 ///     not the worker; recording every logon/VPN session flap as a
 ///     `SupervisorDetected` crash buried real crashes in the fleet
-///     dashboard (CORPLAP-1 logged several per day).
+///     dashboard (winhost-a logged several per day).
 ///   * `ALREADY_RUNNING_EXIT_CODE` — the worker declined to start because
 ///     another instance already holds the lock. That is the single-instance
 ///     guard working, not a crash; banking it would mean a host with two
@@ -2138,7 +2138,7 @@ mod tests {
 
     /// W4 — Windows session teardown (0x40010004) is the OS's action, not a
     /// crash: counter RESETS (a logon/VPN flap storm must not climb toward
-    /// the 60 s cap — the CORPLAP-1 multi-minute-outage class) but the respawn
+    /// the 60 s cap — the winhost-a multi-minute-outage class) but the respawn
     /// keeps a 2 s floor so a spoofed exit code can't create a hot loop.
     /// And it never pollutes fleet crash metrics.
     #[test]

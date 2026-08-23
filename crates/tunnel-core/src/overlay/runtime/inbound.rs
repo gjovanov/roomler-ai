@@ -199,7 +199,7 @@ impl OverlayRuntime {
             node_id,
             Installed {
                 // rc.276 — adopted from an authenticated INBOUND dial: the
-                // flow was initiated by the peer (the CORPLAP-1-class rescue
+                // flow was initiated by the peer (the winhost-a-class rescue
                 // path a stateful corp firewall permits); `initiated: false`
                 // is base's default.
                 hs_done: true, // authenticate_init proved the session
