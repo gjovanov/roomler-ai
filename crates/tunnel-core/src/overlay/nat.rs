@@ -111,7 +111,7 @@ async fn setup(if_name: &str, overlay_cidr: &str, _advertised_routes: &[String])
     ])
     .await;
     // filter/FORWARD ACCEPT (P5/A4): container hosts (Docker/containerd — the
-    // k8s fleet mars/jupiter/zeus) default the FORWARD chain policy to DROP, so
+    // k8s fleet buildhost/fleet-host-1/fleet-host-2) default the FORWARD chain policy to DROP, so
     // `ip_forward=1` + NAT alone silently drop forwarded packets. Explicitly
     // accept overlay→uplink and the established return path. Needed by BOTH
     // subnet-routers and exit nodes; the subnet-router path only ever "worked"
@@ -239,7 +239,7 @@ async fn setup(if_name: &str, overlay_cidr: &str, advertised_routes: &[String]) 
     // silently dropped them — peers had the OS route installed and every TCP
     // connection still timed out.
     //
-    // Field-diagnosed on pc50045 2026-08-03: `roomler` Enabled, every other NIC
+    // Field-diagnosed on winhost-a 2026-08-03: `roomler` Enabled, every other NIC
     // Disabled, `Get-NetNat` healthy — the subnet router had been dead for a
     // week while the agent logged "forwarding + NAT enabled".
     //

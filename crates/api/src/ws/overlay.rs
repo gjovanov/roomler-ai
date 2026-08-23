@@ -243,6 +243,32 @@ async fn handle_overlay_join(
     // lookup is LIVE-scoped: a machine that was removed from the fleet had its
     // node tombstoned and its host number recycled, so it must come back as a
     // brand-new node with a fresh lease rather than reviving the tombstone.
+    // The WG public key is client-supplied but is used as an ADDRESSING key
+    // (DERP registration authorizes against it; WireGuard keys peers by it).
+    // Refuse a key already held by a DIFFERENT live node in this network —
+    // otherwise a second enrolled device can advertise a peer's key and
+    // black-hole its DERP traffic. Rotation by the SAME machine is unaffected.
+    match state
+        .overlay_nodes
+        .wg_key_taken_by_other(network_id, &wg_public_key, &machine_id)
+        .await
+    {
+        Ok(true) => {
+            warn!(
+                %tenant_id, %machine_id,
+                "overlay.join: refused — wg_public_key already held by another live node"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            // Fail CLOSED: this check exists to stop one node hijacking
+            // another's identity, so an unverifiable claim must not proceed.
+            warn!(%tenant_id, %e, "overlay.join: wg key uniqueness check failed");
+            return;
+        }
+    }
+
     let self_node = match state
         .overlay_nodes
         .find_live_by_tenant_and_machine(tenant_id, &machine_id)
@@ -830,7 +856,7 @@ async fn handle_overlay_relay_request(
     // Both ends derive identical creds from the symmetric pair_key, AND the
     // broker pins them to a single deterministic coturn worker (see
     // `overlay_ice_servers`) so the relay-to-relay leg is an intra-worker
-    // hairpin that never crosses mars's dual-public-IP SNAT.
+    // hairpin that never crosses buildhost's dual-public-IP SNAT.
     let ice_servers = overlay_ice_servers(
         state,
         &pair_key,
@@ -2083,7 +2109,7 @@ fn next_epoch() -> u64 {
 /// Overlay relay creds, pinned to ONE coturn worker for this pair.
 ///
 /// The relay-to-relay leg must hairpin on a single worker — cross-worker
-/// traffic drops under mars's dual-public-IP SNAT (the flakiness the QUIC
+/// traffic drops under buildhost's dual-public-IP SNAT (the flakiness the QUIC
 /// tunnel pinned around in rc.112). The agent's own deterministic pick
 /// (`relay_link::pick_worker`) can't co-locate the two nodes because they
 /// resolve `coturn.roomler.ai` to *different* IP sets per host. The broker
@@ -2221,11 +2247,11 @@ fn stun_urls_from_turn_urls(turn_urls: &[String]) -> Vec<String> {
 ///
 /// The relay pin MUST be identical for BOTH ends of a pair — they co-locate on
 /// one coturn worker so the relay-to-relay leg is an intra-worker hairpin
-/// (cross-worker traffic drops under mars's dual-public-IP SNAT). But
+/// (cross-worker traffic drops under buildhost's dual-public-IP SNAT). But
 /// `lookup_host` can return a rotating subset/order per call, so two grants for
 /// the same pair seconds apart could resolve **different-sized** IP sets and
 /// `pick_worker_fnv1a` (FNV `% len`) would then pick DIFFERENT workers — exactly
-/// the field split (NEO16 on one worker, the VPN'd peer on another → 100% loss).
+/// the field split (DEVBOX on one worker, the VPN'd peer on another → 100% loss).
 /// Resolving ONCE and caching for a short TTL makes every grant in the window
 /// share one stable set → one pin. On a transient resolve failure we reuse the
 /// last-good set rather than emit an unpinned grant that would round-robin the
@@ -2377,7 +2403,7 @@ mod tests {
     /// instead of the row vanishing, which is what a `removes` delta did.
     #[test]
     fn leave_upsert_is_the_same_row_marked_unreachable() {
-        let n = node("clk00017265-wsl", "100.64.0.7");
+        let n = node("corplap-01-wsl", "100.64.0.7");
         let peer = to_netmap_peer(&n, false);
 
         assert!(
@@ -2388,7 +2414,7 @@ mod tests {
         // already holds and the delta silently creates a duplicate/no-op.
         assert_eq!(peer.node_id, n.id.unwrap());
         assert_eq!(peer.overlay_ip, "100.64.0.7");
-        assert_eq!(peer.name, "clk00017265-wsl");
+        assert_eq!(peer.name, "corplap-01-wsl");
         assert_eq!(peer.wg_public_key, "cHVia2V5");
     }
 
@@ -2396,7 +2422,7 @@ mod tests {
     /// is the caller's verdict, and both verdicts must be expressible.
     #[test]
     fn to_netmap_peer_carries_presence_verbatim() {
-        let n = node("mars", "100.64.0.14");
+        let n = node("buildhost", "100.64.0.14");
         assert!(to_netmap_peer(&n, true).reachable);
         assert!(!to_netmap_peer(&n, false).reachable);
     }
@@ -2625,7 +2651,7 @@ mod tests {
         b.wg_public_key = BASE64.encode([9u8; 32]);
         a.supports_server_relay_strategy = true;
         b.supports_server_relay_strategy = true;
-        // The clk case, measured: srflx PRESENT + no latch, but the probe
+        // The corplap case, measured: srflx PRESENT + no latch, but the probe
         // proved a's relay band is dropped ⇒ a anchors, b dials — despite
         // the srflx/pubkey inputs saying otherwise.
         a.srflx_endpoints = vec!["1.2.3.4:5".into()];

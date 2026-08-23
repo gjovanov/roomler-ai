@@ -49,7 +49,7 @@ pub trait TunIo: Send + Sync {
     /// so overlay traffic out-specifics any colliding *less*-specific route on
     /// the host's uplink — e.g. an ISP/corp **CGNAT `100.64.0.0/10`** that
     /// otherwise swallows the packets. The connected-CIDR route alone is not
-    /// enough on such a host (field bug 2026-06-10: PC50045's pings to peers
+    /// enough on such a host (field bug 2026-06-10: WINHOST-A's pings to peers
     /// leaked to its carrier's CGNAT until a manual `/32` was added). Default
     /// no-op (the in-memory mock + platforms where the connected route is
     /// sufficient). **Best-effort:** a failure is logged by the caller, not
@@ -66,7 +66,7 @@ pub trait TunIo: Send + Sync {
     ///
     /// [`add_peer_route`] has evicted VPN-installed competing `/32`s for every
     /// PEER since rc.208, but our own address was never defended — and a
-    /// full-tunnel VPN installs a `/32` for it too. Field (pc50045, Check Point
+    /// full-tunnel VPN installs a `/32` for it too. Field (winhost-a, Check Point
     /// Endpoint, 2026-07-31):
     ///
     /// ```text
@@ -109,7 +109,7 @@ pub trait TunIo: Send + Sync {
     /// both the connected `/10` and the rc.288 metric-0 defense — longest
     /// prefix wins BEFORE metric — so whenever a peer's `/32` is momentarily
     /// absent (netmap churn, carrier rebuild), packets for it leak to the
-    /// CORP GATEWAY (field 2026-08-08, pc50045: `Antwort von 10.16.6.34:
+    /// CORP GATEWAY (field 2026-08-08, winhost-a: `Antwort von 10.16.6.34:
     /// Zielhost nicht erreichbar`). The `/12` floors out-specific the `/11`,
     /// so absent-`/32` traffic drops locally at the TUN instead.
     ///
@@ -130,7 +130,7 @@ pub trait TunIo: Send + Sync {
     /// silently skip every sibling's. Default no-op, like the plain method.
     async fn defend_block_floor_of(&self, _net: std::net::Ipv4Addr, _plen: u8) {}
 
-    /// clk route war v3 (#23) — verify the overlay actually WINS the OS
+    /// corplap route war v3 (#23) — verify the overlay actually WINS the OS
     /// forwarding decision for each installed peer, and re-assert the
     /// tie-breaking interface metric if it doesn't.
     ///
@@ -139,7 +139,7 @@ pub trait TunIo: Send + Sync {
     /// prefixes at equal route metric on an equally-pinned interface, so
     /// eviction alone only ever produced a tie that Windows broke by lower
     /// ifIndex — the VPN's — and the per-destination pick is sticky, which is
-    /// how peers stayed captured across restarts (clk, 2026-08-18/19). With
+    /// how peers stayed captured across restarts (corplap, 2026-08-18/19). With
     /// the metric pinned to 0 our rows win outright, so this step is the
     /// CHECK rather than the fight: ask the FIB which interface it would use
     /// per peer, and if any answer is foreign, re-pin the metric (a network
@@ -448,7 +448,7 @@ mod system {
         /// rc.288 — a metric mismatch is fixed **IN PLACE** via
         /// `SetIpForwardEntry2`, NOT delete-then-re-add. The delete opened a
         /// window with NO route for the prefix, and on a host whose corp VPN
-        /// runs a route monitor that window is fatal: CLK00017265 (AnyConnect)
+        /// runs a route monitor that window is fatal: CORPLAP-01 (AnyConnect)
         /// came back from the rc.287 update with **no `/32` at all** for any
         /// peer — ours never got re-added and Cisco withdrew its mirrors once
         /// ours vanished — so every peer fell through to Cisco's captured
@@ -484,7 +484,7 @@ mod system {
         /// write.
         ///
         /// rc.291 — this fires for EVERY metric, not just 0. Field
-        /// (CLK00017265 / Cisco AnyConnect, 2026-08-02): `New-NetRoute`
+        /// (CORPLAP-01 / Cisco AnyConnect, 2026-08-02): `New-NetRoute`
         /// succeeds and the row is gone within ~1 s, for both a v4 `/32` and a
         /// v6 `/128`. The agent's own adds meet the same fate, and because
         /// `add_peer_route`'s result is `.ok()`d by the caller, the host
@@ -550,7 +550,7 @@ mod system {
             let rc = unsafe { GetIpForwardEntry2(&mut probe) };
             if rc != NO_ERROR {
                 // Absent. Normal on the FIRST install; a STRIKE afterwards —
-                // something outside this process deleted a row we wrote (CLK
+                // something outside this process deleted a row we wrote (CORPLAP
                 // 2026-08-01: AnyConnect's monitor removes any route that
                 // would out-rank its own, leaving the prefix unrouted and
                 // killing even inbound REPLIES).
@@ -569,7 +569,7 @@ mod system {
                 return Ok(());
             }
             // Fallback: the old delete-then-add. Never silent — losing the
-            // route here is exactly the CLK failure mode.
+            // route here is exactly the CORPLAP failure mode.
             del(luid, dest, plen);
             let re = add(luid, dest, plen, metric);
             if let Err(e) = &re {
@@ -586,7 +586,7 @@ mod system {
         /// rc.287 — eviction-WARN throttle state. The rc.279 WARN assumed a
         /// competitor re-adds at most once per VPN connect ("self-limiting");
         /// Cisco AnyConnect's route monitor re-adds within MILLISECONDS of
-        /// every deletion (CLK00017265, 2026-08-01: 25,197 WARNs in one day).
+        /// every deletion (CORPLAP-01, 2026-08-01: 25,197 WARNs in one day).
         /// Emit at most one WARN per prefix per minute, carrying the count of
         /// evictions suppressed since the last one — the war stays visible,
         /// the log stays readable.
@@ -677,7 +677,7 @@ mod system {
                         // rc.279 — the route war used to be completely
                         // silent: an operator could not tell "healthy" from
                         // "winning an eviction fight on every VPN reconnect"
-                        // (the invisibility that fed the pc50045 hunt's six
+                        // (the invisibility that fed the winhost-a hunt's six
                         // wrong diagnoses). Emit only on an ACTUAL deletion,
                         // so the every-2s no-op guard ticks stay quiet;
                         // rc.287 throttles the emit to 1 WARN/min/prefix
@@ -696,7 +696,7 @@ mod system {
             }
         }
 
-        /// clk route war, 08-18 — is `row_net/row_plen` ENTIRELY inside
+        /// corplap route war, 08-18 — is `row_net/row_plen` ENTIRELY inside
         /// `net/plen`? The in-block eviction's targeting rule, split out
         /// pure so the subset math is unit-tested without a FIB. Requiring
         /// the row's plen to be at least the block's structurally excludes
@@ -717,7 +717,7 @@ mod system {
             (row_net & mask) == (net & mask)
         }
 
-        /// clk route war, 08-18 — evict EVERY foreign v4 route whose prefix
+        /// corplap route war, 08-18 — evict EVERY foreign v4 route whose prefix
         /// lies INSIDE `net/plen`, at ANY prefix length. Generalizes
         /// [`evict_competing_v4`], which matches its exact defended plen
         /// (/32 peers, the block floor) — and which the Check Point endpoint
@@ -725,7 +725,7 @@ mod system {
         /// **/24s** (plus broadcast /32s and learned per-flow host routes):
         /// prefixes we never defended, out-prefixing the /22 floor for any
         /// destination without a /32 winner, steering overlay traffic into
-        /// the corp gateway where it dies (field: CLK00017265, four peers
+        /// the corp gateway where it dies (field: CORPLAP-01, four peers
         /// unreachable while their carriers ran). Same kill-switch
         /// (`overlay_route_evict`) and the same WARN-on-actual-deletion
         /// contract; the CALLER gates on `floor_safe` so a CGNAT uplink
@@ -769,7 +769,7 @@ mod system {
             }
         }
 
-        /// clk route war v3 (#23) — order-insensitive fold of one foreign
+        /// corplap route war v3 (#23) — order-insensitive fold of one foreign
         /// in-block row into a set fingerprint (FNV-1a per row, XOR across
         /// rows: commutative, so FIB iteration order can never fake a
         /// change). Pure; the debounce decision is exactly "did this value
@@ -788,7 +788,7 @@ mod system {
             acc ^ h
         }
 
-        /// clk route war v3 (#23) — fingerprint of the current FOREIGN
+        /// corplap route war v3 (#23) — fingerprint of the current FOREIGN
         /// in-block route set (the exact rows [`evict_foreign_in_block_v4`]
         /// would delete). `0` = empty set. The caller compares waves and
         /// skips the blind eviction when nothing changed — see
@@ -823,7 +823,7 @@ mod system {
             fp
         }
 
-        /// clk route war v3 (#23) — reclaim-outcome log throttle (the same
+        /// corplap route war v3 (#23) — reclaim-outcome log throttle (the same
         /// 1/min/destination discipline as [`evict_warn`]; a host whose
         /// competitor wins the pin race would otherwise emit every wave).
         /// `Some(suppressed)` = log now; `None` = inside the quiet window.
@@ -948,7 +948,7 @@ mod system {
         /// the defense wave runs. `GetBestRoute2` is the honest oracle for
         /// it — the OS PATH table only holds destinations with live
         /// conversations, so it reports nothing for relay-carried peers
-        /// (which is exactly the set that was captured on clk).
+        /// (which is exactly the set that was captured on corplap).
         pub fn best_route_luid(dst: IpAddr) -> Option<u64> {
             use windows_sys::Win32::NetworkManagement::IpHelper::GetBestRoute2;
             // SAFETY: out-params are written on success; the destination is
@@ -1202,7 +1202,7 @@ mod system {
     /// * **#388 (read-after-write race)** — `netsh add` and `netsh show`
     ///   don't see the interface at the same instant, so a single-sample
     ///   presence probe declared a just-created address ABSENT and the
-    ///   caller's rollback deleted it (pc50045, every restart). `Create…` and
+    ///   caller's rollback deleted it (winhost-a, every restart). `Create…` and
     ///   `Get…UnicastIpAddressEntry` operate on the SAME in-memory MIB table,
     ///   so the skew — and the 4×150 ms polling loop that tolerated it —
     ///   cannot exist here.
@@ -1357,7 +1357,7 @@ mod system {
         /// bring-up from the assigned address + netmask. Defended at metric 0
         /// alongside the peer `/32`s: when a `/32` is momentarily missing,
         /// traffic falls through to this prefix, and a corp VPN that mirrors
-        /// the whole `/10` (AnyConnect) otherwise captures it — the CLK
+        /// the whole `/10` (AnyConnect) otherwise captures it — the CORPLAP
         /// failure mode. `None` on a non-contiguous mask.
         #[cfg(windows)]
         connected_v4: Option<(Ipv4Addr, u8)>,
@@ -1390,7 +1390,7 @@ mod system {
         /// their decisions flip independently.
         #[cfg(windows)]
         floor_state: std::sync::Mutex<Vec<((Ipv4Addr, u8), u8)>>,
-        /// clk route war v3 (#23) — fingerprint of the FOREIGN in-block route
+        /// corplap route war v3 (#23) — fingerprint of the FOREIGN in-block route
         /// set per block, from the last wave that ran the blind in-block
         /// eviction. The wave re-evicts only when the set CHANGED: a corp
         /// route monitor re-adds the same rows within seconds of every
@@ -1406,10 +1406,10 @@ mod system {
         /// rc.411 (#23) — peers whose `/32` has been ESCALATED to route
         /// metric 0 because a foreign interface out-ranked us for them even
         /// at our pinned interface metric (the equal-interface-metric tie:
-        /// pc50045's Check Point NIC and pc55331's both sit at interface
+        /// winhost-a's Check Point NIC and winhost-b's both sit at interface
         /// metric 0 like ours, so a mirrored row at route metric 1 would tie
         /// our route-1 + interface-0 total and win on lower ifIndex —
-        /// exactly what clk demonstrated at 1-vs-1).
+        /// exactly what corplap demonstrated at 1-vs-1).
         ///
         /// Sticky for the process, and consulted by
         /// [`TunIo::add_peer_route`]: the defense wave re-asserts every
@@ -1665,7 +1665,7 @@ mod system {
         crate::env::flag("OVERLAY_ROUTE_EVICT", true)
     }
 
-    /// clk route war v3 (#23) — gate for the stolen-path reclaim (detect →
+    /// corplap route war v3 (#23) — gate for the stolen-path reclaim (detect →
     /// targeted evict → pin, [`TunIo::reclaim_stolen_peer_paths`]) AND the
     /// in-block eviction debounce that rides on it (blind per-wave eviction
     /// is what fed the route-flap → netstate-Major → forced-poke treadmill;
@@ -1687,12 +1687,12 @@ mod system {
     /// `overlay_route_metric0`).
     ///
     /// **rc.289: default flipped to OFF.** Field result on the only host that
-    /// motivated it (CLK00017265, Cisco AnyConnect): the VPN's route monitor
+    /// motivated it (CORPLAP-01, Cisco AnyConnect): the VPN's route monitor
     /// DELETES any route of ours that would out-rank its own, so metric 0
     /// bought nothing there — and left the prefix unrouted, which broke even
     /// INBOUND replies (remote support into the host stopped working). No
     /// host has yet been shown to benefit: the Check Point fleet
-    /// (pc50045/pc55331) already wins with eviction at metric 1. A default
+    /// (winhost-a/winhost-b) already wins with eviction at metric 1. A default
     /// with zero demonstrated benefit and one demonstrated regression does
     /// not belong on the fleet — it stays as an opt-in experiment, now
     /// protected by the [`METRIC0_REJECTED`] auto-yield.
@@ -1703,7 +1703,7 @@ mod system {
     /// 1 — a FULL tie against our metric-1 rows that Windows breaks in
     /// Cisco's favor (lower ifIndex), and its route monitor re-adds within
     /// milliseconds of an eviction, so the 2 s guard can never hold the FIB
-    /// (CLK00017265, 2026-08-01: 25,197 evictions in one day; node-initiated
+    /// (CORPLAP-01, 2026-08-01: 25,197 evictions in one day; node-initiated
     /// egress 100 % captured while REPLIES escaped via strong-host
     /// source-constrained routing). Metric 0 wins outright (0+1 < 1+1): no
     /// tie-break, no deletion race. Inert on hosts with no competing routes.
@@ -2035,7 +2035,7 @@ mod system {
             // teardown REMOVES a created adapter (Wintun contract), so every
             // bring-up re-created it — and without a requested GUID wintun
             // rolls a RANDOM one per create, minting a brand-new interface
-            // identity each time: a new ifIndex/LUID (the pc50045
+            // identity each time: a new ifIndex/LUID (the winhost-a
             // 83→70→46→75→29→46 trail) and a brand-new "Unidentified
             // network" landing in the Public firewall profile (why the
             // Private-profile retry + WFP permit below exist). A constant
@@ -2126,17 +2126,17 @@ mod system {
             // prefixes at route metric 1 on a NIC whose own interface metric
             // is also 1 — a FULL tie at every prefix length, which Windows
             // breaks by lower ifIndex, i.e. reliably in the VPN's favour
-            // (clk: Ethernet 2 = ifIndex 10 vs roomler = 20). At a tie the
+            // (corplap: Ethernet 2 = ifIndex 10 vs roomler = 20). At a tie the
             // per-destination pick is also STICKY, so peers stayed captured
             // across restarts: node-initiated traffic died 100 % while
             // strong-host source pinning kept replies flowing, and the RTT
             // prober (which shells the OS `ping`) showed a dash — the
             // "one-way carrier" that was never a carrier fault at all.
             // The rc.287 answer was metric-0 ROUTES, which those VPNs simply
-            // delete (the rc.289 auto-yield, re-observed on clk 2026-08-19).
+            // delete (the rc.289 auto-yield, re-observed on corplap 2026-08-19).
             // An INTERFACE metric is not a route: the VPN cannot delete it,
             // and 0 + 1 beats 1 + 1 outright with no tie-break — field-proven
-            // on clk, where all four captured peers flipped to the overlay NIC
+            // on corplap, where all four captured peers flipped to the overlay NIC
             // instantly (0 % loss, 24-26 ms) with every competing `/32` still
             // in the table.
             #[cfg(target_os = "windows")]
@@ -2427,7 +2427,7 @@ mod system {
             {
                 let luid = self.dev.tun_luid();
                 winroute::evict_competing_v4(luid, self_ip, 32);
-                // rc.281 — the v6 twin. IPv6 survived the pc50045 hijack only
+                // rc.281 — the v6 twin. IPv6 survived the winhost-a hijack only
                 // because that VPN didn't claim ULA space — an assumption, not
                 // a guarantee (the v4 CGNAT hijack was "impossible" too), and
                 // v6 was the diagnostic control channel that cracked the case;
@@ -2442,7 +2442,7 @@ mod system {
                 // competitors for it. AnyConnect mirrors the /96 on its
                 // miniport at effective metric 2; our auto CONNECTED route
                 // sits at 256+1 and loses outright, so v6 node-initiated
-                // egress was captured exactly like v4 (CLK: v6 ping
+                // egress was captured exactly like v4 (CORPLAP: v6 ping
                 // "Allgemeiner Fehler"). A metric-0 row wins with no
                 // tie-break. Reconciled every wave. Gate OFF reconciles to
                 // 256 — the connected-route default — NOT `del`: the auto
@@ -2458,7 +2458,7 @@ mod system {
                 // prefix — and AnyConnect mirrors the whole /10 at effective
                 // metric 2 while our connected route sits at 257, so the
                 // fall-through lands in the corp tunnel. That is exactly how
-                // CLK00017265 looked after rc.287: no /32 anywhere, every
+                // CORPLAP-01 looked after rc.287: no /32 anywhere, every
                 // peer resolving to Cisco's /10. Metric 0 makes the overlay
                 // win the fall-through too; gate-off restores 256.
                 if let Some((net, plen)) = self.connected_v4 {
@@ -2645,7 +2645,7 @@ mod system {
                         self.del_cidr_route(c).await;
                     }
                 }
-                // clk route war, 08-18 — with the floor SAFE (the uplink
+                // corplap route war, 08-18 — with the floor SAFE (the uplink
                 // provably lives outside the block), also evict every
                 // foreign route INSIDE the block at any prefix length: the
                 // Check Point manager shadows the overlay with /24s +
@@ -2696,7 +2696,7 @@ mod system {
             }
         }
 
-        /// clk route war v3 (#23) — see
+        /// corplap route war v3 (#23) — see
         /// [`TunIo::verify_peer_path_ownership`]. Windows-only, and a
         /// two-rung escalation rather than a fight: ask the FIB who owns
         /// each peer, and on a foreign winner (1) re-assert the INTERFACE
@@ -2718,7 +2718,7 @@ mod system {
                 // OS path table it answers for every destination, not only
                 // ones with live conversations (the path table is empty for
                 // relay-carried peers, which is exactly the set that was
-                // captured on clk).
+                // captured on corplap).
                 let stolen: Vec<Ipv4Addr> = peers
                     .iter()
                     .copied()
@@ -2746,7 +2746,7 @@ mod system {
                     .collect();
                 // rc.411 (#23) — still losing at our lowest INTERFACE metric
                 // means the competitor's interface is pinned as low as ours
-                // (pc50045's Check Point NIC and pc55331's both sit at 0),
+                // (winhost-a's Check Point NIC and winhost-b's both sit at 0),
                 // so the totals TIE and Windows breaks it on lower ifIndex —
                 // theirs, since our adapter is created later. The interface
                 // metric has no lower rung, so escalate the ROUTE metric for
@@ -3604,7 +3604,7 @@ mod system {
         use std::cell::Cell;
         use std::time::Duration;
 
-        /// clk route war — the in-block eviction's targeting rule. The
+        /// corplap route war — the in-block eviction's targeting rule. The
         /// safety property under test: ONLY prefixes that fit entirely
         /// inside the overlay block match; anything broader (defaults, /1
         /// split-halves, corp LANs, an adjacent CGNAT block) never does.
@@ -3710,7 +3710,7 @@ mod system {
         /// rc.410 (#23) — the interface metric must default to 0, the value
         /// that wins the route war outright. A regression to 1 restores the
         /// exact tie (route 1 + iface 1 on both sides) that let Check Point
-        /// capture clk's peers by ifIndex tie-break for weeks, and the
+        /// capture corplap's peers by ifIndex tie-break for weeks, and the
         /// failure is INVISIBLE without a hostile VPN present — so the
         /// default is locked here rather than left to field observation.
         #[cfg(windows)]
@@ -3722,11 +3722,11 @@ mod system {
                 0,
                 "the overlay interface metric must default to 0: Windows ranks by \
                  route metric + INTERFACE metric, so 1 ties with a corp VPN's mirrored \
-                 rows and loses the ifIndex tie-break (clk, 2026-08-18)"
+                 rows and loses the ifIndex tie-break (corplap, 2026-08-18)"
             );
         }
 
-        /// clk route war v3 (#23) — the eviction-debounce fingerprint:
+        /// corplap route war v3 (#23) — the eviction-debounce fingerprint:
         /// order-insensitive (FIB iteration order can never fake a change),
         /// sensitive to every component of a row (prefix, plen, luid), and
         /// zero only for the empty set — the exact properties the

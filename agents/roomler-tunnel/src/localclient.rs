@@ -259,7 +259,7 @@ async fn run_remote(node: &str, shell: &str, command: &str, timeout_ms: u64) -> 
 /// Resolve a roomler device NAME to its overlay address (P6c).
 ///
 /// Case-insensitive, matching the server's `resolve_exec_target`, because
-/// device names are display strings and nobody types `CLK00017265`.
+/// device names are display strings and nobody types `CORPLAP-01`.
 /// `Ok(None)` = no such peer — the caller must report that rather than dial
 /// something arbitrary.
 pub async fn resolve_overlay_ip(name: &str) -> Result<Option<String>> {
@@ -890,7 +890,7 @@ fn fmt_peer_row(p: &PeerInfo, now_ms: u64) -> String {
     };
     // rc.275 honesty — a carrier the health sweep judged SILENTLY ONE-WAY
     // renders as `stalled`, not as a healthy-looking `direct`/`relay` (the
-    // dishonest label cost a multi-session field hunt on pc50045: every tier
+    // dishonest label cost a multi-session field hunt on winhost-a: every tier
     // "installed", zero completed handshakes, 100 % ping loss — and the table
     // still said direct). Takes precedence over `upgrading`; the tier itself
     // stays visible in `peers --json` (`connection` + `stalled`).
@@ -1249,7 +1249,7 @@ mod tests {
     /// indistinguishable from a ~175 ms DERP/TCP one.
     #[test]
     fn relay_rows_name_the_relay_kind_and_transport() {
-        let mut p = peer("zeus", "");
+        let mut p = peer("fleet-host-2", "");
         p.connection = ConnectionType::Relay;
 
         p.relay_kind = Some("turn".into());
@@ -1268,7 +1268,7 @@ mod tests {
 
         // A DIRECT peer never carries a relay qualifier, even if stale fields
         // linger in the payload.
-        let mut d = peer("mars", "");
+        let mut d = peer("buildhost", "");
         d.relay_kind = Some("turn".into());
         d.relay_transport = Some("udp".into());
         assert_eq!(relay_qualified_label(&d), "direct");
@@ -1315,7 +1315,7 @@ mod tests {
         fn info(state: RouteState) -> RouteInfo {
             RouteInfo {
                 route: tunnel_core::localapi::RouteDescriptor {
-                    id: "pg-mars".into(),
+                    id: "pg-buildhost".into(),
                     kind: FlowKind::Forward,
                     node: "aabbccddeeff001122334455".into(),
                     local: 15432,
@@ -1330,7 +1330,7 @@ mod tests {
         let active = fmt_route_row(&info(RouteState::Active {
             flow_id: "fl-3".into(),
         }));
-        assert!(active.contains("pg-mars"), "got {active}");
+        assert!(active.contains("pg-buildhost"), "got {active}");
         assert!(active.contains("forward"));
         assert!(active.contains("db:5432"));
         assert!(active.contains("auto"), "empty transport renders auto");
@@ -1386,7 +1386,7 @@ mod tests {
         let now = 1_000_000u64;
         let online = PeerInfo {
             node_id: "n2".into(),
-            name: "pc50045".into(),
+            name: "winhost-a".into(),
             org: String::new(),
             overlay_ip: Some("100.64.0.1".into()),
             overlay_ip6: Some("fd72:6f6f:6d6c::6440:1".into()),
@@ -1406,7 +1406,7 @@ mod tests {
         };
         let row = fmt_peer_row(&online, now);
         assert!(row.starts_with('●'));
-        assert!(row.contains("pc50045"));
+        assert!(row.contains("winhost-a"));
         assert!(row.contains("100.64.0.1"));
         assert!(row.contains("fd72:6f6f:6d6c::6440:1"));
         assert!(row.contains("tunnel"));
@@ -1476,7 +1476,7 @@ mod tests {
         let now = 1_000_000u64;
         let mut p = PeerInfo {
             node_id: "n4".into(),
-            name: "pc50045".into(),
+            name: "winhost-a".into(),
             org: String::new(),
             overlay_ip: Some("100.64.0.1".into()),
             overlay_ip6: None,
@@ -1515,7 +1515,7 @@ mod tests {
             kind: FlowKind::Forward,
             local_addr: "127.0.0.1:5432".into(),
             target: Some("10.0.0.5:5432".into()),
-            node: Some("pc50045".into()),
+            node: Some("winhost-a".into()),
             transport: "quic-v1".into(),
             active_flows: 2,
             bytes_in: 4096,
@@ -1534,7 +1534,7 @@ mod tests {
             kind: FlowKind::Socks5,
             local_addr: "127.0.0.1:1080".into(),
             target: None,
-            node: Some("pc50045".into()),
+            node: Some("winhost-a".into()),
             transport: "quic-v1".into(),
             active_flows: 0,
             bytes_in: 0,
@@ -1542,7 +1542,7 @@ mod tests {
         };
         let row = fmt_flow_row(&socks);
         assert!(row.contains("socks5"));
-        assert!(row.contains("pc50045")); // node fallback when target is None
+        assert!(row.contains("winhost-a")); // node fallback when target is None
     }
 
     #[test]

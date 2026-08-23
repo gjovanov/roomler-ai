@@ -2,7 +2,7 @@
 //! when the *encoder itself* can't keep up, so a weak sender GPU stops
 //! saturating and the periodic freeze goes away.
 //!
-//! Field root cause (PC50045 Iris Xe, `hevc_qsv`, 1920×1200@60): the shared
+//! Field root cause (WINHOST-A Iris Xe, `hevc_qsv`, 1920×1200@60): the shared
 //! iGPU does DXGI capture AND HEVC encode, and under sustained window-drag
 //! motion `avg_encode_ms` climbs from ~11 ms to 40-194 ms — the 194 ms
 //! windows are the 1-2 s hangs. The operator's manual `FFMPEG_FPS=30` fixed

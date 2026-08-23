@@ -768,7 +768,7 @@ async fn handle_agent_exec_request(
         }
     };
 
-    // Target by hex id, else by device name — an operator types `pc50045`,
+    // Target by hex id, else by device name — an operator types `winhost-a`,
     // not an ObjectId.
     let agent = match resolve_exec_target(state, tenant_id, &target).await {
         Some(a) => a,

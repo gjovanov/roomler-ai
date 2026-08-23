@@ -667,7 +667,7 @@ async fn join_org_refuses_incapable_or_offline_devices() {
 /// The whole point, end to end: a LIVE agent in org A is pushed into org B
 /// from the API, enrolls itself, appends an `[[orgs]]` entry, and the new
 /// org's supervised loop brings the device online there — no restart, no
-/// shell on the device (the exact thing that blocked PC50045 in the field).
+/// shell on the device (the exact thing that blocked WINHOST-A in the field).
 #[tokio::test]
 async fn join_org_pushes_a_live_device_into_a_second_organization() {
     let app = TestApp::spawn().await;

@@ -10,7 +10,7 @@
 //!   bootstrapped for every own public IP, then a fresh egress-pinned raw
 //!   socket dials the allocation's own relayed address. The tagged datagram
 //!   coming back through the allocation proves the relay band is reachable;
-//!   its absence (with STUN working) proves the corp drop CLK-class hosts
+//!   its absence (with STUN working) proves the corp drop CORPLAP-class hosts
 //!   showed on capture — without burning a peer pair to find out.
 //! * `stun_udp` / `nat` — the existing gather/typing results, snapshotted.
 //! * `derp_ws_ok` — the central `/derp` WS liveness (the floor's health).
@@ -61,7 +61,7 @@ pub struct CapVector {
     /// The srflx gather found a public mapping (existing Phase B result).
     pub stun_udp: bool,
     /// Raw UDP from this host reaches coturn's relay band — measured over
-    /// the exact single-relay dialer path. `Some(false)` = the CLK-class
+    /// the exact single-relay dialer path. `Some(false)` = the CORPLAP-class
     /// egress drop, proven without a peer pair.
     pub relay_band_udp: Option<bool>,
     /// The central `/derp` WS is up + registered (the floor's health).

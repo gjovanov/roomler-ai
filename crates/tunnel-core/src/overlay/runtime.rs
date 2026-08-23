@@ -306,7 +306,7 @@ struct Installed {
     /// rc.275 honesty — the health sweep's verdict that this carrier is
     /// SILENTLY ONE-WAY: installed past the warm-up grace with either no
     /// completed WG handshake ever (the pre-handshake zombie whose tx/rx
-    /// counters stay flat — pc50045 behind its corp VPN: every tier
+    /// counters stay flat — winhost-a behind its corp VPN: every tier
     /// "installed", zero handshakes, `roomler peers` said `direct`/`relay`
     /// while 100% of pings died) or the rc.137 one-way strike counter
     /// accumulating. Surfaced through the LocalAPI peer view so the CLI can
@@ -376,7 +376,7 @@ struct Installed {
     tier: DirectTier,
     /// rc.276 diagnostics — did WE initiate this carrier's flow (outbound dial /
     /// our own allocation), or was it adopted from an authenticated INBOUND
-    /// dial (accept re-point / accepted-probe promote)? The pc50045 corp-VPN
+    /// dial (accept re-point / accepted-probe promote)? The winhost-a corp-VPN
     /// case turns on exactly this split: outbound-initiated flows are policy-
     /// dropped while inbound-accepted ones pass — and pre-rc.276 the
     /// `initiate` bit was discarded at install, so the peers view couldn't
@@ -388,7 +388,7 @@ struct Installed {
     hs_done: bool,
     /// rc.276 diagnostics — the carrier socket's LOCAL address (for a relay
     /// carrier: the allocation's relayed address). Which socket each
-    /// direction rides is the exact question the pc50045 field captures need
+    /// direction rides is the exact question the winhost-a field captures need
     /// answered.
     carrier_local: Option<std::net::SocketAddr>,
     /// rc.276 diagnostics — the carrier's send destination (direct: the dial
@@ -584,7 +584,7 @@ struct AllocDone {
 /// rc.218 — OFF-LOOP relay allocates. rc.211 moved the QUIC-over-TURN build
 /// off-loop and flagged `on_grant`'s inline DNS + TURN allocate (UDP 5 s →
 /// TURNS/TCP 6 s caps per candidate) as "next in line if it ever fires in the
-/// field" — it did: pc50045's rc.213–216 logs still show `stalled the data
+/// field" — it did: winhost-a's rc.213–216 logs still show `stalled the data
 /// plane` from exactly this await on its hostile corp path. The `RelayGrant`
 /// arm stashes the creds (`grant_accept`, sync), spawns
 /// [`RelayCoordinator::allocate_for_pair`], and a dedicated select! arm
@@ -911,8 +911,8 @@ fn spawn_srflx_keepalive(
         // works perfectly — so it presents as "that org is black-holed" with
         // nothing in the log to explain it.
         //
-        // Field 2026-08-12 (pc50045, dual-org): grox reachable, jovanov 100 %
-        // loss from EVERY peer; zeus aimed at :62349 while the host had
+        // Field 2026-08-12 (winhost-a, dual-org): grox reachable, jovanov 100 %
+        // loss from EVERY peer; fleet-host-2 aimed at :62349 while the host had
         // rebound to :59669. Restarting only swapped which org was stale.
         // Diagnosis cost hours precisely because this arm said nothing.
         (punch, stun, rx) => {
@@ -950,7 +950,7 @@ fn spawn_plane_srflx_forwarder(
     // forwarder that only fires on `changed()` misses the current value if it
     // subscribed AFTER the shared gather set it — so a re-join's one-shot
     // re-advert is the only thing keeping the mesh populated, and if it races
-    // the join that org goes relay-locked (field 2026-08-10: pc50045's GROX
+    // the join that org goes relay-locked (field 2026-08-10: winhost-a's GROX
     // mesh had `srflx=[]` while JOVANOV had the candidate — same plane socket,
     // one org simply lost its advert). The idempotent periodic re-advert makes
     // every org converge; the interval's immediate first tick also covers the
@@ -1792,7 +1792,7 @@ impl OverlayRuntime {
         let (srflx_reattach_tx, srflx_reattach_rx) = tokio::sync::watch::channel(0u64);
         // Which re-advert path THIS org took, and whether it got one at all.
         // `overlay_shared_carrier=true` is supposed to mean "plane", but
-        // pc50045 had it set and produced no plane log lines whatsoever —
+        // winhost-a had it set and produced no plane log lines whatsoever —
         // there was no way to tell a plane-mode host from a legacy one, or a
         // spawned forwarder from a silently-skipped one, without this.
         // W5 — this runtime's OWN receiver on the plane's shared srflx watch,
@@ -1975,7 +1975,7 @@ impl OverlayRuntime {
         // established DIRECT carrier gets a forced revalidation poke, so a
         // captured-route casualty (corp-VPN connect) dies at its handshake
         // deadline (~seconds) instead of waiting out `POKE_SILENCE_AFTER` +
-        // the passive rx-stale race (~90 s observed, pc50045 2026-08-15).
+        // the passive rx-stale race (~90 s observed, winhost-a 2026-08-15).
         let mut netchange_poke_due = false;
         // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't
         // keep its competing capture routes installed. First tick fires
@@ -2167,7 +2167,7 @@ impl OverlayRuntime {
         // read future starves — outbound packets then only left the ring when a
         // periodic arm (route guard 2 s / fallback 5 s) woke the loop and a
         // FRESH read future's `try_receive` drained the backlog. Field-proven
-        // on neo16: mars-side tcpdump showed every overlay packet arriving in
+        // on devbox: buildhost-side tcpdump showed every overlay packet arriving in
         // bursts on exactly the union of those two timer grids (sub-ms aligned;
         // RTT sequence {2,2,1,1,2,2} s ⇒ the measured ~1.65 s averages) while
         // the raw wire RTT was 43 ms — and the rc.211 handler watchdog stayed
@@ -3522,9 +3522,9 @@ mod tests {
     async fn sync_name_map_includes_self_when_the_server_names_us() {
         let names: dns::NameMap = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let me = Ipv4Addr::new(100, 65, 4, 2);
-        sync_name_map(&names, &HashMap::new(), Some("goran-xmg-neo16"), me).await;
+        sync_name_map(&names, &HashMap::new(), Some("devbox"), me).await;
         assert_eq!(
-            names.read().await.get("goran-xmg-neo16"),
+            names.read().await.get("devbox"),
             Some(&me),
             "own name must resolve to own overlay IP"
         );
@@ -4148,7 +4148,7 @@ mod tests {
     /// Net-change acceleration — `force_poke` arms a revalidation poke on an
     /// established direct carrier with FRESH rx (none of the passive gates
     /// met), and without the flag the same sweep arms nothing. This is the
-    /// contract that collapses the pc50045 CP-connect failover from ~90 s
+    /// contract that collapses the winhost-a CP-connect failover from ~90 s
     /// (waiting out `POKE_SILENCE_AFTER` + the rx-stale race) to ~one
     /// handshake deadline: the OS route event is the suspicion, the poke is
     /// the honest proof either way.
@@ -4425,7 +4425,7 @@ mod tests {
     /// for our own address that out-ranks Windows' metric-256 on-link route, so
     /// every packet addressed to us — including the REPLY to everything we
     /// initiate — is forwarded into the corp tunnel instead of delivered
-    /// locally (field: pc50045, 100 % IPv4 loss both ways while its WireGuard
+    /// locally (field: winhost-a, 100 % IPv4 loss both ways while its WireGuard
     /// carriers were healthy and IPv6 worked). rc.285 — the test now drives the
     /// REAL wave (`defended_routes` → `run_defense_wave`, the exact code both
     /// select-loop arms spawn) instead of a hand-mirrored copy of the arms.
@@ -5916,8 +5916,8 @@ mod tests {
         assert_eq!(view.peers[1].last_seen_ms, Some(epoch_now_ms));
         assert!(view.peers[2].last_seen_ms.is_none());
         assert!(view.peers[3].last_seen_ms.is_none());
-        // rc.187 — relay endpoints surface only for the relay peer (local=mars,
-        // dst=zeus ⇒ the cross-worker signal an operator reads from `peers`);
+        // rc.187 — relay endpoints surface only for the relay peer (local=buildhost,
+        // dst=fleet-host-2 ⇒ the cross-worker signal an operator reads from `peers`);
         // direct + carrier-less peers carry none.
         assert_eq!(
             view.peers[1].relay_local.as_deref(),
@@ -6611,17 +6611,17 @@ mod tests {
         let a = exit_oid(0x0a);
         let b = exit_oid(0x0b);
         let mut peers = HashMap::new();
-        peers.insert(a, exit_np(a, "jupiter", vec![]));
-        peers.insert(b, exit_np(b, "zeus", vec![]));
+        peers.insert(a, exit_np(a, "fleet-host-1", vec![]));
+        peers.insert(b, exit_np(b, "fleet-host-2", vec![]));
         // By name.
-        assert_eq!(resolve_exit_peer("jupiter", &peers), Some(a));
-        assert_eq!(resolve_exit_peer("zeus", &peers), Some(b));
+        assert_eq!(resolve_exit_peer("fleet-host-1", &peers), Some(a));
+        assert_eq!(resolve_exit_peer("fleet-host-2", &peers), Some(b));
         // By node-id hex.
         assert_eq!(resolve_exit_peer(&a.to_hex(), &peers), Some(a));
         // Surrounding whitespace is tolerated.
-        assert_eq!(resolve_exit_peer("  jupiter  ", &peers), Some(a));
+        assert_eq!(resolve_exit_peer("  fleet-host-1  ", &peers), Some(a));
         // Unknown selector → None (reconcile defers rather than blackholing).
-        assert_eq!(resolve_exit_peer("mars", &peers), None);
+        assert_eq!(resolve_exit_peer("buildhost", &peers), None);
     }
 
     /// Names are recycled between machines now, so a NAME selector that starts
@@ -6632,15 +6632,15 @@ mod tests {
         let a = exit_oid(0x31);
         let b = exit_oid(0x32);
         assert!(
-            !exit_selector_drifted(None, "jupiter", a),
+            !exit_selector_drifted(None, "fleet-host-1", a),
             "first resolution is not drift"
         );
         assert!(
-            !exit_selector_drifted(Some(a), "jupiter", a),
+            !exit_selector_drifted(Some(a), "fleet-host-1", a),
             "same machine is not drift"
         );
         assert!(
-            exit_selector_drifted(Some(a), "jupiter", b),
+            exit_selector_drifted(Some(a), "fleet-host-1", b),
             "the name moved to another machine"
         );
         assert!(
@@ -6756,7 +6756,7 @@ mod tests {
         let exit = NetmapPeer {
             node_id: exit_oid(7),
             overlay_ip: "100.64.0.7".into(),
-            name: "jupiter".into(),
+            name: "fleet-host-1".into(),
             wg_public_key: kp.public_base64(),
             endpoints: vec![],
             lan_endpoints: vec![],
@@ -6798,23 +6798,26 @@ mod tests {
         // Not in the mesh at all.
         let empty: HashMap<ObjectId, NetmapPeer> = HashMap::new();
         assert_eq!(
-            exit_readiness("jupiter", &empty, &no_carriers).unwrap_err(),
+            exit_readiness("fleet-host-1", &empty, &no_carriers).unwrap_err(),
             "exit node not visible in the mesh yet"
         );
 
         // Present, but not an admin-approved exit node (no /0 in its routes).
         let mut subnet_only = HashMap::new();
-        subnet_only.insert(id, exit_np(id, "jupiter", vec!["192.168.1.0/24".into()]));
+        subnet_only.insert(
+            id,
+            exit_np(id, "fleet-host-1", vec!["192.168.1.0/24".into()]),
+        );
         assert_eq!(
-            exit_readiness("jupiter", &subnet_only, &no_carriers).unwrap_err(),
+            exit_readiness("fleet-host-1", &subnet_only, &no_carriers).unwrap_err(),
             "not an admin-approved exit node (no 0.0.0.0/0 approved)"
         );
 
         // Approved, but no live carrier yet.
         let mut approved = HashMap::new();
-        approved.insert(id, exit_np(id, "jupiter", vec!["0.0.0.0/0".into()]));
+        approved.insert(id, exit_np(id, "fleet-host-1", vec!["0.0.0.0/0".into()]));
         assert_eq!(
-            exit_readiness("jupiter", &approved, &no_carriers).unwrap_err(),
+            exit_readiness("fleet-host-1", &approved, &no_carriers).unwrap_err(),
             "exit node has no live carrier yet"
         );
 
@@ -6829,7 +6832,7 @@ mod tests {
                 Instant::now(),
             ),
         );
-        let (rid, _np, pk) = exit_readiness("jupiter", &approved, &carriered).unwrap();
+        let (rid, _np, pk) = exit_readiness("fleet-host-1", &approved, &carriered).unwrap();
         assert_eq!(rid, id);
         assert_eq!(pk, [7u8; 32]);
     }
@@ -6841,8 +6844,8 @@ mod tests {
         assert!(exit_node_status(None, &st).is_none());
         // Configured + withheld surfaces the reason.
         st.withheld_reason = Some("exit node has no live carrier yet".into());
-        let w = exit_node_status(Some("jupiter"), &st).unwrap();
-        assert_eq!(w.selector, "jupiter");
+        let w = exit_node_status(Some("fleet-host-1"), &st).unwrap();
+        assert_eq!(w.selector, "fleet-host-1");
         assert!(!w.active);
         assert_eq!(
             w.withheld_reason.as_deref(),
@@ -6852,23 +6855,31 @@ mod tests {
         assert!(!w.v6_active);
         // Active but v6 undecided/fail-closed → active, v6 off.
         st.split_default_installed = true;
-        let a = exit_node_status(Some("jupiter"), &st).unwrap();
+        let a = exit_node_status(Some("fleet-host-1"), &st).unwrap();
         assert!(a.active);
         assert!(a.withheld_reason.is_none());
         assert!(!a.v6_active);
         // Active AND v6 enabled → both on.
         st.v6_active = Some(true);
-        let a6 = exit_node_status(Some("jupiter"), &st).unwrap();
+        let a6 = exit_node_status(Some("fleet-host-1"), &st).unwrap();
         assert!(a6.active && a6.v6_active);
         // Active but v6 fail-closed → v4 on, v6 off.
         st.v6_active = Some(false);
-        assert!(!exit_node_status(Some("jupiter"), &st).unwrap().v6_active);
+        assert!(
+            !exit_node_status(Some("fleet-host-1"), &st)
+                .unwrap()
+                .v6_active
+        );
         // S4b — DNS steered surfaces only while active.
         st.dns_steered = true;
-        let d = exit_node_status(Some("jupiter"), &st).unwrap();
+        let d = exit_node_status(Some("fleet-host-1"), &st).unwrap();
         assert!(d.active && d.dns_steered);
         // Not active → dns_steered is never reported true (masked like v6).
         st.split_default_installed = false;
-        assert!(!exit_node_status(Some("jupiter"), &st).unwrap().dns_steered);
+        assert!(
+            !exit_node_status(Some("fleet-host-1"), &st)
+                .unwrap()
+                .dns_steered
+        );
     }
 }

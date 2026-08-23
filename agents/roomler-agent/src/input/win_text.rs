@@ -276,7 +276,7 @@ pub(super) fn type_text(text: &str) {
     // computes the shift state assuming CapsLock OFF, so when it's ON we flip the
     // shift bit for ALPHABETIC chars (CapsLock only affects letters). Non-letters
     // and the Unicode fallback are unaffected. Hosts with CapsLock off (e.g.
-    // PC50045) read `false` here → no change.
+    // WINHOST-A) read `false` here → no change.
     let caps = capslock_on(fg_tid);
     let mut switches_this_call: u32 = 0;
     for c in text.chars() {

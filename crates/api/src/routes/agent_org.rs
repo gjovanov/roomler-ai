@@ -1,7 +1,7 @@
 //! Multi-org — add an ALREADY-ENROLLED device to a second organization from
 //! the admin UI, without touching the machine.
 //!
-//! Field 2026-08-05: the multi-org fleet test could not finish on PC50045 (a
+//! Field 2026-08-05: the multi-org fleet test could not finish on WINHOST-A (a
 //! corp-managed Windows box) purely because every path to a second enrollment
 //! ran through a shell on the device. This is that path, remote:
 //!
@@ -87,7 +87,7 @@ pub struct JoinOrgResponse {
 /// process restarts, because the primary org's loop already holds the
 /// adapter's (single-session-only) Wintun handle.
 ///
-/// Field 2026-08-07, PC50045: without this, the click reported plain success
+/// Field 2026-08-07, WINHOST-A: without this, the click reported plain success
 /// while the device logged `WintunStartSession failed "Failed to register
 /// rings"` on every reconnect. The join was fine; the promise wasn't.
 pub fn needs_restart_for_tun(overlay_mode: Option<&str>, caps_multi_org: &[String]) -> bool {
@@ -386,7 +386,7 @@ mod tests {
         let single = caps(&["join"]);
         let muxed = caps(&["join", "tun"]);
 
-        // The case that burned PC50045: tun asked of a single-org daemon.
+        // The case that burned WINHOST-A: tun asked of a single-org daemon.
         assert!(needs_restart_for_tun(Some("tun"), &single));
         assert!(
             needs_restart_for_tun(Some(" TUN "), &single),

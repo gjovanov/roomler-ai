@@ -270,7 +270,7 @@ impl TunnelPeer {
 /// because the ICE agent's sockets belong to spawned tasks rather than to
 /// this struct, dropping the `Arc` freed nothing.
 ///
-/// Measured on neo16 the day this was found: `roomlerd` held **15,446 UDP
+/// Measured on devbox the day this was found: `roomlerd` held **15,446 UDP
 /// sockets** after 12 h — 10,367 of them on `0.0.0.0:5353`, the rest one per
 /// local address per leaked agent — which is the entire 16,384-port ephemeral
 /// range. Every socket allocation on the host then failed with `WSAENOBUFS`,

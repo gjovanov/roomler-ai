@@ -7,7 +7,7 @@
 > TURNS/TCP head-of-line blocking.
 >
 > Status: **DESIGN — no code yet.** Finalize against two field inputs due
-> after the next VPN-on window on pc50045: (1) W5 phase-2 — does the
+> after the next VPN-on window on winhost-a: (1) W5 phase-2 — does the
 > grandfathered DIRECT-socket mapping survive VPN connect? (2) how does
 > QUIC-over-TURN behave when only the anchor's client leg is TCP?
 >
@@ -20,7 +20,7 @@
 
 ## 1. The network this is for
 
-Check Point-class corp VPNs (pc50045, field-proven 2026-08-14) block
+Check Point-class corp VPNs (winhost-a, field-proven 2026-08-14) block
 **every fresh outbound UDP flow** — any port, any destination, including
 DNS — while **grandfathering flows that already exist** in the session
 table, as long as ~20–25 s keepalives keep them assured. Consequences
@@ -108,12 +108,12 @@ warm manager needs a **pair-less grant**:
 1. `overlay_warm_relay` config key (tribool, default **OFF**) + full
    config-surface plumbing.
 2. **Stage 1 — establish + keep alive only** (no pairing use): field-gate
-   on pc50045 = the allocation survives a VPN connect (refresh keeps
+   on winhost-a = the allocation survives a VPN connect (refresh keeps
    succeeding over the grandfathered flow; `relay warm R=<addr> age=<h>`
    in status). Measurement-only, like every stage-1 in this program.
 3. **Stage 2 — anchor prefers the warm allocation** for new pairs when
    live; per-pair allocation stays as fallback. Field-gate: VPN-on
-   pc50045 pairs read `relay:turn/udp` (not `tcp`), and the disco
+   winhost-a pairs read `relay:turn/udp` (not `tcp`), and the disco
    `rtt_tail` p95 for those pairs drops to the UDP baseline.
 4. **Stage 3 — QUIC-over-warm** (the endpoint refactor), only if stage-2
    raw shows the TCP-leg HoL is otherwise still visible end-to-end.

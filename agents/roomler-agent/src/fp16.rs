@@ -1,6 +1,6 @@
 //! FP16 (scRGB) → BGRA8 sRGB pixel conversion for ACM / HDR desktops.
 //!
-//! ## Why (field DESKTOP-V6FJE58, 2026-07-23)
+//! ## Why (field WINHOST-F, 2026-07-23)
 //!
 //! Windows 11 Auto Color Management (ACM; Settings → Display → Advanced
 //! display → "Automatically manage color for apps") makes the DWM composite

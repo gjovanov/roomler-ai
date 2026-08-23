@@ -17,7 +17,7 @@
  *   E2E_BASE_URL=https://roomler.ai \
  *   E2E_TENANT_ID=<hex24> E2E_AGENT_ID=<hex24> \
  *   E2E_UPLOAD_FILE=/path/to/payload.pdf \
- *   bunx playwright test remote-upload-pc50045 --headed --reporter=list
+ *   bunx playwright test remote-upload-winhost-a --headed --reporter=list
  * ```
  *
  * **Why headed**: WebRTC peer connections need a real Chrome

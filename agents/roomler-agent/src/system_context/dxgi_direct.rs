@@ -11,7 +11,7 @@
 //! can bind Desktop Duplication to the render-only dGPU; `DuplicateOutput`
 //! then fails (the dGPU owns no output to duplicate) and the capture pump
 //! falls through to the slow GDI BitBlt path (~85 ms/frame ⇒ ~12 fps).
-//! Field host PC55331 (rc.105 telemetry: `backend=gdi`, Intel owns the
+//! Field host WINHOST-B (rc.105 telemetry: `backend=gdi`, Intel owns the
 //! primary output, NVIDIA reports 0 outputs, `scrap::Capturer::new:
 //! permission denied`) is the motivating case.
 //!
@@ -25,7 +25,7 @@
 //!      the primary output — so on Optimus we bind to the iGPU, exactly
 //!      where the display lives, and DXGI stays on the fast path.
 //!
-//! On an Intel-only host (PC50054, already 62 fps via the scrap path) the
+//! On an Intel-only host (WINHOST-E, already 62 fps via the scrap path) the
 //! primary-output adapter IS the only adapter, so this backend binds to
 //! the same GPU `scrap` would have — no behaviour change, just an explicit
 //! adapter handle.
@@ -359,7 +359,7 @@ impl DxgiDirectBackend {
     /// ACM/HDR desktop composition format) is ACCEPTED since rc.207 and
     /// converted to sRGB BGRA8 per frame via [`crate::fp16`] — critically,
     /// this backend must own that case because the scrap fallback misreads
-    /// FP16 surfaces as BGRA8 (field DESKTOP-V6FJE58: purple 2×-zoomed
+    /// FP16 surfaces as BGRA8 (field WINHOST-F: purple 2×-zoomed
     /// flicker on every recomposited frame).
     pub fn primary() -> Result<Self, BackendBail> {
         unsafe {
@@ -407,7 +407,7 @@ impl DxgiDirectBackend {
                 // composites in scRGB (Settings → Display → Advanced display →
                 // "Automatically manage color for apps", or true HDR). Costs a
                 // few ms/frame of CPU convert; turning ACM/HDR off on the host
-                // removes it. Field: DESKTOP-V6FJE58 purple-flicker incident.
+                // removes it. Field: WINHOST-F purple-flicker incident.
                 tracing::warn!(
                     width,
                     height,
@@ -952,7 +952,7 @@ impl DxgiDirectBackend {
 
 impl DxgiCapture for DxgiDirectBackend {
     fn frame(&mut self, output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail> {
-        // Phase B field fix (2026-08-21, pc50045/clk): a refine Up flips the
+        // Phase B field fix (2026-08-21, winhost-a/corplap): a refine Up flips the
         // cap Some→None while the desktop is AT REST — but every real frame
         // delivered under the rung was GPU-scaled, so the pump's keepalive
         // holds no native pixels and the "crisp native IDR" can never ship

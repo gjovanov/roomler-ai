@@ -182,7 +182,7 @@ pub fn maybe_intercept(
         let ctx = ctx.clone();
         let dev = inner(ip, nm, mtu)?;
         // Loud about the one case where switching this on changes who answers
-        // an address that already had a server: `neo16` (sshd bound to the
+        // an address that already had a server: `devbox` (sshd bound to the
         // overlay IP) and the Linux boxes (sshd on `0.0.0.0:22`).
         warn_if_os_listener(ip, port);
 

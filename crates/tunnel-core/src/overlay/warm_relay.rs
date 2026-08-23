@@ -31,7 +31,7 @@ pub(crate) const PROBE_SPACING: Duration = Duration::from_secs(60);
 /// Which transport the warm leg rides. Stage 2 (PR-A): UDP is still
 /// preferred — the corp-VPN flow-grandfathering measurement (stage 1's
 /// whole point) only exists on a UDP leg — but a strict-corp host whose
-/// fresh UDP is dead on every path (field pc50045: CP desktop policy
+/// fresh UDP is dead on every path (field winhost-a: CP desktop policy
 /// blocks ALL fresh outbound UDP incl. 443) gets a TURNS/TCP:443 leg
 /// instead: it rides the same middlebox TLS path the control WS does and
 /// SURVIVES a VPN capture, which is exactly what a standing failover leg
@@ -76,7 +76,7 @@ pub(crate) enum WarmTransition {
     EstablishFailed,
     ProbeOk,
     /// One probe failed but the 2-strike rule is tolerating it (field
-    /// 2026-08-15, pc55331 on VPN: a single lost CreatePermission round
+    /// 2026-08-15, winhost-b on VPN: a single lost CreatePermission round
     /// trip cycled a healthy allocation at 09:52Z).
     ProbeMissed,
     Lost,

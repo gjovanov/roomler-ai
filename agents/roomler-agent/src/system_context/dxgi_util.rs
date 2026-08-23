@@ -1,7 +1,7 @@
 //! DXGI adapter + output enumeration for the SystemContext capture path.
 //!
 //! Phase 0 (rc.105) — DIAGNOSTICS for the hybrid-GPU ("Optimus")
-//! slow-capture bug. Field host PC55331 (Intel iGPU drives the display +
+//! slow-capture bug. Field host WINHOST-B (Intel iGPU drives the display +
 //! NVIDIA RTX PRO 3000 dGPU render-only; SystemContext) caps HEVC-over-DC
 //! at ~12 fps because the capture grab itself takes ~85 ms/frame — the
 //! signature of the GDI BitBlt fallback (capture_pump swaps DXGI→GDI

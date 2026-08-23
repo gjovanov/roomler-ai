@@ -81,7 +81,7 @@ export const RC_RECONNECT_STEADY_MS = 8000
  * connection — so the backoff never grew and the retry ran at fixed rate
  * forever.
  *
- * Field 2026-08-07: a controller left pointed at pc50045, whose Check Point
+ * Field 2026-08-07: a controller left pointed at winhost-a, whose Check Point
  * profile leaves it with no usable ICE candidate, produced **388 sessions in
  * 24 h** — each connecting, running ~10.9 s of dead air, and dying. The other
  * hosts in the same office logged 3 and 4.
@@ -179,7 +179,7 @@ export type ReadyRecoveryAction = 'proceed' | 'ignore' | 'reschedule' | 'fail'
  * Decision for an inbound `rc:ready`. The old handler silently returned on
  * `!pc` or a gate mismatch, which parked the UI in `awaiting_consent`
  * FOREVER when the server's reply won a race against a client teardown
- * (2026-08-05 pc50045 incident: consent granted server-side, Ready
+ * (2026-08-05 winhost-a incident: consent granted server-side, Ready
  * processed by nobody, session stuck in Negotiating, operator stuck at
  * "awaiting consent"). Gate mismatch = stale session, ignore; a missing
  * PeerConnection with retry args = reschedule through the ladder; without
@@ -1708,7 +1708,7 @@ export interface AutoTransportInputs {
 
 /** rc.190 Ã¢ÂÂ pure HWÃÂHW transport rank for `videoTransport === 'auto'`.
  *
- *  Field lesson (2026-07-16, GEAL8N6/NEO16 Ã¢ÂÂ PC50045): VP9 is
+ *  Field lesson (2026-07-16, GEAL8N6/DEVBOX Ã¢ÂÂ WINHOST-A): VP9 is
  *  software-ENCODED on almost every host (only Intel Gen11+ iGPUs have
  *  VP9 encode silicon; NVIDIA/AMD never shipped it), and HEVC/AV1 can be
  *  software-DECODED on the viewer Ã¢ÂÂ a codec is only smooth when it's
@@ -2004,7 +2004,7 @@ export function parseLocalRelayDescriptor(raw: unknown): LocalRelayDescriptor | 
 /** 2026-07-24 decode-stall A/B Ã¢ÂÂ experimental override for the DC decode
  *  workers' `VideoDecoder.hardwareAcceleration`. localStorage
  *  `roomler-rc-decode-pref`: `'software'` | `'hardware'` | unset
- *  (`no-preference`, today's behaviour). Field context: NEO16 viewing PC50045
+ *  (`no-preference`, today's behaviour). Field context: DEVBOX viewing WINHOST-A
  *  hits 3-5 s mid-session decoder stalls (Mbps > 0, decoded fps Ã¢ÂÂ 0, then a
  *  catch-up burst) on BOTH HEVC and VP9 with the agent proven healthy Ã¢ÂÂ
  *  suspect Chrome's GPU-process decode on the hybrid-GPU laptop. Setting
@@ -5163,7 +5163,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, 1)
         // rc.100 Ã¢ÂÂ the worker now reports the CODED size as width/height and
         // forwards coded/display/visibleRect for field diagnosis. Logging the
-        // gap localises the NVDEC HEVC dim mismatch (GORAN-XMG-NEO16: agent
+        // gap localises the NVDEC HEVC dim mismatch (DEVBOX: agent
         // encodes 2560ÃÂ1600 but display came out 1280ÃÂ720).
         console.info(
           '[rc] hevc first frame', msg.width, 'x', msg.height,
@@ -5440,7 +5440,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     on('rc:session.created', (msg) => {
       // Only accept while we actually have a request in flight Ã¢ÂÂ a
       // late/stale create must not resurrect an abandoned attempt.
-      // (2026-08-05 pc50045 wedge) ...but don't LEAK a rejected create:
+      // (2026-08-05 winhost-a wedge) ...but don't LEAK a rejected create:
       // the server holds a live session pinned to the agent until someone
       // terminates it (previously it survived until the next request's
       // orphan reap or the consent timeout).
@@ -5479,7 +5479,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       clearSignalingTimeout()
     })
     on('rc:ready', async (msg) => {
-      // (2026-08-05 pc50045 wedge) NEVER drop rc:ready silently: the server
+      // (2026-08-05 winhost-a wedge) NEVER drop rc:ready silently: the server
       // is now in Negotiating and sends nothing further, so a dropped Ready
       // used to park the UI in 'awaiting_consent' forever. Stale-session
       // Readys are ignored; a Ready whose PeerConnection lost a race
@@ -5622,7 +5622,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // session (e.g. session_not_found for our own hangup). Ignore.
       if (phase.value === 'reconnecting') return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
-      // (2026-08-05 pc50045 wedge) An un-scoped transient (no session_id -
+      // (2026-08-05 winhost-a wedge) An un-scoped transient (no session_id -
       // e.g. agent_offline bounced by our own hangup for the PREVIOUS
       // session while the agent's WS flaps) passes the gate and used to
       // failWith a LIVE attempt mid-flight. With an attempt in flight,
@@ -6145,7 +6145,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // reaching `connected` is not proof the session works. A pair with no
         // usable ICE candidate connects every time and then sits in dead air
         // until the media watchdog kills it, so resetting here made the ladder
-        // restart at 250 ms forever (pc50045: 388 sessions/24 h). The media
+        // restart at 250 ms forever (winhost-a: 388 sessions/24 h). The media
         // watchdog clears both counters the moment a frame actually arrives,
         // which still gives a long-lived session that drops at hour 5 its
         // 250 ms first retry — that session had media.
@@ -7307,7 +7307,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // level so we can verify that the browser-side intrinsic dims
     // (videoElement.videoWidth/Height after the agent's auto-downscale
     // rebuild) match what the agent expects. The Crystal-Clear-OFF
-    // H.264 path on PC50045 still mis-positions and we suspect a
+    // H.264 path on WINHOST-A still mis-positions and we suspect a
     // race between the SDP-advertised native dims (1920ÃÂ1200) and
     // the actual first frame (1280ÃÂ800 post-downscale) Ã¢ÂÂ this log
     // captures intrinsicW/H + renderRect + computed norm so a single

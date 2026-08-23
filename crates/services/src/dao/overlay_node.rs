@@ -89,6 +89,38 @@ pub struct NewOverlayNode {
 }
 
 impl OverlayNodeDao {
+    /// Is `wg_public_key` already held by a LIVE node in this network that is
+    /// NOT `machine_id`?
+    ///
+    /// The WG public key arrives verbatim from the joining client and is then
+    /// used as an ADDRESSING key: `/derp` authorizes a registration by
+    /// comparing against the node row's key, and WireGuard itself keys peers by
+    /// pubkey. Without this check a second enrolled device in the same tenant
+    /// could join advertising ANOTHER device's key and black-hole its DERP
+    /// traffic (registration is last-writer-wins) or capture its peer entry.
+    /// Nothing proves possession of the private half, so uniqueness is the
+    /// cheap structural defence.
+    ///
+    /// Live-scoped: tombstones keep their key as the forensic record and must
+    /// not block a new joiner.
+    pub async fn wg_key_taken_by_other(
+        &self,
+        network_id: ObjectId,
+        wg_public_key: &str,
+        machine_id: &str,
+    ) -> DaoResult<bool> {
+        Ok(self
+            .base
+            .find_one(doc! {
+                "network_id": network_id,
+                "wg_public_key": wg_public_key,
+                "machine_id": { "$ne": machine_id },
+                "deleted_at": null,
+            })
+            .await?
+            .is_some())
+    }
+
     /// Insert a fresh node with a freshly-allocated overlay IP.
     pub async fn create(&self, new: NewOverlayNode) -> DaoResult<OverlayNode> {
         let NewOverlayNode {

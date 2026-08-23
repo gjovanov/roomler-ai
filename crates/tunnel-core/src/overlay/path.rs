@@ -108,7 +108,7 @@ impl PathMonMode {
     /// PR-D — `off|0|false` → Off, `shadow` → Shadow (the per-host revert
     /// rail), anything else (incl. unset, `on`, `1`, `true`) → **On**: the
     /// monitor is authoritative by default after two green 48 h soaks
-    /// (soak #1 shadow-parity on rc.246; soak #2 fleet shadow + neo16
+    /// (soak #1 shadow-parity on rc.246; soak #2 fleet shadow + devbox
     /// ON-pilot on rc.271/272 — harmful 0, steady 0–0.05 % throughout,
     /// incl. a fleet-wide server-churn incident absorbed mid-soak).
     pub(crate) fn parse(v: Option<&str>) -> Self {
@@ -1665,7 +1665,7 @@ mod tests {
     /// LATER than the spacing pin: the pin never binds, and the effective
     /// cadence is `deadline + H_ORDINARY`, not 60 s.
     ///
-    /// Field 2026-08-13: pc50045's LAN probes retried every ~90 s, not 60 s,
+    /// Field 2026-08-13: winhost-a's LAN probes retried every ~90 s, not 60 s,
     /// and reconciling that by hand from timestamps took longer than the
     /// incident it was buried in. This pins the real relationship so a future
     /// reader does not re-derive it — and so any cadence tuning has to state

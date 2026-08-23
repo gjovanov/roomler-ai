@@ -1,7 +1,7 @@
 /**
  * Phase 2 — browser-driven remote-control smoke against the Phase 1
  * `agent-e2e` harness. Replaces the manual `.cred`-driven
- * `remote-upload-pc50045.spec.ts` workflow with a fully-CI version
+ * `remote-upload-winhost-a.spec.ts` workflow with a fully-CI version
  * that talks to the in-cluster agents the Phase 1 chunk wired up.
  *
  * **Skip-conditions** (each independent so the spec is safe to ship
@@ -34,7 +34,7 @@
  *    compile `--features enigo-input` (no X server in the Pod), so
  *    inputs are silently dropped by the agent's input pump. Phase 3
  *    handles this either via an Xvfb sidecar or a Windows agent.
- *  - File-DC upload — covered by remote-upload-pc50045.spec.ts
+ *  - File-DC upload — covered by remote-upload-winhost-a.spec.ts
  *    against PROD; Phase 3 promotes that to the CI fixture agent.
  */
 import { test, expect, type Page } from '@playwright/test'

@@ -14,7 +14,7 @@
 //! 15.6 ms granularity the floor sleep AND the per-frame capture oneshot
 //! round-trip (`SystemContextCapture::next_frame`: mpsc cmd → worker
 //! thread → scrap `frame()` 0.85 ms → oneshot reply → tokio reschedule)
-//! both round *up* to 15.6 ms ticks. Field data (PC50054, 2026-05-30)
+//! both round *up* to 15.6 ms ticks. Field data (WINHOST-E, 2026-05-30)
 //! showed the round-trip ballooning to ~45 ms/frame under motion despite
 //! the worker-side scrap call measuring 0.85 ms — i.e. ~44 ms was pure
 //! timer/scheduler quantization. Result: ~12 fps under motion.

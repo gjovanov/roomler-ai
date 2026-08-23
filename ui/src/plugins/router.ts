@@ -235,7 +235,14 @@ router.beforeEach((to, _from, next) => {
     if (pendingInvite) {
       sessionStorage.removeItem('pending_invite_code')
       next({ name: 'invite', params: { code: pendingInvite } })
-    } else if (pendingRedirect && pendingRedirect.startsWith('/')) {
+    } else if (
+      // Same-origin paths ONLY: `startsWith('/')` alone also admits the
+      // protocol-relative `//evil.com` / `/\evil.com` open-redirect forms.
+      pendingRedirect &&
+      pendingRedirect.startsWith('/') &&
+      !pendingRedirect.startsWith('//') &&
+      !pendingRedirect.startsWith('/\\')
+    ) {
       sessionStorage.removeItem('pending_redirect')
       next(pendingRedirect)
     } else {

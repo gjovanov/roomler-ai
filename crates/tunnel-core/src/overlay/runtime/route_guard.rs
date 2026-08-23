@@ -67,13 +67,13 @@ pub(super) enum Defend {
     /// `/128` and the connected ULA `/96`: EVICTION-ONLY
     /// ([`TunIo::defend_self_route`]). Re-adding our own address via the TUN
     /// risks a forwarding loop; Windows' on-link route serves local delivery
-    /// the moment the competitor is gone (field-proven on pc50045).
+    /// the moment the competitor is gone (field-proven on winhost-a).
     EvictSelf(Ipv4Addr),
     /// Change B — the block-floor maintenance step
     /// ([`TunIo::defend_block_floor`]): assert the four `plen+2` sub-prefixes
     /// of the connected overlay block (a corp VPN's `/11` out-specifics both
     /// the connected `/10` and the rc.288 metric-0 defense, so absent-`/32`
-    /// traffic leaked to the CORP GATEWAY — field 2026-08-08, pc50045), or
+    /// traffic leaked to the CORP GATEWAY — field 2026-08-08, winhost-a), or
     /// actively retract them when the host's own uplink sits inside the block
     /// (the ISP-CGNAT self-wedge gate — decided per wave, inside the detached
     /// task, off the select loop).

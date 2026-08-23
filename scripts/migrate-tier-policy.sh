@@ -156,10 +156,10 @@ wait_pod_on_node() {
 }
 
 # ======================================================================
-# tickytack — to worker-3 (jupiter HP), fresh init
+# tickytack — to worker-3 (fleet-host-1 HP), fresh init
 # ======================================================================
 echo
-echo "--- tickytack -> jupiter (worker-3), fresh init ---"
+echo "--- tickytack -> fleet-host-1 (worker-3), fresh init ---"
 delete_pvc tickytack mongodb-data
 delete_pv  tickytack-mongodb-pv
 make_pv    tickytack-mongodb-pv mongodb tickytack 5Gi /data/tickytack/mongodb k8s-worker-3 mongodb-data
@@ -169,10 +169,10 @@ remove_hostname_pin "$DEPLOY_PARENT"/tickytack-deploy/k8s/base/statefulset-mongo
 push_deploy "$DEPLOY_PARENT"/tickytack-deploy 'feat(scheduling): unpin worker-1; tier=high-performance overlay handles placement (M5 migration)'
 
 # ======================================================================
-# roomler-old — to worker-2 (zeus HP), fresh init
+# roomler-old — to worker-2 (fleet-host-2 HP), fresh init
 # ======================================================================
 echo
-echo "--- roomler-old -> zeus (worker-2), fresh init ---"
+echo "--- roomler-old -> fleet-host-2 (worker-2), fresh init ---"
 delete_pvc roomler mongodb-data
 delete_pvc roomler roomler-uploads
 delete_pv  roomler-mongodb-pv
@@ -190,10 +190,10 @@ done
 push_deploy "$DEPLOY_PARENT"/roomler-deploy 'feat(scheduling): unpin worker-1; tier=high-performance overlay handles placement (M5 migration)'
 
 # ======================================================================
-# bauleiter — to worker-1 (mars utility), data restored from backup
+# bauleiter — to worker-1 (buildhost utility), data restored from backup
 # ======================================================================
 echo
-echo "--- bauleiter -> mars (worker-1), with mongo + uploads restore ---"
+echo "--- bauleiter -> buildhost (worker-1), with mongo + uploads restore ---"
 delete_pvc bauleiter mongodb-data
 delete_pvc bauleiter bauleiter-uploads
 delete_pv  bauleiter-mongodb-pv
@@ -212,7 +212,7 @@ if [ -f /tmp/tier-patch.tmpl ] && ! grep -q '^patches:' "$KUST"; then
   echo "OVERLAY bauleiter-deploy: added tier=utility patch"
 fi
 
-push_deploy "$DEPLOY_PARENT"/bauleiter-deploy 'feat(scheduling): repin worker-1 + tier=utility (M5 migration jupiter->mars)'
+push_deploy "$DEPLOY_PARENT"/bauleiter-deploy 'feat(scheduling): repin worker-1 + tier=utility (M5 migration fleet-host-1->buildhost)'
 
 wait_pod_on_node bauleiter app=mongodb k8s-worker-1 300
 
@@ -245,10 +245,10 @@ else
 fi
 
 # ======================================================================
-# regal — to worker-1 (mars utility), data restored from backup
+# regal — to worker-1 (buildhost utility), data restored from backup
 # ======================================================================
 echo
-echo "--- regal -> mars (worker-1), with data + uploads restore ---"
+echo "--- regal -> buildhost (worker-1), with data + uploads restore ---"
 delete_pvc regal regalbg-data
 delete_pvc regal regalbg-uploads
 delete_pv  regal-regalbg-data-pv
@@ -258,7 +258,7 @@ make_pv    regal-regalbg-uploads-pv regalbg regal 1Gi /data/arse/regalbg-uploads
 make_pvc   regal regalbg-data    regal-regalbg-data-pv    1Gi
 make_pvc   regal regalbg-uploads regal-regalbg-uploads-pv 1Gi
 change_hostname_pin "$DEPLOY_PARENT"/regal-deploy/k8s/base/deployment-regalbg.yaml k8s-worker-1
-push_deploy "$DEPLOY_PARENT"/regal-deploy 'feat(scheduling): repin worker-1 (M5 migration jupiter->mars)'
+push_deploy "$DEPLOY_PARENT"/regal-deploy 'feat(scheduling): repin worker-1 (M5 migration fleet-host-1->buildhost)'
 
 wait_pod_on_node regal app=regalbg k8s-worker-1 300
 

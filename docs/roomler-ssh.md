@@ -12,7 +12,7 @@ audit log, host-key verification, the `roomler ssh` / `roomler proxy` clients,
 SFTP/scp, port forwarding, the device-reported session-activity log, and the
 admin UI for all of it.
 
-**Field-proven on `clk00017265`** (a corp-managed laptop with no `sshd`, all
+**Field-proven on `corplap-01`** (a corp-managed laptop with no `sshd`, all
 three firewall profiles enabled, and WSL holding loopback `:22`): a session
 opened through the full gate chain returns `orfnet\extjovanov` — the signed-in
 domain user — with **no listener bound on the SSH port** and no firewall rule
@@ -32,10 +32,10 @@ the fleet on 2026-08-19, by actually binding those addresses:
 
 | Host | `overlay:22` | Why |
 |---|---|---|
-| mars / zeus / jupiter | **EADDRINUSE**, on *both* orgs' addresses | `sshd` holds `0.0.0.0:22`, which covers every local address |
-| neo16 | **EADDRINUSE** | `sshd` is bound to `100.65.4.2:22` — the overlay address itself |
-| clk00017265 | free, but useless | no `sshd` at all (`OpenSSH.Server` capability is `NotPresent`, corp-managed), WSL's `wslrelay` holds loopback `:22`, and all three firewall profiles are enabled so a new listener needs a rule an ordinary user cannot add |
-| pc50045 / pc55331 | free | `sshd` installed but `Stopped/Manual` |
+| buildhost / fleet-host-2 / fleet-host-1 | **EADDRINUSE**, on *both* orgs' addresses | `sshd` holds `0.0.0.0:22`, which covers every local address |
+| devbox | **EADDRINUSE** | `sshd` is bound to `100.65.4.2:22` — the overlay address itself |
+| corplap-01 | free, but useless | no `sshd` at all (`OpenSSH.Server` capability is `NotPresent`, corp-managed), WSL's `wslrelay` holds loopback `:22`, and all three firewall profiles are enabled so a new listener needs a rule an ordinary user cannot add |
+| winhost-a / winhost-b | free | `sshd` installed but `Stopped/Manual` |
 
 On four of seven hosts a bound socket is impossible. So roomler takes the
 packets one layer lower, the way Tailscale does:
@@ -53,7 +53,7 @@ between them. Consequences:
 
 - **No port conflict.** `sshd` keeps `0.0.0.0:22`. Both serve, on different
   paths, on the same host.
-- **No firewall rule.** Nothing binds. clk's three enabled profiles are
+- **No firewall rule.** Nothing binds. corplap's three enabled profiles are
   irrelevant.
 - **Nothing for EDR to kill.** No new service and no new listening socket — the
   failure mode that parked `regal` outbound-only when Kaspersky terminated
@@ -82,13 +82,13 @@ first fragment only, every field bounds-checked, malformed input answered with
 
 ```bash
 roomler config set ssh_enabled true
-roomler config set ssh_authorized_keys "ssh-ed25519 AAAAC3Nz... goran@neo16"
+roomler config set ssh_authorized_keys "ssh-ed25519 AAAAC3Nz... goran@devbox"
 # restart to apply, then from any peer in the org:
 ssh -p 2222 roomler@100.65.4.30 -- whoami
 ```
 
 **Why 2222 and not 22.** Turning interception on for a port an OS daemon already
-serves changes *who answers* for mesh traffic to that address — on neo16 and the
+serves changes *who answers* for mesh traffic to that address — on devbox and the
 Linux boxes that would silently shadow the `sshd` the fleet SSHes into daily.
 2222 lets both coexist during migration; the daemon logs a warning when it
 detects an OS listener on the address and port it is taking over. Move a device
@@ -382,7 +382,7 @@ gets no key should say so rather than quietly falling back to TOFU.
 ⚠️ **The field tracks whether a host KEY is stored — not whether SSH is on**,
 and the converse does not hold. A device that ever had SSH enabled keeps
 `ssh_host_key` in its config afterwards, so it keeps publishing. Field-checked
-2026-08-21: jupiter reads `ssh_enabled = false` and still publishes the key
+2026-08-21: fleet-host-1 reads `ssh_enabled = false` and still publishes the key
 minted for the P4a test. That is harmless — a caller who dials a device that
 is not serving gets a connection refusal, not a verification failure — but do
 not read a non-empty value as "SSH is accepting sessions here". Whether a
@@ -395,8 +395,8 @@ so a device that switches SSH off stops advertising a key it no longer holds.
 ### `roomler ssh <device>` (P6b — shipped)
 
 ```
-roomler ssh pc50045
-roomler ssh pc50045 -- uptime
+roomler ssh winhost-a
+roomler ssh winhost-a -- uptime
 ```
 
 **It execs the system `ssh` rather than embedding a client.** What roomler adds
@@ -450,14 +450,14 @@ never parses an SFTP packet.
 `CreateProcessAsUserW`, whose streaming form currently only exists in the
 pty's pseudoconsole path — there is no pipes variant yet. Running the transfer
 as SYSTEM instead would be the dangerous answer, so it refuses and says so.
-Unix (all modes) and Windows-as-daemon work; **clk does not get scp yet.**
+Unix (all modes) and Windows-as-daemon work; **corplap does not get scp yet.**
 
 ⚠️ **No `sftp-server` binary ⇒ refuse**, naming what to install. The probe
 covers Debian/RHEL/Arch/macOS/Windows layouts; `ROOMLER_SFTP_SERVER` overrides
 for an unusual host. `sftp-server`'s stderr goes to the daemon log, never the
 channel — SFTP is binary and injected text corrupts a transfer.
 
-Field-proven 2026-08-22, mars → jupiter: an `sftp put` landed
+Field-proven 2026-08-22, buildhost → fleet-host-1: an `sftp put` landed
 `-rw-r--r-- root root` (matching `ssh_account_mode = daemon`), and `scp`
 round-tripped a file byte-identical in both directions.
 
@@ -494,7 +494,7 @@ roomler config set forward_acl '{"enabled":true,"allowlist":[
 error at `config set`, not a silent no-op, but the message won't tell you the
 shape.
 
-Field-proven 2026-08-22, neo16 → zeus (both rc.451), all four paths:
+Field-proven 2026-08-22, devbox → fleet-host-2 (both rc.451), all four paths:
 
 | attempt | result |
 |---|---|
@@ -607,7 +607,7 @@ is the row an operator is usually hunting for.
 Host *.roomler
   ProxyCommand roomler proxy %h %p
 
-scp report.pdf clk00017265.roomler:/tmp/
+scp report.pdf corplap-01.roomler:/tmp/
 ```
 
 Resolves a device **name** to its overlay address and pipes stdio. A literal
@@ -679,11 +679,11 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P5c | `ssh_account_mode` — key-list sessions obey an explicit identity instead of silently taking the daemon's | **shipped** rc.419, field-proven |
 | P5d | `SshPolicy.consent_mode` honoured — a policy of `prompt` now prompts, and refuses when nobody can be asked | **shipped** |
 | P4a | PTY / interactive shell on **Unix** (`openpty`, login shell, resize, group teardown) | **shipped** |
-| P4b | The same on **Windows** — ConPTY + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`. The platform that needs this most | **shipped** rc.429, field-proven on clk |
+| P4b | The same on **Windows** — ConPTY + `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` on `CreateProcessAsUserW`. The platform that needs this most | **shipped** rc.429, field-proven on corplap |
 | P6a | Devices publish their SSH host key; the server stores it and returns it with the grant, so a caller has something to verify against | **shipped** rc.444 |
-| P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, field-proven mars→clk |
+| P6b | `roomler ssh <name>` — ephemeral keypair → grant → verify against the published key → hand off to the system `ssh` | **shipped** rc.446, field-proven buildhost→corplap |
 | P6c | `roomler proxy` — stdio `ProxyCommand`, so stock `ssh`/`scp`/`rsync`/`git` reach devices BY NAME | **shipped** |
-| P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven mars→jupiter |
+| P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven buildhost→fleet-host-1 |
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
 | P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |

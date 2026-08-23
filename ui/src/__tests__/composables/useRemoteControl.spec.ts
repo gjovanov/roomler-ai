@@ -1764,7 +1764,7 @@ describe('rc-vp9-444-worker frame header', () => {
 })
 
 describe('leading-delta keyframe gate (rc.103)', () => {
-  // Locks the fix for the LAPTOP-P2TU89GB hevc_qsv failure: the HW decoder
+  // Locks the fix for the WINHOST-G hevc_qsv failure: the HW decoder
   // throws "A key frame is required after configure() or flush()" on a
   // leading delta, and the FFmpeg async encoder can ship a buffered delta
   // ahead of the DC-open IDR. The worker must DROP deltas until the first
@@ -1810,7 +1810,7 @@ describe('leading-delta keyframe gate (rc.103)', () => {
 })
 
 describe('classifyCrop — HEVC conformance-window handling', () => {
-  // Locks the DESKTOP-V6FJE58 fix: QSV codes a 1920×1080 desktop as
+  // Locks the WINHOST-F fix: QSV codes a 1920×1080 desktop as
   // 1920×1088 + an 8-row bottom crop (alignment padding = per-frame junk).
   // The NVDEC-bug rewrap (rc.102) must NOT override that legit crop — doing
   // so painted the junk rows as a purple/blue band flickering during drags.
@@ -2177,7 +2177,7 @@ describe('deadAirDelayMs', () => {
 
   it('backs off to minutes once dead air is clearly the steady state', () => {
     // From the 3rd consecutive frameless session the pair almost certainly has
-    // no media path at all (pc50045: 388 sessions in 24 h, each ~10.9 s of
+    // no media path at all (winhost-a: 388 sessions in 24 h, each ~10.9 s of
     // dead air). Retrying every ~19 s buys nothing.
     expect(deadAirDelayMs(3)).toBe(30_000)
     expect(deadAirDelayMs(4)).toBe(60_000)
@@ -2324,7 +2324,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     ...over,
   })
 
-  it('NEO16→capable-viewer pair picks AV1 (HW on both ends)', () => {
+  it('DEVBOX→capable-viewer pair picks AV1 (HW on both ends)', () => {
     const r = pickAutoTransport(
       base({
         agentTransports: ['data-channel-vp9-444', 'data-channel-hevc', 'data-channel-av1'],
@@ -2338,7 +2338,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     expect(r.transport).toBe('data-channel-av1')
   })
 
-  it('GEAL8N6→PC50045 pair picks HEVC (agent has NO AV1/VP9 HW encode)', () => {
+  it('GEAL8N6→WINHOST-A pair picks HEVC (agent has NO AV1/VP9 HW encode)', () => {
     // UHD 630 + GTX 1650: hevc_nvenc is the only HW DC encoder.
     const r = pickAutoTransport(
       base({

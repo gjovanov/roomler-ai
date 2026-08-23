@@ -140,13 +140,13 @@ truncated sample still ties to what ran.
 ### CLI
 
 ```bash
-roomler exec pc50045 -- Get-NetRoute -AddressFamily IPv4
-roomler exec neo16 --shell pwsh --timeout 60 -- Get-NetAdapter
-roomler exec pc50045 --json -- ipconfig /all
+roomler exec winhost-a -- Get-NetRoute -AddressFamily IPv4
+roomler exec devbox --shell pwsh --timeout 60 -- Get-NetAdapter
+roomler exec winhost-a --json -- ipconfig /all
 
 # canned evidence bundles
-roomler diag host pc50045
-roomler diag pair NEO16 pc50045
+roomler diag host winhost-a
+roomler diag pair DEVBOX winhost-a
 ```
 
 Exit status mirrors the remote command's, so `roomler exec` composes in a

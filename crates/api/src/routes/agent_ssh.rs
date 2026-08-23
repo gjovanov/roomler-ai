@@ -354,6 +354,20 @@ async fn decide(
 
     authorize(state, tenant_id, &gates, caller).await?;
 
+    // Ceiling, enforced AFTER the identity gates so a refusal is attributable
+    // (and audited by `dispatch`) rather than an anonymous throttle. This is
+    // the one place both the HTTP route and the device's `rc:ssh.request` leg
+    // pass through — the WS leg never touches the per-IP HTTP governor. It
+    // also protects the TARGET: the device's pending-grant table holds 16 and
+    // evicts the OLDEST, so an unthrottled caller could burst a legitimate
+    // caller's un-redeemed grant out of existence.
+    if !state
+        .ssh_rate_limiter
+        .check(caller.user_id, agent_id, ssh_limits::RATE_LIMIT_PER_MINUTE)
+    {
+        return Err(SshDenyReason::RateLimited);
+    }
+
     // Where to send them. A device can pass every gate and still be
     // unreachable — that is a different failure and says so.
     let node = match state
@@ -557,6 +571,27 @@ async fn http_caller(state: &AppState, auth: &AuthUser) -> Caller {
     }
 }
 
+/// Parse the tenant AND require the caller to be a member of it — the same
+/// cheap pre-check `agent_exec` performs, and for the same reason.
+///
+/// Gate 2 (`SSH_DEVICE`) is evaluated inside [`authorize`] so a refusal is
+/// AUDITED rather than a bare 403. Without this, a non-member still reached
+/// the device lookup, which distinguishes "agent exists" (200 + refusal) from
+/// "no such agent" (404) — a cross-tenant fleet-enumeration oracle — wrote
+/// attacker-timed rows into ANOTHER tenant's `ssh_audit`, and leaked whether
+/// that org had `remote_ssh_enabled`.
+async fn member_tenant(
+    state: &AppState,
+    tenant_id: &str,
+    auth: &AuthUser,
+) -> Result<ObjectId, ApiError> {
+    let tid = tenant_of(tenant_id).await?;
+    if !state.tenants.is_member(tid, auth.user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".into()));
+    }
+    Ok(tid)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Handlers
 // ────────────────────────────────────────────────────────────────────────────
@@ -571,7 +606,7 @@ pub async fn request_session(
     Path((tenant_id, agent_id)): Path<(String, String)>,
     Json(body): Json<SshRequestBody>,
 ) -> Result<Json<SshResponseBody>, ApiError> {
-    let tid = tenant_of(&tenant_id).await?;
+    let tid = member_tenant(&state, &tenant_id, &auth).await?;
     let agent = load_agent(&state, tid, &agent_id).await?;
     let caller = http_caller(&state, &auth).await;
     Ok(Json(
@@ -1011,7 +1046,7 @@ mod audit_tests {
         Granted {
             grant_id: "abc123".to_string(),
             address: "100.65.4.30".to_string(),
-            name: Some("clk".to_string()),
+            name: Some("corplap".to_string()),
             host_pubkey: Some("ssh-ed25519 AAAAC3Nz…".to_string()),
             expires_at_ms: 1,
             account_mode: SshAccountMode::ConsoleUser,
@@ -1235,7 +1270,7 @@ mod tests {
     #[test]
     fn only_ed25519_keys_are_accepted() {
         assert!(is_supported_public_key(
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterialHere00 goran@neo16"
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterialHere00 goran@devbox"
         ));
         // No comment is fine — `ssh-keygen -y` emits exactly this.
         assert!(is_supported_public_key(
@@ -1245,7 +1280,7 @@ mod tests {
         // RSA is refused on purpose: the `rsa` feature is off in the agent, so
         // accepting one here would mint a grant no device could ever redeem.
         assert!(!is_supported_public_key(
-            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQExampleKeyMaterial00 goran@neo16"
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQExampleKeyMaterial00 goran@devbox"
         ));
         assert!(!is_supported_public_key("ssh-ed25519"));
         assert!(!is_supported_public_key(""));
