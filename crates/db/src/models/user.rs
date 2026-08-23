@@ -5,7 +5,17 @@ use serde::{Deserialize, Serialize};
 pub struct User {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    /// The account's address, and a UNIQUE index — so whatever is here is
+    /// *reserved*. Only an address the account has PROVEN belongs here (a
+    /// password sign-up that completed activation, or an OAuth provider that
+    /// verified it). Everything else goes to `unverified_email`.
     pub email: String,
+    /// An address that was claimed but never proven: asserted by an OAuth
+    /// provider without a verification claim, or evicted from an account that
+    /// held it without proof. Kept for support and for a future claim flow —
+    /// deliberately NOT indexed and never a lookup key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified_email: Option<String>,
     pub username: String,
     pub display_name: String,
     pub avatar: Option<String>,
