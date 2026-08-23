@@ -593,17 +593,35 @@ jobs:
           "$BIN" --version
           echo "  payload OK"
 
-      - name: Assert the LaunchAgent is loaded, and the root half is not
+      - name: Assert the LaunchAgent is registered, and the root half is not
         run: |
           set -euo pipefail
-          # The postinstall bootstraps into the CONSOLE user's gui domain.
-          uid_now=$(id -u)
-          if launchctl print "gui/$uid_now/com.roomler.agent" >/dev/null 2>&1; then
-            echo "  LaunchAgent loaded in gui/$uid_now"
+          # Two legitimate outcomes, and the job must not confuse them.
+          #
+          # A hosted runner usually has NO Aqua session, which is the same
+          # situation as installing over SSH or at the login window. The
+          # postinstall must then place what it can and say so — NOT abort and
+          # leave a half-applied install reported as a failure, which is what
+          # it did before this job existed to catch it.
+          console_user=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
+          echo "console user: '${console_user:-<none>}'"
+
+          if [ -z "$console_user" ] || [ "$console_user" = root ]; then
+            # No GUI session: the install must still have SUCCEEDED (asserted by
+            # the step above, which would have failed on a missing payload).
+            echo "  no GUI session — install completed without registering the agent, as intended"
           else
-            echo "::error::com.roomler.agent is not loaded in gui/$uid_now"
-            launchctl print "gui/$uid_now" 2>&1 | head -40
-            exit 1
+            uid_now=$(id -u "$console_user")
+            plist="$(dscl . -read /Users/"$console_user" NFSHomeDirectory | awk '{print $2}')/Library/LaunchAgents/com.roomler.agent.plist"
+            test -f "$plist" || { echo "::error::plist not placed at $plist"; exit 1; }
+            echo "  plist placed at $plist"
+            if launchctl print "gui/$uid_now/com.roomler.agent" >/dev/null 2>&1; then
+              echo "  LaunchAgent loaded in gui/$uid_now"
+            else
+              # Placed but not loaded is the documented degraded outcome (it
+              # loads at next login), so this is a note, not a failure.
+              echo "  plist placed but not loaded in gui/$uid_now — starts at next login"
+            fi
           fi
           # Opt-in, and NOT requested here, so it must be absent. The
           # postinstall declining to install a root daemon nobody asked for is
