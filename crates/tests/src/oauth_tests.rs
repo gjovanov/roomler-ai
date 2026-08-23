@@ -1,5 +1,4 @@
 use crate::fixtures::test_app::TestApp;
-use serde_json::Value;
 
 #[tokio::test]
 async fn oauth_redirect_google_returns_302() {
