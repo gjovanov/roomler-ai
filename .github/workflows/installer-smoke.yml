@@ -578,6 +578,17 @@ jobs:
           pkgbuild --root payload --scripts scripts --identifier com.roomler.agent \
             --version "$VERSION" --install-location / dist/smoke.pkg
 
+          # Prove what is actually IN the package before installing it. The
+          # postinstall reads a plist out of the installed bundle, so a payload
+          # missing it fails the install with PackageKit's one opaque sentence
+          # and no clue whether the fault is the script or the staging.
+          echo "=== payload ==="
+          pkgutil --payload-files dist/smoke.pkg | sed -n '1,40p'
+          pkgutil --payload-files dist/smoke.pkg | grep -q 'Contents/Resources/com.roomler.agent.plist' \
+            || { echo "::error::the LaunchAgent plist is not in the payload"; exit 1; }
+          pkgutil --payload-files dist/smoke.pkg | grep -q 'usr/local/bin/roomler' \
+            || { echo "::error::the CLI is not in the payload"; exit 1; }
+
       - name: Install it
         run: sudo installer -verbose -pkg dist/smoke.pkg -target /
 
