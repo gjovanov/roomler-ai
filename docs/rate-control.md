@@ -51,6 +51,7 @@ Each DC video pump runs these, owned by `encode::governor::RateGovernor`
 | **Byte-budget queue gate** (rc.442) | bytes in flight vs `constrained_queue_ms` (450 ms) of the relay ceiling | skip producing a frame | every loop iteration |
 | **Viewer-rate divisor** (`encode::viewer_rate`) | browser's decoded-fps + struggling report | send every Nth frame | 1 s windows |
 | **Encode pressure + auto tier** (`encode::encode_pressure`) | avg encode ms | maxrate factor; long-edge cap when encode-bound | 2 s heartbeat |
+| **Goodput estimate** (`encode::goodput`, rc.453) | busy-period throughput from the send task | *none yet* — observed and reported only | folded on the 1 s window |
 
 Two rules keep them from stepping on each other:
 
@@ -110,12 +111,50 @@ All keys live in the agent config (`roomler config set …`) with
 | rc.445 | **No-flip motion**: dial rungs off, dial ceiling factors, motion-deferred QSV bitrate, send-epoch flush, proven-encoder fast path | The remaining ~1 s mid-drag freeze measured as the flip's blocking encoder open (865/654 ms) + mid-motion ladder rebuilds |
 | rc.446 | Deferral motion clock on any ≥4 KB frame | Light motion (GDI + AV1 window moves at 5–30 KB) slipped under the significance floor and let ladder rebuilds through mid-burst |
 
-## Roadmap: the measured-rate closed loop
+## The measured-rate closed loop
 
 The remaining constants (dial percentages, 450 ms budget, relay clamp) are
-open-loop. The planned `GoodputEstimator` (busy-period throughput sampling in
-the send task) will derive the effective budget `B = min(nominal, 0.85 × G)`
-per session, turning the ceiling, queue budget, HRD window (with a per-codec
-keyframe floor — the rc.442 lesson) and settle into measured quantities.
-Staged: observe-only telemetry first, then derivation behind a kill switch,
-then deletion of the tunables.
+open-loop: they key off a NOMINAL relay clamp while the variable that matters
+is what the session actually delivers. The AIMD only watches send-channel
+occupancy and SCTP absorbs the mismatch, so it parks at the ceiling and never
+learns the pipe — a field capture shows `target_bps=3000000` constant across a
+session delivering 1.75 Mbps.
+
+### Stage 0 — measured, reported, not yet consumed (rc.453)
+
+`encode::goodput::GoodputEstimator`, owned by the governor, folded on the
+existing 1 s viewer-window tick, reported in the heartbeat as `goodput_bps`
+and `goodput_samples=(accepted, rejected)`. **Read it against `target_bps` on
+the same line — the gap between them is the open-loop error.**
+
+The hard part is that *a fast sample is not evidence*. Handing a frame to SCTP
+is not delivering it: with buffer headroom a frame serialises in microseconds,
+which computes to an absurd rate and means only "at least this fast". So the
+measurement is taken across a **busy period** — an unbroken stretch where the
+send task always had another frame waiting — and only when that stretch lasted
+≥ 300 ms. A period that long can only end when the pipe drains, so its
+bytes-over-time *is* the drain rate. Shorter periods are **discarded, not
+down-weighted**, so no amount of idle traffic can bias the estimate upward.
+
+Two consequences, both intentional:
+
+- On an unbound link no period qualifies, so the estimate stays `None`,
+  everything falls back to the nominal band, and **direct sessions behave
+  exactly as before, by construction**. `accepted=0` with a large `rejected`
+  is the healthy signature there, not a wiring fault.
+- On relay sessions the at-rest polish traffic (~1.75 Mbps) keeps periods
+  alive, so the estimate survives an idle viewer.
+
+The EWMA is asymmetric — down fast (α 0.5), up slow (α 0.1): a VPN throttling
+mid-session is worth believing at once, one lucky burst is not proof the pipe
+grew. Confidence decays to `None` after 60 s without a qualifying sample, so a
+stale number can never outlive the conditions that produced it.
+
+### Stages 1–2 — planned
+
+`B = min(nominal, 0.85 × G)` becomes the effective budget, turning the ceiling,
+queue budget, HRD window (with a per-codec keyframe floor — the rc.442 lesson)
+and settle into measured quantities, behind a `measured_rate` kill switch with
+the current constants as the confidence-`None` fallback. Then the tunables are
+deleted. ⚠️ Measurement may only ever LOWER the clamp: the clamp also protects
+the TURN path.
