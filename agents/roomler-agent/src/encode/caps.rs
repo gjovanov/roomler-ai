@@ -752,7 +752,13 @@ fn rpc_caps() -> Vec<String> {
     // Named by VARIANT, not by string literal: the wire spelling lives in
     // exactly one place (`RpcCap::wire`) that both this producer and every
     // server-side consumer go through, so the two can no longer drift.
-    let mut caps = vec![RpcCap::Exec, RpcCap::Originate];
+    // `Config` is unconditional: understanding the frame is a property of the
+    // BUILD, not of any feature or local setting. Whether the device obeys it
+    // is a separate question answered by `remote_config_enabled` and by
+    // whether the frame arrived on the primary org's socket — advertising
+    // here must not imply either, or the server would read "will comply" from
+    // a verb that only means "will parse".
+    let mut caps = vec![RpcCap::Exec, RpcCap::Originate, RpcCap::Config];
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise
