@@ -1894,8 +1894,38 @@ jobs:
           cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
 
+          # Turn OFF bundle relocation. This is not a nicety.
+          #
+          # `pkgbuild --root` infers the .app as a BUNDLE COMPONENT and marks it
+          # relocatable by default. PackageKit then asks LaunchServices where a
+          # bundle with this identifier already lives and installs THERE,
+          # ignoring the payload path. Measured on a CI runner:
+          #
+          #   PackageKit: Applications/roomler-agent.app relocated to
+          #               Users/runner/work/.../payload/Applications/roomler-agent.app
+          #
+          # …i.e. it installed into the staging directory it had just been built
+          # from. On a user's Mac the same rule redirects the install to any
+          # indexed copy — an old one in ~/Downloads, a previous install in a
+          # different folder — while both launchd plists and the postinstall go
+          # on naming /Applications, so the install "succeeds" into a path
+          # nothing else references.
+          #
+          # Everything here installs to a fixed absolute path, so relocation is
+          # never wanted.
+          pkgbuild --analyze --root payload component.plist
+          i=0
+          while /usr/libexec/PlistBuddy -c "Print :$i:BundleIsRelocatable" component.plist >/dev/null 2>&1; do
+            /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" component.plist
+            i=$((i + 1))
+          done
+          [ "$i" -gt 0 ] || { echo "::error::pkgbuild --analyze found no bundle component to pin"; exit 1; }
+          echo "pinned $i bundle component(s) to their payload path"
+          plutil -p component.plist
+
           pkgbuild \
             --root payload \
+            --component-plist component.plist \
             --scripts scripts \
             --identifier com.roomler.agent \
             --version "$VERSION" \
