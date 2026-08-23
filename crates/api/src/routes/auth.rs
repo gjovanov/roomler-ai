@@ -236,7 +236,7 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
-    let user = if let Some(ref username) = body.username {
+    let lookup = if let Some(ref username) = body.username {
         state.users.find_by_username(username).await
     } else if let Some(ref email) = body.email {
         state.users.find_by_email(email).await
@@ -244,18 +244,32 @@ pub async fn login(
         return Err(ApiError::BadRequest(
             "Either username or email is required".to_string(),
         ));
-    }
-    .map_err(|_| ApiError::Unauthorized("Invalid credentials".to_string()))?;
+    };
 
-    let password_hash = user
-        .password_hash
+    // Every failure below answers with the SAME error after doing the SAME
+    // work. Previously an unknown account returned before any Argon2 verify
+    // (~tens of ms cheaper — a timing oracle for "is this address
+    // registered"), and an OAuth-only account answered "No password set",
+    // which states outright that the address exists. Both are account
+    // enumeration; the rate limiter throttles it but does not remove it.
+    let invalid = || ApiError::Unauthorized("Invalid credentials".to_string());
+    let user = lookup.ok().filter(|u| u.password_hash.is_some());
+    let hash = user
         .as_ref()
-        .ok_or_else(|| ApiError::Unauthorized("No password set".to_string()))?;
+        .and_then(|u| u.password_hash.as_deref())
+        .unwrap_or_else(|| dummy_password_hash(&state));
 
-    let valid = state.auth.verify_password(&body.password, password_hash)?;
-    if !valid {
-        return Err(ApiError::Unauthorized("Invalid credentials".to_string()));
-    }
+    // Verified even when the account is absent, so the Argon2 cost is paid on
+    // every path. `unwrap_or(false)`, not `?`: a stored hash that fails to
+    // parse must read as "wrong password", not as a 500 that distinguishes
+    // this account from a nonexistent one.
+    let valid = state
+        .auth
+        .verify_password(&body.password, hash)
+        .unwrap_or(false);
+    let Some(user) = user.filter(|_| valid) else {
+        return Err(invalid());
+    };
 
     if !user.is_verified {
         return Err(ApiError::Unauthorized(
@@ -293,6 +307,24 @@ pub async fn login(
     };
 
     Ok((headers, Json(response)))
+}
+
+/// A real Argon2 PHC string that no supplied password can match, computed
+/// once per process from a random secret.
+///
+/// Exists so the "no such account" branch of [`login`] performs the same
+/// Argon2 verification as the real one — without it, an unknown address
+/// answered measurably faster than a known one, which is an account-existence
+/// oracle. It is never compared against anything a caller controls, so the
+/// random input is only there to guarantee no one can pre-image it.
+fn dummy_password_hash(state: &AppState) -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        state
+            .auth
+            .hash_password(&uuid::Uuid::new_v4().to_string())
+            .unwrap_or_default()
+    })
 }
 
 /// `; Secure` in production, empty in dev — the session cookie is a full API

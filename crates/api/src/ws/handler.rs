@@ -132,14 +132,17 @@ async fn ws_upgrade_user(
     );
     let analytics_tenant = tid.as_deref().and_then(|t| ObjectId::parse_str(t).ok());
 
-    ws.on_upgrade(move |socket| async move {
-        let session =
-            crate::user_analytics::open_session(&state, user_id, analytics_tenant, &ua, ip).await;
-        handle_socket(socket, state.clone(), user_id, username, tid).await;
-        if let Some(id) = session {
-            crate::user_analytics::close_session(&state, id).await;
-        }
-    })
+    ws.max_message_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            let session =
+                crate::user_analytics::open_session(&state, user_id, analytics_tenant, &ua, ip)
+                    .await;
+            handle_socket(socket, state.clone(), user_id, username, tid).await;
+            if let Some(id) = session {
+                crate::user_analytics::close_session(&state, id).await;
+            }
+        })
 }
 
 fn ws_upgrade_tunnel_client(
@@ -194,7 +197,9 @@ fn ws_upgrade_tunnel_client(
         }
     };
 
-    ws.on_upgrade(move |socket| async move {
+    ws.max_message_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
         // Connect-time revocation check. Periodic re-check (every 60 s)
         // lives in `ws::tunnel::handle_tunnel_client_socket`.
         let client = match state
@@ -282,53 +287,55 @@ fn ws_upgrade_agent(
         }
     };
 
-    ws.on_upgrade(move |socket| async move {
-        // Verify the agent still exists and isn't quarantined/deleted before
-        // we pump any signalling. One Mongo read per connect is cheap and
-        // gives us a clean revocation story without needing a token blacklist.
-        let agent = match state.agents.find_in_tenant(tenant_id, agent_id).await {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(%agent_id, %e, "agent lookup failed on WS connect");
-                return;
-            }
-        };
-        if agent.deleted_at.is_some()
-            || matches!(
-                agent.status,
-                roomler_ai_remote_control::models::AgentStatus::Quarantined
-            )
-        {
-            // rc.53: push a `ServerMsg::Goodbye { reason: AgentDeleted }`
-            // text frame + a Close frame BEFORE dropping the socket so
-            // the agent can log a useful "your row was deleted, re-enrol"
-            // line instead of an opaque `ws read` (the failure mode
-            // WINHOST-B wedged on for hours pre-rc.53). The agent's
-            // `handle_server_msg::ServerMsg::Goodbye` arm decides this is
-            // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
-            // the SCM supervisor's rc.53 code-7 fast-alarm fires on the
-            // FIRST exit.
-            info!(%agent_id, "agent is quarantined or deleted; refusing WS with rc:goodbye");
-            let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
-                reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
-                message: "This agent's server-side row was deleted (or quarantined). \
+    ws.max_message_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(crate::ws::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            // Verify the agent still exists and isn't quarantined/deleted before
+            // we pump any signalling. One Mongo read per connect is cheap and
+            // gives us a clean revocation story without needing a token blacklist.
+            let agent = match state.agents.find_in_tenant(tenant_id, agent_id).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(%agent_id, %e, "agent lookup failed on WS connect");
+                    return;
+                }
+            };
+            if agent.deleted_at.is_some()
+                || matches!(
+                    agent.status,
+                    roomler_ai_remote_control::models::AgentStatus::Quarantined
+                )
+            {
+                // rc.53: push a `ServerMsg::Goodbye { reason: AgentDeleted }`
+                // text frame + a Close frame BEFORE dropping the socket so
+                // the agent can log a useful "your row was deleted, re-enrol"
+                // line instead of an opaque `ws read` (the failure mode
+                // WINHOST-B wedged on for hours pre-rc.53). The agent's
+                // `handle_server_msg::ServerMsg::Goodbye` arm decides this is
+                // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
+                // the SCM supervisor's rc.53 code-7 fast-alarm fires on the
+                // FIRST exit.
+                info!(%agent_id, "agent is quarantined or deleted; refusing WS with rc:goodbye");
+                let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
+                    reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
+                    message: "This agent's server-side row was deleted (or quarantined). \
                           Re-enrol with a fresh enrollment token from the admin UI to \
                           revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
-                    .into(),
-            };
-            send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
-            return;
-        }
-        crate::ws::remote_control::handle_agent_socket(
-            state,
-            socket,
-            agent_id,
-            tenant_id,
-            agent.owner_user_id,
-            tid,
-        )
-        .await;
-    })
+                        .into(),
+                };
+                send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
+                return;
+            }
+            crate::ws::remote_control::handle_agent_socket(
+                state,
+                socket,
+                agent_id,
+                tenant_id,
+                agent.owner_user_id,
+                tid,
+            )
+            .await;
+        })
 }
 
 /// rc.53: push a server-initiated close frame WITH a structured

@@ -39,9 +39,20 @@ jobs:
         run: brew install nasm
 
       - name: Build LGPL FFmpeg (shared, VideoToolbox, @rpath install names)
+        # The dispatch input reaches the script through the environment, never
+        # via `${{ }}` interpolation into the shell — interpolation pastes the
+        # raw value into the script text, so it would EXECUTE.
+        env:
+          INPUT_FFMPEG_REF: ${{ github.event.inputs.ffmpeg_ref }}
         run: |
           set -euo pipefail
-          REF="${{ github.event.inputs.ffmpeg_ref }}"
+          REF="${INPUT_FFMPEG_REF:-}"
+          # A git ref, not a shell fragment: it is interpolated into a clone
+          # below and must not carry metacharacters.
+          if [[ ! "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Invalid ffmpeg_ref: '${REF}'"
+            exit 1
+          fi
           git clone --depth 1 --branch "$REF" https://github.com/FFmpeg/FFmpeg.git ffsrc
           cd ffsrc
           echo "FFmpeg source: $(git describe --tags --always)"

