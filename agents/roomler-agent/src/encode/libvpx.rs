@@ -473,11 +473,23 @@ impl Vp9Encoder {
                 frame.height
             );
         }
-        let expected = (frame.width as usize) * (frame.height as usize) * 4;
+        // The SOURCE stride, not `width * 4`: a capture backend may hand us
+        // padded rows (macOS IOSurfaces routinely do), and reading them at the
+        // packed pitch shears the picture. The sibling backends have always
+        // passed `frame.stride` through — `encode/ffmpeg/encoder.rs` and
+        // `encode/mf/sync_pipeline.rs` — this one silently substituted
+        // `width * 4` and was the second half of the macOS distortion.
+        let src_stride = (frame.stride as usize).max((frame.width as usize) * 4);
+        // Size the floor off the ACTUAL stride. The old `width * height * 4`
+        // check passed on a padded buffer and then read past the last row.
+        let expected = src_stride * (frame.height as usize);
         if frame.data.len() < expected {
             bail!(
-                "vp9-444: BGRA buffer too small — need {} bytes, got {}",
+                "vp9-444: BGRA buffer too small — need {} bytes ({}x{} at stride {}), got {}",
                 expected,
+                frame.width,
+                frame.height,
+                src_stride,
                 frame.data.len()
             );
         }
@@ -497,7 +509,7 @@ impl Vp9Encoder {
             num_planes: 3,
         };
         let src_buffers: &[&[u8]] = &[&frame.data];
-        let src_strides = &[(frame.width * 4) as usize];
+        let src_strides = &[src_stride];
         let dst_buffers: &mut [&mut [u8]] =
             &mut [&mut self.y_plane, &mut self.u_plane, &mut self.v_plane];
         let dst_strides = &[self.width as usize, uv_stride, uv_stride];
@@ -865,5 +877,67 @@ mod tests {
     fn rejects_odd_dims() {
         assert!(Vp9Encoder::new(321, 240).is_err());
         assert!(Vp9Encoder::new(320, 241).is_err());
+    }
+
+    /// A padded source must convert to the same picture as a tight one.
+    ///
+    /// This converter substituted `width * 4` for `frame.stride` until
+    /// rc.454, which is half of why macOS rendered a sheared screen (the
+    /// other half was the capture backend inventing the stride). Every
+    /// synthetic frame in this file happens to be tightly packed, so the
+    /// substitution was indistinguishable from correct until a real
+    /// IOSurface — which pads — reached it.
+    ///
+    /// The padding is filled with a value that is NOT the picture colour on
+    /// purpose: if the stride is ignored, that filler bleeds into the output
+    /// and the planes diverge.
+    #[test]
+    fn honours_source_stride() {
+        let (w, h) = (32u32, 16u32);
+        let stride = (w as usize) * 4 + 28; // 28 bytes of row padding
+        let mut padded = vec![0xA5u8; stride * h as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let off = y * stride + x * 4;
+                padded[off] = 64; // B — must match synth_bgra
+                padded[off + 1] = 192; // G
+                padded[off + 2] = 128; // R
+                padded[off + 3] = 255; // A
+            }
+        }
+
+        let mut padded_frame = synth_bgra(w, h);
+        padded_frame.data = padded;
+        padded_frame.stride = stride as u32;
+
+        let mut from_padded = Vp9Encoder::new(w, h).expect("encoder init");
+        from_padded
+            .bgra_to_yuv(&padded_frame)
+            .expect("padded convert");
+
+        let mut from_tight = Vp9Encoder::new(w, h).expect("encoder init");
+        from_tight
+            .bgra_to_yuv(&synth_bgra(w, h))
+            .expect("tight convert");
+
+        assert_eq!(from_padded.y_plane, from_tight.y_plane, "Y plane differs");
+        assert_eq!(from_padded.u_plane, from_tight.u_plane, "U plane differs");
+        assert_eq!(from_padded.v_plane, from_tight.v_plane, "V plane differs");
+    }
+
+    /// The size floor must be computed from the ACTUAL stride. The old check
+    /// was `width * height * 4`, which a padded buffer one row short still
+    /// satisfies — and the converter then reads past the end.
+    #[test]
+    fn rejects_padded_buffer_that_is_short_a_row() {
+        let (w, h) = (32u32, 16u32);
+        let stride = (w as usize) * 4 + 28;
+        let mut frame = synth_bgra(w, h);
+        frame.stride = stride as u32;
+        // Big enough for the old `w*h*4` check, too small for the real rows.
+        frame.data = vec![0u8; stride * (h as usize - 1)];
+
+        let mut enc = Vp9Encoder::new(w, h).expect("encoder init");
+        assert!(enc.bgra_to_yuv(&frame).is_err());
     }
 }
