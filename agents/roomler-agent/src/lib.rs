@@ -47,6 +47,7 @@ pub mod lock_overlay;
 pub mod lock_state;
 pub mod logs_fetch;
 pub mod mdns_resolve;
+pub mod remote_config;
 // P5 — crate-private: its surface leans on `peer::TargetResolution`
 // (pub(crate)) and nothing outside the agent consumes it. Compiled on
 // every build so its pure logic unit-tests on the default feature set
