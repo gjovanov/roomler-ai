@@ -299,6 +299,39 @@ export interface SshAuditEntry {
   denied_message?: string | null
 }
 
+/** What a device REPORTED doing inside an SSH session (P8).
+ *
+ *  Distinct from {@link SshAuditEntry} on purpose: an audit row is the
+ *  server's own decision and is authoritative, while one of these is a claim
+ *  by a host that may be compromised or simply have reporting switched off.
+ *  Join the two on `grant_id`. */
+export type SshActivityKind =
+  | 'session_open'
+  | 'session_close'
+  | 'exec'
+  | 'shell'
+  | 'sftp'
+  | 'forward'
+
+export interface SshActivityEntry {
+  id?: string
+  agent_id: string
+  /** Correlates back to the `ssh_audit` decision that authorised the session.
+   *  Absent for a key-list session, which no grant backs. */
+  grant_id?: string | null
+  /** Principal as the DEVICE saw it — unverified. */
+  caller: string
+  kind: SshActivityKind
+  /** The command for `exec`, `host:port` for `forward`. Redacted and capped
+   *  on the device before it ever left the host. */
+  detail?: string | null
+  exit_code?: number | null
+  /** `false` when the DEVICE refused the action — a forward its `forward_acl`
+   *  did not permit. Those are the rows worth reading. */
+  allowed: boolean
+  at: string
+}
+
 /** A tenant member as returned by `GET /tenant/{id}/member` — enough to populate
  *  the owner-reassign picker + resolve `owner_user_id` to a name. */
 export interface TenantMember {
@@ -723,6 +756,25 @@ export const useAgentStore = defineStore('agents', () => {
     return { items: resp.items, total: resp.total }
   }
 
+  /** P8 — what devices reported doing inside their sessions.
+   *
+   *  `grantId` narrows to ONE session, which is how a reader gets from an
+   *  audit row ("who was let in") to what followed it. */
+  async function fetchSshActivity(
+    tenantId: string,
+    opts: { agentId?: string; grantId?: string; page?: number; perPage?: number } = {},
+  ): Promise<{ items: SshActivityEntry[]; total: number }> {
+    const q = new URLSearchParams()
+    if (opts.agentId) q.set('agent_id', opts.agentId)
+    if (opts.grantId) q.set('grant_id', opts.grantId)
+    q.set('page', String(opts.page ?? 1))
+    q.set('per_page', String(opts.perPage ?? 50))
+    const resp = await api.get<{ items: SshActivityEntry[]; total: number }>(
+      `/tenant/${tenantId}/ssh-activity?${q.toString()}`,
+    )
+    return { items: resp.items, total: resp.total }
+  }
+
   return {
     agents,
     total,
@@ -753,6 +805,7 @@ export const useAgentStore = defineStore('agents', () => {
     setOrgSshEnabled,
     updateSshPolicy,
     fetchSshAudit,
+    fetchSshActivity,
     execOnAgent,
     execOnFleet,
     cancelExec,
