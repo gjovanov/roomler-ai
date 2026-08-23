@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DisplayInfo, ExecPolicy, OsKind, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy, OsKind,
+    SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -55,6 +56,10 @@ impl AgentDao {
             // admin act, never a side effect of enrollment.
             exec_policy: ExecPolicy::default(),
             ssh_policy: SshPolicy::default(),
+            // Nothing requested until an operator asks for something
+            // (docs/remote-config.md). A freshly enrolled device must not
+            // arrive carrying a config intent nobody wrote.
+            desired_config: DesiredConfig::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
