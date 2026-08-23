@@ -216,10 +216,15 @@ async fn oauth_user_dao_does_not_duplicate_provider() {
     assert_eq!(user.oauth_providers.len(), 1);
 }
 
-/// nOAuth: an identity whose email the provider did NOT verify must get
-/// its OWN account, never inherit one that happens to share the address.
-/// Microsoft's multi-tenant endpoint returns a tenant-settable `mail`, so
-/// treating it as an account key was an account-takeover path.
+/// nOAuth: an identity whose email the provider did NOT verify must never
+/// inherit an account that happens to share the address. Microsoft's
+/// multi-tenant endpoint returns a tenant-settable `mail`, so treating it as
+/// an account key was an account-takeover path.
+///
+/// When the address is free it gets its own account; when the address is
+/// already taken it is REFUSED, because `users.email` is uniquely indexed and
+/// a second account for one address cannot exist. Either way the identity is
+/// never linked to the existing user, which is the takeover-relevant property.
 #[tokio::test]
 async fn unverified_oauth_email_never_links_into_an_existing_account() {
     let app = TestApp::spawn().await;
@@ -237,8 +242,18 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
         .unwrap();
 
     // Attacker signs in via a provider asserting the SAME address with no
-    // verification claim — must NOT resolve to the victim.
-    let attacker = dao
+    // verification claim. This is REFUSED, not given a separate account.
+    //
+    // The original test demanded "its OWN account" and could never pass:
+    // `users.email` is uniquely indexed, so a second row with the victim's
+    // address cannot exist. The insert collided on EMAIL while the retry loop
+    // assumed a USERNAME clash, and the whole thing surfaced as "Failed to
+    // generate unique username after retries" — which is why this test died in
+    // setup rather than on its assertion, leaving the protection unverified.
+    //
+    // Refusal is the correct outcome and was always the effective one: a
+    // takeover needs the identity to be LINKED to the victim, and it never is.
+    let err = dao
         .find_or_create_by_oauth(
             "microsoft",
             "ms-attacker-oid",
@@ -248,37 +263,43 @@ async fn unverified_oauth_email_never_links_into_an_existing_account() {
             false,
         )
         .await
-        .unwrap();
-    assert_ne!(
-        attacker.id.unwrap(),
-        victim.id.unwrap(),
-        "unverified email must not take over the existing account"
-    );
+        .expect_err("unverified email must not resolve to the existing account");
+    let msg = err.to_string();
     assert!(
-        attacker
-            .oauth_providers
-            .iter()
-            .any(|p| p.provider == "microsoft")
+        msg.contains("did not") && msg.contains("verify"),
+        "the refusal must name its reason, not blame the username: {msg}"
     );
 
-    // The victim's account is untouched (no provider grafted onto it).
+    // The victim's account is untouched — no provider grafted onto it, which
+    // is the property that actually matters.
     let victim_after = dao.find_by_email("victim@corp.example").await.unwrap();
     assert_eq!(victim_after.id.unwrap(), victim.id.unwrap());
     assert!(victim_after.oauth_providers.is_empty());
 
-    // Same provider identity signs in again → its own account, stably.
-    let again = dao
+    // ...and no second account was created behind the scenes.
+    let all_with_email = app
+        .db
+        .collection::<bson::Document>("users")
+        .count_documents(bson::doc! { "email": "victim@corp.example" })
+        .await
+        .unwrap();
+    assert_eq!(all_with_email, 1, "no shadow account for the same address");
+
+    // An unverified identity on a FRESH address is unaffected — it still gets
+    // an account. The refusal above is about the collision, not about being
+    // unverified.
+    let fresh = dao
         .find_or_create_by_oauth(
             "microsoft",
-            "ms-attacker-oid",
-            "victim@corp.example",
-            "Not The Victim",
+            "ms-other-oid",
+            "someone-else@corp.example",
+            "Someone Else",
             None,
             false,
         )
         .await
-        .unwrap();
-    assert_eq!(again.id.unwrap(), attacker.id.unwrap());
+        .expect("an unverified identity on a free address still signs up");
+    assert_ne!(fresh.id.unwrap(), victim.id.unwrap());
 
     // A VERIFIED provider email still links, as before.
     let linked = dao
