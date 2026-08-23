@@ -133,8 +133,14 @@ pub async fn oauth_callback(
 
     let frontend_url = state.settings.oauth.base_url.replace(":5001", ":5000"); // API → UI port
 
+    // The token goes in the FRAGMENT, not the query. A fragment is never sent
+    // to a server, so it cannot land in an nginx access log or a `Referer` —
+    // whereas `?token=<7-day JWT>` was written verbatim into the log of every
+    // hop that served this redirect. The SPA reads `location.hash` and clears
+    // it immediately; it still accepts the old query form for one deploy so a
+    // cached older bundle keeps working.
     let redirect_url = format!(
-        "{}/oauth/callback?token={}",
+        "{}/oauth/callback#token={}",
         frontend_url, tokens.access_token
     );
 
