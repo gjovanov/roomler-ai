@@ -248,13 +248,6 @@ pub fn detect_in_process() -> AgentCaps {
     compute_caps(true)
 }
 
-/// `run_hw_probes = false` computes everything that needs no driver call —
-/// which is exactly the honest answer when the probe child did not come back.
-///
-/// `unused_variables` is allowed because EVERY consumer of the flag sits
-/// behind a `#[cfg]` (mf-encoder / ffmpeg-encoder / vp9-444); a default-feature
-/// build probes nothing and legitimately never reads it.
-#[allow(unused_variables)]
 /// Whether the OS will let this process capture the screen.
 ///
 /// macOS is the only platform with a gate, and it is a silent one:
@@ -289,6 +282,13 @@ fn input_permission_granted() -> bool {
     }
 }
 
+/// `run_hw_probes = false` computes everything that needs no driver call —
+/// which is exactly the honest answer when the probe child did not come back.
+///
+/// `unused_variables` is allowed because EVERY consumer of the flag sits
+/// behind a `#[cfg]` (mf-encoder / ffmpeg-encoder / vp9-444); a default-feature
+/// build probes nothing and legitimately never reads it.
+#[allow(unused_variables)]
 fn compute_caps(run_hw_probes: bool) -> AgentCaps {
     // `mut` is only consumed inside the cfg-gated push blocks below
     // (openh264-encoder / mf-encoder). Default-feature builds skip
@@ -947,10 +947,6 @@ mod tests {
         );
     }
 
-    /// THE property this slice exists for: a host whose hardware probes
-    /// cannot be trusted still produces usable caps, and never claims a codec
-    /// it has no evidence for.
-    ///
     /// Permissions are always REPORTED, even when everything is granted.
     ///
     /// `None` means "this agent is too old to know", and a server or UI must
@@ -998,6 +994,10 @@ mod tests {
         );
     }
 
+    /// THE property this slice exists for: a host whose hardware probes
+    /// cannot be trusted still produces usable caps, and never claims a codec
+    /// it has no evidence for.
+    ///
     /// `compute_caps(false)` is exactly what `detect()` falls back to when the
     /// probe child dies, so this is the shape a driver fault now yields —
     /// where before it yielded a crash-looping daemon.
