@@ -684,12 +684,14 @@ pub(crate) async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
             MIN_INSTALLER_BYTES
         );
     }
-    // Integrity check: when GitHub / our proxy gave us a digest,
-    // verify the downloaded bytes match. This catches both
-    // corruption mid-flight (rare with TLS but possible with broken
-    // middleboxes) and tampering by anyone who can serve responses
-    // on the asset URL. Mismatched downloads do NOT touch disk —
-    // we'd rather skip an update than run a wrong installer.
+    // Transport-integrity check: when GitHub / our proxy gave us a digest,
+    // verify the downloaded bytes match. This catches corruption mid-flight
+    // (rare with TLS but possible with broken middleboxes).
+    //
+    // ⚠️ It is NOT a tamper anchor, which is why the signature check below
+    // exists: this digest arrives in the SAME manifest, from the SAME origin,
+    // as the URL we just fetched — anyone able to serve one can serve the
+    // other, so a hostile mirror simply supplies a matching hash.
     if let Some(digest) = asset.digest.as_deref() {
         verify_sha256(&bytes, digest)
             .with_context(|| format!("verifying digest for {}", asset.name))?;
@@ -703,6 +705,40 @@ pub(crate) async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir).context("creating temp update dir")?;
     let path = dir.join(&asset.name);
     std::fs::write(&path, &bytes).context("writing installer to disk")?;
+
+    // Publisher check — the anchor the serving channel cannot forge. Whatever
+    // is on disk here is about to run as SYSTEM, so it must be attributable to
+    // us and not merely to "someone with a code-signing certificate": a valid
+    // Authenticode signature alone would let any commercial cert holder
+    // through, so the signer's name is checked too.
+    //
+    // Fail-closed, and the failure is SKIPPING the update: the file is
+    // discarded and the agent keeps running the version it already has. That
+    // is deliberately the safe direction — a false negative costs an update
+    // cycle, a false positive costs the fleet.
+    //
+    // Windows only for now. The `.deb`/`.pkg` ship detached GPG `.asc`
+    // signatures, but verifying those needs the release public key pinned in
+    // this binary; until that lands those platforms keep the previous
+    // behaviour rather than blocking on a check that cannot run.
+    #[cfg(windows)]
+    {
+        use crate::code_signature::{EXPECTED_PUBLISHER, verify_publisher};
+        match verify_publisher(&path, EXPECTED_PUBLISHER) {
+            Ok(signer) => {
+                tracing::info!(asset = %asset.name, %signer, "installer signature verified");
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                bail!(
+                    "refusing to install {}: {e}. The download was discarded and this \
+                     agent keeps its current version.",
+                    asset.name
+                );
+            }
+        }
+    }
+
     Ok(path)
 }
 
