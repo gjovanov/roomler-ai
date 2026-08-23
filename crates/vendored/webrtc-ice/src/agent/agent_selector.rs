@@ -723,7 +723,7 @@ impl ControlledSelector for AgentInternal {
                     // agent's most recent nomination so both directions ride
                     // the pair it chose; without this the browser switches its
                     // send path while the agent keeps streaming media over the
-                    // stale pair (field 2026-07-27, NEO16→WINHOST-C: video pinned
+                    // stale pair (field 2026-07-27, DEVBOX→WINHOST-C: video pinned
                     // to the overlay pair through carrier churn while the
                     // nominated srflx pair sat idle).
                     // Default-OFF (2026-07-27 field): following renominations let

@@ -391,7 +391,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
 
         // HEVC 4:2:0 on the relay at the Smoother rung — the exact
-        // ceiling_bps=3000000 the CORPLAP-2 field log shows. Constrained ⇒
+        // ceiling_bps=3000000 the winhost-b field log shows. Constrained ⇒
         // the sharpening ladder is OFF and the motion relief SOFTENS
         // (field 2026-08-21: the CQ-18 rung was the 9 fps equilibrium).
         let p = rate_plan(

@@ -88,7 +88,7 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 ///     it has to, because a self-update exits 0 on purpose and must come
 ///     back. So a 0 here is indistinguishable from that, and systemd
 ///     re-launches the redundant process every `RestartSec` forever.
-///     Field 2026-08-21: mars / zeus / jupiter each had two units enabled
+///     Field 2026-08-21: buildhost / fleet-host-2 / fleet-host-1 each had two units enabled
 ///     (packaged `roomlerd.service` + a legacy `roomler-agent.service`),
 ///     and the loser burned 1500+ restarts at 5 s intervals for weeks
 ///     while the winner served happily, so nothing looked wrong.
@@ -794,8 +794,8 @@ mod tests {
         // redundant process regardless unless the unit also lists the
         // code. The two live in different files with nothing coupling
         // them, so renumbering the constant alone would silently restore
-        // the 5 s restart loop this exists to kill (mars / zeus /
-        // jupiter, 1500+ restarts each, found 2026-08-21). Assert the
+        // the 5 s restart loop this exists to kill (buildhost / fleet-host-2 /
+        // fleet-host-1, 1500+ restarts each, found 2026-08-21). Assert the
         // shipped units and the constants agree — in both directions.
         for (name, unit) in [
             (

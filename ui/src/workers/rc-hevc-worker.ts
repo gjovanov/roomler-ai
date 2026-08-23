@@ -376,7 +376,7 @@ function initDecoder() {
         pendingDecodeAt.delete(frame.timestamp)
       }
       // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
-      // geometry for our hevc_nvenc stream (field NEO16, RTX 5090):
+      // geometry for our hevc_nvenc stream (field DEVBOX, RTX 5090):
       // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
       // pump heartbeat: w=2560 h=1600 enc=hevc_nvenc, ~3 MB/window), but the
       // decoded VideoFrame carries a SPURIOUS conformance window —
@@ -576,7 +576,7 @@ function emitFrame(): void {
     // because the viewer-rate cap shed the encode rate (240-frame GOP at
     // 12 fps = 20 s) or the screen went static (frame-counted GOP never
     // advances) — the decoder sat wedged on a stale frame indefinitely
-    // (field: "old screen for 30+ s", NEO16 viewing CORPLAP-1). The 250 ms
+    // (field: "old screen for 30+ s", DEVBOX viewing WINHOST-A). The 250 ms
     // debounce + the agent's MIN_KF_GAP clamp bound this to ~4 req/s.
     requestKeyframeResync()
     // One-shot + periodic diagnostic so the field log shows the gate
@@ -786,7 +786,7 @@ export function shouldDecodeFrame(hasSeenKeyframe: boolean, isKey: boolean): boo
  *    every frame while dragging windows.)
  *  - `spurious`: anything else — a drastically smaller visible rect or an
  *    offset origin is the Chrome NVDEC misreported-geometry bug (field
- *    NEO16: coded 2560×1600, visible 1280×720). The coded pixels
+ *    DEVBOX: coded 2560×1600, visible 1280×720). The coded pixels
  *    are the whole desktop → re-wrap and render the full coded rect.
  *
  *  An alignment pad can never reach 64: aligning to any of 8/16/32/64 pads

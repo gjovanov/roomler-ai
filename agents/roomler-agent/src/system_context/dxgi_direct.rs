@@ -11,7 +11,7 @@
 //! can bind Desktop Duplication to the render-only dGPU; `DuplicateOutput`
 //! then fails (the dGPU owns no output to duplicate) and the capture pump
 //! falls through to the slow GDI BitBlt path (~85 ms/frame ⇒ ~12 fps).
-//! Field host CORPLAP-2 (rc.105 telemetry: `backend=gdi`, Intel owns the
+//! Field host WINHOST-B (rc.105 telemetry: `backend=gdi`, Intel owns the
 //! primary output, NVIDIA reports 0 outputs, `scrap::Capturer::new:
 //! permission denied`) is the motivating case.
 //!
@@ -952,7 +952,7 @@ impl DxgiDirectBackend {
 
 impl DxgiCapture for DxgiDirectBackend {
     fn frame(&mut self, output_cap: Option<(u32, u32)>) -> Result<DxgiFrame, BackendBail> {
-        // Phase B field fix (2026-08-21, CORPLAP-1/CORPLAP-3): a refine Up flips the
+        // Phase B field fix (2026-08-21, winhost-a/corplap): a refine Up flips the
         // cap Some→None while the desktop is AT REST — but every real frame
         // delivered under the rung was GPU-scaled, so the pump's keepalive
         // holds no native pixels and the "crisp native IDR" can never ship

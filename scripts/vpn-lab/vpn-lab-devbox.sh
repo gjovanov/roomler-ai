@@ -1,14 +1,17 @@
 #!/bin/bash
-# vpn-lab-neo16.sh — dev-box half of the VPN cycle lab: timestamped 1 s pings
+# vpn-lab-devbox.sh — dev-box half of the VPN cycle lab: timestamped 1 s pings
 # toward the corp laptop's overlay IPs in BOTH orgs + local overlay snapshots.
 # Runs locally (Git Bash), no fleet-exec dependency; writes into $OUT.
 #
-# Usage: vpn-lab-neo16.sh <out-dir> <duration-s> [target ...]
+# Usage: vpn-lab-devbox.sh <out-dir> <duration-s> [target ...]
+# The fleet device name the sampler greps for in `roomler peers` output comes
+# from $LAB_TARGET (default "winhost-a") so no real hostname is baked in here.
 set -u
 OUT="${1:?out dir}"; DUR="${2:?duration seconds}"; shift 2
 TARGETS=("${@:-100.65.4.28 100.65.0.5}")
 [ $# -eq 0 ] && TARGETS=(100.65.4.28 100.65.0.5)
 ROOMLER="/c/Program Files/Roomler/roomler.exe"
+LAB_TARGET="${LAB_TARGET:-winhost-a}"
 mkdir -p "$OUT"
 
 end=$(( $(date +%s) + DUR ))
@@ -37,7 +40,7 @@ sampler_loop() {
     "$ROOMLER" status 2>&1 | grep -iE "version|srflx|warm|direct sock" >> "$f"
     if [ $((i % 3)) -eq 0 ]; then
       echo "=== $(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) peers" >> "$f"
-      "$ROOMLER" peers 2>&1 | grep -E "CORPLAP-1|org:" >> "$f"
+      "$ROOMLER" peers 2>&1 | grep -E "${LAB_TARGET}|org:" >> "$f"
     fi
     i=$((i + 1))
     sleep 10
@@ -47,4 +50,4 @@ sampler_loop() {
 for t in "${TARGETS[@]}"; do ping_loop "$t" & done
 sampler_loop &
 wait
-echo "neo16 runner done: $OUT"
+echo "dev-box runner done: $OUT"

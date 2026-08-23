@@ -214,7 +214,7 @@ its free pool → cycle every agent's WS.
 > seconds. A host behind a strict corporate VPN loses its established direct
 > path and cannot re-punch while the VPN client is armed — it comes back
 > **relay-locked** until a VPN-off window. Renumber those hosts deliberately.
-> See the CORPLAP-1 notes in [`overlay-nat-traversal.md`](overlay-nat-traversal.md).
+> See the winhost-a notes in [`overlay-nat-traversal.md`](overlay-nat-traversal.md).
 
 > ⚠️ **Tunnel-client nodes** are not hub-registered, so the server has no cycle
 > primitive for them. They are listed in the response under
@@ -285,8 +285,8 @@ org's engine attaches to:
   still advertises on its OWN control WS after its OWN join (the server's
   join-clears-srflx ordering holds per org).
 
-Default ON since rc.339 (after the 4-host field soak: CORPLAP-1 + zeus +
-jupiter + mars, both flags, 08-08→08-10). Explicit `overlay_shared_carrier =
+Default ON since rc.339 (after the 4-host field soak: winhost-a + fleet-host-2 +
+fleet-host-1 + buildhost, both flags, 08-08→08-10). Explicit `overlay_shared_carrier =
 false` is the kill switch: per-runtime binds, byte-identical to the
 pre-plane behavior, retained until the compensation-stack deletion.
 Rebuilds under the flag are PLANE-WIDE (P1-d): any org's trigger
@@ -334,7 +334,7 @@ default state now runs both ON.
 With two org addresses on the ONE shared adapter (§2), the **OS** picks the
 source address for locally-originated traffic — and with nested blocks (a
 legacy `/10` beside a carved `/22`) it can pick the WRONG org's address.
-Field 2026-08-09 (CORPLAP-1): Windows deterministically sourced grox-bound
+Field 2026-08-09 (winhost-a): Windows deterministically sourced grox-bound
 packets from the jovanov address; Linux fleet nodes did the equivalent
 (`inet_select_addr` is address-order-dependent). The packet rides the correct
 pair (demux is dst-based), but a **single-org receiver** RPF-flags the foreign

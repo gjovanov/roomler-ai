@@ -1700,7 +1700,7 @@ pub struct CapVectorWire {
     #[serde(default)]
     pub stun_udp: bool,
     /// Raw UDP reaches coturn's relay band, measured over the exact
-    /// single-relay dialer path. `Some(false)` = the CORPLAP-3-class egress drop.
+    /// single-relay dialer path. `Some(false)` = the CORPLAP-class egress drop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_band_udp: Option<bool>,
     /// The central `/derp` WS is up + registered (the floor's health).
@@ -3740,7 +3740,7 @@ mod tests {
     fn rpc_request_and_response_roundtrip() {
         let m = ClientMsg::RpcExecRequest {
             request_id: "c1".into(),
-            target: "CORPLAP-1".into(),
+            target: "winhost-a".into(),
             shell: "pwsh".into(),
             command: "Get-NetAdapter".into(),
             timeout_ms: 0,
@@ -3749,7 +3749,7 @@ mod tests {
         assert!(s.contains(r#""t":"rc:rpc.request""#));
         match serde_json::from_str::<ClientMsg>(&s).unwrap() {
             ClientMsg::RpcExecRequest { target, shell, .. } => {
-                assert_eq!(target, "CORPLAP-1");
+                assert_eq!(target, "winhost-a");
                 assert_eq!(shell, "pwsh");
             }
             other => panic!("expected RpcExecRequest, got {other:?}"),
@@ -3972,7 +3972,7 @@ mod tests {
             peers: vec![NetmapPeer {
                 node_id,
                 overlay_ip: "100.64.0.4".into(),
-                name: "neo16".into(),
+                name: "devbox".into(),
                 wg_public_key: "cGVlcg==".into(),
                 endpoints: vec!["203.0.113.9:51820".into()],
                 lan_endpoints: vec!["203.0.113.9:51820".into()],
@@ -4109,7 +4109,7 @@ mod tests {
         let json = r#"{
             "node_id":"507f1f77bcf86cd799439011",
             "overlay_ip":"100.64.0.4",
-            "name":"neo16",
+            "name":"devbox",
             "wg_public_key":"cGVlcg==",
             "reachable":true
         }"#;

@@ -1,6 +1,7 @@
 use bson::oid::ObjectId;
-use roomler_ai_db::models::{NotificationSource, NotificationType};
+use roomler_ai_db::models::{Message, NotificationSource, NotificationType, Room};
 
+use crate::error::ApiError;
 use crate::state::AppState;
 use crate::ws;
 
@@ -264,4 +265,51 @@ pub async fn notify_call_started(
     }
 
     spawn_push_for_offline(state, offline_ids, params.title, params.body, params.link);
+}
+
+/// Object-level authorization gate for room-scoped collaboration routes.
+///
+/// Returns the room ONLY if it belongs to `tenant_id` AND the caller is a
+/// member of that tenant. This is the invariant the older collaboration
+/// handlers were missing: `is_member(tid)` alone is satisfied by any tenant
+/// the caller belongs to (a user can create their own tenant for free), so it
+/// does NOT stop reading or mutating ANOTHER tenant's room by id — the
+/// cross-tenant IDOR. Resolving the room *within* the tenant (`{_id,
+/// tenant_id}`) closes it: a foreign room resolves to nothing → 404, leaking
+/// neither its content nor its existence.
+pub async fn require_room_in_tenant(
+    state: &AppState,
+    tenant_id: ObjectId,
+    room_id: ObjectId,
+    user_id: ObjectId,
+) -> Result<Room, ApiError> {
+    if !state.tenants.is_member(tenant_id, user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+    Ok(state
+        .rooms
+        .base
+        .find_by_id_in_tenant(tenant_id, room_id)
+        .await?)
+}
+
+/// The message-keyed sibling of [`require_room_in_tenant`]. Handlers keyed by
+/// `message_id` (reactions, thread replies, edits) cannot rely on the room
+/// check because the id is decoupled from the path room: a caller can pass
+/// their own tenant + room but another tenant's message id. Resolving the
+/// message within the tenant (`{_id, tenant_id}`) is the binding check.
+pub async fn require_message_in_tenant(
+    state: &AppState,
+    tenant_id: ObjectId,
+    message_id: ObjectId,
+    user_id: ObjectId,
+) -> Result<Message, ApiError> {
+    if !state.tenants.is_member(tenant_id, user_id).await? {
+        return Err(ApiError::Forbidden("Not a member".to_string()));
+    }
+    Ok(state
+        .messages
+        .base
+        .find_by_id_in_tenant(tenant_id, message_id)
+        .await?)
 }

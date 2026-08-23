@@ -1,6 +1,6 @@
 /**
  * P1 (Parsec-class plan) — shared pure helpers for the decode workers'
- * per-hop instrumentation. The NEO16 field ceiling (~25-35 fps on an RTX
+ * per-hop instrumentation. The DEVBOX field ceiling (~25-35 fps on an RTX
  * 5090 viewer) could be decode-bound, paint-bound, or main-thread-bound —
  * indistinguishable without per-hop numbers. Each worker accumulates
  * per-window hop timings with `HopStats` and folds the snapshots into its

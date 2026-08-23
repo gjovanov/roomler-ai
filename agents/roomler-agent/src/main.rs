@@ -1239,7 +1239,7 @@ async fn enroll_cmd(
     println!("Config written to: {}", target_path.display());
     println!("Run `roomler-agent run` (or restart the service) to connect.");
 
-    // rc.53 Phase 7: CORPLAP-2's recurring pain — operator runs
+    // rc.53 Phase 7: WINHOST-B's recurring pain — operator runs
     // `enroll --machine-global` from a user PowerShell, the config
     // lands in %PROGRAMDATA% (where the LocalSystem service reads
     // it), but then `roomler-agent run` from THAT SAME user shell
@@ -3425,7 +3425,7 @@ mod tests {
     }
 
     /// rc.53 Phase 7: the stderr warning for the
-    /// `%APPDATA% / %PROGRAMDATA%` same-session asymmetry that CORPLAP-2
+    /// `%APPDATA% / %PROGRAMDATA%` same-session asymmetry that WINHOST-B
     /// burned hours on. Locks the marker phrases so a refactor that
     /// drops "sc start roomler-agent" or "%APPDATA%" or "without
     /// --machine-global" trips the test before it ships.

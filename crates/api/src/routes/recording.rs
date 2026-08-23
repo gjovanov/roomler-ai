@@ -31,9 +31,7 @@ pub async fn list(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let result = state.recordings.find_by_room(rid, &params).await?;
     let items: Vec<RecordingResponse> = result.items.into_iter().map(to_response).collect();
@@ -63,9 +61,7 @@ pub async fn create(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let recording_type = match body.recording_type.as_deref() {
         Some("audio") => roomler_ai_db::models::recording::RecordingType::Audio,

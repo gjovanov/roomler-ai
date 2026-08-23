@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Relay-PoP health probe — run from mars cron (or anywhere) against every PoP.
+"""Relay-PoP health probe — run from buildhost cron (or anywhere) against every PoP.
 
 Per region, one check per transport variant the server advertises for a PoP
 (`expand_turn_url` with the PoP caps `{"tls_443_udp": false}`):

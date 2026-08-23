@@ -1,7 +1,7 @@
 //! Session-scoped NVIDIA GPU clock pin (NVML) — kills the idle-P-state
 //! encode-latency ramp on NVENC senders.
 //!
-//! Field story (NEO16, RTX 5090): an idle desktop lets the GPU drop into a
+//! Field story (DEVBOX, RTX 5090): an idle desktop lets the GPU drop into a
 //! low P-state; the first seconds of a remote-desktop session encode at
 //! ~20 ms/frame until the clocks ramp, and light-motion sessions can bounce
 //! in and out of the slow state indefinitely. A manual `nvidia-smi -lgc`

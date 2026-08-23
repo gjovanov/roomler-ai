@@ -88,7 +88,7 @@ mid-2026 — re-quote at signup.
    `GET /api/relay/regions`, `agents.relay_home` in Mongo / the Devices UI.
    Soak ≥1 week before the next procurement wave.
 
-## Health cron (mars)
+## Health cron (buildhost)
 
 `TURN_SECRET_FILE` points at the fleet truth file so every run exercises real
 Allocates; the trailing-comma `eu-central` row (no PoP DERP) keeps the fleet

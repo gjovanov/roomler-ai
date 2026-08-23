@@ -107,7 +107,7 @@ pub fn overlay_quic_enabled() -> bool {
 /// and its error means coturn drops EVERY inbound from that peer until a
 /// later send re-asserts. This was `let _ = conn.send_to(…)` at three
 /// sites — three silent drops (field 2026-08-15: every QUIC rendezvous on
-/// CORPLAP-1 timed out with rx=0 on BOTH sides and nothing said why).
+/// winhost-a timed out with rx=0 on BOTH sides and nothing said why).
 /// Returns (elapsed_ms, ok) so callers can fold it into their own logs.
 pub(crate) async fn assert_relay_permission(
     conn: &Arc<dyn RelayConn>,
@@ -265,7 +265,7 @@ impl Carrier {
             format!("perm=FAILED@{perm_ms}ms")
         };
         let sock = Arc::new(RelayUdpSocket::new(conn)?);
-        // W6 — rendezvous instrumentation. Field 2026-08-14 (CORPLAP-1): EVERY
+        // W6 — rendezvous instrumentation. Field 2026-08-14 (winhost-a): EVERY
         // relay build logged "accept timed out → raw relay", but the log
         // could not say WHY — dialer never dialed (rendezvous miss), dialer's
         // packets dropped at coturn (permission-IP mismatch), or handshake
@@ -506,7 +506,7 @@ pub struct PeerStats {
     /// answer signal. Initiator-role only, deliberately: a responder-role
     /// session (we answered THEIR init) proves the peer can reach us but says
     /// nothing about our own outbound — and in the exact failure this exists
-    /// to catch (our tx dead, field 2026-08-08 CORPLAP-1→neo16), the peer
+    /// to catch (our tx dead, field 2026-08-08 winhost-a→devbox), the peer
     /// hammers initiations at us every ~5 s, so an either-role stamp would
     /// read permanently alive.
     hs_response_at: AtomicU64,
@@ -1384,7 +1384,7 @@ impl WgDevice {
         // dropped it — silently, pre-decrypt. Carriers are negotiated per
         // side, so this asymmetry is normal, not exotic.
         //
-        // Field 2026-08-12 (CORPLAP-1, dual-org): the org whose peers sat on
+        // Field 2026-08-12 (winhost-a, dual-org): the org whose peers sat on
         // relay was unreachable inbound from EVERY peer while the other org
         // was fine, and a restart flipped which one — whichever org happened
         // to get direct on both ends won. Its carrier socket rx climbed the
@@ -2544,9 +2544,9 @@ async fn run_direct_demux(
             // every path whose carrier socket is served by this seam rather
             // than the carrier plane: the peer answered (its DISCO_ANSWERED
             // climbed), the reply arrived, and the prober never saw it — so a
-            // healthy carrier read `loss=100%`. Field 2026-08-12: zeus→jupiter
-            // and zeus→neo16-wsl on grox, both 0 % by ping, both 100 % by
-            // disco, while the SAME jupiter measured correctly on the other
+            // healthy carrier read `loss=100%`. Field 2026-08-12: fleet-host-2→fleet-host-1
+            // and fleet-host-2→devbox-wsl on grox, both 0 % by ping, both 100 % by
+            // disco, while the SAME fleet-host-1 measured correctly on the other
             // org's engine. `classify`'s own doc already promised the two
             // seams could not diverge; now they don't.
             match super::disco::classify(&buf[..n], src, &disco_secret, &disco_public, |pk| {
@@ -4038,7 +4038,7 @@ mod tests {
     /// carrier deadlocked on (`HANDSHAKE(REKEY_TIMEOUT)`), now over a single
     /// allocation with one IP-only permission.
     ///
-    /// Run on a host with UDP/3478 to the worker (e.g. mars → jupiter's worker):
+    /// Run on a host with UDP/3478 to the worker (e.g. buildhost → fleet-host-1's worker):
     ///   ROOMLER_TEST_TURN_HOST=coturn.roomler.ai \
     ///   ROOMLER_TEST_TURN_SECRET=<coturn static-auth-secret> \
     ///   ROOMLER_TEST_TURN_WORKER=5.9.157.221 \

@@ -40,7 +40,7 @@ User=root
 # the gap that made this unit dangerous — a host enrolled before the convention
 # ran happily on an orphan `roomlerd run` (profile path) and then died
 # `no config found` the first time systemd started it, with `Restart=always`
-# turning that into a crash-loop. Hit on mars, zeus and the WSL sibling; the
+# turning that into a crash-loop. Hit on buildhost, fleet-host-2 and the WSL sibling; the
 # last one needed nothing but a `dpkg -i`. Explicit `--config` is now
 # belt-and-braces rather than the only thing holding the two in agreement.
 Environment=ROOMLERD_CONFIG=/etc/roomler/config.toml
@@ -57,7 +57,7 @@ Environment=RUST_LOG=roomler_agent=info,warn
 # server that already said no; 8 = ALREADY_RUNNING (another process holds the
 # single-instance lock) must NOT either — this process is redundant by
 # definition, and without the exception `always` restarts it every 5 s
-# forever. That is not hypothetical: on 2026-08-21 mars, zeus and jupiter each
+# forever. That is not hypothetical: on 2026-08-21 buildhost, fleet-host-2 and fleet-host-1 each
 # had TWO units enabled (this one plus a legacy `roomler-agent.service`), and
 # the loser of the lock race had burned 1500+ restarts while the winner served
 # normally — `systemctl is-active` read green the whole time.

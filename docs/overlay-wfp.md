@@ -21,7 +21,7 @@ inbound, so the reverse direction fails. Worse, a local
 `New-NetFirewallRule` has no effect: the GPO sets
 `AllowLocalFirewallRules=False`, and the firewall can't be disabled.
 
-Field-observed on CORPLAP-1 (2026-06-12): CORPLAP-1→NEO16 worked, NEO16→CORPLAP-1
+Field-observed on WINHOST-A (2026-06-12): WINHOST-A→DEVBOX worked, DEVBOX→WINHOST-A
 timed out, with relay/WG/routing all proven healthy.
 
 ## How Tailscale solves it (and so do we)

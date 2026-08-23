@@ -75,7 +75,7 @@ fn debounce() -> Duration {
 /// window so a delta lands at least this often while churn is ongoing.
 const DEBOUNCE_CAP: Duration = Duration::from_secs(3);
 
-/// Flap damping (field 2026-08-16 19:00Z, CORPLAP-1 IN-VPN): Check Point and
+/// Flap damping (field 2026-08-16 19:00Z, winhost-a IN-VPN): Check Point and
 /// our own route-guard waves fight over the routing table, so the effective
 /// default-route identity FLAPS (ifindex 26↔17, 134 raw signals in one
 /// burst) — and every flip published a fresh MAJOR. Each Major fires the
