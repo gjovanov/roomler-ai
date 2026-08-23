@@ -45,7 +45,7 @@ async fn require_manage_roles(
 ///
 /// Pure and synchronous on purpose: the interesting behaviour is bit algebra,
 /// and it should be testable without a database.
-fn check_grant(held: u64, current: u64, requested: u64) -> Result<(), ApiError> {
+pub(crate) fn check_grant(held: u64, current: u64, requested: u64) -> Result<(), ApiError> {
     if held & permissions::ADMINISTRATOR != 0 {
         return Ok(());
     }
@@ -57,6 +57,39 @@ fn check_grant(held: u64, current: u64, requested: u64) -> Result<(), ApiError> 
         )));
     }
     Ok(())
+}
+
+/// The same rule, applied to a set of ROLE IDS rather than a raw mask.
+///
+/// Handing someone a role is handing them its permissions, so every path that
+/// writes `tenant_members.role_ids` is a grant and has to answer to
+/// [`check_grant`]. There are four such paths and they are NOT all behind
+/// `MANAGE_ROLES`: `invite::add_member`, `invite::create_invite` and
+/// `invite::batch_create_invite` sit behind `INVITE_MEMBERS`, which is a far
+/// weaker bit and one an org may hand to someone who is not an admin at all.
+///
+/// Unknown or cross-tenant ids are refused rather than skipped — the lookup is
+/// tenant-scoped, so a silent skip would let a caller reference a role the
+/// check never sees.
+pub(crate) async fn check_grant_roles(
+    state: &AppState,
+    tenant_id: ObjectId,
+    held: u64,
+    role_ids: &[ObjectId],
+) -> Result<(), ApiError> {
+    if role_ids.is_empty() || held & permissions::ADMINISTRATOR != 0 {
+        return Ok(());
+    }
+    let mut requested = 0u64;
+    for rid in role_ids {
+        let role = state
+            .roles
+            .base
+            .find_by_id_in_tenant(tenant_id, *rid)
+            .await?;
+        requested |= role.permissions;
+    }
+    check_grant(held, 0, requested)
 }
 
 #[derive(Debug, Serialize)]
@@ -206,14 +239,13 @@ pub async fn assign(
 
     let held = require_manage_roles(&state, tid, auth.user_id).await?;
 
-    // The most direct escalation of the three: permissions are purely
-    // role-derived (`get_member_permissions` ORs the member's role masks, with
-    // no owner special case), so the seeded Owner role carries `ALL` including
+    // The most direct escalation: permissions are purely role-derived
+    // (`get_member_permissions` ORs the member's role masks, with no owner
+    // special case), so the seeded Owner role carries `ALL` including
     // `ADMINISTRATOR`. Without this, one POST assigning Owner to yourself is a
     // full tenant takeover — and gating only `create`/`update` would leave it
     // wide open, since the powerful role already exists.
-    let role = state.roles.base.find_by_id_in_tenant(tid, rid).await?;
-    check_grant(held, 0, role.permissions)?;
+    check_grant_roles(&state, tid, held, &[rid]).await?;
 
     state.tenants.assign_role(tid, uid, rid).await?;
 
@@ -341,5 +373,31 @@ mod tests {
         let rogue = 1u64 << 40;
         let msg = err(check_grant(DEFAULT_ADMIN, 0, rogue));
         assert!(msg.contains(&format!("{rogue:#x}")), "{msg}");
+    }
+
+    // `check_grant_roles` needs a database for the role lookup, so what is
+    // testable here is the part that decides WITHOUT one: a set of roles is
+    // granted iff the UNION of their masks is grantable. That union is the
+    // whole point — three individually-harmless roles can add up to owner.
+    #[test]
+    fn a_set_of_roles_is_judged_by_the_union_of_its_masks() {
+        let held = DEFAULT_ADMIN;
+        // Individually fine...
+        check_grant(held, 0, MANAGE_CHANNELS).unwrap();
+        check_grant(held, 0, KICK_MEMBERS).unwrap();
+        // ...and fine together.
+        check_grant(held, 0, MANAGE_CHANNELS | KICK_MEMBERS).unwrap();
+        // But a role carrying something the caller lacks poisons the union,
+        // which is why the invite paths OR every referenced role before asking.
+        let msg = err(check_grant(held, 0, MANAGE_CHANNELS | SSH_DEVICE));
+        assert!(msg.contains("SSH_DEVICE"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_role_set_grants_nothing_and_is_allowed() {
+        // `check_grant_roles` short-circuits on an empty list; this is the
+        // mask-level statement of the same thing. Inviting someone with no
+        // explicit roles must not require any permission beyond the invite bit.
+        check_grant(0, 0, 0).unwrap();
     }
 }
