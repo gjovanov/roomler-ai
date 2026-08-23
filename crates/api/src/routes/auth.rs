@@ -270,8 +270,10 @@ pub async fn login(
 
     let mut headers = HeaderMap::new();
     let cookie = format!(
-        "access_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}",
-        tokens.access_token, tokens.expires_in
+        "access_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
+        tokens.access_token,
+        tokens.expires_in,
+        secure_attr(&state)
     );
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
 
@@ -293,9 +295,23 @@ pub async fn login(
     Ok((headers, Json(response)))
 }
 
-pub async fn logout() -> Result<HeaderMap, ApiError> {
+/// `; Secure` in production, empty in dev — the session cookie is a full API
+/// credential (the auth extractor accepts it), so it must never travel over
+/// cleartext http; the http://localhost dev/test flow still needs it set.
+fn secure_attr(state: &AppState) -> &'static str {
+    if state.settings.app.environment == "production" {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+pub async fn logout(State(state): State<AppState>) -> Result<HeaderMap, ApiError> {
     let mut headers = HeaderMap::new();
-    let cookie = "access_token=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0";
+    let cookie = format!(
+        "access_token=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{}",
+        secure_attr(&state)
+    );
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
     Ok(headers)
 }
@@ -333,8 +349,10 @@ pub async fn refresh(
 
     let mut headers = HeaderMap::new();
     let cookie = format!(
-        "access_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}",
-        tokens.access_token, tokens.expires_in
+        "access_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
+        tokens.access_token,
+        tokens.expires_in,
+        secure_attr(&state)
     );
     headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
 

@@ -115,9 +115,14 @@ pub async fn search(
                 .get(&m.author_id)
                 .cloned()
                 .unwrap_or_else(|| m.author_id.to_hex());
-            // Truncate content for preview
-            let content_preview = if m.content.len() > 200 {
-                format!("{}...", &m.content[..200])
+            // Truncate the preview on a CHAR boundary. `&m.content[..200]`
+            // sliced on a BYTE index and panics ("byte index 200 is not a
+            // char boundary") whenever a multi-byte UTF-8 char straddles byte
+            // 200 — so a single crafted message could 500 every OTHER user's
+            // search of that room (there is no CatchPanicLayer wired up).
+            let content_preview = if m.content.chars().count() > 200 {
+                let truncated: String = m.content.chars().take(200).collect();
+                format!("{}...", truncated)
             } else {
                 m.content.clone()
             };

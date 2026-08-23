@@ -15,19 +15,19 @@ pub struct AddReactionRequest {
 pub async fn add(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, _room_id, message_id)): Path<(String, String, String)>,
     Json(body): Json<AddReactionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let rid = ObjectId::parse_str(&room_id)
-        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    // The reaction is keyed by message id, which is decoupled from the path
+    // room — so the message, not the room, is the object we must bind to this
+    // tenant, and its own room is the correct fan-out target.
+    let message = super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    let rid = message.room_id;
 
     let reaction = state
         .reactions
@@ -40,7 +40,7 @@ pub async fn add(
         "data": {
             "action": "add",
             "message_id": message_id,
-            "room_id": room_id,
+            "room_id": rid.to_hex(),
             "user_id": auth.user_id.to_hex(),
             "emoji": reaction.emoji.value,
         }
@@ -59,16 +59,14 @@ pub async fn add(
 pub async fn remove(
     State(state): State<AppState>,
     auth: AuthUser,
-    Path((tenant_id, room_id, message_id, emoji)): Path<(String, String, String, String)>,
+    Path((tenant_id, _room_id, message_id, emoji)): Path<(String, String, String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
+    let message = super::helpers::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
 
     let removed = state
         .reactions
@@ -76,15 +74,14 @@ pub async fn remove(
         .await?;
 
     if removed {
-        let rid = ObjectId::parse_str(&room_id)
-            .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
+        let rid = message.room_id;
         let member_ids = state.rooms.find_member_user_ids(rid).await?;
         let event = serde_json::json!({
             "type": "message:reaction",
             "data": {
                 "action": "remove",
                 "message_id": message_id,
-                "room_id": room_id,
+                "room_id": rid.to_hex(),
                 "user_id": auth.user_id.to_hex(),
                 "emoji": emoji,
             }
