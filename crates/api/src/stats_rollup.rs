@@ -346,6 +346,116 @@ async fn family_floor(state: &AppState, key: &str) -> DateTime {
     DateTime::from_millis(wm_secs.max(now - MAX_LOOKBACK_SECS) * 1000)
 }
 
+/// One compaction pass: a source collection aggregated into a rollup
+/// collection at one grain. Two rows per family (raw→1h, 1h→1d).
+struct Pass {
+    /// Watermark key, also the log label.
+    key: &'static str,
+    src: &'static str,
+    into: &'static str,
+    /// `$dateTrunc` unit for the bucket.
+    unit: &'static str,
+    /// Whether `src` is itself a rollup (changes how counts are summed).
+    src_is_rollup: bool,
+    /// Bucket width, used to hold the watermark back off the open bucket.
+    bucket_secs: i64,
+    pipeline: fn(DateTime, &str, bool, &str) -> Vec<Document>,
+}
+
+/// Every pass this rollup performs, in run order.
+///
+/// A table rather than eight hand-written blocks because the count is an
+/// ASSERTED value: `run_stats_rollup_once` returns how many passes completed
+/// and the integration test compares it against `PASSES.len()`. That keeps the
+/// check meaningful (a pass that silently fails still trips it) without it
+/// going stale the moment a family lands — which is exactly what happened when
+/// `call_user` took the real count to 8 while the test still demanded 6, and
+/// nothing noticed because `crates/tests` had stopped compiling entirely.
+static PASSES: &[Pass] = &[
+    // relay: raw → 1h → 1d
+    Pass {
+        key: "relay:1h",
+        src: STATS_RELAY,
+        into: "stats_relay_1h",
+        unit: "hour",
+        src_is_rollup: false,
+        bucket_secs: HOUR,
+        pipeline: relay_pipeline,
+    },
+    Pass {
+        key: "relay:1d",
+        src: "stats_relay_1h",
+        into: "stats_relay_1d",
+        unit: "day",
+        src_is_rollup: true,
+        bucket_secs: DAY,
+        pipeline: relay_pipeline,
+    },
+    // machine: raw → 1h → 1d
+    Pass {
+        key: "machine:1h",
+        src: STATS_MACHINE,
+        into: "stats_machine_1h",
+        unit: "hour",
+        src_is_rollup: false,
+        bucket_secs: HOUR,
+        pipeline: machine_pipeline,
+    },
+    Pass {
+        key: "machine:1d",
+        src: "stats_machine_1h",
+        into: "stats_machine_1d",
+        unit: "day",
+        src_is_rollup: true,
+        bucket_secs: DAY,
+        pipeline: machine_pipeline,
+    },
+    // call: raw → 1h → 1d
+    Pass {
+        key: "call:1h",
+        src: STATS_CALL,
+        into: "stats_call_1h",
+        unit: "hour",
+        src_is_rollup: false,
+        bucket_secs: HOUR,
+        pipeline: call_pipeline,
+    },
+    Pass {
+        key: "call:1d",
+        src: "stats_call_1h",
+        into: "stats_call_1d",
+        unit: "day",
+        src_is_rollup: true,
+        bucket_secs: DAY,
+        pipeline: call_pipeline,
+    },
+    // call-user (usage ledger): raw → 1h → 1d
+    Pass {
+        key: "call_user:1h",
+        src: STATS_CALL_USER,
+        into: "stats_call_user_1h",
+        unit: "hour",
+        src_is_rollup: false,
+        bucket_secs: HOUR,
+        pipeline: call_user_pipeline,
+    },
+    Pass {
+        key: "call_user:1d",
+        src: "stats_call_user_1h",
+        into: "stats_call_user_1d",
+        unit: "day",
+        src_is_rollup: true,
+        bucket_secs: DAY,
+        pipeline: call_user_pipeline,
+    },
+];
+
+/// How many `$merge` passes a complete run performs. Tests assert against
+/// this rather than a literal.
+pub fn pass_count() -> usize {
+    PASSES.len()
+}
+
 /// Run every family's 1h + 1d compaction once. Public so integration tests
 /// drive it directly (the spawned loop's first tick is a full interval
 /// out). Returns the number of `$merge` passes that completed.
@@ -354,87 +464,11 @@ pub async fn run_stats_rollup_once(state: &AppState) -> usize {
         return 0;
     }
     let mut done = 0usize;
-
-    // relay: raw → 1h → 1d
-    let f = family_floor(state, "relay:1h").await;
-    done += roll_family(
-        state,
-        "relay:1h",
-        STATS_RELAY,
-        relay_pipeline(f, "hour", false, "stats_relay_1h"),
-        HOUR,
-    )
-    .await as usize;
-    let f = family_floor(state, "relay:1d").await;
-    done += roll_family(
-        state,
-        "relay:1d",
-        "stats_relay_1h",
-        relay_pipeline(f, "day", true, "stats_relay_1d"),
-        DAY,
-    )
-    .await as usize;
-
-    // machine: raw → 1h → 1d
-    let f = family_floor(state, "machine:1h").await;
-    done += roll_family(
-        state,
-        "machine:1h",
-        STATS_MACHINE,
-        machine_pipeline(f, "hour", false, "stats_machine_1h"),
-        HOUR,
-    )
-    .await as usize;
-    let f = family_floor(state, "machine:1d").await;
-    done += roll_family(
-        state,
-        "machine:1d",
-        "stats_machine_1h",
-        machine_pipeline(f, "day", true, "stats_machine_1d"),
-        DAY,
-    )
-    .await as usize;
-
-    // call: raw → 1h → 1d
-    let f = family_floor(state, "call:1h").await;
-    done += roll_family(
-        state,
-        "call:1h",
-        STATS_CALL,
-        call_pipeline(f, "hour", false, "stats_call_1h"),
-        HOUR,
-    )
-    .await as usize;
-    let f = family_floor(state, "call:1d").await;
-    done += roll_family(
-        state,
-        "call:1d",
-        "stats_call_1h",
-        call_pipeline(f, "day", true, "stats_call_1d"),
-        DAY,
-    )
-    .await as usize;
-
-    // call-user (usage ledger): raw → 1h → 1d
-    let f = family_floor(state, "call_user:1h").await;
-    done += roll_family(
-        state,
-        "call_user:1h",
-        STATS_CALL_USER,
-        call_user_pipeline(f, "hour", false, "stats_call_user_1h"),
-        HOUR,
-    )
-    .await as usize;
-    let f = family_floor(state, "call_user:1d").await;
-    done += roll_family(
-        state,
-        "call_user:1d",
-        "stats_call_user_1h",
-        call_user_pipeline(f, "day", true, "stats_call_user_1d"),
-        DAY,
-    )
-    .await as usize;
-
+    for p in PASSES {
+        let floor = family_floor(state, p.key).await;
+        let pipeline = (p.pipeline)(floor, p.unit, p.src_is_rollup, p.into);
+        done += roll_family(state, p.key, p.src, pipeline, p.bucket_secs).await as usize;
+    }
     done
 }
 
