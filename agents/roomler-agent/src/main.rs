@@ -806,13 +806,15 @@ async fn main() -> Result<()> {
         } => {
             enroll_cmd(
                 &config_path,
-                &server,
-                &token,
-                &name,
-                machine_global,
-                label.as_deref(),
-                replace,
-                overlay,
+                EnrollOptions {
+                    server: &server,
+                    enrollment_token: &token,
+                    machine_name: &name,
+                    machine_global,
+                    label: label.as_deref(),
+                    replace,
+                    overlay,
+                },
             )
             .await
         }
@@ -1128,16 +1130,33 @@ fn resolve_encoder_preference(
     }
 }
 
-async fn enroll_cmd(
-    config_path: &Path,
-    server: &str,
-    enrollment_token: &str,
-    machine_name: &str,
+/// What `enroll` was asked to do.
+///
+/// A struct rather than eight positionals because three of them are bools:
+/// `enroll_cmd(.., true, false, true)` says nothing at the call site and a
+/// transposition compiles perfectly. Same reasoning as `OverlayNodeDao::create`
+/// (#621). Destructured exhaustively below, so a new field has to be given a
+/// meaning rather than silently ignored.
+struct EnrollOptions<'a> {
+    server: &'a str,
+    enrollment_token: &'a str,
+    machine_name: &'a str,
     machine_global: bool,
-    label: Option<&str>,
+    label: Option<&'a str>,
     replace: bool,
     overlay: bool,
-) -> Result<()> {
+}
+
+async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
+    let EnrollOptions {
+        server,
+        enrollment_token,
+        machine_name,
+        machine_global,
+        label,
+        replace,
+        overlay,
+    } = opts;
     // rc.52: --machine-global retargets the write to
     // %PROGRAMDATA%\roomler\roomler-agent\config.toml so a perMachine
     // + SystemContext host's LocalSystem worker can load it pre-logon.
