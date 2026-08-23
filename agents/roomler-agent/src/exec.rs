@@ -823,6 +823,15 @@ impl ExecEngine {
 
         outcome.stdout = redactor.apply(&outcome.stdout);
         outcome.stderr = redactor.apply(&outcome.stderr);
+        // The error string leaves the host too — it is streamed to an SSH
+        // client's stderr and persisted in `exec_audit` for 90 days — so it
+        // gets the same treatment as the output. It is agent-generated today
+        // and unlikely to carry a secret, but "unlikely" is not a property
+        // worth relying on when the redactor is already in hand: an error that
+        // interpolates a command line, a path or an env value is one edit away.
+        if let Some(err) = outcome.error.take() {
+            outcome.error = Some(redactor.apply(&err));
+        }
 
         info!(
             request_id = %req.request_id,
