@@ -91,6 +91,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Run Fleet-RPC commands sent by the server (commands inherit the daemon's SYSTEM/root identity). Default: OFF.",
     ),
     (
+        "remote_config_enabled",
+        "bool",
+        "Accept configuration pushed by the control plane. NEVER settable by the server — it is what keeps exec_enabled/ssh_enabled refusable by a compromised one. Turning it ON delegates that last refusal. Default: OFF.",
+    ),
+    (
         "ssh_enabled",
         "bool",
         "Serve SSH in-process on this node's overlay address (intercepted before the OS; sessions inherit the daemon's SYSTEM/root identity). Default: OFF.",
@@ -554,6 +559,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "auto_grant_session" => Some(fmt_bool(cfg.auto_grant_session)),
         "enable_remote_browse" => Some(fmt_bool(cfg.enable_remote_browse)),
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
+        "remote_config_enabled" => Some(fmt_bool(cfg.remote_config_enabled)),
         "ssh_enabled" => Some(fmt_bool(cfg.ssh_enabled)),
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
@@ -677,6 +683,12 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         // Clearing the key (`value: None`) resets to OFF, not ON — the
         // fail-safe direction for a gate that grants root.
         "exec_enabled" => cfg.exec_enabled = parse_bool_or(value, false)?,
+        // Same fail-safe direction, and note WHERE this is settable from:
+        // locally (this surface — CLI, desktop companion), never from a
+        // server push. A future config-push handler must reject this field
+        // explicitly; if the server could set it, every other gate here would
+        // be one push away from meaningless. See `docs/remote-config.md`.
+        "remote_config_enabled" => cfg.remote_config_enabled = parse_bool_or(value, false)?,
         // Same fail-safe direction as `exec_enabled`: clearing the key means
         // OFF. An SSH session is strictly more than a bounded command.
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
@@ -1797,6 +1809,52 @@ mod tests {
         apply(&mut cfg, "exec_enabled", None).unwrap();
         assert!(!cfg.exec_enabled, "clearing must fail SAFE, not open");
         assert!(apply(&mut cfg, "exec_enabled", Some("perhaps")).is_err());
+    }
+
+    /// The opt-in that keeps `exec_enabled` / `ssh_enabled` refusable by a
+    /// compromised control plane (`docs/remote-config.md`). Locked here
+    /// because the DEFAULT is the security property: a device that has not
+    /// opted in cannot be opened by any server, so a stray `#[serde(default)]`
+    /// change or a "sensible" default-on would silently undo the design.
+    #[test]
+    fn remote_config_opt_in_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            current_value(&cfg, "remote_config_enabled").as_deref(),
+            Some("false"),
+            "a fresh device must not accept pushed config"
+        );
+        apply(&mut cfg, "remote_config_enabled", Some("true")).unwrap();
+        assert!(cfg.remote_config_enabled);
+        assert_eq!(
+            entry_for(&cfg, "remote_config_enabled")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("true")
+        );
+        // Clearing opts back OUT. The fail-safe direction for this key is the
+        // one that RESTORES the local veto.
+        apply(&mut cfg, "remote_config_enabled", None).unwrap();
+        assert!(
+            !cfg.remote_config_enabled,
+            "clearing must re-close the door"
+        );
+        assert!(apply(&mut cfg, "remote_config_enabled", Some("maybe")).is_err());
+    }
+
+    /// A config file written before this key existed must load as opted-OUT.
+    /// Every device in the field predates it, so the `#[serde(default)]`
+    /// behaviour here is what decides whether the fleet wakes up closed.
+    #[test]
+    fn absent_remote_config_key_loads_as_opted_out() {
+        let cfg: crate::config::AgentConfig =
+            toml::from_str("server_url = \"https://example.invalid\"\nws_url = \"wss://example.invalid/ws\"\nagent_token = \"t\"\nagent_id = \"a\"\ntenant_id = \"t\"\nmachine_id = \"m\"\nmachine_name = \"n\"\n")
+                .expect("minimal config parses");
+        assert!(
+            !cfg.remote_config_enabled,
+            "a config predating the key must not be opted in"
+        );
     }
 
     #[test]

@@ -88,6 +88,34 @@ pub struct AgentConfig {
     #[serde(default)]
     pub exec_enabled: bool,
 
+    /// Whether this device accepts configuration pushed from its control
+    /// plane (see `docs/remote-config.md`).
+    ///
+    /// Default **`false`**, and **never settable by the server** — that
+    /// exclusion is the entire point, not an oversight. [`Self::exec_enabled`]
+    /// and [`Self::ssh_enabled`] are "the only refusal that survives a
+    /// compromised server" for exactly one reason: the server cannot write
+    /// them. A config-push feature deletes that property unless something
+    /// replaces it, and this key is that replacement — a device that has not
+    /// opted in cannot be opened by any control plane, compromised or not.
+    ///
+    /// ⚠️ Be honest about what turning it ON costs: it delegates that last
+    /// refusal to the control plane for every key the push covers. It trades a
+    /// per-key local decision for a one-time local decision. That is a real
+    /// reduction in safety and the reason the default is OFF — opting in has
+    /// to be a deliberate act by whoever holds the box.
+    ///
+    /// ⚠️ If the server could set this, the whole design would be one push
+    /// away from meaningless. Any future config-push handler must refuse to
+    /// apply this field, and the refusal belongs in the handler rather than in
+    /// a comment.
+    ///
+    /// Inert on its own: nothing reads it yet. The key lands first so that a
+    /// device can be opted in before the mechanism exists, rather than the
+    /// mechanism arriving and finding every device closed.
+    #[serde(default)]
+    pub remote_config_enabled: bool,
+
     /// Serve SSH on this node's overlay address, in-process.
     ///
     /// Default **`false`**, for the same reason as [`Self::exec_enabled`] and
@@ -1420,6 +1448,7 @@ pub fn test_fixture() -> AgentConfig {
         enable_remote_browse: true,
         auto_grant_session: true,
         exec_enabled: false,
+        remote_config_enabled: false,
         ssh_enabled: false,
         ssh_port: None,
         ssh_authorized_keys: Vec::new(),
