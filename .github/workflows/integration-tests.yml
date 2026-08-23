@@ -1,0 +1,137 @@
+# The integration suite, actually running.
+#
+# `crates/tests` — 288 tests across 25 modules — ran in NO CI lane for
+# months. It needs MongoDB + Redis, `ci.yml` has neither, and every module is
+# `#[cfg(test)]`-gated so `--workspace` clippy compiles only `pub mod
+# fixtures`. The crate stopped compiling entirely (a DAO grew three fields and
+# its 8 test callers didn't) and every PR stayed green throughout. #603 added
+# a `cargo check` so the crate at least BUILDS; this lane is the other half.
+#
+# ⚠️ The failure mode that let it rot is a lane that runs NOTHING and reports
+# success — a build log printing `Checking roomler-ai-tests` was mistaken for
+# coverage for months. So this workflow asserts a MINIMUM TEST COUNT: if the
+# harness executes far fewer tests than the suite contains, the job fails
+# loudly instead of passing quietly. A green tick here has to mean the tests
+# ran.
+#
+# Deliberately NOT on every PR: the suite is ~40 min on the build host, and
+# a job that long on every push trains people to ignore it. Master pushes
+# that touch backend code, plus manual dispatch.
+name: integration-tests
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/**'
+      - 'agents/roomler-agent/**'
+      - '.github/workflows/integration-tests.yml'
+  pull_request:
+    paths:
+      - 'crates/tests/**'
+      - '.github/workflows/integration-tests.yml'
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'Only run tests matching this substring (empty = whole suite)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Integration suite (MongoDB + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    services:
+      # Port 27019 on the host, not 27017: `TestApp` and the local
+      # docker-compose both use 27019, so the tests need no override.
+      mongo:
+        image: mongo:7
+        ports:
+          - 27019:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      ROOMLER__DATABASE__URL: mongodb://localhost:27019
+      # File storage defaults to local disk in dev/test (see
+      # crates/api/src/storage.rs), so no MinIO/S3 is needed here. Leaving
+      # ROOMLER__S3__* unset is what selects that backend.
+      RUST_BACKTRACE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Rust cache
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: ci-integration
+          cache-on-failure: true
+
+      - name: Build the test binary
+        # Separate from the run so a compile failure reads as a compile
+        # failure, not as "0 tests passed".
+        run: cargo test -p roomler-ai-tests --no-run
+
+      - name: Run the suite
+        id: run
+        env:
+          FILTER: ${{ github.event.inputs.filter }}
+        run: |
+          set -o pipefail
+          cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads=4 \
+            2>&1 | tee /tmp/itest.log
+
+      - name: Assert the suite actually ran
+        # ⚠️ THE POINT OF THIS STEP. A test lane that silently executes
+        # nothing is indistinguishable from a passing one, and that is
+        # precisely how this crate rotted. `cargo test` happily reports
+        # success for a filter that matches no test, so success alone is
+        # not evidence.
+        #
+        # The floor is deliberately well under the real count (288 as of
+        # 2026-08-23) so ordinary churn does not trip it, while a harness
+        # that runs a handful — or none — fails loudly. Raise it when the
+        # suite grows; if you find yourself LOWERING it, that is the signal
+        # to stop and ask what stopped running.
+        if: ${{ github.event.inputs.filter == '' }}
+        run: |
+          set -euo pipefail
+          total=$(grep -oE '^test result: .*[0-9]+ passed' /tmp/itest.log \
+                  | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' \
+                  | awk '{s+=$1} END {print s+0}')
+          echo "tests reported passed: $total"
+          MIN=200
+          if [ "$total" -lt "$MIN" ]; then
+            echo "::error::only $total tests ran (floor $MIN). A green run that executes nothing is the failure this lane exists to prevent — find out what stopped running before touching this number."
+            exit 1
+          fi
+
+      - name: Upload the log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-log
+          path: /tmp/itest.log
+          retention-days: 7
