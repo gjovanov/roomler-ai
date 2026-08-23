@@ -119,8 +119,11 @@ gh attestation verify roomler-agent-<v>-x86_64-unknown-linux-gnu.deb --repo gjov
 ```
 
 Windows binaries are Authenticode-signed; macOS artifacts are Developer-ID signed
-and notarized where the format allows. The installer proxies exist precisely so
-corporate networks can allow-list `roomler.ai` instead of `github.com`.
+and notarized where the format allows. [code-signing.md](code-signing.md) covers
+the whole chain — who the publisher is, how CI signs without holding any key
+material, and how to verify an artifact by hand. The installer proxies exist
+precisely so corporate networks can allow-list `roomler.ai` instead of
+`github.com`.
 
 ## Uninstall / cleanup
 
