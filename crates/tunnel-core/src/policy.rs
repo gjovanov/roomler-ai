@@ -954,6 +954,7 @@ mod tests {
             access_policy: Default::default(),
             exec_policy: Default::default(),
             ssh_policy: Default::default(),
+            desired_config: Default::default(),
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
