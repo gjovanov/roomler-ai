@@ -47,17 +47,9 @@ jobs:
     timeout-minutes: 75
 
     services:
-      # Port 27019 on the host, not 27017: `TestApp` and the local
-      # docker-compose both use 27019, so the tests need no override.
-      mongo:
-        image: mongo:7
-        ports:
-          - 27019:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 12
+      # MongoDB is deliberately NOT a service container — see "Start MongoDB"
+      # below. Service containers accept no command arguments, and this
+      # workload needs one.
       redis:
         image: redis:7
         ports:
@@ -89,6 +81,32 @@ jobs:
           shared-key: ci-integration
           cache-on-failure: true
 
+      - name: Start MongoDB (capped WiredTiger cache)
+        # A service container cannot take command arguments, and this one
+        # needs `--wiredTigerCacheSizeGB`. The default cache is ~50 % of RAM;
+        # on a 2-core/7 GB runner that competes with the test binary, and the
+        # first run of this lane (32670680394) lost Mongo mid-suite —
+        # 28 tests died on `Connection refused (os error 111)` with
+        # `SystemOverloadedError`, while 263 around them passed. Those were
+        # never 28 code failures; they were one process going away.
+        #
+        # Port 27019 on the host, not 27017: `TestApp` and the local
+        # docker-compose both use 27019, so the tests need no override.
+        run: |
+          set -euo pipefail
+          docker run -d --name roomler-test-mongo -p 27019:27017 \
+            --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'" \
+            --health-interval 5s --health-timeout 5s --health-retries 20 \
+            mongo:7 --wiredTigerCacheSizeGB 0.5
+          for i in $(seq 1 40); do
+            if docker exec roomler-test-mongo mongosh --quiet \
+                 --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              echo "mongo ready after ${i} attempt(s)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::MongoDB never became ready"; docker logs roomler-test-mongo | tail -40; exit 1
+
       - name: Build the test binary
         # Separate from the run so a compile failure reads as a compile
         # failure, not as "0 tests passed".
@@ -100,7 +118,10 @@ jobs:
           FILTER: ${{ github.event.inputs.filter }}
         run: |
           set -o pipefail
-          cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads=4 \
+          # 2 threads, not 4: every test creates and drops its OWN database,
+          # so concurrency here is concurrent DB churn against one Mongo on a
+          # 2-core runner — which is what took it down on the first run.
+          cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads=2 \
             2>&1 | tee /tmp/itest.log
 
       - name: Assert the suite actually ran
@@ -127,6 +148,19 @@ jobs:
             echo "::error::only $total tests ran (floor $MIN). A green run that executes nothing is the failure this lane exists to prevent — find out what stopped running before touching this number."
             exit 1
           fi
+
+      - name: Did MongoDB survive?
+        # Ask FIRST on a failure. A dead or restarted Mongo turns one
+        # environmental fault into dozens of unrelated-looking test failures,
+        # and reading those as code bugs is a long detour — it is exactly what
+        # the first run of this lane looked like.
+        if: failure()
+        run: |
+          echo "--- container state ---"
+          docker inspect -f 'Status={{.State.Status}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Restarts={{.RestartCount}}' \
+            roomler-test-mongo || true
+          echo "--- last mongo logs ---"
+          docker logs --tail 60 roomler-test-mongo 2>&1 || true
 
       - name: Upload the log on failure
         if: failure()
