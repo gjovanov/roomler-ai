@@ -5,12 +5,12 @@ without distributing `authorized_keys`, and without opening a port on the host.
 The roomler answer to [Tailscale SSH](https://tailscale.com/kb/1193/tailscale-ssh)
 — with one capability theirs does not have: **it works on Windows.**
 
-Status: **P1–P7 shipped and field-proven, plus P8a** — transport, server, the
-full four-gate authorization path, the privilege model and interactive shells
-on **both** Windows and Unix, operator consent, the audit log and admin UI,
-host-key verification, the `roomler ssh` / `roomler proxy` clients, SFTP/scp,
-port forwarding, and the device-reported session-activity log. Remaining:
-**P8b**, an admin UI for the activity feed.
+Status: **the whole programme, P1 through P8, is shipped and field-proven** —
+transport, server, the full four-gate authorization path, the privilege model
+and interactive shells on **both** Windows and Unix, operator consent, the
+audit log, host-key verification, the `roomler ssh` / `roomler proxy` clients,
+SFTP/scp, port forwarding, the device-reported session-activity log, and the
+admin UI for all of it.
 
 **Field-proven on `clk00017265`** (a corp-managed laptop with no `sshd`, all
 three firewall profiles enabled, and WSL holding loopback `:22`): a session
@@ -592,6 +592,14 @@ stalling the session that produced it, and `session_close` is emitted from the
 handler's `Drop` so it fires however the session ended — clean exit, dropped
 client, `session_secs` deadline, consent refusal.
 
+**The UI (P8b)** is `SshActivitySection`, directly under `SshAuditSection` in
+org Settings so the two are read together. It leads with the two things a
+reader would otherwise get wrong — that an empty list is not evidence of
+inactivity, and that these are the device's own account of itself — because
+both are properties of the design rather than caveats that go away later. A
+refused row is rendered in error red, since a forward the device turned down
+is the row an operator is usually hunting for.
+
 ### `roomler proxy` for stock tools (P6c — shipped)
 
 ```
@@ -678,7 +686,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P7a | SFTP subsystem — `sftp` and `scp` | **shipped** rc.450, field-proven mars→jupiter |
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
-| P8b | Admin UI for the activity feed | designed |
+| P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |
 
 ## 6. Build
 
