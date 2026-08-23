@@ -391,4 +391,52 @@ describe('useAgentStore', () => {
     expect(url).toContain('user_id=u9')
     expect(url).toContain('per_page=25')
   })
+
+  it('fetchSshActivity hits its OWN route, not the audit one', async () => {
+    // The two logs mean different things — the server's decision vs the
+    // device's claim about itself — and are deliberately separate
+    // collections. Pointing this at `ssh-audit` would silently present
+    // unverified device reports as authoritative.
+    mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+    const s = useAgentStore()
+    await s.fetchSshActivity(TENANT_ID)
+    const url = mockApi.get.mock.calls.at(-1)![0] as string
+    expect(url).toContain(`/tenant/${TENANT_ID}/ssh-activity?`)
+    expect(url).not.toContain('ssh-audit')
+  })
+
+  it('fetchSshActivity can narrow to one session via grant_id', async () => {
+    // The join from an audit decision row to what followed it.
+    mockApi.get.mockResolvedValueOnce({ items: [], total: 0 })
+    const s = useAgentStore()
+    await s.fetchSshActivity(TENANT_ID, { grantId: 'g-7', agentId: 'a1' })
+    const url = mockApi.get.mock.calls.at(-1)![0] as string
+    expect(url).toContain('grant_id=g-7')
+    expect(url).toContain('agent_id=a1')
+  })
+
+  it('an activity row with allowed:false survives the round trip', async () => {
+    // A refused forward is the row an operator most wants to find. If
+    // `allowed` were dropped or defaulted, a denial would render as an
+    // ordinary action.
+    mockApi.get.mockResolvedValueOnce({
+      items: [
+        {
+          id: 'r1',
+          agent_id: 'a1',
+          caller: 'ssh:Someone@100.65.4.2:1',
+          kind: 'forward',
+          detail: '10.0.0.5:5432',
+          allowed: false,
+          at: '2026-08-23T00:00:00Z',
+        },
+      ],
+      total: 1,
+    })
+    const s = useAgentStore()
+    const res = await s.fetchSshActivity(TENANT_ID)
+    expect(res.items[0]!.allowed).toBe(false)
+    expect(res.items[0]!.kind).toBe('forward')
+    expect(res.items[0]!.detail).toBe('10.0.0.5:5432')
+  })
 })
