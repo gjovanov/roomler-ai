@@ -180,7 +180,7 @@ async fn serve(
 ) {
     // Bind the FIRST FREE port in the candidate range (rc.232), not a
     // single fixed port. A host can run MORE THAN ONE agent — e.g.
-    // NEO16's Windows agent + a WSL agent under Win11 mirrored
+    // DEVBOX's Windows agent + a WSL agent under Win11 mirrored
     // networking, which share the Windows loopback and both want 47989
     // — so a fixed port deadlocks: whoever loses gets "address in use"
     // FOREVER (the earlier bind-retry only covered the transient

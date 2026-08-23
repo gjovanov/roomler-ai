@@ -12,7 +12,7 @@
 # That bit rc.439. It added `RestartPreventExitStatus=7 8` so a redundant
 # instance stops restart-looping, and on an upgraded host the file on disk
 # had the exception while the running systemd did not — the fix looked
-# shipped and did nothing. Verified on mars: before this script the package
+# shipped and did nothing. Verified on buildhost: before this script the package
 # had no maintainer scripts at all, only .list and .md5sums.
 #
 # Reload ONLY. This must never enable, start, restart or stop anything:

@@ -14,7 +14,7 @@
 //! browser's STUN checks arriving at the agent's host candidate) racing the
 //! pre-warmed TURN relay pair — and Chrome, as the controlling side,
 //! nominates whichever check succeeds first. Field 2026-07-13
-//! (NEO16 hosting, same-LAN viewers): sessions flipped between
+//! (DEVBOX hosting, same-LAN viewers): sessions flipped between
 //! `Host↔Host` and the Germany TURN relay across reconnects seconds apart,
 //! with the relay winning most rolls — 3 Mbps clamp, 30 fps, +100-150 ms
 //! mouse RTT.

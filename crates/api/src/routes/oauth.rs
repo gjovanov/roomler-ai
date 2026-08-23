@@ -1,12 +1,31 @@
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{error::ApiError, state::AppState};
+
+/// `; Secure` in production, empty in dev — the http://localhost dev/test flow
+/// must still receive the cookie, and prod is https end-to-end.
+fn secure_attr(state: &AppState) -> &'static str {
+    if state.settings.app.environment == "production" {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+/// Read one cookie value out of the request `Cookie` header.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    let prefix = format!("{}=", name);
+    raw.split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.strip_prefix(&prefix).map(str::to_string))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CallbackQuery {
@@ -23,26 +42,49 @@ pub async fn oauth_redirect(
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("OAuth not configured".to_string()))?;
 
+    // CSRF: mint a random state, bind it to THIS browser via a short-lived
+    // HttpOnly cookie (double-submit), and carry the same value in the auth
+    // URL. The callback requires the two to match — without it an attacker
+    // could feed a victim a pre-obtained code+state and silently sign them
+    // into the ATTACKER's account (login CSRF / forced account takeover).
     let csrf_state = Uuid::new_v4().to_string();
-    // In production, store state in a short-lived cache (Redis) for validation.
-    // For now we pass it through and skip strict validation.
 
     let auth_url = oauth
         .build_auth_url(&provider, &csrf_state)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    Ok(Redirect::temporary(&auth_url).into_response())
+    let cookie = format!(
+        "oauth_state={}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600{}",
+        csrf_state,
+        secure_attr(&state)
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.insert(header::LOCATION, auth_url.parse().unwrap());
+    Ok((StatusCode::TEMPORARY_REDIRECT, headers).into_response())
 }
 
 pub async fn oauth_callback(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    req_headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
     let oauth = state
         .oauth
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("OAuth not configured".to_string()))?;
+
+    // CSRF: the query `state` MUST equal the `oauth_state` cookie we bound to
+    // this browser at redirect time. A missing/mismatched value means the flow
+    // was not initiated by this browser (login CSRF) — reject before touching
+    // the code.
+    if params.state.is_empty()
+        || cookie_value(&req_headers, "oauth_state").as_deref() != Some(params.state.as_str())
+    {
+        return Err(ApiError::Forbidden("Invalid OAuth state".to_string()));
+    }
 
     // Exchange code and fetch user info
     let user_info = oauth
@@ -76,10 +118,17 @@ pub async fn oauth_callback(
         .auth
         .generate_tokens(user_id, &user.email, &user.username)?;
 
-    // Set cookie and redirect to frontend
+    // Set the session cookie (Secure in prod) and clear the one-shot CSRF
+    // state cookie now that it has been consumed.
     let cookie = format!(
-        "access_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}",
-        tokens.access_token, tokens.expires_in
+        "access_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
+        tokens.access_token,
+        tokens.expires_in,
+        secure_attr(&state)
+    );
+    let clear_state = format!(
+        "oauth_state=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{}",
+        secure_attr(&state)
     );
 
     let frontend_url = state.settings.oauth.base_url.replace(":5001", ":5000"); // API → UI port
@@ -90,7 +139,8 @@ pub async fn oauth_callback(
     );
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.append(header::SET_COOKIE, clear_state.parse().unwrap());
     headers.insert(header::LOCATION, redirect_url.parse().unwrap());
 
     Ok((StatusCode::FOUND, headers).into_response())

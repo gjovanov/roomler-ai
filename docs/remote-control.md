@@ -1232,7 +1232,7 @@ green. Cache is an optimisation, not a correctness gate.
 Discovered while validating 0.1.52 → 0.1.53: existing tasks
 created via `schtasks /Create /SC ONLOGON` (the pre-0.1.50 path)
 can develop a tightened ACL that denies even the owner Modify and
-Delete rights without elevation. Symptom on neo16:
+Delete rights without elevation. Symptom on devbox:
 `Unregister-ScheduledTask` returns `HRESULT 0x80070005`
 (E_ACCESSDENIED), and `schtasks /Create /XML /F` fails with
 `Access is denied` even though the existing task's `Author` field
@@ -1295,7 +1295,7 @@ Agent (`agents/roomler-agent/src/signaling.rs`) adds a 30 s
 up that adds the `sysinfo` crate); `active_sessions = peers.len()`
 straight off the per-connection peer map.
 
-Backend deployed via mars rebuild → ArgoCD GitOps in the same cycle.
+Backend deployed via buildhost rebuild → ArgoCD GitOps in the same cycle.
 
 #### 19.8.3 agent-v0.1.57 — Phase 8 pre-flight checks
 

@@ -24,7 +24,7 @@
 One mechanism explains two long-standing user reports:
 
 - *"When the Windows logon screen is shown, the overlay stops working."*
-- *"When CORPLAP-1 connects to the corporate VPN, roomlerd gets restarted."*
+- *"When winhost-a connects to the corporate VPN, roomlerd gets restarted."*
 
 The Windows agent is **two processes from one EXE**: the SCM runs
 `roomlerd.exe service-run` (LocalSystem, session 0 — the *supervisor*), which
@@ -48,7 +48,7 @@ sessions, punched NAT mappings, TURN allocations, DNS/NRPT state — all gone,
 all rebuilt 2–60 s later. On flow-lifecycle networks (Check Point grandfathers
 only *existing* UDP flows) a single death permanently downgrades the host from
 direct/UDP to TCP relay until the next VPN-off window. Field 2026-08-14:
-CORPLAP-1 had four worker generations in 75 minutes, each rolling a fresh
+winhost-a had four worker generations in 75 minutes, each rolling a fresh
 direct-socket flow.
 
 The rest of the fleet does not have this problem — on Linux/macOS the daemon
@@ -165,7 +165,7 @@ Worker attach/detach semantics:
 
 1. **`overlay_netd` config key (tribool, default OFF)** + supervisor support
    for the two-child topology. With the flag off, nothing changes.
-2. **Stage 1 — netd hosts the network plane** on opt-in hosts (CORPLAP-1
+2. **Stage 1 — netd hosts the network plane** on opt-in hosts (winhost-a
    class first: the hosts whose session churn costs the most). Worker keeps
    RC; IPC relay carries RC signalling. Field gate: node stays reachable
    (peers, DNS, exec) across sign-out → 2 min at the logon screen → sign-in,

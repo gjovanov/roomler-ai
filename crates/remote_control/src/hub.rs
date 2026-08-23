@@ -365,7 +365,7 @@ impl Hub {
         // connection-teardown path closes its peers, and the fresh
         // connection starts with none — so any Active row still pinned to
         // this agent is a ZOMBIE whose Terminate was lost with the dying WS
-        // (field 2026-08-15 CORPLAP-1: red frame held, capacity held, the
+        // (field 2026-08-15 winhost-a: red frame held, capacity held, the
         // controller's live tab retried into AgentBusy until a host-side
         // click). Reap now: `terminate` notifies the possibly-still-live
         // controller tab (its UI unblocks and may auto-reconnect), frees
@@ -394,7 +394,7 @@ impl Hub {
         }
         // Re-push any consent-pending Request to the fresh connection: an
         // agent whose control WS flapped between the Request and its
-        // `rc:consent` reply lost the exchange (2026-08-05 CORPLAP-1 — three
+        // `rc:consent` reply lost the exchange (2026-08-05 winhost-a — three
         // sessions parked in AwaitingConsent during a VPN-churn window). The
         // agent handles a duplicate Request idempotently (its consent broker
         // re-runs; a second `rc:consent` for an already-resolved slot is a
@@ -953,7 +953,7 @@ impl Hub {
                 // controller's offer never arrives when its socket died or its
                 // reply raced a client teardown. Without a deadline the session
                 // sits in `Negotiating` forever while the browser shows
-                // "awaiting consent" (2026-08-05 CORPLAP-1). `EndReason::Error`
+                // "awaiting consent" (2026-08-05 winhost-a). `EndReason::Error`
                 // is deliberate — the controller's terminate handler treats it
                 // as retryable, so a live UI auto-reconnects cleanly.
                 let hub = self.clone();
@@ -1782,7 +1782,7 @@ mod tests {
         assert!(matches!(m, ServerMsg::Ready { .. }));
     }
 
-    /// 2026-08-05 CORPLAP-1 wedge, leg A — an agent whose control WS flaps
+    /// 2026-08-05 winhost-a wedge, leg A — an agent whose control WS flaps
     /// between the `Request` and its `rc:consent` reply loses the exchange.
     /// `register_agent` must re-push the pending Request on the fresh
     /// connection, and must NOT re-push once consent was delivered.
@@ -1838,7 +1838,7 @@ mod tests {
         );
     }
 
-    /// 2026-08-05 CORPLAP-1 wedge, leg B — consent granted + `Ready` pushed but
+    /// 2026-08-05 winhost-a wedge, leg B — consent granted + `Ready` pushed but
     /// the controller never sends an offer (it never received `Ready`).
     /// The negotiating reaper must terminate with `EndReason::Error` (which
     /// the controller's ladder treats as retryable); a session whose offer

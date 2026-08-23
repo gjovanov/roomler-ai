@@ -618,14 +618,14 @@ mod tests {
 
     #[test]
     fn parses_question_name_and_type() {
-        let q = parse_question(&query_for("neo16.myorg.roomler.net", 1)).unwrap();
-        assert_eq!(q.qname, "neo16.myorg.roomler.net");
+        let q = parse_question(&query_for("devbox.myorg.roomler.net", 1)).unwrap();
+        assert_eq!(q.qname, "devbox.myorg.roomler.net");
         assert_eq!(q.qtype, 1);
     }
 
     #[test]
     fn a_answer_is_well_formed() {
-        let query = query_for("neo16.myorg.roomler.net", 1);
+        let query = query_for("devbox.myorg.roomler.net", 1);
         let q = parse_question(&query).unwrap();
         let resp = build_a(&query, q.qend, Ipv4Addr::new(100, 64, 0, 7));
         assert_eq!(&resp[0..2], &query[0..2]); // ID echoed
@@ -640,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn in_zone_hit_answers_a_and_miss_is_nxdomain() {
         let mut map = HashMap::new();
-        map.insert("neo16".to_string(), Ipv4Addr::new(100, 64, 0, 7));
+        map.insert("devbox".to_string(), Ipv4Addr::new(100, 64, 0, 7));
         let cfg = DnsConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             magic_domain: "myorg.roomler.net".into(),
@@ -649,7 +649,7 @@ mod tests {
             answer_aaaa: true,
         };
 
-        let hit = build_response(&query_for("neo16.myorg.roomler.net", 1), &cfg)
+        let hit = build_response(&query_for("devbox.myorg.roomler.net", 1), &cfg)
             .await
             .unwrap();
         assert_eq!(u16::from_be_bytes([hit[6], hit[7]]), 1); // one answer
@@ -665,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn aaaa_answers_derived_v6_and_kill_switch_reverts_to_nodata() {
         let mut map = HashMap::new();
-        map.insert("neo16".to_string(), Ipv4Addr::new(100, 64, 0, 7));
+        map.insert("devbox".to_string(), Ipv4Addr::new(100, 64, 0, 7));
         let mut cfg = DnsConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             magic_domain: "myorg.roomler.net".into(),
@@ -675,7 +675,7 @@ mod tests {
         };
 
         // In-zone AAAA → one answer whose RDATA is the DERIVED overlay v6.
-        let hit = build_response(&query_for("neo16.myorg.roomler.net", 28), &cfg)
+        let hit = build_response(&query_for("devbox.myorg.roomler.net", 28), &cfg)
             .await
             .unwrap();
         assert_eq!(u16::from_be_bytes([hit[6], hit[7]]), 1); // one answer
@@ -686,7 +686,9 @@ mod tests {
         assert_eq!(&hit[rr..rr + 2], &[0, 28]);
 
         // Bare label AAAA resolves the same way.
-        let bare = build_response(&query_for("neo16", 28), &cfg).await.unwrap();
+        let bare = build_response(&query_for("devbox", 28), &cfg)
+            .await
+            .unwrap();
         assert_eq!(&bare[bare.len() - 16..], &want);
 
         // Unknown in-zone name stays NXDOMAIN on AAAA too.
@@ -697,13 +699,13 @@ mod tests {
 
         // Kill switch: AAAA → NODATA (name exists, zero answers, rcode 0).
         cfg.answer_aaaa = false;
-        let off = build_response(&query_for("neo16.myorg.roomler.net", 28), &cfg)
+        let off = build_response(&query_for("devbox.myorg.roomler.net", 28), &cfg)
             .await
             .unwrap();
         assert_eq!(off[3] & 0x0F, 0);
         assert_eq!(u16::from_be_bytes([off[6], off[7]]), 0);
         // A records are unaffected by the switch.
-        let a = build_response(&query_for("neo16.myorg.roomler.net", 1), &cfg)
+        let a = build_response(&query_for("devbox.myorg.roomler.net", 1), &cfg)
             .await
             .unwrap();
         assert_eq!(&a[a.len() - 4..], &[100, 64, 0, 7]);
@@ -712,7 +714,7 @@ mod tests {
     #[tokio::test]
     async fn bare_known_label_resolves() {
         let mut map = HashMap::new();
-        map.insert("neo16".to_string(), Ipv4Addr::new(100, 64, 0, 9));
+        map.insert("devbox".to_string(), Ipv4Addr::new(100, 64, 0, 9));
         let cfg = DnsConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             magic_domain: "myorg.roomler.net".into(),
@@ -720,7 +722,7 @@ mod tests {
             names: Arc::new(RwLock::new(map)),
             answer_aaaa: true,
         };
-        let resp = build_response(&query_for("neo16", 1), &cfg).await.unwrap();
+        let resp = build_response(&query_for("devbox", 1), &cfg).await.unwrap();
         assert_eq!(&resp[resp.len() - 4..], &[100, 64, 0, 9]);
     }
 }

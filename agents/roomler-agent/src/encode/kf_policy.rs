@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 /// keepalive frames ALWAYS flow, so the "wedge insurance" was in practice a
 /// 4-second IDR METRONOME on every DC session — and each metronome IDR
 /// QP-starves under the maxrate cap, painting the field-reported "text
-/// blurs every ~3 s then re-sharpens" pulse (2026-07-25, NEO16 viewing
-/// CORPLAP-1/REGAL) on every codec. Wedge safety is preserved without the
+/// blurs every ~3 s then re-sharpens" pulse (2026-07-25, DEVBOX viewing
+/// WINHOST-A/REGAL) on every codec. Wedge safety is preserved without the
 /// metronome: rc:keyframe rides the RELIABLE control DC (can't be lost in
 /// transit), every force arms `pending_since`, this retry covers a
 /// swallowed force, and the rebuild fallback covers force-ignoring

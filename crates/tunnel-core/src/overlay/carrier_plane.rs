@@ -4,7 +4,7 @@
 //! process-global stable port ([`direct::direct_port`]), deconflicted only by
 //! the blind band walk — so which org holds the base is a spawn-order race
 //! that re-runs on every restart and rebuild, churning the NAT mappings of
-//! every org that loses it (field: CORPLAP-1's second org re-punching after
+//! every org that loses it (field: winhost-a's second org re-punching after
 //! each restart). The plane replaces that with ONE socket set for the whole
 //! process: every attached engine (one per org) sends and receives on the
 //! same stable `ip:port`, and inbound datagrams are demultiplexed by the
@@ -75,7 +75,7 @@ pub struct EngineHooks {
     /// per-plane: N org engines share one plane, so a single plane-wide sink
     /// would be taken by whichever engine asked first and leave every other
     /// engine blind — every path it measures reading 100 % loss. Field
-    /// 2026-08-12: one engine reported 8 % on the same mars endpoint the
+    /// 2026-08-12: one engine reported 8 % on the same buildhost endpoint the
     /// other reported 100 % on. Routed exactly like `direct_events`.
     pub disco_events: mpsc::Sender<DiscoInbound>,
     pub direct_events: mpsc::Sender<DirectInbound>,
@@ -207,7 +207,7 @@ pub struct CarrierPlane {
     /// empty-view fast-path, both bind, and the second `st.binds` assignment
     /// dropped the first set — whose sockets the first runtime's `DirectCtx`
     /// already held: bound, reader-less, still advertised. Field 2026-08-10:
-    /// mars/jupiter relay-locked, the advertised socket's Recv-Q pegged at
+    /// buildhost/fleet-host-1 relay-locked, the advertised socket's Recv-Q pegged at
     /// rmem, the winner walked the band to :43649. First caller binds; every
     /// later caller waits here and reuses the same view.
     bind_gate: tokio::sync::Mutex<()>,
@@ -801,7 +801,7 @@ impl CarrierPlane {
             None => {
                 // An authenticated-looking session datagram for an index no
                 // engine registered. This was a bare `Drop` with NO log, and
-                // that silence is what made the 2026-08-12 CORPLAP-1 outage take
+                // that silence is what made the 2026-08-12 winhost-a outage take
                 // a day: packets arrived on the carrier socket, nothing
                 // reached any TUN, and every layer above reported health.
                 //
@@ -1209,7 +1209,7 @@ impl CarrierPlane {
     /// WARN to debug. The SEEKING task re-walks every backoff tick (and on
     /// every interface-event poke), so at full verbosity a UDP-blocked host
     /// wrote the same 4 lines per walk forever — field 2026-08-14: 40k srflx
-    /// lines in one day's log on CORPLAP-1. The task keeps its own low-rate
+    /// lines in one day's log on winhost-a. The task keeps its own low-rate
     /// heartbeat instead.
     async fn gather_via_sink(
         &self,
@@ -1234,7 +1234,7 @@ impl CarrierPlane {
         // The old single-`resolve_stun_server` pick used the FIRST resolved
         // address for every socket, so one corp path that drops UDP to that
         // /16 read as "srflx NONE" even when the other vantages were fine
-        // (field 2026-08-14: CORPLAP-1's error named 94.130.141.74 while
+        // (field 2026-08-14: winhost-a's error named 94.130.141.74 while
         // 5.9.157.x would have answered).
         let mut targets = direct::resolve_stun_targets(stun_urls, &v.my_ips).await;
         if targets.is_empty()
@@ -1287,7 +1287,7 @@ impl CarrierPlane {
             // R2 — full-tunnel rescue: every LAN-bound sock came up empty for
             // this vantage. The UNSPECIFIED public dialer egresses via the
             // captured default route (the tunnel), which on AnyConnect-class
-            // hosts is the ONLY path that passes UDP (field CORPLAP-3
+            // hosts is the ONLY path that passes UDP (field corplap-3
             // 2026-08-15: physical NICs filtered both directions, tunnel UDP
             // fine — srflx sat at NONE because nothing ever asked the one
             // socket that could answer). Outside the per-server budget above
@@ -1486,7 +1486,7 @@ impl CarrierPlane {
                     // W6 — pokes bypass the backoff BY DESIGN (a VPN drop
                     // must re-gather fast), but a churny event source must
                     // not turn that into a continuous STUN loop: field
-                    // 2026-08-14, CORPLAP-1 under Check Point emitted an
+                    // 2026-08-14, winhost-a under Check Point emitted an
                     // interface event every ~6 s, so SEEKING walked all 3
                     // vantages back-to-back for 15 minutes (~140 walks)
                     // until the source quieted. Timer-driven walks never
@@ -1802,7 +1802,7 @@ impl CarrierPlane {
 
 /// W6 — minimum spacing between POKED srflx walks/queries. Interface-event
 /// pokes bypass the SEEKING backoff by design, so a churny event source
-/// (field 2026-08-14: Check Point on CORPLAP-1 emitted one every ~6 s) would
+/// (field 2026-08-14: Check Point on winhost-a emitted one every ~6 s) would
 /// otherwise drive back-to-back multi-vantage STUN walks indefinitely.
 const SEEK_POKE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1851,7 +1851,7 @@ mod tests {
     /// wildcard public-dial socket (which the OS routes via the captured
     /// default = the VPN tunnel) can reach STUN, the gather promotes ITS
     /// mapping instead of reporting NONE, and attributes it. Field
-    /// CORPLAP-3 2026-08-15: AnyConnect filtered the physical NICs both
+    /// corplap-3 2026-08-15: AnyConnect filtered the physical NICs both
     /// directions while the CORP3 tunnel passed UDP fine — srflx sat at NONE
     /// purely because the gather never asked the one socket that could
     /// answer. The fake STUN server here ignores the "LAN" sock (the
@@ -1934,7 +1934,7 @@ mod tests {
     /// pre-decrypt — silently. Carriers are negotiated per side, so that
     /// asymmetry is routine.
     ///
-    /// Field 2026-08-12 (CORPLAP-1, dual-org): the org whose peers sat on relay
+    /// Field 2026-08-12 (winhost-a, dual-org): the org whose peers sat on relay
     /// was unreachable inbound from EVERY peer, its socket rx climbing while
     /// its TUN rx stayed at idle; a restart only changed WHICH org lost.
     #[tokio::test]
@@ -2525,7 +2525,7 @@ mod tests {
     /// must produce exactly ONE bind pass and the SAME socket set. Field
     /// 2026-08-10: without the gate, both passed the empty-view check, both
     /// bound, and the loser's sockets stayed bound + advertised with no
-    /// reader (Recv-Q pegged at rmem) — mars/jupiter relay-locked fleet-wide.
+    /// reader (Recv-Q pegged at rmem) — buildhost/fleet-host-1 relay-locked fleet-wide.
     /// Binds REAL host ports (band-walking if a local daemon holds the base);
     /// on a host with no usable LAN interface both callers get `None`, and
     /// the ≤1 assertion still locks the invariant.
