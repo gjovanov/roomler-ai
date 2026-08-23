@@ -835,27 +835,27 @@ async fn derp_split_rehomes_toward_newest_registration() {
         (&aid_b, "derp-mach-b", pk_b, "100.64.0.2", "derp-node-b"),
     ] {
         nodes
-            .create(
-                tid,
-                NodeRef::Agent {
+            .create(roomler_ai_services::dao::overlay_node::NewOverlayNode {
+                tenant_id: tid,
+                node_ref: NodeRef::Agent {
                     agent_id: bson::oid::ObjectId::parse_str(aid).unwrap(),
                 },
-                network_id,
-                machine.to_string(),
-                name.to_string(),
-                ip.to_string(),
-                B64.encode(pk),
-                0,
-                vec![],
-                false,
-                false,
-                true,
-                false,
-                false,
-                false,
-                false,
-                vec![],
-            )
+                network_id: network_id,
+                machine_id: machine.to_string(),
+                name: name.to_string(),
+                overlay_ip: ip.to_string(),
+                wg_public_key: B64.encode(pk),
+                key_epoch: 0,
+                endpoints: vec![],
+                supports_quic: false,
+                supports_relay_single: false,
+                supports_derp: true,
+                supports_forced_derp: false,
+                supports_server_relay_strategy: false,
+                supports_derp_floor: false,
+                supports_overlay_echo: false,
+                advertised_routes: vec![],
+            })
             .await
             .unwrap();
     }
@@ -1037,30 +1037,31 @@ async fn shutdown_releases_tunnel_and_derp_records() {
     let network_id = networks.get_or_create(tid).await.unwrap().id.unwrap();
     let pk: [u8; 32] = [0xc3; 32];
     nodes
-        .create(
-            tid,
-            NodeRef::Agent {
+        .create(roomler_ai_services::dao::overlay_node::NewOverlayNode {
+            tenant_id: tid,
+            node_ref: NodeRef::Agent {
                 agent_id: bson::oid::ObjectId::parse_str(&aid).unwrap(),
             },
             network_id,
-            // Must match the enrolled machine id (see the note in
-            // `derp_split_rehomes_toward_newest_registration`) — this said
-            // "mach-shut" against an agent enrolled as "shut-mach".
-            "shut-mach".into(),
-            "shut-node".into(),
-            "100.64.0.9".into(),
-            B64.encode(pk),
-            0,
-            vec![],
-            false,
-            false,
-            true,
-            false,
-            false,
-            false,
-            false,
-            vec![],
-        )
+            // Must match the enrolled machine id — see the field doc on
+            // `NewOverlayNode::machine_id`. This said "mach-shut" against an
+            // agent enrolled as "shut-mach", which is exactly the
+            // transposition the named fields now make hard to write.
+            machine_id: "shut-mach".into(),
+            name: "shut-node".into(),
+            overlay_ip: "100.64.0.9".into(),
+            wg_public_key: B64.encode(pk),
+            key_epoch: 0,
+            endpoints: vec![],
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_derp: true,
+            supports_forced_derp: false,
+            supports_server_relay_strategy: false,
+            supports_derp_floor: false,
+            supports_overlay_echo: false,
+            advertised_routes: vec![],
+        })
         .await
         .unwrap();
     let (mut ws, _) = connect_async(&format!("ws://{}/derp?token={}", app.addr, tok))
