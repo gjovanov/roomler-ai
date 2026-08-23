@@ -18,6 +18,14 @@ path = "src/main.rs"
 
 [dependencies]
 
+# build.rs embeds a Windows VERSIONINFO resource. This shim INSTALLS as
+# roomler.exe on every Windows daemon host, so an anonymous binary here is
+# exactly as visible to AV/inventory tooling as the daemon itself. See
+# agents/roomler-agent/Cargo.toml for the embed-resource-vs-winresource
+# rationale.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [target.'cfg(unix)'.dependencies]
 # signal()/SIG_IGN/SIG_DFL for the Ctrl-C wrapper convention (parent ignores,
 # child resets in pre_exec). Ubiquitous, no build cost.

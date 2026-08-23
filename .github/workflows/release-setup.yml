@@ -22,12 +22,15 @@ name: Release roomler-setup
 #
 # Windows signing is REQUIRED (the wizard downloads MSIs + invokes
 # msiexec — corporate ESET/Defender quarantine an unsigned downloader
-# as a "downloader trojan"; rc.28 BLOCKER-10). Signing is opt-in via
-# the WIN_CODESIGN_PFX_BASE64 secret (same cert as release-agent); a
-# missing secret emits an unsigned zip + a ::warning:: rather than
-# failing, so packaging can be iterated before certs are wired.
-# Linux/macOS stay unsigned (Gatekeeper/SmartScreen workaround in
-# docs/tunnel-install.md), matching the legacy wizard.
+# as a "downloader trojan"; rc.28 BLOCKER-10). It runs through
+# ./.github/actions/sign-windows (Azure Artifact Signing over OIDC; the
+# signing job carries `environment: release` — the federated credential
+# is bound to that GitHub environment) and HARD-FAILS on a release tag.
+# A credential-less dispatch run still succeeds with a ::warning:: so
+# packaging can be iterated. macOS ships a signed + notarised + STAPLED
+# `Roomler Setup.app` inside the tarball (same asset name — the wizard
+# is the one binary users double-click from Finder, so it gets full
+# offline Gatekeeper validation). See docs/code-signing.md.
 #
 # Triggered by:
 #  - `git push` of a tag matching `setup-v*` → publishes a GitHub Release.
@@ -45,6 +48,15 @@ on:
         required: true
       publish_release:
         description: 'Create a GitHub Release with the artifacts'
+        type: boolean
+        default: false
+      signing_mode:
+        description: 'Windows signing: auto (azure if configured) | azure | local (self-signed rehearsal) | off'
+        type: choice
+        options: [auto, local, azure, 'off']
+        default: auto
+      require_signing:
+        description: 'Fail the job if artifacts end up unsigned (rehearses the release-tag gate)'
         type: boolean
         default: false
 
@@ -197,6 +209,57 @@ jobs:
             target/aarch64-apple-darwin/release/roomler-setup
           strip target/release-universal/roomler-setup
           file target/release-universal/roomler-setup
+
+      # Wrap the universal binary in a .app BEFORE signing.
+      #
+      # This is the one Roomler binary a user genuinely double-clicks from
+      # Finder, i.e. the worst Gatekeeper case, and a bare Mach-O cannot carry
+      # a stapled notarisation ticket (Apple only staples bundles/.dmg/.pkg).
+      # A bundle can -- and the ticket lands as a regular file inside it, so
+      # it survives the tar round-trip and the wizard validates even on an
+      # offline Mac. A relative symlink keeps the documented `./roomler-setup`
+      # invocation working, and the ARCHIVE NAME is unchanged so
+      # `pick_setup_asset` (setup_release.rs) is untouched.
+      - name: Stage .app bundle
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate-version.outputs.version }}"
+          APP="/tmp/stage/Roomler Setup.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release-universal/roomler-setup "$APP/Contents/MacOS/roomler-setup"
+          chmod 755 "$APP/Contents/MacOS/roomler-setup"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>          <string>roomler-setup</string>
+              <key>CFBundleIdentifier</key>          <string>ai.roomler.setup</string>
+              <key>CFBundleName</key>                <string>Roomler Setup</string>
+              <key>CFBundleShortVersionString</key>  <string>${version}</string>
+              <key>CFBundleVersion</key>             <string>${version}</string>
+              <key>CFBundlePackageType</key>         <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>      <string>12.0</string>
+              <key>NSPrincipalClass</key>            <string>NSApplication</string>
+          </dict>
+          </plist>
+          PLIST
+          echo "path=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Sign + notarise the wizard bundle
+        uses: ./.github/actions/sign-macos
+        with:
+          bundle-path:          ${{ steps.app.outputs.path }}
+          require:              ${{ needs.validate-version.outputs.is_release == 'true' }}
+          app-p12-base64:       ${{ secrets.APPLE_DEVELOPER_ID_APP_P12_BASE64 }}
+          installer-p12-base64: ${{ secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          cert-password:        ${{ secrets.APPLE_CERT_PASSWORD }}
+          api-key-id:           ${{ secrets.APPLE_API_KEY_ID }}
+          api-issuer-id:        ${{ secrets.APPLE_API_ISSUER_ID }}
+          api-key-p8-base64:    ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+
       - name: Pack tarball
         id: tar
         shell: bash
@@ -205,12 +268,33 @@ jobs:
           version="${{ needs.validate-version.outputs.version }}"
           name="roomler-setup-${version}-universal-apple-darwin"
           mkdir -p "/tmp/${name}"
-          cp target/release-universal/roomler-setup "/tmp/${name}/"
+          cp -R "/tmp/stage/Roomler Setup.app" "/tmp/${name}/"
+          # Keep `./roomler-setup` working (docs + muscle memory) while the
+          # real, stapled code lives in the bundle.
+          ln -s "Roomler Setup.app/Contents/MacOS/roomler-setup" "/tmp/${name}/roomler-setup"
           cp LICENSE README.md "/tmp/${name}/" 2>/dev/null || true
-          (cd /tmp && tar czf "${name}.tar.gz" "${name}")
+          # `tar` preserves the symlink and the stapled ticket; COPYFILE_DISABLE
+          # stops bsdtar emitting ._ AppleDouble files alongside every entry.
+          (cd /tmp && COPYFILE_DISABLE=1 tar czf "${name}.tar.gz" "${name}")
           shasum -a 256 "/tmp/${name}.tar.gz" | awk '{print $1"  "$2}' > "/tmp/${name}.tar.gz.sha256"
           mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
           echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      # The whole point of the .app: prove the ticket survived tar/untar, so
+      # the wizard validates offline. A bare-binary tarball cannot pass this.
+      - name: Verify the stapled ticket survives a tar round-trip
+        if: needs.validate-version.outputs.is_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/roundtrip && mkdir -p /tmp/roundtrip
+          tar xzf "${{ steps.tar.outputs.artifact }}" -C /tmp/roundtrip
+          app="$(find /tmp/roundtrip -maxdepth 3 -name '*.app' -type d | head -n1)"
+          [ -n "$app" ] || { echo "::error::no .app found in the packed tarball"; exit 1; }
+          xcrun stapler validate "$app"
+          spctl -a -vvv "$app" 2>&1 | tee /tmp/spctl.txt
+          grep -q 'source=Notarized Developer ID' /tmp/spctl.txt \
+            || { echo "::error::extracted wizard is not Gatekeeper-clean"; exit 1; }
       - name: Upload macOS wizard artifact
         uses: actions/upload-artifact@v4
         with:
@@ -228,6 +312,12 @@ jobs:
     needs: validate-version
     runs-on: windows-latest
     timeout-minutes: 60
+    # The signing federated credential is bound to this GitHub environment
+    # (the tenant rejects wildcard tag subjects) — do not remove.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write     # azure/login OIDC inside ./.github/actions/sign-windows
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
     steps:
@@ -253,32 +343,27 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build -p roomler-setup --release
-      - name: Authenticode sign the wizard EXE
-        # Sign BEFORE zipping so the zipped EXE the operator extracts is
-        # signed. Opt-in via the secret; a missing secret warns rather
-        # than fails (unsigned zip — SmartScreen/AV will flag it).
-        if: env.WIN_CODESIGN_PFX_BASE64 != ''
-        shell: pwsh
-        env:
-          WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
-          WIN_CODESIGN_PASSWORD:   ${{ secrets.WIN_CODESIGN_PASSWORD }}
-        run: |
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WIN_CODESIGN_PFX_BASE64))
-          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
-                      Sort-Object FullName -Descending | Select-Object -First 1
-          & $signtool.FullName sign `
-              /f $pfxPath `
-              /p $env:WIN_CODESIGN_PASSWORD `
-              /fd SHA256 `
-              /tr http://timestamp.digicert.com `
-              /td SHA256 `
-              "target\release\roomler-setup.exe"
-          Remove-Item $pfxPath -Force
-      - name: Warn on unsigned build
-        if: env.WIN_CODESIGN_PFX_BASE64 == ''
-        shell: bash
-        run: echo "::warning::WIN_CODESIGN_PFX_BASE64 not set — roomler-setup.exe is unsigned. SmartScreen/ESET may quarantine the downloader."
+      # Sign BEFORE zipping, so the EXE the operator extracts is the signed
+      # one. This is the artifact rc.28 BLOCKER-10 was about: a downloader
+      # that fetches MSIs and shells out to msiexec is exactly the shape
+      # corporate ESET/Defender quarantine when it has no publisher.
+      - name: Sign the wizard EXE
+        id: sign
+        uses: ./.github/actions/sign-windows
+        with:
+          files:                    target\release\roomler-setup.exe
+          description:              'Roomler Setup'
+          mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
+          require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
+          expect-subject-contains:  ${{ vars.AZURE_SIGNING_EXPECT_SUBJECT }}
+          endpoint:                 ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name:     ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          azure-client-id:          ${{ vars.AZURE_CLIENT_ID }}
+          azure-tenant-id:          ${{ vars.AZURE_TENANT_ID }}
+          azure-subscription-id:    ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          local-pfx-base64:         ${{ secrets.WIN_TEST_PFX_BASE64 }}
+          local-pfx-password:       ${{ secrets.WIN_TEST_PFX_PASSWORD }}
         env:
           WIN_CODESIGN_PFX_BASE64: ${{ secrets.WIN_CODESIGN_PFX_BASE64 }}
       - name: Pack zip
@@ -317,6 +402,10 @@ jobs:
     needs: [validate-version, build-linux, build-macos, build-windows]
     if: needs.validate-version.outputs.is_release == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sigstore identity for the provenance attestation
+      attestations: write  # actions/attest-build-provenance
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -329,6 +418,29 @@ jobs:
           mkdir -p release
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release/ \;
           ls -la release/
+      # GPG + provenance: same pattern as release-agent.yml -- .asc detached
+      # signatures when the key is configured, SLSA provenance always.
+      - name: GPG-sign release artifacts
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE:  ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "::notice::GPG_PRIVATE_KEY not configured -- publishing without .asc signatures."
+            exit 0
+          fi
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          for f in release/*; do
+            case "$f" in *.asc|*.sha256) continue ;; esac
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+                --armor --detach-sign "$f"
+          done
+          gpg --batch --armor --export > release/roomler-release-pubkey.asc
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'release/*'
       - name: Create / update Release
         uses: softprops/action-gh-release@v2
         with:
@@ -349,8 +461,9 @@ jobs:
             **Download / run:**
             - Windows x86_64: `.zip` containing a signed `roomler-setup.exe` — extract + double-click.
             - Linux x86_64: `.tar.gz` — extract, run `./roomler-setup`.
-            - macOS universal (x86_64 + aarch64): `.tar.gz` — extract, run `./roomler-setup`
-              (Gatekeeper may require `xattr -d com.apple.quarantine ./roomler-setup` on first launch).
+            - macOS universal (x86_64 + aarch64): `.tar.gz` — extract, then open `Roomler Setup.app`
+              (or run `./roomler-setup`, a symlink into the bundle). The app is Developer-ID-signed,
+              notarised and stapled, so Gatekeeper accepts it even offline — no `xattr` workaround.
 
             **What the wizard does:** pick a role, detect existing installs, paste an enrollment token, and it
             resolves → downloads → verifies → installs → enrolls the node. On Windows the daemon roles
