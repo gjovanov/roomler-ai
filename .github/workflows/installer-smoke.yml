@@ -479,3 +479,170 @@ jobs:
           name: msi-logs
           path: ${{ runner.temp }}/msi-logs/
           retention-days: 7
+
+  # macOS had NO installer coverage at all until rc.454, and the platform
+  # shipped for months with an install that could not work: the pkg payload was
+  # the .app and nothing else (no CLI), the privileged half was gated on a
+  # marker file nothing ever created, and running the one-liner under `sudo`
+  # silently enrolled into the wrong profile. None of that is visible to a
+  # compile check — it needs a real install.
+  #
+  # What this CAN prove on a hosted runner: the pkg builds, installs, puts both
+  # binaries where the plists and the docs say they are, loads the LaunchAgent,
+  # and the CLI shim resolves the daemon inside the bundle. What it CANNOT: TCC
+  # grants, since there is no way to accept a privacy prompt headlessly — so it
+  # asserts the honest REFUSAL path instead, which is exactly what runtime
+  # permission reporting made assertable.
+  macos-pkg-install:
+    name: macOS pkg install smoke
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-pkg-smoke
+
+      - name: Install system deps
+        run: brew install cmake libvpx pkg-config
+
+      # Feature set is a subset of release-agent.yml's build-macos: `full`
+      # would drag in the whole media stack for no extra signal, and the
+      # payload shape plus the launchd wiring are what this job is about.
+      - name: Build the agent + the CLI shim
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          set -euo pipefail
+          cargo build -p roomler-agent --release \
+            --features "media,vp9-444,vp9-444-bindgen,overlay-l3" \
+            --target aarch64-apple-darwin
+          cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
+
+      - name: Stage + build the pkg
+        run: |
+          set -euo pipefail
+          VERSION="0.0.0-smoke"
+          APP=stage/roomler-agent.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+          cp target/aarch64-apple-darwin/release/roomlerd "$APP/Contents/MacOS/roomler-agent"
+
+          # The same dependency walk the release lane runs. Without it the
+          # binary loads Homebrew paths that exist here and nowhere else, and
+          # the install "passes" while being undeployable.
+          FW="$APP/Contents/Frameworks"
+          bundle_deps() {
+            local target="$1" dep base
+            otool -L "$target" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+              case "$dep" in /usr/lib/*|/System/*|@*) continue ;; esac
+              base="$(basename "$dep")"
+              if [ ! -f "$FW/$base" ]; then
+                cp -L "$dep" "$FW/$base"
+                chmod u+w "$FW/$base"
+                install_name_tool -id "@rpath/$base" "$FW/$base"
+                bundle_deps "$FW/$base"
+              fi
+              install_name_tool -change "$dep" "@rpath/$base" "$target"
+            done
+          }
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomler-agent"
+          bundle_deps "$APP/Contents/MacOS/roomler-agent"
+          find "$APP" -type f \( -name '*.dylib' -o -name 'roomler-agent' \) \
+            -exec codesign --force --sign - {} \;
+
+          cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
+          cp agents/roomler-agent/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>roomler-agent</string>
+            <key>CFBundleIdentifier</key><string>com.roomler.agent</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSUIElement</key><true/>
+          </dict></plist>
+          PLIST
+
+          mkdir -p payload/Applications payload/usr/local/bin scripts dist
+          cp -R "$APP" payload/Applications/
+          cp target/aarch64-apple-darwin/release/roomler-shim payload/usr/local/bin/roomler
+          chmod 755 payload/usr/local/bin/roomler
+          cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
+          chmod 755 scripts/postinstall
+          pkgbuild --root payload --scripts scripts --identifier com.roomler.agent \
+            --version "$VERSION" --install-location / dist/smoke.pkg
+
+      - name: Install it
+        run: sudo installer -pkg dist/smoke.pkg -target /
+
+      - name: Assert the payload landed where everything expects it
+        run: |
+          set -euo pipefail
+          BIN=/Applications/roomler-agent.app/Contents/MacOS/roomler-agent
+          # Both plists and the docs name this path literally, and a rename
+          # would void every TCC grant keyed to the binary.
+          test -x "$BIN" || { echo "::error::missing $BIN"; exit 1; }
+          # The CLI the pkg did not ship at all before rc.454.
+          test -x /usr/local/bin/roomler || { echo "::error::missing /usr/local/bin/roomler"; exit 1; }
+          "$BIN" --version
+          echo "  payload OK"
+
+      - name: Assert the LaunchAgent is loaded, and the root half is not
+        run: |
+          set -euo pipefail
+          # The postinstall bootstraps into the CONSOLE user's gui domain.
+          uid_now=$(id -u)
+          if launchctl print "gui/$uid_now/com.roomler.agent" >/dev/null 2>&1; then
+            echo "  LaunchAgent loaded in gui/$uid_now"
+          else
+            echo "::error::com.roomler.agent is not loaded in gui/$uid_now"
+            launchctl print "gui/$uid_now" 2>&1 | head -40
+            exit 1
+          fi
+          # Opt-in, and NOT requested here, so it must be absent. The
+          # postinstall declining to install a root daemon nobody asked for is
+          # as load-bearing as installing one that was asked for.
+          if [ -f /Library/LaunchDaemons/com.roomler.daemon.plist ]; then
+            echo "::error::the root LaunchDaemon appeared without the enable-daemon marker"
+            exit 1
+          fi
+          echo "  privileged half correctly absent"
+
+      - name: Assert the CLI shim resolves the daemon inside the bundle
+        run: |
+          set -euo pipefail
+          # macOS is the one platform where the shim's sibling-`roomlerd` probe
+          # cannot work, so this covers the bundle fallback. Nothing is enrolled
+          # here, so the command itself will fail — what must NOT happen is the
+          # shim failing to locate the daemon at all.
+          out="$(/usr/local/bin/roomler status 2>&1 || true)"
+          echo "$out"
+          case "$out" in
+            *"daemon binary is missing"*)
+              echo "::error::the shim could not resolve the bundle executable"
+              exit 1
+              ;;
+          esac
+          echo "  shim resolves the daemon"
+
+      - name: Assert permissions are reported HONESTLY when denied
+        run: |
+          set -euo pipefail
+          # A hosted runner grants neither Screen Recording nor Accessibility,
+          # so this is the denied path — the one that used to advertise itself
+          # as working because `has_input_permission` was a compile-time
+          # constant. Being able to assert this at all is the point of moving
+          # it to a runtime probe.
+          caps="$(/Applications/roomler-agent.app/Contents/MacOS/roomler-agent caps 2>&1 || true)"
+          echo "$caps"
+          if echo "$caps" | grep -qi 'has_input_permission: true'; then
+            echo "::error::input advertised as granted on a runner that granted nothing"
+            exit 1
+          fi
+          echo "  permissions reported honestly"
