@@ -51,11 +51,28 @@ SYSTEM=0
 # and as root $HOME is /root, where the agent's appdirs resolver would look
 # in the wrong tree entirely. Must match roomlerd.service's ROOMLERD_CONFIG.
 SYSTEM_CONFIG="/etc/roomler/config.toml"
+# macOS's privileged half has its OWN path, and it is NOT $SYSTEM_CONFIG above:
+# com.roomler.daemon.plist passes `--config /etc/roomler-agent/config.toml`
+# explicitly, and the agent's root-aware config ladder is Linux-only. Reusing
+# one variable for both would enroll into a file nothing reads.
+MACOS_DAEMON_CONFIG="/etc/roomler-agent/config.toml"
+MACOS_DAEMON_MARKER="/etc/roomler-agent/enable-daemon"
+DAEMON_TOKEN=""
 NO_ENROLL=0
 
 usage() {
     sed -n '2,30p' "$0" 2>/dev/null || true
-    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME] [--system] [--download-only] [--no-enroll]"
+    echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME]"
+    echo "                  [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
+    echo
+    echo "  --daemon-token  macOS only. Installs the privileged half as well (overlay/mesh)."
+    echo "                  macOS needs TWO processes: a per-user LaunchAgent for screen"
+    echo "                  capture and input (they only work inside a GUI login session)"
+    echo "                  and a root LaunchDaemon for the overlay (creating a utun needs"
+    echo "                  root). They cannot share one enrollment — the hub keys on"
+    echo "                  agent_id and the second connection displaces the first — so"
+    echo "                  this takes a SECOND single-use enrollment token and the Mac"
+    echo "                  appears as two devices."
     exit 1
 }
 
@@ -65,6 +82,7 @@ while [ $# -gt 0 ]; do
         --server) SERVER="$2"; shift 2 ;;
         --token) TOKEN="$2"; shift 2 ;;
         --name) NAME="$2"; shift 2 ;;
+        --daemon-token) DAEMON_TOKEN="$2"; shift 2 ;;
         --system) SYSTEM=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --no-enroll) NO_ENROLL=1; shift ;;
@@ -86,8 +104,47 @@ case "$OS" in
 esac
 
 if [ "$SYSTEM" = 1 ] && { [ "$ROLE" != daemon ] || [ "$OS" != Linux ]; }; then
-    echo "error: --system applies to '--role daemon' on Linux only (macOS autostarts via a LaunchAgent; the tunnel role installs a CLI, not a service)" >&2
+    echo "error: --system applies to '--role daemon' on Linux only (on macOS use --daemon-token for the privileged half; the tunnel role installs a CLI, not a service)" >&2
     exit 1
+fi
+
+if [ -n "$DAEMON_TOKEN" ] && { [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; }; then
+    echo "error: --daemon-token applies to '--role daemon' on macOS only" >&2
+    exit 1
+fi
+
+# ─── who is the desktop user? ───────────────────────────────────────────────
+#
+# On macOS the per-user half is a LaunchAgent in the console user's `gui/<uid>`
+# domain, and its config comes from that user's HOME. So the enroll has to run
+# AS that user — not as whoever invoked the script.
+#
+# This matters because running the whole one-liner under `sudo` is the natural
+# thing to do (the script calls `sudo` internally for `installer`, so people
+# reasonably front-load it), and it used to break the install silently:
+# macOS sudoers carries `env_keep += "HOME"`, so the enroll wrote the config to
+# the user's own path but owned root:wheel 0600 — and the uid-501 LaunchAgent
+# then hit EACCES on every start, relaunched under KeepAlive, and logged to a
+# file in /tmp nothing points at. With `sudo -i` it is worse but louder: the
+# config lands in /var/root and the LaunchAgent's path simply does not exist.
+# Either way the user sees "it didn't start as a service".
+#
+# `stat -f %Su /dev/console` is the same idiom the pkg postinstall uses to
+# place the plist, so the two agree by construction.
+CONSOLE_USER=""
+CONSOLE_UID=""
+if [ "$OS" = Darwin ]; then
+    CONSOLE_USER="$(stat -f "%Su" /dev/console 2>/dev/null || echo "")"
+    if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
+        echo "error: no GUI session is logged in (console user is '${CONSOLE_USER:-unknown}')." >&2
+        echo "       The macOS agent runs inside a login session — screen capture and input" >&2
+        echo "       do not work from a LaunchDaemon. Log in on the Mac and re-run this." >&2
+        exit 1
+    fi
+    CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+    if [ "$(id -u)" = 0 ]; then
+        printf '==> %s\n' "running as root — the per-user half will be installed for '$CONSOLE_USER' (uid $CONSOLE_UID)"
+    fi
 fi
 
 STAGE="$(mktemp -d /tmp/roomler-install.XXXXXX)"
@@ -235,31 +292,104 @@ install_daemon_macos() {
     download "$url" "$pkg"
     verify_sha256 "$pkg" "$digest"
 
-    daemon_bin="/Applications/roomler-agent.app/Contents/MacOS/roomlerd"
+    # The .app kept its legacy internal name through the roomlerd rename —
+    # CFBundleExecutable is `roomler-agent`, and CI asserts it, because
+    # renaming would change the binary's TCC identity and force every existing
+    # Mac to re-grant Screen Recording and Accessibility. The old probe led
+    # with `roomlerd`, which never exists, and relied on the fallback.
+    daemon_bin="/Applications/roomler-agent.app/Contents/MacOS/roomler-agent"
+
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo installer -pkg $pkg -target /"
         say "download-only: would run: $daemon_bin enroll --server $SERVER --token <token> --name $NAME"
+        [ -n "$DAEMON_TOKEN" ] && say "download-only: would also enroll the privileged half at $MACOS_DAEMON_CONFIG"
         return 0
     fi
 
-    say "installing the roomlerd daemon (.pkg — sudo required; postinstall loads the LaunchAgent)"
-    sudo installer -pkg "$pkg" -target /
-
-    # S1b: the app bundle deliberately kept its legacy internals through the
-    # roomlerd rename — its binary may be `roomler-agent`, not `roomlerd`.
-    # Probing both fixes the previously-broken macOS enroll step.
-    if [ ! -x "$daemon_bin" ]; then
-        daemon_bin="/Applications/roomler-agent.app/Contents/MacOS/roomler-agent"
+    # The marker has to exist BEFORE the pkg runs: the postinstall reads it to
+    # decide whether to install the root LaunchDaemon, and its ABSENCE actively
+    # removes a previously-installed one. Nothing in the product ever created
+    # this file, which is why the privileged half was unreachable through the
+    # advertised one-liner despite shipping for months.
+    if [ -n "$DAEMON_TOKEN" ]; then
+        say "requesting the privileged half (root LaunchDaemon — the overlay needs root)"
+        sudo mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
+        sudo touch "$MACOS_DAEMON_MARKER"
     fi
 
+    say "installing the roomler agent (.pkg — sudo required)"
+    sudo installer -pkg "$pkg" -target /
+
+    [ -x "$daemon_bin" ] || {
+        echo "error: the package did not install $daemon_bin" >&2
+        exit 1
+    }
+
+    # ── the per-user half: capture + input, inside the GUI session ──
     enroll_daemon "$daemon_bin"
 
-    # postinstall already bootstrapped com.roomler.agent into the console
-    # user's gui domain; kickstart restarts it so it picks up the fresh
-    # enrollment config.
+    # postinstall bootstrapped com.roomler.agent into the CONSOLE user's gui
+    # domain, so kickstart it THERE. `gui/$(id -u)` was wrong under sudo — uid
+    # 0 has no Aqua domain, the error went to /dev/null, and the warning that
+    # replaced it ("will pick up the config at next login") was misleading.
     say "restarting the LaunchAgent so it picks up the enrollment"
-    launchctl kickstart -k "gui/$(id -u)/com.roomler.agent" 2>/dev/null \
+    launchctl kickstart -k "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null \
         || warn "launchctl kickstart failed — the agent will pick up the config at next login"
+
+    # ── the privileged half: overlay/mesh, as root, its own enrollment ──
+    if [ -n "$DAEMON_TOKEN" ]; then
+        install_macos_privileged_half "$daemon_bin"
+    else
+        say "NOTE: this Mac has the per-user half only — screen sharing works, the overlay"
+        say "      mesh does not (creating a utun needs root). Pass --daemon-token <a second"
+        say "      enrollment token> to add the privileged half."
+    fi
+
+    macos_permissions_notice
+}
+
+# The root half. A SEPARATE enrollment by construction: the hub keys sessions
+# on agent_id, so two processes sharing one identity would fight over the
+# control WS — the second connection displaces the first.
+install_macos_privileged_half() {
+    daemon_bin="$1"
+
+    if [ ! -f /Library/LaunchDaemons/com.roomler.daemon.plist ]; then
+        warn "the package did not install the LaunchDaemon — skipping the privileged half"
+        return 0
+    fi
+
+    if sudo test -f "$MACOS_DAEMON_CONFIG"; then
+        say "privileged half already enrolled at $MACOS_DAEMON_CONFIG — leaving it alone"
+    else
+        # `--overlay` writes overlay_enabled with the rest of the enrolled
+        # config. The overlay is the ONLY reason this half exists, and choosing
+        # to install a root daemon IS the opt-in, so it would be perverse to
+        # leave the operator hunting for a config key afterwards.
+        # (`overlay_enabled` stays default-off everywhere else — unchanged.)
+        say "enrolling the privileged half as '$NAME-daemon' (second single-use token, overlay on)"
+        sudo "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
+            enroll --server "$SERVER" --token "$DAEMON_TOKEN" --name "$NAME-daemon" --overlay
+    fi
+
+    say "starting the privileged half"
+    sudo launchctl kickstart -k system/com.roomler.daemon 2>/dev/null \
+        || warn "launchctl kickstart failed for the daemon — it will start at next boot"
+}
+
+# macOS grants these two by hand, per binary, and never errors when they are
+# missing: capture silently returns wallpaper-only frames and injected input is
+# silently dropped. The agent logs both, but to a file under /tmp that nobody
+# is told about — so say it here, where the person installing is still looking.
+macos_permissions_notice() {
+    say ""
+    say "ONE MANUAL STEP REMAINS — macOS will not grant these without you:"
+    say "  System Settings → Privacy & Security → Screen Recording  → enable 'roomler-agent'"
+    say "  System Settings → Privacy & Security → Accessibility     → enable 'roomler-agent'"
+    say ""
+    say "Without Screen Recording the remote screen is blank; without Accessibility the"
+    say "remote keyboard and mouse do nothing. Neither reports an error. After granting:"
+    say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
 }
 
 enroll_daemon() {
@@ -268,6 +398,11 @@ enroll_daemon() {
     # runs with; the per-user flow keeps the caller's own profile.
     if [ "$SYSTEM" = 1 ]; then
         enroll_pre="sudo $daemon_bin --config $SYSTEM_CONFIG"
+    elif [ "$OS" = Darwin ] && [ "$(id -u)" = 0 ]; then
+        # See `as_console_user`: the LaunchAgent runs as the console user and
+        # reads that user's config, so the enroll has to write it AS them.
+        # Running it as root here is what silently broke the whole install.
+        enroll_pre="sudo -H -u $CONSOLE_USER $daemon_bin"
     else
         enroll_pre="$daemon_bin"
     fi

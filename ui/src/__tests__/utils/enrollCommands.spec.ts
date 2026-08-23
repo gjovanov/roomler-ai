@@ -48,7 +48,9 @@ describe('enrollCommands', () => {
       /^sudo roomlerd --config \/etc\/roomler\/config\.toml enroll /,
     )
     expect(linux!.blocks[2]!.command).toContain(`--server ${ORIGIN}`)
-    expect(macos!.blocks[2]!.command).toMatch(/^roomlerd enroll /)
+    // NOT `roomlerd`: on macOS the daemon lives inside the .app bundle and no
+    // binary by that name exists anywhere on the machine.
+    expect(macos!.blocks[2]!.command).toMatch(/^\/Applications\/roomler-agent\.app\S* enroll /)
   })
 
   it('maps the user scope to the per-user roles', () => {
@@ -56,9 +58,11 @@ describe('enrollCommands', () => {
     expect(windows!.blocks[0]!.command).toContain('-Role daemon-user')
     expect(linux!.blocks[0]!.command).toContain('--role daemon')
     expect(linux!.blocks[0]!.command).not.toContain('--system')
-    for (const os of [windows!, linux!, macos!]) {
+    for (const os of [windows!, linux!]) {
       expect(os.blocks[2]!.command).toMatch(/^roomlerd enroll /)
     }
+    // macOS resolves to the bundle executable — see above.
+    expect(macos!.blocks[2]!.command).toMatch(/^\/Applications\/roomler-agent\.app\S* enroll /)
     expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
   })
 
@@ -89,7 +93,14 @@ describe('enrollCommands', () => {
       expect(macos!.note).toMatch(/per-user/)
     }
     for (const os of enrollCommands('agent', ORIGIN, TOKEN, 'user')) {
-      expect(os.note).toBeUndefined()
+      // macOS carries a caveat at EVERY scope: its per-user/root split is a
+      // property of the platform (capture needs a GUI session, a utun needs
+      // root), not of the scope the operator picked.
+      if (os.os === 'macos') {
+        expect(os.note).toMatch(/daemon-token/)
+      } else {
+        expect(os.note).toBeUndefined()
+      }
     }
     for (const os of enrollCommands('tunnel', ORIGIN, TOKEN)) {
       expect(os.note).toBeUndefined()
@@ -120,13 +131,32 @@ describe('enrollCommands', () => {
       for (const scope of SCOPES) {
         for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope)) {
           for (const block of os.blocks) {
-            expect(block.command).not.toContain('roomler-agent')
+            // macOS is the ONE exception and it is not the retired name
+            // resurfacing: the .app's CFBundleExecutable is literally
+            // `roomler-agent` (renaming it would void the TCC grants keyed to
+            // that binary), both launchd plists name that path, and CI asserts
+            // it. Everywhere else the name is retired and must stay gone.
+            if (os.os !== 'macos') {
+              expect(block.command).not.toContain('roomler-agent')
+            }
             expect(block.command).not.toContain('roomler-tunnel')
             expect(block.command).not.toContain('https://roomler.ai')
           }
         }
       }
     }
+  })
+
+  it('the macOS manual enroll points at the binary that actually exists there', () => {
+    // There is no `roomlerd` anywhere on a Mac — the daemon ships inside the
+    // .app bundle — so the generic `roomlerd enroll` this used to print was a
+    // command the user could not run.
+    const macos = enrollCommands('agent', ORIGIN, TOKEN).find((o) => o.os === 'macos')!
+    const manual = macos.blocks.find((b) => b.id.endsWith('-manual'))!
+    expect(manual.command).toContain(
+      '/Applications/roomler-agent.app/Contents/MacOS/roomler-agent enroll',
+    )
+    expect(manual.command).not.toMatch(/^roomlerd /)
   })
 
   it('renders a placeholder while the token is still being issued', () => {

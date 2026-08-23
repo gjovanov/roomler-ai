@@ -1638,6 +1638,14 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server" --target aarch64-apple-darwin
 
+      # The `roomler` CLI. macOS shipped WITHOUT one until rc.454 — the pkg
+      # payload was the .app and nothing else — so `roomler peers` was
+      # impossible on a Mac despite the daemon carrying the entire command
+      # surface behind `roomlerd cli`. Same ~150 KB shim as the .deb and the
+      # MSI (P3e lever D); it lands at /usr/local/bin/roomler below.
+      - name: Build the roomler CLI shim
+        run: cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
+
       - name: Stage .app bundle
         shell: bash
         run: |
@@ -1820,13 +1828,28 @@ jobs:
                    --options runtime --timestamp \
                    "stage/roomler-agent.app"
 
+          # The CLI shim ships in the same .pkg, outside the bundle. Sign it
+          # HERE: nothing may `cargo build` after this point (a relink strips
+          # signatures), and pkgbuild harvests it in the very next step.
+          codesign --force --sign "Developer ID Application" \
+                   --options runtime --timestamp \
+                   "target/aarch64-apple-darwin/release/roomler-shim"
+
       - name: Build component + product pkg
         id: pkg
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p payload/Applications scripts dist
+          mkdir -p payload/Applications payload/usr/local/bin scripts dist
           cp -R stage/roomler-agent.app payload/Applications/
+          # The CLI. Until rc.454 the macOS payload was the .app and NOTHING
+          # else — no `roomler` on PATH, so `roomler peers` was impossible on a
+          # Mac even though the daemon carries the whole command surface. Same
+          # ~150 KB shim the .deb and the MSI install; it re-execs
+          # `<daemon> cli <args>`, resolving the bundle path on macOS because
+          # the two binaries cannot be siblings here.
+          cp target/aarch64-apple-darwin/release/roomler-shim payload/usr/local/bin/roomler
+          chmod 755 payload/usr/local/bin/roomler
           cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
 
