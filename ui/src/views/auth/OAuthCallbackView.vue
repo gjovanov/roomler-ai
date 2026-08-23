@@ -27,11 +27,20 @@ const ws = useWsStore()
 const error = ref('')
 
 onMounted(async () => {
-  const token = route.query.token as string
+  // The token arrives in the URL FRAGMENT, which browsers never put on the
+  // wire: it is not in the request line nginx logs, and not in `Referer`.
+  // The query-string form is still accepted so a cached older SPA (or an
+  // older API) keeps working through a deploy; drop it once both sides have
+  // rolled and nothing emits `?token=` any more.
+  const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''))
+  const token = (hash.get('token') ?? (route.query.token as string)) || ''
   if (!token) {
     error.value = 'No token received from OAuth provider'
     return
   }
+  // Whichever form it came in, get it out of the address bar so it does not
+  // linger in history or get copy-pasted with the URL.
+  window.history.replaceState({}, '', window.location.pathname)
 
   // Pre-validate the token with a RAW fetch, outside the api client.
   // Rationale: with an invalid/expired token, `auth.fetchMe()` swallows
