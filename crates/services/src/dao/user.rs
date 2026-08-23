@@ -208,6 +208,8 @@ impl UserDao {
                             doc! { "$set": {
                                 "email": evicted_placeholder_email(&holder),
                                 "unverified_email": &squatter.email,
+                                // update_by_id does not stamp this itself.
+                                "updated_at": DateTime::now(),
                             }},
                         )
                         .await?;
