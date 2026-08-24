@@ -785,7 +785,18 @@ fn rpc_caps() -> Vec<String> {
     // whether the frame arrived on the primary org's socket — advertising
     // here must not imply either, or the server would read "will comply" from
     // a verb that only means "will parse".
-    let mut caps = vec![RpcCap::Exec, RpcCap::Originate, RpcCap::Config];
+    // `ConfigReport` rides alongside `Config` in THIS build, but it is a
+    // separate verb because rc.457/rc.458 shipped `config` alone: those agents
+    // apply a pushed config and never say a word about it. A server that read
+    // "reports back" out of `config` would wait forever for an answer from
+    // most of the fleet — the identical trap `ssh` / `ssh-consent` exists to
+    // avoid, recurring exactly as that doc predicted it would.
+    let mut caps = vec![
+        RpcCap::Exec,
+        RpcCap::Originate,
+        RpcCap::Config,
+        RpcCap::ConfigReport,
+    ];
     if cfg!(feature = "ssh-server") {
         caps.push(RpcCap::Ssh);
         // P5d. Distinct from `ssh` because agents rc.419 and earlier advertise
