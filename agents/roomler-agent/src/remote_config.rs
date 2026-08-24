@@ -56,20 +56,64 @@ pub struct RemoteConfigServices {
     /// The LIVE `exec_enabled`, read by the `rc:rpc.exec` gate. Seeded from
     /// the startup config and the only copy that decides anything.
     exec_enabled: Arc<AtomicBool>,
+    /// The LIVE opt-in, read by the `rc:agent.config` handler.
+    ///
+    /// Live for a reason that is the whole point of the key: it is how the
+    /// person holding the machine REVOKES the delegation. A revocation that
+    /// only took effect after a service restart — while the control plane's
+    /// assertions took effect immediately — would be a strange kind of last
+    /// word. The server can never write this; only [`Self::adopt_local`] can.
+    remote_config_enabled: Arc<AtomicBool>,
 }
 
 impl RemoteConfigServices {
-    pub fn new(path: PathBuf, lock: crate::config::WriteLock, exec_enabled: bool) -> Self {
+    pub fn new(
+        path: PathBuf,
+        lock: crate::config::WriteLock,
+        exec_enabled: bool,
+        remote_config_enabled: bool,
+    ) -> Self {
         Self {
             path,
             lock,
             exec_enabled: Arc::new(AtomicBool::new(exec_enabled)),
+            remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
         }
     }
 
     /// Gate 4 for Fleet RPC, read per request.
     pub fn exec_enabled(&self) -> bool {
         self.exec_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Does this device accept pushed config at all? Read per push.
+    pub fn remote_config_enabled(&self) -> bool {
+        self.remote_config_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Re-seed the live flags from a config the LOCAL owner just wrote.
+    ///
+    /// Called by the LocalAPI's `ConfigSet` (the desktop companion, `roomler
+    /// config set`) after a successful save, and it closes a genuine inversion:
+    /// [`Self::apply`] made a SERVER push to `exec_enabled` take effect
+    /// immediately, while an owner's own edit sat in the file until the daemon
+    /// restarted. Gate 4 exists so the person holding the machine has the last
+    /// word — it cannot be the slower of the two.
+    ///
+    /// ⚠️ This does NOT stop the next reconnect from re-applying a standing
+    /// `desired_config`, and it should not: a device with
+    /// `remote_config_enabled = true` has delegated the key, which is the
+    /// documented bargain (`docs/remote-config.md` §2). The owner's real
+    /// remedy is to turn the OPT-IN off — which is exactly why that one is
+    /// live here too, and why turning it off takes effect before the next push
+    /// rather than after a restart.
+    ///
+    /// The caller already holds the write lock, so this reads a config that
+    /// cannot be mid-write.
+    pub fn adopt_local(&self, cfg: &crate::config::AgentConfig) {
+        self.exec_enabled.store(cfg.exec_enabled, Ordering::Relaxed);
+        self.remote_config_enabled
+            .store(cfg.remote_config_enabled, Ordering::Relaxed);
     }
 
     /// Reconcile the on-disk config against `desired`, persist, and put the
@@ -149,10 +193,15 @@ mod tests {
     use super::*;
 
     fn svc(exec: bool) -> RemoteConfigServices {
+        svc_with(exec, true)
+    }
+
+    fn svc_with(exec: bool, opted_in: bool) -> RemoteConfigServices {
         RemoteConfigServices::new(
             PathBuf::from("unused-in-this-test.toml"),
             Arc::new(tokio::sync::Mutex::new(())),
             exec,
+            opted_in,
         )
     }
 
@@ -160,6 +209,37 @@ mod tests {
     fn the_live_flag_is_what_the_gate_reads() {
         assert!(!svc(false).exec_enabled());
         assert!(svc(true).exec_enabled());
+    }
+
+    #[test]
+    fn the_opt_in_is_seeded_from_the_config_this_daemon_loaded() {
+        assert!(!svc_with(false, false).remote_config_enabled());
+        assert!(svc_with(false, true).remote_config_enabled());
+    }
+
+    /// The inversion this closes.
+    ///
+    /// `apply` (a SERVER push) puts `exec_enabled` into force immediately. If
+    /// the owner's own edit only reached the file, their "off" would wait for a
+    /// service restart while the control plane's "on" did not — and gate 4
+    /// exists precisely so the person holding the machine has the last word.
+    /// It cannot be the slower of the two.
+    #[test]
+    fn an_owners_local_edit_is_at_least_as_live_as_a_pushed_one() {
+        let svc = svc_with(true, true);
+        assert!(svc.exec_enabled());
+
+        let mut cfg = crate::config::test_fixture();
+        cfg.exec_enabled = false;
+        cfg.remote_config_enabled = false;
+        svc.adopt_local(&cfg);
+
+        assert!(!svc.exec_enabled(), "the owner turned exec off; it is off");
+        assert!(
+            !svc.remote_config_enabled(),
+            "revoking the delegation must not wait for a restart either — \
+             otherwise the server keeps pushing over a decision already made"
+        );
     }
 
     #[test]

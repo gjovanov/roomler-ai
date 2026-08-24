@@ -2338,6 +2338,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         config_path.clone(),
         cfg_write_lock.clone(),
         cfg.exec_enabled,
+        cfg.remote_config_enabled,
     );
     // P6: the declared-route reconciler — converges `[[tunnel_routes]]`
     // from the loaded config into live hub flows, and backs the LocalAPI
@@ -2418,6 +2419,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             // The rename verb persists through the daemon's own resolved
             // config path + the P6 write lock (profile-correct under SYSTEM).
             .with_config_persist(config_path.clone(), cfg_write_lock.clone())
+            // …and the live gate-4 flags, so a `config set` here is in force
+            // as fast as a pushed one (docs/remote-config.md).
+            .with_remote_config(remote_cfg.clone())
             // Multi-org P1 — live per-enrollment rows for `roomler status`.
             .with_orgs(org_registry.clone())
             .with_org_views(org_views.clone()),

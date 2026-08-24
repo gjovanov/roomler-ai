@@ -43,6 +43,7 @@ fn spawn_agent_signaling_as(
         .expect("consent broker init");
         // Read before `cfg` is moved into the call below.
         let exec_enabled = cfg.exec_enabled;
+        let remote_config_enabled = cfg.remote_config_enabled;
         let _ = signaling::run(
             ctx,
             cfg,
@@ -63,6 +64,7 @@ fn spawn_agent_signaling_as(
                 std::path::PathBuf::from("unused-in-tests.toml"),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 exec_enabled,
+                remote_config_enabled,
             ),
         )
         .await;
