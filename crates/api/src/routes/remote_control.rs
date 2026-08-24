@@ -388,6 +388,29 @@ pub struct DesiredConfigView {
     pub updated_at: Option<String>,
 }
 
+impl From<roomler_ai_remote_control::models::DesiredConfig> for DesiredConfigView {
+    /// The ONE place a `DesiredConfig` becomes client-facing JSON.
+    ///
+    /// Extracted because it wasn't: the listing projected through this shape
+    /// while `set_desired_config` returned the stored model directly, so the
+    /// same object came back as `{"$oid": …}` / `{"$date": …}` from the write
+    /// and as hex + RFC3339 from the read. The client stores the write's
+    /// answer, so its `updated_at` was an object where its own type said
+    /// string — measured against prod, 2026-08-24.
+    fn from(d: roomler_ai_remote_control::models::DesiredConfig) -> Self {
+        Self {
+            revision: d.revision,
+            exec_enabled: d.exec_enabled,
+            ssh_enabled: d.ssh_enabled,
+            ssh_authorized_keys: d.ssh_authorized_keys,
+            ssh_account_mode: d.ssh_account_mode,
+            ssh_port: d.ssh_port,
+            updated_by: d.updated_by.map(|i| i.to_hex()),
+            updated_at: d.updated_at.map(fmt_dt),
+        }
+    }
+}
+
 /// [`ConfigReport`] with an RFC3339 timestamp.
 ///
 /// [`ConfigReport`]: roomler_ai_remote_control::models::ConfigReport
@@ -440,16 +463,7 @@ fn remote_config_view(
         None => RemoteConfigState::Pending,
     };
     Some(RemoteConfigView {
-        desired: DesiredConfigView {
-            revision: desired.revision,
-            exec_enabled: desired.exec_enabled,
-            ssh_enabled: desired.ssh_enabled,
-            ssh_authorized_keys: desired.ssh_authorized_keys,
-            ssh_account_mode: desired.ssh_account_mode,
-            ssh_port: desired.ssh_port,
-            updated_by: desired.updated_by.map(|i| i.to_hex()),
-            updated_at: desired.updated_at.map(fmt_dt),
-        },
+        desired: desired.into(),
         report: report.map(|r| ConfigReportView {
             revision: r.revision,
             outcome: r.outcome,

@@ -778,7 +778,16 @@ pub async fn config_set(key: &str, value: Option<&str>) -> Result<()> {
         Some(v) if !v.is_empty() => println!("{} = {v}", entry.key),
         _ => println!("{} cleared (built-in default applies)", entry.key),
     }
-    println!("takes effect on the next daemon restart");
+    // Two keys are LIVE as of the gate-4 liveness work (docs/remote-config.md
+    // §7b): the daemon re-seeds them from the file it just wrote, so telling an
+    // operator to restart would be wrong in the direction that matters — they
+    // would believe a refusal they just made is not in force yet, and either
+    // restart a healthy daemon for nothing or assume they are still exposed.
+    if matches!(entry.key.as_str(), "exec_enabled" | "remote_config_enabled") {
+        println!("in effect now — no restart needed");
+    } else {
+        println!("takes effect on the next daemon restart");
+    }
     Ok(())
 }
 
