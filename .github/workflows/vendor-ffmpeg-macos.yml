@@ -150,12 +150,25 @@ jobs:
           #include <libavcodec/avcodec.h>
           #include <stdio.h>
           int main(void) {
-            const char *want[] = {"h264_videotoolbox","hevc_videotoolbox","av1_videotoolbox"};
+            /* REQUIRED: the two Apple silicon actually has encode blocks for. */
+            const char *want[] = {"h264_videotoolbox","hevc_videotoolbox"};
             for (unsigned i = 0; i < sizeof(want)/sizeof(*want); i++) {
               if (!avcodec_find_encoder_by_name(want[i])) {
                 fprintf(stderr, "MISSING encoder %s\n", want[i]); return 1;
               }
             }
+            /* OPTIONAL: av1_videotoolbox. It stays in --enable-encoder so a
+               future runner/SDK builds it automatically, but it is NOT
+               required — measured 2026-08-24 on macos-14, the registry does
+               not hand it out even though libavcodec carries a
+               "VideoToolbox AV1 Encoder" long-name string. That is precisely
+               why this check is a runtime registry lookup and not a symbol
+               scan: the string is present, the encoder is not. Report it so a
+               future SDK flipping this is visible in the log. */
+            printf("av1_videotoolbox: %s\n",
+                   avcodec_find_encoder_by_name("av1_videotoolbox")
+                     ? "PRESENT (new — the Rust dispatch rung is now live)"
+                     : "absent (expected on current SDKs)");
             /* And the trim must actually have taken — if a general decoder or
                an unrelated encoder survived, --disable-everything did not
                apply and this is the fat tree again. */
@@ -165,7 +178,7 @@ jobs:
             if (avcodec_find_encoder_by_name("mpeg4")) {
               fprintf(stderr, "mpeg4 encoder present — trim did not take\n"); return 1;
             }
-            printf("probe OK: 3 videotoolbox encoders present, registry trimmed\n");
+            printf("probe OK: required videotoolbox encoders present, registry trimmed\n");
             return 0;
           }
           EOC
