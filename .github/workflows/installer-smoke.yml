@@ -32,6 +32,29 @@ on:
     paths:
       - 'agents/roomler-agent/**'
       - '.github/workflows/installer-smoke.yml'
+  # Also on PRs — but only those touching the INSTALLER surface, not the whole
+  # agent. Until now this job ran on push-to-master and dispatch only, so its
+  # checks (including the PE import audit added in #647) first executed AFTER
+  # a change had already landed. A gate that cannot run on the change under
+  # review is a gate that reports history.
+  #
+  # Scoped deliberately rather than mirroring the push paths: this is a ~20 min
+  # windows-latest job, and Windows runner contention in this repo is real —
+  # rc.424's MSI job sat QUEUED for 70 minutes behind a release burst. Measured
+  # over the last 90 days, these paths carry 29 commits against 316 for
+  # `agents/roomler-agent/**`, so this fires on roughly one agent PR in ten:
+  # the ones where the installer itself changed.
+  #
+  # ⚠️ If you change what the MSI SHIPS (a new native dependency, a wxs
+  # component, the CRT staging list), add that path here too — otherwise the
+  # audit silently stops covering the change that needed it most.
+  pull_request:
+    paths:
+      - 'agents/roomler-agent/wix/**'
+      - 'agents/roomler-agent/wix-perMachine/**'
+      - 'agents/roomler-agent/packaging/windows/**'
+      - 'agents/roomler-agent/build.rs'
+      - '.github/workflows/installer-smoke.yml'
   workflow_dispatch: {}
 
 # actions:write for the "Refresh the cache seed" step's `gh cache delete`
