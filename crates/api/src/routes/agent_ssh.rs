@@ -159,6 +159,37 @@ pub struct SshPolicyBody {
     pub consent_mode: Option<ConsentMode>,
 }
 
+impl From<SshPolicy> for SshPolicyBody {
+    /// The stored policy as the dashboard reads it back — hex ids, because
+    /// bson's `ObjectId` serialises to `{"$oid": …}` and no client here parses
+    /// that.
+    ///
+    /// Destructured EXHAUSTIVELY for the same reason [`SshPolicy::split`] is:
+    /// this is the shape a dialog re-saves, so a field added to [`SshPolicy`]
+    /// and forgotten here would not merely fail to display — the next save
+    /// would reset it to its default. Better a compile error.
+    fn from(p: SshPolicy) -> Self {
+        let SshPolicy {
+            mode,
+            can_originate,
+            allowed_user_ids,
+            allowed_role_ids,
+            account_mode,
+            account,
+            consent_mode,
+        } = p;
+        Self {
+            mode,
+            can_originate,
+            allowed_user_ids: allowed_user_ids.iter().map(|i| i.to_hex()).collect(),
+            allowed_role_ids: allowed_role_ids.iter().map(|i| i.to_hex()).collect(),
+            account_mode,
+            account,
+            consent_mode,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OrgSshSettings {
     pub remote_ssh_enabled: bool,
