@@ -2405,6 +2405,75 @@ impl OverlayRuntime {
         self.install_built(wg, by_node, tun, link, None).await;
     }
 
+    /// #27 — act on one unroutable inbound `/derp` frame: FOLLOW that peer onto
+    /// DERP, because a peer only relays to us once it has demoted, so we are
+    /// holding a carrier it has abandoned. Returns `true` when a carrier was
+    /// actually installed (the caller then re-reconciles + republishes).
+    ///
+    /// Extracted from the select arm so the decision is testable: the arm is
+    /// glue, and every gate below is a rule.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn demote_follow(
+        &self,
+        pk: [u8; 32],
+        wg: &mut WgDevice,
+        by_node: &mut HashMap<ObjectId, Installed>,
+        relay: &mut Option<RelayCoordinator>,
+        tun: &Arc<dyn TunIo>,
+        current_peers: &HashMap<ObjectId, NetmapPeer>,
+        relay_bq: &mut RelayBuildQueue,
+        cooldown: &mut HashMap<ObjectId, Instant>,
+    ) -> bool {
+        // Resolve against the CURRENT netmap. An unknown pubkey is ignored
+        // outright, so this can never act on a node we don't already carry —
+        // the first and cheapest bound on the signal.
+        let Some((nid, cfg)) = current_peers.iter().find_map(|(nid, np)| {
+            peer_config_from_netmap(np)
+                .filter(|c| c.public_key == pk)
+                .map(|c| (*nid, c))
+        }) else {
+            debug!(
+                "overlay relay: unroutable /derp frame from a pubkey not in our netmap — ignored"
+            );
+            return false;
+        };
+        // Already on DERP ⇒ nothing to follow. This is the ordinary shape of a
+        // repeat notice: the peer keeps relaying until we converge, and frames
+        // already in flight when we flipped still arrive.
+        if by_node
+            .get(&nid)
+            .is_some_and(|e| e.relay_kind == Some(crate::overlay::relay_link::RelayKind::Derp))
+        {
+            return false;
+        }
+        let now = Instant::now();
+        if cooldown.get(&nid).is_some_and(|&t| now < t) {
+            return false;
+        }
+        let Some(coord) = relay.as_mut() else {
+            return false;
+        };
+        cooldown.insert(nid, now + DERP_FOLLOW_COOLDOWN);
+        let was = by_node.get(&nid).map(|e| e.tier);
+        match coord.follow_peer_to_derp(nid, cfg) {
+            Some(link) => {
+                warn!(
+                    peer = %nid, ?was,
+                    "overlay relay: peer is relaying to us over /derp while we hold another carrier — following it onto DERP now (demote-follow)"
+                );
+                self.install_ready(wg, by_node, tun, link, relay_bq).await;
+                true
+            }
+            None => {
+                debug!(
+                    peer = %nid,
+                    "overlay relay: demote-follow declined (no mux / mux down / peer lacks derp) — the walk retries"
+                );
+                false
+            }
+        }
+    }
+
     /// rc.211 — commit an already-BUILT relay/test carrier as a WG peer: the
     /// µs-fast install half of the old `install_ready` (`wg.add_peer` + `/32`
     /// route + subnets + bookkeeping). `quic: Some` = the off-loop QUIC build
