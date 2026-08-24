@@ -116,6 +116,17 @@ jobs:
           done
           echo "::error::MongoDB never became ready"; docker logs roomler-test-mongo | tail -40; exit 1
 
+      - name: Prove the ulimit actually applied
+        # ⚠️ Do not assume a flag took. Two runs were "fixed" by raising
+        # nofile and both still died on EMFILE, which means either the flag
+        # did not apply or the ceiling is not where I thought. Print the
+        # effective limit so the next failure is diagnosable from the run
+        # page instead of by another guess-and-rerun cycle.
+        run: |
+          echo "--- mongod's effective limits ---"
+          docker exec roomler-test-mongo sh -c 'grep -i "open files" /proc/1/limits' || true
+          docker exec roomler-test-mongo sh -c 'ulimit -n' || true
+
       - name: Build the test binary
         # Separate from the run so a compile failure reads as a compile
         # failure, not as "0 tests passed".
@@ -179,6 +190,24 @@ jobs:
             echo "::error::only $total tests ran (floor $MIN). A green run that executes nothing is the failure this lane exists to prevent — find out what stopped running before touching this number."
             exit 1
           fi
+
+      - name: How many databases leaked?
+        # The suspected root cause: `impl Drop for TestApp` cleans up with a
+        # detached `tokio::spawn`, and a `#[tokio::test]`'s runtime shuts down
+        # as the test returns — so that task overwhelmingly never runs and the
+        # per-test databases are never dropped. WiredTiger then holds every
+        # collection and index file of ~289 databases open until EMFILE.
+        # (Same shape as #602: a dropped JoinHandle detaches.)
+        #
+        # A count near the test count confirms it; a count near zero refutes
+        # it and sends the next person somewhere else.
+        if: always()
+        run: |
+          docker exec roomler-test-mongo mongosh --quiet --eval '
+            const dbs = db.adminCommand({listDatabases:1, nameOnly:true}).databases
+              .filter(d => d.name.startsWith("roomler_ai_test_"));
+            print("leaked test databases: " + dbs.length);
+          ' || echo "(mongo is gone — see the post-mortem below)"
 
       - name: Did MongoDB survive?
         # Ask FIRST on a failure. A dead or restarted Mongo turns one
