@@ -1,0 +1,324 @@
+# The integration suite, actually running.
+#
+# `crates/tests` — 288 tests across 25 modules — ran in NO CI lane for
+# months. It needs MongoDB + Redis, `ci.yml` has neither, and every module is
+# `#[cfg(test)]`-gated so `--workspace` clippy compiles only `pub mod
+# fixtures`. The crate stopped compiling entirely (a DAO grew three fields and
+# its 8 test callers didn't) and every PR stayed green throughout. #603 added
+# a `cargo check` so the crate at least BUILDS; this lane is the other half.
+#
+# ⚠️ The failure mode that let it rot is a lane that runs NOTHING and reports
+# success — a build log printing `Checking roomler-ai-tests` was mistaken for
+# coverage for months. So this workflow asserts a MINIMUM TEST COUNT: if the
+# harness executes far fewer tests than the suite contains, the job fails
+# loudly instead of passing quietly. A green tick here has to mean the tests
+# ran.
+#
+# Deliberately NOT on every PR: the suite is ~40 min on the build host, and
+# a job that long on every push trains people to ignore it. Master pushes
+# that touch backend code, plus manual dispatch.
+name: integration-tests
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/**'
+      - 'agents/roomler-agent/**'
+      - '.github/workflows/integration-tests.yml'
+  pull_request:
+    paths:
+      - 'crates/tests/**'
+      - '.github/workflows/integration-tests.yml'
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'Only run tests matching this substring (empty = whole suite)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Integration suite (MongoDB + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    services:
+      # MongoDB is deliberately NOT a service container — see "Start MongoDB"
+      # below. Service containers accept no command arguments, and this
+      # workload needs one.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      ROOMLER__DATABASE__URL: mongodb://localhost:27019
+      # File storage defaults to local disk in dev/test (see
+      # crates/api/src/storage.rs), so no MinIO/S3 is needed here. Leaving
+      # ROOMLER__S3__* unset is what selects that backend.
+      RUST_BACKTRACE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Rust cache
+        continue-on-error: true
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          shared-key: ci-integration
+          cache-on-failure: true
+
+      - name: Start MongoDB (capped WiredTiger cache)
+        # A service container cannot take command arguments, and this one
+        # needs `--wiredTigerCacheSizeGB`. The default cache is ~50 % of RAM;
+        # on a 2-core/7 GB runner that competes with the test binary, and the
+        # first run of this lane (32670680394) lost Mongo mid-suite —
+        # 28 tests died on `Connection refused (os error 111)` with
+        # `SystemOverloadedError`, while 263 around them passed. Those were
+        # never 28 code failures; they were one process going away.
+        #
+        # Port 27019 on the host, not 27017: `TestApp` and the local
+        # docker-compose both use 27019, so the tests need no override.
+        run: |
+          set -euo pipefail
+          # ⚠️ --ulimit nofile FIXED NOTHING, and the record should say so.
+          # I added it after run 32673736740 died on
+          #   "couldn't open [/proc/1/stat] Too many open files"
+          #   WiredTiger error 24 (EMFILE) -> fatal assertion 50853 -> abort
+          # But that run had NO ulimit flag and died at 265 tests; with 64000
+          # set, the next died at 256. Both at ~62 000 descriptors — so the
+          # runner's own default is ~65 536 and this flag merely restated it.
+          # (Local Docker Desktop defaults to 1 048 576, which is why "the
+          # default must be too low" felt obvious. It was not measured.)
+          #
+          # The real cause was the harness never dropping its test databases;
+          # see `impl Drop for TestApp`. The flag stays only as a DELIBERATE
+          # ceiling: a bounded limit makes a future leak fail loudly and early
+          # instead of quietly consuming a million descriptors. 64000 is
+          # MongoDB's own documented production minimum.
+          docker run -d --name roomler-test-mongo -p 27019:27017 \
+            --ulimit nofile=64000:64000 \
+            --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'" \
+            --health-interval 5s --health-timeout 5s --health-retries 20 \
+            mongo:7 --wiredTigerCacheSizeGB 0.5
+          for i in $(seq 1 40); do
+            if docker exec roomler-test-mongo mongosh --quiet \
+                 --eval 'db.adminCommand({ping:1})' >/dev/null 2>&1; then
+              echo "mongo ready after ${i} attempt(s)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::MongoDB never became ready"; docker logs roomler-test-mongo | tail -40; exit 1
+
+      - name: Prove the ulimit actually applied
+        # ⚠️ Do not assume a flag took. Two runs were "fixed" by raising
+        # nofile and both still died on EMFILE, which means either the flag
+        # did not apply or the ceiling is not where I thought. Print the
+        # effective limit so the next failure is diagnosable from the run
+        # page instead of by another guess-and-rerun cycle.
+        run: |
+          echo "--- mongod's effective limits ---"
+          docker exec roomler-test-mongo sh -c 'grep -i "open files" /proc/1/limits' || true
+          docker exec roomler-test-mongo sh -c 'ulimit -n' || true
+
+      - name: Build the test binary
+        # Separate from the run so a compile failure reads as a compile
+        # failure, not as "0 tests passed".
+        run: cargo test -p roomler-ai-tests --no-run
+
+      - name: Watch mongod while the suite runs
+        # ⚠️ THE MISTAKE THIS FIXES. The leaked-database count below runs
+        # AFTER the suite — and mongod dies mid-suite, so on run 32675563670
+        # it printed "(mongo is gone)". The one step built to discriminate
+        # between hypotheses could not run at the moment that mattered. A
+        # post-mortem instrument cannot observe the thing that killed the
+        # patient.
+        #
+        # So sample DURING, and separate FILES from SOCKETS, because "what is
+        # consuming the descriptors" is the actual question and I have already
+        # answered it wrong once: `conn1333` in the mongod log was read as "too
+        # many connections", a client-pool cap was added, and it fixed nothing
+        # — the ceiling was EMFILE on FILES.
+        #
+        #   wt_files   — WiredTiger's own "files currently open". This IS the
+        #                EMFILE quantity; one table per collection AND per
+        #                index, per database. Climbs if databases leak.
+        #   dhandles   — data handles active; the same story one level up.
+        #   conns      — connections. Climbs if the driver leaks sockets.
+        #   leaked_dbs — `roomler_ai_test_*` databases still present.
+        #
+        # Whichever curve climbs is the culprit; the flat ones are exonerated.
+        #
+        # ⚠️ These come from `serverStatus()`, NOT from classifying the
+        # symlinks in /proc/1/fd, and that is not a style choice: `readlink`
+        # on those entries is DENIED in this container runtime even as uid 0,
+        # so `ls -l` prints names with no targets. The first version of this
+        # step classified them anyway and — with stderr sent to /dev/null —
+        # silently reported `fds_wt=0 fds_sock=0` against a live mongod that
+        # obviously held both. It was caught by rehearsing the step against a
+        # local container before pushing, which took two minutes.
+        run: |
+          set -euo pipefail
+          setsid nohup bash -c '
+            while true; do
+              t=$(date -u +%H:%M:%S)
+              fd=$(docker exec roomler-test-mongo sh -c "ls /proc/1/fd 2>/dev/null | wc -l" 2>/dev/null || echo -1)
+              m=$(docker exec roomler-test-mongo mongosh --quiet --eval "const s=db.serverStatus();const n=db.adminCommand({listDatabases:1,nameOnly:true}).databases.filter(x=>x.name.startsWith(\"roomler_ai_test\")).length;print(\"wt_files=\"+s.wiredTiger[\"connection\"][\"files currently open\"]+\" dhandles=\"+s.wiredTiger[\"data-handle\"][\"connection data handles currently active\"]+\" conns=\"+s.connections.current+\" leaked_dbs=\"+n)" 2>/dev/null || echo "wt_files=-1 dhandles=-1 conns=-1 leaked_dbs=-1")
+              echo "$t fds=$fd $m"
+              sleep 15
+            done' > /tmp/mongo-watch.log 2>&1 < /dev/null &
+          sleep 16
+          echo "--- first sample (baseline, before any test has run) ---"
+          cat /tmp/mongo-watch.log
+          # ⚠️ Prove the instrument works BEFORE the suite depends on it. A
+          # watcher that silently produced nothing would leave the next run
+          # as undiagnosable as the last one.
+          grep -qE 'wt_files=[0-9]+ ' /tmp/mongo-watch.log || {
+            echo "::error::the mongod watcher is not producing usable samples — fix it before trusting this run"; exit 1; }
+
+      - name: Run the suite
+        id: run
+        env:
+          FILTER: ${{ github.event.inputs.filter }}
+        run: |
+          set -o pipefail
+          # 2 threads, not 4: every test creates and drops its OWN database,
+          # so concurrency here is concurrent DB churn against one Mongo on a
+          # 2-core runner — which is what took it down on the first run.
+          #
+          # The two skips were MEASURED here (run 32671814889: 289 passed,
+          # these 2 failed), not inherited from the build host — porting that
+          # box's list across would have been the same environment-assumption
+          # this lane exists to catch. Each needs a reason and a way out:
+          #
+          #   conference … call_leave_cleans_up_participant_media
+          #     Wants a live mediasoup worker; the runner has none, so it gets
+          #     `media:error` where `media:router_capabilities` is expected.
+          #     Un-skip if the worker is ever provisioned in CI.
+          #
+          #   rate_limit … rate_limit_returns_429_after_burst
+          #     Timing-sensitive against tower_governor's per-second refill.
+          #     ⚠️ Skipping a timing test hides real rate-limit regressions —
+          #     prefer making it deterministic (inject the clock) over leaving
+          #     it skipped forever. Tracked, not resolved.
+          #
+          # ⚠️ Adding a third skip should feel expensive. If this list grows,
+          # the lane is drifting back toward the unfalsifiable state it
+          # replaced.
+          cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads=2 \
+            --skip conference_tests::call_leave_cleans_up_participant_media \
+            --skip rate_limit_tests::rate_limit_returns_429_after_burst \
+            2>&1 | tee /tmp/itest.log
+
+      - name: The mongod watch log (READ THIS FIRST on a failure)
+        # The curve, not the corpse. Read the last sample before the numbers
+        # stop moving: that is the state mongod was in when it died.
+        if: always()
+        run: |
+          echo "--- mongod descriptors + leaked databases over the run ---"
+          cat /tmp/mongo-watch.log || echo "(watcher produced nothing)"
+
+      - name: Assert the suite actually ran
+        # ⚠️ THE POINT OF THIS STEP. A test lane that silently executes
+        # nothing is indistinguishable from a passing one, and that is
+        # precisely how this crate rotted. `cargo test` happily reports
+        # success for a filter that matches no test, so success alone is
+        # not evidence.
+        #
+        # The floor is deliberately well under the real count (288 as of
+        # 2026-08-23) so ordinary churn does not trip it, while a harness
+        # that runs a handful — or none — fails loudly. Raise it when the
+        # suite grows; if you find yourself LOWERING it, that is the signal
+        # to stop and ask what stopped running.
+        if: ${{ github.event.inputs.filter == '' }}
+        run: |
+          set -euo pipefail
+          total=$(grep -oE '^test result: .*[0-9]+ passed' /tmp/itest.log \
+                  | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' \
+                  | awk '{s+=$1} END {print s+0}')
+          echo "tests reported passed: $total"
+          MIN=200
+          if [ "$total" -lt "$MIN" ]; then
+            echo "::error::only $total tests ran (floor $MIN). A green run that executes nothing is the failure this lane exists to prevent — find out what stopped running before touching this number."
+            exit 1
+          fi
+
+      - name: Assert the harness cleaned up after itself
+        # This began as a diagnostic and is now a regression check, because the
+        # measurement came back: `impl Drop for TestApp` cleaned up with a
+        # DETACHED `tokio::spawn`, and every test here is a plain
+        # `#[tokio::test]` — a current-thread runtime that is dropped the
+        # instant the body returns, taking the queued-but-never-polled cleanup
+        # task with it. Run 32767662554: 29 tests ran, 29 databases remained.
+        #
+        # That is what killed mongod. Sampled mid-run, connections were FLAT
+        # (conns 5 -> 11) while files exploded (wt_files 14 -> 5166 across 21
+        # databases) — ~246 WiredTiger files per database, one per collection
+        # and per index. `fds ~= 26 + 246 x databases` reaches the 64 000
+        # nofile ceiling at ~260 databases, i.e. mid-suite, which is exactly
+        # where EMFILE -> WiredTiger error 24 -> fatal assertion 50853 landed.
+        # Raising nofile could never have fixed it; it only moved the wall.
+        #
+        # ⚠️ Keep this a FAILURE, not a print. A teardown that silently stops
+        # running is invisible until it takes the database server down with
+        # it — which is precisely how this cost a day.
+        if: always()
+        run: |
+          set -uo pipefail
+          n=$(docker exec roomler-test-mongo mongosh --quiet --eval \
+                'print(db.adminCommand({listDatabases:1,nameOnly:true}).databases.filter(d=>d.name.startsWith("roomler_ai_test")).length)' \
+                2>/dev/null) || n=""
+          peak=$(grep -oE 'leaked_dbs=[0-9]+' /tmp/mongo-watch.log 2>/dev/null \
+                 | grep -oE '[0-9]+' | sort -n | tail -1)
+          echo "test databases still present: ${n:-<unreadable>}   (peak during the run: ${peak:-<none>})"
+          if [ -z "$n" ]; then
+            echo "::notice::mongod did not outlive the suite, so the final count could not be read — the watch log above is the evidence. Not failing the job twice for one fault."
+            exit 0
+          fi
+          # A handful is fine: a test may hold a TestApp past the suite, and
+          # the count races the last teardown. Hundreds is the bug.
+          MAX=5
+          if [ "$n" -gt "$MAX" ]; then
+            echo "::error::$n test databases were left behind (max $MAX). TestApp's teardown is not running — see impl Drop for TestApp in crates/tests/src/fixtures/test_app.rs. Left unchecked this exhausts mongod's file descriptors mid-suite."
+            exit 1
+          fi
+
+      - name: Did MongoDB survive?
+        # Ask FIRST on a failure. A dead or restarted Mongo turns one
+        # environmental fault into dozens of unrelated-looking test failures,
+        # and reading those as code bugs is a long detour — it is exactly what
+        # the first run of this lane looked like.
+        if: failure()
+        run: |
+          echo "--- container state ---"
+          docker inspect -f 'Status={{.State.Status}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Restarts={{.RestartCount}}' \
+            roomler-test-mongo || true
+          echo "--- mongod fatal/error lines (the CAUSE) ---"
+          # ⚠️ Grep for severity first. A plain `--tail` catches only the
+          # BACKTRACE frames mongod prints on its way out — which says it died
+          # but not why. That happened on run 32672829603: 59 `Frame` lines and
+          # no assertion, because the fatal message had already scrolled past.
+          docker logs roomler-test-mongo 2>&1 | grep -E '"s":"[FE]"' | tail -20 || true
+          echo "--- last 120 lines ---"
+          docker logs --tail 120 roomler-test-mongo 2>&1 || true
+
+      - name: Upload the log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-log
+          path: /tmp/itest.log
+          retention-days: 7

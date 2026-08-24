@@ -30,6 +30,35 @@ pub struct TestApp {
 /// Opt-in rather than always-on: the suite is chatty and most runs don't want
 /// it. `with_test_writer` routes through the harness capture, so output shows
 /// up under `--nocapture` and stays attached to the failing test otherwise.
+/// Keep each `TestApp`'s connection pool tiny.
+///
+/// Every test builds its OWN `Client` against its OWN database, and the
+/// driver's default pool is 10 connections — so a full suite run can ask one
+/// mongod for a couple of thousand sockets, each of which is a file
+/// descriptor on the server.
+///
+/// ⚠️ This fixed NOTHING, and the measurement says so. I read `conn1333` in
+/// the crash log as "too many connections" and capped the pool; the next run
+/// failed identically. Sampling mongod during a run (CI run 32767662554)
+/// settled it — connections are FLAT while files explode:
+///
+/// ```text
+///   19:30:34  fds=51    wt_files=14    conns=5   leaked_dbs=0
+///   19:30:50  fds=5192  wt_files=5166  conns=11  leaked_dbs=21
+/// ```
+///
+/// 5 166 files for 21 databases is ~246 WiredTiger files per database (one
+/// per collection AND per index), so `fds ≈ 26 + 246 × databases` and the
+/// 64 000 `nofile` ceiling arrives at ~260 databases — mid-suite. The cause
+/// is the teardown that never ran; see `impl Drop for TestApp`.
+///
+/// The cap stays because it is genuinely free: a test needs ~1 connection at
+/// a time, so 2 is generous. It is not a fix for anything.
+fn cap_pool(opts: &mut ClientOptions) {
+    opts.max_pool_size = Some(2);
+    opts.min_pool_size = Some(0);
+}
+
 fn init_tracing() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -65,9 +94,10 @@ impl TestApp {
         }
         settings.database.name = db_name.clone();
 
-        let client_options = ClientOptions::parse(&settings.database.url)
+        let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
             .expect("Failed to parse MongoDB URL");
+        cap_pool(&mut client_options);
         let mongo_client =
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         let db = mongo_client.database(&db_name);
@@ -159,9 +189,10 @@ impl TestApp {
         // Apply caller's customizations
         mutator(&mut settings);
 
-        let client_options = ClientOptions::parse(&settings.database.url)
+        let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
             .expect("Failed to parse MongoDB URL");
+        cap_pool(&mut client_options);
         let mongo_client =
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         // Phase A-1: honor a mutator-overridden db name — `spawn_pair`
@@ -233,9 +264,10 @@ impl TestApp {
         settings.oauth.microsoft.client_id = "test-microsoft-id".to_string();
         settings.oauth.microsoft.client_secret = "test-microsoft-secret".to_string();
 
-        let client_options = ClientOptions::parse(&settings.database.url)
+        let mut client_options = ClientOptions::parse(&settings.database.url)
             .await
             .expect("Failed to parse MongoDB URL");
+        cap_pool(&mut client_options);
         let mongo_client =
             Client::with_options(client_options).expect("Failed to create MongoDB client");
         let db = mongo_client.database(&db_name);
@@ -297,12 +329,57 @@ impl TestApp {
 }
 
 impl Drop for TestApp {
+    /// Drop this test's database — **synchronously**.
+    ///
+    /// This used to be a detached `tokio::spawn`, which **never ran**. Every
+    /// test here is a plain `#[tokio::test]` (all 291 of them), so the body is
+    /// driven by `block_on` on a current-thread runtime; this `Drop` fires as
+    /// that body completes, queues a task, and `block_on` returns on the very
+    /// next step. The runtime is then dropped with the task still queued and
+    /// never polled — so *every* test database survived its test. Same shape
+    /// as #602: a dropped `JoinHandle` detaches, and detached is not "later",
+    /// it is "never" once the runtime goes.
+    ///
+    /// Measured cost of the leak (CI run 32767662554): 29 tests → 29 databases
+    /// → ~246 WiredTiger files each. A full suite crossed mongod's 64 000
+    /// descriptor ceiling around the 260th database, hit `EMFILE`, and aborted
+    /// on fatal assertion 50853 — which surfaced as dozens of unrelated-looking
+    /// tests failing on `Connection refused`.
+    ///
+    /// ⚠️ The new client is **not** redundant with `self.db`, and reusing the
+    /// existing one deadlocks. We block this thread on `join()`, so the test's
+    /// runtime stops driving its IO driver — and `self.db`'s sockets are
+    /// registered with exactly that driver, so their readiness would never be
+    /// delivered. The cleanup must own every part of its own I/O.
     fn drop(&mut self) {
-        let db = self.db.clone();
-        // Best effort cleanup: drop the test database
-        tokio::spawn(async move {
-            let _ = db.drop().await;
-        });
+        let uri = self.settings.database.url.clone();
+        let name = self.db.name().to_string();
+        let _ = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                // ⚠️ Bound the wait. If mongod is already gone — which is
+                // exactly the state this teardown exists to prevent — the
+                // driver's 30 s default server selection would be spent once
+                // PER TEST, and ~290 of those turn a diagnosable failure into
+                // a job that hits its wall-clock limit having reported
+                // nothing. Three seconds is generous for a local socket.
+                let Ok(mut opts) = ClientOptions::parse(&uri).await else {
+                    return;
+                };
+                opts.server_selection_timeout = Some(std::time::Duration::from_secs(3));
+                opts.connect_timeout = Some(std::time::Duration::from_secs(3));
+                opts.max_pool_size = Some(1);
+                if let Ok(client) = Client::with_options(opts) {
+                    let _ = client.database(&name).drop().await;
+                }
+            });
+        })
+        .join();
     }
 }
 
