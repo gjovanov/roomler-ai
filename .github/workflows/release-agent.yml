@@ -1872,7 +1872,20 @@ jobs:
           bad="$(otool -L "$DESK/Contents/MacOS/roomler-desktop" | tail -n +2 | awk '{print $1}' \
                  | grep -E '^/(opt|usr/local)/' || true)"
           [ -z "$bad" ] || { echo "::error::companion loads non-system paths:"; echo "$bad"; exit 1; }
-          "$DESK/Contents/MacOS/roomler-desktop" --version 2>/dev/null || true
+          # dyld/exec smoke, HARD-BOUNDED: `|| true` guards the exit code,
+          # not a hang — once #659 made the companion actually START, this
+          # probe launched a Tauri menu-bar event loop that never exits and
+          # pinned the job until timeout (run 32738472108: 20+ min stuck
+          # here; previously the binary failed fast, so the line "worked").
+          # Background + kill keeps the probe's only real value (a dyld
+          # crash still surfaces in the log) without trusting the binary
+          # to ever return. macOS runners lack GNU `timeout` natively, so
+          # do it by hand.
+          "$DESK/Contents/MacOS/roomler-desktop" --version 2>/dev/null &
+          probe=$!
+          sleep 5
+          kill -9 "$probe" 2>/dev/null || true
+          wait "$probe" 2>/dev/null || true
           echo "  companion staged: $(du -h "$DESK/Contents/MacOS/roomler-desktop" | cut -f1)"
 
       - name: Import signing certs
