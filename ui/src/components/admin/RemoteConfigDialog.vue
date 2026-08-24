@@ -77,7 +77,7 @@
         />
 
         <v-expand-transition>
-          <div v-if="draft.ssh_enabled !== undefined || sshDetailsTouched">
+          <div v-if="sshDetailsShown">
             <v-textarea
               v-model="authorizedKeysText"
               :disabled="!mayGrantSsh"
@@ -255,6 +255,23 @@ const mayGrantExec = computed(() =>
 )
 const mayGrantSsh = computed(() =>
   canGrantDeviceSsh(tenantStore.myPermissions, tenantStore.isOwner),
+)
+
+/** Show the SSH details whenever ANY ssh key is under management — not just
+ *  when `ssh_enabled` is.
+ *
+ *  Keying this on `ssh_enabled` alone hid keys that were being pushed: a device
+ *  managed as "authorized keys, but leave the switch alone" opened with the
+ *  section collapsed, so an operator could neither see nor edit them — and the
+ *  draft still carried them, so saving silently re-asserted a list they had
+ *  never been shown. */
+const sshDetailsShown = computed(
+  () =>
+    sshDetailsTouched.value ||
+    draft.value.ssh_enabled !== undefined ||
+    draft.value.ssh_authorized_keys !== undefined ||
+    draft.value.ssh_account_mode !== undefined ||
+    draft.value.ssh_port !== undefined,
 )
 
 const orgExecDisabled = computed(() => agentStore.orgExecEnabled === false)
