@@ -59,6 +59,37 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check --all
 
+      # The companion's icons shipped as 1x1 PLACEHOLDERS for its whole life.
+      # Windows tolerated them; macOS aborts the process before the app starts —
+      # `tao`'s tray setup panics on "dimensions don't match the number of
+      # pixels supplied", inside a callback that cannot unwind. So the one
+      # platform where the companion is the only thing telling you a permission
+      # is missing was the one platform it could not run on.
+      #
+      # Cheap, and it fails on the commit that reintroduces a stub rather than
+      # on someone's Mac. Regenerate with scripts/gen-tray-icons.py.
+      - name: Assert the companion's icons are real
+        run: |
+          python3 - <<'PY'
+          import sys, struct, pathlib
+          icons = pathlib.Path("agents/roomler-agent-tray/icons")
+          bad = []
+          for name in ("tray.png", "icon.png"):
+              p = icons / name
+              raw = p.read_bytes()
+              if raw[:8] != b"\x89PNG\r\n\x1a\n":
+                  bad.append(f"{name}: not a PNG"); continue
+              # IHDR is always the first chunk: width/height at bytes 16..24.
+              w, h = struct.unpack(">II", raw[16:24])
+              if min(w, h) < 16:
+                  bad.append(f"{name}: {w}x{h} — a placeholder, not an icon")
+          if bad:
+              print("::error::" + "; ".join(bad))
+              print("regenerate with: python3 scripts/gen-tray-icons.py")
+              sys.exit(1)
+          print("  companion icons OK")
+          PY
+
       # P5 (invariant I5) — the vendored webrtc-ice must equal pristine
       # upstream + the ONE canonical patch. An edit to the fork without a
       # matching `--regen` of the patch fails here, so third-party debt
