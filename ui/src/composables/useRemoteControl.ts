@@ -1704,6 +1704,11 @@ export interface AutoTransportInputs {
   viewerVp9Hw: boolean
   viewerVp9Decodable: boolean
   viewerH264Hw: boolean
+  /** The viewer's Priority dial. Only `sharper` changes the outcome, and
+   *  only on the libvpx SW rung — see the chroma note on `pickAutoTransport`.
+   *  Optional so existing callers/tests keep their meaning (absent =
+   *  `balanced` = the pre-existing 4:2:0 behaviour). */
+  priority?: RcPriority
 }
 
 /** rc.190 Ã¢ÂÂ pure HWÃÂHW transport rank for `videoTransport === 'auto'`.
@@ -1725,7 +1730,22 @@ export interface AutoTransportInputs {
  *    6. webrtc   Ã¢ÂÂ the REMB-adaptive H.264 track (universal fallback)
  *  Returns the transport (null = webrtc) + a chroma override ('yuv420'
  *  for the VP9 picks so the fallback never lands on software-decoded
- *  profile 1). Exported for vitest. */
+ *  profile 1). Exported for vitest.
+ *
+ *  Chroma vs. the Priority dial: 4:2:0 is the right DEFAULT (it is the
+ *  universally HW-decoded VP9 profile), but it subsamples exactly the
+ *  colour edges that make TEXT legible, so a Mac streaming a terminal on
+ *  Auto looked soft for a reason the picker never surfaced. `sharper`
+ *  therefore buys full chroma at the cost of SW decode — which is the
+ *  trade that dial already means everywhere else. Deliberately narrow:
+ *  ONLY rung 5, because that rung's encoder is libvpx (profile 1 always
+ *  available) and its own guard is `isVp9_444DecodeSupported()`, i.e. it
+ *  has already proven this browser decodes profile 1. Rung 3 is
+ *  `vp9_qsv`, whose 4:4:4 support is not established — forcing it there
+ *  risks failing the encoder open, so it stays 4:2:0 whatever the dial
+ *  says. HEVC stays untouched: its Rext 4:4:4 pick is double-gated on a
+ *  browser probe AND agent caps precisely because a mismatch is a black
+ *  screen, and the auto-rank must not guess at it. */
 export function pickAutoTransport(inputs: AutoTransportInputs): {
   transport: Exclude<RcVideoTransport, 'auto' | 'webrtc'> | null
   chromaOverride: string | null
@@ -1773,6 +1793,15 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
     }
   }
   if (hasVp9Dc && inputs.viewerVp9Decodable) {
+    // Sharper => full chroma. Safe here and ONLY here: libvpx always has
+    // profile 1, and this rung's own guard IS the profile-1 decode probe.
+    if (inputs.priority === 'sharper') {
+      return {
+        transport: 'data-channel-vp9-444',
+        chromaOverride: 'yuv444',
+        reason: 'VP9 4:4:4: SW encode on agent - Sharper trades HW decode for full-chroma text',
+      }
+    }
     return {
       transport: 'data-channel-vp9-444',
       chromaOverride: 'yuv420',
@@ -7010,6 +7039,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // P2 Ã¢ÂÂ H.264-DC needs both the HW-smooth verdict AND an accepted
         // Annex-B avc1 config (the worker configures with the latter).
         viewerH264Hw: h264Hw && h264Codec !== null,
+        // Sharper can upgrade the SW VP9 rung to full chroma - see the
+        // chroma note on `pickAutoTransport`.
+        priority: priority.value,
       })
       preferredTransport = pick.transport
       chromaOverride = pick.chromaOverride
@@ -7020,7 +7052,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           : pick.transport === 'data-channel-hevc'
             ? hevcHw
             : pick.transport === 'data-channel-vp9-444'
-              ? vp9Hw
+              ? // Profile 1 has no fixed-function decode anywhere - claiming
+                // `dec HW` on a 4:4:4 pick would make the badge lie, which is
+                // the exact thing rc.87's real-encoder plumbing exists to stop.
+                pick.chromaOverride === 'yuv444'
+                ? false
+                : vp9Hw
               : pick.transport === 'data-channel-h264'
                 ? h264Hw
                 : null
