@@ -51,6 +51,29 @@ runs:
         # step below prunes salted siblings down to the newest.
         key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-r${{ github.run_id }}
 
+    - name: Verify the save landed (surface silent failures)
+      shell: bash
+      run: |
+        # actions/cache/save treats "Unable to reserve …" as a soft warning
+        # and stays green — which is how the 2026-08-24 wedge went unseen
+        # while every rehearsal silently stopped persisting generations and
+        # rc.460 built near-cold behind green runs. Ask the API whether the
+        # exact salted key actually exists on this ref; if not, put a
+        # warning ON THE RUN PAGE instead of leaving it to log archaeology.
+        # Soft-skips without GH_TOKEN (the calling step passes it).
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "GH_TOKEN not provided — skipping save verification"
+          exit 0
+        fi
+        key="seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-r${{ github.run_id }}"
+        found="$(gh api "repos/${GITHUB_REPOSITORY}/actions/caches?key=${key}&ref=${GITHUB_REF}" --jq '.total_count' 2>/dev/null || echo 0)"
+        if [ "${found:-0}" -ge 1 ]; then
+          echo "save verified: ${key}"
+        else
+          echo "::warning title=Seed save did not land::'${key}' is absent on ${GITHUB_REF} after the save step — the cargo seed for family '${{ inputs.shared-key }}' was NOT refreshed by this run (aborted upload, API error, or instant eviction from an over-budget pool). Tag builds will restore an older generation or run cold until a later rehearsal succeeds."
+        fi
+        exit 0
+
     - name: Retire superseded generations (keep only the newest on this ref)
       shell: bash
       run: |
