@@ -35,10 +35,19 @@
 //!
 //! That is why [`verify_artifact_version`] reports
 //! [`Unsupported`](VersionError::Unsupported) rather than a refusal for the
-//! Linux `.deb` and macOS `.pkg`: nothing authenticates those artifacts yet,
-//! so a binding there would check a claim against a claim while reading like a
-//! control. They gain a real one when their signature verification lands
-//! (GPG for `.deb`, `pkgutil --check-signature` for `.pkg`) — and not before.
+//! Linux `.deb` and macOS `.pkg`: **this agent has authenticated nothing about
+//! them**, so a binding there would check a claim against a claim while reading
+//! like a control.
+//!
+//! Note the precise gap — the release pipeline is further along than the agent
+//! is. Every published artifact already carries a detached OpenPGP `.asc`, and
+//! `roomler-release-pubkey.asc` ships in the release (verified 2026-08-24
+//! against `agent-v0.3.0-rc.458`: a good signature verifies and a single
+//! flipped byte yields `BAD signature`). What is missing is the *client* half —
+//! verifying it needs the release public key **pinned in this binary**, because
+//! a key fetched from the release is the same-channel trust failure as the
+//! SHA256. `.deb`/`.pkg` gain a real version binding once that lands (and
+//! `pkgutil --check-signature` for the notarised `.pkg`), and not before.
 
 use std::path::Path;
 
