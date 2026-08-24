@@ -259,3 +259,63 @@ async fn list_for_agent_is_tenant_scoped() {
     // Tenant B has zero crashes (their agent never crashed).
     assert!(items.is_empty(), "tenant B leaked tenant A's records");
 }
+
+/// The revocation property: an agent token is valid for a YEAR, so deleting a
+/// device has to be what stops it writing — not the token's expiry.
+///
+/// Before the `AuthAgent` extractor this handler trusted the JWT claims alone
+/// and never read the row, so a deleted device kept posting crash reports for
+/// the remaining life of its token. This drives the real route end to end,
+/// which is the only thing that proves the extractor is actually wired in
+/// (the unit tests can only prove the rule, not that anything applies it).
+#[tokio::test]
+async fn ingest_refuses_a_deleted_agents_token_with_401() {
+    let app = TestApp::spawn().await;
+    let (cfg, admin_token) = enrol(&app, "crash-revoked").await;
+
+    let url = format!("{}/api/agent/crash", app.base_url);
+
+    // Baseline: the very same token is accepted while the agent is live, so a
+    // 401 below cannot be blamed on a malformed token or payload.
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&cfg.agent_token)
+        .json(&fresh_payload())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "a live agent should be accepted"
+    );
+
+    // Delete the device through the admin route the operator would use.
+    let del = app
+        .auth_delete(
+            &format!("/api/tenant/{}/agent/{}", cfg.tenant_id, cfg.agent_id),
+            &admin_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        del.status().is_success(),
+        "agent delete failed: {}",
+        del.status()
+    );
+
+    // Same token, same payload — now refused.
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&cfg.agent_token)
+        .json(&fresh_payload())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a deleted agent's token must stop being accepted"
+    );
+}
