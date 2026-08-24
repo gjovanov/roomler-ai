@@ -1,10 +1,14 @@
 # Remote configuration — enabling exec / SSH from the dashboard
 
-**Status: steps 1–3 SHIPPED (#626, #630, #640); step 4 is BLOCKED on the
-restart question in §7b.** This documents a design and the reasoning
-that constrains it. Every claim about current behaviour below was checked
-against the code at `5b60dacc`; the file notes where a check would need
-repeating.
+**Status: steps 1–6 SHIPPED** (#626, #630, #640, #645, #668). Step 4 took
+option **C** from the fork in §7b — `exec_enabled` is live, `ssh_*` are
+persisted and honestly reported as needing a restart. Option **A**
+(supervisor-detected exit-to-restart) is deliberately still unbuilt; §7b is the
+record of why, not a to-do that was forgotten.
+
+This documents a design and the reasoning that constrains it. Claims about
+behaviour were checked against the code at `5b60dacc` unless noted; the file
+says where a check would need repeating.
 
 ## 1. The problem
 
@@ -247,6 +251,25 @@ exit-to-restart inherits it.
   re-run without more work. C avoids the restart entirely for the key that
   matters most, and is independent of A.
 
+### ⚠️ C creates an asymmetry, and the asymmetry has to be fixed with it
+
+Making a key live for the SERVER while the owner's own edit still waits for a
+restart inverts the property gate 4 exists for. `exec_enabled` is documented as
+*"the only refusal that survives a compromised server"* — a refusal that takes
+effect on the next service restart, while the compromise's assertion takes
+effect on the next command, is a much weaker claim than that sentence makes.
+
+So the LocalAPI's `ConfigSet` re-seeds the live flags after its save
+(`RemoteConfigServices::adopt_local`), and `remote_config_enabled` is live too.
+The second one matters more than the first: it is how the owner REVOKES the
+delegation, and a revocation that waits for a restart leaves the server pushing
+over a decision already made.
+
+⚠️ This does not stop the next reconnect from re-applying a standing
+`desired_config`, and it must not — a device with `remote_config_enabled = true`
+has delegated the key, which is the bargain in §2. Turning the OPT-IN off is
+the owner's actual remedy, which is precisely why that one is live.
+
 **C then A** looks right: it removes the restart from the common case, and
 leaves the dangerous mechanism to be built deliberately rather than because
 step 4 needed it. But this is a real decision with real trade-offs, not a
@@ -286,10 +309,23 @@ silently.
    ⚠️ It writes an INTENT and says so at the top. Every other device dialog in
    the admin UI writes a server-side policy that takes effect on save; a reader
    who assumes this one does too will misread every status on it.
-6. Desktop companion: already has a generic settings pane over
-   `cmd_config_entries` / `cmd_config_set`, which already exposes
-   `exec_enabled` / `ssh_enabled`. It needs the new key surfaced, not a new
-   pane.
+6. Desktop companion — **no code needed, verified rather than assumed.** Its
+   settings pane is built entirely from `cmd_config_entries`, which is
+   `config_surface::SURFACE`, which has carried `remote_config_enabled` with
+   its full description since step 1. The generic pane picked it up the day it
+   landed.
 
-Steps 1–2 are safe to land before the design is fully settled; step 3 fixes the
-wire and should not be rushed.
+   What DID need code is the other half: a `ConfigSet` through that pane now
+   re-seeds the live flags (`adopt_local`), so an owner's edit takes effect at
+   the same moment a pushed one would. See §7b — option C created that
+   asymmetry, and leaving it would have made gate 4 the slower of the two.
+
+## 9. Not built, on purpose
+
+- **Option A**, supervisor-detected exit-to-restart (§7b). The `ssh_*` keys are
+  therefore still restart-required, reported as such rather than pretended
+  into effect.
+- **A restart verb.** Same reason: nothing can tell whether the daemon is
+  supervised, and orphan `roomlerd run` hosts exist.
+- **Secondary-org control** (§4). A borrowed device is not yours to
+  reconfigure; the UI says so instead of showing a switch that does nothing.
