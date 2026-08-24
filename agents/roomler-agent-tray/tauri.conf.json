@@ -9,7 +9,7 @@
   "app": {
     "trayIcon": {
       "iconPath": "icons/tray.png",
-      "iconAsTemplate": false
+      "iconAsTemplate": true
     },
     "withGlobalTauri": true,
     "windows": [
