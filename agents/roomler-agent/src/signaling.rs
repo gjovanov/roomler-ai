@@ -449,6 +449,10 @@ pub async fn run(
     // LocalAPI's DaemonState (create/kill/flows verbs). The signaling loop
     // publishes the live agent-WS egress into it + demuxes client-bound replies.
     tunnel_hub: crate::tunnel::client_mgr::TunnelClientHub,
+    // Remote config (docs/remote-config.md) — the config path, the daemon-wide
+    // write lock and the LIVE `exec_enabled` as one value. Machine-wide, so the
+    // SAME instance is shared by every org loop; only the primary ever applies.
+    remote_cfg: crate::remote_config::RemoteConfigServices,
 ) -> Result<()> {
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
@@ -519,6 +523,7 @@ pub async fn run(
         match connect_once(
             &ctx,
             &cfg,
+            &remote_cfg,
             encoder_preference,
             shutdown.clone(),
             indicator.clone(),
@@ -842,6 +847,8 @@ enum ConnectError {
 async fn connect_once(
     ctx: &OrgCtx,
     cfg: &AgentConfig,
+    // Remote config — the live `exec_enabled` and the persist path.
+    remote_cfg: &crate::remote_config::RemoteConfigServices,
     encoder_preference: crate::encode::EncoderPreference,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     indicator: ViewerIndicator,
@@ -1536,6 +1543,7 @@ async fn connect_once(
                                 &relay_regions_slot,
                                 &derp_ticket_slot,
                                 cfg,
+                                remote_cfg,
                             )
                             .await?;
                         }
@@ -1657,6 +1665,7 @@ async fn handle_server_msg(
     // identity a pushed `rc:agent.join_org` enrolls with. Never a value
     // taken off the wire.
     agent_cfg: &AgentConfig,
+    remote_cfg: &crate::remote_config::RemoteConfigServices,
 ) -> Result<(), ConnectError> {
     match msg {
         ServerMsg::Request {
@@ -2467,20 +2476,37 @@ async fn handle_server_msg(
                 );
                 return Ok(());
             }
-            // Opted in and primary: step 4 will reconcile and persist. Logged
-            // rather than silently dropped so the wire can be verified in the
-            // field BEFORE anything mutates a device — and so an operator
-            // reading the daemon log can see the frame arrived.
-            info!(
-                revision,
-                exec_enabled = ?desired.exec_enabled,
-                ssh_enabled = ?desired.ssh_enabled,
-                ssh_keys = desired.ssh_authorized_keys.as_ref().map(|k| k.len()),
-                ssh_account_mode = ?desired.ssh_account_mode,
-                ssh_port = ?desired.ssh_port,
-                "rc:agent.config received and accepted for reconciliation \
-                 (apply lands in step 4; nothing changed yet)"
-            );
+            // Opted in and primary: reconcile against the file on DISK.
+            // Idempotent — an already-matching desired state writes nothing,
+            // which matters because this runs on every single reconnect.
+            match remote_cfg.apply(&desired).await {
+                Ok(applied) if applied.is_noop() => {
+                    debug!(revision, "rc:agent.config — already matches; nothing to do");
+                }
+                Ok(applied) => {
+                    // Two lists, deliberately never one: `exec_enabled` is in
+                    // force NOW, while the ssh_* keys are only WRITTEN until
+                    // the daemon restarts (the SSH server is spliced into the
+                    // packet path at overlay-runtime build). Reporting them
+                    // together would tell an operator SSH is on when it isn't.
+                    info!(
+                        revision,
+                        live = ?applied.live,
+                        needs_restart = ?applied.needs_restart,
+                        "rc:agent.config applied"
+                    );
+                    if !applied.needs_restart.is_empty() {
+                        warn!(
+                            keys = ?applied.needs_restart,
+                            "rc:agent.config — saved, but these need a daemon restart \
+                             to take effect"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(revision, %e, "rc:agent.config apply failed");
+                }
+            }
         }
 
         // Fleet RPC — run one bounded command and answer with rc:rpc.result.
@@ -2504,7 +2530,10 @@ async fn handle_server_msg(
             caller,
             consent_mode,
         } => {
-            if !agent_cfg.exec_enabled {
+            // Gate 4, read LIVE (docs/remote-config.md): a pushed change takes
+            // effect on the next command, with no restart — which is why
+            // this is the atomic and not the startup snapshot.
+            if !remote_cfg.exec_enabled() {
                 warn!(
                     %request_id, %caller,
                     "rc:rpc.exec refused — exec_enabled is off on this device"
