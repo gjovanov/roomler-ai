@@ -375,6 +375,106 @@ jobs:
           }
           Write-Host "User PATH contains the install dir"
 
+      - name: Assert the install is self-contained (PE import audit)
+        shell: pwsh
+        run: |
+          # A file-EXISTS check is not a self-containment check.
+          #
+          # The step above proves msvcp140/vcruntime140* were laid down; it
+          # cannot prove they are SUFFICIENT, and running the binary here
+          # would not either — `windows-latest` carries the VC redist (it is
+          # where the staging step SOURCES those DLLs from, via vswhere), so
+          # the loader would satisfy the imports from System32 and pass on a
+          # machine that is guaranteed to have the dependency. That is the
+          # exact shape that shipped a launch-crashing macOS .pkg in every
+          # release until rc.453: a check executed in the environment that
+          # supplies the missing dependency cannot detect a dependency on
+          # that environment.
+          #
+          # So read the imports instead of trusting a successful start —
+          # the Windows analogue of the Mach-O load-command scan. This is
+          # the `dumpbin -dependents` check CLAUDE.md tells humans to run by
+          # hand before adding a C++ dependency, made automatic.
+          $ErrorActionPreference = 'Stop'
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                     Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
+
+          # Redistributables — shipped by us, never by Windows. These MUST be
+          # app-local; finding them in System32 proves nothing about a fresh
+          # machine, so they are excluded from the System32 allowance below.
+          $mustBeAppLocal = '^(msvcp|vcruntime|concrt|mfc|vcomp|msvcr)'
+
+          function Audit-Imports {
+            param([switch]$Quiet)
+            $found    = @()
+            $appLocal = @()
+            foreach ($exe in @('roomlerd.exe', 'roomler.exe')) {
+              $path = Join-Path $installDir $exe
+              if (-not (Test-Path $path)) { $found += "$exe missing"; continue }
+              $imports = & $dumpbin /dependents $path |
+                Select-String -Pattern '^\s{4}(\S+\.dll)$' |
+                ForEach-Object { $_.Matches[0].Groups[1].Value }
+              if (-not $imports) { $found += "$exe : dumpbin listed no imports (parse broke?)"; continue }
+              if (-not $Quiet) { Write-Host "$exe imports $($imports.Count) DLLs" }
+              foreach ($dll in $imports) {
+                if (Test-Path (Join-Path $installDir $dll)) { $appLocal += $dll; continue }
+                if ($dll -match $mustBeAppLocal) {
+                  $found += "$exe -> $dll is a REDISTRIBUTABLE and is not app-local"
+                  continue
+                }
+                # API sets and OS DLLs are fine — they ship with Windows.
+                if ($dll -match '^(api-ms-win-|ext-ms-win-)') { continue }
+                if (Test-Path (Join-Path $env:SystemRoot 'System32' $dll)) { continue }
+                $found += "$exe -> $dll is neither app-local nor an OS DLL"
+              }
+            }
+            [pscustomobject]@{
+              Problems = @($found)
+              AppLocal = @($appLocal | Sort-Object -Unique)
+            }
+          }
+
+          Write-Host '--- 1/2: the real install must be clean ---'
+          $r = Audit-Imports
+          if ($r.Problems.Count -gt 0) {
+            $r.Problems | ForEach-Object { Write-Host "::error::$_" }
+            throw "install is not self-contained"
+          }
+          Write-Host "OK: every import is app-local or shipped by Windows"
+          Write-Host "app-local imports: $($r.AppLocal -join ', ')"
+
+          # ⚠️ A gate proven only on the passing case is the failure mode this
+          # step exists to fix — "it printed OK" is not evidence it can say
+          # anything else. Hide a bundled DLL and require a complaint.
+          #
+          # The victim is chosen from what the binaries ACTUALLY import, not
+          # named up front: this job builds a minimal feature set, so the C++
+          # deps that pull in msvcp140 may be absent, and hiding a DLL nothing
+          # imports proves nothing. (First attempt did exactly that and the
+          # control caught it — which is the argument for having one.)
+          Write-Host '--- 2/2: negative control — hiding a bundled import must FAIL the audit ---'
+          if ($r.AppLocal.Count -eq 0) {
+            throw "NEGATIVE CONTROL IMPOSSIBLE: no imported DLL is app-local, so this audit has nothing to detect. Either the bundle is unnecessary in this build, or the dumpbin parse is wrong — both need a human."
+          }
+          $victim = Join-Path $installDir $r.AppLocal[0]
+          $stash  = "$victim.hidden"
+          Write-Host "hiding $($r.AppLocal[0])"
+          Move-Item $victim $stash
+          try {
+            $neg = Audit-Imports -Quiet
+            if ($neg.Problems.Count -eq 0) {
+              throw "NEGATIVE CONTROL FAILED: $($r.AppLocal[0]) was removed and the audit still passed — this check cannot detect what it claims to."
+            }
+            Write-Host "OK: audit reported $($neg.Problems.Count) problem(s): $($neg.Problems[0])"
+          } finally {
+            Move-Item $stash $victim
+          }
+
       - name: Uninstall the MSI (quiet)
         shell: pwsh
         run: |
