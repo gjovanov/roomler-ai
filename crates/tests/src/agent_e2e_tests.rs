@@ -51,6 +51,8 @@ fn spawn_agent_signaling(
             std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
         )
         .expect("consent broker init");
+        // Read before `cfg` is moved into the call below.
+        let exec_enabled = cfg.exec_enabled;
         let _ = signaling::run(
             signaling::OrgCtx::primary(),
             cfg,
@@ -63,12 +65,14 @@ fn spawn_agent_signaling(
             Default::default(),
             broker,
             roomler_agent::tunnel::client_mgr::TunnelClientHub::new("test".into()),
-            // Remote config: tests never push one, so services over a throwaway
-            // path with exec off is the correct input, not a stub.
+            // Remote config: tests never PUSH one, but the live `exec_enabled`
+            // must still be SEEDED from the config this agent was handed —
+            // which is exactly what `main.rs` does. See agent_exec_tests for
+            // the failure hardcoding `false` produced.
             roomler_agent::remote_config::RemoteConfigServices::new(
                 std::path::PathBuf::from("unused-in-tests.toml"),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                false,
+                exec_enabled,
             ),
         )
         .await;
