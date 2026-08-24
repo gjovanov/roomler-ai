@@ -426,12 +426,14 @@ pub fn build_router(state: AppState) -> Router {
             "/installer/{flavour}",
             get(routes::agent_release::installer_proxy),
         )
-        // Agent crash-report ingest (Task 9 Phase 2). Public because
-        // the agent authenticates by its own JWT in the Authorization
-        // header — same security posture as the WS `/ws?role=agent`
-        // upgrade, and the user-JWT extractor isn't applicable here.
-        // The route handler calls `state.auth.verify_agent_token`
-        // directly.
+        // Agent crash-report ingest (Task 9 Phase 2). "Public" only in the
+        // sense that the user-JWT extractor does not apply: the agent
+        // authenticates with its own JWT in the Authorization header, via the
+        // `AuthAgent` extractor — which also confirms the agent's row is still
+        // one we accept (deleted / quarantined ⇒ 401), the same rule the WS
+        // `/ws?role=agent` upgrade applies. Until #667 this handler read the
+        // claims and nothing else, so a deleted device kept writing for the
+        // remaining year of its token.
         .route("/crash", post(routes::agent_crash::ingest));
 
     // Public owner-consent routes (Phase 4). No auth extractor — the unguessable
