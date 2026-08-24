@@ -236,6 +236,59 @@ curl -fsSL https://github.com/gjovanov/roomler-ai/releases/latest/download/rooml
 gpg --verify <asset>.asc <asset>
 ```
 
+## 7b. What the AGENT verifies before installing an update
+
+§7 is a human checking a release. This is the machine refusing one. Both gates
+live in `updater::download_asset`, both fail closed, and both failures are the
+same benign outcome: the file is discarded and the agent keeps the version it
+is already running.
+
+| Gate | Module | Answers | Enforced on |
+|---|---|---|---|
+| Authenticode + publisher name | `code_signature::verify_publisher` | *Whose* bytes are these? | Windows |
+| Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | Windows (`.msi`) |
+
+**Neither is sufficient alone, and the second is the less obvious one.**
+`is_newer` decides to upgrade by reading the **manifest's** tag, while the
+signature verifies the **artifact** — so before the version binding existed,
+a tampered manifest could advertise `agent-v0.3.0-rc.999` and point
+`browser_download_url` at a genuinely-signed **older** MSI. Signature: valid,
+it really is ours. `is_newer`: 999 beats everything in the field. Result: the
+whole fleet downgrades into a version whose exploit is public, with nothing
+untrue said about the bytes at any point.
+
+The binding works because the MSI's `ProductVersion` sits **inside the signed
+envelope** — editing it invalidates the Authenticode signature the first gate
+already enforces. Equally, the signature is what makes the embedded version
+unforgeable. Neither gate means much without the other.
+
+⚠️ **`.deb` and `.pkg` report `Unsupported`, not a refusal.** Nothing
+authenticates those artifacts yet, so a version check there would compare a
+claim against a claim while reading like a control. They get a real binding
+when their signature verification lands (GPG for `.deb`,
+`pkgutil --check-signature` for `.pkg`) — and not before.
+
+⚠️ **The `MAJOR.MINOR.RC` mapping has two copies.** Windows Installer's version
+is three numeric fields, so `0.3.0-rc.458` cannot be stored literally;
+`release-agent.yml`'s "Derive the MSI ProductVersion" step maps it to `0.3.458`
+and `artifact_version::msi_product_version_for` reproduces that mapping. If
+they diverge, **every agent refuses every update** — a silent fleet-wide
+freeze, not an error. Re-check the Rust side against a real artifact after any
+change to either:
+
+```bash
+gh release download agent-v<version> --repo gjovanov/roomler-ai \
+  --pattern '*perMachine*.msi' --dir /tmp
+ROOMLER_TEST_MSI=/tmp/roomler-agent-<version>-perMachine-x86_64-pc-windows-msvc.msi \
+ROOMLER_TEST_MSI_TAG=agent-v<version> \
+  cargo test -p roomler-agent --lib -- --ignored real_published_msi
+```
+
+The same freeze risk applies to the signing gate: a release that ships an
+unsigned or mis-signed Windows artifact does not error, it just stops updating
+the fleet. The `require` mode in `.github/actions/sign-windows` is what
+prevents that reaching a release tag — do not weaken it.
+
 ## 8. Enterprise pilot path (before/without the public cert)
 
 `50-selfsigned-dev-cert.ps1` + `51-trust-dev-cert.ps1` produce a self-signed
