@@ -26,8 +26,19 @@ runs:
           ~/.cargo/git/db
           ~/.cargo/bin
           target
-        key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        # Run-salted primary key (always a miss — restores go through the
+        # restore-keys below; saves land under this unique key). The salt
+        # exists because 2026-08-24 a rehearsal was CANCELLED mid-upload by
+        # the #556 concurrency group and GitHub's reservation for the
+        # shared key stayed wedged: every later (green!) rehearsal failed
+        # its save with "Unable to reserve cache … another job may be
+        # creating this cache", no Windows generation persisted, and
+        # rc.460 built near-cold. Unique per-run keys make reservation
+        # contention structurally impossible; the keep-newest retirement
+        # in seed-cache-save prunes the salted siblings.
+        key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-r${{ github.run_id }}
         restore-keys: |
+          seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-
           seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-
 
     - name: Accretion GC (rehearsals only)
