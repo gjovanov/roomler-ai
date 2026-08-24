@@ -4,10 +4,11 @@
 //!
 //! Phase 2 of the Task 9 crash-log feature. The agent's
 //! `crash_uploader` POSTs an `AgentCrashPayload` JSON body with an
-//! `Authorization: Bearer <agent_jwt>` header. The ingest handler
-//! verifies the agent JWT (same code path as the WS upgrade at
-//! `crates/api/src/ws/handler.rs`), validates the body shape, and
-//! persists via `AgentCrashDao::record`.
+//! `Authorization: Bearer <agent_jwt>` header. The ingest handler takes the
+//! [`AuthAgent`](crate::extractors::agent::AuthAgent) extractor — which
+//! verifies the JWT *and* confirms the agent's row is still one we accept,
+//! the same rule `crates/api/src/ws/handler.rs` applies on the WS upgrade —
+//! validates the body shape, and persists via `AgentCrashDao::record`.
 //!
 //! Admin UI fetches via the protected GET endpoint which goes
 //! through the standard `AuthUser` middleware + tenant-membership
@@ -16,7 +17,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::StatusCode,
     response::IntoResponse,
 };
 use bson::oid::ObjectId;
@@ -24,7 +25,11 @@ use roomler_ai_remote_control::models::{AgentCrashPayload, AgentCrashRecord};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{
+    error::ApiError,
+    extractors::{agent::AuthAgent, auth::AuthUser},
+    state::AppState,
+};
 
 /// Maximum `log_tail` byte length accepted by the ingest endpoint.
 /// Matches `roomler_agent::crash_recorder::MAX_PAYLOAD_BYTES` so a
@@ -44,32 +49,25 @@ const MAX_FUTURE_SECS: i64 = 60 * 60; // 1h tolerance for clock skew
 ///
 /// Status codes:
 ///   201 — accepted, record persisted.
-///   401 — missing / malformed / invalid agent JWT.
+///   401 — missing / malformed / invalid agent JWT, or an agent whose row
+///         has been deleted or quarantined.
 ///   422 — payload validation failed (log_tail too large, summary
 ///         empty, crashed_at_unix outside plausibility window).
-///   500 — DB write failure.
+///   500 — DB write failure, or the agent row could not be read.
+///
+/// The `AuthAgent` extractor is what makes the 401 case real: this handler
+/// used to trust the claims alone, so a deleted or quarantined device kept
+/// writing crash reports for the remaining life of its year-long token.
 pub async fn ingest(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    agent: AuthAgent,
     Json(payload): Json<AgentCrashPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let token = extract_bearer(&headers)
-        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
-    let claims = state
-        .auth
-        .verify_agent_token(token)
-        .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
-
-    let tenant_id = ObjectId::parse_str(&claims.tenant_id)
-        .map_err(|_| ApiError::BadRequest("invalid tenant_id in claims".to_string()))?;
-    let agent_id = ObjectId::parse_str(&claims.sub)
-        .map_err(|_| ApiError::BadRequest("invalid agent_id in claims".to_string()))?;
-
     validate_payload(&payload)?;
 
     let _id = state
         .agent_crashes
-        .record(tenant_id, agent_id, payload)
+        .record(agent.tenant_id, agent.agent_id, payload)
         .await
         .map_err(|e| ApiError::Internal(format!("agent_crashes insert: {e}")))?;
 
@@ -132,22 +130,6 @@ impl From<AgentCrashRecord> for AgentCrashView {
     }
 }
 
-/// Extract the bearer token from an `Authorization` header. Returns
-/// the token slice (no copy) or `None` if the header is missing /
-/// malformed.
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    let v = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let token = v
-        .strip_prefix("Bearer ")
-        .or_else(|| v.strip_prefix("bearer "))?;
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
 /// Validate body invariants. Returns `Err(ApiError::Validation)` on
 /// failure so the response is 422 not 400.
 fn validate_payload(payload: &AgentCrashPayload) -> Result<(), ApiError> {
@@ -180,7 +162,6 @@ fn validate_payload(payload: &AgentCrashPayload) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
     use roomler_ai_remote_control::models::CrashReason;
 
     fn sample_payload() -> AgentCrashPayload {
@@ -197,45 +178,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_bearer_returns_token_after_prefix() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer abc.def.ghi"),
-        );
-        assert_eq!(extract_bearer(&h), Some("abc.def.ghi"));
-    }
-
-    #[test]
-    fn extract_bearer_accepts_lowercase_scheme() {
-        let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, HeaderValue::from_static("bearer xyz"));
-        assert_eq!(extract_bearer(&h), Some("xyz"));
-    }
-
-    #[test]
-    fn extract_bearer_returns_none_on_missing_header() {
-        let h = HeaderMap::new();
-        assert_eq!(extract_bearer(&h), None);
-    }
-
-    #[test]
-    fn extract_bearer_returns_none_on_empty_token() {
-        let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer    "));
-        assert_eq!(extract_bearer(&h), None);
-    }
-
-    #[test]
-    fn extract_bearer_returns_none_on_wrong_scheme() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Basic Zm9vOmJhcg=="),
-        );
-        assert_eq!(extract_bearer(&h), None);
-    }
+    // Bearer-parsing tests moved with the behaviour, to
+    // `crate::extractors::agent` — this route no longer parses the header
+    // itself; the `AuthAgent` extractor does, and checks the agent row too.
 
     #[test]
     fn validate_payload_accepts_fresh_payload() {
