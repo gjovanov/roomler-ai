@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use bson::oid::ObjectId;
 use tokio::net::lookup_host;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::netmap::PeerConfig;
@@ -385,6 +386,9 @@ pub struct RelayCoordinator {
     /// [`DerpConn`] off that region's mux; everything else keeps the central
     /// [`derp_mux`](Self::derp_mux).
     regional_muxes: HashMap<String, Arc<DerpMux>>,
+    /// #27 — the runtime's sink for "a peer is relaying to us over DERP that we
+    /// hold no conn for". Held here so every mux that arrives later gets it.
+    unrouted_sink: Option<mpsc::Sender<[u8; 32]>>,
     /// Multi-region DERP — the regional URL a force-pinned peer must use
     /// (server-pushed, identical on both ends). Entry present ONLY when the
     /// matching regional mux exists; pruned alongside `forced_derp_until`.
@@ -544,6 +548,7 @@ impl RelayCoordinator {
             roles: HashMap::new(),
             forced_derp_until: HashMap::new(),
             regional_muxes: HashMap::new(),
+            unrouted_sink: None,
             forced_urls: HashMap::new(),
             derp_regrade_at: HashMap::new(),
             derp_regrade_last: HashMap::new(),
@@ -720,6 +725,9 @@ impl RelayCoordinator {
         if self.derp_mux.is_none() {
             self.derp_mux = Some(mux);
         }
+        if let Some(m) = self.derp_mux.as_ref() {
+            Self::arm_unrouted(&self.unrouted_sink, m);
+        }
         // U1 — a mux registered: the sticky open-failure evidence is stale.
         self.derp_mux_failed = false;
     }
@@ -751,7 +759,35 @@ impl RelayCoordinator {
     /// Multi-region DERP — register a lazily-opened regional mux. First mux
     /// per URL wins (per-peer `DerpConn`s vend from the original).
     pub fn set_regional_mux(&mut self, url: &str, mux: Arc<DerpMux>) {
-        self.regional_muxes.entry(url.to_string()).or_insert(mux);
+        let m = self.regional_muxes.entry(url.to_string()).or_insert(mux);
+        Self::arm_unrouted(&self.unrouted_sink, m);
+    }
+
+    /// #27 — install the runtime's unroutable-inbound sink, and back-fill it
+    /// onto every mux already held. Idempotent; a rebuild re-points cleanly.
+    ///
+    /// The coordinator owns this rather than the runtime reaching in, because
+    /// muxes arrive through two doors at unpredictable times ([`set_derp_mux`]
+    /// for the central one, [`set_regional_mux`] per region) and a mux that
+    /// never got the sink is a mux whose black-hole stays silent — exactly the
+    /// failure this whole path exists to close.
+    ///
+    /// [`set_derp_mux`]: Self::set_derp_mux
+    /// [`set_regional_mux`]: Self::set_regional_mux
+    pub fn set_unrouted_sink(&mut self, tx: mpsc::Sender<[u8; 32]>) {
+        self.unrouted_sink = Some(tx);
+        if let Some(m) = self.derp_mux.as_ref() {
+            Self::arm_unrouted(&self.unrouted_sink, m);
+        }
+        for m in self.regional_muxes.values() {
+            Self::arm_unrouted(&self.unrouted_sink, m);
+        }
+    }
+
+    fn arm_unrouted(sink: &Option<mpsc::Sender<[u8; 32]>>, mux: &Arc<DerpMux>) {
+        if let Some(tx) = sink {
+            mux.set_unrouted_sink(tx.clone());
+        }
     }
 
     /// The DERP mux serving `node_id`: its force-pinned REGIONAL mux when one
@@ -862,6 +898,76 @@ impl RelayCoordinator {
                 self.roles.insert(node_id, RelayStrategy::Derp);
             }
             None => return None, // stamp-only: pin governs the next cycle
+        }
+        self.try_build_derp(&node_id)
+    }
+
+    /// #27 — FOLLOW a peer that is already relaying to us over DERP.
+    ///
+    /// The trigger is an inbound `/derp` frame we could not route (see
+    /// `DerpMux::deliver`): a peer only relays once it has DEMOTED, so such a
+    /// frame means our side is still on a carrier the peer has abandoned.
+    /// Measured 2026-08-24: without this the far end sat on a dead direct
+    /// carrier for **67 s** — it had no netstate Major of its own, so it waited
+    /// out `POKE_SILENCE_AFTER` (floored by the ~25 s WG keepalive) plus its
+    /// tier deadline — and the pair was 100 % dark in BOTH directions for the
+    /// whole time, since our replies went out the abandoned path.
+    ///
+    /// Deliberately NOT [`force_derp`](Self::force_derp), whose semantics are a
+    /// server escalation: that one pins a TTL and overrides `roles`, which
+    /// would outlive the transient condition and keep the pair on DERP after
+    /// the network settled. This only reconciles the peer's slot into `derping`
+    /// and builds — the relay STRATEGY is left alone, and the direct re-upgrade
+    /// (make-before-break) is untouched, so a pair that can go direct again
+    /// still does.
+    ///
+    /// `None` (no carrier built) when the peer can't speak DERP, when no mux
+    /// serves it, or when that mux's WS is currently down — the ordinary walk
+    /// picks it up once the mux is back.
+    pub fn follow_peer_to_derp(
+        &mut self,
+        node_id: ObjectId,
+        peer: PeerConfig,
+    ) -> Option<ReadyLink> {
+        if !peer.supports_derp {
+            return None;
+        }
+        // Decide BEFORE mutating: a follow that is going to be withheld must
+        // leave the coordinator exactly as it found it. Seeding `derping` and
+        // then failing would park an INSTALLED peer in a tracking slot, which
+        // is the rc.412 starvation shape (`request` early-returns on
+        // `is_tracking`) — survivable today only because `build_floor` decides
+        // alone since rc.416, and not worth re-creating.
+        if !self.mux_for(&node_id).is_some_and(|m| m.is_alive()) {
+            return None;
+        }
+        // Same slot reconciliation as `force_derp` — a peer mid-coordination
+        // must not keep a TURN slot that would race the DERP build. Dropping
+        // `allocated` releases the TURN client (its `Drop` closes the
+        // allocation), so its advertised address must go with it.
+        let slot = if let Some(pp) = self.pending.remove(&node_id) {
+            Some(pp.peer)
+        } else if let Some(p) = self.dialing.remove(&node_id) {
+            Some(p)
+        } else if let Some(a) = self.allocated.remove(&node_id) {
+            self.advertised.remove(&node_id);
+            Some(a.peer)
+        } else {
+            None
+        };
+        match slot {
+            Some(p) => {
+                self.derping.insert(node_id, p);
+            }
+            // Already coordinating a DERP link — the build below is the same
+            // carrier, delivered now rather than when the trickle arrives.
+            None if self.derping.contains_key(&node_id) => {}
+            // The ordinary case this exists for: the peer holds NO relay slot
+            // because we have it on a DIRECT carrier that looks healthy from
+            // here. Seed the slot from the netmap.
+            None => {
+                self.derping.insert(node_id, peer);
+            }
         }
         self.try_build_derp(&node_id)
     }
@@ -3627,6 +3733,67 @@ mod tests {
             "a derping peer IS excluded — the floor would duplicate its link"
         );
         coord.derping.remove(&node);
+    }
+
+    /// #27 — `follow_peer_to_derp` builds for a peer holding NO relay slot (the
+    /// ordinary case: we have it on a direct carrier that looks fine from
+    /// here), and refuses on each of its three preconditions. It must NOT
+    /// behave like `force_derp`: no TTL pin, no `roles` override, so the pair's
+    /// relay strategy — and therefore its ability to re-coordinate normally
+    /// once the network settles — is untouched.
+    #[tokio::test]
+    async fn follow_peer_to_derp_builds_without_pinning_the_pair() {
+        let (tx, _rx) = mpsc::channel::<ClientMsg>(8);
+        let node = ObjectId::new();
+        let peer = PeerConfig {
+            supports_derp: true,
+            supports_derp_floor: true,
+            ..base_peer()
+        };
+
+        // No mux at all ⇒ declined (a build would have nothing to ride).
+        let mut bare = RelayCoordinator::new(tx.clone(), [0u8; 32], true, vec![], None);
+        assert!(bare.follow_peer_to_derp(node, peer.clone()).is_none());
+
+        let mux = DerpMux::new([9u8; 32]).0;
+        let mut coord = RelayCoordinator::new(tx, [0u8; 32], true, vec![], Some(Arc::clone(&mux)));
+
+        // A peer that cannot speak DERP ⇒ declined before anything is touched.
+        let no_derp = PeerConfig {
+            supports_derp: false,
+            ..peer.clone()
+        };
+        assert!(coord.follow_peer_to_derp(node, no_derp).is_none());
+        assert!(
+            !coord.strategy_is_derp(&node, &peer),
+            "a declined follow must not have flipped any strategy"
+        );
+
+        // The real case: no relay slot (we hold it on direct) ⇒ builds.
+        let link = coord
+            .follow_peer_to_derp(node, peer.clone())
+            .expect("a peer relaying to us is followable");
+        assert_eq!(link.relay_kind, RelayKind::Derp);
+        assert_eq!(link.node_id, node);
+        assert!(
+            !coord.forced_derp_active(&node),
+            "follow must NOT pin the pair like a server force-derp escalation \
+             — the pin would outlive the transient condition that caused it"
+        );
+
+        // Mux mid-reconnect ⇒ withheld, not a carrier born dead — and the
+        // decision happens BEFORE any mutation, so a withheld follow leaves no
+        // tracking slot behind on a peer that is still installed elsewhere.
+        mux.mark_down();
+        let other = ObjectId::new();
+        assert!(
+            coord.follow_peer_to_derp(other, peer.clone()).is_none(),
+            "a DERP carrier built over a down WS is born dead — withhold instead"
+        );
+        assert!(
+            !coord.is_tracking(&other),
+            "a withheld follow must not park the peer in a tracking slot"
+        );
     }
 
     #[tokio::test]
