@@ -523,6 +523,12 @@ const FALLBACK_TICK: Duration = Duration::from_secs(5);
 /// is synchronous over an already-open mux. One pulled-forward tick therefore
 /// convicts, re-floors and republishes in a single pass.
 const MAJOR_RECHECK_AFTER: Duration = Duration::from_millis(2_250);
+/// #27 — minimum spacing between demote-follows for the SAME peer. Comfortably
+/// above one carrier build + handshake, so a successful follow is never
+/// re-triggered by frames already in flight, and short enough that a follow
+/// declined for a transient reason (mux mid-reconnect) retries promptly rather
+/// than waiting out the ordinary walk.
+const DERP_FOLLOW_COOLDOWN: Duration = Duration::from_secs(5);
 /// P8 — resume-from-suspend detection threshold: across one sweep interval,
 /// wall-clock advancing this much MORE than the monotonic clock means the host
 /// slept in between (monotonic clocks exclude suspend on Windows and Linux —
@@ -2122,6 +2128,19 @@ impl OverlayRuntime {
             }
             CarrierMode::Direct(_) => None,
         };
+        // #27 — the demote-follow signal. ONE channel for every mux the
+        // coordinator holds now or acquires later (central + regional); it
+        // installs the sender as each arrives.
+        let (unrouted_tx, mut unrouted_rx) =
+            mpsc::channel::<[u8; 32]>(crate::transport::derp::DerpMux::UNROUTED_SINK_DEPTH);
+        if let Some(r) = relay.as_mut() {
+            r.set_unrouted_sink(unrouted_tx);
+        }
+        // #27 — per-peer floor on how often a demote-follow may fire. The
+        // signal is level-triggered (a demoted peer keeps relaying until we
+        // converge), so without this a peer whose DERP build keeps failing
+        // would re-follow on every inbound frame.
+        let mut derp_follow_cooldown: HashMap<ObjectId, Instant> = HashMap::new();
         // C4 stage 1 — the warm-allocation manager's loop-side state
         // (measurement-only; see `warm_relay` module + docs/overlay-warm-relay.md).
         let warm_enabled =
@@ -2330,6 +2349,40 @@ impl OverlayRuntime {
                         }
                         warn_if_slow("arm:relay_build_commit", t_arm);
                     }
+                },
+                // #27 — DEMOTE-FOLLOW. A `/derp` frame arrived that no local
+                // conn could route, which means that peer has demoted to DERP
+                // and we are still on a carrier it has abandoned. Follow it.
+                //
+                // This closes the one gap that made a VPN transition a
+                // multi-minute outage rather than a blip: the hole is
+                // `max(both ends)`, and the end whose network did NOT change
+                // has no fast lane at all — it waits out `POKE_SILENCE_AFTER`
+                // (floored by the ~25 s WG keepalive) plus its tier deadline.
+                // Measured 2026-08-24: 67 s, with BOTH directions dark for the
+                // whole window (our replies rode the abandoned path).
+                //
+                // The signal is trustworthy because the relay STAMPS the source
+                // pubkey from the sender's authenticated registration — it is
+                // not sender-chosen (`api::ws::derp::forward_frame`) — so it
+                // can only name a node registered in this network whose ACL
+                // permits reaching us. The worst a misbehaving member can do is
+                // hold a pair on the relay it is already entitled to use, and
+                // make-before-break re-upgrades it anyway.
+                Some(pk) = unrouted_rx.recv() => {
+                    let t_arm = Instant::now();
+                    let installed = self.demote_follow(
+                        pk, &mut wg, &mut by_node, &mut relay, &tun,
+                        &current_peers, &mut relay_bq, &mut derp_follow_cooldown,
+                    ).await;
+                    if installed {
+                        // Same tail as any other carrier flip: the relay set
+                        // may need a new exit exemption, and the LocalAPI view
+                        // must show the carrier the peer is actually on.
+                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
+                    }
+                    warn_if_slow("arm:derp_demote_follow", t_arm);
                 },
                 // rc.218 — commit a finished OFF-LOOP relay ALLOCATE (the
                 // spawned DNS + TURN allocate — see `RelayAllocQueue`). Success
@@ -4368,6 +4421,163 @@ mod tests {
         assert!(
             !p.from_major,
             "an addr/iface signal must NOT inherit the Major conviction window"
+        );
+    }
+
+    /// #27 — the demote-follow, end to end. A peer we hold on a DIRECT carrier
+    /// that is relaying to us over `/derp` flips onto DERP immediately, instead
+    /// of waiting for our own passive detectors — which, on the end whose
+    /// network did NOT change, means no netstate Major, so `POKE_SILENCE_AFTER`
+    /// (floored by the ~25 s WG keepalive) plus a tier deadline. Field
+    /// 2026-08-24: **67 s**, with BOTH directions dark for all of it.
+    ///
+    /// The three bounds are asserted with it: an unknown pubkey is ignored, a
+    /// peer already ON derp is a no-op, and the per-peer cooldown holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn demote_follow_flips_a_direct_carrier_onto_derp() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let pk = peer_kp.public.to_bytes();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx.clone(), tf, 1280);
+
+        // A coordinator with a LIVE /derp mux — the follow builds over it.
+        let mux = DerpMux::new(kp.public.to_bytes()).0;
+        let mut relay = Some(RelayCoordinator::new(
+            out_tx,
+            kp.public.to_bytes(),
+            true,
+            vec![],
+            Some(mux),
+        ));
+
+        // The peer, on a DIRECT (LAN) carrier that looks perfectly healthy.
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 65, 4, 28);
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dst, true)
+            .await;
+        let nid = ObjectId::from_bytes([7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now()),
+        );
+
+        let mut current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+        current_peers.insert(
+            nid,
+            NetmapPeer {
+                node_id: nid,
+                overlay_ip: overlay_ip.to_string(),
+                name: "pc".into(),
+                wg_public_key: peer_kp.public_base64(),
+                supports_derp: true,
+                supports_derp_floor: true,
+                reachable: true,
+                endpoints: vec![],
+                lan_endpoints: vec![],
+                srflx_endpoints: vec![],
+                srflx_nat: None,
+                udp_dialer_ok: None,
+                relay_home: None,
+                warm_relay_endpoint: None,
+                supports_quic: false,
+                supports_relay_single: false,
+                supports_forced_derp: false,
+                caps: None,
+                supports_overlay_echo: false,
+                relay_strategy: None,
+                routes: vec![],
+                agent_id: None,
+                ingress_rules: None,
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut bq = test_relay_bq();
+        let mut cooldown: HashMap<ObjectId, Instant> = HashMap::new();
+
+        // A pubkey nobody in the netmap owns must be ignored outright — the
+        // first bound on a signal that arrives from the network.
+        assert!(
+            !rt.demote_follow(
+                [0xAB; 32],
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                &current_peers,
+                &mut bq,
+                &mut cooldown,
+            )
+            .await,
+            "an unknown pubkey must never move a carrier"
+        );
+        assert!(cooldown.is_empty(), "and must not even arm the cooldown");
+
+        // The real signal: the peer is relaying to us. Follow it.
+        assert!(
+            rt.demote_follow(
+                pk,
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                &current_peers,
+                &mut bq,
+                &mut cooldown,
+            )
+            .await,
+            "a known peer relaying to us must flip our carrier"
+        );
+        let e = by_node.get(&nid).expect("still installed");
+        assert_eq!(
+            e.relay_kind,
+            Some(crate::overlay::relay_link::RelayKind::Derp),
+            "the carrier must now be DERP — the path the peer is actually using"
+        );
+        assert_eq!(e.tier, DirectTier::Relay);
+
+        // Repeat notices are ordinary (frames in flight when we flipped) and
+        // must be inert, not a rebuild loop.
+        assert!(
+            !rt.demote_follow(
+                pk,
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                &current_peers,
+                &mut bq,
+                &mut cooldown,
+            )
+            .await,
+            "a peer already ON derp is a no-op"
+        );
+
+        // And the cooldown holds even if the carrier is somehow not derp.
+        by_node.get_mut(&nid).unwrap().relay_kind = None;
+        assert!(
+            !rt.demote_follow(
+                pk,
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                &current_peers,
+                &mut bq,
+                &mut cooldown,
+            )
+            .await,
+            "the per-peer cooldown must bound how often a follow can fire"
         );
     }
 
