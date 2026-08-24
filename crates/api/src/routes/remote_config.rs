@@ -31,10 +31,20 @@ pub struct DesiredConfigBody {
     pub ssh_port: Option<u16>,
 }
 
+/// ⚠️ `desired` is the SAME projection the listing returns
+/// ([`DesiredConfigView`]), not the stored model.
+///
+/// Returning the model here shipped `{"$oid": …}` / `{"$date": …}` extended
+/// JSON — measured against prod on 2026-08-24 — while `GET …/agent` returned
+/// hex + RFC3339 for the identical object. The client keeps the WRITE's answer
+/// in its store, so its `updated_at` was an object where its own type said
+/// string. A write and a read must not describe one object two ways.
+///
+/// [`DesiredConfigView`]: crate::routes::remote_control::DesiredConfigView
 #[derive(Debug, Serialize)]
 pub struct DesiredConfigResponse {
     pub revision: u64,
-    pub desired: DesiredConfig,
+    pub desired: crate::routes::remote_control::DesiredConfigView,
 }
 
 /// Why a desired-config write was refused. Enumerated rather than stringly
@@ -191,7 +201,7 @@ pub async fn set_desired_config(
 
     Ok(Json(DesiredConfigResponse {
         revision: requested.revision,
-        desired: requested,
+        desired: requested.into(),
     }))
 }
 
@@ -320,6 +330,48 @@ mod tests {
         )
         .unwrap();
         assert!(DesiredConfig::default().is_empty());
+    }
+
+    /// The WRITE must describe an object the same way the READ does.
+    ///
+    /// Caught in prod on 2026-08-24: `PUT …/desired-config` answered
+    /// `"updated_by":{"$oid":…}` / `"updated_at":{"$date":{"$numberLong":…}}`
+    /// while `GET …/agent` returned hex + RFC3339 for the identical object.
+    /// The client keeps the write's answer in its store, so its `updated_at`
+    /// was an object where its own type said string — the same extended-JSON
+    /// trap `SshAuditRow` / `ExecAuditRow` were created to avoid, re-opened by
+    /// a response type nobody projected.
+    #[test]
+    fn the_put_response_is_the_same_shape_the_listing_returns() {
+        let requested = DesiredConfig {
+            exec_enabled: Some(true),
+            revision: 1,
+            updated_by: Some(bson::oid::ObjectId::new()),
+            updated_at: Some(DateTime::now()),
+            ..Default::default()
+        };
+        let body = DesiredConfigResponse {
+            revision: requested.revision,
+            desired: requested.into(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(
+            !json.contains("$oid") && !json.contains("$date"),
+            "extended JSON leaked into the write response: {json}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["desired"]["updated_by"]
+                .as_str()
+                .is_some_and(|s| s.len() == 24),
+            "updated_by must be a 24-char hex id: {json}"
+        );
+        assert!(
+            v["desired"]["updated_at"]
+                .as_str()
+                .is_some_and(|s| s.contains('T') && s.ends_with('Z')),
+            "updated_at must be an RFC3339 string: {json}"
+        );
     }
 
     #[test]
