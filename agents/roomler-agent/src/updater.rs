@@ -661,7 +661,12 @@ pub fn pick_latest_release(mut releases: Vec<GithubRelease>) -> Option<GithubRel
 /// size so we don't run a ~200 byte HTML error page as an installer.
 /// `pub(crate)`: the S1a companion-refresh (`crate::companion`) reuses
 /// the same verified-download plumbing for `roomler-desktop.exe`.
-pub(crate) async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
+///
+/// `claimed_release` is the tag the manifest offered this asset AS
+/// (`agent-v0.3.0-rc.458`). It is not decoration: the artifact has to
+/// self-identify as that release or it is discarded — see
+/// [`crate::artifact_version`] for the downgrade this closes.
+pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("roomler-agent/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(600))
@@ -736,6 +741,42 @@ pub(crate) async fn download_asset(asset: &GithubAsset) -> Result<PathBuf> {
                     asset.name
                 );
             }
+        }
+    }
+
+    // Version binding — the check above proves the bytes are OURS, this one
+    // proves they are the RELEASE we were told to install. Both are needed:
+    // `is_newer` decided to upgrade by reading the MANIFEST's tag, while the
+    // signature verified the ARTIFACT, and until now nothing connected the
+    // two. See `crate::artifact_version` for the full downgrade.
+    //
+    // Same fail-closed direction as the signature check, for the same reason:
+    // a refusal costs an update cycle, a wrongly-accepted payload costs the
+    // fleet.
+    match crate::artifact_version::verify_artifact_version(&path, claimed_release) {
+        Ok(found) => {
+            tracing::info!(
+                asset = %asset.name,
+                claimed = %claimed_release,
+                artifact_version = %found,
+                "artifact self-identifies as the release it was offered as"
+            );
+        }
+        // Not a refusal: the format carries no signature for a version to be
+        // anchored to, so enforcing one would check a claim against a claim.
+        // Logged at INFO rather than WARN — it is the expected steady state on
+        // Linux/macOS today, and a warning per update check would train
+        // operators to ignore it.
+        Err(e @ crate::artifact_version::VersionError::Unsupported(_)) => {
+            tracing::info!(asset = %asset.name, reason = %e, "no artifact-version binding available");
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            bail!(
+                "refusing to install {}: {e}. The download was discarded and this \
+                 agent keeps its current version.",
+                asset.name
+            );
         }
     }
 
@@ -821,7 +862,10 @@ pub async fn pin_version(tag: &str) -> CheckOutcome {
             return CheckOutcome::Skipped(format!("no platform installer in release {tag}"));
         }
     };
-    match download_asset(asset).await {
+    // Bound before the match so the borrow for the version check ends before
+    // the arm moves the tag into the outcome.
+    let downloaded = download_asset(asset, &release.tag_name).await;
+    match downloaded {
         Ok(path) => CheckOutcome::UpdateReady {
             current,
             latest: release.tag_name,
@@ -867,7 +911,8 @@ pub async fn check_once() -> CheckOutcome {
             ));
         }
     };
-    match download_asset(asset).await {
+    let downloaded = download_asset(asset, &latest_parsed).await;
+    match downloaded {
         Ok(path) => CheckOutcome::UpdateReady {
             current,
             latest: latest_parsed,

@@ -16,6 +16,7 @@ pub use roomler_agent_core::{
 };
 
 pub mod apps;
+pub mod artifact_version;
 #[cfg(feature = "audio")]
 pub mod audio;
 pub mod capture;
