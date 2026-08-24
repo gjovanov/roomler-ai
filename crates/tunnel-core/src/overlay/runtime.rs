@@ -282,6 +282,52 @@ impl PathShadow {
     }
 }
 
+/// #26 — WHY a sweep is arming forced revalidation pokes, which is also what
+/// decides the conviction window of the pokes it arms. The two net-change
+/// causes are deliberately NOT one flag: their rate limits differ by 40x (one
+/// Major per 120 s vs one addr/iface wave per 3 s) and so does what they imply
+/// about the carriers being judged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ForcedPoke {
+    /// No forced arming this sweep — only the silence / stale-proof / re-init
+    /// pressure triggers.
+    No,
+    /// An addr/iface signal that did NOT rise to a netstate Major: a virtual
+    /// adapter appearing (Docker, WSL, Hyper-V, a VPN client's TAP), a lease
+    /// renewal, an interface renumber. Worth revalidating — that is why this
+    /// path exists — but NOT worth the tight window. These fire up to once per
+    /// `netstate::ROUTE_WAVE_MIN_INTERVAL` (3 s) against carriers that are
+    /// usually perfectly healthy, and a one-round-trip verdict would demote
+    /// every direct pair on the box each time an adapter blinked. Judged on the
+    /// tier deadline, exactly as before #26 — an answered poke costs one
+    /// handshake round and nothing else, which is the property that makes
+    /// arming here harmless in the first place.
+    AddrIface,
+    /// A material netstate **MAJOR** — the default route moved or addresses
+    /// vanished. That is the VPN-transition signature, it is the class the
+    /// measured 9-and-34-dropped-ping holes belong to, and `netstate` publishes
+    /// at most one per `MAJOR_PUBLISH_COOLDOWN` (120 s). Judged on
+    /// [`lifecycle::MAJOR_POKE_DEADLINE`].
+    Major,
+}
+
+/// Stage 2 / #26 — an in-flight active-revalidation poke: WHEN it was armed
+/// and WHICH class it is. The class rides the poke rather than the carrier on
+/// purpose — it decides the conviction window
+/// ([`lifecycle::MAJOR_POKE_DEADLINE`] vs the tier's handshake deadline),
+/// so it must be impossible for it to outlive the poke it describes. Held
+/// inside the `Option` for exactly that reason: clearing the poke clears the
+/// class, structurally. A parallel `bool` on `Installed` would have worked
+/// too, and would have had two places to keep in sync — which is precisely
+/// the shape of the rc.411/412/415/416 floor wedges, where `floored`,
+/// `dialing` and `derping` each outlived the thing they described and starved
+/// a peer of its carrier for hours.
+#[derive(Clone, Copy, Debug)]
+struct PokeArm {
+    at: Instant,
+    from_major: bool,
+}
+
 /// An installed peer carrier + the bookkeeping the direct→relay fallback
 /// (rc.136/137) needs.
 struct Installed {
@@ -297,12 +343,12 @@ struct Installed {
     /// Consecutive sweeps where we sent but received nothing (tx grew, rx
     /// flat). A few in a row ⇒ the direct carrier is one-way / dead.
     bad_sweeps: u32,
-    /// Stage 2 — when the sweep last armed an active-revalidation poke (a
-    /// forced WG rekey) for this carrier; `None` = none pending. Cleared when
-    /// the poke is answered (an initiator-role handshake completed at-or-after
-    /// it — `WgDevice::peer_initiator_hs_answered`); an unanswered poke past
-    /// the tier's handshake deadline is a `DeathReason::RekeyUnanswered`.
-    last_poke_at: Option<Instant>,
+    /// Stage 2 — the active-revalidation poke (a forced WG rekey) the sweep
+    /// last armed for this carrier; `None` = none pending. Cleared when the
+    /// poke is answered (an initiator-role handshake completed at-or-after it
+    /// — `WgDevice::peer_initiator_hs_answered`); an unanswered poke past its
+    /// window is a `DeathReason::RekeyUnanswered`.
+    poke: Option<PokeArm>,
     /// rc.275 honesty — the health sweep's verdict that this carrier is
     /// SILENTLY ONE-WAY: installed past the warm-up grace with either no
     /// completed WG handshake ever (the pre-handshake zombie whose tx/rx
@@ -421,7 +467,7 @@ impl Installed {
             since: now,
             last_traffic: (0, 0),
             bad_sweeps: 0,
-            last_poke_at: None,
+            poke: None,
             stalled: false,
             initiated: false,
             hs_done: false,
@@ -457,6 +503,26 @@ const RELAY_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 /// How often the carrier-health sweep runs. Cheap (lock-free atomic reads), so
 /// a tighter cadence is fine and makes detection quicker.
 const FALLBACK_TICK: Duration = Duration::from_secs(5);
+/// #26 — after a netstate MAJOR arms the forced revalidation pokes, pull the
+/// next fallback tick forward to just past
+/// [`lifecycle::MAJOR_POKE_DEADLINE`] instead of letting it land wherever
+/// the 5 s grid happens to be. Without this the tight window buys much less
+/// than it looks: the deadline is only ever EVALUATED on a tick, so a 2 s rule
+/// judged on a 5 s grid convicts somewhere in 2–7 s (mean ~4.5) purely on the
+/// phase of a timer started when the runtime did.
+///
+/// The margin over the deadline is deliberate and must stay comfortably above
+/// timer jitter: the conviction predicate is a strict `>`, so a tick landing a
+/// hair early doesn't just miss — it costs a whole `FALLBACK_TICK`. Locked
+/// against both bounds by `major_recheck_lands_inside_the_grid`.
+///
+/// Reusing the fallback interval (rather than adding a select arm) is the
+/// point: conviction alone changes nothing a peer can feel, and the SAME tick
+/// body is what rebuilds — `install_peers` runs right behind the sweep inside
+/// the post-Major `fast_reupgrade_until` window, and the DERP floor it builds
+/// is synchronous over an already-open mux. One pulled-forward tick therefore
+/// convicts, re-floors and republishes in a single pass.
+const MAJOR_RECHECK_AFTER: Duration = Duration::from_millis(2_250);
 /// P8 — resume-from-suspend detection threshold: across one sweep interval,
 /// wall-clock advancing this much MORE than the monotonic clock means the host
 /// slept in between (monotonic clocks exclude suspend on Windows and Linux —
@@ -2453,10 +2519,18 @@ impl OverlayRuntime {
                         }
                     }
                     let t0 = Instant::now();
+                    // #26 — the parked flag is the ADDR/IFACE cause; a Major
+                    // never reaches here (its lane consumes the flag inline).
+                    // The distinction decides the conviction window, so it is
+                    // a type, not a bool: see `ForcedPoke`.
                     self.sweep_carrier_health(
                         &mut wg, &mut by_node, &mut relay, &tun,
                         &mut relay_refresh_cooldown, &current_peers,
-                        std::mem::take(&mut netchange_poke_due),
+                        if std::mem::take(&mut netchange_poke_due) {
+                            ForcedPoke::AddrIface
+                        } else {
+                            ForcedPoke::No
+                        },
                     ).await;
                     warn_if_slow("sweep_carrier_health", t0);
                     // C2 — disco round: one out-of-tunnel echo per direct
@@ -2685,11 +2759,22 @@ impl OverlayRuntime {
                                 self.sweep_carrier_health(
                                     &mut wg, &mut by_node, &mut relay, &tun,
                                     &mut relay_refresh_cooldown, &current_peers,
-                                    true,
+                                    ForcedPoke::Major,
                                 ).await;
                                 warn_if_slow("sweep_carrier_health(net-change)", t0);
                                 fast_reupgrade_until =
                                     Some(Instant::now() + Duration::from_secs(25));
+                                // #26 — the sweep above only ARMED the pokes;
+                                // the verdict lands on the next tick. Pull it
+                                // to the deadline so the pokes are judged when
+                                // they expire rather than at the next grid
+                                // point, and the same tick re-floors the
+                                // casualties (the fast_reupgrade window just
+                                // opened makes `install_peers` run behind the
+                                // sweep). Phase-shifting the fallback grid is
+                                // harmless: every tick body is idempotent and
+                                // the D8 re-upgrade counter is a modulo.
+                                fallback.reset_after(MAJOR_RECHECK_AFTER);
                             }
                             // The route wave rides EVERY delta — including
                             // immaterial ones (an erased peer /32 is
@@ -3821,6 +3906,36 @@ mod tests {
         );
     }
 
+    /// #26 — the post-Major re-check has to land in the narrow band between
+    /// "past the conviction window" and "before the tick it replaces", and
+    /// BOTH bounds are load-bearing:
+    ///
+    /// * at or below `MAJOR_POKE_DEADLINE` the pulled-forward tick judges
+    ///   a poke that has not expired yet, the strict `>` fails, and the real
+    ///   verdict slips to the NEXT tick — i.e. the acceleration silently buys
+    ///   nothing while looking like it works;
+    /// * at or above `FALLBACK_TICK` it is not an acceleration at all, just a
+    ///   phase shift of the ordinary grid.
+    ///
+    /// The margin also has to be big enough to swallow timer jitter, since
+    /// undershooting costs a whole `FALLBACK_TICK` rather than a millisecond.
+    #[test]
+    fn major_recheck_lands_inside_the_grid() {
+        assert!(
+            MAJOR_RECHECK_AFTER > crate::overlay::lifecycle::MAJOR_POKE_DEADLINE,
+            "the re-check must land AFTER the conviction window, or it judges an unexpired poke"
+        );
+        assert!(
+            MAJOR_RECHECK_AFTER < FALLBACK_TICK,
+            "a re-check at/after the ordinary cadence is not an acceleration"
+        );
+        assert!(
+            MAJOR_RECHECK_AFTER - crate::overlay::lifecycle::MAJOR_POKE_DEADLINE
+                >= Duration::from_millis(100),
+            "leave real margin over timer jitter — undershooting costs a whole FALLBACK_TICK"
+        );
+    }
+
     /// P8 — the resume detector: fires only when wall-clock outran the
     /// monotonic clock by more than the threshold (suspend), not on NTP-step
     /// noise or ordinary ticks.
@@ -4016,7 +4131,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
 
@@ -4117,7 +4232,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
 
@@ -4202,11 +4317,11 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
         assert!(
-            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_none()),
+            by_node.get(&nid).is_some_and(|e| e.poke.is_none()),
             "fresh carrier is not poked without the net-change flag"
         );
 
@@ -4219,12 +4334,123 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            true,
+            ForcedPoke::Major,
         )
         .await;
         assert!(
-            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_some()),
-            "net-change forces a revalidation poke despite fresh rx"
+            by_node
+                .get(&nid)
+                .is_some_and(|e| e.poke.is_some_and(|p| p.from_major)),
+            "a Major forces a revalidation poke despite fresh rx, STAMPED \
+             `from_major` (the stamp is what buys the tight conviction window)"
+        );
+
+        // #26 — the CHATTY cause arms the same poke but must NOT stamp it: an
+        // addr/iface signal fires up to once per 3 s (a Docker/WSL adapter
+        // blinking, a lease renewal) against carriers that are usually
+        // healthy, so judging it on one round trip would demote every direct
+        // pair on the box. Only the ≤1-per-120 s Major earns that.
+        by_node.get_mut(&nid).unwrap().poke = None;
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            ForcedPoke::AddrIface,
+        )
+        .await;
+        let p = by_node
+            .get(&nid)
+            .and_then(|e| e.poke)
+            .expect("an addr/iface signal still arms the forced poke (pre-#26 behaviour)");
+        assert!(
+            !p.from_major,
+            "an addr/iface signal must NOT inherit the Major conviction window"
+        );
+    }
+
+    /// #26 — a net-change RE-ARMS a poke that is already in flight, and the
+    /// re-arm both restamps the clock and marks the poke net-change-class.
+    ///
+    /// This is the second half of the VPN-transition hole: the pre-#26 arming
+    /// sat behind `last_poke_at.is_none()`, so a poke armed by the silence or
+    /// proof trigger seconds before a VPN connect kept its establish-sized
+    /// tier deadline (12-30 s) and blackholed that pair for the whole window
+    /// while its neighbours failed over in ~2 s. Re-arming is also what makes
+    /// the tight window honest: it judges an initiation sent NOW, not one
+    /// whose last boringtun re-send may already be ~5 s old.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn major_rearms_a_poke_already_in_flight() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx, tf, 1280);
+
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 64, 0, 6);
+        let pk = peer_kp.public.to_bytes();
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dead, true)
+            .await;
+        wg.test_latch_handshake_done(&pk);
+
+        let nid = ObjectId::from_bytes([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // An ORDINARY poke armed 5 s ago (as the silence trigger would), on a
+        // Public-tier carrier whose deadline is 30 s — so nothing convicts it
+        // yet, and pre-#26 nothing would re-arm it either.
+        let armed_at = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed {
+                since: Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
+                last_rx_at: Instant::now(),
+                poke: Some(PokeArm {
+                    at: armed_at,
+                    from_major: false,
+                }),
+                ..Installed::base(pk, overlay_ip, DirectTier::Public, Instant::now())
+            },
+        );
+
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut relay_refresh: HashMap<ObjectId, Instant> = HashMap::new();
+        let mut relay: Option<RelayCoordinator> = None;
+        let current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+
+        rt.sweep_carrier_health(
+            &mut wg,
+            &mut by_node,
+            &mut relay,
+            &tun,
+            &mut relay_refresh,
+            &current_peers,
+            ForcedPoke::Major,
+        )
+        .await;
+
+        let p = by_node
+            .get(&nid)
+            .expect("carrier survives the arming sweep")
+            .poke
+            .expect("the poke is still armed");
+        assert!(
+            p.from_major,
+            "a net-change must PROMOTE an in-flight poke to the tight window"
+        );
+        assert!(
+            p.at > armed_at,
+            "the re-arm must restamp the clock — judging a 2 s window against a \
+             5 s-old initiation would convict on stale evidence"
         );
     }
 
@@ -4288,21 +4514,22 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
         assert!(
-            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_some()),
+            by_node.get(&nid).is_some_and(|e| e.poke.is_some()),
             "silent carrier survives the arming sweep with a poke pending"
         );
 
         // Back-date the poke past the LAN window (12 s): the next sweep must
         // reap it — RekeyUnanswered, and the no-penalty contract holds.
-        by_node.get_mut(&nid).unwrap().last_poke_at = Some(
-            Instant::now()
+        by_node.get_mut(&nid).unwrap().poke = Some(PokeArm {
+            at: Instant::now()
                 .checked_sub(LAN_HANDSHAKE_DEADLINE + Duration::from_secs(1))
                 .unwrap(),
-        );
+            from_major: false,
+        });
         rt.sweep_carrier_health(
             &mut wg,
             &mut by_node,
@@ -4310,7 +4537,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
         assert!(
@@ -4341,11 +4568,12 @@ mod tests {
             nid,
             Installed {
                 since: Instant::now().checked_sub(Duration::from_secs(60)).unwrap(),
-                last_poke_at: Some(
-                    Instant::now()
+                poke: Some(PokeArm {
+                    at: Instant::now()
                         .checked_sub(LAN_HANDSHAKE_DEADLINE + Duration::from_secs(1))
                         .unwrap(),
-                ),
+                    from_major: false,
+                }),
                 ..Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now())
             },
         );
@@ -4357,11 +4585,11 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
         assert!(
-            by_node.get(&nid).is_some_and(|e| e.last_poke_at.is_none()),
+            by_node.get(&nid).is_some_and(|e| e.poke.is_none()),
             "an answered poke clears and the carrier survives"
         );
     }
@@ -4802,6 +5030,16 @@ mod tests {
     async fn probe_latency_measures_from_probe_start() {
         let (_rt, wg, _tun, _by_node, _probes, _nid, pk) =
             mbb_fixture(DirectTier::Srflx, Instant::now()).await;
+        // De-flake (2026-08-24): `probe_handshake_latency_ms` measures `since`
+        // against the process-wide `wg_epoch()`, with a `saturating_duration_since`.
+        // A `since` older than that epoch clamps to 0, and the assert then reads
+        // "milliseconds since the WG epoch" instead of the probe latency — so the
+        // test failed whenever it happened to run inside the first 200 ms of the
+        // process, i.e. ALWAYS in isolation (`--lib -- probe_latency…`, where this
+        // test is what initializes the epoch) and intermittently in the full suite
+        // depending on scheduling. Age the epoch past the back-date first; the
+        // fixture above has already touched it.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         let since = Instant::now() - Duration::from_millis(200);
         assert_eq!(
             wg.probe_handshake_latency_ms(&pk, since),
@@ -5082,7 +5320,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
 
@@ -5173,7 +5411,7 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
 
@@ -5259,11 +5497,11 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
         assert!(
-            by_node.get(&nid).unwrap().last_poke_at.is_none(),
+            by_node.get(&nid).unwrap().poke.is_none(),
             "ordinary rekey cadence must not trigger the pressure poke"
         );
 
@@ -5277,11 +5515,11 @@ mod tests {
             &tun,
             &mut relay_refresh,
             &current_peers,
-            false,
+            ForcedPoke::No,
         )
         .await;
         assert!(
-            by_node.get(&nid).unwrap().last_poke_at.is_some(),
+            by_node.get(&nid).unwrap().poke.is_some(),
             "re-init pressure must force an immediate revalidation poke"
         );
     }

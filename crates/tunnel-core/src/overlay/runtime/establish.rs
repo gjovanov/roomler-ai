@@ -276,7 +276,7 @@ impl OverlayRuntime {
         tun: &Arc<dyn TunIo>,
         relay_refresh_cooldown: &mut HashMap<ObjectId, Instant>,
         current_peers: &HashMap<ObjectId, NetmapPeer>,
-        force_poke: bool,
+        force_poke: ForcedPoke,
     ) {
         let now = Instant::now();
         // P3 PR-A — the shadow monitor consumes the same env read the legacy
@@ -328,15 +328,18 @@ impl OverlayRuntime {
             // `PeerStats::hs_response_at`). An answered poke clears, re-arming
             // the triggers; an unanswered one rides into the tick, which
             // kills it once the tier's handshake-deadline window closes.
-            let poke = e.last_poke_at.map(|at| PokeState {
-                since_poke: now.saturating_duration_since(at),
-                answered: wg.peer_initiator_hs_answered(&e.pubkey, at),
+            let poke = e.poke.map(|p| PokeState {
+                since_poke: now.saturating_duration_since(p.at),
+                answered: wg.peer_initiator_hs_answered(&e.pubkey, p.at),
+                from_major: p.from_major,
             });
             // Diagnostic — capture poke state before `poke` moves into
             // `carrier_tick` (see `OVERLAY_SESSION_TRACE`).
-            let trace_poke = poke.as_ref().map(|p| (p.since_poke, p.answered));
+            let trace_poke = poke
+                .as_ref()
+                .map(|p| (p.since_poke, p.answered, p.from_major));
             if poke.as_ref().is_some_and(|p| p.answered) {
-                e.last_poke_at = None;
+                e.poke = None;
             }
             // P2 — every rule that can kill this carrier lives in ONE pure
             // transition (`lifecycle::carrier_tick`): the per-tier handshake
@@ -376,9 +379,13 @@ impl OverlayRuntime {
                     hs_done = handshake_done,
                     since_rx_s = since_last_rx.as_secs(),
                     proof_age_s = proof_age.as_secs(),
-                    poke_pending = e.last_poke_at.is_some(),
-                    poke_since_s = trace_poke.map(|(s, _)| s.as_secs()),
-                    poke_answered = trace_poke.map(|(_, a)| a),
+                    poke_pending = e.poke.is_some(),
+                    poke_since_s = trace_poke.map(|(s, _, _)| s.as_secs()),
+                    poke_answered = trace_poke.map(|(_, a, _)| a),
+                    // #26 — which window this poke is judged on: a
+                    // net-change-armed poke convicts at MAJOR_POKE_DEADLINE
+                    // instead of the tier's establish-sized deadline.
+                    poke_netchange = trace_poke.map(|(_, _, n)| n),
                     // A2 round-2 — the one-way inputs: does tx-DATA advance
                     // (tx>last_tx) while rx-DATA stays flat (rx==last_rx)?
                     // That's what must accumulate `bad_sweeps` → OneWay demote.
@@ -441,9 +448,45 @@ impl OverlayRuntime {
             }
             // PR-E — the strike-clear (CC1: the carrier's OWN tier only)
             // lives in the monitor now (`on_healthy_rx`, fed just above).
+            // Net-change acceleration — an OS addr/iface event this tick is
+            // itself the suspicion: skip the silence/proof waits and
+            // revalidate every established DIRECT carrier NOW. A healthy
+            // carrier answers within a handshake round; a captured-route
+            // casualty dies at `MAJOR_POKE_DEADLINE` instead of ~90 s
+            // later (winhost-a CP-connect, 2026-08-15). Relay carriers are
+            // exempt — they ride TCP/TLS and have their own refresh logic.
+            //
+            // #26 — this RE-ARMS over a poke already in flight, so it is
+            // hoisted out of the `last_poke_at.is_none()` branch it used to
+            // live in. Two reasons, both load-bearing: a poke armed by the
+            // silence/proof triggers moments before a VPN connect otherwise
+            // kept its 12–30 s tier deadline (a hole exactly one poke-window
+            // wide, and the pre-#26 arming skipped it entirely), and the tight
+            // window is only honest against a FRESH initiation — boringtun's
+            // last re-send of an in-flight poke can already be ~5 s old.
+            let forced = force_poke != ForcedPoke::No
+                && e.is_direct
+                && should_poke_on_netchange(handshake_done);
             if let Some(reason) = v.death {
                 dead.push((*nid, e.tier, reason));
-            } else if e.last_poke_at.is_none() {
+            } else if forced {
+                if wg.poke_handshake(&e.pubkey) {
+                    let rearmed = e.poke.is_some();
+                    // Only a MAJOR earns the tight conviction window — see
+                    // `ForcedPoke::AddrIface` for why the chatty cause must not.
+                    let from_major = force_poke == ForcedPoke::Major;
+                    e.poke = Some(PokeArm {
+                        at: now,
+                        from_major,
+                    });
+                    info!(
+                        peer = %nid, tier = ?e.tier,
+                        silent_s = since_last_rx.as_secs(),
+                        rearmed, from_major,
+                        "overlay: net-change — revalidating direct carrier now (forced rekey poke)"
+                    );
+                }
+            } else if e.poke.is_none() {
                 // Stage 2 — arm an active revalidation for a SURVIVOR when the
                 // passive signals can't prove it either way: silent past
                 // `POKE_SILENCE_AFTER`, or no initiator-role handshake within
@@ -454,16 +497,6 @@ impl OverlayRuntime {
                 let since_proof = wg
                     .peer_initiator_hs_age(&e.pubkey)
                     .map_or(e.since.elapsed(), |age| age.min(e.since.elapsed()));
-                // Net-change acceleration — an OS addr/iface event this tick
-                // is itself the suspicion: skip the silence/proof waits and
-                // revalidate every established DIRECT carrier NOW. A healthy
-                // carrier answers within a handshake round; a captured-route
-                // casualty dies at the tier's handshake deadline instead of
-                // ~90 s later (winhost-a CP-connect, 2026-08-15). Relay
-                // carriers are exempt — they ride TCP/TLS and have their own
-                // refresh logic.
-                let forced =
-                    force_poke && e.is_direct && should_poke_on_netchange(handshake_done, false);
                 // #22 — re-init pressure: the peer is retrying its handshake
                 // at the ~5 s failure cadence against our ESTABLISHED
                 // session, which means it cannot hear our responses on the
@@ -474,13 +507,16 @@ impl OverlayRuntime {
                 // can never catch this: the re-inits themselves keep
                 // `last_rx_at` fresh.
                 let pressured = handshake_done && e.reinit_recent >= REINIT_PRESSURE_MIN;
-                if (forced
-                    || pressured
-                    || should_poke(handshake_done, false, since_last_rx, since_proof))
+                if (pressured || should_poke(handshake_done, false, since_last_rx, since_proof))
                     && wg.poke_handshake(&e.pubkey)
                 {
-                    e.last_poke_at = Some(now);
-                    if pressured && !forced {
+                    // Not a net-change poke: judged on the tier's handshake
+                    // deadline, as before #26.
+                    e.poke = Some(PokeArm {
+                        at: now,
+                        from_major: false,
+                    });
+                    if pressured {
                         info!(
                             peer = %nid, tier = ?e.tier,
                             reinits_in_window = e.reinit_recent,
@@ -488,12 +524,6 @@ impl OverlayRuntime {
                         );
                         e.reinit_recent = 0;
                         e.reinit_window_from = now;
-                    } else if forced {
-                        info!(
-                            peer = %nid, tier = ?e.tier,
-                            silent_s = since_last_rx.as_secs(),
-                            "overlay: net-change — revalidating direct carrier now (forced rekey poke)"
-                        );
                     } else {
                         debug!(
                             peer = %nid, tier = ?e.tier,
@@ -556,8 +586,17 @@ impl OverlayRuntime {
                     // went unanswered. No strike booked (the rebuild supplies
                     // fresh evidence itself), so a re-upgrade may re-attempt
                     // direct immediately — its failure is what books.
+                    //
+                    // #26 — `from_major` says WHICH window convicted: a
+                    // Major-armed poke judges a SINGLE initiation over
+                    // `MAJOR_POKE_DEADLINE`, every other poke judges 2–3 over
+                    // the tier deadline. If the tight window ever proves too
+                    // eager in the field, this is the line that shows it
+                    // (Major convictions immediately followed by a successful
+                    // direct re-upgrade of the same pair).
                     warn!(
                         peer = %nid, tier = tier_name,
+                        from_major = e.poke.is_some_and(|p| p.from_major),
                         "overlay: established direct carrier failed active revalidation (forced rekey unanswered — path filtered / VPN / NAT rebind?) — rebuilding via relay"
                     );
                 } else if reason == DeathReason::RxStale {
