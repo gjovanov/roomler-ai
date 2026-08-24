@@ -2331,6 +2331,14 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // graceful shutdown) holds it across load→mutate→save so one writer's
     // full-struct save can't drop another's just-written field.
     let cfg_write_lock: config::WriteLock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    // Remote config (docs/remote-config.md) — machine-wide, so ONE instance
+    // shared by every org loop. Seeds the live `exec_enabled` from the config
+    // this daemon actually loaded.
+    let remote_cfg = roomler_agent::remote_config::RemoteConfigServices::new(
+        config_path.clone(),
+        cfg_write_lock.clone(),
+        cfg.exec_enabled,
+    );
     // P6: the declared-route reconciler — converges `[[tunnel_routes]]`
     // from the loaded config into live hub flows, and backs the LocalAPI
     // Route* verbs (persisting through the write lock).
@@ -2474,6 +2482,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // org's task and is recorded for `NodeStatus.orgs`.
     let mut org_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for (org, org_ctx, org_connected, org_terminal) in org_spawns {
+        // One clone per org task: each spawn MOVES its capture, so a shared
+        // binding would be consumed by the first iteration.
+        let remote_cfg_org = remote_cfg.clone();
         let org_cfg = cfg.for_org(&org);
         let (org_view_tx, org_view_rx) =
             tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
@@ -2500,6 +2511,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                     org_slot,
                     broker,
                     org_hub,
+                    remote_cfg_org,
                 )
                 .await
                 {
@@ -2535,6 +2547,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let org_stops: std::sync::Arc<
             std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Sender<bool>>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // Cloned for the org-join closure: it is an `Fn` (called per join), so
+        // it must not consume the captured services.
+        let remote_cfg2 = remote_cfg.clone();
         roomler_agent::org_join::install(roomler_agent::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
@@ -2638,6 +2653,9 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                     return;
                 };
                 let broker = broker.clone();
+                // Per-spawn clone: the async block below MOVES its capture,
+                // and this closure runs once per join.
+                let remote_cfg_join = remote_cfg2.clone();
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
                     async move {
@@ -2651,6 +2669,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                             org_slot,
                             broker,
                             org_hub,
+                            remote_cfg_join,
                         )
                         .await
                         {
@@ -2715,6 +2734,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 sample_slot,
                 consent_broker,
                 tunnel_hub,
+                remote_cfg,
             )
             .await
         }
