@@ -43,7 +43,13 @@ runs:
           ~/.cargo/git/db
           ~/.cargo/bin
           target
-        key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}
+        # Run-salted: unique key per run, so a save can NEVER lose a
+        # reservation race or hit a reservation wedged by a rehearsal that
+        # was cancelled mid-upload (2026-08-24: one such wedge made every
+        # later green rehearsal silently skip its Windows save — no
+        # generation persisted and rc.460 built near-cold). The retirement
+        # step below prunes salted siblings down to the newest.
+        key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-r${{ github.run_id }}
 
     - name: Retire superseded generations (keep only the newest on this ref)
       shell: bash
