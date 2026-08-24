@@ -152,11 +152,21 @@ export interface Agent {
   advertised_routes?: string[]
   /** Optional because pre-2A.1 agents (and tests) may not include it. */
   capabilities?: AgentCapabilities
-  /** Fleet RPC gate 3. Absent on API bodies that predate the feature —
-   *  consumers must treat that as `mode: 'off'`, never as permissive. */
-  exec_policy?: ExecPolicy
-  /** Roomler SSH gate 3. Same rule as `exec_policy`: absent means OFF, never
+  /** Fleet RPC gate 3, as actually stored on the device row.
+   *
+   *  Absent = nobody has configured this device (the server omits a policy
+   *  that is byte-for-byte the default), or an API body that predates the
+   *  feature. Either way consumers must read it as `mode: 'off'`, never as
    *  permissive. */
+  exec_policy?: ExecPolicy
+  /** Roomler SSH gate 3. Same rule as `exec_policy`: absent means OFF.
+   *
+   *  ⚠️ Absent is also the ONLY correct reading for an unconfigured device:
+   *  the server's model default names `account_mode: 'daemon'` (SYSTEM /
+   *  root), so if this ever starts arriving for devices nobody configured,
+   *  {@link SshPolicyDialog}'s spread would pre-select a root shell. The
+   *  dialog's own default is `console_user` for exactly that reason — don't
+   *  "helpfully" fill this in. */
   ssh_policy?: SshPolicy
   /** Multi-region relay PoPs: the agent's nearest relay region id (derived
    *  server-side from its STUN probe reports), e.g. "us-east". Absent/null =
