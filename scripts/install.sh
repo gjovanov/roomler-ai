@@ -488,7 +488,11 @@ enroll_tunnel() {
 # ─── main ───────────────────────────────────────────────────────────────────
 
 say "roomler install.sh — role=$ROLE os=$OS server=$SERVER"
-say "note: the roomler-desktop companion ships for Windows only today — not installed here"
+# The companion rides IN the macOS .pkg (and the Windows MSI); only Linux has
+# none, and there it is the daemon + CLI without a desktop surface.
+if [ "$ROLE" = daemon ] && [ "$OS" = Linux ]; then
+    say "note: the roomler-desktop companion is not available on Linux — not installed here"
+fi
 
 case "$ROLE/$OS" in
     daemon/Linux)  install_daemon_linux ;;

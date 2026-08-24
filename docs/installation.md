@@ -135,10 +135,12 @@ are silently dropped.
 - System Settings → Privacy & Security → **Screen Recording** → enable `roomler-agent`
 - System Settings → Privacy & Security → **Accessibility** → enable `roomler-agent`
 
-The agent probes both at startup, says what is missing in its log, opens the
-right pane, and reports the state to the server — the device list shows "No
-screen access" / "No input access" instead of letting you discover it by
-connecting to a black screen.
+You do not have to hunt for this: the **Roomler menu-bar app** names whichever
+grant is missing and gives you a button per permission that opens the right
+pane. The agent also probes both at startup, says what is missing in its log,
+and reports the state to the server — so the device list shows "No screen
+access" / "No input access" instead of letting you discover it by connecting to
+a black screen.
 
 Then restart it: `launchctl kickstart -k gui/$(id -u)/com.roomler.agent`
 
@@ -146,14 +148,21 @@ Then restart it: `launchctl kickstart -k gui/$(id -u)/com.roomler.agent`
 finished the `.pkg` is unsigned, so **an agent update invalidates them** and
 both toggles need re-enabling.
 
-### The CLI
+### What the package installs
 
-The `.pkg` installs `/usr/local/bin/roomler` (a small shim onto the daemon's
-own command surface). `roomler peers` / `status` reach the **per-user** half;
-`sudo roomler …` reaches the **root** half, because the two listen on different
-LocalAPI sockets (`$TMPDIR/roomler/roomler.sock` vs `/var/run/roomler/roomler.sock`).
-If a command reports "daemon not running", you are probably asking the wrong
-half.
+| | |
+|---|---|
+| `/Applications/roomler-agent.app` | the daemon (its executable is `roomler-agent`; renaming it would void the TCC grants keyed to that binary) |
+| `/Applications/Roomler.app` | the **menu-bar companion** — status, routes, and the permissions panel. `LSUIElement`, so no Dock tile |
+| `/usr/local/bin/roomler` | the CLI (a small shim onto the daemon's own command surface) |
+| `/usr/local/bin/roomlerd` | the daemon on PATH, for `roomlerd enroll` / `--version` — a symlink into the bundle, not a second copy |
+
+Same three commands as Windows and Linux.
+
+`roomler peers` / `status` reach the **per-user** half; `sudo roomler …` reaches
+the **root** half, because the two listen on different LocalAPI sockets
+(`$TMPDIR/roomler/roomler.sock` vs `/var/run/roomler/roomler.sock`). If a
+command reports "daemon not running", you are probably asking the wrong half.
 
 ### Paths, logs, limits
 
@@ -174,10 +183,12 @@ adapters are also unavailable on macOS today.
 
 ```bash
 launchctl bootout "gui/$(id -u)/com.roomler.agent"
+launchctl bootout "gui/$(id -u)/com.roomler.desktop"
 sudo launchctl bootout system/com.roomler.daemon          # if the root half is installed
-rm -f ~/Library/LaunchAgents/com.roomler.agent.plist
+rm -f ~/Library/LaunchAgents/com.roomler.{agent,desktop}.plist
 sudo rm -f /Library/LaunchDaemons/com.roomler.daemon.plist
-sudo rm -rf /Applications/roomler-agent.app /usr/local/bin/roomler /etc/roomler-agent
+sudo rm -rf /Applications/roomler-agent.app /Applications/Roomler.app \
+            /usr/local/bin/roomler /usr/local/bin/roomlerd /etc/roomler-agent
 rm -rf ~/Library/Application\ Support/live.roomler.roomler
 ```
 

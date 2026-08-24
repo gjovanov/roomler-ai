@@ -62,8 +62,29 @@ else
 fi
 rm -f /tmp/roomler-bootstrap.err
 
+# The desktop companion (menu-bar app), same user domain. It is a UI surface,
+# not a service: it holds no session and captures nothing, so a failure to
+# start it must never fail the install — but it IS the only place that tells
+# the user which macOS permission is missing, which the OS never does.
+DESKTOP_PLIST_SOURCE="/Applications/roomler-agent.app/Contents/Resources/com.roomler.desktop.plist"
+DESKTOP_PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.desktop.plist"
+if [ -f "$DESKTOP_PLIST_SOURCE" ] && [ -d /Applications/Roomler.app ]; then
+  cp "$DESKTOP_PLIST_SOURCE" "$DESKTOP_PLIST_TARGET"
+  chown "$CONSOLE_USER":staff "$DESKTOP_PLIST_TARGET"
+  chmod 644 "$DESKTOP_PLIST_TARGET"
+  launchctl bootout "gui/$CONSOLE_UID/com.roomler.desktop" 2>/dev/null || true
+  if launchctl bootstrap "gui/$CONSOLE_UID" "$DESKTOP_PLIST_TARGET" 2>/dev/null; then
+    echo "Roomler menu-bar app started for $CONSOLE_USER"
+  else
+    echo "Roomler menu-bar app installed; it will start at the next login"
+  fi
+else
+  echo "NOTE: the menu-bar companion is not in this package; skipping"
+fi
+
 echo "Grant Screen Recording + Accessibility permissions in System Settings, then:"
 echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+echo "(the Roomler menu-bar app shows which of the two is missing, with a button for each)"
 
 # ---------------------------------------------------------------------------
 # The privileged half — OPT-IN.
