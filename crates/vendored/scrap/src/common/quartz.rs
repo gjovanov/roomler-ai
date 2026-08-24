@@ -15,8 +15,19 @@ impl Capturer {
         let f = frame.clone();
         let inner = quartz::Capturer::new(
             display.0,
-            display.width(),
-            display.height(),
+            // ROOMLER PATCH: size the stream in PIXELS, not POINTS.
+            //
+            // Upstream passes `display.width()/height()`, which are
+            // `CGDisplayPixelsWide/High` — misleadingly named, they return
+            // POINTS. On a Retina panel that is half the real count each way,
+            // so CoreGraphics downsampled the frame 4:1 with its own scaler
+            // before the capturer ever saw it: text drawn at 2x arrived
+            // already destroyed, and nothing downstream could recover it.
+            //
+            // `Display::width()/height()` deliberately keep returning POINTS —
+            // pointer injection maps normalised coordinates into that space.
+            display.0.pixel_width(),
+            display.0.pixel_height(),
             quartz::PixelFormat::Argb8888,
             Default::default(),
             move |inner| {

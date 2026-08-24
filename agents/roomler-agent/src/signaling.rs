@@ -1993,6 +1993,26 @@ async fn handle_server_msg(
             }
         }
 
+        // ⚠️ `WARN [] failed to handle_inbound: ErrChunk` immediately BEFORE
+        // this line is EXPECTED and benign — it is the teardown, not a fault.
+        // The controller hangs up, DTLS goes away, and a final in-flight SCTP
+        // packet fails to parse on the way out. Measured on a macOS host
+        // 2026-08-24: 14/14 occurrences were followed by this `Terminate`
+        // (`reason=ControllerHangup`) within ~25 ms, and NO session ended
+        // without one. It is emitted by `webrtc_sctp::association` with an
+        // EMPTY name (`[]`), so it carries no `session_id` and reads as
+        // unattributable — which is exactly why it invites a wrong story.
+        // (It cost one: "sessions die at ~7 s" — they did not; those sessions
+        // were disconnected by hand while a healthy one in the same log ran to
+        // 8160 frames / 75 MB.)
+        //
+        // ⚠️ Do NOT "fix" it by filtering `webrtc_sctp::association` — a
+        // grep for ErrChunk otherwise lands only on the CHUNKING story
+        // (`clipboard.rs` rc.44, `useRemoteControl.ts` rc.23: a single SCTP
+        // message ≥ the 65536 `max_message_size` default), and that same warn
+        // was the ONLY signal for both of those real bugs, which dropped data
+        // silently otherwise. Mid-session it means something; here it does not.
+        // Distinguish by what follows: a teardown line, or nothing.
         ServerMsg::Terminate { session_id, reason } => {
             info!(%session_id, ?reason, "session terminated by server");
             if let Some(peer) = peers.remove(&session_id) {
