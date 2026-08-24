@@ -1,6 +1,7 @@
 # Remote configuration — enabling exec / SSH from the dashboard
 
-**Status: PLAN, nothing implemented.** This documents a design and the reasoning
+**Status: steps 1–3 SHIPPED (#626, #630, #640); step 4 is BLOCKED on the
+restart question in §7b.** This documents a design and the reasoning
 that constrains it. Every claim about current behaviour below was checked
 against the code at `5b60dacc`; the file notes where a check would need
 repeating.
@@ -162,12 +163,66 @@ unrepresentable.
 - **`remote_config_enabled` is never itself remotely settable.** If it were,
   the whole design would be one push away from meaningless.
 
+## 7b. The restart problem — found building step 4, changes the plan
+
+Step 4 said "apply, persist, staggered restart". Building it turned up four
+facts that make the restart the hard part of this whole feature rather than a
+detail at the end of it. All verified at `09ada123`.
+
+**A persisted change is inert until restart.** `signaling::run(cfg: AgentConfig)`
+takes an OWNED snapshot at startup and passes it down by reference;
+`exec_enabled` is read as `agent_cfg.exec_enabled` per request from that
+snapshot, never re-read from disk. So writing config.toml changes nothing about
+the running daemon. `config_surface`'s "the whole surface is
+`restart_required = true`" is exactly right.
+
+**There is no self-restart primitive.** `restart-service` is Windows-only,
+external (an admin runs it), and does an SCM Stop+Start — which a process cannot
+perform on itself. The auto-updater's restart is a *side effect of the package
+install* (the `.deb` postinst, the MSI), not something callable.
+
+**"Exit and let the supervisor restart me" is the standard mechanism on all
+three platforms** — systemd `Restart=always`, the Windows supervisor's
+`ExitReaction::Respawn`, launchd `KeepAlive` — **and the daemon cannot currently
+tell whether it is supervised.** Nothing in the tree checks `INVOCATION_ID` or
+equivalent. Orphan `roomlerd run` processes demonstrably exist in the field (the
+pre-rc.435 hosts). A fleet-wide config push that exits them would take every one
+**permanently offline**, which is a far worse outcome than the manual edit this
+feature exists to remove.
+
+**The Windows respawn path has an open bug** (`decide_exit_reaction` maps exit 0
+to `Respawn` with zero backoff — see CLAUDE.md's known issues). Anything built on
+exit-to-restart inherits it.
+
+### The fork
+
+- **A — supervisor-detected exit-to-restart.** The real fix. Needs a
+  "am I supervised?" probe per platform, and the Windows supervisor bug closed
+  first. Highest value, highest blast radius; a mistake takes hosts offline.
+- **B — apply + persist now, restart stays manual.** Safe and small, but the
+  change does nothing until someone restarts the device — which for `exec_enabled`
+  is circular, since remote restart is what exec is for.
+- **C — make the keys live instead of restart-required.** Put the config behind
+  a watch/`ArcSwap` so a push updates the running value. For `exec_enabled` this
+  looks tractable: it is a bool read per request. For `ssh_enabled` it is not —
+  `RuntimeFingerprint` has no SSH field (§3), so the `SplitTun` splice would not
+  re-run without more work. C avoids the restart entirely for the key that
+  matters most, and is independent of A.
+
+**C then A** looks right: it removes the restart from the common case, and
+leaves the dangerous mechanism to be built deliberately rather than because
+step 4 needed it. But this is a real decision with real trade-offs, not a
+detail to settle by momentum — hence written down here rather than chosen
+silently.
+
 ## 8. Order
 
 1. `remote_config_enabled` key + config-surface entry, default OFF. Inert alone.
 2. `desired_config` on `agents` + the authz rule in §5 + audit collection.
 3. Hello capability flag + the `ServerMsg` variant + reconcile-on-connect.
-4. Apply/persist/staggered-restart on the agent, primary-only.
+4. Apply + persist on the agent, primary-only. ⚠️ The restart half is NOT
+   settled — see §7b. A persisted change is inert until the daemon restarts,
+   and no safe self-restart exists yet.
 5. Dashboard UI, including the "secondary org" and "agent too old" states.
 6. Desktop companion: already has a generic settings pane over
    `cmd_config_entries` / `cmd_config_set`, which already exposes
