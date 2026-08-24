@@ -132,6 +132,56 @@ jobs:
         # failure, not as "0 tests passed".
         run: cargo test -p roomler-ai-tests --no-run
 
+      - name: Watch mongod while the suite runs
+        # ⚠️ THE MISTAKE THIS FIXES. The leaked-database count below runs
+        # AFTER the suite — and mongod dies mid-suite, so on run 32675563670
+        # it printed "(mongo is gone)". The one step built to discriminate
+        # between hypotheses could not run at the moment that mattered. A
+        # post-mortem instrument cannot observe the thing that killed the
+        # patient.
+        #
+        # So sample DURING, and separate FILES from SOCKETS, because "what is
+        # consuming the descriptors" is the actual question and I have already
+        # answered it wrong once: `conn1333` in the mongod log was read as "too
+        # many connections", a client-pool cap was added, and it fixed nothing
+        # — the ceiling was EMFILE on FILES.
+        #
+        #   wt_files   — WiredTiger's own "files currently open". This IS the
+        #                EMFILE quantity; one table per collection AND per
+        #                index, per database. Climbs if databases leak.
+        #   dhandles   — data handles active; the same story one level up.
+        #   conns      — connections. Climbs if the driver leaks sockets.
+        #   leaked_dbs — `roomler_ai_test_*` databases still present.
+        #
+        # Whichever curve climbs is the culprit; the flat ones are exonerated.
+        #
+        # ⚠️ These come from `serverStatus()`, NOT from classifying the
+        # symlinks in /proc/1/fd, and that is not a style choice: `readlink`
+        # on those entries is DENIED in this container runtime even as uid 0,
+        # so `ls -l` prints names with no targets. The first version of this
+        # step classified them anyway and — with stderr sent to /dev/null —
+        # silently reported `fds_wt=0 fds_sock=0` against a live mongod that
+        # obviously held both. It was caught by rehearsing the step against a
+        # local container before pushing, which took two minutes.
+        run: |
+          set -euo pipefail
+          setsid nohup bash -c '
+            while true; do
+              t=$(date -u +%H:%M:%S)
+              fd=$(docker exec roomler-test-mongo sh -c "ls /proc/1/fd 2>/dev/null | wc -l" 2>/dev/null || echo -1)
+              m=$(docker exec roomler-test-mongo mongosh --quiet --eval "const s=db.serverStatus();const n=db.adminCommand({listDatabases:1,nameOnly:true}).databases.filter(x=>x.name.startsWith(\"roomler_ai_test\")).length;print(\"wt_files=\"+s.wiredTiger[\"connection\"][\"files currently open\"]+\" dhandles=\"+s.wiredTiger[\"data-handle\"][\"connection data handles currently active\"]+\" conns=\"+s.connections.current+\" leaked_dbs=\"+n)" 2>/dev/null || echo "wt_files=-1 dhandles=-1 conns=-1 leaked_dbs=-1")
+              echo "$t fds=$fd $m"
+              sleep 15
+            done' > /tmp/mongo-watch.log 2>&1 < /dev/null &
+          sleep 16
+          echo "--- first sample (baseline, before any test has run) ---"
+          cat /tmp/mongo-watch.log
+          # ⚠️ Prove the instrument works BEFORE the suite depends on it. A
+          # watcher that silently produced nothing would leave the next run
+          # as undiagnosable as the last one.
+          grep -qE 'wt_files=[0-9]+ ' /tmp/mongo-watch.log || {
+            echo "::error::the mongod watcher is not producing usable samples — fix it before trusting this run"; exit 1; }
+
       - name: Run the suite
         id: run
         env:
@@ -166,6 +216,14 @@ jobs:
             --skip rate_limit_tests::rate_limit_returns_429_after_burst \
             2>&1 | tee /tmp/itest.log
 
+      - name: The mongod watch log (READ THIS FIRST on a failure)
+        # The curve, not the corpse. Read the last sample before the numbers
+        # stop moving: that is the state mongod was in when it died.
+        if: always()
+        run: |
+          echo "--- mongod descriptors + leaked databases over the run ---"
+          cat /tmp/mongo-watch.log || echo "(watcher produced nothing)"
+
       - name: Assert the suite actually ran
         # ⚠️ THE POINT OF THIS STEP. A test lane that silently executes
         # nothing is indistinguishable from a passing one, and that is
@@ -191,7 +249,7 @@ jobs:
             exit 1
           fi
 
-      - name: How many databases leaked?
+      - name: How many databases leaked? (final count)
         # The suspected root cause: `impl Drop for TestApp` cleans up with a
         # detached `tokio::spawn`, and a `#[tokio::test]`'s runtime shuts down
         # as the test returns — so that task overwhelmingly never runs and the
@@ -201,6 +259,10 @@ jobs:
         #
         # A count near the test count confirms it; a count near zero refutes
         # it and sends the next person somewhere else.
+        #
+        # ⚠️ This only answers when mongod OUTLIVES the suite — a filtered
+        # dispatch, or a run after the leak is fixed. When it dies mid-suite
+        # this prints nothing useful and the watch log above is the evidence.
         if: always()
         run: |
           docker exec roomler-test-mongo mongosh --quiet --eval '
