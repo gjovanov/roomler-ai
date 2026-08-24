@@ -37,15 +37,23 @@ pub struct TestApp {
 /// mongod for a couple of thousand sockets, each of which is a file
 /// descriptor on the server.
 ///
-/// ⚠️ This is a contributing factor, NOT the cause of the CI failures that
-/// prompted it. I inferred "conn1333 in the crash log ⇒ too many connections"
-/// and capped the pool; the next run failed identically, and a wider log grep
-/// gave the real answer — `EMFILE`, from WiredTiger holding files open per
-/// collection and index across ~289 per-test databases. The fix is the
-/// `--ulimit nofile` in `.github/workflows/integration-tests.yml`.
+/// ⚠️ This fixed NOTHING, and the measurement says so. I read `conn1333` in
+/// the crash log as "too many connections" and capped the pool; the next run
+/// failed identically. Sampling mongod during a run (CI run 32767662554)
+/// settled it — connections are FLAT while files explode:
+///
+/// ```text
+///   19:30:34  fds=51    wt_files=14    conns=5   leaked_dbs=0
+///   19:30:50  fds=5192  wt_files=5166  conns=11  leaked_dbs=21
+/// ```
+///
+/// 5 166 files for 21 databases is ~246 WiredTiger files per database (one
+/// per collection AND per index), so `fds ≈ 26 + 246 × databases` and the
+/// 64 000 `nofile` ceiling arrives at ~260 databases — mid-suite. The cause
+/// is the teardown that never ran; see `impl Drop for TestApp`.
 ///
 /// The cap stays because it is genuinely free: a test needs ~1 connection at
-/// a time, so 2 is generous, and fewer sockets is fewer descriptors.
+/// a time, so 2 is generous. It is not a fix for anything.
 fn cap_pool(opts: &mut ClientOptions) {
     opts.max_pool_size = Some(2);
     opts.min_pool_size = Some(0);
@@ -321,12 +329,45 @@ impl TestApp {
 }
 
 impl Drop for TestApp {
+    /// Drop this test's database — **synchronously**.
+    ///
+    /// This used to be a detached `tokio::spawn`, which **never ran**. Every
+    /// test here is a plain `#[tokio::test]` (all 291 of them), so the body is
+    /// driven by `block_on` on a current-thread runtime; this `Drop` fires as
+    /// that body completes, queues a task, and `block_on` returns on the very
+    /// next step. The runtime is then dropped with the task still queued and
+    /// never polled — so *every* test database survived its test. Same shape
+    /// as #602: a dropped `JoinHandle` detaches, and detached is not "later",
+    /// it is "never" once the runtime goes.
+    ///
+    /// Measured cost of the leak (CI run 32767662554): 29 tests → 29 databases
+    /// → ~246 WiredTiger files each. A full suite crossed mongod's 64 000
+    /// descriptor ceiling around the 260th database, hit `EMFILE`, and aborted
+    /// on fatal assertion 50853 — which surfaced as dozens of unrelated-looking
+    /// tests failing on `Connection refused`.
+    ///
+    /// ⚠️ The new client is **not** redundant with `self.db`, and reusing the
+    /// existing one deadlocks. We block this thread on `join()`, so the test's
+    /// runtime stops driving its IO driver — and `self.db`'s sockets are
+    /// registered with exactly that driver, so their readiness would never be
+    /// delivered. The cleanup must own every part of its own I/O.
     fn drop(&mut self) {
-        let db = self.db.clone();
-        // Best effort cleanup: drop the test database
-        tokio::spawn(async move {
-            let _ = db.drop().await;
-        });
+        let uri = self.settings.database.url.clone();
+        let name = self.db.name().to_string();
+        let _ = std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                if let Ok(client) = Client::with_uri_str(&uri).await {
+                    let _ = client.database(&name).drop().await;
+                }
+            });
+        })
+        .join();
     }
 }
 
