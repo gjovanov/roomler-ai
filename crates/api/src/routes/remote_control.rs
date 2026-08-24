@@ -167,12 +167,23 @@ pub async fn enroll_agent(
     // field 2026-08-05 replayed one after a cap rejection. Claimed on BOTH
     // branches: a replay against a KNOWN machine still mints a fresh agent
     // JWT, which is the credential worth protecting.
+    //
+    // The claim fails CLOSED (see `UsedTokenDao::claim`), and the two failures
+    // are reported differently on purpose: "already used" sends an operator
+    // looking for a replay, so a ledger that merely could not answer must not
+    // borrow that phrasing. It gets a 503 the caller can retry — the token is
+    // still valid for the rest of its 10 minutes.
     state
         .used_tokens
         .claim(&claims.jti, "agent-enroll")
         .await
-        .map_err(|_| {
-            ApiError::Unauthorized("This enrollment token has already been used".into())
+        .map_err(|e| match e {
+            roomler_ai_services::dao::base::DaoError::Validation(_) => {
+                ApiError::Unauthorized("This enrollment token has already been used".into())
+            }
+            _ => ApiError::ServiceUnavailable(
+                "Could not verify this enrollment token is unused; please retry".into(),
+            ),
         })?;
 
     let agent = match existing {
