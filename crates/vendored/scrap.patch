@@ -1,7 +1,29 @@
 diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/quartz.rs
 --- upstream/src/common/quartz.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/common/quartz.rs	2026-08-23 21:12:25.528485571 +0200
-@@ -66,6 +66,17 @@
++++ vendored/src/common/quartz.rs	2026-08-24 21:09:45.568993300 +0200
+@@ -15,8 +15,19 @@
+         let f = frame.clone();
+         let inner = quartz::Capturer::new(
+             display.0,
+-            display.width(),
+-            display.height(),
++            // ROOMLER PATCH: size the stream in PIXELS, not POINTS.
++            //
++            // Upstream passes `display.width()/height()`, which are
++            // `CGDisplayPixelsWide/High` — misleadingly named, they return
++            // POINTS. On a Retina panel that is half the real count each way,
++            // so CoreGraphics downsampled the frame 4:1 with its own scaler
++            // before the capturer ever saw it: text drawn at 2x arrived
++            // already destroyed, and nothing downstream could recover it.
++            //
++            // `Display::width()/height()` deliberately keep returning POINTS —
++            // pointer injection maps normalised coordinates into that space.
++            display.0.pixel_width(),
++            display.0.pixel_height(),
+             quartz::PixelFormat::Argb8888,
+             Default::default(),
+             move |inner| {
+@@ -66,6 +77,17 @@
      PhantomData<&'a [u8]>
  );
  
@@ -19,10 +41,95 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
  impl<'a> ops::Deref for Frame<'a> {
      type Target = [u8];
      fn deref(&self) -> &[u8] {
+diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz/display.rs
+--- upstream/src/quartz/display.rs	2018-01-03 06:28:23.000000000 +0100
++++ vendored/src/quartz/display.rs	2026-08-24 21:09:45.564949300 +0200
+@@ -40,6 +40,48 @@
+         unsafe { CGDisplayPixelsHigh(self.0) }
+     }
+ 
++    /// ROOMLER PATCH: the display's true width in PIXELS.
++    ///
++    /// [`Display::width`] is named for pixels but returns POINTS. Both are
++    /// kept, because the distinction is load-bearing: a capture stream wants
++    /// PIXELS (else a Retina panel streams at a quarter of its real detail),
++    /// while pointer injection wants POINTS (that is the coordinate space
++    /// `CGWarpMouseCursorPosition` and friends live in). Mixing them up puts
++    /// the cursor at half-coordinates or the picture at half-resolution.
++    pub fn pixel_width(self) -> usize {
++        self.pixel_size().0
++    }
++
++    /// ROOMLER PATCH: the display's true height in PIXELS. See
++    /// [`Display::pixel_width`].
++    pub fn pixel_height(self) -> usize {
++        self.pixel_size().1
++    }
++
++    /// Both pixel dimensions in one mode copy.
++    ///
++    /// Falls back to the POINT size whenever the mode is unavailable or
++    /// reports zero, so a caller always receives usable dimensions — a
++    /// degraded-but-working capture beats a zero-sized stream.
++    fn pixel_size(self) -> (usize, usize) {
++        unsafe {
++            let mode = CGDisplayCopyDisplayMode(self.0);
++            if mode.is_null() {
++                return (self.width(), self.height());
++            }
++            let w = CGDisplayModeGetPixelWidth(mode);
++            let h = CGDisplayModeGetPixelHeight(mode);
++            // *Copy* convention — we own this and must release it, on every
++            // path. Done before the zero-check so the early return can't leak.
++            CGDisplayModeRelease(mode);
++            if w == 0 || h == 0 {
++                (self.width(), self.height())
++            } else {
++                (w, h)
++            }
++        }
++    }
++
+     pub fn is_builtin(self) -> bool {
+         unsafe { CGDisplayIsBuiltin(self.0) != 0 }
+     }
 diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi.rs
 --- upstream/src/quartz/ffi.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/ffi.rs	2026-08-23 21:12:25.488486093 +0200
-@@ -174,6 +174,12 @@
++++ vendored/src/quartz/ffi.rs	2026-08-24 21:09:45.563949400 +0200
+@@ -9,6 +9,8 @@
+ pub type CFNumberRef = *mut c_void;
+ pub type CFStringRef = *mut c_void;
+ pub type CGDisplayStreamUpdateRef = *mut c_void;
++// ROOMLER PATCH: see `CGDisplayCopyDisplayMode` below.
++pub type CGDisplayModeRef = *mut c_void;
+ pub type IOSurfaceRef = *mut c_void;
+ pub type DispatchQueue = *mut c_void;
+ pub type DispatchQueueAttr = *mut c_void;
+@@ -160,6 +162,23 @@
+     pub fn CGDisplayPixelsWide(display: u32) -> usize;
+     pub fn CGDisplayPixelsHigh(display: u32) -> usize;
+ 
++    // ROOMLER PATCH: the display's size in PIXELS rather than POINTS.
++    //
++    // `CGDisplayPixelsWide/High` are named for pixels but return POINTS —
++    // on a Retina panel they are half the real count (a 3024x1964 MacBook
++    // reports 1512x982). Upstream sizes the capture stream from them, so
++    // 3/4 of the image is discarded by CoreGraphics' own scaler before any
++    // encoder sees it, and no amount of downstream sharpening gets it back.
++    // The mode's Pixel accessors are the only way to learn the true size.
++    //
++    // NOTE the ownership rule: `CopyDisplayMode` follows the Core Foundation
++    // *Copy* convention, so the caller owns the returned mode and MUST
++    // release it — see `Display::pixel_size`.
++    pub fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
++    pub fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
++    pub fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
++    pub fn CGDisplayModeRelease(mode: CGDisplayModeRef);
++
+     pub fn CGGetOnlineDisplayList(
+         max_displays: u32,
+         online_displays: *mut u32,
+@@ -174,6 +193,12 @@
      // IOSurface
  
      pub fn IOSurfaceGetAllocSize(buffer: IOSurfaceRef) -> usize;
@@ -37,7 +144,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi
      pub fn IOSurfaceDecrementUseCount(buffer: IOSurfaceRef);
 diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/frame.rs
 --- upstream/src/quartz/frame.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/frame.rs	2026-08-23 21:12:25.496485989 +0200
++++ vendored/src/quartz/frame.rs	2026-08-24 21:09:45.561841400 +0200
 @@ -3,7 +3,9 @@
  
  pub struct Frame {
