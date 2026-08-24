@@ -171,6 +171,27 @@ fn verify_msi(_path: &Path, _claimed: &str) -> Result<String, VersionError> {
 /// `None` for any shape the workflow itself refuses to build: a non-`rc.N`
 /// pre-release, an rc with a non-zero patch, an rc above the build field's
 /// ceiling.
+///
+/// ## ⚠️ Releases before `agent-v0.3.0-rc.104` do not follow this mapping
+///
+/// The rc-into-the-build-field fix landed in `6bc9d58d` (2026-06-01), first
+/// released as **rc.104**. MSIs older than that carry cargo-wix's raw
+/// derivation — `0.3.0-rc.N` became `0.3.0.N`, i.e. the same three significant
+/// fields `0.3.0` for every rc, which is precisely the collision the fix
+/// removed. So this function's answer is **wrong for a pre-rc.104 tag**, and a
+/// download of one is refused.
+///
+/// That is accepted rather than special-cased. The only path that fetches an
+/// OLDER release is `updater::pin_version` — crash-loop rollback to
+/// `last_known_good_version`, or an operator-chosen `rc:agent.update` tag — and
+/// a refusal there folds into `CheckOutcome::Skipped`, which `main.rs` already
+/// handles by raising the attention sentinel and leaving the operator to act.
+/// So the failure mode is "rollback needs a human", not a wedge.
+///
+/// Teaching this function the legacy mapping would be worse than that: every
+/// pre-rc.104 `0.3.0-rc.*` MSI shares the fields `0.3.0`, so accepting it would
+/// make any one of them substitutable for any other — re-creating inside the
+/// check the exact ambiguity the release fix removed.
 pub fn msi_product_version_for(release: &str) -> Option<String> {
     // Accept a tag or a bare semver — every caller has a tag, and a helper
     // that silently mis-parses `agent-v…` would be a trap.
@@ -398,6 +419,28 @@ mod tests {
         assert_eq!(msi_product_version_for("agent-v0.3.0.1"), None); // four fields
         assert_eq!(msi_product_version_for(""), None);
         assert_eq!(msi_product_version_for("agent-vNaN.3.0"), None);
+    }
+
+    #[test]
+    fn pre_rc104_releases_are_mapped_by_todays_rule_and_so_will_be_refused() {
+        // Deliberate, documented on `msi_product_version_for`: rc.104
+        // (2026-06-01) is where MSIs began carrying MAJOR.MINOR.RC. An older
+        // MSI carries `0.3.0.N`, i.e. fields (0, 3, 0), which this expectation
+        // cannot match — so a rollback pinning a pre-rc.104 tag is refused and
+        // falls through to the operator sentinel.
+        //
+        // This is locked so nobody "fixes" it by teaching the function the
+        // legacy shape: every pre-rc.104 `0.3.0-rc.*` MSI shares the fields
+        // `0.3.0`, so accepting that would make any one of them substitutable
+        // for any other.
+        assert_eq!(
+            msi_product_version_for("agent-v0.3.0-rc.90").as_deref(),
+            Some("0.3.90")
+        );
+        assert_ne!(
+            msi_product_version_for("agent-v0.3.0-rc.90").as_deref(),
+            Some("0.3.0")
+        );
     }
 
     #[test]
