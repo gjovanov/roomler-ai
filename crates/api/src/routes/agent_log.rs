@@ -19,7 +19,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::StatusCode,
     response::IntoResponse,
 };
 use bson::{DateTime, oid::ObjectId};
@@ -27,7 +27,11 @@ use roomler_ai_db::models::{AgentLogBatch, LogLine, LogSource};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
+use crate::{
+    error::ApiError,
+    extractors::{agent::AuthAgent, auth::AuthUser},
+    state::AppState,
+};
 
 /// Body shape POSTed by an uploader. `source` must NOT be `Browser`
 /// on the agent-authed route; route handler enforces this.
@@ -100,34 +104,36 @@ impl From<AgentLogBatch> for AgentLogBatchView {
 ///
 /// Status codes:
 ///   201 — accepted, batch persisted.
-///   401 — missing / malformed / invalid agent JWT.
+///   401 — missing / malformed / invalid agent JWT, or an agent whose row
+///         has been deleted or quarantined.
 ///   403 — agent-id or tenant-id in route doesn't match JWT claims.
 ///   422 — payload validation failed (too many lines, oversized msg,
 ///         body too large, browser source on agent route).
-///   500 — DB write failure.
+///   500 — DB write failure, or the agent row could not be read.
+///
+/// The `AuthAgent` extractor is what makes the 401 case real: this handler
+/// used to trust the claims alone, so a deleted or quarantined device kept
+/// uploading logs for the remaining life of its year-long token.
 pub async fn ingest_agent(
     State(state): State<AppState>,
     Path((tenant_id, agent_id)): Path<(String, String)>,
-    headers: HeaderMap,
+    agent: AuthAgent,
     Json(payload): Json<LogBatchPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let token = extract_bearer(&headers)
-        .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
-    let claims = state
-        .auth
-        .verify_agent_token(token)
-        .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
-
     // Route params must match JWT claims — defense-in-depth against
     // route-config mistakes that would let agent A in tenant T upload
     // batches under agent B / tenant T'. JWT validation alone doesn't
     // catch this since the agent's JWT trusts the issuer.
-    if claims.tenant_id != tenant_id {
+    //
+    // Compare against the EXTRACTOR's ids, not the raw claims: those are the
+    // ones that were looked up and accepted, so the check cannot pass against
+    // an identity the row check never saw.
+    if agent.tenant_id.to_hex() != tenant_id {
         return Err(ApiError::Forbidden(
             "tenant_id in route does not match agent JWT".to_string(),
         ));
     }
-    if claims.sub != agent_id {
+    if agent.agent_id.to_hex() != agent_id {
         return Err(ApiError::Forbidden(
             "agent_id in route does not match agent JWT".to_string(),
         ));
@@ -141,12 +147,7 @@ pub async fn ingest_agent(
         ));
     }
 
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("invalid tenant_id".to_string()))?;
-    let aid = ObjectId::parse_str(&agent_id)
-        .map_err(|_| ApiError::BadRequest("invalid agent_id".to_string()))?;
-
-    let batch = build_batch(tid, Some(aid), None, payload)?;
+    let batch = build_batch(agent.tenant_id, Some(agent.agent_id), None, payload)?;
     state
         .agent_logs
         .record_batch(batch)
@@ -338,19 +339,6 @@ fn scrub_tokens(s: &str) -> String {
     out
 }
 
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    let v = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let token = v
-        .strip_prefix("Bearer ")
-        .or_else(|| v.strip_prefix("bearer "))?;
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,14 +444,7 @@ mod tests {
         assert_eq!(scrub_tokens(s), s);
     }
 
-    #[test]
-    fn extract_bearer_extracts_token() {
-        use axum::http::HeaderValue;
-        let mut h = HeaderMap::new();
-        h.insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer abc.def.ghi"),
-        );
-        assert_eq!(extract_bearer(&h), Some("abc.def.ghi"));
-    }
+    // The bearer-parsing test moved with the behaviour, to
+    // `crate::extractors::agent` — this route no longer parses the header
+    // itself; the `AuthAgent` extractor does, and checks the agent row too.
 }

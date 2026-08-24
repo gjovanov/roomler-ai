@@ -39,6 +39,8 @@ fn spawn_agent(
             std::env::temp_dir().join(format!("roomler-exec-consent-{}", cfg.agent_id)),
         )
         .expect("consent broker init");
+        // Read before `cfg` is moved into the call below.
+        let exec_enabled = cfg.exec_enabled;
         let _ = signaling::run(
             signaling::OrgCtx::primary(),
             cfg,
@@ -49,12 +51,16 @@ fn spawn_agent(
             Default::default(),
             broker,
             roomler_agent::tunnel::client_mgr::TunnelClientHub::new("test".into()),
-            // Remote config: tests never push one, so services over a throwaway
-            // path with exec off is the correct input, not a stub.
+            // Remote config: tests never PUSH one, but the live `exec_enabled`
+            // must still be SEEDED from the config this agent was handed —
+            // which is exactly what `main.rs` does. Hardcoding `false` made the
+            // harness disagree with production about gate 4, so every test that
+            // sets `cfg.exec_enabled = true` was answered "remote execution is
+            // disabled on this device".
             roomler_agent::remote_config::RemoteConfigServices::new(
                 std::path::PathBuf::from("unused-in-tests.toml"),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                false,
+                exec_enabled,
             ),
         )
         .await;
