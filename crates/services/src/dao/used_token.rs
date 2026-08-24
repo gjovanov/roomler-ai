@@ -33,12 +33,34 @@ impl UsedTokenDao {
     }
 
     /// Claim `jti` for `purpose`. `Ok(())` = this caller won it (first use);
-    /// `Err(DaoError::Validation)` = it was already spent.
+    /// `Err(DaoError::Validation)` = it was already spent; `Err(DaoError::Mongo)`
+    /// = the ledger could not answer, which is ALSO a refusal.
     ///
-    /// A Mongo outage FAILS OPEN with a loud warning: enrollment is how a
-    /// fleet recovers, and bricking every enroll because the ledger is
-    /// unreachable trades a narrow replay window for a total outage. The
-    /// token's short TTL remains the backstop.
+    /// ## Why this fails CLOSED
+    ///
+    /// It used to fail open, reasoning that "enrollment is how a fleet recovers,
+    /// and bricking every enroll because the ledger is unreachable trades a
+    /// narrow replay window for a total outage".
+    ///
+    /// That trade does not exist. The caller writes the agent row through `?`
+    /// immediately after this claim (`routes::remote_control::enroll_agent` →
+    /// `agents.create` / `rehydrate`), and the device-cap check read the tenant
+    /// just before it. **An enrollment cannot succeed without Mongo**, so there
+    /// is no world in which failing open here rescues one. What failing open
+    /// actually did was narrower and worse: in the one case where the
+    /// `used_tokens` insert errors while the `agents` write succeeds — a
+    /// transient blip, a primary stepdown — it let the replay through. It
+    /// disabled the control precisely in the window where the control mattered.
+    ///
+    /// Failing closed costs a RETRY, not an enrollment: the token is still
+    /// valid for the rest of its 10 minutes.
+    ///
+    /// ⚠️ One case does burn a token: an insert that SUCCEEDED but reported an
+    /// error, after which the retry legitimately sees a duplicate key. That is
+    /// why the two failures are different variants and the route reports them
+    /// differently — an operator has to be able to tell "someone replayed this"
+    /// from "mint a new one", and answering both with "already used" would send
+    /// them hunting an attacker who is not there.
     pub async fn claim(&self, jti: &str, purpose: &str) -> DaoResult<()> {
         let doc = doc! {
             "_id": jti,
@@ -53,12 +75,12 @@ impl UsedTokenDao {
                         "this enrollment token has already been used".to_string(),
                     ))
                 } else {
-                    tracing::warn!(
+                    tracing::error!(
                         %purpose, %e,
-                        "single-use token ledger unavailable; allowing the enrollment \
-                         (short token TTL is the remaining bound)"
+                        "single-use token ledger unavailable; REFUSING the enrollment \
+                         (cannot prove this token is unspent)"
                     );
-                    Ok(())
+                    Err(DaoError::Mongo(e))
                 }
             }
         }
