@@ -189,7 +189,17 @@ rm -f ~/Library/LaunchAgents/com.roomler.{agent,desktop}.plist
 sudo rm -f /Library/LaunchDaemons/com.roomler.daemon.plist
 sudo rm -rf /Applications/roomler-agent.app /Applications/Roomler.app \
             /usr/local/bin/roomler /usr/local/bin/roomlerd /etc/roomler-agent
-rm -rf ~/Library/Application\ Support/live.roomler.roomler
+# `sudo`, and both trees: an install done under sudo before rc.454 wrote the
+# config into your home owned by root, so a plain rm cannot remove it.
+# `live.roomler.roomler-agent` is the pre-rename path and may also be present.
+sudo rm -rf ~/Library/Application\ Support/live.roomler.roomler \
+            ~/Library/Application\ Support/live.roomler.roomler-agent
+
+# The two privacy grants are bound to the binary you just deleted. Clearing
+# them means the fresh install prompts again instead of showing a toggle that
+# is ON but attached to something no longer there.
+sudo tccutil reset ScreenCapture com.roomler.agent
+sudo tccutil reset Accessibility com.roomler.agent
 ```
 
 Remove the device row(s) in the admin UI too — deletion there releases the
