@@ -36,8 +36,35 @@
 //! - On an unbound LAN link, periods never last that long, the estimate
 //!   stays `None`, and every derived quantity falls back to the nominal
 //!   band. Direct sessions are byte-identical to today, by construction.
-//! - On relay sessions the at-rest polish traffic (~1.75 Mbps sustained)
-//!   keeps periods alive, so the estimate survives an idle viewer.
+//! - ⚠️ **This next claim was WRONG, and it was the design's load-bearing
+//!   assumption.** It read: "on relay sessions the at-rest polish traffic
+//!   (~1.75 Mbps sustained) keeps periods alive, so the estimate survives
+//!   an idle viewer." Field-measured at rc.453 on a live relay session
+//!   (browser → PC50045, corp VPN, hevc_qsv): `goodput_bps=None`,
+//!   `goodput_samples=(0, 11597)` — **zero accepted**, and still zero
+//!   under forced motion. Frames serialise in ~14 µs because the
+//!   bottleneck is capture+encode *upstream* of the socket sampled here,
+//!   so the queue never fills. It was an assumption written as a finding,
+//!   and nothing here could have caught it — only a session could.
+//!   Locked now by `the_measured_field_shape_yields_no_estimate`.
+//!
+//! ## Where this leaves stage 0
+//!
+//! Reporting-only, and currently reporting `None` on exactly the sessions
+//! it was built for. **Stages 1+ must not be built on it as it stands** —
+//! `G=None` permanently means the nominal band 100 % of the time, i.e. a
+//! large change that is green, implemented, and inert, with the constants
+//! it was meant to replace still quietly in charge.
+//!
+//! The way out, analysed but NOT built: `B = min(nominal, 0.85 × G)` only
+//! ever LOWERS the clamp, so the estimator never needs to observe unused
+//! capacity — it needs evidence of *insufficiency*, which is precisely a
+//! congestion episode. So sample during **backpressure**, at its natural
+//! timescale, and the 300 ms floor can go with it (a queue-full episode is
+//! by construction not buffer headroom, which is what the floor stood in
+//! for). The pump already emits the signal: `frames_skipped_backpressure`,
+//! 94 of them in that same session. The arithmetic was never the problem —
+//! see `a_backpressure_episode_on_a_throttled_link_reads_the_throttle`.
 //!
 //! ## Asymmetric adaptation
 //!
@@ -210,6 +237,66 @@ mod tests {
             bytes,
             elapsed: Duration::from_millis(ms),
         }
+    }
+
+    fn period_us(bytes: u64, us: u64) -> BusyPeriod {
+        BusyPeriod {
+            bytes,
+            elapsed: Duration::from_micros(us),
+        }
+    }
+
+    /// **The rc.453 field read, made executable.**
+    ///
+    /// A live relay session (browser → PC50045, corp VPN, hevc_qsv) reported
+    /// `goodput_bps=None, goodput_samples=(0, 11597)` — not one period in
+    /// eleven thousand qualified, and forcing motion did not change it.
+    ///
+    /// The cause is the SHAPE, not the wiring. Frames serialise into the
+    /// socket in ~14 µs because the bottleneck is capture+encode *upstream*
+    /// of the socket this estimator samples, so the queue never fills and
+    /// every period measures a memcpy rather than the link. The module docs'
+    /// claim that "at-rest polish keeps periods alive on relay sessions" was
+    /// an assumption written as a finding.
+    ///
+    /// ⚠️ Kept so that cannot be re-derived the expensive way. If someone
+    /// lowers [`MIN_BUSY_PERIOD`] to "fix" the `None`, this fails — which is
+    /// correct: 1.5 KB in 14 µs computes to ~857 Mbps, i.e. the speed of
+    /// memory, and believing it once poisons the EWMA for a minute.
+    #[test]
+    fn the_measured_field_shape_yields_no_estimate() {
+        let mut est = GoodputEstimator::new();
+        let t0 = Instant::now();
+        for i in 0..11_597u64 {
+            // ~1.5 KB per frame, serialised in 14 µs, at a 30 fps cadence.
+            est.observe(period_us(1_500, 14), t0 + Duration::from_micros(i * 33_000));
+        }
+        assert_eq!(est.accepted(), 0, "the field read was (0, 11597)");
+        assert_eq!(est.rejected(), 11_597);
+        assert_eq!(
+            est.estimate_bps(t0),
+            None,
+            "eleven thousand memcpys are not evidence about a link"
+        );
+    }
+
+    /// The other half of the control, and the whole case for the redesign:
+    /// when the LINK is the bottleneck, the period worth measuring is exactly
+    /// the congestion episode. A 1 Mbps shaped link that backs up for two
+    /// seconds delivers 250 KB in that window — long enough to qualify, and
+    /// it reads the throttle rather than the memcpy.
+    ///
+    /// This is the unit-level form of the `tc` experiment: throttled must
+    /// read ≈ the throttle, and [`the_measured_field_shape_yields_no_estimate`]
+    /// is the same control's negative arm. Together they say the estimator's
+    /// arithmetic was never the problem — where it samples is.
+    #[test]
+    fn a_backpressure_episode_on_a_throttled_link_reads_the_throttle() {
+        let mut est = GoodputEstimator::new();
+        let t0 = Instant::now();
+        // 1 Mbps for 2 s = 250 000 bytes.
+        assert!(est.observe(period(250_000, 2_000), t0));
+        assert_eq!(est.estimate_bps(t0), Some(1_000_000));
     }
 
     /// The whole design rests on this: a frame that serialised instantly
