@@ -2534,7 +2534,13 @@ async fn handle_server_msg(
             // Gate 4, and the reason this feature does not erode it: the
             // device decides whether it accepts pushed config at all, and the
             // server can never set this key.
-            if !agent_cfg.remote_config_enabled {
+            //
+            // Read LIVE, not from the startup snapshot: this is how the person
+            // holding the machine REVOKES the delegation, and a revocation
+            // that waited for a service restart — while the control plane's
+            // assertions took effect immediately — would be the slower half of
+            // a rule that exists to be the last word.
+            if !remote_cfg.remote_config_enabled() {
                 info!(
                     revision,
                     "rc:agent.config ignored — this device has not opted in \
