@@ -22,7 +22,22 @@ use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct WsParams {
-    pub token: String,
+    /// The credential, when it travels in the URL.
+    ///
+    /// **Optional since the session-cookie path landed.** A browser on our own
+    /// origin no longer needs it: the handshake is same-origin, so the
+    /// `access_token` cookie is attached automatically and
+    /// [`session_cookie`] reads it. Native clients (the agent, the tunnel
+    /// CLI) have no cookie jar and always send it.
+    ///
+    /// Why the browser should stop sending it: a query string is written to
+    /// every access log it passes through and kept in browser history, and
+    /// long-lived sockets reconnect constantly — so a 7-day credential piled
+    /// up in plaintext on disk. `files/nginx-pod.conf` currently answers that
+    /// with `access_log off` on `/ws`, which is a stopgap to be removed once
+    /// nothing emits `?token=` any more.
+    #[serde(default)]
+    pub token: Option<String>,
     /// Optional connection role. Defaults to `"user"` to preserve existing
     /// browser behaviour. Set to `"agent"` by the native remote-control agent.
     #[serde(default)]
@@ -59,10 +74,90 @@ pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
 ) -> Response {
     match params.role.as_deref() {
-        Some("agent") => ws_upgrade_agent(state, params.token, params.tid, ws),
-        Some("tunnel-client") => ws_upgrade_tunnel_client(state, params.token, params.tid, ws),
-        _ => ws_upgrade_user(state, params.token, params.tid, headers, ws).await,
+        // Native clients. They have no cookie jar, so the URL is the only
+        // place their credential can be — and accepting a cookie for these
+        // roles would mean a logged-in browser could open an AGENT socket.
+        Some("agent") => match params.token {
+            Some(t) => ws_upgrade_agent(state, t, params.tid, ws),
+            None => unauthorized("agent role requires ?token="),
+        },
+        Some("tunnel-client") => match params.token {
+            Some(t) => ws_upgrade_tunnel_client(state, t, params.tid, ws),
+            None => unauthorized("tunnel-client role requires ?token="),
+        },
+        _ => {
+            // Browser. Prefer the query token while older bundles are still
+            // cached and still sending it; otherwise the session cookie.
+            match params.token {
+                Some(t) => ws_upgrade_user(state, t, params.tid, headers, ws).await,
+                None => {
+                    let Some(t) = session_cookie(&headers) else {
+                        return unauthorized("no session");
+                    };
+                    // ⚠️ A cookie is AMBIENT: the browser attaches it to a
+                    // handshake the page never had to prove it could obtain.
+                    // A WebSocket upgrade is not subject to CORS, so any page
+                    // on the internet may open a socket here — meaning that
+                    // once a cookie is accepted, "who is asking" has to be
+                    // answered by the request rather than by the credential.
+                    //
+                    // `SameSite=Lax` already keeps the cookie off a
+                    // cross-site handshake, so this is the second lock, not
+                    // the only one. It applies ONLY to the cookie path: a
+                    // query token is a credential the caller had to get hold
+                    // of first, and native clients send no Origin at all.
+                    if !origin_is_ours(&state, &headers) {
+                        return forbidden("origin not permitted for cookie auth");
+                    }
+                    ws_upgrade_user(state, t, params.tid, headers, ws).await
+                }
+            }
+        }
     }
+}
+
+fn unauthorized(why: &str) -> Response {
+    debug!(reason = %why, "ws upgrade refused");
+    Response::builder()
+        .status(401)
+        .body("Unauthorized".into())
+        .unwrap()
+}
+
+fn forbidden(why: &str) -> Response {
+    // The reason stays server-side: it names our own configuration.
+    debug!(reason = %why, "ws upgrade refused");
+    Response::builder()
+        .status(403)
+        .body("Forbidden".into())
+        .unwrap()
+}
+
+/// The `access_token` session cookie, if the browser sent one.
+fn session_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())?;
+    raw.split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.strip_prefix("access_token=").map(str::to_string))
+        .filter(|t| !t.is_empty())
+}
+
+/// Is this handshake coming from a page we serve?
+///
+/// A browser ALWAYS sends `Origin` on a WebSocket handshake, so an absent one
+/// means the caller is not a browser — and a non-browser presenting a browser
+/// session cookie is not a case worth accommodating. Refuse.
+fn origin_is_ours(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let policy = crate::origin::policy_from_settings(&state.settings);
+    crate::origin::is_trusted(&policy, origin)
 }
 
 async fn ws_upgrade_user(
@@ -1466,4 +1561,42 @@ async fn handle_stop_audio(
     }
 
     info!(%rid, %playback_id, "Audio playback stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, header::COOKIE};
+
+    fn with_cookie(raw: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(COOKIE, HeaderValue::from_str(raw).unwrap());
+        h
+    }
+
+    #[test]
+    fn reads_the_session_cookie_among_others() {
+        // Real browsers send several; the session must be found wherever it
+        // sits, and a cookie whose name merely ENDS with ours must not match.
+        assert_eq!(
+            session_cookie(&with_cookie("access_token=abc.def.ghi")).as_deref(),
+            Some("abc.def.ghi")
+        );
+        assert_eq!(
+            session_cookie(&with_cookie("theme=dark; access_token=t0k; lang=en")).as_deref(),
+            Some("t0k")
+        );
+        assert_eq!(
+            session_cookie(&with_cookie("other_access_token=nope")),
+            None,
+            "a different cookie ending in our name must not be picked up"
+        );
+    }
+
+    #[test]
+    fn no_cookie_header_and_an_empty_value_both_yield_none() {
+        assert_eq!(session_cookie(&HeaderMap::new()), None);
+        assert_eq!(session_cookie(&with_cookie("access_token=")), None);
+        assert_eq!(session_cookie(&with_cookie("theme=dark")), None);
+    }
 }

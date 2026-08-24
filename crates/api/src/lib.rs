@@ -3,6 +3,7 @@ pub mod error;
 pub mod extractors;
 pub mod media_stats;
 pub mod middleware;
+pub mod origin;
 pub mod rate_limit;
 pub mod relay_load;
 pub mod routes;
@@ -30,27 +31,33 @@ use tower_http::{
 };
 
 fn build_cors_layer(origins: &[String], frontend_url: &str) -> CorsLayer {
-    // Explicit "*" = the operator deliberately chose permissive mode.
-    if origins.iter().any(|o| o == "*") {
-        tracing::warn!("CORS is configured fully permissive (cors_origins contains \"*\")");
-        return CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any);
-    }
-
-    let mut allowed: Vec<axum::http::HeaderValue> =
-        origins.iter().filter_map(|o| o.parse().ok()).collect();
+    // The allow-list is computed by `origin::origin_policy`, which the `/ws`
+    // upgrade also consults before honouring a session COOKIE. Sharing the
+    // answer is the point: two hand-rolled copies of "an origin we trust"
+    // would drift, and the copy that drifts loose is an authenticated socket
+    // for somebody else's page.
+    //
     // Tightened default (2026-07-28, closes the "Any-origin fallback"
     // Known Issue): with no cors_origins configured, allow only the
     // frontend's own origin instead of every origin. Same-origin app
     // traffic never needed CORS; native clients (agent, tunnel CLI,
     // desktop) don't enforce it — so nothing legitimate relied on Any.
-    if origins.is_empty()
-        && let Ok(v) = frontend_url.trim_end_matches('/').parse()
-    {
-        allowed.push(v);
-    }
+    let policy = crate::origin::origin_policy(origins, frontend_url);
+
+    // Explicit "*" = the operator deliberately chose permissive mode.
+    let allowed_strs = match policy {
+        crate::origin::OriginPolicy::AnyOrigin => {
+            tracing::warn!("CORS is configured fully permissive (cors_origins contains \"*\")");
+            return CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any);
+        }
+        crate::origin::OriginPolicy::Only(list) => list,
+    };
+
+    let allowed: Vec<axum::http::HeaderValue> =
+        allowed_strs.iter().filter_map(|o| o.parse().ok()).collect();
     if allowed.is_empty() {
         // Nothing parseable — fail open rather than brick every browser
         // client, but say so loudly.
