@@ -300,12 +300,11 @@ fn ws_upgrade_agent(
                     return;
                 }
             };
-            if agent.deleted_at.is_some()
-                || matches!(
-                    agent.status,
-                    roomler_ai_remote_control::models::AgentStatus::Quarantined
-                )
-            {
+            // One definition of "this agent may still act", shared with the
+            // HTTP ingest routes' `AuthAgent` extractor. This path is the
+            // original; the extractor exists because two HTTP routes had
+            // silently never grown the equivalent.
+            if let Some(reason) = crate::extractors::agent::refusal_reason(&agent) {
                 // rc.53: push a `ServerMsg::Goodbye { reason: AgentDeleted }`
                 // text frame + a Close frame BEFORE dropping the socket so
                 // the agent can log a useful "your row was deleted, re-enrol"
@@ -315,7 +314,7 @@ fn ws_upgrade_agent(
                 // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
                 // the SCM supervisor's rc.53 code-7 fast-alarm fires on the
                 // FIRST exit.
-                info!(%agent_id, "agent is quarantined or deleted; refusing WS with rc:goodbye");
+                info!(%agent_id, reason, "refusing WS with rc:goodbye");
                 let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
                     reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
                     message: "This agent's server-side row was deleted (or quarantined). \

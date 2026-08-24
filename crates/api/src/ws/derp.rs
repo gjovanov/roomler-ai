@@ -216,6 +216,51 @@ pub async fn derp_upgrade(
                 .unwrap();
         }
     };
+    let tenant_id = match ObjectId::parse_str(&claims.tenant_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tenant ID".into())
+                .unwrap();
+        }
+    };
+
+    // The agent's row is the revocation list — an agent token is valid for a
+    // year, so its signature says nothing about whether we still accept the
+    // device. DELETION was already covered here by accident: the cascade
+    // tombstones the overlay node, and `current_node` below is live-scoped, so
+    // a deleted agent found no node. QUARANTINE was not — it leaves the node
+    // row alone, so a quarantined device kept relaying through DERP.
+    //
+    // Checked BEFORE the upgrade: refusing the handshake is a clean signal,
+    // whereas accepting and then dropping looks like a network fault to a
+    // client that marks its mux "up" on send.
+    match state.agents.find_in_tenant(tenant_id, agent_id).await {
+        Ok(agent) => {
+            if let Some(reason) = crate::extractors::agent::refusal_reason(&agent) {
+                info!(%agent_id, %tenant_id, reason, "derp: REFUSED before upgrade");
+                return Response::builder()
+                    .status(401)
+                    .body("Unauthorized (derp)".into())
+                    .unwrap();
+            }
+        }
+        Err(e) => {
+            // Fail closed. This does NOT make DERP newly dependent on Mongo:
+            // `handle_derp_socket` already resolves the overlay node through
+            // `current_node`, which is `.ok().flatten()` — so a DB error was
+            // already a refusal, just a later and quieter one. Moving it here
+            // only changes WHERE the same refusal happens, and gives it a
+            // reason in the log.
+            info!(%agent_id, %tenant_id, %e, "derp: REFUSED — agent row unavailable");
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (derp)".into())
+                .unwrap();
+        }
+    }
+
     ws.max_message_size(crate::ws::MAX_WS_MESSAGE_BYTES)
         .max_frame_size(crate::ws::MAX_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_derp_socket(state, socket, agent_id))
