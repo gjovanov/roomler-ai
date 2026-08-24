@@ -169,6 +169,11 @@ pub struct DaemonState {
     /// [`OrgViewRegistry`]). `None`/empty ⇒ single-org: `peers` returns the
     /// primary's flat list exactly as before.
     org_views: Option<OrgViewRegistry>,
+    /// The daemon's live gate-4 flags, so a `ConfigSet` here takes effect at
+    /// the same moment a pushed change would (`docs/remote-config.md`).
+    /// `None` in unit tests → the save still lands, only the live re-seed is
+    /// skipped.
+    remote_config: Option<crate::remote_config::RemoteConfigServices>,
 }
 
 /// Multi-org P1 — one enrollment's live handles, seeded by `run_cmd` and
@@ -233,6 +238,7 @@ impl DaemonState {
             config_persist: None,
             orgs: None,
             org_views: None,
+            remote_config: None,
         }
     }
 
@@ -271,6 +277,21 @@ impl DaemonState {
         lock: crate::config::WriteLock,
     ) -> Self {
         self.config_persist = Some((path, lock));
+        self
+    }
+
+    /// Attach the daemon's live gate-4 flags so a `ConfigSet` through this
+    /// LocalAPI takes effect at the same moment a SERVER push would.
+    ///
+    /// Without it, `exec_enabled` had an inversion: a pushed change was live
+    /// immediately while the owner's own edit sat in the file until the daemon
+    /// restarted. Gate 4 is the refusal that belongs to whoever holds the
+    /// machine; it cannot be the slower of the two.
+    pub fn with_remote_config(
+        mut self,
+        remote_config: crate::remote_config::RemoteConfigServices,
+    ) -> Self {
+        self.remote_config = Some(remote_config);
         self
     }
 
@@ -698,13 +719,23 @@ impl LocalApiState for DaemonState {
                 crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
             crate::config_surface::apply(&mut cfg, &key, value.as_deref())?;
             crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
-            crate::config_surface::entry_for(&cfg, &key)
-                .ok_or_else(|| format!("unknown config key {key:?}"))
+            let entry = crate::config_surface::entry_for(&cfg, &key)
+                .ok_or_else(|| format!("unknown config key {key:?}"))?;
+            Ok((entry, cfg))
         })
         .await
         .unwrap_or_else(|e| Err(format!("config set task join: {e}")));
         match saved {
-            Ok(entry) => {
+            Ok((entry, cfg)) => {
+                // Re-seed the LIVE gate-4 flags from what was just written,
+                // still under the write lock. Everything else on this surface
+                // genuinely is restart-required; `exec_enabled` and
+                // `remote_config_enabled` are not, and leaving them stale here
+                // would mean a SERVER push took effect faster than the owner's
+                // own decision (docs/remote-config.md).
+                if let Some(rc) = self.remote_config.as_ref() {
+                    rc.adopt_local(&cfg);
+                }
                 tracing::info!(key = %entry.key, value = ?entry.value,
                     "localapi: config key updated (takes effect on restart)");
                 Response::ConfigUpdated { entry }
