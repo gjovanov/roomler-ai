@@ -342,12 +342,19 @@ jobs:
           # Every launchd job this package installs must have a DISTINCT Label:
           # launchctl refuses the second bootstrap of a duplicate and the error
           # reads "already loaded" rather than "you shipped one label twice".
-          # Derived from the directory, so a fourth plist is covered the day it
-          # lands rather than the day someone remembers to add it here.
-          labels=$(for p in agents/roomler-agent/packaging/macos/*.plist; do
-                     plutil -extract Label raw "$p"
+          #
+          # Globbed on `com.roomler.*` — the launchd jobs — rather than every
+          # .plist in the directory, which also holds entitlements.plist (a
+          # codesign input with no Label at all).
+          labels=$(for p in agents/roomler-agent/packaging/macos/com.roomler.*.plist; do
+                     plutil -extract Label raw "$p" \
+                       || { echo "::error::$p has no Label"; exit 1; }
                    done)
           echo "$labels" | sed 's/^/  label: /'
+          # agent + daemon + desktop. A lower count means a job stopped being
+          # globbed, which would silently make the duplicate check vacuous.
+          count=$(echo "$labels" | grep -c .)
+          [ "$count" -ge 3 ] || { echo "::error::expected >=3 launchd jobs, found $count"; exit 1; }
           dupes=$(echo "$labels" | sort | uniq -d)
           [ -z "$dupes" ] || { echo "::error::duplicate launchd Label(s): $dupes"; exit 1; }
           grep -q '/Applications/roomler-agent.app/Contents/MacOS/roomler-agent' \
