@@ -1657,6 +1657,31 @@ pub async fn connect() -> std::io::Result<Client> {
     }
 }
 
+/// The OTHER daemon's socket, when this host runs two and [`connect`] would
+/// have taken the per-user one.
+///
+/// macOS installs two halves by necessity — a per-user LaunchAgent for capture
+/// and input, a root LaunchDaemon for the overlay — and they listen on
+/// different sockets. `connect()` prefers the per-user one, so an unprivileged
+/// `roomler status` on such a host answers for the half that has no overlay and
+/// prints `overlay ip —`, while `roomler peers` prints nothing. Both are
+/// truthful about the process they reached and completely misleading about the
+/// machine, which reads as "the overlay is broken".
+///
+/// Returns `Some(path)` only when BOTH exist, i.e. exactly when a caller could
+/// be looking at the wrong one.
+#[cfg(unix)]
+pub fn other_daemon_socket() -> Option<std::path::PathBuf> {
+    let [user, system] = unix_socket_candidates();
+    (user.exists() && system.exists()).then_some(system)
+}
+
+/// Windows runs a single daemon, so there is never another one to point at.
+#[cfg(windows)]
+pub fn other_daemon_socket() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Named-pipe connect, parameterised on the pipe name so tests can target a
 /// private one. Retries ONCE on `ERROR_PIPE_BUSY` (the server is momentarily
 /// between instances — it pre-creates the next on each accept, but there's a

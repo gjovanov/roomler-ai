@@ -94,7 +94,7 @@ export function enrollCommands(
   // legacy name (renaming it would void the TCC grants keyed to that binary),
   // and there is no `roomlerd` anywhere on the box — so the generic
   // `roomlerd enroll` this used to print could not work on a Mac.
-  const macAgentBin = '/Applications/roomler-agent.app/Contents/MacOS/roomler-agent'
+  const macAgentBin = '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent'
 
   const manual = (os: EnrollOs): CommandBlock => ({
     id: `${kind}-${os}-manual`,
