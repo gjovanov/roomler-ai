@@ -449,6 +449,90 @@ jobs:
       - name: Clippy roomler-agent (overlay-l3 + ssh-server, incl. tests)
         run: cargo clippy -p roomler-agent --features overlay-l3,ssh-server --tests -- -D warnings
 
+  ffmpeg-encoder-check:
+    # `ffmpeg-encoder` compiled in NO pull-request lane. It needs a vendored
+    # FFmpeg 8.1.2 (Ubuntu apt ships 6.1 and `ffmpeg-next = 8.1` needs 8.x),
+    # so the only place it has ever been built is release-agent.yml — at TAG
+    # time, on the slowest feedback loop there is.
+    #
+    # That is the exact shape as the macOS job above, which exists because
+    # tag-time-only compilation broke three releases in a row. This one guards
+    # the main video pump's hardware-encoder backend, so the same accident
+    # here fails a release after every other artifact has already built.
+    #
+    # A SEPARATE job rather than a step in `rust`, deliberately: that job has a
+    # 20-minute timeout against a 4-5 minute warm baseline, and the timeout is
+    # load-bearing (it turns an apt-mirror stall into a fast, loud failure).
+    # Bolting a from-source FFmpeg-linked compile onto it would spend that
+    # headroom and make the timeout meaningless.
+    name: ffmpeg-encoder compile + dispatch locks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
+        with:
+          shared-key: ci-ffmpeg-encoder
+          cache-on-failure: true
+      - name: Install build deps (cached apt)
+        # libclang is bindgen's runtime requirement (ffmpeg-sys-next generates
+        # its FFI at build time); pkg-config is how the vendored tree is found.
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: pkg-config libclang-dev
+          version: ci-ffmpeg-v1
+      - name: Fetch vendored FFmpeg 8.1.2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The SAME artifact release-agent.yml consumes, so this lane and the
+          # tag build cannot disagree about what "the FFmpeg backend" compiles
+          # against. Minimal build: exactly the ten encoders the cascade
+          # dispatches, whole lib dir ~2.5 MB.
+          gh release download vendored-ffmpeg-8.1.2 \
+            --repo "${{ github.repository }}" \
+            --pattern 'ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz' \
+            --dir /tmp/ffdl
+          sudo mkdir -p /opt/roomler-ffmpeg
+          sudo tar xf /tmp/ffdl/ffmpeg-8.1.2-linux64-lgpl-shared-minimal.tar.xz \
+            -C /opt/roomler-ffmpeg --strip-components=1
+          # The .pc files hardcode the vendor machine's prefix.
+          sudo sed -i "s|^prefix=.*|prefix=/opt/roomler-ffmpeg|" \
+            /opt/roomler-ffmpeg/lib/pkgconfig/*.pc
+          {
+            echo "FFMPEG_DIR=/opt/roomler-ffmpeg"
+            echo "PKG_CONFIG_PATH=/opt/roomler-ffmpeg/lib/pkgconfig"
+            echo "LD_LIBRARY_PATH=/opt/roomler-ffmpeg/lib"
+          } >> "$GITHUB_ENV"
+      - name: Prove pkg-config resolved the VENDORED tree
+        # ⚠️ Without this, a silent fall-through to some system FFmpeg would
+        # make the lane pass against a library the release never ships — a
+        # green tick that proves nothing, which is the failure mode this
+        # whole class of gate exists to avoid. Assert the prefix, not the
+        # version: the prefix is the property that distinguishes the two.
+        run: |
+          set -euo pipefail
+          prefix=$(pkg-config --variable=prefix libavcodec)
+          echo "libavcodec $(pkg-config --modversion libavcodec) from $prefix"
+          if [ "$prefix" != "/opt/roomler-ffmpeg" ]; then
+            echo "::error::pkg-config resolved libavcodec to '$prefix', not the vendored tree — this lane would be testing the wrong library"
+            exit 1
+          fi
+      - name: Test agent --features ffmpeg-encoder
+        # Test, not merely check. The ten encoder names the cascade dispatches
+        # (`*_nvenc`/`*_qsv`/`*_amf` x h264/hevc/av1, plus `vp9_qsv`) are locked
+        # by unit tests, and those locks are exactly what keeps the minimal
+        # vendored build and the dispatch table from drifting apart — a drift
+        # that is invisible until a device silently falls back to software.
+        # They need the library present, not a GPU.
+        run: cargo test -p roomler-agent --features ffmpeg-encoder --lib
+
   frontend:
     name: Frontend checks
     runs-on: ubuntu-latest
