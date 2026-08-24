@@ -82,10 +82,23 @@ impl ScrapCapture {
                         Ok(d) => d,
                         Err(e) => break Err(anyhow!("no primary display: {e}")),
                     };
-                    let w = display.width() as u32;
-                    let h = display.height() as u32;
                     match Capturer::new(display) {
-                        Ok(cap) => break Ok((cap, w, h)),
+                        // Dims come from the CAPTURER, never the Display.
+                        //
+                        // On macOS the stream is sized in PIXELS while
+                        // `Display::width/height` report POINTS, so on a Retina
+                        // panel they differ by 2x per axis. Reading them from the
+                        // Display would describe every frame with half its true
+                        // size — and describing a frame with the wrong height is
+                        // precisely the mismatch that sheared macOS capture
+                        // before (see `frame_stride`). Elsewhere (DXGI, X11) the
+                        // capturer reports the display's own size, so this is a
+                        // no-op there.
+                        Ok(cap) => {
+                            let w = cap.width() as u32;
+                            let h = cap.height() as u32;
+                            break Ok((cap, w, h));
+                        }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::PermissionDenied
                                 && attempt < INIT_MAX_ATTEMPTS =>
