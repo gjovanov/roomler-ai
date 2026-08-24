@@ -1941,8 +1941,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p payload/Applications payload/usr/local/bin scripts dist
-          cp -R stage/roomler-agent.app payload/Applications/
+          mkdir -p payload/Applications payload/Library/Roomler payload/usr/local/bin scripts dist
+          # The DAEMON bundle goes to /Library/Roomler, NOT /Applications.
+          #
+          # It is a background service with no window and nothing to launch —
+          # putting it in /Applications gave the user two Roomler icons, one of
+          # which does nothing when double-clicked, and made the internal
+          # `roomler-agent` name look like a stale leftover next to `Roomler`.
+          # /Library/<Vendor> is the conventional home for a helper the user
+          # never opens, and Finder and Launchpad do not surface it.
+          #
+          # Still a BUNDLE, not a bare binary: TCC attributes Screen Recording
+          # and Accessibility to a bundle identity, and Info.plist carries the
+          # two usage descriptions macOS shows in the permission prompt.
+          #
+          # ⚠️ The path is part of the TCC identity, so this move costs every
+          # existing Mac one re-grant. Unavoidable, and cheapest now while the
+          # platform has almost no installs.
+          cp -R stage/roomler-agent.app payload/Library/Roomler/
           # The CLI. Until rc.454 the macOS payload was the .app and NOTHING
           # else — no `roomler` on PATH, so `roomler peers` was impossible on a
           # Mac even though the daemon carries the whole command surface. Same
@@ -1959,7 +1975,7 @@ jobs:
           # bundle (its name is CFBundleExecutable and every launchd plist and
           # TCC grant is keyed to that path), so this is a convenience entry
           # point for `roomlerd enroll` / `--version`, not a second install.
-          ln -s /Applications/roomler-agent.app/Contents/MacOS/roomler-agent \
+          ln -s /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent \
             payload/usr/local/bin/roomlerd
           cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall

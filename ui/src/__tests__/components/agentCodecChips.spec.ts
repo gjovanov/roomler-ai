@@ -144,4 +144,13 @@ describe('permissionWarnings', () => {
   it('says nothing when the agent has no capabilities at all', () => {
     expect(permissionWarnings(makeAgent(undefined))).toEqual([])
   })
+
+  // The THIRD state. macOS's root LaunchDaemon has no GUI session, so capture
+  // and input are impossible there regardless of grants — it is not a device
+  // with missing permissions, it is not a capture target. Warning about it
+  // sends the operator after a toggle that would change nothing, which is
+  // exactly what the device list did on a real two-half Mac.
+  it('says nothing about a device that has no GUI session', () => {
+    expect(permissionWarnings(makeAgent(caps(['no-gui-session'])))).toEqual([])
+  })
 })

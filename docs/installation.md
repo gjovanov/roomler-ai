@@ -152,8 +152,8 @@ both toggles need re-enabling.
 
 | | |
 |---|---|
-| `/Applications/roomler-agent.app` | the daemon (its executable is `roomler-agent`; renaming it would void the TCC grants keyed to that binary) |
-| `/Applications/Roomler.app` | the **menu-bar companion** — status, routes, and the permissions panel. `LSUIElement`, so no Dock tile |
+| `/Applications/Roomler.app` | the **menu-bar companion** — status, routes, and the permissions panel. `LSUIElement`, so no Dock tile. The only Roomler icon you should see |
+| `/Library/Roomler/roomler-agent.app` | the daemon. A background service with nothing to launch, so it is deliberately NOT in `/Applications`; still a bundle, because TCC attributes the two permissions to a bundle identity |
 | `/usr/local/bin/roomler` | the CLI (a small shim onto the daemon's own command surface) |
 | `/usr/local/bin/roomlerd` | the daemon on PATH, for `roomlerd enroll` / `--version` — a symlink into the bundle, not a second copy |
 
@@ -168,7 +168,7 @@ command reports "daemon not running", you are probably asking the wrong half.
 
 | | Path |
 |---|---|
-| App bundle | `/Applications/roomler-agent.app` (executable is `roomler-agent`, not `roomlerd` — renaming it would void the TCC grants) |
+| App bundle | `/Library/Roomler/roomler-agent.app` (executable is `roomler-agent`, not `roomlerd` — renaming it would void the TCC grants) |
 | Per-user config | `~/Library/Application Support/live.roomler.roomler/config.toml` |
 | Root config | `/etc/roomler-agent/config.toml` |
 | Per-user log | `/tmp/roomler-agent.err.log` |
@@ -187,7 +187,7 @@ launchctl bootout "gui/$(id -u)/com.roomler.desktop"
 sudo launchctl bootout system/com.roomler.daemon          # if the root half is installed
 rm -f ~/Library/LaunchAgents/com.roomler.{agent,desktop}.plist
 sudo rm -f /Library/LaunchDaemons/com.roomler.daemon.plist
-sudo rm -rf /Applications/roomler-agent.app /Applications/Roomler.app \
+sudo rm -rf /Library/Roomler /Applications/Roomler.app /Applications/roomler-agent.app \
             /usr/local/bin/roomler /usr/local/bin/roomlerd /etc/roomler-agent
 rm -rf ~/Library/Application\ Support/live.roomler.roomler
 ```
