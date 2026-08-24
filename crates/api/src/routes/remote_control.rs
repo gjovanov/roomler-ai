@@ -290,6 +290,165 @@ pub struct AgentResponse {
     /// default is reported as absent instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_policy: Option<crate::routes::agent_ssh::SshPolicyBody>,
+    /// Remote config — what an operator has ASKED this device to run, and what
+    /// the device SAID it did (`docs/remote-config.md`).
+    ///
+    /// Absent when nothing has ever been requested. The two halves have to
+    /// travel together: a report alone cannot be read (it may be about an
+    /// older revision), and a request alone cannot be read either (a pending
+    /// change and a refused one look identical without the answer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_config: Option<RemoteConfigView>,
+}
+
+/// The remote-config state of one device, as the dashboard needs to read it.
+///
+/// Deliberately assembled here rather than serialising the two model fields
+/// straight out. Beyond the usual `{"$oid": …}` problem, the honest answer to
+/// "did this land?" is a comparison — desired revision vs reported revision vs
+/// what the device is even capable of saying — and doing that comparison in
+/// one place beats doing it in every client that asks.
+#[derive(Debug, Serialize)]
+pub struct RemoteConfigView {
+    /// The keys under management, as requested.
+    pub desired: DesiredConfigView,
+    /// The device's last word, if it has said one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<ConfigReportView>,
+    /// Where this stands, resolved server-side — see [`RemoteConfigState`].
+    pub state: RemoteConfigState,
+}
+
+/// Where a device's remote config stands. One enum rather than three booleans
+/// on the client, because these are mutually exclusive and a client that
+/// derived them separately would eventually render two at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteConfigState {
+    /// The device confirmed this exact revision, and everything asked for is
+    /// in force.
+    Applied,
+    /// Confirmed, but some keys only take effect after a daemon restart. A
+    /// SEPARATE state from `applied` on purpose: reporting them as one would
+    /// tell an operator SSH is open while the device still refuses every
+    /// session.
+    NeedsRestart,
+    /// The device refused — see `report.outcome` for which refusal. Both of
+    /// them have a concrete next action, which is why they are surfaced rather
+    /// than folded into "not applied".
+    Refused,
+    /// The device tried and failed; `report.detail` says why.
+    Failed,
+    /// Requested, and we are waiting for the device to say something about
+    /// THIS revision. Includes "it has not reconnected yet" — reconcile
+    /// happens on connect.
+    Pending,
+    /// The device's agent understands a pushed config but predates
+    /// [`RpcCap::ConfigReport`], so it may well have applied this perfectly
+    /// and will never say so. Distinct from `pending` because waiting is
+    /// futile here and the fix is to update the device.
+    ///
+    /// [`RpcCap::ConfigReport`]: roomler_ai_remote_control::models::RpcCap::ConfigReport
+    ReportsUnsupported,
+    /// The device's agent predates `rc:agent.config` entirely — the push is
+    /// not even sent. Nothing will happen until it is updated.
+    PushUnsupported,
+}
+
+/// [`DesiredConfig`] with hex ids and an RFC3339 timestamp.
+///
+/// [`DesiredConfig`]: roomler_ai_remote_control::models::DesiredConfig
+#[derive(Debug, Serialize)]
+pub struct DesiredConfigView {
+    pub revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_authorized_keys: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_account_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// [`ConfigReport`] with an RFC3339 timestamp.
+///
+/// [`ConfigReport`]: roomler_ai_remote_control::models::ConfigReport
+#[derive(Debug, Serialize)]
+pub struct ConfigReportView {
+    pub revision: u64,
+    pub outcome: roomler_ai_remote_control::models::ConfigOutcome,
+    pub live: Vec<String>,
+    pub needs_restart: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub reported_at: String,
+}
+
+/// Resolve the desired config + the device's report + its capabilities into
+/// the one thing a reader wants: where this stands.
+///
+/// ⚠️ The revision comparison is the load-bearing part. A report for an OLDER
+/// revision is a device that has not caught up — which looks exactly like a
+/// refusal if you only read `outcome`, and exactly like success if you only
+/// read "there is a report". Both misreadings put a wrong answer on a screen
+/// an operator is using to decide whether a device is safe.
+fn remote_config_view(
+    desired: roomler_ai_remote_control::models::DesiredConfig,
+    report: Option<roomler_ai_remote_control::models::ConfigReport>,
+    caps: &roomler_ai_remote_control::models::AgentCaps,
+) -> Option<RemoteConfigView> {
+    use roomler_ai_remote_control::models::{ConfigOutcome, RpcCap};
+
+    if desired.is_empty() {
+        return None;
+    }
+    let current = report.as_ref().filter(|r| r.revision == desired.revision);
+    let state = match current.map(|r| r.outcome) {
+        Some(ConfigOutcome::Applied | ConfigOutcome::Noop) => {
+            // `needs_restart` beats `applied`: the half that is merely written
+            // down is the half an operator will otherwise act on wrongly.
+            if current.is_some_and(|r| !r.needs_restart.is_empty()) {
+                RemoteConfigState::NeedsRestart
+            } else {
+                RemoteConfigState::Applied
+            }
+        }
+        Some(ConfigOutcome::NotOptedIn | ConfigOutcome::NotPrimary) => RemoteConfigState::Refused,
+        Some(ConfigOutcome::Failed) => RemoteConfigState::Failed,
+        // No report for THIS revision. Which of the three "no answer" states
+        // it is depends on what the device can do, not on how long we waited.
+        None if !caps.has_rpc(RpcCap::Config) => RemoteConfigState::PushUnsupported,
+        None if !caps.has_rpc(RpcCap::ConfigReport) => RemoteConfigState::ReportsUnsupported,
+        None => RemoteConfigState::Pending,
+    };
+    Some(RemoteConfigView {
+        desired: DesiredConfigView {
+            revision: desired.revision,
+            exec_enabled: desired.exec_enabled,
+            ssh_enabled: desired.ssh_enabled,
+            ssh_authorized_keys: desired.ssh_authorized_keys,
+            ssh_account_mode: desired.ssh_account_mode,
+            ssh_port: desired.ssh_port,
+            updated_by: desired.updated_by.map(|i| i.to_hex()),
+            updated_at: desired.updated_at.map(fmt_dt),
+        },
+        report: report.map(|r| ConfigReportView {
+            revision: r.revision,
+            outcome: r.outcome,
+            live: r.live,
+            needs_restart: r.needs_restart,
+            detail: r.detail,
+            reported_at: fmt_dt(r.reported_at),
+        }),
+        state,
+    })
 }
 
 /// `None` for a policy that is byte-for-byte the untouched default — see
@@ -923,6 +1082,9 @@ fn to_agent_response(
     // Back-compat: `is_online` = the reachable state only. (Pre-A-1 it
     // was `hub_online || recently_seen`, which is what lied green.)
     let is_online = matches!(presence, AgentPresence::Online);
+    // Resolved before the struct literal moves `capabilities`: the
+    // remote-config state depends on which verbs this device advertises.
+    let remote_config = remote_config_view(a.desired_config, a.config_report, &a.capabilities);
     AgentResponse {
         presence,
         id,
@@ -942,6 +1104,7 @@ fn to_agent_response(
         relay_home: a.relay_home,
         exec_policy: configured_only(a.exec_policy),
         ssh_policy: configured_only(a.ssh_policy),
+        remote_config,
     }
 }
 
@@ -999,6 +1162,160 @@ fn normalize_routes(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
         )));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod remote_config_state_tests {
+    use super::{RemoteConfigState, remote_config_view};
+    use roomler_ai_remote_control::models::{
+        AgentCaps, ConfigOutcome, ConfigReport, DesiredConfig, RpcCap,
+    };
+
+    fn caps(verbs: &[RpcCap]) -> AgentCaps {
+        AgentCaps {
+            rpc: verbs.iter().map(|v| v.wire().to_string()).collect(),
+            ..Default::default()
+        }
+    }
+    fn modern() -> AgentCaps {
+        caps(&[RpcCap::Config, RpcCap::ConfigReport])
+    }
+    fn desired(revision: u64) -> DesiredConfig {
+        DesiredConfig {
+            exec_enabled: Some(true),
+            revision,
+            ..Default::default()
+        }
+    }
+    fn report(revision: u64, outcome: ConfigOutcome, needs_restart: &[&str]) -> ConfigReport {
+        ConfigReport {
+            revision,
+            outcome,
+            live: vec![],
+            needs_restart: needs_restart.iter().map(|s| s.to_string()).collect(),
+            detail: None,
+            reported_at: bson::DateTime::now(),
+        }
+    }
+    fn state(
+        d: DesiredConfig,
+        r: Option<ConfigReport>,
+        c: &AgentCaps,
+    ) -> Option<RemoteConfigState> {
+        remote_config_view(d, r, c).map(|v| v.state)
+    }
+
+    #[test]
+    fn nothing_requested_is_not_a_state_at_all() {
+        assert!(remote_config_view(DesiredConfig::default(), None, &modern()).is_none());
+    }
+
+    /// The comparison this whole view exists for. A device that answered about
+    /// revision 3 has said NOTHING about revision 4 — reading its old
+    /// `outcome` would show a stale "applied" over a change that has not
+    /// landed, which is the most dangerous wrong answer available here.
+    #[test]
+    fn a_report_about_an_older_revision_is_not_an_answer() {
+        assert_eq!(
+            state(
+                desired(4),
+                Some(report(3, ConfigOutcome::Applied, &[])),
+                &modern()
+            ),
+            Some(RemoteConfigState::Pending)
+        );
+        // …and the stale report is still RETURNED, so a UI can say what the
+        // device last confirmed. It just doesn't decide the state.
+        let view = remote_config_view(
+            desired(4),
+            Some(report(3, ConfigOutcome::Applied, &[])),
+            &modern(),
+        )
+        .unwrap();
+        assert_eq!(view.report.map(|r| r.revision), Some(3));
+    }
+
+    #[test]
+    fn applied_and_noop_both_mean_converged() {
+        for outcome in [ConfigOutcome::Applied, ConfigOutcome::Noop] {
+            assert_eq!(
+                state(desired(1), Some(report(1, outcome, &[])), &modern()),
+                Some(RemoteConfigState::Applied),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// `needs_restart` must WIN over `applied`. The keys in that list are
+    /// written to disk and not in force; calling the device "applied" would
+    /// tell an operator SSH is open while it refuses every session.
+    #[test]
+    fn a_pending_restart_is_never_reported_as_applied() {
+        assert_eq!(
+            state(
+                desired(1),
+                Some(report(1, ConfigOutcome::Applied, &["ssh_enabled"])),
+                &modern()
+            ),
+            Some(RemoteConfigState::NeedsRestart)
+        );
+    }
+
+    #[test]
+    fn both_refusals_are_refusals_and_a_failure_is_not() {
+        for outcome in [ConfigOutcome::NotOptedIn, ConfigOutcome::NotPrimary] {
+            assert_eq!(
+                state(desired(1), Some(report(1, outcome, &[])), &modern()),
+                Some(RemoteConfigState::Refused),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(
+            state(
+                desired(1),
+                Some(report(1, ConfigOutcome::Failed, &[])),
+                &modern()
+            ),
+            Some(RemoteConfigState::Failed)
+        );
+    }
+
+    /// Silence means three different things, and only one of them is worth
+    /// waiting through. Collapsing them into "pending" would leave an operator
+    /// watching a spinner for an answer that is never coming.
+    #[test]
+    fn silence_is_disambiguated_by_what_the_device_can_do() {
+        // Modern agent, no answer yet — genuinely pending.
+        assert_eq!(
+            state(desired(1), None, &modern()),
+            Some(RemoteConfigState::Pending)
+        );
+        // rc.457/rc.458-era: applies pushed config, never reports. Waiting is
+        // futile; the fix is an update.
+        assert_eq!(
+            state(desired(1), None, &caps(&[RpcCap::Config])),
+            Some(RemoteConfigState::ReportsUnsupported)
+        );
+        // Predates the push entirely — the server does not even send it.
+        assert_eq!(
+            state(desired(1), None, &caps(&[RpcCap::Exec])),
+            Some(RemoteConfigState::PushUnsupported)
+        );
+    }
+
+    /// `config` is a PREFIX of `config-report`. A device advertising only
+    /// `config` must not be read as report-capable, or every rc.458 device in
+    /// the fleet shows "pending" forever.
+    #[test]
+    fn the_config_prefix_does_not_imply_reporting() {
+        let old = caps(&[RpcCap::Config]);
+        assert!(old.has_rpc(RpcCap::Config));
+        assert!(!old.has_rpc(RpcCap::ConfigReport));
+        assert_eq!(
+            state(desired(1), None, &old),
+            Some(RemoteConfigState::ReportsUnsupported)
+        );
+    }
 }
 
 #[cfg(test)]

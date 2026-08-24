@@ -275,6 +275,22 @@ pub enum RpcCap {
     /// and carries on — so without this verb a dashboard would show a change
     /// that simply evaporated.
     Config,
+    /// `rc:agent.config_status` — the agent reports back what it DID with a
+    /// pushed desired-config.
+    ///
+    /// ⚠️ Distinct from [`Self::Config`] for the reason [`Self::SshConsent`] is
+    /// distinct from [`Self::Ssh`], and this is the second time that shape has
+    /// occurred exactly as `SshConsent`'s doc predicted: agents rc.457 and
+    /// rc.458 shipped `config` — they apply a pushed config and say NOTHING
+    /// about it. Folding the report into `config` would tell the dashboard
+    /// "this device reports its outcome" about a fleet that does not, so a
+    /// device that refused would be indistinguishable from one still thinking
+    /// about it. A verb is finer-grained than a version check.
+    ///
+    /// ⚠️ `config` is a PREFIX of `config-report` and they mean different
+    /// things, so matching must stay equality — see
+    /// [`AgentCaps::has_rpc`] and the test that locks it.
+    ConfigReport,
 }
 
 impl RpcCap {
@@ -291,16 +307,18 @@ impl RpcCap {
             Self::Ssh => "ssh",
             Self::SshConsent => "ssh-consent",
             Self::Config => "config",
+            Self::ConfigReport => "config-report",
         }
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 5] = [
+    pub const ALL: [RpcCap; 6] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
         Self::SshConsent,
         Self::Config,
+        Self::ConfigReport,
     ];
 
     /// Parse a wire verb. `None` for anything unrecognised — see
@@ -623,6 +641,20 @@ pub struct Agent {
     /// requested", which is also what an operator clearing the form leaves.
     #[serde(default)]
     pub desired_config: DesiredConfig,
+    /// What the DEVICE last said it did with [`Self::desired_config`].
+    ///
+    /// `None` = it has never reported. That is three different situations —
+    /// it has not connected since the push, its agent predates
+    /// [`RpcCap::ConfigReport`], or nothing has ever been pushed — and the
+    /// reader must resolve which from the capability list and the revision,
+    /// never assume the last one.
+    ///
+    /// ⚠️ Read this ALONGSIDE [`Self::desired_config`], never instead of it:
+    /// a report whose `revision` is behind the desired one is a device that
+    /// has not caught up, which reads on a dashboard exactly like a device
+    /// that refused unless the two numbers are compared.
+    #[serde(default)]
+    pub config_report: Option<ConfigReport>,
     /// Subnet-router CIDRs this agent is a gateway for (Phase 2). The SOCKS
     /// mesh longest-prefix-matches a LAN-IP target against these to pick the
     /// covering agent, which then dials the real IP (still gated by the
@@ -795,6 +827,88 @@ impl DesiredConfig {
             || self.ssh_account_mode.is_some()
             || self.ssh_port.is_some()
     }
+}
+
+/// What a device did with a pushed [`DesiredConfig`].
+///
+/// ⚠️ Every arm except [`Self::Applied`] / [`Self::Noop`] is a REFUSAL, and the
+/// refusals are the reason this type exists. Without them the dashboard cannot
+/// tell a device that declined from one that never heard — the two look
+/// identical, which is exactly the "a switch that silently does nothing" state
+/// the whole feature is trying not to produce.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigOutcome {
+    /// Reconciled. Which keys are in force NOW and which are merely written
+    /// down is in `live` / `needs_restart` — see [`ConfigReport`].
+    Applied,
+    /// The device already matched; nothing was written. Distinct from
+    /// `Applied` with two empty lists so a reader can tell "converged" from
+    /// "applied nothing, and I am not sure why".
+    Noop,
+    /// The device has not opted in: `remote_config_enabled` is off. This is
+    /// gate 4 doing its job, not an error — the operator's move is to set the
+    /// key ON THE HOST, which no server can do for them.
+    NotOptedIn,
+    /// The push arrived on a SECONDARY org's socket. `exec_enabled` / `ssh_*`
+    /// are machine-wide, so only the primary enrollment may drive them; this
+    /// org borrows the device and cannot reconfigure it.
+    NotPrimary,
+    /// The device tried and failed — see `detail`. Almost always an I/O or
+    /// permission problem writing `config.toml`.
+    Failed,
+}
+
+impl ConfigOutcome {
+    /// Did the device actually reconcile? `false` for every refusal, which is
+    /// what a caller usually wants to branch on.
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Applied | Self::Noop)
+    }
+}
+
+/// The DEVICE's account of what it did with revision `revision`.
+///
+/// ⚠️ This is a CLAIM BY THE DEVICE, exactly like [`SshActivityEvent`] and
+/// unlike anything in `config_audit`. The audit collection records the
+/// SERVER's decision and is authoritative; this records what a host — which
+/// may be compromised, may be lying, may simply be old — says happened
+/// afterwards. Never fold the two together: a reader has to be able to tell
+/// which is which, and only one of them survives a dishonest device.
+///
+/// ⚠️ An ABSENT report is not evidence of anything. A device that predates
+/// [`RpcCap::ConfigReport`] applies the config perfectly well and never says
+/// so, which is why the capability is checked before this is read as silence.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ConfigReport {
+    /// Which `desired_config.revision` this is about. A report for an older
+    /// revision than the row currently holds means the device has not caught
+    /// up yet — not that the newer one was refused.
+    pub revision: u64,
+    pub outcome: ConfigOutcome,
+    /// Keys changed and ALREADY in force.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live: Vec<String>,
+    /// Keys written to disk but waiting for a daemon restart.
+    ///
+    /// ⚠️ Kept SEPARATE from `live` all the way to the screen. Collapsing them
+    /// would let the dashboard report SSH as on while the daemon has not
+    /// re-spliced the packet path — the device would refuse every session
+    /// while the UI insisted it was open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs_restart: Vec<String>,
+    /// Why, for [`ConfigOutcome::Failed`]. Capped — see [`Self::MAX_DETAIL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the server received it. Server-stamped, never taken off the wire:
+    /// a device's clock is not a fact the control plane should inherit.
+    pub reported_at: DateTime,
+}
+
+impl ConfigReport {
+    /// Bound on `detail`, applied on the device AND re-clamped on receipt — a
+    /// limit that exists only on the reporting side is not a limit.
+    pub const MAX_DETAIL: usize = 400;
 }
 
 /// Per-device roomler-SSH policy — gate 3 of four, the exact shape of
@@ -2507,30 +2621,71 @@ mod tests {
         assert_eq!(RpcCap::Ssh.wire(), "ssh");
         assert_eq!(RpcCap::SshConsent.wire(), "ssh-consent");
         assert_eq!(RpcCap::Config.wire(), "config");
+        assert_eq!(RpcCap::ConfigReport.wire(), "config-report");
     }
 
-    /// `config` must not ENLARGE the prefix hazard.
+    /// Every prefix relationship between verbs is a KNOWN one.
     ///
     /// A blanket "no verb is a prefix of another" would be false and always
-    /// has been: `ssh` is deliberately a prefix of `ssh-consent`, which is
-    /// exactly why matching is equality everywhere and why
-    /// `ssh_does_not_imply_ssh_consent` exists. So the useful claim is the
-    /// narrow one — the verb added here shares no prefix relationship with
-    /// any existing verb, so it contributes no new way for a sloppy
-    /// `starts_with` to be accidentally right.
+    /// has been: `ssh`/`ssh-consent` is deliberate, and `config`/`config-report`
+    /// now is too. Both encode the same idea — "understands the feature" and
+    /// "actually does the thing" are different questions — and both are why
+    /// matching is equality everywhere.
+    ///
+    /// So the claim worth locking is not "there are none" but "there are
+    /// exactly these". A THIRD pair appearing by accident (say someone adds
+    /// `exec-batch`) fails here and has to be looked at, because each such
+    /// pair is one more place a sloppy `starts_with` could be accidentally
+    /// right on the devices that already exist.
     #[test]
-    fn the_config_verb_adds_no_new_prefix_hazard() {
-        let config = RpcCap::Config.wire();
-        for other in RpcCap::ALL {
-            if other == RpcCap::Config {
-                continue;
+    fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
+        const KNOWN: [(RpcCap, RpcCap); 2] = [
+            (RpcCap::Ssh, RpcCap::SshConsent),
+            (RpcCap::Config, RpcCap::ConfigReport),
+        ];
+        for a in RpcCap::ALL {
+            for b in RpcCap::ALL {
+                if a == b || !b.wire().starts_with(a.wire()) {
+                    continue;
+                }
+                assert!(
+                    KNOWN.contains(&(a, b)),
+                    "`{}` is an UNPLANNED prefix of `{}` — either rename it or \
+                     add the pair to KNOWN and write the equality-matching test \
+                     that goes with it",
+                    a.wire(),
+                    b.wire()
+                );
             }
-            assert!(
-                !other.wire().starts_with(config) && !config.starts_with(other.wire()),
-                "`{config}` and `{}` are prefix-related",
-                other.wire()
-            );
         }
+    }
+
+    /// The `SshConsent` shape, recurring exactly as its doc predicted.
+    ///
+    /// Agents rc.457/rc.458 shipped `config` and report NOTHING back — they
+    /// apply a pushed config in silence. A matcher using `starts_with` (or a
+    /// design that folded the report into `config`) would mark every one of
+    /// them as reporting, and the dashboard would wait forever for an answer
+    /// that was never going to come, while showing the operator a state it
+    /// had no evidence for.
+    #[test]
+    fn config_does_not_imply_config_report() {
+        let rc458_era = AgentCaps {
+            rpc: vec!["exec".into(), "originate".into(), "config".into()],
+            ..Default::default()
+        };
+        assert!(rc458_era.has_rpc(RpcCap::Config));
+        assert!(
+            !rc458_era.has_rpc(RpcCap::ConfigReport),
+            "an rc.458-era agent understands a pushed config but never reports \
+             on it — it must NOT read as report-capable"
+        );
+
+        let both = AgentCaps {
+            rpc: vec!["config".into(), "config-report".into()],
+            ..Default::default()
+        };
+        assert!(both.has_rpc(RpcCap::Config) && both.has_rpc(RpcCap::ConfigReport));
     }
 
     #[test]
