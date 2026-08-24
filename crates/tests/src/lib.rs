@@ -23,6 +23,10 @@ mod reaction_tests;
 #[cfg(test)]
 mod recording_tests;
 
+/// Tests of the fixture itself, not of the product — see the module docs.
+#[cfg(test)]
+mod harness_tests;
+
 #[cfg(test)]
 mod agent_crash_tests;
 #[cfg(test)]
