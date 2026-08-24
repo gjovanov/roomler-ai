@@ -49,6 +49,13 @@ const OUTBOUND_QUEUE: usize = 512;
 /// Depth of a single peer's inbound payload queue. Same drop-on-overflow.
 const INBOUND_QUEUE: usize = 256;
 
+/// #27 — depth of the "a peer is reaching us over DERP that we hold no conn
+/// for" notice queue. Tiny on purpose: the consumer coalesces per peer anyway,
+/// and the signal is level-triggered in practice (a demoted peer keeps sending
+/// until we follow it), so dropping a notice under burst costs at most one more
+/// inbound frame's worth of delay, never the signal itself.
+const UNROUTED_QUEUE: usize = 32;
+
 /// A [`RelayConn`] over a DERP relay, PINNED to one peer pubkey.
 ///
 /// `send_to` ignores its `SocketAddr` argument (DERP is pubkey-addressed, not
@@ -166,6 +173,17 @@ pub struct DerpMux {
     /// U1 healer must not clear force-DERP pins on a flap (Phase A1).
     down_since: Mutex<Option<Instant>>,
     peers: Mutex<HashMap<DerpPubKey, mpsc::Sender<Vec<u8>>>>,
+    /// #27 — where [`deliver`](Self::deliver) reports a frame it could not
+    /// route: a peer is relaying to US while we hold no [`DerpConn`] for it,
+    /// which means that peer has demoted to DERP and we have not followed.
+    /// `None` until the runtime subscribes (tests, and the tunnel-only paths
+    /// that never demote, leave it unset).
+    unrouted_tx: Mutex<Option<mpsc::Sender<DerpPubKey>>>,
+    /// Lifetime count of frames dropped by `deliver`, split by cause. Read by
+    /// the LocalAPI/diagnostics; the point is that neither drop is silent any
+    /// more (they both were — see the `deliver` doc).
+    dropped_unrouted: Arc<std::sync::atomic::AtomicU64>,
+    dropped_backpressure: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DerpMux {
@@ -181,8 +199,33 @@ impl DerpMux {
             alive: Arc::new(AtomicBool::new(true)),
             down_since: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
+            unrouted_tx: Mutex::new(None),
+            dropped_unrouted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_backpressure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
         (mux, ws_out_rx)
+    }
+
+    /// #27 — install the sink for the unroutable-inbound signal (see
+    /// [`Self::unrouted_tx`]). A SETTER rather than a subscribe-and-return
+    /// because a node holds several muxes (central + one per relay region) and
+    /// the runtime wants ONE channel for all of them; the coordinator installs
+    /// this on every mux as it arrives. A second call replaces the sender, so a
+    /// runtime rebuild re-points cleanly.
+    pub fn set_unrouted_sink(&self, tx: mpsc::Sender<DerpPubKey>) {
+        *self.unrouted_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// The channel depth callers should use for [`Self::set_unrouted_sink`].
+    pub const UNROUTED_SINK_DEPTH: usize = UNROUTED_QUEUE;
+
+    /// #27 — `(unrouted, backpressure)` inbound-drop counts for this mux,
+    /// cumulative for its lifetime.
+    pub fn drop_counts(&self) -> (u64, u64) {
+        (
+            self.dropped_unrouted.load(Ordering::Relaxed),
+            self.dropped_backpressure.load(Ordering::Relaxed),
+        )
     }
 
     /// The first frame to send on a fresh `/derp` WS: this node's own pubkey
@@ -208,8 +251,27 @@ impl DerpMux {
     }
 
     /// Route one inbound relay frame `[src_pubkey(32) || payload]` to the
-    /// [`DerpConn`] registered for `src_pubkey`. Drops a short frame or an
-    /// unknown src (no such peer conn); drops on a full inbound queue.
+    /// [`DerpConn`] registered for `src_pubkey`.
+    ///
+    /// #27 — the no-conn branch used to be a bare `if let Some(…)` with no
+    /// `else`, and the queue-full branch a `let _ = try_send`: **two silent
+    /// drops in four lines**, and the first of them was a 100 %-loss black
+    /// hole. A peer only ever relays to us once it has DEMOTED to DERP (both
+    /// ends prefer direct), so a frame arriving for a peer we hold no
+    /// [`DerpConn`] for means *we have not followed it yet* — measured
+    /// 2026-08-24 as **69 s** of mutual blackout on a VPN transition, because
+    /// the far end had no netstate Major of its own and sat out
+    /// `POKE_SILENCE_AFTER` + its tier deadline before demoting independently.
+    ///
+    /// So the miss is now REPORTED, not dropped in silence: the src pubkey goes
+    /// to [`Self::subscribe_unrouted`] and the runtime follows that peer onto
+    /// DERP. Trusting it is sound because the relay STAMPS `src_pubkey` from
+    /// the sender's authenticated registration — it is not sender-chosen (see
+    /// `api::ws::derp::forward_frame`) — so this can only name a node that is
+    /// registered in this network and permitted by its ACL to reach us.
+    ///
+    /// The frame itself is still dropped: we have nowhere to put it, and WG
+    /// retransmits. The signal, not the payload, is what matters.
     pub fn deliver(&self, frame: &[u8]) {
         if frame.len() < 32 {
             return;
@@ -217,8 +279,32 @@ impl DerpMux {
         let mut src = [0u8; 32];
         src.copy_from_slice(&frame[..32]);
         let sender = self.peers.lock().unwrap().get(&src).cloned();
-        if let Some(tx) = sender {
-            let _ = tx.try_send(frame[32..].to_vec());
+        match sender {
+            Some(tx) => {
+                if tx.try_send(frame[32..].to_vec()).is_err() {
+                    // Full (the peer's carrier is not draining) or closed (the
+                    // `DerpConn` was dropped when a better tier replaced this
+                    // carrier — the registration outlives it by design, "last
+                    // one wins"). A CLOSED channel is the same demote-lag
+                    // condition as a missing one, so it reports too.
+                    self.dropped_backpressure.fetch_add(1, Ordering::Relaxed);
+                    self.notify_unrouted(src);
+                }
+            }
+            None => {
+                self.dropped_unrouted.fetch_add(1, Ordering::Relaxed);
+                self.notify_unrouted(src);
+            }
+        }
+    }
+
+    /// Report an unroutable inbound src, if anyone is listening. Never blocks
+    /// and never errors: a full notice queue means a signal for this peer is
+    /// already pending, which is exactly what the notice would have said.
+    fn notify_unrouted(&self, src: DerpPubKey) {
+        let tx = self.unrouted_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(src);
         }
     }
 
@@ -288,6 +374,69 @@ mod tests {
         assert!(
             mux.down_for().expect("fresh outage") < later,
             "a NEW outage restarts the clock"
+        );
+    }
+
+    /// #27 — the black hole. A frame from a peer we hold NO conn for used to be
+    /// dropped with no log, no counter and no signal; it is the 100 %-loss half
+    /// of a one-sided demote to DERP (measured 69 s in the field). It must now
+    /// report the src, and a routable frame must NOT report.
+    #[tokio::test]
+    async fn unroutable_inbound_reports_the_src_and_routable_does_not() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::UNROUTED_SINK_DEPTH);
+        mux.set_unrouted_sink(tx);
+
+        // No conn for 0x02 — the demote-lag case.
+        let mut frame = pk(0x02).to_vec();
+        frame.extend_from_slice(&[1, 2, 3]);
+        mux.deliver(&frame);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(pk(0x02)),
+            "unroutable src reported"
+        );
+        assert_eq!(mux.drop_counts().0, 1, "counted as unrouted");
+
+        // A live conn for 0x03 — routed, and deliberately SILENT.
+        let _conn = mux.conn_for(pk(0x03));
+        let mut frame = pk(0x03).to_vec();
+        frame.extend_from_slice(&[4, 5, 6]);
+        mux.deliver(&frame);
+        assert!(
+            rx.try_recv().is_err(),
+            "a routable frame must never look like a demote signal"
+        );
+        assert_eq!(mux.drop_counts(), (1, 0), "no new drops");
+
+        // A short frame is malformed, not a demote signal.
+        mux.deliver(&[0u8; 8]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// #27 — the registration OUTLIVES its `DerpConn` by design ("last one
+    /// wins"), so a peer whose DERP carrier was replaced by a better tier
+    /// leaves a live entry pointing at a CLOSED channel. That is the same
+    /// demote-lag condition as a missing entry and must report too — otherwise
+    /// exactly the peers that once used DERP stay silently dark.
+    #[tokio::test]
+    async fn a_closed_conn_channel_reports_like_a_missing_one() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::UNROUTED_SINK_DEPTH);
+        mux.set_unrouted_sink(tx);
+
+        let conn = mux.conn_for(pk(0x02));
+        drop(conn); // a better tier replaced this carrier
+
+        let mut frame = pk(0x02).to_vec();
+        frame.extend_from_slice(&[1]);
+        mux.deliver(&frame);
+
+        assert_eq!(rx.try_recv().ok(), Some(pk(0x02)));
+        assert_eq!(
+            mux.drop_counts(),
+            (0, 1),
+            "counted as backpressure/closed, not as a missing registration"
         );
     }
 
