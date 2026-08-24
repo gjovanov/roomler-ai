@@ -164,4 +164,4 @@ const DAEMON_FILE_NAME: &str = "roomlerd";
 /// plists point here, and renaming it would invalidate the TCC grants keyed to
 /// this binary.
 #[cfg(target_os = "macos")]
-const MACOS_BUNDLE_DAEMON: &str = "/Applications/roomler-agent.app/Contents/MacOS/roomler-agent";
+const MACOS_BUNDLE_DAEMON: &str = "/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent";

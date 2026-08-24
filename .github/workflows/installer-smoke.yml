@@ -599,11 +599,12 @@ jobs:
           codesign --force --sign - "$DESK"
 
           mkdir -p payload/Applications payload/usr/local/bin scripts dist
-          cp -R "$APP" payload/Applications/
+          mkdir -p payload/Library/Roomler
+          cp -R "$APP" payload/Library/Roomler/
           cp -R "$DESK" payload/Applications/
           cp target/aarch64-apple-darwin/release/roomler-shim payload/usr/local/bin/roomler
           chmod 755 payload/usr/local/bin/roomler
-          ln -s /Applications/roomler-agent.app/Contents/MacOS/roomler-agent \
+          ln -s /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent \
             payload/usr/local/bin/roomlerd
           cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
@@ -665,7 +666,7 @@ jobs:
           echo "=== install.log (roomler + script lines) ==="
           sudo tail -200 /var/log/install.log | grep -iE "roomler|script|error|fail" || true
           echo "=== what landed anyway ==="
-          ls -la /Applications/roomler-agent.app/Contents/MacOS/ 2>&1 || true
+          ls -la /Library/Roomler/roomler-agent.app/Contents/MacOS/ 2>&1 || true
           ls -la /usr/local/bin/roomler 2>&1 || true
           echo "=== is /Applications what we think it is? ==="
           ls -ld /Applications 2>&1 || true
@@ -683,7 +684,7 @@ jobs:
       - name: Assert the payload landed where everything expects it
         run: |
           set -euo pipefail
-          BIN=/Applications/roomler-agent.app/Contents/MacOS/roomler-agent
+          BIN=/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent
           # Both plists and the docs name this path literally, and a rename
           # would void every TCC grant keyed to the binary.
           test -x "$BIN" || { echo "::error::missing $BIN"; exit 1; }
@@ -784,7 +785,7 @@ jobs:
           # as working because `has_input_permission` was a compile-time
           # constant. Being able to assert this at all is the point of moving
           # it to a runtime probe.
-          caps="$(/Applications/roomler-agent.app/Contents/MacOS/roomler-agent caps 2>&1 || true)"
+          caps="$(/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent caps 2>&1 || true)"
           echo "$caps"
           if echo "$caps" | grep -qi 'has_input_permission: true'; then
             echo "::error::input advertised as granted on a runner that granted nothing"

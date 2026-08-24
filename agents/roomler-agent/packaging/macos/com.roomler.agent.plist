@@ -18,7 +18,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/roomler-agent.app/Contents/MacOS/roomler-agent</string>
+        <string>/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent</string>
         <string>run</string>
     </array>
 
