@@ -227,3 +227,37 @@ export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolea
   if (mask === null) return false
   return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
 }
+
+/**
+ * May this caller ask a device to turn exec / SSH ON?
+ *
+ * `MANAGE_AGENTS` alone is NOT enough, and that is the whole point. Enabling
+ * exec on a device is *granting a power*, and #600/#605 established the rule:
+ * **you cannot grant a permission you do not hold.** An admin without
+ * `EXEC_DEVICE` must not be able to open exec on a fleet device for somebody
+ * else — that is the same escalation those PRs closed, one indirection away.
+ * `EXEC_DEVICE` and `SSH_DEVICE` are deliberately absent from `DEFAULT_ADMIN`,
+ * which is what makes this a real constraint rather than a formality.
+ *
+ * Mirrors `remote_config::decide` server-side. This only avoids offering a
+ * control whose save would 403 — the server is where it is enforced.
+ *
+ * Deliberately FAIL-CLOSED on `mask === null`, like {@link canQueryAnalytics}
+ * and unlike {@link canSeeFleetNav}: the failure mode of guessing wrong here
+ * is an operator who flips a switch, gets a 403, and cannot tell whether the
+ * device refused or they did.
+ */
+export function canGrantDeviceExec(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS', 'EXEC_DEVICE']))
+}
+
+/** {@link canGrantDeviceExec}'s twin. A SEPARATE bit on purpose: an SSH
+ *  session is strictly more than a bounded command, so holding one must never
+ *  imply the other. */
+export function canGrantDeviceSsh(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS', 'SSH_DEVICE']))
+}
