@@ -9,6 +9,8 @@ pub type CFBooleanRef = *mut c_void;
 pub type CFNumberRef = *mut c_void;
 pub type CFStringRef = *mut c_void;
 pub type CGDisplayStreamUpdateRef = *mut c_void;
+// ROOMLER PATCH: see `CGDisplayCopyDisplayMode` below.
+pub type CGDisplayModeRef = *mut c_void;
 pub type IOSurfaceRef = *mut c_void;
 pub type DispatchQueue = *mut c_void;
 pub type DispatchQueueAttr = *mut c_void;
@@ -159,6 +161,23 @@ extern {
     pub fn CGMainDisplayID() -> u32;
     pub fn CGDisplayPixelsWide(display: u32) -> usize;
     pub fn CGDisplayPixelsHigh(display: u32) -> usize;
+
+    // ROOMLER PATCH: the display's size in PIXELS rather than POINTS.
+    //
+    // `CGDisplayPixelsWide/High` are named for pixels but return POINTS —
+    // on a Retina panel they are half the real count (a 3024x1964 MacBook
+    // reports 1512x982). Upstream sizes the capture stream from them, so
+    // 3/4 of the image is discarded by CoreGraphics' own scaler before any
+    // encoder sees it, and no amount of downstream sharpening gets it back.
+    // The mode's Pixel accessors are the only way to learn the true size.
+    //
+    // NOTE the ownership rule: `CopyDisplayMode` follows the Core Foundation
+    // *Copy* convention, so the caller owns the returned mode and MUST
+    // release it — see `Display::pixel_size`.
+    pub fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
+    pub fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+    pub fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+    pub fn CGDisplayModeRelease(mode: CGDisplayModeRef);
 
     pub fn CGGetOnlineDisplayList(
         max_displays: u32,
