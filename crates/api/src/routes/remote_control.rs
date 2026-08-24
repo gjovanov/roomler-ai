@@ -262,6 +262,41 @@ pub struct AgentResponse {
     /// from its STUN probe reports). `None` = never probed / all timed out —
     /// the default region serves it.
     pub relay_home: Option<String>,
+    /// Fleet-RPC gate 3 as stored (`docs/fleet-rpc.md`), or `None` when this
+    /// device's policy is indistinguishable from the untouched default.
+    ///
+    /// ⚠️ Returning this at all is not cosmetic. The policy dialogs PUT the
+    /// WHOLE shape, so a dialog that cannot read the current policy opens on
+    /// its closed default and the next save REPLACES the real one — silently
+    /// dropping an `allowed_user_ids` restriction, which widens the device
+    /// from "these three people" to "anyone holding the bit".
+    ///
+    /// ⚠️ And `Option`, not "always `Some`", for the mirror-image reason: the
+    /// stored model cannot tell a device nobody configured from one explicitly
+    /// saved as all-defaults, so `None` is the honest answer for that shape and
+    /// leaves the dialog on its own closed default. See [`Self::ssh_policy`],
+    /// where the difference has teeth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec_policy: Option<crate::routes::agent_exec::ExecPolicyBody>,
+    /// Roomler-SSH gate 3 as stored, with the same replace-on-save warning as
+    /// [`Self::exec_policy`] — and this is the one that makes `Option`
+    /// load-bearing rather than tidy.
+    ///
+    /// The MODEL's default `account_mode` is `daemon` (SYSTEM / root); the
+    /// DIALOG's is `console_user`, deliberately, so that an admin who turns SSH
+    /// on without reading the selector does not get a root shell. Sending the
+    /// model default for every unconfigured device would pre-select `daemon` in
+    /// that dialog and undo exactly that protection — so a policy equal to the
+    /// default is reported as absent instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_policy: Option<crate::routes::agent_ssh::SshPolicyBody>,
+}
+
+/// `None` for a policy that is byte-for-byte the untouched default — see
+/// [`AgentResponse::ssh_policy`] for why that distinction has to survive to
+/// the client rather than being flattened here.
+fn configured_only<T: Default + PartialEq, B: From<T>>(policy: T) -> Option<B> {
+    (policy != T::default()).then(|| policy.into())
 }
 
 pub async fn list_agents(
@@ -905,6 +940,8 @@ fn to_agent_response(
         advertised_routes: a.advertised_routes,
         capabilities: a.capabilities,
         relay_home: a.relay_home,
+        exec_policy: configured_only(a.exec_policy),
+        ssh_policy: configured_only(a.ssh_policy),
     }
 }
 

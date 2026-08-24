@@ -139,6 +139,36 @@ pub struct ExecPolicyBody {
     pub shells: Vec<String>,
 }
 
+impl From<ExecPolicy> for ExecPolicyBody {
+    /// The stored policy as the dashboard reads it back — hex ids, because
+    /// bson's `ObjectId` serialises to `{"$oid": …}` and no client here parses
+    /// that.
+    ///
+    /// The source is destructured EXHAUSTIVELY on purpose, the same rule
+    /// `SshPolicy::split` follows: this projection is what a dialog re-saves,
+    /// so a field added to [`ExecPolicy`] and forgotten here would not be a
+    /// missing readout — it would be a field the next save silently resets to
+    /// its default. Failing to compile is the cheap version of that bug.
+    fn from(p: ExecPolicy) -> Self {
+        let ExecPolicy {
+            mode,
+            can_originate,
+            allowed_user_ids,
+            allowed_role_ids,
+            consent_mode,
+            shells,
+        } = p;
+        Self {
+            mode,
+            can_originate,
+            allowed_user_ids: allowed_user_ids.iter().map(|i| i.to_hex()).collect(),
+            allowed_role_ids: allowed_role_ids.iter().map(|i| i.to_hex()).collect(),
+            consent_mode,
+            shells,
+        }
+    }
+}
+
 /// One audit row as the API renders it.
 ///
 /// Deliberately NOT `ExecAuditEvent` straight off the wire: bson's `ObjectId`
