@@ -518,6 +518,42 @@ pub async fn handle_agent_socket(
                                     });
                                     continue;
                                 }
+                                // Remote config — the device's own account of
+                                // what it did with a pushed desired-config
+                                // (`docs/remote-config.md`). Recorded on the
+                                // agent row rather than in `config_audit`:
+                                // that collection holds the SERVER's decisions
+                                // and is authoritative, while this is a claim
+                                // by a host that may be compromised. Folding
+                                // them together would leave a reader unable to
+                                // tell which is which.
+                                //
+                                // ⚠️ `tenant_id` / `agent_id` come from the
+                                // authenticated WS, never the frame, so a
+                                // device can only report about itself.
+                                ClientMsg::ConfigStatus {
+                                    revision,
+                                    outcome,
+                                    live,
+                                    needs_restart,
+                                    detail,
+                                } => {
+                                    let state = state.clone();
+                                    tokio::spawn(async move {
+                                        record_config_report(
+                                            &state,
+                                            tenant_id,
+                                            agent_id,
+                                            revision,
+                                            outcome,
+                                            live,
+                                            needs_restart,
+                                            detail,
+                                        )
+                                        .await;
+                                    });
+                                    continue;
+                                }
                                 other => other,
                             };
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
@@ -880,6 +916,55 @@ async fn record_ssh_activity(
     };
     if let Err(e) = state.ssh_activity.record(event).await {
         warn!(%agent_id, %e, "ssh_activity insert failed");
+    }
+}
+
+/// Persist a device's [`ClientMsg::ConfigStatus`] onto its agent row.
+///
+/// Last-report-wins rather than a collection: unlike `ssh_activity` there is
+/// no history worth keeping here — an operator asks "did this land?", which is
+/// a question about the CURRENT desired revision. The trail of who asked for
+/// what already exists in `config_audit`, on the authoritative side.
+///
+/// ⚠️ `reported_at` is stamped HERE, not taken off the wire. A device's clock
+/// is not a fact the control plane should inherit — a skewed host would
+/// otherwise be able to make its report look newer (or older) than it is.
+#[allow(clippy::too_many_arguments)]
+async fn record_config_report(
+    state: &AppState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    revision: u64,
+    outcome: roomler_ai_remote_control::models::ConfigOutcome,
+    live: Vec<String>,
+    needs_restart: Vec<String>,
+    detail: Option<String>,
+) {
+    use roomler_ai_remote_control::models::ConfigReport;
+
+    // Re-clamped on receipt: a bound that exists only on the reporting side is
+    // not a bound, since the reporting side is the untrusted one.
+    let detail = detail.map(|mut d| {
+        if d.chars().count() > ConfigReport::MAX_DETAIL {
+            d = d.chars().take(ConfigReport::MAX_DETAIL).collect();
+            d.push('…');
+        }
+        d
+    });
+    let report = ConfigReport {
+        revision,
+        outcome,
+        live,
+        needs_restart,
+        detail,
+        reported_at: bson::DateTime::now(),
+    };
+    if let Err(e) = state
+        .agents
+        .record_config_report(tenant_id, agent_id, &report)
+        .await
+    {
+        warn!(%agent_id, %e, "config report write failed");
     }
 }
 

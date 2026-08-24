@@ -790,3 +790,101 @@ async fn join_org_pushes_a_live_device_into_a_second_organization() {
     let _ = stop_tx.send(true);
     let _ = primary.await;
 }
+
+/// End-to-end: a device that has NOT opted in refuses a pushed config and
+/// SAYS SO, and the listing resolves that into `refused`.
+///
+/// This is the loop the whole remote-config feature turns on, exercised
+/// through every real layer: the agent advertises `config-report`, the server
+/// gates the push on `config` and sends it on connect, the agent takes gate
+/// 4's refusal branch, reports over its own control WS, the server persists
+/// the claim on the device row, and the view resolves desired-vs-reported
+/// revision into one answer.
+///
+/// The refusal path is the one worth driving end-to-end rather than the happy
+/// path: it needs no writable config file, and it is the state an operator
+/// will actually meet, because `remote_config_enabled` is default-OFF on every
+/// device that exists. Before the report existed, this looked identical to a
+/// device that had never received the frame — and the two have completely
+/// different fixes.
+#[tokio::test]
+async fn a_device_that_has_not_opted_in_reports_its_refusal() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcfgreport").await;
+    let cfg = enrol_via_agent_lib(&app, &seeded, "mach-rcfgreport", "Opt-out box").await;
+    assert!(
+        !cfg.remote_config_enabled,
+        "the opt-in must be default OFF — the rest of this test assumes the \
+         device refuses"
+    );
+
+    // Requested BEFORE the agent connects: delivery is reconcile-on-connect,
+    // so this also covers the offline-device case by construction.
+    let resp = app
+        .auth_put(
+            &format!(
+                "/api/tenant/{}/agent/{}/desired-config",
+                seeded.tenant_id, cfg.agent_id
+            ),
+            &seeded.admin.access_token,
+        )
+        .json(&json!({ "exec_enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "desired-config PUT");
+
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let sig_task = spawn_agent_signaling(cfg.clone(), stop_rx);
+
+    let mut row = Value::Null;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        row = app
+            .auth_get(
+                &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, cfg.agent_id),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if row["remote_config"]["report"].is_object() {
+            break;
+        }
+    }
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), sig_task).await;
+
+    let rc = &row["remote_config"];
+    assert!(
+        rc["report"].is_object(),
+        "the device never reported on the push. If `state` is \
+         `push_unsupported` or `reports_unsupported`, the capability list is \
+         the thing that broke — the agent must advertise BOTH `config` and \
+         `config-report`. Row: {row}"
+    );
+    assert_eq!(
+        rc["report"]["outcome"].as_str(),
+        Some("not_opted_in"),
+        "gate 4 refused, and the device must name WHICH refusal — \
+         \"it didn't work\" is not actionable: {rc}"
+    );
+    assert_eq!(
+        rc["state"].as_str(),
+        Some("refused"),
+        "a named refusal must resolve to `refused`, never to `pending`: {rc}"
+    );
+    assert_eq!(
+        rc["report"]["revision"].as_u64(),
+        rc["desired"]["revision"].as_u64(),
+        "the report must be about the revision that was pushed: {rc}"
+    );
+    // The intent is recorded and the device is still closed — which is the
+    // whole shape of the design: the server may ASK, and gate 4 is the
+    // device's to keep. `not_opted_in` is itself the proof nothing was
+    // written; that branch returns before `apply` is ever called.
+    assert_eq!(rc["desired"]["exec_enabled"].as_bool(), Some(true));
+}

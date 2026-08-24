@@ -6,6 +6,8 @@ import {
   DEFAULT_MEMBER,
   PERMISSION_FLAGS,
   PERMISSION_GROUPS,
+  canGrantDeviceExec,
+  canGrantDeviceSsh,
   canQueryAnalytics,
   canSeeFleetNav,
   describePermissions,
@@ -210,5 +212,51 @@ describe('canQueryAnalytics (org analytics gating — stats PR-4)', () => {
   it('plain member denied', () => {
     expect(canQueryAnalytics(DEFAULT_MEMBER, false)).toBe(false)
     expect(canQueryAnalytics(0, false)).toBe(false)
+  })
+})
+
+describe('canGrantDeviceExec / canGrantDeviceSsh', () => {
+  const MANAGE_AGENTS = 1 << 24
+  const EXEC_DEVICE = 1 << 27
+  const SSH_DEVICE = 1 << 29
+
+  /// The rule #600/#605 established: you cannot grant a permission you do not
+  /// hold. `DEFAULT_ADMIN` carries MANAGE_AGENTS and NEITHER grant bit, which
+  /// is exactly what makes this a real constraint — if the bits were in the
+  /// default admin mask, this whole check would be a formality.
+  it('MANAGE_AGENTS alone cannot open exec or SSH on a device', () => {
+    expect(hasPermission(DEFAULT_ADMIN, MANAGE_AGENTS)).toBe(true)
+    expect(canGrantDeviceExec(DEFAULT_ADMIN, false)).toBe(false)
+    expect(canGrantDeviceSsh(DEFAULT_ADMIN, false)).toBe(false)
+  })
+
+  it('the matching grant bit, on top of MANAGE_AGENTS, is what it takes', () => {
+    expect(canGrantDeviceExec(DEFAULT_ADMIN | EXEC_DEVICE, false)).toBe(true)
+    expect(canGrantDeviceSsh(DEFAULT_ADMIN | SSH_DEVICE, false)).toBe(true)
+    // …and the grant bit alone is not enough: managing a device at all is a
+    // MANAGE_AGENTS act.
+    expect(canGrantDeviceExec(EXEC_DEVICE, false)).toBe(false)
+    expect(canGrantDeviceSsh(SSH_DEVICE, false)).toBe(false)
+  })
+
+  it('the two grants never substitute for each other', () => {
+    // A separate bit precisely because an SSH session is strictly more than a
+    // bounded command.
+    expect(canGrantDeviceSsh(DEFAULT_ADMIN | EXEC_DEVICE, false)).toBe(false)
+    expect(canGrantDeviceExec(DEFAULT_ADMIN | SSH_DEVICE, false)).toBe(false)
+  })
+
+  it('ADMINISTRATOR and owner bypass, as everywhere else', () => {
+    expect(canGrantDeviceExec(ADMINISTRATOR, false)).toBe(true)
+    expect(canGrantDeviceSsh(ADMINISTRATOR, false)).toBe(true)
+    expect(canGrantDeviceExec(null, true)).toBe(true)
+    expect(canGrantDeviceSsh(0, true)).toBe(true)
+  })
+
+  it('fails CLOSED before the mask loads', () => {
+    // Guessing "allowed" here shows a switch whose save 403s, and the operator
+    // cannot tell whether the DEVICE refused or they did.
+    expect(canGrantDeviceExec(null, false)).toBe(false)
+    expect(canGrantDeviceSsh(null, false)).toBe(false)
   })
 })

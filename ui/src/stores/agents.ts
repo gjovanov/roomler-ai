@@ -168,6 +168,11 @@ export interface Agent {
    *  dialog's own default is `console_user` for exactly that reason — don't
    *  "helpfully" fill this in. */
   ssh_policy?: SshPolicy
+  /** Remote config: what an operator asked this device to run, what the device
+   *  said it did, and where that leaves things (`docs/remote-config.md`).
+   *
+   *  Absent = nothing has ever been requested for this device. */
+  remote_config?: RemoteConfig
   /** Multi-region relay PoPs: the agent's nearest relay region id (derived
    *  server-side from its STUN probe reports), e.g. "us-east". Absent/null =
    *  never probed or all probes timed out — the default region serves it. */
@@ -231,6 +236,79 @@ export interface SshPolicy {
   /** Only `auto` (unattended) and `prompt` are honoured. `null` = prompt —
    *  an absent directive means ask, the fail-safe the agent also applies. */
   consent_mode: ConsentMode | null
+}
+
+/** What the device did with a pushed desired-config. Mirrors the Rust
+ *  `ConfigOutcome`. Everything except `applied` / `noop` is a refusal, and the
+ *  refusals are the ones an operator can act on. */
+export type ConfigOutcome = 'applied' | 'noop' | 'not_opted_in' | 'not_primary' | 'failed'
+
+/** Where a device's remote config stands, resolved SERVER-side.
+ *
+ *  Deliberately one enum rather than several booleans: these are mutually
+ *  exclusive, and a client deriving them separately would eventually render
+ *  two at once. The comparison behind it (desired revision vs reported
+ *  revision vs what the agent is even capable of saying) happens once, on the
+ *  server — see `remote_config_view`. */
+export type RemoteConfigState =
+  /** Confirmed, and everything asked for is in force. */
+  | 'applied'
+  /** Confirmed, but some keys wait on a daemon restart. NEVER merge this into
+   *  `applied`: doing so tells an operator SSH is open while the device still
+   *  refuses every session. */
+  | 'needs_restart'
+  /** The device said no — `report.outcome` says which no. */
+  | 'refused'
+  /** The device tried and failed; `report.detail` says why. */
+  | 'failed'
+  /** Waiting on the device to answer about THIS revision (includes "it has
+   *  not reconnected yet" — delivery is reconcile-on-connect). */
+  | 'pending'
+  /** The agent applies pushed config but predates `config-report`, so it will
+   *  never say what it did. Distinct from `pending` because waiting is futile
+   *  and the fix is to update the device. */
+  | 'reports_unsupported'
+  /** The agent predates `rc:agent.config` — the push is not even sent. */
+  | 'push_unsupported'
+
+/** The device's own account of a push.
+ *
+ *  ⚠️ A CLAIM BY THE DEVICE, not the server's record. `config_audit` holds who
+ *  asked for what and is authoritative; this is what a host says happened
+ *  afterwards. */
+export interface ConfigReport {
+  revision: number
+  outcome: ConfigOutcome
+  /** Keys now IN FORCE. */
+  live: string[]
+  /** Keys written to disk, waiting on a restart. */
+  needs_restart: string[]
+  detail?: string
+  reported_at: string
+}
+
+/** The keys under management. `undefined` means NOT MANAGED — the device
+ *  keeps whatever it has locally — which is a different thing from `false`.
+ *
+ *  ⚠️ `remote_config_enabled` is deliberately absent and must never be added:
+ *  it is the device's opt-in to accepting any of this, and a server able to
+ *  set it could opt a device in and then open every other key. */
+export interface DesiredConfig {
+  revision: number
+  exec_enabled?: boolean
+  ssh_enabled?: boolean
+  ssh_authorized_keys?: string[]
+  ssh_account_mode?: string
+  ssh_port?: number
+  updated_by?: string
+  updated_at?: string
+}
+
+/** Desired config + the device's answer + where that leaves things. */
+export interface RemoteConfig {
+  desired: DesiredConfig
+  report?: ConfigReport
+  state: RemoteConfigState
 }
 
 /** One remote command's result. `exit_code: null` together with a non-null
@@ -712,6 +790,42 @@ export const useAgentStore = defineStore('agents', () => {
     if (idx !== -1) agents.value[idx]!.ssh_policy = policy
   }
 
+  /** Record the device config an operator wants (`docs/remote-config.md`).
+   *
+   *  This writes an INTENT, never a fact. The device reconciles it when it
+   *  next connects and is free to refuse — so the response must NOT be read
+   *  back as "this device now has exec on". Re-fetch and read
+   *  `remote_config.state` for that; until the device answers, the honest
+   *  answer is `pending`.
+   *
+   *  Omitting a key means "leave it alone", so a partial body is normal.
+   *
+   *  Throws on a 403: enabling exec needs `EXEC_DEVICE` and any SSH key needs
+   *  `SSH_DEVICE`, on top of `MANAGE_AGENTS` — you cannot grant a permission
+   *  you do not hold. The caller must surface that rather than close. */
+  async function updateDesiredConfig(
+    tenantId: string,
+    agentId: string,
+    desired: Omit<DesiredConfig, 'revision'>,
+  ): Promise<{ revision: number }> {
+    const resp = await api.put<{ revision: number; desired: DesiredConfig }>(
+      `/tenant/${tenantId}/agent/${agentId}/desired-config`,
+      desired,
+    )
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) {
+      // Optimistic, and deliberately only the DESIRED half: the report is the
+      // device's word and we have not heard from it about this revision, so
+      // anything else here would be inventing an answer. `pending` is the
+      // truth until it speaks.
+      agents.value[idx]!.remote_config = {
+        desired: resp.desired,
+        state: 'pending',
+      }
+    }
+    return { revision: resp.revision }
+  }
+
   /** Run a command on one device.
    *
    *  Resolves even when the command was REFUSED — the server answers 200 with
@@ -829,6 +943,7 @@ export const useAgentStore = defineStore('agents', () => {
     fetchOrgSshEnabled,
     setOrgSshEnabled,
     updateSshPolicy,
+    updateDesiredConfig,
     fetchSshAudit,
     fetchSshActivity,
     execOnAgent,

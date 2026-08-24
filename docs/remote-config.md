@@ -146,6 +146,44 @@ fleet-wide push without jitter restarts every device at once. The jitter is
 per-device and derived from the machine id, so it is stable across retries
 rather than re-rolled.
 
+**The device reports back** (`rc:agent.config_status`). Every outcome, refusals
+included. This is not telemetry — it is what makes the dashboard capable of
+being honest, and it was promised by `ConfigPush::revision`'s own doc long
+before it existed.
+
+Without it, four situations are one situation on screen:
+
+| what actually happened | what an operator must do |
+|---|---|
+| applied, in force | nothing |
+| applied, waiting on a restart | restart the daemon |
+| refused — not opted in | set `remote_config_enabled` **on the host** |
+| refused — secondary org | ask the primary org's admin (§4) |
+| never arrived — agent too old | update the device |
+
+All five look like "nothing happened" from the server alone, and every one has
+a different fix.
+
+⚠️ **A report is a CLAIM BY THE DEVICE**, in the same sense as `ssh_activity`
+and the opposite sense to `config_audit`. The audit collection holds the
+server's own decision and is authoritative; this is what a host — possibly
+compromised, possibly lying, possibly just old — says happened afterwards.
+Stored on the agent row rather than folded into the audit trail so a reader can
+always tell which is which.
+
+⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
+the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it
+would. Agents rc.457 and rc.458 shipped `config`: they apply a pushed config
+and say nothing. Reading "reports back" out of `config` would make the
+dashboard wait forever for an answer from most of the fleet. ⚠️ `config` is a
+PREFIX of `config-report` — matching must stay equality.
+
+⚠️ **Compare revisions, not just outcomes.** A report about revision 3 says
+nothing about revision 4. Reading only `outcome` shows a stale "applied" over a
+change that never landed; reading only "there is a report" shows success for
+the same reason. `RemoteConfigState` does that comparison once, server-side,
+rather than in every client.
+
 **Audit.** Every change and every refusal, in the same shape as `exec_audit` /
 `ssh_audit`: who asked, which device, which keys, what the outcome was. The
 refusals are the load-bearing rows — as in `agent_ssh.rs::dispatch`, the
@@ -223,7 +261,31 @@ silently.
 4. Apply + persist on the agent, primary-only. ⚠️ The restart half is NOT
    settled — see §7b. A persisted change is inert until the daemon restarts,
    and no safe self-restart exists yet.
+4b. `rc:agent.config_status` — the device reports what it did, behind its own
+   `config-report` verb, resolved server-side into `RemoteConfigState`. Found
+   while starting step 5, which cannot render "secondary org" at all without
+   it: only the DEVICE knows it is a secondary, so the server has no way to
+   report that state on its own.
 5. Dashboard UI, including the "secondary org" and "agent too old" states.
+   `RemoteConfigDialog` (a device menu entry + a row chip). Three things it
+   does that are not decoration:
+   - **Tri-state per key** (`ManagedSwitch`): *leave alone* / *off* / *on*. The
+     wire has three states and a switch has two — `undefined` means the device
+     keeps what it has, and an operator toggling exec must not silently assert
+     a value for every other key.
+   - **Combination warnings.** `ssh_enabled` alone grants nothing: without
+     `ssh_authorized_keys` nobody can connect, and with an unset
+     `ssh_account_mode` a key-list session authenticates and then runs nothing.
+     Both produce a device that is "on" and unreachable — the same
+     silent-nothing this whole feature exists to remove, so the dialog says so
+     before you save rather than leaving you to find out by `ssh`ing at it.
+   - **Grant bits mirrored** (`canGrantDeviceExec` / `canGrantDeviceSsh`), so a
+     caller without `EXEC_DEVICE` sees a disabled control and the reason,
+     rather than a 403 they cannot attribute to themselves or to the device.
+
+   ⚠️ It writes an INTENT and says so at the top. Every other device dialog in
+   the admin UI writes a server-side policy that takes effect on save; a reader
+   who assumes this one does too will misread every status on it.
 6. Desktop companion: already has a generic settings pane over
    `cmd_config_entries` / `cmd_config_set`, which already exposes
    `exec_enabled` / `ssh_enabled`. It needs the new key surfaced, not a new
