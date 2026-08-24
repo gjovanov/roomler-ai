@@ -51,7 +51,12 @@ export interface AgentCapabilities {
    *  ⚠️ `undefined` and `[]` mean OPPOSITE things: undefined is a
    *  pre-rc.454 agent that cannot report (say nothing), `[]` is an
    *  agent reporting it holds NEITHER (warn loudly). Never collapse
-   *  them with a falsy check. */
+   *  them with a falsy check.
+   *
+   *  'no-gui-session' is a THIRD state and appears ALONE: the process
+   *  is outside a GUI login session (macOS's root LaunchDaemon), so
+   *  capture and input are impossible regardless of grants. It is not
+   *  a device with missing permissions — it is not a capture target. */
   permissions?: string[]
   supports_clipboard: boolean
   supports_file_transfer: boolean
