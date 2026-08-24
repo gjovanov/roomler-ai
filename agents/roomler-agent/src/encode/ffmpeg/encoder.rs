@@ -82,8 +82,15 @@ const DEFAULT_ENCODER_FPS: i32 = 30;
 const TIME_BASE_DEN: i32 = 1000;
 
 /// Codec dispatch order for HEVC. First successful `find_by_name +
-/// open_as` wins. Matches RustDesk's order (NVIDIA → Intel → AMD).
-const HEVC_ENCODER_NAMES: &[&str] = &["hevc_nvenc", "hevc_qsv", "hevc_amf"];
+/// open_as` wins. Matches RustDesk's order (NVIDIA → Intel → AMD), with
+/// Apple's VideoToolbox appended.
+///
+/// The entries are DISJOINT BY PLATFORM: nvenc/qsv/amf can never exist on
+/// macOS, and `hevc_videotoolbox` can never exist anywhere else. So the
+/// order decides nothing except how many cheap registry misses precede the
+/// hit. Appended rather than prepended purely so the existing fleet's
+/// dispatch is unchanged — a Mac paying three misses costs nothing.
+const HEVC_ENCODER_NAMES: &[&str] = &["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_videotoolbox"];
 
 /// rc.83 — Codec dispatch order for VP9. Intel oneVPL only — NVIDIA
 /// NVENC + AMD AMF never added VP9 encode (they skipped to AV1). On
@@ -106,7 +113,22 @@ const VP9_ENCODER_NAMES: &[&str] = &["vp9_qsv"];
 /// (`ActivateObject` 0x8000FFFF on RTX 5090 Blackwell) is MF-specific —
 /// this path talks to the NVENC SDK via FFmpeg directly, and the probe
 /// protects us if it ever shares the failure.
-const AV1_ENCODER_NAMES: &[&str] = &["av1_nvenc", "av1_qsv", "av1_amf"];
+///
+/// `av1_videotoolbox` is appended DELIBERATELY UNPROVEN. FFmpeg 8.1.2 does
+/// ship the encoder (verified against the vendored dylib: libavcodec carries
+/// a `VideoToolbox AV1 Encoder` long-name), but Apple has only ever announced
+/// AV1 *decode* silicon — from M3 — so on current Macs the open is expected to
+/// FAIL. That is the right shape here rather than a guess either way: the
+/// cascade records `last_err` and moves on, and `caps.rs` only advertises the
+/// AV1 transport if an open actually succeeded. So a Mac that lacks the block
+/// silently doesn't offer AV1, and the first Mac that gains one starts
+/// offering it with no code change.
+///
+/// ⚠️ Do not "confirm" a VideoToolbox encoder by grepping the dylib for
+/// `*_videotoolbox` — that token also matches DECODE hwaccels (`vp9_`,
+/// `mpeg2_`, `h263_`, `mpeg4_` all appear). The long-name string is what
+/// distinguishes an encoder.
+const AV1_ENCODER_NAMES: &[&str] = &["av1_nvenc", "av1_qsv", "av1_amf", "av1_videotoolbox"];
 
 /// P2 (Parsec-class plan) — Codec dispatch order for H.264 over the
 /// `data-channel-h264` transport. HW-only by construction (openh264 SW
@@ -115,7 +137,13 @@ const AV1_ENCODER_NAMES: &[&str] = &["av1_nvenc", "av1_qsv", "av1_amf"];
 /// QSV generation, every AMF generation). Probe-gated in caps.rs like
 /// HEVC/AV1 — hosts without H.264 HW simply don't advertise the transport
 /// and explicit H.264 picks stay on the RTP track + `<video>` fallback.
-const H264_ENCODER_NAMES: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf"];
+///
+/// `h264_videotoolbox` appended for Apple silicon — see the platform-
+/// disjointness note on [`HEVC_ENCODER_NAMES`]. Every Mac has an H.264
+/// encode block, so on macOS this is the reliable HW rung; HEVC is the
+/// better-compression one and is tried first by the transport ranking,
+/// not by this list.
+const H264_ENCODER_NAMES: &[&str] = &["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"];
 
 /// rc.86 — constant-quality target (lower = sharper, more bits).
 /// Default 22 is a good screen-content sweet spot for HEVC/VP9 — fine
@@ -342,6 +370,35 @@ fn encoder_options(
         // low-latency lever alongside vbr_latency).
         if let Some(v) = lowlat_knob("FFMPEG_AMF_QUERY_TIMEOUT", "1") {
             lowlat.push(("query_timeout".into(), v));
+        }
+    } else if name.contains("videotoolbox") {
+        // Apple VideoToolbox (macOS). This branch exists because the chain
+        // above has NO `else`: without it a `*_videotoolbox` name reached the
+        // encoder with an EMPTY option dict — no `maxrate`, no `bufsize`, so
+        // no HRD bound at all, and the ceiling the rate governor computes
+        // would have been silently ignored.
+        //
+        // No `cq`/`qp_i`/`global_quality` here, unlike the three vendor
+        // encoders: VT is ABR-anchored, and `build_encoder` already gives it
+        // a real `bit_rate` (only `nvenc` is special-cased to 0). Adding a
+        // quality knob on top would fight the rate control rather than
+        // replace it.
+        base.push(("maxrate".into(), cap.clone()));
+        base.push(("bufsize".into(), buf.clone()));
+        // `realtime` is the whole point for remote desktop: it tells VT to
+        // favour hitting the frame deadline over spending longer per frame.
+        // `prio_speed` pushes the same way on the encode-priority side.
+        //
+        // Both live in the tier-protected `lowlat` group, not `base` — the
+        // option dict is ALL-OR-NOTHING, and these are the two keys whose
+        // availability varies across macOS releases. If a future OS rejects
+        // one we drop only the latency posture and keep the rate control,
+        // instead of reverting to encoder defaults.
+        if let Some(v) = lowlat_knob("FFMPEG_VT_REALTIME", "1") {
+            lowlat.push(("realtime".into(), v));
+        }
+        if let Some(v) = lowlat_knob("FFMPEG_VT_PRIO_SPEED", "1") {
+            lowlat.push(("prio_speed".into(), v));
         }
     }
 
@@ -1375,7 +1432,10 @@ impl VideoEncoder for FfmpegEncoder {
     }
 
     fn is_hardware(&self) -> bool {
-        // All three names in HEVC_ENCODER_NAMES are HW backends.
+        // Every name in the dispatch tables is a HW backend — including
+        // `*_videotoolbox`, which by default refuses to fall back to Apple's
+        // software encoder (`allow_sw` defaults to 0 and we never set it), so
+        // a successful open really does mean the media engine.
         true
     }
 }
@@ -1438,14 +1498,86 @@ mod tests {
     /// Verify the dispatch order matches RustDesk's pattern + our docs.
     /// Locks the order so a refactor doesn't accidentally reorder.
     #[test]
-    fn av1_dispatch_order_is_nvenc_qsv_amf() {
-        // rc.190 — same vendor order as HEVC (NVIDIA → Intel → AMD).
-        assert_eq!(AV1_ENCODER_NAMES, &["av1_nvenc", "av1_qsv", "av1_amf"]);
+    fn av1_dispatch_order_is_nvenc_qsv_amf_videotoolbox() {
+        // rc.190 — same vendor order as HEVC (NVIDIA → Intel → AMD), with
+        // Apple last. The videotoolbox entry is expected to FAIL to open on
+        // current Macs (no AV1 encode silicon announced); it is present so
+        // the caps probe answers the question instead of a code comment.
+        assert_eq!(
+            AV1_ENCODER_NAMES,
+            &["av1_nvenc", "av1_qsv", "av1_amf", "av1_videotoolbox"]
+        );
     }
 
     #[test]
-    fn hevc_dispatch_order_is_nvenc_qsv_amf() {
-        assert_eq!(HEVC_ENCODER_NAMES, &["hevc_nvenc", "hevc_qsv", "hevc_amf"]);
+    fn hevc_dispatch_order_is_nvenc_qsv_amf_videotoolbox() {
+        assert_eq!(
+            HEVC_ENCODER_NAMES,
+            &["hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_videotoolbox"]
+        );
+    }
+
+    #[test]
+    fn h264_dispatch_order_is_nvenc_qsv_amf_videotoolbox() {
+        assert_eq!(
+            H264_ENCODER_NAMES,
+            &["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
+        );
+    }
+
+    /// The vendor encoders are appended-to, never reordered: an existing
+    /// fleet must keep resolving to exactly the encoder it resolved to
+    /// before, so `*_videotoolbox` may only ever be LAST.
+    #[test]
+    fn videotoolbox_is_appended_never_prepended() {
+        for names in [HEVC_ENCODER_NAMES, H264_ENCODER_NAMES, AV1_ENCODER_NAMES] {
+            let vt = names
+                .iter()
+                .position(|n| n.contains("videotoolbox"))
+                .expect("every table should offer a videotoolbox rung");
+            assert_eq!(
+                vt,
+                names.len() - 1,
+                "videotoolbox must be last in {names:?} — prepending it would \
+                 change dispatch for every non-Apple host in the fleet"
+            );
+        }
+    }
+
+    /// Without a `videotoolbox` arm in `encoder_options` the if/else-if
+    /// chain falls off the end and the encoder is opened with an EMPTY
+    /// option dict — no `maxrate`, no `bufsize`, so the ceiling the rate
+    /// governor computed is silently discarded. Lock the bound.
+    #[test]
+    fn videotoolbox_gets_a_rate_ceiling() {
+        let (base, lowlat, summary) =
+            encoder_options("hevc_videotoolbox", 3_000_000, 22, false, false, false);
+        let has = |v: &[(String, String)], k: &str| v.iter().any(|(a, _)| a == k);
+        assert!(has(&base, "maxrate"), "missing maxrate: {summary}");
+        assert!(has(&base, "bufsize"), "missing bufsize: {summary}");
+        // Latency knobs belong to the tier-protected group so a rejection
+        // drops only them and keeps the rate control.
+        assert!(
+            has(&lowlat, "realtime"),
+            "realtime must be tiered: {summary}"
+        );
+        assert!(!has(&base, "realtime"), "realtime must not be in base");
+        // VT is ABR-anchored — a constant-quality knob here would fight the
+        // bitrate target rather than replace it.
+        for k in ["cq", "qp_i", "qp_p", "global_quality", "rc"] {
+            assert!(!has(&base, k), "unexpected {k} for videotoolbox: {summary}");
+        }
+    }
+
+    /// The vendor branches must not start matching on the Apple name (they
+    /// key off substrings, and a careless `contains` could overlap).
+    #[test]
+    fn videotoolbox_does_not_collide_with_the_vendor_branches() {
+        for n in ["hevc_videotoolbox", "h264_videotoolbox", "av1_videotoolbox"] {
+            assert!(!n.contains("nvenc"));
+            assert!(!n.contains("qsv"));
+            assert!(!n.contains("amf"));
+        }
     }
 
     /// P7 — the Rext profile key must appear exactly when 4:4:4 is
