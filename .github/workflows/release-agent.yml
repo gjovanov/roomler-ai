@@ -1664,6 +1664,13 @@ jobs:
       - name: Build the roomler CLI shim
         run: cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
 
+      # The desktop companion — the macOS counterpart of roomler-desktop.exe.
+      # `custom-protocol` is on unconditionally in its Cargo.toml, so a plain
+      # `cargo build` embeds the frontend and no Tauri toolchain is needed on
+      # the runner (the same reason the Windows lane uses `cargo build`).
+      - name: Build the desktop companion
+        run: cargo build -p roomler-agent-tray --release --target aarch64-apple-darwin
+
       - name: Stage .app bundle
         shell: bash
         run: |
@@ -1770,6 +1777,9 @@ jobs:
           # operator has opted in. Staged unconditionally so enabling the
           # daemon never requires a different package.
           cp agents/roomler-agent/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
+          # The companion's LaunchAgent rides here too — the postinstall reads
+          # every plist it installs out of this one directory.
+          cp agents/roomler-agent/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1814,6 +1824,56 @@ jobs:
             echo "::error::the .app's signature does not match its contents"
             exit 1
           }
+
+      - name: Stage the desktop companion (.app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A Tauri app must be a real bundle on macOS — it owns a menu-bar item
+          # and a WKWebView, and both want bundle identity (and LSUIElement, to
+          # stay out of the Dock). Hand-staged rather than built with
+          # `cargo tauri build` for the same reason the Windows lane uses plain
+          # `cargo build`: no Tauri toolchain on the runner, and the frontend is
+          # already embedded via `custom-protocol`.
+          DESK=stage/Roomler.app
+          mkdir -p "$DESK/Contents/MacOS" "$DESK/Contents/Resources"
+          cp target/aarch64-apple-darwin/release/roomler-desktop "$DESK/Contents/MacOS/roomler-desktop"
+          cp agents/roomler-agent-tray/icons/icon.png "$DESK/Contents/Resources/icon.png"
+          cat > "$DESK/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>          <string>roomler-desktop</string>
+              <key>CFBundleIdentifier</key>          <string>ai.roomler.agent-tray</string>
+              <key>CFBundleName</key>                <string>Roomler</string>
+              <key>CFBundleShortVersionString</key>  <string>${VERSION}</string>
+              <key>CFBundleVersion</key>             <string>${VERSION}</string>
+              <key>CFBundlePackageType</key>         <string>APPL</string>
+              <key>CFBundleIconFile</key>            <string>icon.png</string>
+              <key>LSMinimumSystemVersion</key>      <string>12.0</string>
+              <!-- Menu-bar only: no Dock tile, no app-switcher entry. -->
+              <key>LSUIElement</key>                 <true/>
+              <key>NSHighResolutionCapable</key>     <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Seal AFTER every file is in place — same ordering rule as the agent
+          # bundle, where signing first produced a _CodeSignature that no longer
+          # matched its contents.
+          codesign --force --sign - "$DESK"
+          codesign --verify --strict "$DESK" || {
+            echo "::error::the companion .app's signature does not match its contents"
+            exit 1
+          }
+          # It links only system frameworks; assert that rather than assume it,
+          # since the agent bundle taught us what an un-checked dylib costs.
+          bad="$(otool -L "$DESK/Contents/MacOS/roomler-desktop" | tail -n +2 | awk '{print $1}' \
+                 | grep -E '^/(opt|usr/local)/' || true)"
+          [ -z "$bad" ] || { echo "::error::companion loads non-system paths:"; echo "$bad"; exit 1; }
+          "$DESK/Contents/MacOS/roomler-desktop" --version 2>/dev/null || true
+          echo "  companion staged: $(du -h "$DESK/Contents/MacOS/roomler-desktop" | cut -f1)"
 
       - name: Import signing certs
         if: steps.apple.outputs.mode == 'full'
@@ -1891,6 +1951,16 @@ jobs:
           # the two binaries cannot be siblings here.
           cp target/aarch64-apple-darwin/release/roomler-shim payload/usr/local/bin/roomler
           chmod 755 payload/usr/local/bin/roomler
+          # The menu-bar companion, and its LaunchAgent (installed by the
+          # postinstall alongside the agent's).
+          cp -R stage/Roomler.app payload/Applications/
+          # `roomlerd` on PATH for command-surface parity with Linux and
+          # Windows. A symlink, not a copy: the daemon binary lives inside the
+          # bundle (its name is CFBundleExecutable and every launchd plist and
+          # TCC grant is keyed to that path), so this is a convenience entry
+          # point for `roomlerd enroll` / `--version`, not a second install.
+          ln -s /Applications/roomler-agent.app/Contents/MacOS/roomler-agent \
+            payload/usr/local/bin/roomlerd
           cp agents/roomler-agent/packaging/macos/postinstall scripts/postinstall
           chmod 755 scripts/postinstall
 
