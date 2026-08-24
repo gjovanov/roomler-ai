@@ -60,6 +60,9 @@ impl AgentDao {
             // (docs/remote-config.md). A freshly enrolled device must not
             // arrive carrying a config intent nobody wrote.
             desired_config: DesiredConfig::default(),
+            // The device has never spoken, so it has said nothing. Distinct
+            // from "it said nothing happened" — see `Agent::config_report`.
+            config_report: None,
             routes: Vec::new(),
             advertised_routes: Vec::new(),
             relay_home: None,
@@ -394,6 +397,33 @@ impl AgentDao {
             .update_one(
                 doc! { "_id": agent_id, "tenant_id": tenant_id },
                 doc! { "$set": { "ssh_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// Record the DEVICE's own report on a pushed desired-config
+    /// (`docs/remote-config.md`).
+    ///
+    /// ⚠️ Unlike every other setter on this type, the writer here is the
+    /// DEVICE, not an admin — so this must never grow into a general "let the
+    /// agent patch its own row" primitive. It writes one field, whose whole
+    /// meaning is "this is what the host claims"; `config_audit` holds the
+    /// server's own record of what was asked for, and that is the side a
+    /// dispute is settled on.
+    ///
+    /// Last-report-wins: the question this answers is "did the current
+    /// revision land?", which is about now, not about history.
+    pub async fn record_config_report(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        report: &roomler_ai_remote_control::models::ConfigReport,
+    ) -> DaoResult<bool> {
+        let report_bson = bson::to_bson(report).unwrap_or(bson::Bson::Null);
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "config_report": report_bson } },
             )
             .await
     }
