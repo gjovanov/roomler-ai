@@ -71,8 +71,15 @@ SmartScreen reputation organically from download volume. What signing buys
   **`environment:release`** — which is why every job that calls
   `sign-windows` in azure mode carries `environment: release`. Removing
   that line breaks the OIDC exchange for tag builds.
-- Still pending: Apple D-U-N-S → `60-apple-setup.sh`; GPG key →
-  `70-gpg-release-key.sh`.
+- **GPG is LIVE** (re-checked 2026-08-24 — this line previously said "pending"
+  and was stale). `agent-v0.3.0-rc.458` publishes 9 `.asc` sidecars plus
+  `roomler-release-pubkey.asc`: ed25519 primary `[C]` certify-only
+  `D654B016256FD92A81634A0E2AD1E9F025973A7F` + ed25519 `[S]` subkey
+  `5DB8221F546288DE780C10D3A2C53E5FE6FA485A`, both to 2028-08-22. Signatures
+  verify; a flipped byte gives `BAD signature`. The agent does not check them
+  yet — see §7b.
+- Still pending: Apple D-U-N-S → `60-apple-setup.sh` (which is what blocks
+  `pkgutil --check-signature` in the updater).
 
 ## 3. Credential setup — `scripts/signing/`
 
@@ -235,6 +242,76 @@ gh attestation verify roomler-agent-<v>-x86_64-unknown-linux-gnu.deb --repo gjov
 curl -fsSL https://github.com/gjovanov/roomler-ai/releases/latest/download/roomler-release-pubkey.asc | gpg --import
 gpg --verify <asset>.asc <asset>
 ```
+
+## 7b. What the AGENT verifies before installing an update
+
+§7 is a human checking a release. This is the machine refusing one. Both gates
+live in `updater::download_asset`, both fail closed, and both failures are the
+same benign outcome: the file is discarded and the agent keeps the version it
+is already running.
+
+| Gate | Module | Answers | Enforced on |
+|---|---|---|---|
+| Authenticode + publisher name | `code_signature::verify_publisher` | *Whose* bytes are these? | Windows |
+| Embedded version vs manifest claim | `artifact_version::verify_artifact_version` | *Which release* are they? | Windows (`.msi`) |
+
+**Neither is sufficient alone, and the second is the less obvious one.**
+`is_newer` decides to upgrade by reading the **manifest's** tag, while the
+signature verifies the **artifact** — so before the version binding existed,
+a tampered manifest could advertise `agent-v0.3.0-rc.999` and point
+`browser_download_url` at a genuinely-signed **older** MSI. Signature: valid,
+it really is ours. `is_newer`: 999 beats everything in the field. Result: the
+whole fleet downgrades into a version whose exploit is public, with nothing
+untrue said about the bytes at any point.
+
+The binding works because the MSI's `ProductVersion` sits **inside the signed
+envelope** — editing it invalidates the Authenticode signature the first gate
+already enforces. Equally, the signature is what makes the embedded version
+unforgeable. Neither gate means much without the other.
+
+⚠️ **`.deb` and `.pkg` report `Unsupported`, not a refusal.** The *agent* has
+authenticated nothing about them, so a version check there would compare a
+claim against a claim while reading like a control.
+
+Note the gap precisely — **the release pipeline is ahead of the agent here.**
+Every published artifact already carries a detached `.asc`, and
+`roomler-release-pubkey.asc` ships in the release. Verified 2026-08-24 against
+`agent-v0.3.0-rc.458`: the key is an ed25519 primary `[C]` (certify-only,
+offline, `D654B016256FD92A81634A0E2AD1E9F025973A7F`) with an ed25519 `[S]`
+signing subkey (`5DB8221F546288DE780C10D3A2C53E5FE6FA485A`), both valid to
+2028-08-22; the `.deb` sidecar verifies, and flipping one byte yields
+`BAD signature`. **What is missing is the client half.** Verifying in-process
+needs the release public key *pinned in the binary* — a key fetched from the
+release alongside the artifact is the same-channel trust failure as the SHA256.
+
+That makes the remaining Linux work a size question, not a key-custody one:
+both a pinned-raw-ed25519 scheme and in-process OpenPGP put a *signing* key in
+CI, and the primitive is ed25519 either way. The difference is **revocability**
+— pinning the offline primary lets a compromised subkey be revoked and replaced
+without touching the fleet, whereas a pinned raw key can only be rotated by a
+fleet-wide update signed with the very key being rotated. Measure the linked
+size of a minimal OpenPGP verify path before committing.
+
+⚠️ **The `MAJOR.MINOR.RC` mapping has two copies.** Windows Installer's version
+is three numeric fields, so `0.3.0-rc.458` cannot be stored literally;
+`release-agent.yml`'s "Derive the MSI ProductVersion" step maps it to `0.3.458`
+and `artifact_version::msi_product_version_for` reproduces that mapping. If
+they diverge, **every agent refuses every update** — a silent fleet-wide
+freeze, not an error. Re-check the Rust side against a real artifact after any
+change to either:
+
+```bash
+gh release download agent-v<version> --repo gjovanov/roomler-ai \
+  --pattern '*perMachine*.msi' --dir /tmp
+ROOMLER_TEST_MSI=/tmp/roomler-agent-<version>-perMachine-x86_64-pc-windows-msvc.msi \
+ROOMLER_TEST_MSI_TAG=agent-v<version> \
+  cargo test -p roomler-agent --lib -- --ignored real_published_msi
+```
+
+The same freeze risk applies to the signing gate: a release that ships an
+unsigned or mis-signed Windows artifact does not error, it just stops updating
+the fleet. The `require` mode in `.github/actions/sign-windows` is what
+prevents that reaching a release tag — do not weaken it.
 
 ## 8. Enterprise pilot path (before/without the public cert)
 

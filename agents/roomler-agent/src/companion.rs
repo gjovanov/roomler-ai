@@ -98,7 +98,10 @@ async fn refresh_inner(respawn: RespawnContext) -> Result<()> {
         .with_context(|| format!("fetching release {tag}"))?;
     let asset = pick_desktop_asset(&release.assets)
         .with_context(|| format!("no roomler-desktop asset in release {tag}"))?;
-    let staged = crate::updater::download_asset(asset)
+    // The tag is OUR OWN version, so there is no version claim to be lied to
+    // about here — but pass it anyway: the day the desktop EXE gains a
+    // readable version binding, this call site should not need finding.
+    let staged = crate::updater::download_asset(asset, &tag)
         .await
         .with_context(|| format!("downloading {}", asset.name))?;
 
