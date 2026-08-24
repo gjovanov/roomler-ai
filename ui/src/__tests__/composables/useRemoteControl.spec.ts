@@ -2381,6 +2381,52 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     expect(r.chromaOverride).toBe('yuv420')
   })
 
+  // Priority -> chroma. A Mac has no HW encoder at all, so Auto always
+  // lands it on the SW rung, where 4:2:0 subsampled exactly the colour
+  // edges that make terminal text legible. `sharper` buys full chroma at
+  // the cost of SW decode; nothing else changes behaviour.
+  it('Sharper upgrades the VP9 SW rung to 4:4:4 (the macOS text case)', () => {
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444'],
+        agentHwEncoders: ['libvpx-vp9-444-sw'],
+        viewerVp9Hw: false,
+        viewerVp9Decodable: true,
+        priority: 'sharper',
+      }),
+    )
+    expect(r.transport).toBe('data-channel-vp9-444')
+    expect(r.chromaOverride).toBe('yuv444')
+  })
+
+  it('Sharper does NOT force 4:4:4 onto the vp9_qsv HW rung', () => {
+    // libvpx always has profile 1; vp9_qsv's 4:4:4 support is not
+    // established, and forcing it could fail the encoder open. The dial
+    // must not reach a rung whose encoder might refuse the format.
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444'],
+        agentHwEncoders: ['ffmpeg-vp9_qsv', 'libvpx-vp9-444-sw'],
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+        priority: 'sharper',
+      }),
+    )
+    expect(r.transport).toBe('data-channel-vp9-444')
+    expect(r.chromaOverride).toBe('yuv420')
+  })
+
+  it('balanced / smoother / absent all keep the SW rung on 4:2:0', () => {
+    const sw = {
+      agentTransports: ['data-channel-vp9-444'],
+      agentHwEncoders: ['libvpx-vp9-444-sw'],
+      viewerVp9Decodable: true,
+    }
+    for (const priority of ['balanced', 'smoother', undefined] as const) {
+      expect(pickAutoTransport(base({ ...sw, priority })).chromaOverride).toBe('yuv420')
+    }
+  })
+
   it('P2 — H.264-DC HW×HW slots ABOVE the VP9 SW-encode tier', () => {
     // Agent with H.264 HW but no HEVC/AV1/vp9_qsv (old NVIDIA/AMD class):
     // H.264-DC must beat the ≤1920-capped libvpx SW fallback.
