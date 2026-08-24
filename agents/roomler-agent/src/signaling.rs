@@ -1629,6 +1629,45 @@ async fn connect_once(
     }
 }
 
+/// Tell the server what this device did with a pushed desired-config
+/// (`docs/remote-config.md`).
+///
+/// Fire-and-forget, mirroring `ssh::ActivitySink::report` and for the same
+/// reason: a full outbound queue means the connection is already struggling,
+/// and losing a status line must never be allowed to stall the WS receive path
+/// that produced it. The daemon log always has the same information.
+///
+/// `detail` is redacted and capped BEFORE it leaves the host — it is an error
+/// string we did not compose, so it gets the same treatment as any other text
+/// this daemon ships off the machine.
+fn report_config_status(
+    outbound_tx: &mpsc::Sender<ClientMsg>,
+    revision: u64,
+    outcome: roomler_ai_remote_control::models::ConfigOutcome,
+    detail: Option<&str>,
+) {
+    use roomler_ai_remote_control::models::ConfigReport;
+
+    let detail = detail.map(|d| {
+        let mut s = crate::exec::redactor().apply(d);
+        if s.chars().count() > ConfigReport::MAX_DETAIL {
+            s = s.chars().take(ConfigReport::MAX_DETAIL).collect();
+            s.push('…');
+        }
+        s
+    });
+    let msg = ClientMsg::ConfigStatus {
+        revision,
+        outcome,
+        live: Vec::new(),
+        needs_restart: Vec::new(),
+        detail,
+    };
+    if outbound_tx.try_send(msg).is_err() {
+        debug!("rc:agent.config_status dropped (outbound queue full or closed)");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_server_msg(
     ctx: &OrgCtx,
@@ -2465,12 +2504,18 @@ async fn handle_server_msg(
             }
         }
 
-        // Remote config (docs/remote-config.md) — step 3 lands the WIRE only.
-        // This arm decides and SAYS what it decided; applying, persisting and
-        // the staggered restart are step 4, deliberately separate because
-        // mutating a device's config and restarting its daemon deserves its
-        // own review rather than riding in on a transport change.
+        // Remote config (docs/remote-config.md) — reconcile against a pushed
+        // desired state, then SAY what happened.
+        //
+        // Every branch below reports, including both refusals. That is the
+        // point of the report rather than a completeness reflex: an operator
+        // watching the dashboard cannot otherwise tell a device that declined
+        // from one that never received the frame, and the two refusals here
+        // are the ones they will actually hit — each with a concrete next
+        // action they can only take if somebody tells them.
         ServerMsg::ConfigPush { revision, desired } => {
+            use roomler_ai_remote_control::models::ConfigOutcome;
+
             // Machine-wide keys, so only the PRIMARY enrollment may drive
             // them — the identical rule `UpdateNow` applies to the
             // machine-wide self-updater. `AgentConfig::for_org` scopes none
@@ -2483,6 +2528,7 @@ async fn handle_server_msg(
                     "rc:agent.config ignored — only the primary enrollment may \
                      change machine-wide config"
                 );
+                report_config_status(outbound_tx, revision, ConfigOutcome::NotPrimary, None);
                 return Ok(());
             }
             // Gate 4, and the reason this feature does not erode it: the
@@ -2494,6 +2540,11 @@ async fn handle_server_msg(
                     "rc:agent.config ignored — this device has not opted in \
                      (set remote_config_enabled=true locally to accept pushed config)"
                 );
+                // Reporting a refusal is NOT a leak of gate 4's protection:
+                // the server already knows it pushed and got nothing. What it
+                // does not know is WHY, and that difference is the whole gap
+                // between "update this device" and "go set one key on it".
+                report_config_status(outbound_tx, revision, ConfigOutcome::NotOptedIn, None);
                 return Ok(());
             }
             // Opted in and primary: reconcile against the file on DISK.
@@ -2502,6 +2553,11 @@ async fn handle_server_msg(
             match remote_cfg.apply(&desired).await {
                 Ok(applied) if applied.is_noop() => {
                     debug!(revision, "rc:agent.config — already matches; nothing to do");
+                    // Still reported. A converged device and a device that has
+                    // not answered look identical otherwise, and the steady
+                    // state of this feature is "everything already matches" —
+                    // so the common case would be the one with no evidence.
+                    report_config_status(outbound_tx, revision, ConfigOutcome::Noop, None);
                 }
                 Ok(applied) => {
                     // Two lists, deliberately never one: `exec_enabled` is in
@@ -2522,9 +2578,29 @@ async fn handle_server_msg(
                              to take effect"
                         );
                     }
+                    let msg = ClientMsg::ConfigStatus {
+                        revision,
+                        outcome: ConfigOutcome::Applied,
+                        live: applied.live.iter().map(|k| k.to_string()).collect(),
+                        needs_restart: applied
+                            .needs_restart
+                            .iter()
+                            .map(|k| k.to_string())
+                            .collect(),
+                        detail: None,
+                    };
+                    if outbound_tx.try_send(msg).is_err() {
+                        debug!("rc:agent.config_status dropped (outbound queue full or closed)");
+                    }
                 }
                 Err(e) => {
                     warn!(revision, %e, "rc:agent.config apply failed");
+                    report_config_status(
+                        outbound_tx,
+                        revision,
+                        ConfigOutcome::Failed,
+                        Some(e.as_str()),
+                    );
                 }
             }
         }

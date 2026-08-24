@@ -439,4 +439,111 @@ describe('useAgentStore', () => {
     expect(res.items[0]!.kind).toBe('forward')
     expect(res.items[0]!.detail).toBe('10.0.0.5:5432')
   })
+
+  // ── Remote config (docs/remote-config.md) ──────────────────────────
+
+  it('updateDesiredConfig sends only the keys under management', async () => {
+    // `undefined` means "leave the device alone" and must NOT be sent as a
+    // value. A body that asserted every key would silently turn SSH off on a
+    // device whose admin only meant to touch exec.
+    mockApi.put.mockResolvedValueOnce({
+      revision: 1,
+      desired: { revision: 1, exec_enabled: true },
+    })
+    const s = useAgentStore()
+    s.agents = [mkAgent()]
+    await s.updateDesiredConfig(TENANT_ID, 'a1', { exec_enabled: true })
+
+    const [url, body] = mockApi.put.mock.calls.at(-1)!
+    expect(url).toBe(`/tenant/${TENANT_ID}/agent/a1/desired-config`)
+    expect(body).toEqual({ exec_enabled: true })
+    expect('ssh_enabled' in (body as object)).toBe(false)
+  })
+
+  it('a saved request is optimistically PENDING, never applied', async () => {
+    // The device has not spoken yet. Writing anything but `pending` would put
+    // an answer on screen that no device has given — the exact lie the
+    // report-back mechanism exists to prevent.
+    mockApi.put.mockResolvedValueOnce({
+      revision: 4,
+      desired: { revision: 4, exec_enabled: true },
+    })
+    const s = useAgentStore()
+    s.agents = [mkAgent()]
+    await s.updateDesiredConfig(TENANT_ID, 'a1', { exec_enabled: true })
+
+    expect(s.agents[0]!.remote_config!.state).toBe('pending')
+    expect(s.agents[0]!.remote_config!.report).toBeUndefined()
+    expect(s.agents[0]!.remote_config!.desired.exec_enabled).toBe(true)
+  })
+
+  it('a device with no remote_config is simply unmanaged', () => {
+    // Absent means nobody has requested anything — NOT "everything is off".
+    expect(mkAgent().remote_config).toBeUndefined()
+  })
+
+  it('a refusal keeps its reason, because the reason IS the next action', async () => {
+    // `not_opted_in` (go set a key on the host) and `not_primary` (ask the
+    // other org) need completely different responses. Collapsing them into
+    // "refused" would leave an operator with nothing to do.
+    mockApi.get.mockResolvedValueOnce({
+      items: [
+        mkAgent({
+          remote_config: {
+            desired: { revision: 2, exec_enabled: true },
+            report: {
+              revision: 2,
+              outcome: 'not_primary',
+              live: [],
+              needs_restart: [],
+              reported_at: '2026-08-24T00:00:00Z',
+            },
+            state: 'refused',
+          },
+        }),
+      ],
+      total: 1,
+      page: 1,
+      per_page: 20,
+      total_pages: 1,
+    })
+    const s = useAgentStore()
+    await s.fetchAgents(TENANT_ID)
+    expect(s.agents[0]!.remote_config!.state).toBe('refused')
+    expect(s.agents[0]!.remote_config!.report!.outcome).toBe('not_primary')
+  })
+
+  it('needs_restart is never reported as applied', async () => {
+    // The keys in that list are written to disk and not in force. Reading it
+    // as "applied" tells an operator SSH is open while the device refuses
+    // every session.
+    mockApi.get.mockResolvedValueOnce({
+      items: [
+        mkAgent({
+          remote_config: {
+            desired: { revision: 3, ssh_enabled: true },
+            report: {
+              revision: 3,
+              outcome: 'applied',
+              live: [],
+              needs_restart: ['ssh_enabled'],
+              reported_at: '2026-08-24T00:00:00Z',
+            },
+            state: 'needs_restart',
+          },
+        }),
+      ],
+      total: 1,
+      page: 1,
+      per_page: 20,
+      total_pages: 1,
+    })
+    const s = useAgentStore()
+    await s.fetchAgents(TENANT_ID)
+    const rc = s.agents[0]!.remote_config!
+    // The device said "applied"; the SERVER resolved that to `needs_restart`
+    // because of the key list. The state is the thing to render.
+    expect(rc.report!.outcome).toBe('applied')
+    expect(rc.state).toBe('needs_restart')
+  })
 })
