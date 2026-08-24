@@ -230,6 +230,31 @@ pub(crate) const POKE_SILENCE_AFTER: Duration = Duration::from_secs(30);
 /// organically and the poke only fires for idle or responder-role carriers —
 /// one 2-packet handshake per peer per ~2 min at worst.
 pub(crate) const POKE_PROOF_AFTER: Duration = Duration::from_secs(120);
+/// #26 — the conviction window for a poke armed BY a netstate **Major** (a VPN
+/// connect / default-route move), instead of the tier's handshake deadline.
+///
+/// Those deadlines (12 s LAN/Srflx, 30 s Public, 45 s Relay) answer a
+/// different question: *"can a carrier ESTABLISH over this path?"* — a NAT
+/// punch, a TURN allocation and two ends' grants all have to converge, so they
+/// are generous by design. Re-validating an ALREADY-ESTABLISHED carrier is a
+/// far easier question — a live path answers a forced rekey in ONE round trip
+/// (single-digit ms on a LAN, ~200 ms across the internet) — and paying the
+/// establish-sized deadline for it IS the VPN-transition hole: field
+/// 2026-08-24 measured 9 dropped pings on a LAN/Srflx pair and **34** on a
+/// public pair, both matching their tier deadline almost exactly.
+///
+/// ⚠️ The trade this makes, stated plainly: boringtun re-sends an in-flight
+/// initiation about every 5 s, so a 12 s window judges 2–3 attempts while this
+/// one judges **one**. A single dropped initiation therefore convicts. That is
+/// the right side of an asymmetric bet — a *false* conviction demotes the pair
+/// to the relay floor, which carries traffic at a worse RTT and re-upgrades
+/// itself within a sweep or two (`RekeyUnanswered` deliberately books NO
+/// PathMonitor strike or penalty, so the tier stays eligible), whereas a *late*
+/// conviction is 100 % packet loss for its whole duration. Degrade beats
+/// blackhole. It is also bounded: only ESTABLISHED **direct** carriers are
+/// armed on a net-change, and `netstate` publishes at most one material Major
+/// per `MAJOR_PUBLISH_COOLDOWN` (120 s), so this cannot become a churn engine.
+pub(crate) const MAJOR_POKE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Why a carrier died. Precedence when several signals co-trip (mirrors the
 /// pre-P2 log selection, which keyed off `(hard_dead, rx_stale)` in this
@@ -318,6 +343,14 @@ impl CarrierPhase {
 pub(crate) struct PokeState {
     pub(crate) since_poke: Duration,
     pub(crate) answered: bool,
+    /// #26 — this poke was armed by a netstate **Major** specifically, so it
+    /// convicts on [`MAJOR_POKE_DEADLINE`] rather than the tier's
+    /// establish-sized handshake deadline. ⚠️ Not merely "armed by a
+    /// net-change": the chattier addr/iface cause arms the same poke with this
+    /// `false`, deliberately (`runtime::ForcedPoke`). Carried on the POKE, not
+    /// on the carrier — the class belongs to the question being asked, and a
+    /// re-arm is what re-decides it.
+    pub(crate) from_major: bool,
 }
 
 /// Everything [`carrier_tick`] needs about one installed carrier, gathered by
@@ -389,9 +422,19 @@ pub(crate) fn carrier_tick(i: &HealthInputs) -> HealthVerdict {
             // it is literally the same physical question ("can a handshake
             // complete over this path?"), so the deadline table stays the
             // single source of truth.
-            i.poke
-                .as_ref()
-                .is_some_and(|p| !p.answered && p.since_poke > i.tier.handshake_deadline()),
+            //
+            // #26 — EXCEPT for a poke armed by a netstate MAJOR, which asks
+            // the easier question "is this ESTABLISHED carrier still alive?"
+            // and convicts on `MAJOR_POKE_DEADLINE` instead. Both windows are
+            // chosen here so the deadline policy stays in one place.
+            i.poke.as_ref().is_some_and(|p| {
+                let window = if p.from_major {
+                    MAJOR_POKE_DEADLINE
+                } else {
+                    i.tier.handshake_deadline()
+                };
+                !p.answered && p.since_poke > window
+            }),
         ),
     };
 
@@ -489,8 +532,17 @@ pub(crate) fn should_poke(
 /// roam, VPN disconnect) costs one handshake round per pair, nothing more.
 /// Established carriers only — an Installing carrier already has the
 /// handshake-deadline reaper.
-pub(crate) fn should_poke_on_netchange(handshake_done: bool, poke_pending: bool) -> bool {
-    handshake_done && !poke_pending
+///
+/// #26 — it deliberately does NOT take `poke_pending`: a net-change **re-arms**
+/// over a poke that is already in flight. It used to skip those carriers, which
+/// left a hole exactly one poke-window wide — a poke armed by the silence or
+/// proof trigger seconds before a VPN connect kept its establish-sized tier
+/// deadline (12–30 s) and blackholed the pair for that whole window. Re-arming
+/// is also the honest way to apply [`MAJOR_POKE_DEADLINE`]: the tight
+/// window judges a FRESH initiation sent now, not one whose last boringtun
+/// re-send may already be ~5 s old.
+pub(crate) fn should_poke_on_netchange(handshake_done: bool) -> bool {
+    handshake_done
 }
 
 /// A make-before-break shadow probe's verdict (pre-P2: the two branch
@@ -983,21 +1035,18 @@ mod tests {
         ));
     }
 
-    /// Stage 2 — the arming matrix: silence and stale-proof each trigger;
-    /// a pending poke, a missing handshake, or fresh evidence suppress.
-    /// Net-change forced pokes: established + no in-flight poke arms;
-    /// pre-handshake carriers and pending pokes never double-arm. The
+    /// Stage 2 — net-change forced pokes arm on any ESTABLISHED carrier; a
+    /// pre-handshake one is left to the handshake-deadline reaper. The
     /// silence/proof waits are deliberately absent — the OS event is the
     /// suspicion (winhost-a 2026-08-15: 92 s failover waiting out the gates).
+    /// #26 — and a poke already in flight no longer suppresses: the
+    /// net-change RE-ARMS, which is what lets the tight window judge a fresh
+    /// initiation (the parameter is gone, so no caller can reintroduce the
+    /// skip by passing `true`).
     #[test]
     fn should_poke_on_netchange_matrix() {
-        assert!(should_poke_on_netchange(true, false));
-        assert!(!should_poke_on_netchange(false, false), "pre-handshake");
-        assert!(
-            !should_poke_on_netchange(true, true),
-            "poke already pending"
-        );
-        assert!(!should_poke_on_netchange(false, true));
+        assert!(should_poke_on_netchange(true));
+        assert!(!should_poke_on_netchange(false), "pre-handshake");
     }
 
     #[test]
@@ -1032,6 +1081,7 @@ mod tests {
                 poke: Some(PokeState {
                     since_poke,
                     answered,
+                    from_major: false,
                 }),
                 ..established()
             };
@@ -1062,6 +1112,7 @@ mod tests {
             poke: Some(PokeState {
                 since_poke: Duration::from_secs(60),
                 answered: false,
+                from_major: false,
             }),
             ..established()
         };
@@ -1074,10 +1125,106 @@ mod tests {
             poke: Some(PokeState {
                 since_poke: Duration::from_secs(60),
                 answered: false,
+                from_major: false,
             }),
             ..established()
         };
         assert!(carrier_tick(&i).death.is_none());
+    }
+
+    /// #26 — the net-change window. A poke armed BY a netstate Major convicts
+    /// at [`MAJOR_POKE_DEADLINE`] on EVERY tier, including the two whose
+    /// establish-sized deadlines (Public 30 s, Relay 45 s) measured as the
+    /// 34-dropped-ping hole; an ordinary poke on the same carrier still waits
+    /// out its tier. The two properties that keep it honest are asserted with
+    /// it: an ANSWERED net-change poke never convicts however old it is, and
+    /// the tight window is Established-only (a never-handshaked carrier still
+    /// yields the Installing-phase verdict, not a 2 s one).
+    #[test]
+    fn major_poke_convicts_on_its_own_window_not_the_tier_deadline() {
+        let s = Duration::from_secs;
+        for (tier, is_direct) in [
+            (DirectTier::Lan, true),
+            (DirectTier::Srflx, true),
+            (DirectTier::Public, true),
+            (DirectTier::Relay, false),
+        ] {
+            let poked = |since_poke: Duration, answered: bool, from_major: bool| HealthInputs {
+                tier,
+                is_direct,
+                poke: Some(PokeState {
+                    since_poke,
+                    answered,
+                    from_major,
+                }),
+                ..established()
+            };
+            // Inside the tight window: alive.
+            assert!(
+                carrier_tick(&poked(MAJOR_POKE_DEADLINE, false, true))
+                    .death
+                    .is_none(),
+                "{tier:?} must survive inside the net-change window"
+            );
+            // Just past it: dead — WITHOUT waiting for the tier deadline,
+            // which is 6-22x longer on every tier here.
+            assert_eq!(
+                carrier_tick(&poked(MAJOR_POKE_DEADLINE + s(1), false, true)).death,
+                Some(DeathReason::RekeyUnanswered),
+                "{tier:?} net-change poke must convict at its own window"
+            );
+            // The SAME age on an ordinary poke is still well inside every
+            // tier's deadline — the two classes must not collapse into one.
+            assert!(
+                carrier_tick(&poked(MAJOR_POKE_DEADLINE + s(1), false, false))
+                    .death
+                    .is_none(),
+                "{tier:?} ordinary poke must still wait out its tier deadline"
+            );
+            // Answered: alive, at any age. This is the whole reason a
+            // one-round-trip window is safe on a benign net-change.
+            assert!(
+                carrier_tick(&poked(tier.handshake_deadline() * 3, true, true))
+                    .death
+                    .is_none(),
+                "{tier:?} answered net-change poke must never kill"
+            );
+        }
+        // Phase gate: Established-only, exactly like the ordinary poke.
+        let i = HealthInputs {
+            handshake_done: false,
+            since_install: s(60),
+            poke: Some(PokeState {
+                since_poke: s(60),
+                answered: false,
+                from_major: true,
+            }),
+            ..established()
+        };
+        assert_eq!(carrier_tick(&i).death, Some(DeathReason::HandshakeDeadline));
+    }
+
+    /// #26 — the window has to stay tighter than every tier deadline, or the
+    /// net-change class silently becomes a no-op (and, on a hypothetical tier
+    /// below it, a REGRESSION that convicts later than before).
+    #[test]
+    fn major_poke_window_is_tighter_than_every_tier_deadline() {
+        for tier in [
+            DirectTier::Lan,
+            DirectTier::Srflx,
+            DirectTier::Public,
+            DirectTier::Relay,
+        ] {
+            assert!(
+                MAJOR_POKE_DEADLINE < tier.handshake_deadline(),
+                "{tier:?}: net-change window must be tighter than the tier deadline"
+            );
+        }
+        // And tighter than the passive triggers it front-runs, or a carrier
+        // could be convicted by a net-change poke it was never even eligible
+        // to be armed for.
+        assert!(MAJOR_POKE_DEADLINE < POKE_SILENCE_AFTER);
+        assert!(MAJOR_POKE_DEADLINE < POKE_PROOF_AFTER);
     }
 
     /// Stage 2 — precedence: HardDead outranks the poke verdict; the poke
@@ -1093,6 +1240,7 @@ mod tests {
             poke: Some(PokeState {
                 since_poke: Duration::from_secs(46),
                 answered: false,
+                from_major: false,
             }),
             ..established()
         };
@@ -1113,6 +1261,7 @@ mod tests {
             poke: Some(PokeState {
                 since_poke: Duration::from_secs(31),
                 answered: false,
+                from_major: false,
             }),
             ..established()
         };

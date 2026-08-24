@@ -239,6 +239,31 @@ cascade's guarantees while replacing its reactive counters:
   the evidence (a failed re-attempt books `HandshakeDeadline` ~12 s later;
   a transient recovers with zero penalty and cannot feed the forced-DERP
   churn escalation).
+- **The Major fast lane (#26).** A poke armed by a netstate **MAJOR** — the
+  default route moved or addresses vanished, i.e. the VPN-transition
+  signature — is judged on `MAJOR_POKE_DEADLINE` (2 s) instead of the tier's
+  deadline, and the next health sweep is pulled forward to just past it rather
+  than waiting for the 5 s grid. The tier deadlines answer *"can a carrier
+  ESTABLISH here?"* (NAT punch + allocation + both grants) and are generous by
+  design; re-validating an **already-established** carrier is one round trip,
+  and paying the establish-sized price for it WAS the transition hole —
+  measured 2026-08-24 as 9 dropped pings on a LAN/Srflx pair and 34 on a
+  public one, each matching its tier deadline almost exactly. A Major also
+  **re-arms** a poke already in flight (pre-#26 it skipped those carriers, so
+  a poke armed seconds earlier by the silence trigger kept the 12-30 s window),
+  which is what lets the tight window judge a *fresh* initiation.
+  Two bounds keep it safe: only ESTABLISHED **direct** carriers are armed, and
+  the chattier addr/iface cause (a virtual adapter blinking, a lease renewal —
+  up to once per 3 s, vs. one Major per 120 s) still arms its poke on the
+  **tier** deadline. The residual hole is now dominated by netstate's own
+  debounce (0.75 s, capped at 3 s during a signal storm), which is deliberate
+  flap damping — see `MAJOR_PUBLISH_COOLDOWN`.
+  ⚠️ The trade: a 2 s window judges ONE initiation where 12 s judges 2-3, so a
+  single dropped handshake convicts. That is the right side of an asymmetric
+  bet — a false conviction *degrades* the pair to the relay floor and
+  re-upgrades (no strike is booked, so the tier stays eligible), while a late
+  conviction is 100 % loss for its whole duration. The conviction log line
+  carries `from_major=` so the field can measure whether it is ever too eager.
 - **Resets.** An endpoint change (roam) clears penalties, strikes, and `Q` —
   new endpoints make old evidence stale. Forced-DERP remains a **server
   override**: the monitor annotates the pinned window and never selects
