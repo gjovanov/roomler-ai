@@ -18,7 +18,8 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/cache/restore@v4
+    - id: restore
+      uses: actions/cache/restore@v4
       with:
         path: |
           ~/.cargo/registry/index
@@ -40,6 +41,22 @@ runs:
         restore-keys: |
           seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-
           seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-
+
+    - name: Surface a cold tag build
+      shell: bash
+      env:
+        MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
+      run: |
+        # A tag build that restores NOTHING is an SLO breach in the making
+        # (+~10 min) and, historically, the first visible symptom of a
+        # silent producer-side failure (rc.460: a wedged reservation had
+        # stopped every green rehearsal from persisting generations).
+        # Annotate the run page instead of leaving it to log archaeology.
+        if [ "${GITHUB_REF_TYPE:-branch}" = "tag" ] && [ -z "${MATCHED:-}" ]; then
+          echo "::warning title=Cold tag build (no cargo seed)::no seed generation matched for family '${{ inputs.shared-key }}' — this release build runs cold (~+10 min). Check the reseed rehearsals: gh run list --workflow=release-agent.yml (workflow_dispatch lanes), and the seed-cache-save 'save verified' lines."
+        elif [ -n "${MATCHED:-}" ]; then
+          echo "restored from: ${MATCHED}"
+        fi
 
     - name: Accretion GC (rehearsals only)
       shell: bash
