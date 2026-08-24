@@ -55,6 +55,11 @@
    */
   let cfgLoaded = false;
 
+  /* Keys the daemon puts into force WITHOUT a restart. Kept in sync with
+   * `localclient.rs::config_set` and `RemoteConfigServices::adopt_local`;
+   * everything else on this surface really is read at startup only. */
+  const LIVE_KEYS = new Set(['exec_enabled', 'remote_config_enabled']);
+
   function cfgRowStatus(row) {
     return row.querySelector('.cfg-row-status');
   }
@@ -66,7 +71,15 @@
     const status = cfgRowStatus(row);
     try {
       const entry = await invoke('cmd_config_set', { key, value });
-      status.textContent = 'Saved — takes effect after the service restarts.';
+      // `exec_enabled` and `remote_config_enabled` are LIVE — the daemon
+      // re-seeds them from the file it just wrote (docs/remote-config.md §7b).
+      // Saying "restart" would be wrong in the direction that matters: the
+      // person switching one OFF would believe their refusal is not in force
+      // yet, and either restart a healthy daemon for nothing or assume they
+      // are still exposed.
+      status.textContent = LIVE_KEYS.has(key)
+        ? 'Saved — in effect now, no restart needed.'
+        : 'Saved — takes effect after the service restarts.';
       status.classList.remove('error');
       return entry;
     } catch (e) {
