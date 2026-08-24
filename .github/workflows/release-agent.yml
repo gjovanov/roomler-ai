@@ -1266,6 +1266,135 @@ jobs:
             }
           }
 
+      - name: Assert the shipping MSIs are self-contained (PE import audit)
+        shell: pwsh
+        run: |
+          # The Windows half of the check that would have caught the macOS
+          # .pkg which crashed on every clean Mac until rc.453: a dependency
+          # satisfied by the BUILD machine is invisible to any check that runs
+          # on the build machine. `windows-latest` carries the VC redist — it
+          # is where the CRT staging step SOURCES those DLLs from — so
+          # launching a binary here proves nothing about a fresh host.
+          #
+          # installer-smoke.yml (#647) audits an INSTALLED per-User MSI. This
+          # is the same audit on the artifacts that actually ship, and it is
+          # not redundant with that one:
+          #   - installer-smoke builds a MINIMAL feature set; this job builds
+          #     full-hw + vp9-444 + system-context + ffmpeg-encoder, which is
+          #     where a new native dependency would actually appear.
+          #   - it covers per-Machine too, a SEPARATE wxs whose component list
+          #     can drift from the per-User one.
+          #   - it reads the MSI, not `target\release\`. Auditing the staging
+          #     directory would pass on a DLL that is staged but never
+          #     harvested into a wxs component — i.e. exactly the bug where
+          #     the install is missing a file the build had.
+          #
+          # ⚠️ This arms on a workflow_dispatch as well as on a tag, on
+          # purpose. #639: `publish_release=false` does not exercise the
+          # tag-only gates, so they are unrehearsable and first run when a
+          # release is on the line. A gate you cannot rehearse is a gate you
+          # find out about at the worst moment.
+          $ErrorActionPreference = 'Stop'
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                     Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
+
+          # Redistributables — shipped by us, never by Windows. These MUST be
+          # app-local; finding them in System32 proves nothing about a fresh
+          # machine, so they are excluded from the System32 allowance below.
+          $mustBeAppLocal = '^(msvcp|vcruntime|concrt|mfc|vcomp|msvcr)'
+
+          function Audit-Dir {
+            param([string]$Dir, [switch]$Quiet)
+            $found    = @()
+            $appLocal = @()
+            foreach ($exe in @('roomlerd.exe', 'roomler.exe')) {
+              $path = Join-Path $Dir $exe
+              if (-not (Test-Path $path)) { $found += "$exe missing from the MSI payload"; continue }
+              $imports = & $dumpbin /dependents $path |
+                Select-String -Pattern '^\s{4}(\S+\.dll)$' |
+                ForEach-Object { $_.Matches[0].Groups[1].Value }
+              if (-not $imports) { $found += "$exe : dumpbin listed no imports (parse broke?)"; continue }
+              if (-not $Quiet) { Write-Host "  $exe imports $($imports.Count) DLLs" }
+              foreach ($dll in $imports) {
+                if (Test-Path (Join-Path $Dir $dll)) { $appLocal += $dll; continue }
+                if ($dll -match $mustBeAppLocal) {
+                  $found += "$exe -> $dll is a REDISTRIBUTABLE and the MSI does not ship it"
+                  continue
+                }
+                if ($dll -match '^(api-ms-win-|ext-ms-win-)') { continue }
+                if (Test-Path (Join-Path $env:SystemRoot 'System32' $dll)) { continue }
+                $found += "$exe -> $dll is neither in the MSI nor an OS DLL"
+              }
+            }
+            [pscustomobject]@{
+              Problems = @($found)
+              AppLocal = @($appLocal | Sort-Object -Unique)
+            }
+          }
+
+          $flavours = @(
+            @{ Name = 'per-User';    Msi = '${{ steps.locate.outputs.artifact }}' },
+            @{ Name = 'per-Machine'; Msi = '${{ steps.locate_pm.outputs.artifact }}' }
+          )
+
+          $lastDir      = $null
+          $lastAppLocal = @()
+          foreach ($f in $flavours) {
+            Write-Host "--- 1/2: $($f.Name) MSI payload must be self-contained ---"
+            $out = Join-Path $env:RUNNER_TEMP "msi-audit\$($f.Name)"
+            Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $out -Force | Out-Null
+            # /a is an ADMINISTRATIVE install: it lays the payload out on disk
+            # without installing, registering or running anything.
+            $msiPath = (Resolve-Path $f.Msi).Path
+            $p = Start-Process msiexec.exe -Wait -PassThru `
+                   -ArgumentList @('/a', "`"$msiPath`"", '/qn', "TARGETDIR=`"$out`"")
+            if ($p.ExitCode -ne 0) { throw "msiexec /a failed for $($f.Name) with exit $($p.ExitCode)" }
+
+            $hit = Get-ChildItem -Recurse $out -Filter 'roomlerd.exe' -File | Select-Object -First 1
+            if (-not $hit) { throw "roomlerd.exe not found in the extracted $($f.Name) payload" }
+            $installDir = $hit.DirectoryName
+            Write-Host "  payload dir: $($installDir.Substring($out.Length))"
+
+            $r = Audit-Dir -Dir $installDir
+            if ($r.Problems.Count -gt 0) {
+              $r.Problems | ForEach-Object { Write-Host "::error::[$($f.Name)] $_" }
+              throw "$($f.Name) MSI is not self-contained"
+            }
+            Write-Host "  OK: every import is shipped in the MSI or by Windows"
+            Write-Host "  MSI-shipped imports: $($r.AppLocal -join ', ')"
+            $lastDir = $installDir
+            $lastAppLocal = $r.AppLocal
+          }
+
+          # ⚠️ A gate proven only on the passing case is the failure mode this
+          # step exists to fix — "it printed OK" is not evidence it can say
+          # anything else. Hide a shipped DLL and require a complaint. The
+          # victim is chosen from what the binaries ACTUALLY import rather
+          # than named up front: hard-coding msvcp140 is precisely how the
+          # first version of the installer-smoke control passed vacuously.
+          Write-Host '--- 2/2: negative control — removing a shipped import must FAIL the audit ---'
+          if ($lastAppLocal.Count -eq 0) {
+            throw "NEGATIVE CONTROL IMPOSSIBLE: no imported DLL is shipped in the MSI, so this audit has nothing to detect. Either the CRT bundle is unnecessary in this build, or the dumpbin parse is wrong — both need a human."
+          }
+          $victim = Join-Path $lastDir $lastAppLocal[0]
+          $stash  = "$victim.hidden"
+          Write-Host "  hiding $($lastAppLocal[0])"
+          Move-Item $victim $stash
+          try {
+            $neg = Audit-Dir -Dir $lastDir -Quiet
+            if ($neg.Problems.Count -eq 0) {
+              throw "NEGATIVE CONTROL FAILED: $($lastAppLocal[0]) was removed and the audit still passed — this check cannot detect what it claims to."
+            }
+            Write-Host "  OK: audit reported $($neg.Problems.Count) problem(s): $($neg.Problems[0])"
+          } finally {
+            Move-Item $stash $victim
+          }
+
       - name: 'Verify MSI size budget (P4b: MSI carries the tunnel CLI)'
         # Budget history: rc.63 baseline 8 MB (pre-ffmpeg); rc.65's
         # Option B guard capped ffmpeg bloat at a 24 MB hard ceiling;
