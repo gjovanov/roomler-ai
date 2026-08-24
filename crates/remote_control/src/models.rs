@@ -456,7 +456,10 @@ pub enum ExecMode {
 /// construction. That is required for the diagnostics this exists for
 /// (`Get-NetFirewallRule`, `netsh`, route tables, service state) and is stated
 /// in the admin UI's opt-in copy rather than buried here.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+/// `PartialEq` so a caller can ask "is this indistinguishable from the
+/// untouched default?" — the API listing needs exactly that question to avoid
+/// reporting a policy nobody set (see `AgentResponse::exec_policy`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ExecPolicy {
     /// Does this device accept exec requests? Gate 3.
     #[serde(default)]
@@ -804,7 +807,11 @@ impl DesiredConfig {
 ///
 /// ⚠️ With [`SshAccountMode::Daemon`] — the current default — `SshMode::On` is
 /// root-equivalent by construction, exactly like `ExecMode::On`.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+/// `PartialEq` for the same reason [`ExecPolicy`] carries it, and it matters
+/// more here: the untouched default names [`SshAccountMode::Daemon`], so an
+/// API that could not tell "never configured" from "explicitly all-defaults"
+/// would hand the dialog a pre-selected root shell.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct SshPolicy {
     /// Does this device accept SSH sessions? Gate 3.
     #[serde(default)]

@@ -631,6 +631,166 @@ async fn rc_session_request_omits_preferred_transport_when_unset() {
     );
 }
 
+/// The agent listing must return the device's stored exec + SSH policies.
+///
+/// Regression, and the failure mode is worse than a blank field: both policy
+/// dialogs PUT the WHOLE shape, and both build their draft as
+/// `{...closedDefault, ...(agent.ssh_policy ?? {})}`. With the policies absent
+/// from the listing, a dialog reopened after any page load shows the closed
+/// default, and the next save REPLACES the stored policy with what is on
+/// screen — so an admin who re-enables SSH silently drops an
+/// `allowed_user_ids` restriction, widening the device from "these people" to
+/// "anyone holding SSH_DEVICE", and resets `account_mode` from whatever was
+/// chosen back to the default.
+///
+/// The hex assertions are load-bearing too: serialising the stored model
+/// directly would render `allowed_user_ids` as `[{"$oid": …}]`, which no
+/// client here parses (the same reason `SshAuditRow` / `ExecAuditRow` exist).
+#[tokio::test]
+async fn agent_listing_returns_the_stored_exec_and_ssh_policies() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcpolicy").await;
+    let (agent_id, _token) = enroll_helper(&app, &seeded, "mach-rcpolicy-A", "Policy Box").await;
+    let admin_id = seeded.admin.id.clone();
+
+    let resp = app
+        .auth_put(
+            &format!(
+                "/api/tenant/{}/agent/{}/exec-policy",
+                seeded.tenant_id, agent_id
+            ),
+            &seeded.admin.access_token,
+        )
+        .json(&json!({
+            "mode": "on",
+            "can_originate": true,
+            "allowed_user_ids": [admin_id],
+            "consent_mode": "auto",
+            "shells": ["bash"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "exec-policy PUT");
+
+    let resp = app
+        .auth_put(
+            &format!(
+                "/api/tenant/{}/agent/{}/ssh-policy",
+                seeded.tenant_id, agent_id
+            ),
+            &seeded.admin.access_token,
+        )
+        .json(&json!({
+            "mode": "on",
+            "can_originate": true,
+            "allowed_user_ids": [admin_id],
+            "account_mode": "daemon",
+            // `auto` rather than a prompt policy: a freshly enrolled row has
+            // no capabilities yet, and the server rightly refuses a prompt
+            // policy an agent would ignore.
+            "consent_mode": "auto",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "ssh-policy PUT");
+
+    let listing: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/agent", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // ⚠️ The listing is `{"items": [...]}` — an `["agents"]` lookup silently
+    // yields null and every assertion below would pass vacuously.
+    let row = listing["items"]
+        .as_array()
+        .expect("listing must have items")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("enrolled agent must be listed");
+
+    let exec = &row["exec_policy"];
+    assert_eq!(exec["mode"].as_str(), Some("on"), "exec mode: {row}");
+    assert_eq!(exec["can_originate"].as_bool(), Some(true));
+    assert_eq!(exec["consent_mode"].as_str(), Some("auto"));
+    assert_eq!(
+        exec["allowed_user_ids"].as_array().map(Vec::as_slice),
+        Some([Value::String(admin_id.clone())].as_slice()),
+        "allowed_user_ids must be hex strings, not extended JSON: {exec}"
+    );
+    assert_eq!(
+        exec["shells"].as_array().map(Vec::as_slice),
+        Some([Value::String("bash".into())].as_slice())
+    );
+
+    let ssh = &row["ssh_policy"];
+    assert_eq!(ssh["mode"].as_str(), Some("on"), "ssh mode: {row}");
+    assert_eq!(ssh["can_originate"].as_bool(), Some(true));
+    assert_eq!(ssh["account_mode"].as_str(), Some("daemon"));
+    assert_eq!(ssh["consent_mode"].as_str(), Some("auto"));
+    assert_eq!(
+        ssh["allowed_user_ids"].as_array().map(Vec::as_slice),
+        Some([Value::String(admin_id)].as_slice()),
+        "allowed_user_ids must be hex strings, not extended JSON: {ssh}"
+    );
+}
+
+/// A device nobody has configured must report NO policy — not the model's
+/// default one.
+///
+/// This is the counterpart to the test above and it is a security assertion,
+/// not tidiness. `SshPolicy::default()` names `account_mode: daemon`
+/// (SYSTEM / root), while the dialog's own closed default is `console_user`
+/// precisely so that turning SSH on without reading the account selector
+/// cannot hand out a root shell. If the listing shipped the model default,
+/// the dialog would spread it over its own and pre-select `daemon` for every
+/// unconfigured device in the fleet — re-creating the exact hazard the
+/// dialog's default exists to remove.
+///
+/// The stored model genuinely cannot tell "never configured" from "explicitly
+/// saved as all-defaults", so absent is the honest answer for that shape.
+#[tokio::test]
+async fn an_unconfigured_device_reports_no_policy_rather_than_a_root_default() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcpolicy2").await;
+    let (agent_id, _token) = enroll_helper(&app, &seeded, "mach-rcpolicy-B", "Fresh Box").await;
+
+    let listing: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/agent", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = listing["items"]
+        .as_array()
+        .expect("listing must have items")
+        .iter()
+        .find(|a| a["id"].as_str() == Some(agent_id.as_str()))
+        .expect("enrolled agent must be listed");
+
+    assert!(
+        row.get("exec_policy").is_none(),
+        "an unconfigured device must not report an exec policy: {row}"
+    );
+    assert!(
+        row.get("ssh_policy").is_none(),
+        "an unconfigured device must not report an ssh policy — the model \
+         default is `daemon`, and the dialog would pre-select it: {row}"
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
