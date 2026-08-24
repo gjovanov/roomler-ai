@@ -39,8 +39,31 @@ pub async fn status(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         print_status(&status);
+        print_other_daemon_hint();
     }
     Ok(())
+}
+
+/// Say so when this host runs a SECOND daemon we did not answer for.
+///
+/// On macOS the two halves are separate processes on separate sockets, and the
+/// unprivileged CLI always reaches the per-user one — which has no overlay. So
+/// `status` prints `overlay ip —` and `peers` prints nothing, both perfectly
+/// true of the process reached and both read as "the overlay is broken" when
+/// the root half is meshed and healthy. Field-hit on a MacBook, 2026-08-24.
+///
+/// Only printed in human mode: `--json` output is parsed, and a stray line
+/// would be a breaking change for anything consuming it.
+fn print_other_daemon_hint() {
+    if let Some(other) = localapi::other_daemon_socket() {
+        eprintln!();
+        eprintln!(
+            "note: a second roomler daemon is running on this host ({}).",
+            other.display()
+        );
+        eprintln!("      This is the per-user half; the overlay runs in the privileged one.");
+        eprintln!("      Use `sudo roomler …` to ask that one instead.");
+    }
 }
 
 /// `roomler logs` — surface the S2 `TailLog` verb on the CLI.
@@ -157,6 +180,7 @@ pub async fn peers(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&peers)?);
     } else {
         print_peers(&peers, now_ms());
+        print_other_daemon_hint();
     }
     Ok(())
 }

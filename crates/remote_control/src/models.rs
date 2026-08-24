@@ -96,6 +96,13 @@ pub struct AgentCaps {
     ///   and it is always present.
     /// * `input` — the agent may inject keyboard/mouse events. On macOS this
     ///   is the Accessibility grant.
+    /// * `no-gui-session` — a THIRD state, distinct from granted and denied:
+    ///   this process is not in a GUI login session (macOS's root
+    ///   LaunchDaemon), so capture and input are impossible regardless of any
+    ///   grant. Present ALONE — never alongside the two above. Readers must
+    ///   treat it as "this device is not a capture target", not as "two
+    ///   permissions are missing", or a mesh-only daemon reads as broken and
+    ///   sends the operator after a toggle that would change nothing.
     ///
     /// ⚠️ `None` and `Some([])` mean OPPOSITE things and must never be
     /// collapsed: `None` is a pre-rc.454 agent that cannot report (no
