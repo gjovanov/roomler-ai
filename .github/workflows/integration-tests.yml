@@ -249,27 +249,45 @@ jobs:
             exit 1
           fi
 
-      - name: How many databases leaked? (final count)
-        # The suspected root cause: `impl Drop for TestApp` cleans up with a
-        # detached `tokio::spawn`, and a `#[tokio::test]`'s runtime shuts down
-        # as the test returns — so that task overwhelmingly never runs and the
-        # per-test databases are never dropped. WiredTiger then holds every
-        # collection and index file of ~289 databases open until EMFILE.
-        # (Same shape as #602: a dropped JoinHandle detaches.)
+      - name: Assert the harness cleaned up after itself
+        # This began as a diagnostic and is now a regression check, because the
+        # measurement came back: `impl Drop for TestApp` cleaned up with a
+        # DETACHED `tokio::spawn`, and every test here is a plain
+        # `#[tokio::test]` — a current-thread runtime that is dropped the
+        # instant the body returns, taking the queued-but-never-polled cleanup
+        # task with it. Run 32767662554: 29 tests ran, 29 databases remained.
         #
-        # A count near the test count confirms it; a count near zero refutes
-        # it and sends the next person somewhere else.
+        # That is what killed mongod. Sampled mid-run, connections were FLAT
+        # (conns 5 -> 11) while files exploded (wt_files 14 -> 5166 across 21
+        # databases) — ~246 WiredTiger files per database, one per collection
+        # and per index. `fds ~= 26 + 246 x databases` reaches the 64 000
+        # nofile ceiling at ~260 databases, i.e. mid-suite, which is exactly
+        # where EMFILE -> WiredTiger error 24 -> fatal assertion 50853 landed.
+        # Raising nofile could never have fixed it; it only moved the wall.
         #
-        # ⚠️ This only answers when mongod OUTLIVES the suite — a filtered
-        # dispatch, or a run after the leak is fixed. When it dies mid-suite
-        # this prints nothing useful and the watch log above is the evidence.
+        # ⚠️ Keep this a FAILURE, not a print. A teardown that silently stops
+        # running is invisible until it takes the database server down with
+        # it — which is precisely how this cost a day.
         if: always()
         run: |
-          docker exec roomler-test-mongo mongosh --quiet --eval '
-            const dbs = db.adminCommand({listDatabases:1, nameOnly:true}).databases
-              .filter(d => d.name.startsWith("roomler_ai_test_"));
-            print("leaked test databases: " + dbs.length);
-          ' || echo "(mongo is gone — see the post-mortem below)"
+          set -uo pipefail
+          n=$(docker exec roomler-test-mongo mongosh --quiet --eval \
+                'print(db.adminCommand({listDatabases:1,nameOnly:true}).databases.filter(d=>d.name.startsWith("roomler_ai_test")).length)' \
+                2>/dev/null) || n=""
+          peak=$(grep -oE 'leaked_dbs=[0-9]+' /tmp/mongo-watch.log 2>/dev/null \
+                 | grep -oE '[0-9]+' | sort -n | tail -1)
+          echo "test databases still present: ${n:-<unreadable>}   (peak during the run: ${peak:-<none>})"
+          if [ -z "$n" ]; then
+            echo "::notice::mongod did not outlive the suite, so the final count could not be read — the watch log above is the evidence. Not failing the job twice for one fault."
+            exit 0
+          fi
+          # A handful is fine: a test may hold a TestApp past the suite, and
+          # the count races the last teardown. Hundreds is the bug.
+          MAX=5
+          if [ "$n" -gt "$MAX" ]; then
+            echo "::error::$n test databases were left behind (max $MAX). TestApp's teardown is not running — see impl Drop for TestApp in crates/tests/src/fixtures/test_app.rs. Left unchecked this exhausts mongod's file descriptors mid-suite."
+            exit 1
+          fi
 
       - name: Did MongoDB survive?
         # Ask FIRST on a failure. A dead or restarted Mongo turns one
