@@ -12,6 +12,7 @@
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGSessionCopyCurrentDictionary() -> CFTypeRef;
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
 }
@@ -122,3 +123,28 @@ pub fn open_settings_pane(anchor: &str) {
 pub const PANE_SCREEN_RECORDING: &str = "Privacy_ScreenCapture";
 /// Settings anchor for the Accessibility toggle.
 pub const PANE_ACCESSIBILITY: &str = "Privacy_Accessibility";
+
+/// Is this process inside a GUI login session?
+///
+/// The root LaunchDaemon is not, and never can be — session 0 has no
+/// WindowServer, so it cannot capture the screen or post CGEvents no matter
+/// what TCC says. Reporting "permission missing" for that process invites the
+/// operator to go looking for a toggle that would change nothing; the honest
+/// statement is that the capability does not exist there at all.
+///
+/// `CGSessionCopyCurrentDictionary` returning NULL is the canonical test — it
+/// asks the window server about THIS process rather than guessing from a uid,
+/// which would be wrong for a root process that IS in a session (`sudo` from a
+/// terminal) and for a non-root one that is not.
+pub fn has_gui_session() -> bool {
+    // SAFETY: the call takes no arguments and returns either NULL or a
+    // retained CFDictionary, which we release.
+    unsafe {
+        let d = CGSessionCopyCurrentDictionary();
+        if d.is_null() {
+            return false;
+        }
+        CFRelease(d);
+        true
+    }
+}
