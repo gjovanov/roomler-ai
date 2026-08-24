@@ -53,6 +53,13 @@ fn spawn_agent_signaling_as(
             Default::default(),
             broker,
             roomler_agent::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            // Remote config: tests never push one, so services over a throwaway
+            // path with exec off is the correct input, not a stub.
+            roomler_agent::remote_config::RemoteConfigServices::new(
+                std::path::PathBuf::from("unused-in-tests.toml"),
+                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                false,
+            ),
         )
         .await;
     })
