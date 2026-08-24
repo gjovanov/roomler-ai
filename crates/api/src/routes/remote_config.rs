@@ -87,14 +87,38 @@ impl ConfigDenyReason {
 /// Both bits are deliberately absent from `DEFAULT_ADMIN`, which is what makes
 /// this a real constraint rather than a formality. `ADMINISTRATOR` bypasses, as
 /// everywhere else.
-pub fn decide(caller_permissions: u64, requested: &DesiredConfig) -> Result<(), ConfigDenyReason> {
+pub fn decide(
+    caller_permissions: u64,
+    current: &DesiredConfig,
+    requested: &DesiredConfig,
+) -> Result<(), ConfigDenyReason> {
     if !permissions::has(caller_permissions, permissions::MANAGE_AGENTS) {
         return Err(ConfigDenyReason::NotDeviceAdmin);
     }
-    if requested.touches_exec() && !permissions::has(caller_permissions, permissions::EXEC_DEVICE) {
+    // An UNCHANGED family is not a grant, and #600's `check_grant` says so in
+    // the same words: it gates `requested & !current & !held` — only bits being
+    // ADDED. Without this carve-out the two grant bits stop composing, which is
+    // the whole reason they are separate: on a device where one admin manages
+    // exec, an `SSH_DEVICE`-only admin cannot edit SSH at all, because the
+    // request necessarily re-states the exec field it must not drop. (Omitting
+    // it is not an option — an absent key means UNMANAGED, so a partial body
+    // would silently delete the other admin's setting.)
+    //
+    // Deliberately equality, not an escalation analysis. "Is `["A"]` → `["A",
+    // "B"]` a grant?" has an obvious answer and "is `console_user` → `daemon`?"
+    // does too, but the general form is a per-field judgement call and getting
+    // one wrong opens a hole. Byte-identical is unambiguous, and it is exactly
+    // the case that was blocked.
+    if !requested.same_exec_as(current)
+        && requested.touches_exec()
+        && !permissions::has(caller_permissions, permissions::EXEC_DEVICE)
+    {
         return Err(ConfigDenyReason::CannotGrantExec);
     }
-    if requested.touches_ssh() && !permissions::has(caller_permissions, permissions::SSH_DEVICE) {
+    if !requested.same_ssh_as(current)
+        && requested.touches_ssh()
+        && !permissions::has(caller_permissions, permissions::SSH_DEVICE)
+    {
         return Err(ConfigDenyReason::CannotGrantSsh);
     }
     Ok(())
@@ -136,7 +160,7 @@ pub async fn set_desired_config(
     // ONE call site records both arms. `decide` returning a Result rather than
     // a bool is what makes "a new refusal that forgets to audit itself"
     // unrepresentable — the same shape as `agent_ssh::dispatch`.
-    let verdict = decide(perms, &requested);
+    let verdict = decide(perms, &agent.desired_config, &requested);
     if let Err(e) = state
         .config_audit
         .record(
@@ -192,13 +216,13 @@ mod tests {
     #[test]
     fn a_non_device_admin_is_refused_before_anything_else() {
         assert_eq!(
-            decide(DEFAULT_MEMBER, &exec_req()),
+            decide(DEFAULT_MEMBER, &DesiredConfig::default(), &exec_req()),
             Err(ConfigDenyReason::NotDeviceAdmin)
         );
         // Even an empty request: managing a device's desired config at all is
         // a MANAGE_AGENTS action.
         assert_eq!(
-            decide(0, &DesiredConfig::default()),
+            decide(0, &DesiredConfig::default(), &DesiredConfig::default()),
             Err(ConfigDenyReason::NotDeviceAdmin)
         );
     }
@@ -209,21 +233,31 @@ mod tests {
         // grant bit — so a default admin may rename a device and may not open
         // a root shell on it.
         assert_eq!(
-            decide(DEFAULT_ADMIN, &exec_req()),
+            decide(DEFAULT_ADMIN, &DesiredConfig::default(), &exec_req()),
             Err(ConfigDenyReason::CannotGrantExec)
         );
         assert_eq!(
-            decide(DEFAULT_ADMIN, &ssh_req()),
+            decide(DEFAULT_ADMIN, &DesiredConfig::default(), &ssh_req()),
             Err(ConfigDenyReason::CannotGrantSsh)
         );
     }
 
     #[test]
     fn holding_the_matching_grant_is_enough() {
-        decide(DEFAULT_ADMIN | EXEC_DEVICE, &exec_req()).unwrap();
-        decide(DEFAULT_ADMIN | SSH_DEVICE, &ssh_req()).unwrap();
-        decide(ADMINISTRATOR, &exec_req()).unwrap();
-        decide(ADMINISTRATOR, &ssh_req()).unwrap();
+        decide(
+            DEFAULT_ADMIN | EXEC_DEVICE,
+            &DesiredConfig::default(),
+            &exec_req(),
+        )
+        .unwrap();
+        decide(
+            DEFAULT_ADMIN | SSH_DEVICE,
+            &DesiredConfig::default(),
+            &ssh_req(),
+        )
+        .unwrap();
+        decide(ADMINISTRATOR, &DesiredConfig::default(), &exec_req()).unwrap();
+        decide(ADMINISTRATOR, &DesiredConfig::default(), &ssh_req()).unwrap();
     }
 
     #[test]
@@ -231,11 +265,19 @@ mod tests {
         // EXEC_DEVICE and SSH_DEVICE are separate bits precisely because an
         // SSH session is strictly more than a bounded command.
         assert_eq!(
-            decide(DEFAULT_ADMIN | EXEC_DEVICE, &ssh_req()),
+            decide(
+                DEFAULT_ADMIN | EXEC_DEVICE,
+                &DesiredConfig::default(),
+                &ssh_req()
+            ),
             Err(ConfigDenyReason::CannotGrantSsh)
         );
         assert_eq!(
-            decide(DEFAULT_ADMIN | SSH_DEVICE, &exec_req()),
+            decide(
+                DEFAULT_ADMIN | SSH_DEVICE,
+                &DesiredConfig::default(),
+                &exec_req()
+            ),
             Err(ConfigDenyReason::CannotGrantExec)
         );
     }
@@ -260,7 +302,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                decide(DEFAULT_ADMIN, &req),
+                decide(DEFAULT_ADMIN, &DesiredConfig::default(), &req),
                 Err(ConfigDenyReason::CannotGrantSsh),
                 "{req:?} must require SSH_DEVICE"
             );
@@ -271,7 +313,12 @@ mod tests {
     fn an_untouched_surface_needs_only_manage_agents() {
         // Clearing the form is a legitimate MANAGE_AGENTS action and must not
         // demand grant bits the caller never uses.
-        decide(DEFAULT_ADMIN, &DesiredConfig::default()).unwrap();
+        decide(
+            DEFAULT_ADMIN,
+            &DesiredConfig::default(),
+            &DesiredConfig::default(),
+        )
+        .unwrap();
         assert!(DesiredConfig::default().is_empty());
     }
 
@@ -285,5 +332,92 @@ mod tests {
             !json.contains("remote_config"),
             "the device opt-in must not be server-settable: {json}"
         );
+    }
+
+    /// The two grant bits have to COMPOSE, or making them separate was
+    /// pointless.
+    ///
+    /// The PUT replaces the whole `DesiredConfig`, so an SSH admin editing a
+    /// device where somebody else manages exec must re-state the exec field —
+    /// omitting it means UNMANAGED, which would silently delete the other
+    /// admin's setting. Gating on any *mention* therefore locked them out of
+    /// the device entirely. Re-stating a value unchanged grants nothing, which
+    /// is the same rule `check_grant` applies to role masks: only bits being
+    /// ADDED count.
+    #[test]
+    fn re_stating_another_admins_setting_unchanged_is_not_granting_it() {
+        let current = DesiredConfig {
+            exec_enabled: Some(true),
+            ..Default::default()
+        };
+        // An SSH_DEVICE-only admin turns SSH on, carrying exec through as-is.
+        let requested = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ..Default::default()
+        };
+        decide(DEFAULT_ADMIN | SSH_DEVICE, &current, &requested).unwrap();
+    }
+
+    /// …and the carve-out is EQUALITY, nothing looser. The moment the value
+    /// actually moves, the bit is required again — including the case that
+    /// matters most, flipping exec from off to on.
+    #[test]
+    fn changing_the_value_still_needs_the_bit() {
+        let off = DesiredConfig {
+            exec_enabled: Some(false),
+            ..Default::default()
+        };
+        let on = DesiredConfig {
+            exec_enabled: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(DEFAULT_ADMIN | SSH_DEVICE, &off, &on),
+            Err(ConfigDenyReason::CannotGrantExec)
+        );
+        // Adding a key to an existing list is a change, so it needs SSH_DEVICE
+        // even though `ssh_enabled` itself did not move.
+        let one_key = DesiredConfig {
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA…A".into()]),
+            ..Default::default()
+        };
+        let two_keys = DesiredConfig {
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec![
+                "ssh-ed25519 AAAA…A".into(),
+                "ssh-ed25519 AAAA…B".into(),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide(DEFAULT_ADMIN | EXEC_DEVICE, &one_key, &two_keys),
+            Err(ConfigDenyReason::CannotGrantSsh)
+        );
+        // The whole SSH family counts, not just the key list: an account-mode
+        // change on an otherwise-identical request is still an SSH change.
+        let daemon = DesiredConfig {
+            ssh_account_mode: Some("daemon".into()),
+            ..one_key.clone()
+        };
+        assert_eq!(
+            decide(DEFAULT_ADMIN | EXEC_DEVICE, &one_key, &daemon),
+            Err(ConfigDenyReason::CannotGrantSsh)
+        );
+    }
+
+    /// Unmanaging a key is not a grant — it stops asking, and the device keeps
+    /// whatever it already has. "Stop managing this device" must not require
+    /// bits the caller only needed in order to open something.
+    #[test]
+    fn clearing_the_form_never_needs_a_grant_bit() {
+        let current = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA…A".into()]),
+            ..Default::default()
+        };
+        decide(DEFAULT_ADMIN, &current, &DesiredConfig::default()).unwrap();
     }
 }
