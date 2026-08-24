@@ -362,7 +362,19 @@ impl Drop for TestApp {
                 return;
             };
             rt.block_on(async {
-                if let Ok(client) = Client::with_uri_str(&uri).await {
+                // ⚠️ Bound the wait. If mongod is already gone — which is
+                // exactly the state this teardown exists to prevent — the
+                // driver's 30 s default server selection would be spent once
+                // PER TEST, and ~290 of those turn a diagnosable failure into
+                // a job that hits its wall-clock limit having reported
+                // nothing. Three seconds is generous for a local socket.
+                let Ok(mut opts) = ClientOptions::parse(&uri).await else {
+                    return;
+                };
+                opts.server_selection_timeout = Some(std::time::Duration::from_secs(3));
+                opts.connect_timeout = Some(std::time::Duration::from_secs(3));
+                opts.max_pool_size = Some(1);
+                if let Ok(client) = Client::with_options(opts) {
                     let _ = client.database(&name).drop().await;
                 }
             });
