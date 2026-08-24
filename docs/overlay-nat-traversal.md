@@ -264,6 +264,30 @@ cascade's guarantees while replacing its reactive counters:
   re-upgrades (no strike is booked, so the tier stays eligible), while a late
   conviction is 100 % loss for its whole duration. The conviction log line
   carries `from_major=` so the field can measure whether it is ever too eager.
+- **Demote-follow (#27) — the other end.** Fast conviction on ONE end is not
+  enough, because a transition's outage is `max(both ends)`, not `min`. The end
+  whose network did **not** change gets no Major, so it has no fast lane at all
+  and waits out `POKE_SILENCE_AFTER` (floored by the ~25 s WG keepalive) plus
+  its tier deadline. Measured 2026-08-24: the transitioning host demoted in
+  2.3 s, its peer took **67 s**, and the pair was 100 % dark in BOTH directions
+  for the whole gap — our frames were dropped by the peer's `DerpMux::deliver`
+  (no conn for a peer it still held on direct) and the peer's replies rode the
+  path we had abandoned.
+
+  So an inbound `/derp` frame that no local conn can route is now a **signal,
+  not a silent drop**: a peer only relays once it has demoted, so we follow it
+  onto DERP immediately (`RelayCoordinator::follow_peer_to_derp`). This is the
+  carrier-layer twin of WireGuard endpoint roaming, which already existed for
+  the direct plane (`carrier_plane` `SessionRoam`) and never for DERP.
+  It is safe to act on because the relay **stamps** the source pubkey from the
+  sender's authenticated registration — it is not sender-chosen — so the signal
+  can only name a node registered in this network whose ACL permits reaching
+  us; an unknown pubkey is ignored outright. Bounds: no-op when already on
+  DERP, one follow per peer per `DERP_FOLLOW_COOLDOWN`, and — unlike a server
+  force-DERP escalation — **no TTL pin and no `roles` override**, so the pair
+  re-upgrades normally once the network settles. Both `deliver` drop classes
+  now carry counters (`DerpMux::drop_counts`); they were silent, which is why
+  this cost a day of field time to find.
 - **Resets.** An endpoint change (roam) clears penalties, strikes, and `Q` —
   new endpoints make old evidence stale. Forced-DERP remains a **server
   override**: the monitor annotates the pinned window and never selects
