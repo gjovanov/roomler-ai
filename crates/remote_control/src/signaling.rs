@@ -422,6 +422,48 @@ pub enum ClientMsg {
         allowed: bool,
     },
 
+    /// The agent's answer to a [`ServerMsg::ConfigPush`] — what it actually
+    /// did (`docs/remote-config.md`).
+    ///
+    /// This is the frame `ConfigPush::revision`'s doc has always promised:
+    /// without it, a device that REFUSED a push and a device that never heard
+    /// about one are indistinguishable on the dashboard, and only one of those
+    /// is something an operator can fix.
+    ///
+    /// Sent on every outcome, including the refusals — especially the
+    /// refusals. `not_opted_in` and `not_primary` are the two states an
+    /// operator will actually hit, and both have a concrete next action that
+    /// they can only take if they are told.
+    ///
+    /// ⚠️ `tenant_id` / `agent_id` come from the authenticated WS, NOT from
+    /// this frame, so a device can only ever report about itself — the same
+    /// rule as [`Self::SshActivity`].
+    ///
+    /// ⚠️ Unlike `SshActivity` this one IS capability-gated on the server's
+    /// read side ([`RpcCap::ConfigReport`]): rc.457/rc.458 agents apply pushed
+    /// config and stay silent, so "no report" has to mean "cannot report"
+    /// there, and "has not answered yet" on a newer device.
+    ///
+    /// [`RpcCap::ConfigReport`]: crate::models::RpcCap::ConfigReport
+    #[serde(rename = "rc:agent.config_status")]
+    ConfigStatus {
+        /// The `desired_config.revision` being reported on, echoed from the
+        /// push.
+        revision: u64,
+        outcome: crate::models::ConfigOutcome,
+        /// Keys now IN FORCE.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        live: Vec<String>,
+        /// Keys written but waiting for a restart. Never merged into `live` —
+        /// see [`crate::models::ConfigReport::needs_restart`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        needs_restart: Vec<String>,
+        /// Why, for `failed`. Redacted and capped by the device; re-clamped on
+        /// receipt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// Agent answers a controller's offer.
     #[serde(rename = "rc:sdp.answer")]
     SdpAnswer {

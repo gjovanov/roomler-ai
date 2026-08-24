@@ -148,6 +148,15 @@
                     title="SSH policy"
                     @click="openSshPolicy(a)"
                   />
+                  <!-- Writes an INTENT the device may refuse (step 5 of
+                       docs/remote-config.md) — unlike the two policies above,
+                       which take effect the moment they save. The dialog leads
+                       with that difference. -->
+                  <v-list-item
+                    prepend-icon="mdi-cog-transfer-outline"
+                    title="Device configuration"
+                    @click="openRemoteConfig(a)"
+                  />
                   <v-list-subheader>Network</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-ip-network-outline"
@@ -228,6 +237,21 @@
                 :title="presenceTitle(a)"
               >
                 {{ statusLabel(a) }}
+              </v-chip>
+              <!-- Only states that need someone to DO something. A steady-state
+                   badge on every row is noise that trains people to stop
+                   reading the row. -->
+              <v-chip
+                v-if="remoteConfigChip(a)"
+                size="x-small"
+                variant="tonal"
+                class="mt-1"
+                :color="remoteConfigChip(a)!.color"
+                :prepend-icon="remoteConfigChip(a)!.icon"
+                :title="remoteConfigChip(a)!.tooltip"
+                @click="openRemoteConfig(a)"
+              >
+                {{ remoteConfigChip(a)!.text }}
               </v-chip>
             </td>
             <td>
@@ -386,6 +410,18 @@
               >
                 {{ statusLabel(a) }}
               </v-chip>
+              <v-chip
+                v-if="remoteConfigChip(a)"
+                size="x-small"
+                variant="tonal"
+                class="ml-1"
+                :color="remoteConfigChip(a)!.color"
+                :prepend-icon="remoteConfigChip(a)!.icon"
+                :title="remoteConfigChip(a)!.tooltip"
+                @click="openRemoteConfig(a)"
+              >
+                {{ remoteConfigChip(a)!.text }}
+              </v-chip>
             </div>
             <div class="text-caption text-medium-emphasis mb-2">
               <span :title="`Agent ID: ${a.id}`">id: {{ shortId(a.id) }}</span>
@@ -516,6 +552,15 @@
                     prepend-icon="mdi-console-network-outline"
                     title="SSH policy"
                     @click="openSshPolicy(a)"
+                  />
+                  <!-- Writes an INTENT the device may refuse (step 5 of
+                       docs/remote-config.md) — unlike the two policies above,
+                       which take effect the moment they save. The dialog leads
+                       with that difference. -->
+                  <v-list-item
+                    prepend-icon="mdi-cog-transfer-outline"
+                    title="Device configuration"
+                    @click="openRemoteConfig(a)"
                   />
                   <v-list-subheader>Network</v-list-subheader>
                   <v-list-item
@@ -806,6 +851,13 @@
     :tenant-id="tenantId"
     :agent="sshPolicyTarget"
   />
+  <RemoteConfigDialog
+    v-if="remoteConfigTarget"
+    v-model="remoteConfigDialogOpen"
+    :tenant-id="tenantId"
+    :agent="remoteConfigTarget"
+    @saved="agentStore.fetchAgents(tenantId)"
+  />
 
   <!-- S1a — Update-all confirmation -->
   <v-dialog v-model="updateAllDialogOpen" max-width="480">
@@ -1090,6 +1142,7 @@ import AgentLogsDialog from './AgentLogsDialog.vue'
 import DeviceConsoleDialog from './DeviceConsoleDialog.vue'
 import ExecPolicyDialog from './ExecPolicyDialog.vue'
 import SshPolicyDialog from './SshPolicyDialog.vue'
+import RemoteConfigDialog from './RemoteConfigDialog.vue'
 import EnrollmentDialog from '@/components/enroll/EnrollmentDialog.vue'
 import {
   useOverlayRoutesStore,
@@ -1350,6 +1403,71 @@ const sshPolicyTarget = ref<Agent | null>(null)
 function openSshPolicy(a: Agent) {
   sshPolicyTarget.value = a
   sshPolicyDialogOpen.value = true
+}
+
+const remoteConfigDialogOpen = ref(false)
+const remoteConfigTarget = ref<Agent | null>(null)
+
+function openRemoteConfig(a: Agent) {
+  remoteConfigTarget.value = a
+  remoteConfigDialogOpen.value = true
+}
+
+/** The row badge for a device with a pending / refused / failed config
+ *  request. `null` for `applied` and for devices nobody is managing — a
+ *  steady-state chip on every row is noise that trains people to stop reading
+ *  the row, and the states worth interrupting for are the ones that need
+ *  someone to do something. */
+function remoteConfigChip(
+  a: Agent,
+): { color: string; icon: string; text: string; tooltip: string } | null {
+  const state = a.remote_config?.state
+  switch (state) {
+    case 'needs_restart':
+      return {
+        color: 'warning',
+        icon: 'mdi-restart-alert',
+        text: 'restart needed',
+        tooltip: 'Config saved on the device but not yet in effect.',
+      }
+    case 'refused':
+      return {
+        color: 'warning',
+        icon: 'mdi-hand-back-left-outline',
+        text: 'config refused',
+        tooltip:
+          a.remote_config?.report?.outcome === 'not_primary'
+            ? 'This org is a secondary on that host; only its primary enrollment may change machine-wide config.'
+            : 'The device has not opted in to remote configuration.',
+      }
+    case 'failed':
+      return {
+        color: 'error',
+        icon: 'mdi-alert-circle-outline',
+        text: 'config failed',
+        tooltip: a.remote_config?.report?.detail ?? 'The device could not write its config.',
+      }
+    case 'pending':
+      return {
+        color: 'info',
+        icon: 'mdi-clock-outline',
+        text: 'config pending',
+        tooltip: 'Waiting for the device to reconnect and reconcile.',
+      }
+    case 'reports_unsupported':
+    case 'push_unsupported':
+      return {
+        color: 'grey',
+        icon: 'mdi-update',
+        text: 'agent too old',
+        tooltip:
+          state === 'push_unsupported'
+            ? 'This agent predates remote configuration; nothing is sent to it.'
+            : 'This agent applies pushed config but cannot report what it did.',
+      }
+    default:
+      return null
+  }
 }
 
 function osIcon(os: string) {
