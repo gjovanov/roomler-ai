@@ -827,6 +827,37 @@ impl DesiredConfig {
             || self.ssh_account_mode.is_some()
             || self.ssh_port.is_some()
     }
+
+    /// Does this request ask for the same exec state as `other`?
+    ///
+    /// Used to tell "granting exec" from "leaving the exec ask exactly as some
+    /// other admin already set it" — see `remote_config::decide`.
+    pub fn same_exec_as(&self, other: &Self) -> bool {
+        self.exec_enabled == other.exec_enabled
+    }
+
+    /// [`Self::same_exec_as`] for the SSH family.
+    ///
+    /// Destructured EXHAUSTIVELY: a new key added to this struct must be
+    /// classified as exec, SSH, or neither before this compiles. A key that
+    /// silently fell outside both comparisons would let an unchanged-request
+    /// carve-out pass a change nobody checked.
+    pub fn same_ssh_as(&self, other: &Self) -> bool {
+        let Self {
+            exec_enabled: _,
+            ssh_enabled,
+            ssh_authorized_keys,
+            ssh_account_mode,
+            ssh_port,
+            revision: _,
+            updated_by: _,
+            updated_at: _,
+        } = self;
+        *ssh_enabled == other.ssh_enabled
+            && *ssh_authorized_keys == other.ssh_authorized_keys
+            && *ssh_account_mode == other.ssh_account_mode
+            && *ssh_port == other.ssh_port
+    }
 }
 
 /// What a device did with a pushed [`DesiredConfig`].
