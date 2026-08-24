@@ -186,7 +186,17 @@ pub async fn derp_upgrade(
     Query(params): Query<WsParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let claims = match state.auth.verify_agent_token(&params.token) {
+    // `WsParams::token` became optional when `/ws` learned to accept a browser
+    // session cookie. DERP is agent-only — no cookie jar on this side, and a
+    // browser must never be able to register as a relay node — so the token
+    // stays REQUIRED here.
+    let Some(token) = params.token.as_deref() else {
+        return Response::builder()
+            .status(401)
+            .body("Unauthorized (derp)".into())
+            .unwrap();
+    };
+    let claims = match state.auth.verify_agent_token(token) {
         Ok(c) => c,
         Err(_) => {
             return Response::builder()
