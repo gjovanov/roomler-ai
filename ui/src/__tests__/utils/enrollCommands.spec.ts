@@ -50,7 +50,7 @@ describe('enrollCommands', () => {
     expect(linux!.blocks[2]!.command).toContain(`--server ${ORIGIN}`)
     // NOT `roomlerd`: on macOS the daemon lives inside the .app bundle and no
     // binary by that name exists anywhere on the machine.
-    expect(macos!.blocks[2]!.command).toMatch(/^\/Applications\/roomler-agent\.app\S* enroll /)
+    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomler-agent\.app\S* enroll /)
   })
 
   it('maps the user scope to the per-user roles', () => {
@@ -62,7 +62,7 @@ describe('enrollCommands', () => {
       expect(os.blocks[2]!.command).toMatch(/^roomlerd enroll /)
     }
     // macOS resolves to the bundle executable — see above.
-    expect(macos!.blocks[2]!.command).toMatch(/^\/Applications\/roomler-agent\.app\S* enroll /)
+    expect(macos!.blocks[2]!.command).toMatch(/^\/Library\/Roomler\/roomler-agent\.app\S* enroll /)
     expect(windows!.blocks[2]!.command).not.toContain('--machine-global')
   })
 
@@ -154,7 +154,7 @@ describe('enrollCommands', () => {
     const macos = enrollCommands('agent', ORIGIN, TOKEN).find((o) => o.os === 'macos')!
     const manual = macos.blocks.find((b) => b.id.endsWith('-manual'))!
     expect(manual.command).toContain(
-      '/Applications/roomler-agent.app/Contents/MacOS/roomler-agent enroll',
+      '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent enroll',
     )
     expect(manual.command).not.toMatch(/^roomlerd /)
   })
