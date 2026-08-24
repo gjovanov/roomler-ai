@@ -66,6 +66,10 @@ export interface PermissionWarning {
 export function permissionWarnings(a: Agent): PermissionWarning[] {
   const perms = a.capabilities?.permissions
   if (perms === undefined) return []
+  // Not a capture target at all — macOS's root LaunchDaemon, which has no GUI
+  // session. It is missing nothing; there is no toggle that would change this,
+  // and saying "No screen access" about a mesh-only node is a wild goose chase.
+  if (perms.includes('no-gui-session')) return []
   const out: PermissionWarning[] = []
   if (!perms.includes('screen-capture')) {
     out.push({

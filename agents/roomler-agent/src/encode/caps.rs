@@ -254,6 +254,22 @@ pub fn detect_in_process() -> AgentCaps {
 /// `CGDisplayStream` opens successfully without the Screen Recording grant
 /// and delivers wallpaper-only frames forever. Probed rather than assumed so
 /// the server can be told the truth. Cheap — a preflight call, no prompt.
+/// Can this process reach a GUI session at all?
+///
+/// macOS's root LaunchDaemon cannot: session 0 has no WindowServer, so capture
+/// and input are unavailable there no matter what TCC says. Every other
+/// platform always can.
+fn gui_session_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::tcc::has_gui_session()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 fn capture_permission_granted() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -690,11 +706,20 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
     // See `AgentCaps::permissions`: `None` (a pre-rc.454 agent) and
     // `Some([])` mean opposite things, so this is always `Some` here.
     let mut permissions: Vec<String> = Vec::new();
-    if capture_permission_granted() {
-        permissions.push("screen-capture".into());
-    }
-    if input_permission_granted() {
-        permissions.push("input".into());
+    if !gui_session_available() {
+        // THIRD state, distinct from granted and denied: this process is not
+        // in a GUI login session (macOS's root LaunchDaemon), so capture and
+        // input are impossible regardless of any grant. Without saying so, a
+        // mesh-only daemon reports "holds neither permission" and the device
+        // list tells the operator to go fix something that is not broken.
+        permissions.push("no-gui-session".into());
+    } else {
+        if capture_permission_granted() {
+            permissions.push("screen-capture".into());
+        }
+        if input_permission_granted() {
+            permissions.push("input".into());
+        }
     }
 
     AgentCaps {
@@ -704,7 +729,9 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
         // Mac with Accessibility denied still advertised working input while
         // silently dropping every event. The feature must be compiled in AND
         // the OS must have granted it.
-        has_input_permission: cfg!(feature = "enigo-input") && input_permission_granted(),
+        has_input_permission: cfg!(feature = "enigo-input")
+            && gui_session_available()
+            && input_permission_granted(),
         permissions: Some(permissions),
         supports_clipboard: cfg!(feature = "clipboard"),
         supports_file_transfer: true,
