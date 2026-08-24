@@ -39,8 +39,14 @@ set -uo pipefail
 QUICK=0
 [ "${1:-}" = "--quick" ] && QUICK=1
 
-LOGDIR="${TMPDIR:-/tmp}/roomler-ci-local"
-mkdir -p "$LOGDIR" 2>/dev/null || { LOGDIR="$HOME/.cache/roomler-ci-local"; mkdir -p "$LOGDIR"; }
+# Per-CHECKOUT log dir. Parallel sessions each run this from their own
+# worktree but share $TMPDIR, and a fixed path meant two runs redirected into
+# the same files: one truncated the other mid-write, `grep` reported "binary
+# file matches", and a lane that passes cleanly in isolation showed FAIL.
+# A local check you cannot trust is worse than no local check — that is the
+# whole reason this script exists — so the path is keyed to the checkout.
+LOGDIR="${TMPDIR:-/tmp}/roomler-ci-local/$(basename "$(cd "$(dirname "$0")/.." && pwd)")-$$"
+mkdir -p "$LOGDIR" 2>/dev/null || { LOGDIR="$HOME/.cache/roomler-ci-local-$$"; mkdir -p "$LOGDIR"; }
 
 FAILED=()
 run() {
