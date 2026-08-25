@@ -776,6 +776,13 @@ pub enum SshAccountMode {
 /// It is the device's opt-in to accepting anything here at all; a server able
 /// to set it could opt a device in and then open every other key, which is the
 /// one move the whole design exists to prevent.
+///
+/// ⚠️ `ssh_max_privilege` (M5) is ABSENT for the same reason. It is the
+/// device's ceiling on what a SERVER GRANT may run as — the one SSH gate that
+/// still holds when the server is the compromised thing — so a server able to
+/// set it could raise its own ceiling and the setting would mean nothing. This
+/// list is an allowlist, so leaving it out is sufficient; the trap is a later
+/// change that adds "the rest of the ssh_* surface" for symmetry.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct DesiredConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3156,5 +3163,51 @@ mod tests {
         // …and the first address of the NEXT block is unreachable from here.
         assert_eq!(overlay_ip(&cidr, 1024), None);
         assert_eq!(overlay_host(&cidr, "100.65.4.0"), None);
+    }
+
+    /// `DesiredConfig` is an ALLOWLIST, and two keys are outside it because a
+    /// server able to set them could open everything else: the device's opt-in
+    /// (`remote_config_enabled`) and the device's SSH privilege ceiling
+    /// (`ssh_max_privilege`, M5). Both are commented at the type — this is the
+    /// part that fails a build when someone adds them "for symmetry".
+    #[test]
+    fn the_device_owned_refusals_are_not_pushable() {
+        // Every field populated, so nothing is skipped by
+        // `skip_serializing_if` and the key set is the whole surface.
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("daemon".into()),
+            ssh_port: Some(2222),
+            revision: 1,
+            updated_by: Some(ObjectId::new()),
+            updated_at: Some(DateTime::now()),
+        };
+        let json = serde_json::to_value(&full).expect("serialises");
+        let keys: Vec<&str> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for forbidden in ["remote_config_enabled", "ssh_max_privilege"] {
+            assert!(
+                !keys.contains(&forbidden),
+                "{forbidden} must never be pushable by the server — it is the device's own \
+                 refusal, and a server that can set it can set everything. Got keys: {keys:?}"
+            );
+        }
+
+        // And the receiving side ignores it rather than erroring, which is the
+        // safe direction: a server asserting it gets no effect, not a refused
+        // config push that would also drop the legitimate keys beside it.
+        let pushed: DesiredConfig = serde_json::from_value(serde_json::json!({
+            "ssh_enabled": true,
+            "ssh_max_privilege": "daemon",
+            "remote_config_enabled": true,
+        }))
+        .expect("unknown keys are ignored, not fatal");
+        assert_eq!(pushed.ssh_enabled, Some(true));
     }
 }

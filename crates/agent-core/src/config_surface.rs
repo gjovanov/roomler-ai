@@ -120,6 +120,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "string",
         "What an ssh_authorized_keys session runs as: daemon | console_user | named:<account>. Empty = sessions authenticate but run nothing (listing a key must not silently hand out SYSTEM/root).",
     ),
+    (
+        "ssh_max_privilege",
+        "string",
+        "Ceiling on what a SERVER-GRANTED ssh session may run as: daemon (or empty) = no device-side limit; console_user = a grant asking for the daemon identity is refused. The device's answer to 'what do I still refuse when the server asking is the compromised thing'.",
+    ),
     // `ssh_host_key` is deliberately ABSENT from this surface: it is private
     // key material, and everything here is readable over the LocalAPI.
     (
@@ -564,6 +569,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ssh_port" => cfg.ssh_port.map(|p| p.to_string()),
         "ssh_authorized_keys" => Some(cfg.ssh_authorized_keys.join(",")),
         "ssh_account_mode" => cfg.ssh_account_mode.clone(),
+        "ssh_max_privilege" => cfg.ssh_max_privilege.clone(),
         "ssh_activity_log" => Some(fmt_bool(cfg.ssh_activity_log)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -739,6 +745,22 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         ));
                     }
                     Some(v.to_string())
+                }
+            }
+        }
+        // Only the two values that name a comparable privilege level. `named:`
+        // is deliberately NOT accepted: a ceiling has to be an ordering, and
+        // "is `named:svc-backup` above or below `console_user`?" has no answer
+        // — so it would be a setting whose meaning nobody could state.
+        "ssh_max_privilege" => {
+            cfg.ssh_max_privilege = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) if v == "daemon" || v == "console_user" => Some(v.to_string()),
+                Some(other) => {
+                    return Err(format!(
+                        "ssh_max_privilege must be daemon | console_user (got {other:?}); \
+                         empty means no device-side limit"
+                    ));
                 }
             }
         }
@@ -1983,5 +2005,47 @@ mod netstack_port_surface_tests {
             cfg.netstack_socks_port, None,
             "clearing returns to OS-TUN mode"
         );
+    }
+
+    /// The M5 privilege ceiling. Two values only — a ceiling has to be an
+    /// ordering, and `named:<account>` has no place in one — and the reject
+    /// happens on the way IN, so a typo is a failed `config set` rather than
+    /// a device that silently kept accepting root sessions.
+    #[test]
+    fn ssh_max_privilege_set_echo_clear_and_validate() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            current_value(&cfg, "ssh_max_privilege"),
+            None,
+            "unset by default: arriving switched on would revoke a working config mid-roll"
+        );
+
+        apply(&mut cfg, "ssh_max_privilege", Some("console_user")).unwrap();
+        assert_eq!(cfg.ssh_max_privilege.as_deref(), Some("console_user"));
+        assert_eq!(
+            current_value(&cfg, "ssh_max_privilege").as_deref(),
+            Some("console_user")
+        );
+
+        apply(&mut cfg, "ssh_max_privilege", Some("daemon")).unwrap();
+        assert_eq!(
+            cfg.ssh_max_privilege.as_deref(),
+            Some("daemon"),
+            "explicit `daemon` is a stated no-limit, distinct from never having chosen"
+        );
+
+        // `named:` is accepted for ssh_account_mode and refused here on
+        // purpose: "is named:svc-backup above or below console_user?" has no
+        // answer, so it cannot bound anything.
+        assert!(apply(&mut cfg, "ssh_max_privilege", Some("named:svc")).is_err());
+        assert!(apply(&mut cfg, "ssh_max_privilege", Some("Console_User")).is_err());
+        assert_eq!(
+            cfg.ssh_max_privilege.as_deref(),
+            Some("daemon"),
+            "a rejected set is a no-op"
+        );
+
+        apply(&mut cfg, "ssh_max_privilege", None).unwrap();
+        assert_eq!(cfg.ssh_max_privilege, None, "clearing returns to no limit");
     }
 }

@@ -400,6 +400,21 @@ mod sshd {
         /// out SYSTEM/root without saying so, and made a device policy of
         /// `account_mode = console_user` untrue for this path.
         pub key_list_run_as: Result<crate::exec::RunAs, String>,
+        /// M5: refuse a SERVER GRANT that asks to run as the daemon identity
+        /// (SYSTEM/root), resolved once from `ssh_max_privilege`.
+        ///
+        /// Every other gate on an SSH session is decided by the server. This
+        /// one is decided here, so it is the only one that still holds when
+        /// the server is the compromised thing: a control plane that mints
+        /// `account_mode = daemon, consent_mode = auto` otherwise gets an
+        /// unattended root shell on every device that answers.
+        ///
+        /// Default `false` — permissive, no behaviour change — because a
+        /// device-side ceiling that arrives switched ON revokes a working
+        /// configuration mid-roll, and the device you lose root SSH to is
+        /// liable to be the one you needed it for. The start-up log says so
+        /// on every device that has not chosen.
+        pub deny_daemon_grants: bool,
         /// Daemon services a session depends on — the consent broker, threaded
         /// from `run_cmd` so it provably exists wherever a server does.
         pub services: super::SessionServices,
@@ -492,16 +507,31 @@ mod sshd {
                 warn!(%e, "ssh: ssh_authorized_keys is populated but has no account mode");
             }
 
+            // Unset is permissive (see `Ctx::deny_daemon_grants`), so the
+            // device that has not chosen is the one worth saying it out loud
+            // on — an operator reading this log should not have to know the
+            // key exists to learn that it is off.
+            let deny_daemon_grants = cfg.ssh_max_privilege.as_deref() == Some("console_user");
+            if !deny_daemon_grants {
+                warn!(
+                    "ssh: ssh_max_privilege is not set to console_user, so a server grant asking \
+                     for the daemon identity would run as SYSTEM/root here. Set it if this device \
+                     should refuse that even from a control plane that asks."
+                );
+            }
+
             info!(
                 fingerprint = %host_fingerprint,
                 authorized_keys = authorized.len(),
                 key_list_run_as = key_list_run_as.as_ref().map(|r| r.label()).unwrap_or_else(|_| "unset".into()),
+                %deny_daemon_grants,
                 "ssh: server ready"
             );
             Some(Arc::new(Self {
                 config: Arc::new(config),
                 authorized,
                 key_list_run_as,
+                deny_daemon_grants,
                 services,
                 forward_acl: cfg.forward_acl.clone(),
                 forwards: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FORWARDS)),
@@ -550,7 +580,15 @@ mod sshd {
     impl ResolvedSessionPolicy {
         /// Resolve a redeemed server grant. The grant is authoritative for
         /// everything a session may do; nothing the CLIENT said is consulted.
-        pub(super) fn from_grant(grant: super::Grant, peer: std::net::SocketAddr) -> Self {
+        ///
+        /// `deny_daemon_grants` is the one exception, and it is the device's,
+        /// not the client's — the M5 ceiling from `ssh_max_privilege`. See
+        /// [`Ctx::deny_daemon_grants`].
+        pub(super) fn from_grant(
+            grant: super::Grant,
+            peer: std::net::SocketAddr,
+            deny_daemon_grants: bool,
+        ) -> Self {
             use roomler_ai_remote_control::models::{ConsentMode, ssh_limits};
 
             // EXHAUSTIVE on purpose — see the type doc. A field added to the
@@ -573,8 +611,23 @@ mod sshd {
             // line as precedent for being dropped.
             let _ = (public_key, deadline);
 
+            // The ceiling REFUSES rather than downgrading. A caller who asked
+            // for root and silently got a user shell has been told something
+            // untrue about their own session — they would read a permission
+            // error as the command's problem, not the device's answer. The
+            // refusal is deferred to run time (an `Err` here) so it can say
+            // this on stderr; an auth failure cannot explain itself.
+            let run_as = match crate::exec::RunAs::from_wire(&account_mode, account.as_deref()) {
+                Ok(crate::exec::RunAs::Daemon) if deny_daemon_grants => Err(
+                    "this device refuses ssh sessions that run as the daemon identity \
+                     (ssh_max_privilege = console_user). Ask for console_user instead."
+                        .to_string(),
+                ),
+                other => other,
+            };
+
             Self {
-                run_as: crate::exec::RunAs::from_wire(&account_mode, account.as_deref()),
+                run_as,
                 // Only an explicit `Auto` skips the operator. `Prompt`,
                 // `Email`, `Push` and a server that said NOTHING all ask —
                 // the fail-safe direction for a gate whose whole purpose is a
@@ -1091,7 +1144,11 @@ mod sshd {
                 // Resolving HERE — not lazily at each request — is the P5
                 // design: one place turns a grant into what a session may do,
                 // and the request handlers can only read the result.
-                self.policy = Some(ResolvedSessionPolicy::from_grant(grant, self.peer));
+                self.policy = Some(ResolvedSessionPolicy::from_grant(
+                    grant,
+                    self.peer,
+                    self.ctx.deny_daemon_grants,
+                ));
                 self.report(SshActivityKind::SessionOpen, None, None, true);
                 return Ok(Auth::Accept);
             }
@@ -2593,6 +2650,7 @@ mod tests {
         let auto = super::sshd::ResolvedSessionPolicy::from_grant(
             test_grant(Some(ConsentMode::Auto), 0),
             test_peer(),
+            false,
         );
         assert!(
             auto.consent_sentinel.is_none(),
@@ -2604,8 +2662,11 @@ mod tests {
             Some(ConsentMode::Push),
             None, // the fail-safe: absent directive ⇒ ask
         ] {
-            let resolved =
-                super::sshd::ResolvedSessionPolicy::from_grant(test_grant(m, 0), test_peer());
+            let resolved = super::sshd::ResolvedSessionPolicy::from_grant(
+                test_grant(m, 0),
+                test_peer(),
+                false,
+            );
             assert_eq!(
                 resolved.consent_sentinel.as_deref(),
                 Some("g-1"),
@@ -2628,15 +2689,19 @@ mod tests {
                 .as_secs()
         };
 
-        let bounded =
-            super::sshd::ResolvedSessionPolicy::from_grant(test_grant(None, 3600), test_peer());
+        let bounded = super::sshd::ResolvedSessionPolicy::from_grant(
+            test_grant(None, 3600),
+            test_peer(),
+            false,
+        );
         let left = secs_until(bounded.deadline.expect("a grant session has a deadline"));
         assert!(
             (3595..=3600).contains(&left),
             "expected ≈3600s, got {left}s"
         );
 
-        let zero = super::sshd::ResolvedSessionPolicy::from_grant(test_grant(None, 0), test_peer());
+        let zero =
+            super::sshd::ResolvedSessionPolicy::from_grant(test_grant(None, 0), test_peer(), false);
         let left = secs_until(zero.deadline.expect("0 must mean the ceiling, not forever"));
         assert!(
             (ssh_limits::MAX_SESSION_SECS - 5..=ssh_limits::MAX_SESSION_SECS).contains(&left),
@@ -2655,6 +2720,94 @@ mod tests {
         assert!(key_list.consent_sentinel.is_none());
         assert!(key_list.caller.contains("(key-list)"));
         assert_eq!(key_list.run_as.unwrap(), crate::exec::RunAs::ConsoleUser);
+    }
+
+    // ── M5: the device-side privilege ceiling ─────────────────────────────
+
+    /// The hole this closes: every other gate on an SSH session is the
+    /// server's, so a control plane that mints `account_mode = daemon` +
+    /// `consent_mode = auto` gets an unattended SYSTEM/root shell on every
+    /// device that answers. `ssh_max_privilege` is the device's own answer,
+    /// and it is the only one that still holds when the server is the
+    /// compromised thing.
+    #[test]
+    fn the_ceiling_refuses_a_daemon_grant_rather_than_downgrading_it() {
+        // `test_grant` asks for `daemon` — the shape that matters.
+        let refused =
+            super::sshd::ResolvedSessionPolicy::from_grant(test_grant(None, 0), test_peer(), true);
+        // REFUSED, not downgraded: a caller told they have a session that
+        // silently is not the one they asked for reads every later permission
+        // error as the command's problem.
+        let why = refused
+            .run_as
+            .expect_err("a daemon grant must be refused, never quietly substituted");
+        assert!(
+            why.contains("ssh_max_privilege"),
+            "the refusal must name the setting that caused it, got {why:?}"
+        );
+    }
+
+    /// The ceiling bounds ONE thing. A grant that never wanted the daemon
+    /// identity is untouched, and so is everything else the grant decides —
+    /// otherwise "turn the ceiling on" would be a change nobody could scope.
+    #[test]
+    fn the_ceiling_leaves_a_console_user_grant_alone() {
+        let mut grant = test_grant(None, 3600);
+        grant.account_mode = "console_user".into();
+        let resolved = super::sshd::ResolvedSessionPolicy::from_grant(grant, test_peer(), true);
+        assert_eq!(
+            resolved.run_as.expect("console_user is under the ceiling"),
+            crate::exec::RunAs::ConsoleUser
+        );
+        assert_eq!(resolved.consent_sentinel.as_deref(), Some("g-1"));
+        assert!(resolved.deadline.is_some());
+    }
+
+    /// Unset is PERMISSIVE, deliberately: a device-side ceiling that arrives
+    /// switched on revokes a working configuration in the middle of a fleet
+    /// roll, and the device you lose root SSH to is liable to be the one you
+    /// needed it for. This test is the record of that decision — if it ever
+    /// flips, it should be because someone chose to, not by drift.
+    #[test]
+    fn an_unset_ceiling_changes_nothing() {
+        let cfg = cfg_with_mode(vec![client_key(26).1], Some("console_user"));
+        assert!(cfg.ssh_max_privilege.is_none(), "unset is the default");
+        let ctx = super::sshd::Ctx::build(&cfg, test_services()).expect("a usable host key");
+        assert!(
+            !ctx.deny_daemon_grants,
+            "an unset ceiling must not refuse anything"
+        );
+
+        let allowed = super::sshd::ResolvedSessionPolicy::from_grant(
+            test_grant(None, 0),
+            test_peer(),
+            ctx.deny_daemon_grants,
+        );
+        assert_eq!(
+            allowed.run_as.expect("unset ⇒ pre-M5 behaviour"),
+            crate::exec::RunAs::Daemon
+        );
+    }
+
+    /// `console_user` is the ONLY value that arms it — a typo must not read
+    /// as "on" (which would break a working device) and must not read as a
+    /// silent "off" either, which is why `config set` rejects the value on
+    /// the way in rather than here.
+    #[test]
+    fn only_console_user_arms_the_ceiling() {
+        for (value, armed) in [
+            (Some("console_user"), true),
+            (Some("daemon"), false),
+            (None, false),
+        ] {
+            let mut cfg = cfg_with_mode(vec![client_key(27).1], Some("console_user"));
+            cfg.ssh_max_privilege = value.map(str::to_string);
+            let ctx = super::sshd::Ctx::build(&cfg, test_services()).expect("a usable host key");
+            assert_eq!(
+                ctx.deny_daemon_grants, armed,
+                "ssh_max_privilege = {value:?} should arm={armed}"
+            );
+        }
     }
 
     // ── Operator consent ──────────────────────────────────────────────────
