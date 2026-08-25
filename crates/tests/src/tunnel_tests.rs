@@ -54,6 +54,15 @@
 //!   tears it down. (Target B stays online so the open passes the server's
 //!   target-online check.)
 //!
+//! * `tunnel_grace_defers_then_terminates_when_target_stays_offline` (R3) — with
+//!   `rc.tunnel_grace_secs > 0`, dropping the TARGET agent's WS does NOT
+//!   immediately push `rc:tunnel.terminate` to the client; the server holds the
+//!   session for the window and terminates only after the agent stays offline.
+//!
+//! * `tunnel_grace_reregister_cancels_terminate` (R3) — the target re-registers
+//!   inside the window and the pending terminate is cancelled, so the client's
+//!   session survives the control-WS blip (the server half of peer-survival).
+//!
 //! The assertion deliberately stops at the OPEN handshake. The subsequent
 //! WebRTC DC data plane (peer build → SDP offer → answer → DC pool → TCP byte
 //! exchange) is NOT covered here — the in-process ICE flakiness in
@@ -903,4 +912,172 @@ async fn agent_daemon_originated_forward_reaches_target() {
 
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), sig).await;
+}
+
+/// R3 grace fixture — a tunnel CLIENT (agent A) with an OPEN session to target
+/// agent B, on an app whose `rc.tunnel_grace_secs` is `grace`. Returns A's WS
+/// (watch it for `rc:tunnel.terminate`), B's WS (drop it to fire
+/// `terminate_sessions_targeting_agent`), and the pieces to RE-connect B.
+struct GraceRig {
+    app: TestApp,
+    seeded: crate::fixtures::seed::SeededTenant,
+    a_ws: AgentWs,
+    b_ws: AgentWs,
+    b_id: String,
+    b_tok: String,
+}
+
+async fn open_client_tunnel_to_target(grace: u64, tag: &str) -> GraceRig {
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.rc.tunnel_grace_secs = grace;
+        // Fast presence writes so an offline→online transition on a reconnect
+        // lands well inside `wait_agent_online`'s budget.
+        s.rc.presence_batch_ms = 50;
+    })
+    .await;
+    let seeded = app.seed_tenant(tag).await;
+
+    // any user (⇒ any principal, incl. an agent) may reach 127.0.0.1:9000-9999
+    let policy = json!({
+        "name": "allow-loopback",
+        "subjects": [{ "kind": "all_users" }],
+        "targets": [{ "kind": "all_agents" }],
+        "allowlist": [{
+            "host_pattern": { "kind": "cidr", "value": "127.0.0.0/8" },
+            "port_range": { "low": 9000, "high": 9999 }
+        }],
+        "max_concurrent_flows": 32,
+        "max_bytes_per_session": 1048576
+    });
+    app.auth_post(
+        &format!("/api/tenant/{}/tunnel-policy", seeded.tenant_id),
+        &seeded.admin.access_token,
+    )
+    .json(&policy)
+    .send()
+    .await
+    .unwrap();
+
+    let (a_id, a_tok) = enroll_agent(&app, &seeded, &format!("mach-{tag}-A"), "origin-A").await;
+    let (b_id, b_tok) = enroll_agent(&app, &seeded, &format!("mach-{tag}-B"), "target-B").await;
+    let mut a_ws = connect_agent_ws(&app, &a_tok, "origin-A").await;
+    let b_ws = connect_agent_ws(&app, &b_tok, "target-B").await;
+    wait_agent_online(&app, &seeded, &a_id).await;
+    wait_agent_online(&app, &seeded, &b_id).await;
+
+    // A drives the tunnel-client role and opens a session to target B — this is
+    // what populates `tunnel_sessions_by_target_agent[b_id]`.
+    a_ws.send(Message::Text(
+        json!({
+            "t": "rc:tunnel.hello",
+            "role": "client",
+            "version": "0.3.0",
+            "supported_transports": ["webrtc-dc-v1"],
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    a_ws.send(Message::Text(
+        json!({
+            "t": "rc:tunnel.open",
+            "agent_id": b_id,
+            "transport": "webrtc-dc-v1",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    read_until(&mut a_ws, "rc:tunnel.opened")
+        .await
+        .expect("A must receive rc:tunnel.opened for its own origination");
+
+    GraceRig {
+        app,
+        seeded,
+        a_ws,
+        b_ws,
+        b_id,
+        b_tok,
+    }
+}
+
+#[tokio::test]
+async fn tunnel_grace_defers_then_terminates_when_target_stays_offline() {
+    // R3 — with `rc.tunnel_grace_secs > 0`, a target agent's control-WS drop
+    // must NOT immediately terminate the sessions aimed at it (the pre-R3
+    // behaviour with grace=0): the server holds them for the window, then
+    // terminates BECAUSE the agent stayed offline. This is the server half that
+    // lets the agent's surviving QUIC peers ride out a WS blip.
+    let mut rig = open_client_tunnel_to_target(2, "r3-grace-expire").await;
+
+    // The event that fires `terminate_sessions_targeting_agent(b_id)`.
+    rig.b_ws.close(None).await.ok();
+
+    // Inside the grace window the client (A) must see NO terminate. Earliest a
+    // terminate could arrive is detection + 2 s, so a 1 s watch must time out.
+    let early = tokio::time::timeout(
+        Duration::from_millis(1000),
+        read_until(&mut rig.a_ws, "rc:tunnel.terminate"),
+    )
+    .await;
+    assert!(
+        early.is_err(),
+        "grace must DEFER termination: A received rc:tunnel.terminate inside the grace window"
+    );
+
+    // After the window (target still offline) the server DOES terminate; A gets
+    // the push. read_until's own 5 s deadline covers the remaining ~1 s + slop.
+    let terminated = read_until(&mut rig.a_ws, "rc:tunnel.terminate").await;
+    assert!(
+        terminated.is_some(),
+        "grace expired with the target still offline ⇒ the session must terminate"
+    );
+}
+
+#[tokio::test]
+async fn tunnel_grace_reregister_cancels_terminate() {
+    // R3 — if the target agent re-registers within the grace window, the
+    // pending termination is CANCELLED and the client's session is preserved:
+    // exactly the WS-blip survival the pairing exists for. A 4 s grace leaves
+    // the reconnect + hub re-registration comfortably ahead of the deadline.
+    let mut rig = open_client_tunnel_to_target(4, "r3-grace-cancel").await;
+
+    // Target's WS blips...
+    rig.b_ws.close(None).await.ok();
+    // ...a real blip has a GAP: let the server observe the drop (teardown +
+    // offline mark) BEFORE the reconnect, so the new hello can't race the old
+    // connection's teardown (a presence-layer concern, not this test's
+    // subject). Then it reconnects on the SAME machine id (⇒ same agent row /
+    // hub key) well inside the 4 s window.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let _b_ws2 = connect_agent_ws(&rig.app, &rig.b_tok, "target-B").await;
+    wait_agent_online(&rig.app, &rig.seeded, &rig.b_id).await;
+
+    // Watch A across the grace deadline (~4 s from the drop, i.e. ~3 s from
+    // here) and assert NO `rc:tunnel.terminate` arrives — the re-registration
+    // cancelled it. A self-controlled 5 s watch (not `read_until`, whose own
+    // 5 s cap could stop short of a late deadline) straddles it.
+    let saw_terminate = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rig.a_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text)
+                        && v.get("t").and_then(|x| x.as_str()) == Some("rc:tunnel.terminate")
+                    {
+                        return true;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(
+        !matches!(saw_terminate, Ok(true)),
+        "a re-register within grace must CANCEL the pending terminate (A received one)"
+    );
 }

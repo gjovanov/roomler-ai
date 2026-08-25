@@ -112,6 +112,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_derp_floor: None,
         overlay_netcheck: None,
         tunnel_derp_fallback: None,
+        tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
         overlay_lan_iface_filter: None,
         overlay_wsl_mirrored_guard: None,
