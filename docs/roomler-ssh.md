@@ -78,6 +78,7 @@ first fragment only, every field bounds-checked, malformed input answered with
 | `ssh_port` | `2222` | The intercepted TCP port |
 | `ssh_authorized_keys` | *(empty)* | OpenSSH public keys allowed to authenticate |
 | `ssh_account_mode` | *(unset)* | What those keys run as: `daemon` \| `console_user` \| `named:<account>`. **Unset = they authenticate but run nothing** |
+| `ssh_max_privilege` | *(unset)* | Ceiling on what a **server-granted** session may run as: `console_user` refuses a grant asking for the daemon identity. Unset/`daemon` = no device-side limit |
 | `ssh_host_key` | *(minted on first use)* | This node's host identity — **not** exposed on the config surface |
 
 ```bash
@@ -249,6 +250,37 @@ that happens to be uid 0.
 runs sessions as **SYSTEM / root**, exactly like Fleet RPC and for the same
 reason. Listing a key in `ssh_authorized_keys` grants root to its holder unless
 the policy says otherwise.
+
+### The device's own ceiling — `ssh_max_privilege` (M5)
+
+Everything above is decided by the **server**: the org switch, the permission
+bit, the `SshPolicy`, the account mode, the consent mode. That is the right
+shape for administering a fleet, and it has one consequence worth stating
+plainly — a control plane that mints `account_mode = daemon` with
+`consent_mode = auto` gets an **unattended root shell on every device that
+answers**, with nothing on the device consulted. `ssh_account_mode` does not
+help here; it governs only the key-list path.
+
+`ssh_max_privilege` is the device's own answer, and the only gate in the list
+that still holds when the server is the compromised thing:
+
+```bash
+roomler config set ssh_max_privilege console_user
+```
+
+Set to `console_user`, a grant asking for the daemon identity is **refused, not
+downgraded** — a caller who asked for root and silently got a user shell has
+been told something untrue about their own session, and would read every later
+permission error as the command's problem rather than the device's answer. The
+refusal names the setting, on stderr, at run time.
+
+**Unset is permissive** and changes nothing, deliberately: a device-side
+ceiling that arrived switched on would revoke a working configuration in the
+middle of a fleet roll, and the device you lose root SSH to is liable to be the
+one you needed it for. Every SSH-enabled device that has not chosen says so in
+its start-up log. `named:<account>` is not accepted as a value — a ceiling has
+to be an ordering, and "is `named:svc-backup` above or below `console_user`?"
+has no answer.
 
 ## 4. Authorization, and the gap P3 closes
 
@@ -687,6 +719,7 @@ unaffected (it passes via the `ADMINISTRATOR` bypass).
 | P7b | `-L` / `-J` / `-W` via `direct-tcpip`, default-deny on `forward_acl`. **`-R` deliberately not implemented** — it would make the device bind a listening socket | **shipped** |
 | P8a | Session **activity** log — commands + exit codes, shell/SFTP/forward events, device-reported into `ssh_activity`. Deliberately NOT session content | **shipped** |
 | P8b | Admin UI for the activity feed — `SshActivitySection`, under the audit log in org Settings | **shipped** |
+| M5 | `ssh_max_privilege` — the device refuses a server grant that asks for the daemon identity. The one gate that survives a compromised control plane | **shipped**, default unset (permissive) |
 
 ## 6. Build
 
