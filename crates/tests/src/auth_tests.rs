@@ -462,3 +462,169 @@ async fn tenant_endpoint_returns_401_with_invalid_token() {
 
     assert_eq!(resp.status().as_u16(), 401);
 }
+
+// ── the refresh cookie (cookie-only sessions, step 3) ──────────────────────
+//
+// A refresh token is the longest-lived browser credential: 30 days by default,
+// and it re-mints access tokens, so it is worth far more to steal than an
+// access token. These lock the server half — set it, accept it, clear it —
+// which has to be live before the SPA stops keeping it in localStorage.
+
+/// Pull one `Set-Cookie` value by name out of a response.
+fn set_cookie<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
+    resp.headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with(&format!("{name}=")))
+}
+
+#[tokio::test]
+async fn login_sets_both_session_cookies() {
+    let app = TestApp::spawn().await;
+    app.register_user(
+        "cookies@test.com",
+        "cookieuser",
+        "Cookie User",
+        "Password123!",
+        None,
+        None,
+    )
+    .await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/auth/login"))
+        .json(&serde_json::json!({ "email": "cookies@test.com", "password": "Password123!" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // ⚠️ Both, not one. `HeaderMap::insert` replaces every value for a name, so
+    // a second `insert` of Set-Cookie would silently drop the access cookie —
+    // this is the assertion that catches that.
+    let access = set_cookie(&resp, "access_token").expect("access_token cookie");
+    let refresh = set_cookie(&resp, "refresh_token").expect("refresh_token cookie");
+
+    assert!(access.contains("HttpOnly"), "access: {access}");
+    assert!(access.contains("Path=/;"), "access: {access}");
+
+    assert!(refresh.contains("HttpOnly"), "refresh: {refresh}");
+    // Scoped to the ONE endpoint that spends it, so it stops riding along on
+    // every other request.
+    assert!(
+        refresh.contains("Path=/api/auth/refresh"),
+        "the refresh cookie must be path-scoped: {refresh}"
+    );
+    assert!(refresh.contains("SameSite=Lax"), "refresh: {refresh}");
+}
+
+#[tokio::test]
+async fn refresh_works_from_the_cookie_with_an_empty_body() {
+    let app = TestApp::spawn().await;
+    app.register_user(
+        "cookieref@test.com",
+        "cookierefuser",
+        "Cookie Refresh",
+        "Password123!",
+        None,
+        None,
+    )
+    .await;
+
+    // A cookie store, so the login's Set-Cookie is replayed on the next call —
+    // exactly what a browser does.
+    let jar = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let login = jar
+        .post(app.url("/api/auth/login"))
+        .json(&serde_json::json!({ "email": "cookieref@test.com", "password": "Password123!" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status().as_u16(), 200);
+
+    // `{}` — no token in the body at all. This is what the SPA will send.
+    let resp = jar
+        .post(app.url("/api/auth/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "the refresh cookie alone must be enough"
+    );
+    let json: Value = resp.json().await.unwrap();
+    let minted = json["access_token"].as_str().expect("a new access token");
+    let me = app.auth_get("/api/auth/me", minted).send().await.unwrap();
+    assert_eq!(me.status().as_u16(), 200, "the minted token must work");
+}
+
+#[tokio::test]
+async fn refresh_still_accepts_the_token_in_the_body() {
+    // The compatibility guarantee the UI change depends on: during a rolling
+    // deploy a cached bundle still posts the token in the body.
+    let app = TestApp::spawn().await;
+    let user = app
+        .register_user(
+            "bodyref@test.com",
+            "bodyrefuser",
+            "Body Refresh",
+            "Password123!",
+            None,
+            None,
+        )
+        .await;
+
+    let resp = app
+        .client
+        .post(app.url("/api/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": user.refresh_token }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn refresh_with_neither_cookie_nor_body_is_401() {
+    let app = TestApp::spawn().await;
+    let resp = app
+        .client
+        .post(app.url("/api/auth/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn logout_clears_the_refresh_cookie_too() {
+    // Clearing only the access cookie would leave a 30-day credential in the
+    // browser that re-mints access tokens — a "logout" that does not log out.
+    let app = TestApp::spawn().await;
+    let resp = app
+        .client
+        .post(app.url("/api/auth/logout"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let access = set_cookie(&resp, "access_token").expect("access clear");
+    let refresh = set_cookie(&resp, "refresh_token").expect("refresh clear");
+    assert!(access.contains("Max-Age=0"), "access: {access}");
+    assert!(refresh.contains("Max-Age=0"), "refresh: {refresh}");
+    // The attributes must match the ones it was SET with, or the browser keeps
+    // the original cookie and the clear is cosmetic.
+    assert!(
+        refresh.contains("Path=/api/auth/refresh"),
+        "a clear on the wrong Path does not remove the cookie: {refresh}"
+    );
+}
