@@ -19,6 +19,7 @@ import { ref, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useWsStore } from '@/stores/ws'
+import { markSignedIn, clearSignedIn } from '@/api/session'
 
 const router = useRouter()
 const route = useRoute()
@@ -32,38 +33,33 @@ onMounted(async () => {
   // The query-string form is still accepted so a cached older SPA (or an
   // older API) keeps working through a deploy; drop it once both sides have
   // rolled and nothing emits `?token=` any more.
-  const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''))
-  const token = (hash.get('token') ?? (route.query.token as string)) || ''
-  if (!token) {
-    error.value = 'No token received from OAuth provider'
-    return
-  }
-  // Whichever form it came in, get it out of the address bar so it does not
-  // linger in history or get copy-pasted with the URL.
+  // Nothing to read out of the URL and nothing to store: the session already
+  // arrived, as a Set-Cookie on the redirect that landed us here. The token
+  // this page used to lift out of the fragment went straight into
+  // localStorage, which is exactly what cookie-only sessions exist to stop.
+  //
+  // The server still appends `#token=` for older cached bundles. We ignore the
+  // value but still strip the fragment, so it does not linger in history or
+  // get copy-pasted out of the address bar.
   window.history.replaceState({}, '', window.location.pathname)
 
-  // Pre-validate the token with a RAW fetch, outside the api client.
-  // Rationale: with an invalid/expired token, `auth.fetchMe()` swallows
-  // the failure (internal catch → logout) and the api client's 401
-  // handler navigates to /login — the user gets silently bounced and
-  // this view's error alert never renders (e2e oauth.spec locks the
-  // intended behavior: show "Failed to complete OAuth login" here).
-  const tokenOk = await fetch('/api/auth/me', {
-    headers: { Authorization: `Bearer ${token}` },
-  })
+  // Validate with a RAW fetch, outside the api client. Rationale: on a failed
+  // sign-in `auth.fetchMe()` swallows the error (internal catch → logout) and
+  // the api client's 401 handler navigates to /login — the user gets silently
+  // bounced and this view's error alert never renders (e2e oauth.spec locks
+  // the intended behaviour: show "Failed to complete OAuth login" here).
+  // Same-origin, so the session cookie rides along by itself.
+  const sessionOk = await fetch('/api/auth/me')
     .then((r) => r.ok)
     .catch(() => false)
-  if (!tokenOk) {
+  if (!sessionOk) {
     error.value = 'Failed to complete OAuth login'
-    localStorage.removeItem('access_token')
-    auth.token = null
+    clearSignedIn()
     return
   }
 
   try {
-    // Store the token and fetch user info
-    localStorage.setItem('access_token', token)
-    auth.token = token
+    markSignedIn()
     await auth.fetchMe()
     ws.connect()
     // S2: honor a protected deep-link stashed by the router guard
@@ -82,9 +78,9 @@ onMounted(async () => {
     } else {
       router.push({ name: 'dashboard' })
     }
-  } catch (e) {
+  } catch {
     error.value = 'Failed to complete OAuth login'
-    localStorage.removeItem('access_token')
+    clearSignedIn()
   }
 })
 </script>
