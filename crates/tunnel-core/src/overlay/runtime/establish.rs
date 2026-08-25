@@ -624,10 +624,28 @@ impl OverlayRuntime {
                 // The kind rides every conviction line (field 2026-08-16: a
                 // dead DERP carrier convicted under "stale coturn port?" and
                 // sent the diagnosis hunting through coturn for hours).
+                //
+                // #28 — and so does the SENTENCE. A DERP carrier is raw WG over
+                // the pubkey-addressed `/derp` WS: it has no coturn allocation,
+                // no relayed port, nothing to re-allocate. Adding `kind=` in
+                // 2026-08-16 made the truth available; it did not stop the
+                // message itself from asserting a TURN diagnosis, and the
+                // message is what a human greps and reads first.
+                let is_derp = e.relay_kind == Some(crate::overlay::relay_link::RelayKind::Derp);
+                let rebuild = if is_derp {
+                    "rebuilding the /derp carrier"
+                } else {
+                    "re-allocating"
+                };
                 if reason == DeathReason::HardDead {
+                    let cause = if is_derp {
+                        "/derp WS closed under it"
+                    } else {
+                        "TURNS/TCP reset / QUIC-over-TURN lost"
+                    };
                     warn!(
                         peer = %nid, kind = ?e.relay_kind,
-                        "overlay: relay carrier send hard-errored (TURNS/TCP reset / QUIC-over-TURN lost) — re-allocating"
+                        "overlay: relay carrier send hard-errored ({cause}) — {rebuild}"
                     );
                 } else if reason == DeathReason::RekeyUnanswered {
                     // Stage 2 — the relay accepted our sends (no hard error)
@@ -637,22 +655,43 @@ impl OverlayRuntime {
                     // caught EVEN when the peer's own inbound traffic keeps
                     // rx moving (the one-way class no passive rule can see;
                     // field 2026-08-08, winhost-a→devbox via a raw-dialed srflx).
+                    let cause = if is_derp {
+                        "one-way over /derp"
+                    } else {
+                        "one-way or dead allocation"
+                    };
                     warn!(
                         peer = %nid, kind = ?e.relay_kind,
-                        "overlay: relay carrier failed active revalidation (forced rekey unanswered — one-way or dead allocation) — re-allocating"
+                        "overlay: relay carrier failed active revalidation (forced rekey unanswered — {cause}) — {rebuild}"
                     );
                 } else if reason == DeathReason::RxStale {
                     // rc.206 — a relay carrier that stopped delivering with no
                     // send-error to trip `hard_dead` (silently-dropped coturn
                     // allocation / a dead worker the send path can't detect).
+                    let cause = if is_derp {
+                        "the relay is not delivering the peer's frames to us"
+                    } else {
+                        "coturn allocation dropped?"
+                    };
                     warn!(
                         peer = %nid, kind = ?e.relay_kind,
-                        "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — coturn allocation dropped?) — re-allocating"
+                        "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — {cause}) — {rebuild}"
                     );
                 } else {
+                    // #28 — the one-way class is where the wrong sentence hurt
+                    // most, because on DERP it has a completely different
+                    // cause: nothing of ours is coming BACK, which means the
+                    // peer is not on `/derp` with us (its own WS down, or —
+                    // pre-#27 — it simply never followed us here). Re-running a
+                    // coturn hunt for that is wasted field time.
+                    let cause = if is_derp {
+                        "the peer is not reachable over /derp — its WS may be down, or it has not followed us onto DERP"
+                    } else {
+                        "stale coturn port?"
+                    };
                     warn!(
                         peer = %nid, kind = ?e.relay_kind,
-                        "overlay: relay carrier one-way (stale coturn port?) — re-allocating"
+                        "overlay: relay carrier one-way ({cause}) — {rebuild}"
                     );
                 }
             }
