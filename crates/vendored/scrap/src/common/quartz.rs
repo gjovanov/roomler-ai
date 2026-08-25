@@ -167,4 +167,20 @@ impl Display {
     pub fn height(&self) -> usize {
         self.0.height()
     }
+
+    /// ROOMLER PATCH: the display's TRUE pixel size (see `quartz::Display::
+    /// pixel_size` — `CGDisplayModeGetPixelWidth/Height`, with the point-size
+    /// fallback). `width()/height()` stay POINTS on purpose (pointer mapping);
+    /// these exist for callers that must know the panel's real resolution
+    /// INDEPENDENT of whatever size a capture stream was opened at — a
+    /// capturer opened at the encode box reports the box, and using that as
+    /// "native" is the feedback loop that re-opened the stream every frame
+    /// (field 2026-08-26).
+    pub fn pixel_width(&self) -> usize {
+        self.0.pixel_width()
+    }
+
+    pub fn pixel_height(&self) -> usize {
+        self.0.pixel_height()
+    }
 }
