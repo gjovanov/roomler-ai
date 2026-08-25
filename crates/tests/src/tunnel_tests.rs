@@ -930,6 +930,9 @@ struct GraceRig {
 async fn open_client_tunnel_to_target(grace: u64, tag: &str) -> GraceRig {
     let app = TestApp::spawn_with_settings(move |s| {
         s.rc.tunnel_grace_secs = grace;
+        // Fast presence writes so an offline→online transition on a reconnect
+        // lands well inside `wait_agent_online`'s budget.
+        s.rc.presence_batch_ms = 50;
     })
     .await;
     let seeded = app.seed_tenant(tag).await;
@@ -1044,20 +1047,37 @@ async fn tunnel_grace_reregister_cancels_terminate() {
 
     // Target's WS blips...
     rig.b_ws.close(None).await.ok();
-    // ...and it reconnects on the SAME machine id (⇒ same agent row / hub key)
-    // well inside the window; wait until the hub sees it online again.
+    // ...a real blip has a GAP: let the server observe the drop (teardown +
+    // offline mark) BEFORE the reconnect, so the new hello can't race the old
+    // connection's teardown (a presence-layer concern, not this test's
+    // subject). Then it reconnects on the SAME machine id (⇒ same agent row /
+    // hub key) well inside the 4 s window.
+    tokio::time::sleep(Duration::from_millis(800)).await;
     let _b_ws2 = connect_agent_ws(&rig.app, &rig.b_tok, "target-B").await;
     wait_agent_online(&rig.app, &rig.seeded, &rig.b_id).await;
 
-    // Past the original grace deadline, A must have received NO terminate — the
-    // re-registration cancelled it. A 5 s watch straddles the ~4.2 s expiry.
-    let terminated = tokio::time::timeout(
-        Duration::from_millis(5000),
-        read_until(&mut rig.a_ws, "rc:tunnel.terminate"),
-    )
+    // Watch A across the grace deadline (~4 s from the drop, i.e. ~3 s from
+    // here) and assert NO `rc:tunnel.terminate` arrives — the re-registration
+    // cancelled it. A self-controlled 5 s watch (not `read_until`, whose own
+    // 5 s cap could stop short of a late deadline) straddles it.
+    let saw_terminate = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rig.a_ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text)
+                        && v.get("t").and_then(|x| x.as_str()) == Some("rc:tunnel.terminate")
+                    {
+                        return true;
+                    }
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return false,
+            }
+        }
+    })
     .await;
     assert!(
-        terminated.is_err() || terminated.unwrap().is_none(),
-        "a re-register within grace must CANCEL the pending terminate"
+        !matches!(saw_terminate, Ok(true)),
+        "a re-register within grace must CANCEL the pending terminate (A received one)"
     );
 }
