@@ -181,6 +181,14 @@ pub(crate) const H_ORDINARY: Duration = Duration::from_secs(60);
 /// Escalated suppression half-life ≡ the legacy `DIRECT_DENY_COOLDOWN` /
 /// `SRFLX_DENY_COOLDOWN` (both 15 min since rc.225).
 pub(crate) const H_ESCALATED: Duration = Duration::from_secs(15 * 60);
+/// #30 — how long a peer that is RELAYING to us holds every direct tier
+/// ineligible (see [`PathMonitor::on_peer_relayed_instead`]). Must comfortably
+/// exceed the make-before-break probe cadence — measured at ~70-80 s in the
+/// field — or the promote↔follow flap simply resumes at that cadence. Three
+/// minutes covers two to three probe cycles; every follow re-arms it, and once
+/// the peer stops relaying it lapses and the very next probe promotes, so the
+/// worst case for a peer that came back is one window on the relay.
+pub(crate) const RELAYED_INSTEAD_HOLDOFF: Duration = Duration::from_secs(3 * 60);
 /// Strike thresholds ≡ legacy `DIRECT_MAX_FAILURES` / `SRFLX_MAX_FAILURES`.
 /// The LAN tier under make-before-break never escalates (P8 — fixed 60 s
 /// spacing on both ends guarantees bilateral punch alignment; see
@@ -349,6 +357,15 @@ struct PeerPath {
     /// P7 — the server's forced-DERP pin window, as an annotation. Direct
     /// decisions ignore it entirely (see the module doc).
     forced_derp_until: Option<Instant>,
+    /// #30 — the peer is demonstrably relaying to us instead of using a direct
+    /// tier (the demote-follow, #27). Direct tiers are INELIGIBLE until this
+    /// passes. Unlike a penalty this is a hard window, because the penalty
+    /// plane cannot express it: `suppression_half_life` pins LAN-under-MBB to
+    /// `H_ORDINARY` by the P8 never-strand rule, and the make-before-break
+    /// probe cadence (~70-80 s measured) is close enough to that half-life that
+    /// the tier is eligible again by the next probe — which is exactly the flap
+    /// #29 tried and failed to stop.
+    relayed_instead_until: Option<Instant>,
     /// Voluntary-switch hysteresis bookkeeping (disabled-at-flip machinery).
     hysteresis: Hysteresis,
 }
@@ -566,11 +583,19 @@ impl PathMonitor {
         if tier.is_direct() {
             self.book_failure(peer, tier, mbb, now);
         }
-        self.peers
-            .entry(*peer)
-            .or_default()
-            .hysteresis
-            .record_switch(now);
+        let p = self.peers.entry(*peer).or_default();
+        // #30 — a hard window on top of the penalty. The penalty ALONE does not
+        // hold: LAN-under-MBB is pinned to `H_ORDINARY` (60 s) by the P8
+        // never-strand rule, and MBB re-probes every ~70-80 s, so the tier is
+        // eligible again before the next probe and the pair keeps flapping
+        // (field 2026-08-25, measured for 20 min after #29 shipped believing it
+        // had fixed exactly this).
+        //
+        // Re-armed by every follow, so it self-extends while the peer stays
+        // away and simply lapses once it stops relaying — at which point the
+        // next probe promotes normally. Nothing is stranded.
+        p.relayed_instead_until = Some(now + RELAYED_INSTEAD_HOLDOFF);
+        p.hysteresis.record_switch(now);
     }
 
     /// The sweep advanced the peer's keepalive-inclusive last-heard marker.
@@ -802,6 +827,14 @@ impl PathMonitor {
             Some(p) => p,
             None => return true, // fresh peer: no penalties anywhere
         };
+        // #30 — the peer is relaying to us instead of using ANY direct tier.
+        // That is not a quality judgement about a path, it is a fact about
+        // where the peer is, so it gates eligibility outright rather than
+        // through the penalty plane (which cannot hold long enough — see
+        // `on_peer_relayed_instead`).
+        if p.relayed_instead_until.is_some_and(|until| now < until) {
+            return false;
+        }
         let penalty = p.tiers[idx]
             .penalty
             .map(|pen| pen.value(now))
@@ -1350,11 +1383,27 @@ mod tests {
                 "{tier:?} quality is UNTOUCHED — the path may be fine; the peer \
                  is just not on it"
             );
-            // Decaying, not sticky: far enough past the half-life it is
-            // eligible again, so a peer that comes back gets direct back.
+            // #30 — the property #29's test MISSED, and the field then found
+            // in 20 minutes: a booked strike is not the same as an ineligible
+            // tier. `suppression_half_life` pins LAN-under-MBB to H_ORDINARY
+            // (60 s) by the P8 never-strand rule, and MBB re-probes every
+            // ~70-80 s — so the penalty alone is eligible again by the next
+            // probe and the promote↔follow flap just continues. Assert the
+            // thing that actually stops it.
             assert!(
-                m.eligible(&a, tier, t0 + H_ESCALATED * 4),
-                "{tier:?} suppression must decay — direct returns on its own"
+                !m.eligible(&a, tier, t0 + Duration::from_secs(90)),
+                "{tier:?} must still be INELIGIBLE past one MBB probe cycle — a \
+                 strike alone does not stop make-before-break re-promoting"
+            );
+            // Bounded, not sticky: once the peer stops relaying the window
+            // lapses and the next probe promotes normally.
+            assert!(
+                m.eligible(
+                    &a,
+                    tier,
+                    t0 + RELAYED_INSTEAD_HOLDOFF + Duration::from_secs(1)
+                ),
+                "{tier:?} must recover — nothing may be stranded on the relay"
             );
         }
         // The relay tier is not a direct tier: nothing to suppress, and no
