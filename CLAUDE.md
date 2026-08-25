@@ -33,6 +33,46 @@ Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU)
 as a separate native binary (`roomler-agent`, installed as `roomlerd`) that runs
 on controlled hosts.
 
+### Pillar 2 design goal — read this before touching networking code
+
+> **A resilient, secure private network that "just works" — at maximum
+> performance and lowest achievable latency — across varied and complex
+> real-world network infrastructures.**
+
+"Just works" is the acceptance bar, not a slogan. It has to hold on an
+unmanaged laptop *and* a GPO-locked corporate desktop (locked firewall,
+TLS-inspecting middlebox, EDR, no admin rights on the network stack); under a
+consumer VPN *and* an enterprise full-tunnel client that reroutes and reaps
+routes underneath us; on headless Linux, k8s nodes, containers and WSL with no
+desktop session; on Windows, Linux and macOS, where the mechanics differ
+(Wintun + WFP, netlink + rt tables, utun) but the *behaviour* must not.
+
+Six commitments follow from it. All are load-bearing in the code today — don't
+regress them:
+
+1. **Best carrier that works, always measured, never assumed.** The cascade is
+   LAN → direct-public → srflx hole-punch → single-relay (TURN) → DERP over
+   WSS :443, chosen by a **server verdict over measured `CapVector`s**.
+   Heuristics may *detect*; they never *decide*. Never ratchet: a node that
+   fell to relay keeps re-attempting direct (make-before-break, then relentless
+   re-upgrade).
+2. **A floor that always connects.** With every UDP path blocked, DERP over
+   TLS :443 still carries the mesh (`derp_floor`). Connectivity is never
+   all-or-nothing.
+3. **Never self-wedge.** Route/exit/firewall changes pin carrier + control-plane
+   exemptions FIRST and **withhold** the change if they can't. A mesh feature
+   must never cost the operator their own remote access to the box; route
+   guards re-assert and boot reconcilers heal stale state after a hard exit.
+4. **No OS privileges required as a fallback.** Where a TUN or routing table is
+   unavailable or owned by someone else, `overlay-netstack` gives the same mesh
+   through a userspace stack + loopback SOCKS5 front, with zero routing changes.
+5. **Default-deny, tenant-scoped, end-to-end encrypted** — overlay ACLs, tunnel
+   ACLs, and an agent-local gate that survives a compromised server. Every
+   decision audited.
+6. **Field-validated, not CI-validated.** Networking changes are proven on the
+   real fleet across the topologies above via `roomler exec` after every roll.
+   **CI green ≠ done.**
+
 ## Commands
 
 ```bash
