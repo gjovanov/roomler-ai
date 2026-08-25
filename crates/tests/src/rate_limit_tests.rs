@@ -4,12 +4,29 @@ use crate::fixtures::test_app::TestApp;
 async fn rate_limit_returns_429_after_burst() {
     let app = TestApp::spawn().await;
 
-    // The rate limiter allows burst of 60 requests, then 1 per second.
-    // Send 65 rapid requests to /health (a lightweight unauthenticated endpoint).
-    let mut statuses = Vec::new();
+    // The limiter allows a burst of 60, then refills 1 token per second.
+    //
+    // ⚠️ These requests MUST be concurrent, and that is the whole fix. The
+    // original loop issued 65 round-trips SEQUENTIALLY, so it raced its own
+    // refill: on a slow runner the loop outlasts the burst it is trying to
+    // exhaust — 65 requests spread over >5 s never exceed 60 + refill, every
+    // one returns 200, and the test fails claiming the limiter is broken.
+    // That made it the suite's one timing flake, and it was SKIPPED in CI
+    // rather than fixed, which hides real rate-limit regressions.
+    //
+    // A burst test has to actually burst. Firing all 65 at once makes the
+    // outcome depend on the limiter instead of on how fast the runner is.
+    let mut handles = Vec::with_capacity(65);
     for _ in 0..65 {
-        let resp = app.client.get(app.url("/health")).send().await.unwrap();
-        statuses.push(resp.status().as_u16());
+        let client = app.client.clone();
+        let url = app.url("/health");
+        handles.push(tokio::spawn(async move {
+            client.get(url).send().await.unwrap().status().as_u16()
+        }));
+    }
+    let mut statuses = Vec::with_capacity(handles.len());
+    for h in handles {
+        statuses.push(h.await.unwrap());
     }
 
     // Count how many got 429
