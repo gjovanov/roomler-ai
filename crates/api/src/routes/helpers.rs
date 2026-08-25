@@ -277,7 +277,18 @@ pub async fn notify_call_started(
 /// cross-tenant IDOR. Resolving the room *within* the tenant (`{_id,
 /// tenant_id}`) closes it: a foreign room resolves to nothing → 404, leaking
 /// neither its content nor its existence.
-pub async fn require_room_in_tenant(
+/// Tenant membership + the room resolved WITHIN that tenant, and nothing else.
+///
+/// This is [`require_room_in_tenant`] without the room-level visibility gate,
+/// and it exists for exactly one caller: `join`. Joining is how someone
+/// BECOMES a member, so routing it through a check that requires membership
+/// would make Private rooms unjoinable — a room you can see, cannot read, and
+/// cannot ask to enter.
+///
+/// ⚠️ Do not reach for this to "skip the check" anywhere else. Every other
+/// room-scoped route wants [`require_room_in_tenant`]; a second caller here
+/// would be a visibility bypass wearing a helper's name.
+pub async fn resolve_room_in_tenant(
     state: &AppState,
     tenant_id: ObjectId,
     room_id: ObjectId,
@@ -291,6 +302,39 @@ pub async fn require_room_in_tenant(
         .base
         .find_by_id_in_tenant(tenant_id, room_id)
         .await?)
+}
+
+pub async fn require_room_in_tenant(
+    state: &AppState,
+    tenant_id: ObjectId,
+    room_id: ObjectId,
+    user_id: ObjectId,
+) -> Result<Room, ApiError> {
+    let room = resolve_room_in_tenant(state, tenant_id, room_id, user_id).await?;
+
+    // Room-level read authorization. Tenant membership answers "may you be
+    // here at all"; this answers "may you be in THIS room" — the question that
+    // previously had no answer, so every member could read every room while
+    // the sidebar drew a padlock on most of them.
+    //
+    // `Public` (the default, and what every pre-existing room reads back as)
+    // short-circuits, so this costs no query for the overwhelming majority of
+    // requests and changes no behaviour on the day it ships.
+    if room.visibility.requires_membership()
+        && !state.rooms.is_member(tenant_id, room_id, user_id).await?
+    {
+        // NOT FOUND, not FORBIDDEN, for a `Secret` room: 403 would confirm it
+        // exists to someone who is not supposed to know that, which is the
+        // whole point of Secret. `Private` is listed anyway, so its existence
+        // is not a secret and a 403 is the more useful answer.
+        return Err(if room.visibility.hidden_from_non_members() {
+            ApiError::NotFound("Resource not found".to_string())
+        } else {
+            ApiError::Forbidden("Not a member of this room".to_string())
+        });
+    }
+
+    Ok(room)
 }
 
 /// The message-keyed sibling of [`require_room_in_tenant`]. Handlers keyed by

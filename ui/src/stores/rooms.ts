@@ -12,7 +12,15 @@ export interface Room {
   emoji?: string
   topic?: { value?: string }
   purpose?: string
+  /** Listed in Explore. NOT an access control — see `visibility`. */
   is_open: boolean
+  /**
+   * Who may READ the room, enforced server-side.
+   *
+   * Optional because an older API returns rooms without it; treat a missing
+   * value as `public`, which is what the server defaults to.
+   */
+  visibility?: 'public' | 'private' | 'secret'
   is_archived: boolean
   is_read_only: boolean
   is_default: boolean
