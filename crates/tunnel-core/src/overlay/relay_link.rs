@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 
 use super::netmap::PeerConfig;
 use super::wg::Carrier;
-use crate::transport::derp::DerpMux;
+use crate::transport::derp::{DerpMux, MuxEvent};
 use crate::transport::relay::RelayConn;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, RelayStrategyWire};
 use roomler_ai_remote_control::worker_pick::pick_worker_fnv1a;
@@ -388,7 +388,7 @@ pub struct RelayCoordinator {
     regional_muxes: HashMap<String, Arc<DerpMux>>,
     /// #27 — the runtime's sink for "a peer is relaying to us over DERP that we
     /// hold no conn for". Held here so every mux that arrives later gets it.
-    unrouted_sink: Option<mpsc::Sender<[u8; 32]>>,
+    event_sink: Option<mpsc::Sender<MuxEvent>>,
     /// Multi-region DERP — the regional URL a force-pinned peer must use
     /// (server-pushed, identical on both ends). Entry present ONLY when the
     /// matching regional mux exists; pruned alongside `forced_derp_until`.
@@ -548,7 +548,7 @@ impl RelayCoordinator {
             roles: HashMap::new(),
             forced_derp_until: HashMap::new(),
             regional_muxes: HashMap::new(),
-            unrouted_sink: None,
+            event_sink: None,
             forced_urls: HashMap::new(),
             derp_regrade_at: HashMap::new(),
             derp_regrade_last: HashMap::new(),
@@ -726,7 +726,7 @@ impl RelayCoordinator {
             self.derp_mux = Some(mux);
         }
         if let Some(m) = self.derp_mux.as_ref() {
-            Self::arm_unrouted(&self.unrouted_sink, m);
+            Self::arm_event_sink(&self.event_sink, m);
         }
         // U1 — a mux registered: the sticky open-failure evidence is stale.
         self.derp_mux_failed = false;
@@ -760,11 +760,11 @@ impl RelayCoordinator {
     /// per URL wins (per-peer `DerpConn`s vend from the original).
     pub fn set_regional_mux(&mut self, url: &str, mux: Arc<DerpMux>) {
         let m = self.regional_muxes.entry(url.to_string()).or_insert(mux);
-        Self::arm_unrouted(&self.unrouted_sink, m);
+        Self::arm_event_sink(&self.event_sink, m);
     }
 
-    /// #27 — install the runtime's unroutable-inbound sink, and back-fill it
-    /// onto every mux already held. Idempotent; a rebuild re-points cleanly.
+    /// #27/#28 — install the runtime's [`MuxEvent`] sink, and back-fill it onto
+    /// every mux already held. Idempotent; a rebuild re-points cleanly.
     ///
     /// The coordinator owns this rather than the runtime reaching in, because
     /// muxes arrive through two doors at unpredictable times ([`set_derp_mux`]
@@ -774,19 +774,19 @@ impl RelayCoordinator {
     ///
     /// [`set_derp_mux`]: Self::set_derp_mux
     /// [`set_regional_mux`]: Self::set_regional_mux
-    pub fn set_unrouted_sink(&mut self, tx: mpsc::Sender<[u8; 32]>) {
-        self.unrouted_sink = Some(tx);
+    pub fn set_event_sink(&mut self, tx: mpsc::Sender<MuxEvent>) {
+        self.event_sink = Some(tx);
         if let Some(m) = self.derp_mux.as_ref() {
-            Self::arm_unrouted(&self.unrouted_sink, m);
+            Self::arm_event_sink(&self.event_sink, m);
         }
         for m in self.regional_muxes.values() {
-            Self::arm_unrouted(&self.unrouted_sink, m);
+            Self::arm_event_sink(&self.event_sink, m);
         }
     }
 
-    fn arm_unrouted(sink: &Option<mpsc::Sender<[u8; 32]>>, mux: &Arc<DerpMux>) {
+    fn arm_event_sink(sink: &Option<mpsc::Sender<MuxEvent>>, mux: &Arc<DerpMux>) {
         if let Some(tx) = sink {
-            mux.set_unrouted_sink(tx.clone());
+            mux.set_event_sink(tx.clone());
         }
     }
 
@@ -3733,6 +3733,48 @@ mod tests {
             "a derping peer IS excluded — the floor would duplicate its link"
         );
         coord.derping.remove(&node);
+    }
+
+    /// #27/#28 — the coordinator must arm the runtime's event sink on muxes
+    /// that arrive AFTER the sink does, and on regional muxes, not just the one
+    /// it was constructed with. A mux that never got the sink is a mux whose
+    /// black hole stays silent and whose recovery never wakes the walk — the
+    /// exact failures this seam exists to close, and easy to half-wire because
+    /// muxes enter through three different doors.
+    #[tokio::test]
+    async fn the_event_sink_reaches_muxes_that_arrive_later() {
+        let (ctl, _ctl_rx) = mpsc::channel::<ClientMsg>(8);
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        // Constructed with NO mux at all — the lazy-open shape.
+        let mut coord = RelayCoordinator::new(ctl, [0u8; 32], true, vec![], None);
+        coord.set_event_sink(tx);
+
+        // Door 1: the central mux, registered later.
+        let central = DerpMux::new([9u8; 32]).0;
+        coord.set_derp_mux(Arc::clone(&central));
+        let mut frame = [0xAAu8; 32].to_vec();
+        frame.push(1);
+        central.deliver(&frame);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MuxEvent::Unrouted([0xAA; 32])),
+            "a central mux registered after the sink must still report"
+        );
+        central.mark_down();
+        central.mark_up();
+        assert_eq!(rx.try_recv().ok(), Some(MuxEvent::Recovered));
+
+        // Door 2: a regional mux.
+        let regional = DerpMux::new([8u8; 32]).0;
+        coord.set_regional_mux("wss://derp.example/derp", Arc::clone(&regional));
+        let mut frame = [0xBBu8; 32].to_vec();
+        frame.push(1);
+        regional.deliver(&frame);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MuxEvent::Unrouted([0xBB; 32])),
+            "a regional mux must report on the SAME channel as the central one"
+        );
     }
 
     /// #27 — `follow_peer_to_derp` builds for a peer holding NO relay slot (the
