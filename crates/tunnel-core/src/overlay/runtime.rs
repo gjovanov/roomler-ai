@@ -1346,6 +1346,9 @@ fn build_overlay_view(
         srflx: None,
         warm_relay: None,
         direct_socks: Vec::new(),
+        // Set by `publish_view` from the live mux (the runtime holds the
+        // coordinator; this pure builder has no access to it).
+        derp_inbound_drops: None,
     }
 }
 
@@ -1618,6 +1621,15 @@ impl OverlayRuntime {
             } else {
                 wg.direct_sock_stats()
             };
+            // #32 — the `/derp` inbound-drop counters, so an operator can ask
+            // "is a peer relaying to us that we have not followed?" instead of
+            // inferring it from an absence of log lines. Process-global (see
+            // `evidence`), so no coordinator access is needed here.
+            view.derp_inbound_drops = Some((
+                crate::evidence::DERP_INBOUND_UNROUTED.load(std::sync::atomic::Ordering::Relaxed),
+                crate::evidence::DERP_INBOUND_BACKPRESSURE
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ));
             // send_replace never fails (unlike send) even if the receiver is
             // transiently absent, and keeps the value for the next borrow.
             tx.send_replace(view);
