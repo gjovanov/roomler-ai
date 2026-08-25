@@ -114,6 +114,41 @@ static DERP_FULL_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// hundreds of identical lines per dead pair per minute.
 static MISS_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
 static FULL_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
+
+/// R4 — tunnel-leg shaping. The `quic-derp-v1` tunnel flavor multiplexes
+/// QUIC over this relay, and unlike the WG floor traffic the plane was
+/// sized for, a tunnel can be an elephant flow (a git clone). Per
+/// (network, src) token bucket, applied ONLY to tunnel-class payloads
+/// (non-WG/non-disco first bytes — the same classifier both mux ends use);
+/// WG + disco frames are never shaped. ~3 Mbit/s sustained with a 1 MiB
+/// burst: the leg is a last resort whose job is "usable", not "fast", and
+/// a modest cap keeps the floor honest for every other tenant on the pod.
+static DERP_TUNNEL_SHAPED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TUNNEL_SHAPE_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap::new);
+static TUNNEL_BUCKETS: LazyLock<DashMap<DerpKey, std::sync::Mutex<(f64, Instant)>>> =
+    LazyLock::new(DashMap::new);
+const TUNNEL_RATE_BYTES_PER_SEC: f64 = 375_000.0; // ~3 Mbit/s sustained
+const TUNNEL_BURST_BYTES: f64 = 1_048_576.0; // 1 MiB burst
+
+/// Debit `len` bytes from the (network, src) tunnel bucket; `false` = over
+/// budget, drop the frame (QUIC retransmits under its congestion control,
+/// which converges onto the sustained rate).
+fn tunnel_budget_permits(network_id: ObjectId, src: &DerpPubKey, len: usize) -> bool {
+    let entry = TUNNEL_BUCKETS
+        .entry((network_id, *src))
+        .or_insert_with(|| std::sync::Mutex::new((TUNNEL_BURST_BYTES, Instant::now())));
+    let mut bucket = entry.lock().unwrap();
+    let now = Instant::now();
+    let refill = now.duration_since(bucket.1).as_secs_f64() * TUNNEL_RATE_BYTES_PER_SEC;
+    bucket.0 = (bucket.0 + refill).min(TUNNEL_BURST_BYTES);
+    bucket.1 = now;
+    if bucket.0 >= len as f64 {
+        bucket.0 -= len as f64;
+        true
+    } else {
+        false
+    }
+}
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// First 8 hex chars of a pubkey — enough to correlate registration,
@@ -464,6 +499,23 @@ fn forward_frame(
             dst = %pk8(&dst),
             "derp: dropped a frame the overlay ACL denies"
         );
+        return;
+    }
+
+    // R4 — shape tunnel-class payloads (see the bucket's doc); WG + disco
+    // frames pass untouched.
+    if !tunnel_core::transport::derp::payload_is_wg_or_disco(payload)
+        && !tunnel_budget_permits(network_id, src_pubkey, frame.len())
+    {
+        let total = DERP_TUNNEL_SHAPED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if drop_log_due(&TUNNEL_SHAPE_LOG_AT, (network_id, *src_pubkey)) {
+            info!(
+                %network_id,
+                src = %pk8(src_pubkey),
+                derp_tunnel_shaped_total = total,
+                "derp: tunnel-leg frame dropped by the rate shaper (over ~3 Mbit/s sustained)"
+            );
+        }
         return;
     }
 
