@@ -173,6 +173,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "R4 — tunnel quic-derp-v1 fallback: after repeated quick tunnel session deaths (a corp capture window killing fresh TURN/TLS legs), lead the next attempt with QUIC over the ESTABLISHED /derp WS. Client-side only. Built-in default: off.",
     ),
     (
+        "tunnel_peers_survive_reattach",
+        "tribool",
+        "R3 — keep established tunnel QUIC peers alive across a control-WS reattach instead of tearing them down on every transient WS drop, so a QUIC/derp data plane survives a corp-VPN control-WS blip. Needs the server-side grace. Agent (target) side. Built-in default: off.",
+    ),
+    (
         "overlay_mbb",
         "tribool",
         "Make-before-break overlay carrier upgrades. Built-in default: on.",
@@ -592,6 +597,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_derp_floor" => cfg.overlay_derp_floor.map(fmt_bool),
         "overlay_netcheck" => cfg.overlay_netcheck.map(fmt_bool),
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback.map(fmt_bool),
+        "tunnel_peers_survive_reattach" => cfg.tunnel_peers_survive_reattach.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter.map(fmt_bool),
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard.map(fmt_bool),
@@ -807,6 +813,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_derp_floor" => cfg.overlay_derp_floor = parse_tribool(value)?,
         "overlay_netcheck" => cfg.overlay_netcheck = parse_tribool(value)?,
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback = parse_tribool(value)?,
+        "tunnel_peers_survive_reattach" => {
+            cfg.tunnel_peers_survive_reattach = parse_tribool(value)?
+        }
         "overlay_mbb" => cfg.overlay_mbb = parse_tribool(value)?,
         "overlay_lan_iface_filter" => cfg.overlay_lan_iface_filter = parse_tribool(value)?,
         "overlay_wsl_mirrored_guard" => cfg.overlay_wsl_mirrored_guard = parse_tribool(value)?,
