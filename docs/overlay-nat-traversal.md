@@ -309,8 +309,19 @@ cascade's guarantees while replacing its reactive counters:
   DERP, one follow per peer per `DERP_FOLLOW_COOLDOWN`, and — unlike a server
   force-DERP escalation — **no TTL pin and no `roles` override**, so the pair
   re-upgrades normally once the network settles. Both `deliver` drop classes
-  now carry counters (`DerpMux::drop_counts`); they were silent, which is why
+  now carry counters (`DerpMux::drop_counts`, and `roomler status` prints a
+  `derp drops` line when either is non-zero); they were silent, which is why
   this cost a day of field time to find.
+  ⚠️ **A registration must not outlive the conn that consumes it (#32).** The
+  `src_pubkey → inbound` table was written and never cleaned, which is safe only
+  while a dropped `DerpConn` also closes its channel — and it does not if any
+  `Arc` clone survives the carrier being replaced. Then `try_send` returns **Ok**
+  and the frame lands in a queue nobody drains: a black hole one layer below the
+  one the signal closes, and invisible to it, because the signal only reports on
+  send FAILURE. Field 2026-08-25: a peer relayed to us with `initiate=true` for
+  18 s and the far end neither followed nor logged anything. `DerpConn` now
+  retires its own entry on drop — only if it is still the registered sender, so
+  a rebuild's newer registration is never unregistered.
 - **`/derp` recovery walks immediately (#28).** A VPN transition kills the
   `/derp` WS too, and every DERP build attempted while it is down is
   *withheld* — `try_build_derp` refuses over a dead WS, because a carrier born
