@@ -372,6 +372,29 @@ pub struct DatabaseSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct JwtSettings {
     pub secret: String,
+    /// Secrets that no longer SIGN anything but whose tokens are still
+    /// accepted — comma-separated, most-recent first.
+    ///
+    /// This is what makes rotating `secret` a rolling change instead of a flag
+    /// day. Without it, changing the secret invalidates every live token at
+    /// once, including every enrolled agent's **one-year** token — which means
+    /// the whole fleet re-enrolls by hand, which means in a real incident the
+    /// rotation gets deferred. A control nobody can afford to use is not a
+    /// control.
+    ///
+    /// Rotation: move the current value here, set `secret` to the new one,
+    /// deploy. Both verify; only the new one signs. Drop this once the longest
+    /// TTL still in flight has expired (an agent token: a year, unless they are
+    /// re-issued first).
+    ///
+    /// ⚠️ `String`, not `Vec<String>`, on purpose: this crate feeds
+    /// `Environment` sources straight into serde, and a scalar env var
+    /// deserialising into a sequence FAILS (`invalid type: string, expected a
+    /// sequence` — the same trap documented on `app.cors_origins` in
+    /// `scripts/e2e-k8s/overlay-template/configmap-roomler2-config.yaml`). A
+    /// `Vec` here could not be set by `ROOMLER__JWT__PREVIOUS_SECRETS` at all.
+    #[serde(default)]
+    pub previous_secrets: String,
     pub access_token_ttl_secs: u64,
     pub refresh_token_ttl_secs: u64,
     pub issuer: String,
@@ -536,6 +559,7 @@ impl Settings {
             // exposure on a leaked token for substantially better
             // session continuity. Refresh extended to 30 days so
             // the refresh > access invariant still holds.
+            .set_default("jwt.previous_secrets", "")?
             .set_default("jwt.access_token_ttl_secs", 604800)?
             .set_default("jwt.refresh_token_ttl_secs", 2_592_000)?
             .set_default("jwt.issuer", "roomler-ai")?
