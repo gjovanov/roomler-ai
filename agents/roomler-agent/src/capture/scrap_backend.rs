@@ -41,6 +41,12 @@ const INIT_RETRY_BACKOFF: Duration = Duration::from_millis(120);
 type CaptureReply = Result<Option<Frame>>;
 type CaptureCmd = oneshot::Sender<CaptureReply>;
 
+/// Packed `(width << 32) | height` for [`ScrapCapture::set_output_cap`].
+/// `0` means "no cap — deliver native".
+fn pack_dims(w: u32, h: u32) -> u64 {
+    ((w as u64) << 32) | (h as u64)
+}
+
 pub struct ScrapCapture {
     cmd_tx: std_mpsc::Sender<CaptureCmd>,
     width: u32,
@@ -48,6 +54,11 @@ pub struct ScrapCapture {
     monitor: u8,
     target_frame_period: Duration,
     last_frame_at: Option<Instant>,
+    /// Phase B — the encode box the pump wants, published to the capture
+    /// worker. An atomic rather than a new command variant deliberately: the
+    /// command channel is the per-frame hot path and a cap change is rare, so
+    /// this keeps the frame path byte-for-byte as it was.
+    desired: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ScrapCapture {
@@ -71,6 +82,9 @@ impl ScrapCapture {
         // init failure back to the caller synchronously.
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32)>>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
+        let desired = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(target_os = "macos")]
+        let desired_worker = desired.clone();
 
         thread::Builder::new()
             .name("roomler-agent-capture".into())
@@ -115,7 +129,8 @@ impl ScrapCapture {
                         Err(e) => break Err(anyhow!("creating scrap::Capturer: {e}")),
                     }
                 };
-                let (mut cap, w, h) = match init_outcome {
+                #[allow(unused_mut)]
+                let (mut cap, mut w, mut h) = match init_outcome {
                     Ok(v) => {
                         let _ = ready_tx.send(Ok((v.1, v.2)));
                         v
@@ -126,9 +141,57 @@ impl ScrapCapture {
                     }
                 };
                 let start = Instant::now();
+                #[cfg(target_os = "macos")]
+                let mut applied: u64 = 0;
 
                 // Wait for capture requests.
                 while let Ok(res_tx) = cmd_rx.recv() {
+                    // Phase B (macOS) — re-open the CGDisplayStream at the
+                    // encode box so CoreGraphics does the reduction on the GPU.
+                    // Capturing native and CPU-resampling to the same size cost
+                    // a measured 38 ms/frame against a 16.7 ms budget, which is
+                    // why a SMALLER requested picture used to be slower than
+                    // native. Rare event: only when the pump's cap changes.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let want = desired_worker.load(std::sync::atomic::Ordering::Relaxed);
+                        if want != applied {
+                            let (nw, nh) = ((want >> 32) as u32, (want & 0xFFFF_FFFF) as u32);
+                            let rebuilt = if want == 0 {
+                                Display::primary().ok().and_then(|d| Capturer::new(d).ok())
+                            } else {
+                                Display::primary()
+                                    .ok()
+                                    .and_then(|d| Capturer::new_sized(d, nw as usize, nh as usize).ok())
+                            };
+                            match rebuilt {
+                                Some(c) => {
+                                    w = c.width() as u32;
+                                    h = c.height() as u32;
+                                    cap = c;
+                                    applied = want;
+                                    tracing::info!(
+                                        width = w,
+                                        height = h,
+                                        "capture: re-opened the stream at the encode box (CoreGraphics scales; no CPU resample)"
+                                    );
+                                }
+                                None => {
+                                    // Keep the WORKING capturer rather than
+                                    // dropping the session: a refused resize
+                                    // costs the optimisation, not the stream.
+                                    // Mark it applied so we retry only on the
+                                    // next distinct request, not every frame.
+                                    applied = want;
+                                    tracing::warn!(
+                                        width = nw,
+                                        height = nh,
+                                        "capture: could not re-open at the requested size — keeping the current stream (CPU resample stays the fallback)"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let reply = capture_one_blocking(&mut cap, w, h, start, downscale);
                     let _ = res_tx.send(reply);
                 }
@@ -146,6 +209,7 @@ impl ScrapCapture {
             monitor: 0,
             target_frame_period: Duration::from_millis(1000 / target_fps.max(1) as u64),
             last_frame_at: None,
+            desired,
         })
     }
 
@@ -290,6 +354,31 @@ fn downscale_bgra_2x(src: &[u8], src_w: u32, src_h: u32, src_stride: u32) -> (Ve
 
 #[async_trait::async_trait]
 impl ScreenCapture for ScrapCapture {
+    /// Phase B — honour the pump's encode box by re-opening the capture
+    /// stream at that size, so CoreGraphics scales on the GPU instead of the
+    /// pump resampling on the CPU.
+    ///
+    /// macOS ONLY. `CGDisplayStreamCreateWithDispatchQueue` takes an
+    /// arbitrary output size; DXGI Desktop Duplication and XShm both hand
+    /// back the framebuffer as-is, so on those platforms this stays the
+    /// documented no-op and the pump's resample remains the truth.
+    ///
+    /// ⚠️ This is the fix for "a SMALLER picture is slower than native":
+    /// Lanczos-3 costs ≈24× the SOURCE area regardless of ratio, measured at
+    /// **38 ms/frame** from a 3024×1964 Retina panel against a 16.7 ms budget
+    /// at 60 fps. Native was fast only because 1:1 never resamples.
+    fn set_output_cap(&mut self, target: Option<(u32, u32)>) {
+        let packed = match target {
+            // Ignore a degenerate box rather than opening a zero-sized
+            // stream — that would be a black session, worse than the resample.
+            Some((w, h)) if w >= 2 && h >= 2 => pack_dims(w, h),
+            Some(_) => return,
+            None => 0,
+        };
+        self.desired
+            .store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
     async fn next_frame(&mut self) -> Result<Option<Frame>> {
         // FPS gate.
         if let Some(last) = self.last_frame_at {
@@ -321,6 +410,29 @@ impl ScreenCapture for ScrapCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The encode box crosses to the capture worker as a packed u64, so the
+    /// pack and the worker's unpack have to agree exactly — a mismatch would
+    /// re-open the stream at a garbage size, which is a black session rather
+    /// than a slow one. Mirrors the worker's `(want >> 32, want & 0xFFFF_FFFF)`.
+    #[test]
+    fn packed_dims_round_trip() {
+        for (w, h) in [
+            (1920u32, 1246u32),
+            (3024, 1964),
+            (2, 2),
+            (u32::MAX, u32::MAX),
+        ] {
+            let packed = pack_dims(w, h);
+            assert_eq!(
+                ((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32),
+                (w, h)
+            );
+        }
+        // 0 is reserved for "no cap — deliver native" and must be
+        // unreachable from any dimension the guard lets through (w,h >= 2).
+        assert_ne!(pack_dims(2, 2), 0);
+    }
 
     /// On a headless host there may be no $DISPLAY / X server, so we accept
     /// either a successful capture or a clean construction failure. We only
