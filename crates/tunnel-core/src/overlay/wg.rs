@@ -548,7 +548,7 @@ fn mono_ms_now() -> u64 {
 const RPF_LOG_THROTTLE_MS: u64 = 60_000;
 
 /// Short hex prefix of a WG public key, for logs.
-fn short_key(k: &[u8; 32]) -> String {
+pub(crate) fn short_key(k: &[u8; 32]) -> String {
     format!("{:02x}{:02x}{:02x}{:02x}", k[0], k[1], k[2], k[3])
 }
 
@@ -1961,13 +1961,23 @@ impl WgDevice {
     /// Phase 1 — set the subnet routes a peer is a router for, so packets to
     /// those CIDRs are encapsulated to it (longest-prefix after the host `/32`s).
     /// Replaces any previously-set subnets for the peer; empty clears them.
-    pub fn set_peer_subnets(&mut self, peer_public: [u8; 32], subnets: &[super::router::Cidr]) {
+    ///
+    /// Passes through [`set_subnets`](super::router::Router::set_subnets)'s
+    /// duplicate-claim report — CIDRs
+    /// another peer also claims. Callers must log it (never a silent drop):
+    /// the router keeps both claims and tie-breaks deterministically, but a
+    /// duplicate claim means one claimant's traffic is being RPF-denied.
+    pub fn set_peer_subnets(
+        &mut self,
+        peer_public: [u8; 32],
+        subnets: &[super::router::Cidr],
+    ) -> Vec<(super::router::Cidr, [u8; 32])> {
         self.send
             .0
             .write()
             .unwrap()
             .router
-            .set_subnets(peer_public, subnets);
+            .set_subnets(peer_public, subnets)
     }
 
     /// P5/S3b exit-node — route this node's GLOBAL IPv6 egress through `pubkey`
