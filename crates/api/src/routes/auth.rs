@@ -93,15 +93,20 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct RefreshRequest {
-    pub refresh_token: String,
+    /// Optional since the refresh cookie landed. A browser sends `{}` and lets
+    /// the `refresh_token` cookie carry the credential; older cached bundles
+    /// still put it here and keep working. Native/scripted callers may use
+    /// either.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 pub async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
-) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
+) -> Result<(StatusCode, HeaderMap, Json<RegisterResponse>), ApiError> {
     let password_hash = state.auth.hash_password(&body.password)?;
 
     let user = state
@@ -200,8 +205,31 @@ pub async fn register(
         let tokens = state
             .auth
             .generate_tokens(user_id, &user.email, &user.username)?;
+        // Auto-verified registration IS a login, so it must leave the same
+        // cookies behind as one. Without this the account is "signed in"
+        // according to the response body but carries no session cookie, which
+        // only worked because the SPA kept the token in localStorage.
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::SET_COOKIE,
+            format!(
+                "access_token={}; HttpOnly; Path=/; SameSite=Lax; Max-Age={}{}",
+                tokens.access_token,
+                tokens.expires_in,
+                secure_attr(&state)
+            )
+            .parse()
+            .unwrap(),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            refresh_cookie(&state, &tokens.refresh_token)
+                .parse()
+                .unwrap(),
+        );
         return Ok((
             StatusCode::CREATED,
+            headers,
             Json(RegisterResponse {
                 message: "Registration successful (auto-verified).".to_string(),
                 access_token: Some(tokens.access_token),
@@ -219,8 +247,11 @@ pub async fn register(
         ));
     }
 
+    // No tokens on this path (the account is not activated yet), so no
+    // cookies either — an empty header map, not an absent one.
     Ok((
         StatusCode::CREATED,
+        HeaderMap::new(),
         Json(RegisterResponse {
             message: "Registration successful. Please check your email to activate your account."
                 .to_string(),
@@ -289,7 +320,16 @@ pub async fn login(
         tokens.expires_in,
         secure_attr(&state)
     );
-    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    // ⚠️ APPEND, not insert. `HeaderMap::insert` REPLACES every existing value
+    // for the name, so a second `insert` of Set-Cookie would silently drop the
+    // access cookie and log the user straight back out.
+    headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.append(
+        header::SET_COOKIE,
+        refresh_cookie(&state, &tokens.refresh_token)
+            .parse()
+            .unwrap(),
+    );
 
     let response = AuthResponse {
         access_token: tokens.access_token,
@@ -338,13 +378,60 @@ fn secure_attr(state: &AppState) -> &'static str {
     }
 }
 
+/// The refresh cookie's name and the ONE path it is sent to.
+///
+/// A refresh token is the longest-lived browser credential there is — 30 days
+/// by default, and it re-mints access tokens, so stealing it is worth far more
+/// than stealing an access token. Scoping it to the exact endpoint that spends
+/// it keeps it off every other request.
+///
+/// ⚠️ `Path` is NOT a security boundary against script on the same origin —
+/// it is not a defence against XSS, and `HttpOnly` is what does that work
+/// here. What the narrow path buys is that the credential stops riding along
+/// on requests that have no use for it, which is where accidental logging,
+/// header echo and proxy mishandling live.
+const REFRESH_COOKIE: &str = "refresh_token";
+const REFRESH_COOKIE_PATH: &str = "/api/auth/refresh";
+
+/// `Set-Cookie` for the refresh token, scoped to the refresh endpoint.
+fn refresh_cookie(state: &AppState, token: &str) -> String {
+    format!(
+        "{}={}; HttpOnly; Path={}; SameSite=Lax; Max-Age={}{}",
+        REFRESH_COOKIE,
+        token,
+        REFRESH_COOKIE_PATH,
+        state.settings.jwt.refresh_token_ttl_secs,
+        secure_attr(state)
+    )
+}
+
+/// `Set-Cookie` that expires the refresh cookie. The attributes other than
+/// `Max-Age` must match the ones it was set with, or the browser keeps the
+/// original — a "logout" that leaves a 30-day credential in place.
+fn clear_refresh_cookie(state: &AppState) -> String {
+    format!(
+        "{}=; HttpOnly; Path={}; SameSite=Lax; Max-Age=0{}",
+        REFRESH_COOKIE,
+        REFRESH_COOKIE_PATH,
+        secure_attr(state)
+    )
+}
+
 pub async fn logout(State(state): State<AppState>) -> Result<HeaderMap, ApiError> {
     let mut headers = HeaderMap::new();
     let cookie = format!(
         "access_token=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0{}",
         secure_attr(&state)
     );
-    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+    // Clearing the refresh cookie is the load-bearing half: an access token
+    // expires on its own in days, a refresh token would keep re-minting them
+    // for a month. (Neither is REVOKED — the tokens stay valid if they were
+    // captured; see the stateless-session item. This ends the browser's copy.)
+    headers.append(
+        header::SET_COOKIE,
+        clear_refresh_cookie(&state).parse().unwrap(),
+    );
     Ok(headers)
 }
 
@@ -366,9 +453,17 @@ pub async fn me(
 
 pub async fn refresh(
     State(state): State<AppState>,
+    req_headers: HeaderMap,
     Json(body): Json<RefreshRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
-    let claims = state.auth.verify_refresh_token(&body.refresh_token)?;
+    // Cookie first, body as the compatibility path. Same ordering rule as the
+    // `/ws` work: the server has to accept the cookie BEFORE the UI stops
+    // putting the token in the body, because during a rolling deploy a browser
+    // can hit either pod.
+    let presented = crate::cookies::get(&req_headers, REFRESH_COOKIE)
+        .or_else(|| body.refresh_token.clone())
+        .ok_or_else(|| ApiError::Unauthorized("No refresh token in cookie or body".to_string()))?;
+    let claims = state.auth.verify_refresh_token(&presented)?;
 
     let user_id = bson::oid::ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("Invalid user ID".to_string()))?;
@@ -386,7 +481,16 @@ pub async fn refresh(
         tokens.expires_in,
         secure_attr(&state)
     );
-    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
+    // ⚠️ APPEND, not insert. `HeaderMap::insert` REPLACES every existing value
+    // for the name, so a second `insert` of Set-Cookie would silently drop the
+    // access cookie and log the user straight back out.
+    headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+    headers.append(
+        header::SET_COOKIE,
+        refresh_cookie(&state, &tokens.refresh_token)
+            .parse()
+            .unwrap(),
+    );
 
     let response = AuthResponse {
         access_token: tokens.access_token,
