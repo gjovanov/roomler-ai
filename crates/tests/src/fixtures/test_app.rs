@@ -409,6 +409,7 @@ fn test_settings() -> Settings {
         },
         jwt: roomler_ai_config::JwtSettings {
             secret: "test-secret-key-for-jwt-signing-minimum-32-chars".to_string(),
+            previous_secrets: String::new(),
             access_token_ttl_secs: 3600,
             refresh_token_ttl_secs: 604800,
             issuer: "roomler-ai".to_string(),

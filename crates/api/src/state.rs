@@ -255,6 +255,14 @@ pub struct AppState {
 impl AppState {
     pub async fn new(db: Database, settings: Settings) -> anyhow::Result<Self> {
         let auth = Arc::new(AuthService::new(settings.jwt.clone()));
+        // A secret rotation is otherwise invisible in the record. The correct
+        // shape is `verify_keys` going 1 → 2 while `signing_kid` changes; a new
+        // `signing_kid` with `verify_keys=1` is the flag-day mistake — every
+        // live token, including every agent's one-year token, just died.
+        {
+            let (signing_kid, verify_keys) = auth.key_summary();
+            tracing::info!(%signing_kid, verify_keys, "jwt: signing key");
+        }
         let users = Arc::new(UserDao::new(&db));
         let activation_codes = Arc::new(ActivationCodeDao::new(&db));
         let tenants = Arc::new(TenantDao::new(&db));

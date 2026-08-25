@@ -61,6 +61,7 @@ nesting), loaded via the `config` crate. The ones that matter first:
 |---|---|
 | `ROOMLER__DATABASE__URL` | MongoDB connection string |
 | `ROOMLER__JWT__SECRET` | **Must be set in production** — with `ROOMLER__APP__ENVIRONMENT=production` the server refuses to boot on the default |
+| `ROOMLER__JWT__PREVIOUS_SECRETS` | Comma-separated retired secrets that still **verify** but no longer sign. See [Rotating the JWT secret](#rotating-the-jwt-secret) |
 | `ROOMLER__APP__FRONTEND_URL` | Public origin (also the CORS default — unset `cors_origins` allows only this origin) |
 | `ROOMLER__APP__CORS_ORIGINS` | Explicit allow-list; `"*"` = deliberate permissive mode (warns) |
 | `ROOMLER__TURN__SHARED_SECRET` | coturn REST-auth secret (never committed) |
@@ -69,6 +70,45 @@ nesting), loaded via the `config` crate. The ones that matter first:
 
 Rate limiting (per-IP governor + per-account brute-force gate) and JWT TTLs are
 also settings — see `crates/config/src/settings.rs` for the full surface.
+
+### Rotating the JWT secret
+
+One secret signs six audiences (access, refresh, agent-enrollment, agent,
+tunnel-enrollment, tunnel-client). Changing it used to invalidate every live
+token at once — including every enrolled agent's **one-year** token, i.e. a
+fleet-wide re-enrollment by hand. `previous_secrets` makes it a rolling change:
+
+```bash
+# 1. Both verify; only the new one signs. Restart/roll the pods.
+ROOMLER__JWT__SECRET=<new>
+ROOMLER__JWT__PREVIOUS_SECRETS=<old>
+
+# 2. Wait out the longest TTL still in flight, or re-issue ahead of it:
+#    access 7 d · refresh 30 d · agent + tunnel-client 1 YEAR.
+#    Agent tokens are re-minted on re-enrollment; there is no bulk re-issue yet,
+#    so in practice step 3 waits a year unless you re-enroll.
+
+# 3. Drop the old key. Only now is the old secret actually powerless.
+ROOMLER__JWT__PREVIOUS_SECRETS=
+```
+
+Startup logs `jwt: signing key signing_kid=… verify_keys=N`. A correct rotation
+reads as **`verify_keys` 1 → 2 with a changed `signing_kid`**; a changed
+`signing_kid` with `verify_keys=1` is the flag day — every live token just died.
+
+⚠️ **This is not revocation.** Until step 3, tokens signed with the old secret
+are still accepted, so a *leaked* secret is not contained by step 1 alone. What
+rotation buys is that step 3 is reachable at all: an emergency cut-over can be
+staged (re-issue on the new key, then drop the old) instead of being one
+outage-shaped event.
+
+⚠️ Listing the default `change-me-in-production` in `previous_secrets` is
+refused under `ROOMLER__APP__ENVIRONMENT=production` — a retired secret forges
+exactly as well as a current one.
+
+⚠️ Tokens minted before `kid` shipped carry no key hint, so they are tried
+against every configured key. That is what lets a year-old agent token survive
+a rotation, and it is why the fallback is not an optimisation to remove.
 
 ## Health & probes
 
