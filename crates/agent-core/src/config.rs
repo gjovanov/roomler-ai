@@ -295,6 +295,13 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_NETCHECK`). Built-in default: on.
     #[serde(default)]
     pub overlay_netcheck: Option<bool>,
+    /// R4 — tunnel `quic-derp-v1` fallback: after repeated quick tunnel
+    /// session deaths (a corp capture window killing fresh TURN/TLS legs),
+    /// lead the next attempt with QUIC over the ESTABLISHED `/derp` WS
+    /// (`ROOMLER_NODE_TUNNEL_DERP_FALLBACK`). Built-in default: off while the
+    /// leg is field-proven. Client-side only (the flow supervisor reads it).
+    #[serde(default)]
+    pub tunnel_derp_fallback: Option<bool>,
     /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
     /// Built-in default: on.
     #[serde(default)]
@@ -1504,6 +1511,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_server_relay_strategy: None,
         overlay_derp_floor: None,
         overlay_netcheck: None,
+        tunnel_derp_fallback: None,
         overlay_mbb: None,
         overlay_lan_iface_filter: None,
         overlay_wsl_mirrored_guard: None,
@@ -1671,7 +1679,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 44] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 45] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
@@ -1688,6 +1696,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 44]
         ),
         ("OVERLAY_DERP_FLOOR", cfg.overlay_derp_floor),
         ("OVERLAY_NETCHECK", cfg.overlay_netcheck),
+        ("TUNNEL_DERP_FALLBACK", cfg.tunnel_derp_fallback),
         ("OVERLAY_MBB", cfg.overlay_mbb),
         ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
         ("OVERLAY_WSL_MIRRORED_GUARD", cfg.overlay_wsl_mirrored_guard),
