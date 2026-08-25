@@ -815,7 +815,7 @@ mod tests {
         assert_ne!(kid, kid_for(SECRET_B), "different secrets ⇒ different kids");
         assert_ne!(kid, SECRET_A, "the kid must not BE the secret");
         assert!(
-            !b.verify_agent_token(&t).is_ok(),
+            b.verify_agent_token(&t).is_err(),
             "a kid is not a credential"
         );
     }
