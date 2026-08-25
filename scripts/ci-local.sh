@@ -69,7 +69,15 @@ echo
 
 run "fmt"                cargo fmt --check --all
 run "clippy-workspace"   cargo clippy --workspace -- -D warnings
+# ci.yml runs this SECOND clippy pass because the workspace one above is
+# deliberately not `--all-targets` and therefore never compiles `#[cfg(test)]`
+# bodies. Mirrored here after a lint in a new unit test passed every local gate
+# and then failed in CI (#707) — a local script that cannot catch what CI
+# catches just sends you to CI to find out.
+run "clippy-server-crates" \
+  cargo clippy -p roomler-ai-api -p roomler-ai-services --all-targets -- -D warnings
 run "test-api-lib"       cargo test -p roomler-ai-api --lib
+run "test-services-lib"  cargo test -p roomler-ai-services --lib
 run "check-tests-crate"  cargo check -p roomler-ai-tests --all-targets
 
 if [ "$QUICK" = "0" ]; then

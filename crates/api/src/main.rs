@@ -40,6 +40,30 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // A RETIRED secret still verifies, so it forges exactly as well as the
+    // current one. Rotating away from the default while leaving it in
+    // `previous_secrets` would look like a fix and change nothing — the
+    // guard above has to cover both lists or it only covers the easy half.
+    if settings
+        .jwt
+        .previous_secrets
+        .split(',')
+        .map(str::trim)
+        .any(|s| s == "change-me-in-production")
+    {
+        if settings.app.environment == "production" {
+            anyhow::bail!(
+                "Refusing to start: app.environment=production but the built-in default \
+                 secret is listed in ROOMLER__JWT__PREVIOUS_SECRETS — tokens signed with \
+                 it are still accepted, so this is not a rotation."
+            );
+        }
+        error!(
+            "The built-in default secret is listed in ROOMLER__JWT__PREVIOUS_SECRETS — \
+             tokens signed with it are still accepted."
+        );
+    }
+
     // Stripe half-configuration is a silent checkout-killer: with a secret
     // key but empty price ids, every valid-plan checkout errors (prod hit
     // exactly this — empty ROOMLER__STRIPE__PRICE_PRO/BUSINESS in the
