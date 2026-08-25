@@ -4,7 +4,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Roomler AI** is a real-time collaboration platform with chat, video conferencing, file sharing, room management, and a TeamViewer-style remote desktop subsystem. Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU) + webrtc-rs (P2P remote-control). The remote-control subsystem ships as a separate native agent binary (`roomler-agent`) that runs on controlled hosts — see `docs/remote-control.md`.
+**Roomler AI** is three products on one daemon. `docs/README.md` has been
+organised this way since #490; this file now matches it, because the networking
+pillar owns `tunnel-core`, `derp-relay`, `localapi` and the large majority of
+recent commits while having had no top-level identity here at all.
+
+| # | Pillar | What it is | Start here |
+|---|---|---|---|
+| 1 | **Remote desktop** | TeamViewer-class remote control, in Rust | `docs/remote-control.md` |
+| 2 | **Networking** | a WireGuard overlay mesh (Tailscale-class) **+** userspace tunnels (ngrok-class), DERP relays, and roomler SSH | `docs/overlay-communication.md`, `docs/tunnels.md` |
+| 3 | **Collaboration** | chat · video conferencing · file sharing · rooms | this file's route/model sections |
+
+Two invariants that were previously implicit and are load-bearing in both
+directions:
+
+- **One daemon per enrolled machine.** `roomlerd` *is* the remote-desktop
+  target, the tunnel exit, the tunnel client, the overlay node and the SSH
+  server — not four cooperating services. This is why a "just add another
+  install" answer is almost always wrong (fixed TUN name + GUID, a singleton
+  LocalAPI pipe, host-global exit/DNS/WFP state, one updater — `docs/multi-org.md`).
+- **The server coordinates but never carries plaintext.** Pixels, keystrokes,
+  SSH bytes and tunnel payloads travel P2P or over a relay that only ever sees
+  ciphertext. Any design that would make the control plane a data path is
+  wrong on those grounds alone, not merely on performance grounds.
+
+Stack: Rust (Axum) + MongoDB + Vue 3/Vuetify 3 + Pinia + Mediasoup (WebRTC SFU)
++ webrtc-rs (P2P remote-control) + WireGuard/smoltcp (overlay). The agent ships
+as a separate native binary (`roomler-agent`, installed as `roomlerd`) that runs
+on controlled hosts.
 
 ## Commands
 
