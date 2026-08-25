@@ -146,6 +146,18 @@ pub async fn oauth_callback(
 
     let mut headers = HeaderMap::new();
     headers.append(header::SET_COOKIE, cookie.parse().unwrap());
+    // An OAuth sign-in never got a refresh credential at all: the callback
+    // redirect can only carry ONE value in the fragment, so the refresh token
+    // was minted and thrown away, and the session simply died after the access
+    // token's 7 days. A cookie has no such limit — so OAuth users get the same
+    // 30-day renewable session as password users, and get it without anything
+    // being written where script can read it.
+    headers.append(
+        header::SET_COOKIE,
+        crate::routes::auth::refresh_cookie(&state, &tokens.refresh_token)
+            .parse()
+            .unwrap(),
+    );
     headers.append(header::SET_COOKIE, clear_state.parse().unwrap());
     headers.insert(header::LOCATION, redirect_url.parse().unwrap());
 

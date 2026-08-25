@@ -41,18 +41,20 @@ describe('api client', () => {
     }
   }
 
-  describe('auth token injection', () => {
-    it('should include Authorization header when token exists', async () => {
-      localStorage.setItem('access_token', 'my-token')
+  describe('auth: the cookie carries the session, not a header', () => {
+    it('sends NO Authorization header, even with a stale token in localStorage', async () => {
+      // The client no longer reads a token at all. `BASE_URL` is `/api`, so
+      // every call is same-origin and the browser attaches the HttpOnly
+      // session cookie itself — which the server has always accepted.
+      // A leftover token from an older version must not resurrect the header.
+      localStorage.setItem('access_token', 'stale-token-from-an-old-version')
       mockFetch.mockResolvedValueOnce(mockJsonResponse(200, { ok: true }))
 
       await api.get('/test')
 
-      expect(mockFetch).toHaveBeenCalledWith('/api/test', expect.objectContaining({
-        headers: expect.objectContaining({
-          Authorization: 'Bearer my-token',
-        }),
-      }))
+      const [, init] = mockFetch.mock.calls[0]
+      const headers = (init as { headers: Record<string, string> }).headers
+      expect(headers.Authorization).toBeUndefined()
     })
 
     it('should not include Authorization header when no token', async () => {
@@ -152,12 +154,12 @@ describe('api client', () => {
     })
 
     it('should redirect to login on 401 for non-auth paths', async () => {
-      localStorage.setItem('access_token', 'old-token')
+      localStorage.setItem('roomler-signed-in', '1')
       mockFetch.mockResolvedValueOnce(mockJsonResponse(401, {}, false))
 
       await expect(api.get('/tenant/123/room')).rejects.toThrow()
 
-      expect(localStorage.getItem('access_token')).toBeNull()
+      expect(localStorage.getItem('roomler-signed-in')).toBeNull()
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
 
@@ -165,12 +167,12 @@ describe('api client', () => {
       // The navigation case the logout exists for: membership revoked or the
       // tenant switched underneath, so every read 403s and the UI would
       // otherwise sit there broken.
-      localStorage.setItem('access_token', 'old-token')
+      localStorage.setItem('roomler-signed-in', '1')
       mockFetch.mockResolvedValueOnce(mockJsonResponse(403, {}, false))
 
       await expect(api.get('/tenant/123/room')).rejects.toThrow()
 
-      expect(localStorage.getItem('access_token')).toBeNull()
+      expect(localStorage.getItem('roomler-signed-in')).toBeNull()
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
 
@@ -181,7 +183,7 @@ describe('api client', () => {
     it.each(['post', 'put', 'delete'] as const)(
       'should NOT log out or redirect on a 403 %s',
       async (verb) => {
-        localStorage.setItem('access_token', 'still-valid')
+        localStorage.setItem('roomler-signed-in', '1')
         mockFetch.mockResolvedValueOnce(
           mockJsonResponse(
             403,
@@ -197,7 +199,7 @@ describe('api client', () => {
           'Cannot grant permissions you do not hold: EXEC_DEVICE',
         )
 
-        expect(localStorage.getItem('access_token')).toBe('still-valid')
+        expect(localStorage.getItem('roomler-signed-in')).toBe('1')
         expect(mockRouter.push).not.toHaveBeenCalled()
       },
     )
@@ -223,12 +225,12 @@ describe('api client', () => {
     // session was being logged out and bounced to a login page that was
     // itself throttled.
     it('should NOT log out or redirect on 429', async () => {
-      localStorage.setItem('access_token', 'still-valid')
+      localStorage.setItem('roomler-signed-in', '1')
       mockFetch.mockResolvedValueOnce(mockJsonResponse(429, {}, false))
 
       await expect(api.get('/tenant/123/room')).rejects.toThrow()
 
-      expect(localStorage.getItem('access_token')).toBe('still-valid')
+      expect(localStorage.getItem('roomler-signed-in')).toBe('1')
       expect(mockRouter.push).not.toHaveBeenCalled()
     })
 
@@ -262,31 +264,28 @@ describe('api client', () => {
     // A throttled refresh says nothing about session validity, so the
     // session must survive it — otherwise being rate limited logs you out.
     it('should keep the session when the token refresh is throttled', async () => {
-      localStorage.setItem('access_token', 'expired-token')
-      localStorage.setItem('refresh_token', 'refresh-token')
+      localStorage.setItem('roomler-signed-in', '1')
       mockFetch
         .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // original request
         .mockResolvedValueOnce(mockJsonResponse(429, {}, false)) // refresh throttled
 
       await expect(api.get('/tenant/123/room')).rejects.toThrow()
 
-      expect(localStorage.getItem('access_token')).toBe('expired-token')
-      expect(localStorage.getItem('refresh_token')).toBe('refresh-token')
+      expect(localStorage.getItem('roomler-signed-in')).toBe('1')
       expect(mockRouter.push).not.toHaveBeenCalled()
     })
 
     // ...but a genuine rejection still logs out, so the fix above doesn't
     // strand a dead session.
     it('should still log out when the token refresh is rejected', async () => {
-      localStorage.setItem('access_token', 'expired-token')
-      localStorage.setItem('refresh_token', 'refresh-token')
+      localStorage.setItem('roomler-signed-in', '1')
       mockFetch
         .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // original request
         .mockResolvedValueOnce(mockJsonResponse(401, {}, false)) // refresh rejected
 
       await expect(api.get('/tenant/123/room')).rejects.toThrow()
 
-      expect(localStorage.getItem('access_token')).toBeNull()
+      expect(localStorage.getItem('roomler-signed-in')).toBeNull()
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
 

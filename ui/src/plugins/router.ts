@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
+import { looksSignedIn } from '@/api/session'
 
 const routes: RouteRecordRaw[] = [
   {
@@ -215,8 +216,12 @@ const router = createRouter({
 })
 
 router.beforeEach((to, _from, next) => {
-  const token = localStorage.getItem('access_token')
-  if (to.meta.auth && !token) {
+  // A HINT, not a credential — the session is an HttpOnly cookie this code
+  // cannot read. Guarding on it only decides which screen to render; every
+  // request is still authorised by the server, and a stale hint just means the
+  // first API call 401s and bounces back here.
+  const signedIn = looksSignedIn()
+  if (to.meta.auth && !signedIn) {
     if (to.fullPath === '/' || to.fullPath === '') {
       // Bare root: first-visit marketing page, nothing to return to.
       next({ name: 'landing' })
@@ -228,7 +233,7 @@ router.beforeEach((to, _from, next) => {
       sessionStorage.setItem('pending_redirect', to.fullPath)
       next({ name: 'login' })
     }
-  } else if (to.meta.guest && token) {
+  } else if (to.meta.guest && signedIn) {
     // After login/register, check for pending invite
     const pendingInvite = sessionStorage.getItem('pending_invite_code')
     const pendingRedirect = sessionStorage.getItem('pending_redirect')

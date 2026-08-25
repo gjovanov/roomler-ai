@@ -7,9 +7,9 @@ export function useWebSocket() {
   const ws = useWsStore()
 
   watch(
-    () => auth.token,
-    (token) => {
-      if (token) {
+    () => auth.isAuthenticated,
+    (signedIn) => {
+      if (signedIn) {
         ws.connect()
       } else {
         ws.disconnect()

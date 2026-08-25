@@ -394,7 +394,7 @@ const REFRESH_COOKIE: &str = "refresh_token";
 const REFRESH_COOKIE_PATH: &str = "/api/auth/refresh";
 
 /// `Set-Cookie` for the refresh token, scoped to the refresh endpoint.
-fn refresh_cookie(state: &AppState, token: &str) -> String {
+pub(crate) fn refresh_cookie(state: &AppState, token: &str) -> String {
     format!(
         "{}={}; HttpOnly; Path={}; SameSite=Lax; Max-Age={}{}",
         REFRESH_COOKIE,
