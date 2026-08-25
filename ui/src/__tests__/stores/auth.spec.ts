@@ -30,6 +30,11 @@ import { subscribePush, unsubscribePush } from '@/composables/usePush'
 const mockApi = vi.mocked(api)
 const mockRouter = vi.mocked(router)
 
+/** The non-credential hint the store uses to render before `/auth/me`. */
+const SIGNED_IN = 'roomler-signed-in'
+
+const USER = { id: '1', email: 'test@test.com', username: 'testuser', display_name: 'Test' }
+
 describe('useAuthStore', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
@@ -46,18 +51,25 @@ describe('useAuthStore', () => {
       expect(store.error).toBeNull()
     })
 
-    it('should pick up token from localStorage on creation', () => {
-      localStorage.setItem('access_token', 'existing-token')
+    it('should pick up the signed-in HINT from localStorage on creation', () => {
+      // A hint, not a credential: it renders the app shell instead of the
+      // login form on a hard refresh. The session itself is an HttpOnly
+      // cookie this code cannot read, and the server decides.
+      localStorage.setItem(SIGNED_IN, '1')
       const store = useAuthStore()
-      expect(store.token).toBe('existing-token')
       expect(store.isAuthenticated).toBe(true)
     })
   })
 
   describe('login', () => {
-    it('should store tokens in localStorage and set user', async () => {
-      const mockUser = { id: '1', email: 'test@test.com', username: 'testuser', display_name: 'Test' }
-      mockApi.post.mockResolvedValueOnce({ access_token: 'new-token', user: mockUser })
+    it('signs in WITHOUT putting any token in localStorage', async () => {
+      // The point of the whole change. The session arrived as a Set-Cookie on
+      // this same response; anything stored here is readable by an XSS.
+      mockApi.post.mockResolvedValueOnce({
+        access_token: 'server-still-returns-this',
+        refresh_token: 'and-this',
+        user: USER,
+      })
 
       const store = useAuthStore()
       await store.login('testuser', 'password123')
@@ -66,72 +78,64 @@ describe('useAuthStore', () => {
         username: 'testuser',
         password: 'password123',
       })
-      expect(store.token).toBe('new-token')
-      expect(store.user).toEqual(mockUser)
-      expect(localStorage.getItem('access_token')).toBe('new-token')
+      expect(store.user).toEqual(USER)
       expect(store.isAuthenticated).toBe(true)
       expect(subscribePush).toHaveBeenCalled()
+
+      expect(localStorage.getItem('access_token')).toBeNull()
+      expect(localStorage.getItem('refresh_token')).toBeNull()
+      expect(localStorage.getItem(SIGNED_IN)).toBe('1')
     })
 
-    it('should set loading to true during login and false after', async () => {
-      mockApi.post.mockResolvedValueOnce({ access_token: 'tok', user: { id: '1', email: '', username: '', display_name: '' } })
-
-      const store = useAuthStore()
-      const promise = store.login('u', 'p')
-      // loading is set synchronously before the await
-      expect(store.loading).toBe(true)
-      await promise
-      expect(store.loading).toBe(false)
-    })
-
-    it('should set error and rethrow on login failure', async () => {
+    it('surfaces the error and stays signed out on failure', async () => {
       mockApi.post.mockRejectedValueOnce(new Error('Invalid credentials'))
-
       const store = useAuthStore()
-      await expect(store.login('u', 'p')).rejects.toThrow('Invalid credentials')
+      await expect(store.login('u', 'bad')).rejects.toThrow('Invalid credentials')
       expect(store.error).toBe('Invalid credentials')
-      expect(store.loading).toBe(false)
-      expect(store.user).toBeNull()
+      expect(store.isAuthenticated).toBe(false)
+      expect(localStorage.getItem(SIGNED_IN)).toBeNull()
     })
   })
 
   describe('logout', () => {
-    it('should clear tokens, user, localStorage and redirect to login', async () => {
-      // Set up authenticated state
-      mockApi.post.mockResolvedValueOnce({
-        access_token: 'tok',
-        user: { id: '1', email: 'a@b.c', username: 'u', display_name: 'U' },
-      })
+    it('ASKS THE SERVER to end the session, then clears locally', async () => {
+      // ⚠️ The POST is the load-bearing part and it used to be missing: the
+      // old logout cleared localStorage and navigated, which only looked like
+      // a logout because the SPA then had no token to send. The session COOKIE
+      // survived and the server accepted it for its full 7 days.
+      mockApi.post.mockResolvedValueOnce({ access_token: 'tok', user: USER })
       const store = useAuthStore()
       await store.login('u', 'p')
 
-      store.logout()
+      mockApi.post.mockResolvedValueOnce({})
+      await store.logout()
 
-      expect(store.token).toBeNull()
+      expect(mockApi.post).toHaveBeenCalledWith('/auth/logout', {})
       expect(store.user).toBeNull()
-      expect(localStorage.getItem('access_token')).toBeNull()
       expect(store.isAuthenticated).toBe(false)
+      expect(localStorage.getItem(SIGNED_IN)).toBeNull()
       expect(unsubscribePush).toHaveBeenCalled()
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
-  })
 
-  describe('isAuthenticated', () => {
-    it('should return true when token is set', () => {
-      localStorage.setItem('access_token', 'some-token')
+    it('still clears locally when the server call fails', async () => {
+      // Offline or server down: do not trap the user inside a session they
+      // asked to leave.
+      localStorage.setItem(SIGNED_IN, '1')
       const store = useAuthStore()
-      expect(store.isAuthenticated).toBe(true)
-    })
+      mockApi.post.mockRejectedValueOnce(new Error('network'))
 
-    it('should return false when token is null', () => {
-      const store = useAuthStore()
+      await store.logout()
+
       expect(store.isAuthenticated).toBe(false)
+      expect(localStorage.getItem(SIGNED_IN)).toBeNull()
+      expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
   })
 
   describe('fetchMe', () => {
     it('should fetch user from API and set user', async () => {
-      localStorage.setItem('access_token', 'tok')
+      localStorage.setItem(SIGNED_IN, '1')
       const mockUser = { id: '2', email: 'me@test.com', username: 'me', display_name: 'Me' }
       mockApi.get.mockResolvedValueOnce(mockUser)
 
@@ -143,27 +147,30 @@ describe('useAuthStore', () => {
       expect(subscribePush).toHaveBeenCalled()
     })
 
-    it('should not call API if no token exists', async () => {
+    it('should not call the API when this browser has no session hint', async () => {
       const store = useAuthStore()
       await store.fetchMe()
       expect(mockApi.get).not.toHaveBeenCalled()
     })
 
-    it('should call logout on fetchMe failure', async () => {
-      localStorage.setItem('access_token', 'expired-tok')
+    it('logs out when the server disagrees with the hint', async () => {
+      // The hint is only a hint. The server is the authority, and a stale hint
+      // must not leave the app rendering a signed-in shell.
+      localStorage.setItem(SIGNED_IN, '1')
       mockApi.get.mockRejectedValueOnce(new Error('Unauthorized'))
+      mockApi.post.mockResolvedValueOnce({})
 
       const store = useAuthStore()
       await store.fetchMe()
 
-      expect(store.token).toBeNull()
       expect(store.user).toBeNull()
+      expect(store.isAuthenticated).toBe(false)
       expect(mockRouter.push).toHaveBeenCalledWith({ name: 'login' })
     })
   })
 
   describe('register', () => {
-    it('should register user, store token, and set user', async () => {
+    it('signs in on the auto-verified path without storing a token', async () => {
       const mockUser = { id: '3', email: 'new@test.com', username: 'newuser', display_name: 'New' }
       mockApi.post.mockResolvedValueOnce({ access_token: 'reg-token', user: mockUser })
 
@@ -176,10 +183,24 @@ describe('useAuthStore', () => {
         password: 'pass',
         display_name: 'New',
       })
-      expect(store.token).toBe('reg-token')
       expect(store.user).toEqual(mockUser)
-      expect(localStorage.getItem('access_token')).toBe('reg-token')
+      expect(store.isAuthenticated).toBe(true)
+      expect(localStorage.getItem('access_token')).toBeNull()
       expect(result).toEqual({ access_token: 'reg-token', user: mockUser })
+    })
+
+    it('does NOT sign in when registration needs email activation', async () => {
+      // Production returns `{ message }` only — the account exists but is not
+      // usable yet, so claiming a session would render an app shell whose
+      // every request 401s.
+      mockApi.post.mockResolvedValueOnce({ message: 'check your email' })
+
+      const store = useAuthStore()
+      await store.register('new@test.com', 'newuser', 'pass', 'New')
+
+      expect(store.isAuthenticated).toBe(false)
+      expect(store.user).toBeNull()
+      expect(localStorage.getItem(SIGNED_IN)).toBeNull()
     })
 
     it('should include invite_code when provided', async () => {
