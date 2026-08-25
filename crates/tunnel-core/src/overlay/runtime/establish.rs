@@ -364,11 +364,23 @@ impl OverlayRuntime {
                     .is_some_and(|&until| until > now),
                 poke,
             });
-            // Diagnostic — per-direct-carrier health/poke trace (see
+            // Diagnostic — per-carrier health/poke trace (see
             // `OVERLAY_SESSION_TRACE`). Shows why a uni-directional carrier
             // isn't being revalidated: proof_age vs POKE_PROOF, rx silence,
             // whether a poke is stuck pending, and the tick's death verdict.
-            if crate::overlay::direct::session_trace_enabled() && e.is_direct {
+            //
+            // Covers RELAY carriers too. It was `&& e.is_direct` until
+            // 2026-08-25, which made the one place this trace is most needed
+            // the one place it could not fire: a VPN transition kills the
+            // REMOTE end's relay carrier, and that end sees nothing at all for
+            // the ~15 s (`BAD_SWEEPS_TO_FALLBACK` × the 5 s tick) it spends
+            // accumulating one-way strikes — then emits a single conviction
+            // line. Reading a real capture of that window, the strike
+            // accumulation was simply invisible, so "was the carrier silent,
+            // or was rx advancing on a carrier we weren't sending on?" could
+            // not be answered from the log at all. It is off by default, so
+            // widening it costs nothing until a lab run asks for it.
+            if crate::overlay::direct::session_trace_enabled() {
                 let proof_age = wg
                     .peer_initiator_hs_age(&e.pubkey)
                     .map_or(e.since.elapsed(), |a| a.min(e.since.elapsed()));
@@ -376,6 +388,13 @@ impl OverlayRuntime {
                     peer = %nid,
                     overlay_ip = %e.overlay_ip,
                     tier = ?e.tier,
+                    // Which plane this line is about. Without these two a
+                    // relay line and a direct line are indistinguishable, and
+                    // the poke/proof fields below mean different things on
+                    // each — `tier` alone does not say it (`Relay` is a tier,
+                    // but a DERP carrier and a TURN one are both `Relay`).
+                    is_direct = e.is_direct,
+                    relay_kind = ?e.relay_kind,
                     hs_done = handshake_done,
                     since_rx_s = since_last_rx.as_secs(),
                     proof_age_s = proof_age.as_secs(),
