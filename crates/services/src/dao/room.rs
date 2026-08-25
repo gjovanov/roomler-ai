@@ -3,6 +3,7 @@ use mongodb::Database;
 use rand::Rng;
 use roomler_ai_db::models::{
     ConferenceSettings, MediaSettings, ParticipantRole, ParticipantSession, Room, RoomMember,
+    RoomVisibility,
 };
 
 use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
@@ -77,6 +78,10 @@ impl RoomDao {
             icon: None,
             position: 0,
             is_open,
+            // New rooms are Public: the room-level control is opt-IN, and a
+            // room nobody has joined yet that defaulted to members-only would
+            // be unreachable by everyone including its creator.
+            visibility: RoomVisibility::Public,
             is_archived: false,
             is_read_only: false,
             is_default: false,
@@ -156,6 +161,7 @@ impl RoomDao {
         is_open: Option<bool>,
         is_archived: Option<bool>,
         is_read_only: Option<bool>,
+        visibility: Option<RoomVisibility>,
     ) -> DaoResult<bool> {
         let mut set_doc = doc! {};
 
@@ -176,6 +182,13 @@ impl RoomDao {
         }
         if let Some(is_read_only) = is_read_only {
             set_doc.insert("is_read_only", is_read_only);
+        }
+        if let Some(visibility) = visibility {
+            // Serialised through bson so the stored value matches what
+            // `RoomVisibility`'s Deserialize expects — a hand-written string
+            // here is the "hand-built doc silently drops/renames a field"
+            // class, and this one decides who can read the room.
+            set_doc.insert("visibility", bson::to_bson(&visibility)?);
         }
 
         if set_doc.is_empty() {
@@ -262,6 +275,12 @@ impl RoomDao {
                     "tenant_id": tenant_id,
                     "deleted_at": null,
                     "is_open": true,
+                    // Explore is for finding rooms you are NOT in, so a Secret
+                    // room is excluded outright rather than per-caller: its
+                    // existence is the thing being kept, and a member already
+                    // reaches it from the sidebar. `$ne` also covers documents
+                    // predating the field, which have no `visibility` at all.
+                    "visibility": { "$ne": "secret" },
                     "$or": [
                         { "name": { "$regex": &escaped, "$options": "i" } },
                         { "purpose": { "$regex": &escaped, "$options": "i" } },
@@ -384,6 +403,31 @@ impl RoomDao {
                 params,
             )
             .await
+    }
+
+    /// Does this user hold a membership row in this room?
+    ///
+    /// The authorization primitive behind `RoomVisibility::Private`/`Secret`.
+    /// Scoped by tenant as well as room: the room id alone is a client-supplied
+    /// value, and every other read on this data plane is tenant-scoped since
+    /// the cross-tenant fix — a membership check that was not would be the one
+    /// place a foreign id still meant something.
+    pub async fn is_member(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        user_id: ObjectId,
+    ) -> DaoResult<bool> {
+        let found = self
+            .members
+            .collection()
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "room_id": room_id,
+                "user_id": user_id,
+            })
+            .await?;
+        Ok(found.is_some())
     }
 
     pub async fn find_member_user_ids(&self, room_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
