@@ -1,96 +1,80 @@
 name: seed-cache-save
 description: >-
-  Prune + save the cargo seed under this Cargo.lock's unique key (must
-  mirror seed-cache-restore's path list + key exactly). Because the key is
-  unique per lockfile, saves ALWAYS land — GitHub cache immutability never
-  blocks a refresh, so no delete steps and no absent-key window exist
-  anywhere. A same-lockfile twin rehearsal loses the save reservation
-  race and warns ("cache already exists") — harmless, the winner's
-  content is equivalent. After saving, this action retires its OWN
-  family's superseded generations (keeps ONLY the newest on this ref: at current sizes (~950 MB avg) even two generations per family total ~9.5 GB and re-evict the CI lane; a partial newest from a failed rehearsal is replaced within one release cycle by the next reseed) —
-  self-cleaning at the production site. The 2026-08-18 lesson: relying
-  on cache-janitor's 96 h idle sweep let generations pile to 9.5 GB of
-  the 10 GB pool within a day of releases, and GitHub's LRU evicted the
-  CI lane's cargo caches instead (run 32198738776 went cold). Requires
-  the CALLING step to pass `env: GH_TOKEN` (and the workflow to hold
-  `actions: write`); retirement soft-skips if the token is absent.
+  Prune + publish the cargo seed as RELEASE ASSETS on the rolling
+  `seed-cache` release (two per family: <fam>-cargo.tar.zst +
+  <fam>-target.tar.zst; must mirror seed-cache-restore's layout).
+  Deliberately OUTSIDE GitHub's 10 GB Actions-cache pool — see
+  seed-cache-restore's header for the 13-incident history that ended
+  there. `--clobber` IS the retention policy (exactly keep-newest-1);
+  there are no reservations to race or wedge, no LRU to displace, no
+  budget to blow. The calling step must pass `env: GH_TOKEN`
+  (publication soft-skips without it) and the workflow needs
+  `contents: write` (release-agent.yml has it).
 inputs:
   shared-key:
-    description: Cache family name (must match the restore call)
+    description: Seed family name (must match the restore call)
     required: true
 runs:
   using: composite
   steps:
-    - name: Prune before save
+    - name: Prune before publish
       shell: bash
       run: |
         # rust-cache-style trim: registry sources + git checkouts re-extract
         # cheaply from the cached index/db; incremental dirs are rebuilt
-        # every run anyway.
+        # every run anyway. (Accretion GC lives in seed-cache-restore,
+        # BEFORE the build, so what we publish here is complete AND lean.)
         rm -rf ~/.cargo/registry/src ~/.cargo/git/checkouts 2>/dev/null || true
         rm -rf target/release/incremental target/debug 2>/dev/null || true
-        # (Accretion GC lives in seed-cache-restore, deliberately BEFORE
-        # the build: the run then rebuilds whatever the GC removed, so the
-        # generation saved here is complete AND lean. GC'ing here instead
-        # would save generations with holes that tag builds pay to refill.)
         du -sh target ~/.cargo 2>/dev/null || true
 
-    - uses: actions/cache/save@v4
-      with:
-        path: |
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/git/db
-          ~/.cargo/bin
-          target
-        # Run-salted: unique key per run, so a save can NEVER lose a
-        # reservation race or hit a reservation wedged by a rehearsal that
-        # was cancelled mid-upload (2026-08-24: one such wedge made every
-        # later green rehearsal silently skip its Windows save — no
-        # generation persisted and rc.460 built near-cold). The retirement
-        # step below prunes salted siblings down to the newest.
-        key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-r${{ github.run_id }}
-
-    - name: Verify the save landed (surface silent failures)
-      shell: bash
-      run: |
-        # actions/cache/save treats "Unable to reserve …" as a soft warning
-        # and stays green — which is how the 2026-08-24 wedge went unseen
-        # while every rehearsal silently stopped persisting generations and
-        # rc.460 built near-cold behind green runs. Ask the API whether the
-        # exact salted key actually exists on this ref; if not, put a
-        # warning ON THE RUN PAGE instead of leaving it to log archaeology.
-        # Soft-skips without GH_TOKEN (the calling step passes it).
-        if [ -z "${GH_TOKEN:-}" ]; then
-          echo "GH_TOKEN not provided — skipping save verification"
-          exit 0
-        fi
-        key="seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-r${{ github.run_id }}"
-        found="$(gh api "repos/${GITHUB_REPOSITORY}/actions/caches?key=${key}&ref=${GITHUB_REF}" --jq '.total_count' 2>/dev/null || echo 0)"
-        if [ "${found:-0}" -ge 1 ]; then
-          echo "save verified: ${key}"
-        else
-          echo "::warning title=Seed save did not land::'${key}' is absent on ${GITHUB_REF} after the save step — the cargo seed for family '${{ inputs.shared-key }}' was NOT refreshed by this run (aborted upload, API error, or instant eviction from an over-budget pool). Tag builds will restore an older generation or run cold until a later rehearsal succeeds."
-        fi
-        exit 0
-
-    - name: Retire superseded generations (keep only the newest on this ref)
+    - name: Pack + publish the seed assets
       shell: bash
       run: |
         set -uo pipefail
         if [ -z "${GH_TOKEN:-}" ]; then
-          echo "GH_TOKEN not provided by the calling step — skipping generation retirement"
+          echo "GH_TOKEN not provided — skipping seed publication"
           exit 0
         fi
-        fam="seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-"
-        ref="${GITHUB_REF}"
-        # Newest-first by created_at; keep only the newest (the one just
-        # saved); delete the rest ON THIS REF ONLY.
-        gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100" \
-          --jq ".actions_caches[] | select(.ref == \"${ref}\" and (.key | startswith(\"${fam}\"))) | [.created_at, .id, .key] | @tsv" \
-          | sort -r | tail -n +2 | while IFS=$'\t' read -r created id key; do
-              if gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/caches/${id}" >/dev/null 2>&1; then
-                echo "retired ${key} (created ${created})"
-              fi
-            done
+        fam="seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}"
+        pk="${RUNNER_TEMP:-/tmp}/seedpk"
+        mkdir -p "$pk"
+        # cargo-home subset: only what restore needs; guard each path so a
+        # lane without e.g. git/db still packs.
+        cargo_paths=""
+        for d in registry/index registry/cache git/db bin; do
+          [ -e "$HOME/.cargo/$d" ] && cargo_paths="$cargo_paths $d"
+        done
+        if [ -n "$cargo_paths" ]; then
+          # shellcheck disable=SC2086
+          tar --zstd -cf "$pk/${fam}-cargo.tar.zst" -C "$HOME/.cargo" $cargo_paths
+        fi
+        if [ -d target ]; then
+          tar --zstd -cf "$pk/${fam}-target.tar.zst" target
+        fi
+        ls -lh "$pk" | tail -n +2
+        # Ensure the rolling release exists. --latest=false is CRITICAL:
+        # fielded agents poll /releases/latest for self-update — a
+        # seed-cache release must never shadow an agent release there.
+        if ! gh release view seed-cache --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          gh release create seed-cache --repo "${GITHUB_REPOSITORY}" \
+            --title "Rolling CI seed cache (build dep — not an agent release)" \
+            --notes "Cargo seed tarballs published by seed-cache-save and consumed by seed-cache-restore in release-agent.yml. Clobbered on every rehearsal; safe to delete (next rehearsal republishes)." \
+            --latest=false || true
+        fi
+        ok=1
+        for f in "$pk/${fam}-cargo.tar.zst" "$pk/${fam}-target.tar.zst"; do
+          [ -f "$f" ] || continue
+          gh release upload seed-cache "$f" --repo "${GITHUB_REPOSITORY}" --clobber || ok=0
+        done
+        rm -rf "$pk"
+        # Verify-after-publish, ON THE RUN PAGE (2026-08-24 lesson: a green
+        # step whose effect silently didn't land cost a day of cold builds).
+        have="$(gh release view seed-cache --repo "${GITHUB_REPOSITORY}" \
+                 --json assets --jq "[.assets[].name] | map(select(startswith(\"${fam}-\"))) | length" 2>/dev/null || echo 0)"
+        if [ "$ok" = "1" ] && [ "${have:-0}" -ge 2 ]; then
+          echo "seed published: ${fam} (both assets on seed-cache)"
+        else
+          echo "::warning title=Seed publish did not land::'${fam}' assets are incomplete on the seed-cache release (upload ok=${ok}, assets present=${have}) — tag builds will run cold (~+10 min) until a later rehearsal publishes successfully."
+        fi
         exit 0
