@@ -102,6 +102,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // that never turns SSH on never generates a host key at all.
         ssh_host_key: None,
         ssh_account_mode: None,
+        ssh_max_privilege: None,
         ssh_activity_log: false,
         // S2 env-bridged knobs: unset → built-in defaults.
         overlay_quic: None,
