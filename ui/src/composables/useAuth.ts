@@ -10,7 +10,7 @@ export function useAuth() {
     if (auth.token) {
       await auth.fetchMe()
       if (auth.user) {
-        ws.connect(auth.token!)
+        ws.connect()
       }
     }
   })

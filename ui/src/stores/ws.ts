@@ -56,7 +56,10 @@ export const useWsStore = defineStore('ws', () => {
   // can move ahead of it (lazy affinity — org switches don't redial);
   // placement-critical flows (rc pre-flight) compare against THIS.
   let dialedTid: string | null = null
-  let lastToken: string | null = null
+  // Whether a session has ever been dialed on this store. Replaces the old
+  // `lastToken`: the credential is a cookie now, so there is no token to hold
+  // — but `forceRedial` still needs to know there is something to redial.
+  let dialedOnce = false
   // True once a socket has opened — a later open is a RE-connect and the
   // shell must resync state that WS pushes would have delivered meanwhile.
   let hadConnection = false
@@ -82,12 +85,27 @@ export const useWsStore = defineStore('ws', () => {
     }
   }
 
-  function wsUrl(token: string, tid: string | null): string {
+  /**
+   * The handshake carries NO credential in the URL.
+   *
+   * The browser attaches the `access_token` session cookie automatically —
+   * it is `HttpOnly` and set by login / OAuth / refresh, and the server reads
+   * it on the upgrade (see `ws::handler::session_cookie`). A query string is
+   * written to every access log it passes through and kept in browser history,
+   * and a socket that reconnects every few seconds wrote a live 7-day
+   * credential to disk each time.
+   *
+   * Dev connects straight to the API port to bypass the Vite proxy, which does
+   * not relay WS frames. That is a different PORT, not a different host, and
+   * cookies ignore ports — so the session cookie is sent there too. The
+   * server's origin check compares against `app.frontend_url`, which must
+   * therefore name the Vite origin in dev.
+   */
+  function wsUrl(tid: string | null): string {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    // In dev mode, connect directly to the API server to bypass Vite proxy (which doesn't relay WS frames)
     const wsHost = import.meta.env.DEV ? 'localhost:5001' : location.host
-    const tidParam = tid ? `&tid=${tid}` : ''
-    return `${protocol}//${wsHost}/ws?token=${token}${tidParam}`
+    const query = tid ? `?tid=${tid}` : ''
+    return `${protocol}//${wsHost}/ws${query}`
   }
 
   /**
@@ -116,8 +134,7 @@ export const useWsStore = defineStore('ws', () => {
    * dial re-hashes it. No-op when no socket is live.
    */
   function forceRedial() {
-    if (socket && socket.readyState <= WebSocket.OPEN && lastToken) {
-      const token = lastToken
+    if (socket && socket.readyState <= WebSocket.OPEN && dialedOnce) {
       const old = socket
       // This close is intentional — detach the handlers so the normal
       // onclose auto-reconnect (3 s) doesn't race our immediate redial.
@@ -131,17 +148,21 @@ export const useWsStore = defineStore('ws', () => {
       } catch {
         /* ignore */
       }
-      connect(token)
+      connect()
     }
   }
 
-  function connect(token: string) {
+  /**
+   * Open the socket. Takes no credential: the session cookie is the
+   * credential, and the browser attaches it to a same-site handshake.
+   */
+  function connect() {
     if (socket && socket.readyState <= WebSocket.OPEN) return
 
     status.value = 'connecting'
-    lastToken = token
+    dialedOnce = true
     dialedTid = effectiveTid()
-    socket = new WebSocket(wsUrl(token, dialedTid))
+    socket = new WebSocket(wsUrl(dialedTid))
 
     socket.onopen = () => {
       status.value = 'connected'
@@ -187,7 +208,7 @@ export const useWsStore = defineStore('ws', () => {
       cleanup()
       status.value = 'disconnected'
       connectionId.value = null
-      reconnectTimeout = setTimeout(() => connect(token), 3000)
+      reconnectTimeout = setTimeout(() => connect(), 3000)
     }
 
     socket.onerror = () => {

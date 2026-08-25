@@ -130,20 +130,20 @@ describe('useWsStore', () => {
 
     it('should transition to connecting when connect is called', () => {
       const store = useWsStore()
-      store.connect('test-token')
+      store.connect()
       expect(store.status).toBe('connecting')
     })
 
     it('should transition to connected on WebSocket open', () => {
       const store = useWsStore()
-      store.connect('test-token')
+      store.connect()
       mockWsInstance.simulateOpen()
       expect(store.status).toBe('connected')
     })
 
     it('should transition to disconnected on WebSocket close', () => {
       const store = useWsStore()
-      store.connect('test-token')
+      store.connect()
       mockWsInstance.simulateOpen()
       expect(store.status).toBe('connected')
 
@@ -153,7 +153,7 @@ describe('useWsStore', () => {
 
     it('should transition to disconnected on explicit disconnect', () => {
       const store = useWsStore()
-      store.connect('test-token')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       store.disconnect()
@@ -161,10 +161,33 @@ describe('useWsStore', () => {
     })
   })
 
+  describe('handshake URL', () => {
+    it('carries no credential in the query string', () => {
+      const store = useWsStore()
+      store.connect()
+      const url = (mockWsInstance as unknown as Record<string, unknown>).url as string
+      // The session cookie is the credential now. A token here would be
+      // written to every access log the handshake passes through and kept in
+      // browser history — and this socket reconnects constantly, so it wrote a
+      // live 7-day credential to disk on every reconnect.
+      expect(url).not.toContain('token=')
+      expect(url).toContain('/ws')
+    })
+
+    it('still carries the tenant-affinity key, which is not a credential', () => {
+      const store = useWsStore()
+      store.setTenantAffinity('0123456789abcdef01234567')
+      store.connect()
+      const url = (mockWsInstance as unknown as Record<string, unknown>).url as string
+      expect(url).toContain('?tid=0123456789abcdef01234567')
+      expect(url).not.toContain('token=')
+    })
+  })
+
   describe('sendTyping', () => {
     it('should send correct message format', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       store.sendTyping('room-123')
@@ -179,7 +202,7 @@ describe('useWsStore', () => {
 
     it('should not send when socket is not open', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       // Don't simulate open — socket is still CONNECTING
 
       store.sendTyping('room-123')
@@ -191,7 +214,7 @@ describe('useWsStore', () => {
   describe('send', () => {
     it('should send JSON-serialized message', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       store.send('custom:event', { foo: 'bar' })
@@ -204,7 +227,7 @@ describe('useWsStore', () => {
   describe('message routing', () => {
     it('should route message:create to messageStore.addMessageFromWs', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const messageStore = useMessageStore()
@@ -218,7 +241,7 @@ describe('useWsStore', () => {
 
     it('should route message:update to messageStore.updateMessageFromWs', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const messageStore = useMessageStore()
@@ -232,7 +255,7 @@ describe('useWsStore', () => {
 
     it('should route message:delete to messageStore.removeMessageFromWs', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const messageStore = useMessageStore()
@@ -246,7 +269,7 @@ describe('useWsStore', () => {
 
     it('should route message:reaction to messageStore.handleReactionFromWs', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const messageStore = useMessageStore()
@@ -260,7 +283,7 @@ describe('useWsStore', () => {
 
     it('should increment unread for message:create in a non-current room', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const roomStore = useRoomStore()
@@ -277,7 +300,7 @@ describe('useWsStore', () => {
 
     it('should NOT increment unread for message:create in the current room', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const roomStore = useRoomStore()
@@ -294,7 +317,7 @@ describe('useWsStore', () => {
 
     it('should route room:call_started to roomStore.updateRoomCallStatus', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const roomStore = useRoomStore()
@@ -310,7 +333,7 @@ describe('useWsStore', () => {
 
     it('should route room:call_ended to roomStore.updateRoomCallStatus with null', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const roomStore = useRoomStore()
@@ -331,7 +354,7 @@ describe('useWsStore', () => {
   describe('P4 cross-org routing', () => {
     function openSocketWithActiveOrg(activeTenantId: string) {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
       useTenantStore().setCurrent({ id: activeTenantId, name: 'Org', slug: 'org' } as never)
       return store
@@ -425,7 +448,7 @@ describe('useWsStore', () => {
   describe('media handlers', () => {
     it('should register and invoke persistent media handlers', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const handler = vi.fn()
@@ -438,7 +461,7 @@ describe('useWsStore', () => {
 
     it('should remove media handler with offMediaMessage', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const handler = vi.fn()
@@ -454,7 +477,7 @@ describe('useWsStore', () => {
   describe('ping interval', () => {
     it('should send ping every 30 seconds after connecting', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       vi.advanceTimersByTime(30_000)
@@ -468,7 +491,7 @@ describe('useWsStore', () => {
   describe('rc:* signalling channel', () => {
     it('routes rc:* messages to onRcMessage handlers, not handleMessage', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const handler = vi.fn()
@@ -488,7 +511,7 @@ describe('useWsStore', () => {
 
     it('ignores rc:* messages with no registered handler', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       // Should not throw / not dispatch through handleMessage.
@@ -499,7 +522,7 @@ describe('useWsStore', () => {
 
     it('offRcMessage removes the handler', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const handler = vi.fn()
@@ -515,7 +538,7 @@ describe('useWsStore', () => {
     // only its own handler.
     it('dispatches one rc:* message to EVERY subscriber of the type', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const a = vi.fn()
@@ -530,7 +553,7 @@ describe('useWsStore', () => {
 
     it('the returned unsubscribe removes only its own handler', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const a = vi.fn()
@@ -554,7 +577,7 @@ describe('useWsStore', () => {
 
     it('sendRaw sends the object without a {type,data} envelope', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       store.sendRaw({ t: 'rc:session.request', agent_id: 'aid', permissions: 'VIEW | INPUT' })
@@ -572,7 +595,7 @@ describe('useWsStore', () => {
 
     it('rcHandlers are cleared on disconnect', () => {
       const store = useWsStore()
-      store.connect('tok')
+      store.connect()
       mockWsInstance.simulateOpen()
 
       const handler = vi.fn()
@@ -580,7 +603,7 @@ describe('useWsStore', () => {
       store.disconnect()
 
       // Reconnect and send — handler from the prior session must not fire.
-      store.connect('tok2')
+      store.connect()
       mockWsInstance.simulateOpen()
       mockWsInstance.simulateMessage({ t: 'rc:ice', session_id: 'x', candidate: {} })
 
@@ -618,8 +641,8 @@ describe('useWsStore tenant affinity (PR-1)', () => {
       pathname: `/tenant/${org}/agent/6a6c974930177702c77e3430/remote`,
     })
     const store = useWsStore()
-    store.connect('tok')
-    expect(dialedUrl()).toContain(`&tid=${org}`)
+    store.connect()
+    expect(dialedUrl()).toContain(`?tid=${org}`)
     expect(store.getDialedTid()).toBe(org)
   })
 
@@ -631,27 +654,27 @@ describe('useWsStore tenant affinity (PR-1)', () => {
     })
     const store = useWsStore()
     store.setTenantAffinity(other)
-    store.connect('tok')
-    expect(dialedUrl()).toContain(`&tid=${other}`)
+    store.connect()
+    expect(dialedUrl()).toContain(`?tid=${other}`)
   })
 
   it('falls back to the persisted tenant when off tenant pages', () => {
     globalThis.localStorage.setItem('roomler-current-tenant', org)
     const store = useWsStore()
-    store.connect('tok')
-    expect(dialedUrl()).toContain(`&tid=${org}`)
+    store.connect()
+    expect(dialedUrl()).toContain(`?tid=${org}`)
   })
 
   it('dials key-less only when nothing is known', () => {
     const store = useWsStore()
-    store.connect('tok')
+    store.connect()
     expect(dialedUrl()).not.toContain('tid=')
     expect(store.getDialedTid()).toBeNull()
   })
 
   it('setTenantAffinity is lazy: no redial of the live socket', () => {
     const store = useWsStore()
-    store.connect('tok')
+    store.connect()
     mockWsInstance.simulateOpen()
     const live = mockWsInstance
     store.setTenantAffinity(other)
@@ -662,13 +685,13 @@ describe('useWsStore tenant affinity (PR-1)', () => {
 
   it('forceRedial dials a fresh socket carrying the current affinity', () => {
     const store = useWsStore()
-    store.connect('tok')
+    store.connect()
     mockWsInstance.simulateOpen()
     const old = mockWsInstance
     store.setTenantAffinity(other)
     store.forceRedial()
     expect(mockWsInstance).not.toBe(old)
-    expect(dialedUrl()).toContain(`&tid=${other}`)
+    expect(dialedUrl()).toContain(`?tid=${other}`)
     expect(store.getDialedTid()).toBe(other)
   })
 })

@@ -65,7 +65,7 @@ onMounted(async () => {
     localStorage.setItem('access_token', token)
     auth.token = token
     await auth.fetchMe()
-    ws.connect(token)
+    ws.connect()
     // S2: honor a protected deep-link stashed by the router guard
     // (parity with the password login path).
     const pendingRedirect = sessionStorage.getItem('pending_redirect')
