@@ -189,7 +189,7 @@ impl Vp9Encoder {
         target_fps: u32,
         chroma: Vp9Chroma,
     ) -> Result<Self> {
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("vp9-444: require non-zero, even dimensions, got {width}x{height}");
         }
         let target_fps = target_fps.clamp(1, 240);
