@@ -1,4 +1,5 @@
 pub mod cluster;
+pub mod cookies;
 pub mod error;
 pub mod extractors;
 pub mod media_stats;
