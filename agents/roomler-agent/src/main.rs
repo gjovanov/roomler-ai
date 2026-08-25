@@ -1776,6 +1776,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 "config-backed env fallbacks registered");
             tunnel_core::env::register_config_fallbacks(fallbacks);
         }
+        // R4 — record the PRIMARY enrollment's tenant so the tunnel plane
+        // can resolve the right DERP mux for the quic-derp-v1 flavor
+        // (declared routes are primary-org-scoped by the reconciler).
+        #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+        let _ = roomler_agent::overlay::PRIMARY_TENANT_ID.set(cfg.tenant_id.clone());
     }
 
     // ICE env bridge: the media-ICE hatches live in the VENDORED webrtc-ice

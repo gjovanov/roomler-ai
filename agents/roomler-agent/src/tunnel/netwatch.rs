@@ -31,6 +31,36 @@ pub(crate) fn subscribe() -> Option<NetRx> {
     }
 }
 
+/// R4 — the PRIMARY org's live DERP mux as a tunnel handle (feature-shaped:
+/// the overlay module only exists under overlay-l3/netstack; other builds
+/// have no derp identity and keep the classic ladder).
+pub(crate) fn primary_derp_tunnel_handle() -> Option<tunnel_core::transport::derp::DerpTunnelHandle>
+{
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    {
+        crate::overlay::primary_derp_tunnel_handle()
+    }
+    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+    {
+        None
+    }
+}
+
+/// R4 — a specific tenant's live DERP mux as a tunnel handle (feature-shaped).
+pub(crate) fn derp_tunnel_handle(
+    tenant: &str,
+) -> Option<tunnel_core::transport::derp::DerpTunnelHandle> {
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    {
+        crate::overlay::derp_tunnel_handle(tenant)
+    }
+    #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
+    {
+        let _ = tenant;
+        None
+    }
+}
+
 /// Yield the next material Major's summary (`Lagged` counts as one — the
 /// conservative read); pend forever with no subscription. Cancel-safe, so
 /// it can race a backoff sleep in `tokio::select!`.
