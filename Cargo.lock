@@ -7969,6 +7969,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.12.1",
+ "infer",
  "ipnet",
  "jsonwebtoken",
  "maxminddb",
