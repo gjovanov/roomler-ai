@@ -146,6 +146,15 @@ pub struct NodeStatus {
     /// (bound, reader-less, Recv-Q pegged). Empty from older daemons.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_socks: Vec<DirectSockStatus>,
+    /// #32 — `(unrouted, backpressure)` inbound `/derp` frames the mux could not
+    /// hand to a consumer, cumulative for this process. `None` from older daemons.
+    ///
+    /// `unrouted > 0` means a peer is relaying to us while we hold it on a
+    /// different carrier — the demote-follow's input, and the first thing to read
+    /// when a pair is dark after a network transition. `backpressure > 0` means a
+    /// LIVE consumer stopped draining.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derp_inbound_drops: Option<(u64, u64)>,
     /// PR-B1 tripwire — direct-socket binds that walked off the stable base
     /// port this run (`tunnel_core::evidence::DIRECT_BIND_WALKS`). Nonzero on a
     /// host with a configured stable port = external squatter OR an
@@ -945,6 +954,9 @@ pub struct OverlayView {
     /// plane is on, per-device demux stats otherwise). The daemon copies it
     /// verbatim into [`NodeStatus::direct_socks`].
     pub direct_socks: Vec<DirectSockStatus>,
+    /// #32 — see [`NodeStatus::derp_inbound_drops`]. Filled by the overlay
+    /// runtime on every view publish; the daemon copies it verbatim.
+    pub derp_inbound_drops: Option<(u64, u64)>,
 }
 
 /// Read-only snapshot the daemon provides to [`handle`]. The daemon's impl
