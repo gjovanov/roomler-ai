@@ -1701,6 +1701,16 @@ export interface AutoTransportInputs {
   agentHwEncoders: string[]
   viewerAv1Hw: boolean
   viewerHevcHw: boolean
+  /** Whether WebCodecs `VideoDecoder.isConfigSupported('hev1…')` passed —
+   *  the contract the HEVC-DC worker actually configures against.
+   *  `viewerHevcHw` alone is a MediaCapabilities probe of the `<video>`
+   *  pipeline, and the two DIVERGE on Edge: platform HEVC (HEVC Video
+   *  Extensions) makes MC report supported+smooth while WebCodecs still
+   *  refuses `hev1`, so the rank picked a transport whose worker then
+   *  failed `configure()` — a black session the watchdog re-picked
+   *  forever (field: CORPLAP-3, 2026-08-25). Same shape as P2's
+   *  `viewerH264Hw = MC && accepted avc1 config`. */
+  viewerHevcDecodable: boolean
   viewerVp9Hw: boolean
   viewerVp9Decodable: boolean
   viewerH264Hw: boolean
@@ -1771,7 +1781,10 @@ export function pickAutoTransport(inputs: AutoTransportInputs): {
       reason: 'AV1: HW encode on agent + HW decode here',
     }
   }
-  if (hasHevcDc && inputs.viewerHevcHw) {
+  // Both halves required: MC says the DECODE is hardware-smooth, WebCodecs
+  // says the worker's configure() will actually be accepted. See the
+  // `viewerHevcDecodable` doc — MC alone lies on Edge.
+  if (hasHevcDc && inputs.viewerHevcHw && inputs.viewerHevcDecodable) {
     return {
       transport: 'data-channel-hevc',
       chromaOverride: null,
@@ -3236,6 +3249,20 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   void isHevcDecodeSupported().then((ok) => {
     hevcSupported.value = ok
   })
+  /** DC transports whose worker FAILED before decoding a single frame this
+   *  page-lifetime — i.e. the pre-connect probe said yes and the real
+   *  decoder said no (`isConfigSupported` can lie: Chrome 148 accepted
+   *  vp09.01 then rejected the first frame; Edge accepts probes its
+   *  enterprise policy later refuses). Without this memory the reconnect
+   *  ladder re-ran the SAME rank, re-picked the SAME transport and went
+   *  black forever — the probe result hadn't changed, only reality had.
+   *  Consulted by connect() (auto-rank inputs AND the explicit picks, which
+   *  fall through to their existing fallback chains). Deliberately never
+   *  cleared: a decoder that rejected real bytes once will reject them
+   *  after the next probe too; a page reload starts fresh.
+   *  `Set<string>` (not RcVideoTransport): the vp9-worker ban site keys by
+   *  `sessionDcTransport`, which is a plain string. */
+  const failedDcTransports = new Set<string>()
   /** P7 — whether this browser decodes HEVC Rext 4:4:4 (narrow: Chrome ≥137
    *  + NV driver ≥572.16, or Intel Gen11+ ≥117). Gates the "HEVC · crisp
    *  text (4:4:4)" picker entry together with the agent's `hevc_chroma`. */
@@ -4971,7 +4998,19 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // the standard RTP H.264 track (which the agent sends in parallel
         // to the DC path) renders normally.
         console.warn('[rc] vp9-444 worker', msg.type, msg.error, 'Ã¢ÂÂ auto-fallback to <video>')
+        // Same ban-and-renegotiate as the HEVC handler: a pre-first-frame
+        // failure means the probe lied (this worker serves the vp9-444,
+        // av1 AND h264 DC transports - ban whichever THIS session
+        // negotiated, `sessionDcTransport`). Post-first-frame errors stay
+        // transient and keep today's behaviour.
+        const vp9NeverDecoded = vp9_444FramesDecoded.value === 0
+        const failedTransport = sessionDcTransport
         stopVp9_444Path()
+        if (vp9NeverDecoded && failedTransport && failedTransport !== 'auto' && failedTransport !== 'webrtc') {
+          failedDcTransports.add(failedTransport)
+          console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
+          if (lastConnectArgs) scheduleReconnect()
+        }
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] vp9-444 frame rejected', msg)
       } else if (msg.type === 'awaiting-keyframe') {
@@ -5210,7 +5249,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         // the view re-mounts <video> and the standard RTP path
         // (which the agent sends in parallel) renders normally.
         console.warn('[rc] hevc worker', msg.type, msg.error, 'Ã¢ÂÂ auto-fallback to <video>')
+        // A failure BEFORE the first decoded frame means the pre-connect
+        // probe was wrong for this browser, and it will be wrong again on
+        // the next rank (field: Edge, where MediaCapabilities says HEVC is
+        // hardware-smooth while WebCodecs refuses hev1) - ban the transport
+        // for this page and re-negotiate NOW instead of leaving a black
+        // canvas for the watchdog to find ~10 s later (a DC session's
+        // <video> has no parallel RTP samples, so this fallback renders
+        // nothing). A post-first-frame error is a transient (driver
+        // hiccup) - the same codec may work again on reconnect.
+        const hevcNeverDecoded = hevcFramesDecoded.value === 0
         stopHevcPath()
+        if (hevcNeverDecoded) {
+          failedDcTransports.add('data-channel-hevc')
+          console.warn('[rc] data-channel-hevc banned for this page (decoder failed before first frame) - reconnecting on the next-best transport')
+          if (lastConnectArgs) scheduleReconnect()
+        }
       } else if (msg.type === 'frame-rejected') {
         console.warn('[rc] hevc frame rejected', msg)
       } else if (msg.type === 'awaiting-keyframe') {
@@ -7020,25 +7074,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // agent's advertised encoders with this browser's MediaCapabilities
       // and pick the best pair; explicit user picks skip this entirely.
       const caps = agent?.value?.capabilities
-      const [av1Hw, hevcHw, vp9Hw, vp9Dec, h264Hw, h264Codec] = await Promise.all([
+      const [av1Hw, hevcHw, hevcDec, vp9Hw, vp9Dec, h264Hw, h264Codec] = await Promise.all([
         isAv1HwDecodeSupported(),
         isHevcHwDecodeSupported(),
+        isHevcDecodeSupported(),
         isVp9HwDecodeSupported(),
         isVp9_444DecodeSupported(),
         isH264HwDecodeSupported(),
         isH264DcDecodeSupported(),
       ])
       vp9_444Supported.value = vp9Dec
+      hevcSupported.value = hevcDec
       const pick = pickAutoTransport({
         agentTransports: caps?.transports ?? [],
         agentHwEncoders: caps?.hw_encoders ?? [],
-        viewerAv1Hw: av1Hw,
-        viewerHevcHw: hevcHw,
-        viewerVp9Hw: vp9Hw,
-        viewerVp9Decodable: vp9Dec,
+        viewerAv1Hw: av1Hw && !failedDcTransports.has('data-channel-av1'),
+        viewerHevcHw: hevcHw && !failedDcTransports.has('data-channel-hevc'),
+        // The WebCodecs config probe — the contract the worker configures
+        // against; MC (`hevcHw` above) alone diverges on Edge.
+        viewerHevcDecodable: hevcDec,
+        viewerVp9Hw: vp9Hw && !failedDcTransports.has('data-channel-vp9-444'),
+        viewerVp9Decodable: vp9Dec && !failedDcTransports.has('data-channel-vp9-444'),
         // P2 Ã¢ÂÂ H.264-DC needs both the HW-smooth verdict AND an accepted
         // Annex-B avc1 config (the worker configures with the latter).
-        viewerH264Hw: h264Hw && h264Codec !== null,
+        viewerH264Hw: h264Hw && h264Codec !== null
+          && !failedDcTransports.has('data-channel-h264'),
         // Sharper can upgrade the SW VP9 rung to full chroma - see the
         // chroma note on `pickAutoTransport`.
         priority: priority.value,
@@ -7072,10 +7132,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const h264Caps = agent?.value?.capabilities
       const agentHasH264Dc = (h264Caps?.transports ?? []).includes('data-channel-h264')
       const codec = agentHasH264Dc ? await isH264DcDecodeSupported() : null
-      if (agentHasH264Dc && codec) {
+      if (agentHasH264Dc && codec && !failedDcTransports.has('data-channel-h264')) {
         preferredTransport = 'data-channel-h264'
         h264DcCodec = codec
         viewerDecodeHw.value = await isH264HwDecodeSupported()
+      } else if (failedDcTransports.has('data-channel-h264')) {
+        console.info(
+          '[rc] data-channel-h264 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to the RTP track.',
+        )
       } else {
         console.info(
           agentHasH264Dc
@@ -7088,9 +7152,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // so gate only on decodability; the badge surfaces HW vs SW truth.
       const decodable = av1Supported.value || (await isAv1DecodeSupported())
       av1Supported.value = decodable
-      if (decodable) {
+      if (decodable && !failedDcTransports.has('data-channel-av1')) {
         preferredTransport = 'data-channel-av1'
         viewerDecodeHw.value = await isAv1HwDecodeSupported()
+      } else if (failedDcTransports.has('data-channel-av1')) {
+        console.info(
+          '[rc] data-channel-av1 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to webrtc.',
+        )
       } else {
         console.info(
           '[rc] preferred_transport=data-channel-av1 dropped Ã¢ÂÂ WebCodecs AV1 decode unsupported here. Falling back to webrtc.',
@@ -7099,9 +7167,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     } else if (videoTransport.value === 'data-channel-vp9-444') {
       const supported = vp9_444Supported.value || (await isVp9_444DecodeSupported())
       vp9_444Supported.value = supported
-      if (supported) {
+      if (supported && !failedDcTransports.has('data-channel-vp9-444')) {
         preferredTransport = 'data-channel-vp9-444'
         viewerDecodeHw.value = await isVp9HwDecodeSupported()
+      } else if (failedDcTransports.has('data-channel-vp9-444')) {
+        console.info(
+          '[rc] data-channel-vp9-444 dropped Ã¢ÂÂ its decoder failed on real bytes earlier this page. Falling back to webrtc.',
+        )
       } else {
         console.info(
           '[rc] preferred_transport=data-channel-vp9-444 dropped Ã¢ÂÂ VideoDecoder.isConfigSupported(vp09.01.10.08) returned false. Falling back to webrtc.',
@@ -7119,7 +7191,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // (profile 1), which is ALSO software-decoded and would hang too.
       const decodable = hevcSupported.value || (await isHevcDecodeSupported())
       hevcSupported.value = decodable
-      const hwSmooth = decodable && (await isHevcHwDecodeSupported())
+      const hwSmooth = decodable
+        && !failedDcTransports.has('data-channel-hevc')
+        && (await isHevcHwDecodeSupported())
       if (hwSmooth) {
         preferredTransport = 'data-channel-hevc'
         viewerDecodeHw.value = true
@@ -7143,8 +7217,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           }
         }
       } else {
-        const fallback = vp9_444Supported.value || (await isVp9_444DecodeSupported())
-        vp9_444Supported.value = fallback
+        const vp9Ok = vp9_444Supported.value || (await isVp9_444DecodeSupported())
+        vp9_444Supported.value = vp9Ok
+        const fallback = vp9Ok && !failedDcTransports.has('data-channel-vp9-444')
         if (fallback) {
           console.info(
             decodable
