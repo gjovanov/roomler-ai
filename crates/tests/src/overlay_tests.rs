@@ -96,6 +96,31 @@ impl Ipam {
             })
             .await
     }
+
+    /// A node that ADVERTISES subnet routes (a would-be subnet router), as a
+    /// join with `overlay_advertised_routes` configured would create it.
+    async fn create_router_node(
+        &self,
+        machine_id: &str,
+        name: &str,
+        overlay_ip: &str,
+        advertised: &[&str],
+    ) -> OverlayNode {
+        let mut node = self
+            .create_node(machine_id, name, overlay_ip)
+            .await
+            .unwrap();
+        self.nodes
+            .base
+            .update_one(
+                doc! { "_id": node.id.unwrap() },
+                doc! { "$set": { "advertised_routes": advertised.to_vec() } },
+            )
+            .await
+            .unwrap();
+        node.advertised_routes = advertised.iter().map(|s| s.to_string()).collect();
+        node
+    }
 }
 
 /// The tenant `_id` behind a seeded tenant.
@@ -620,6 +645,65 @@ async fn evict_is_cross_tenant_safe() {
         .await
         .unwrap();
     assert!(still_there.deleted_at.is_none());
+}
+
+/// One LIVE subnet router per CIDR. Field 2026-08-25: the CORP1 router moved
+/// hosts but the old node's row kept its approvals, so two live nodes were
+/// approved for the same corp `/32`s and every client's routing became a
+/// restart lottery between a working and a dead egress. Approving a CIDR that
+/// another live node already holds must be a 409 NAMING the holder — and the
+/// intended operator flow (revoke there first, then approve here) must work.
+#[tokio::test]
+async fn approving_a_cidr_already_approved_on_another_live_node_is_a_409() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("ovdupacl").await;
+    let ipam = Ipam::new(&app, tid(&seeded.tenant_id)).await;
+    const CORP: &str = "10.66.51.147/32";
+
+    ipam.alloc().await.unwrap();
+    ipam.alloc().await.unwrap();
+    let old_router = ipam
+        .create_router_node("mach-old", "old-router", "100.64.0.1", &[CORP])
+        .await;
+    let new_router = ipam
+        .create_router_node("mach-new", "new-router", "100.64.0.2", &[CORP])
+        .await;
+    let put = |node_id: String, routes: Vec<&'static str>| {
+        let path = format!(
+            "/api/tenant/{}/overlay-node/{node_id}/approved-routes",
+            seeded.tenant_id
+        );
+        let token = seeded.admin.access_token.clone();
+        let app = &app;
+        async move {
+            app.auth_put(&path, &token)
+                .json(&serde_json::json!({ "approved_routes": routes }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let old_id = old_router.id.unwrap().to_hex();
+    let new_id = new_router.id.unwrap().to_hex();
+
+    // First router takes the CIDR; re-approving it on ITSELF stays fine.
+    assert_eq!(put(old_id.clone(), vec![CORP]).await.status().as_u16(), 200);
+    assert_eq!(put(old_id.clone(), vec![CORP]).await.status().as_u16(), 200);
+
+    // A second live claimant is refused, and the error names the holder.
+    let resp = put(new_id.clone(), vec![CORP]).await;
+    assert_eq!(resp.status().as_u16(), 409);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("old-router"),
+        "the 409 must name the current holder so the operator knows where to \
+         revoke; got: {body}"
+    );
+
+    // The operator flow that SHOULD have happened on 2026-08-17: revoke on the
+    // old row, then approve on the new one.
+    assert_eq!(put(old_id, vec![]).await.status().as_u16(), 200);
+    assert_eq!(put(new_id, vec![CORP]).await.status().as_u16(), 200);
 }
 
 #[tokio::test]
