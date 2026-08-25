@@ -63,11 +63,16 @@ async fn get_file_metadata() {
     .await
     .unwrap();
 
-    // Upload a file
-    let file_part = multipart::Part::bytes(b"file content here".to_vec())
-        .file_name("document.pdf")
-        .mime_str("application/pdf")
-        .unwrap();
+    // Upload a file whose BYTES really are a PDF. They used to be the string
+    // "file content here", and this test passed only because the server stored
+    // whatever content-type the client claimed — i.e. it asserted that the
+    // server believed a lie. The upload path now sniffs, so the fixture has to
+    // be honest for `application/pdf` to be the right answer.
+    let file_part =
+        multipart::Part::bytes(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\nfile content here".to_vec())
+            .file_name("document.pdf")
+            .mime_str("application/pdf")
+            .unwrap();
 
     let form = multipart::Form::new()
         .part("file", file_part)
@@ -287,4 +292,60 @@ async fn list_files_in_room() {
     assert_eq!(json["total"], 2);
     let items = json["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
+}
+
+/// The stored content-type must come from the BYTES, not from what the
+/// uploader claimed — end to end, through the real multipart handler.
+///
+/// The unit tests in `api::media_type` prove the resolver; this proves the
+/// upload route actually calls it. Those are different failures: a resolver
+/// that works and is never invoked looks identical to no fix at all.
+#[tokio::test]
+async fn upload_stores_the_sniffed_type_not_the_claimed_one() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("filesniff").await;
+    let room_id = tenant.rooms[0].id.clone();
+
+    app.auth_post(
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
+        &tenant.admin.access_token,
+    )
+    .send()
+    .await
+    .unwrap();
+
+    // An HTML body, named and declared as a PNG — the shape that mattered,
+    // because the chat bubble renders <v-img> for anything typed `image/*`.
+    let file_part = multipart::Part::bytes(b"<html><body>not an image</body></html>".to_vec())
+        .file_name("totally-a-picture.png")
+        .mime_str("image/png")
+        .unwrap();
+    let form = multipart::Form::new()
+        .part("file", file_part)
+        .text("room_id", room_id.clone());
+
+    let resp = app
+        .client
+        .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
+        .header(
+            "Authorization",
+            format!("Bearer {}", tenant.admin.access_token),
+        )
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let json: Value = resp.json().await.unwrap();
+    let stored = json["content_type"].as_str().unwrap_or_default();
+    assert!(
+        !stored.starts_with("image/"),
+        "an HTML body claimed as image/png was stored as {stored:?} — the client's \
+         claim is being trusted, and the chat renderer draws <v-img> on `image/*`"
+    );
+    assert_eq!(
+        stored, "text/html",
+        "the sniffer recognises HTML by content, so that is the honest answer"
+    );
 }
