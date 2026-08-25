@@ -1071,6 +1071,20 @@ fn print_status(s: &NodeStatus) {
         }
     }
 
+    // #32 — inbound `/derp` frames that reached no consumer. Printed ONLY when
+    // non-zero: on a healthy node both are 0 and a permanent zero line is noise,
+    // but after a network transition `unrouted` is the first thing to read — it
+    // means a peer is relaying to us that we have not followed onto DERP, which
+    // is exactly the 2026-08-25 case that could not be diagnosed because these
+    // counters existed and were readable nowhere.
+    if let Some((unrouted, backpressure)) = s.derp_inbound_drops
+        && (unrouted > 0 || backpressure > 0)
+    {
+        println!(
+            "  derp drops  unrouted={unrouted} backpressure={backpressure} \n             (cumulative — DIFF two readings, never judge the absolute)"
+        );
+    }
+
     // C4 stage 1 — the warm TURN/UDP allocation. The line the Monday-morning
     // VPN check reads: "live" with a fresh probe while srflx is NONE means
     // the relay flow was grandfathered across the VPN connect.
