@@ -101,6 +101,7 @@ processes**, and it is worth knowing why before you install:
 |------|---------|------|----------------------------------|
 | LaunchAgent `com.roomler.agent` | you, inside your GUI login session | screen capture, input, clipboard | a root LaunchDaemon in session 0 has no WindowServer — capture and `CGEvent` injection do not work there |
 | LaunchDaemon `com.roomler.daemon` | root, from boot | overlay mesh, tunnels | creating a `utun` and installing routes require root |
+| LaunchDaemon `com.roomler.update` | root, on a 6 h timer + on demand | self-update: check, verify, `installer -pkg … -target /` | `installer -target /` needs root, and neither agent half should ever exec its own replacement (the exit-to-update dance is what used to knock Macs offline). Installed by DEFAULT; opt out with `sudo touch /etc/roomler-agent/disable-auto-update` + re-run the installer |
 
 They cannot share one enrollment: the hub keys sessions on `agent_id`, so a
 second control-WS connection displaces the first. **Each half is its own
@@ -185,8 +186,9 @@ adapters are also unavailable on macOS today.
 launchctl bootout "gui/$(id -u)/com.roomler.agent"
 launchctl bootout "gui/$(id -u)/com.roomler.desktop"
 sudo launchctl bootout system/com.roomler.daemon          # if the root half is installed
+sudo launchctl bootout system/com.roomler.update          # the update helper (installed by default)
 rm -f ~/Library/LaunchAgents/com.roomler.{agent,desktop}.plist
-sudo rm -f /Library/LaunchDaemons/com.roomler.daemon.plist
+sudo rm -f /Library/LaunchDaemons/com.roomler.{daemon,update}.plist
 sudo rm -rf /Library/Roomler /Applications/Roomler.app /Applications/roomler-agent.app \
             /usr/local/bin/roomler /usr/local/bin/roomlerd /etc/roomler-agent
 # `sudo`, and both trees: an install done under sudo before rc.454 wrote the
