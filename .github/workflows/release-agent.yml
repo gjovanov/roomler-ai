@@ -2010,6 +2010,10 @@ jobs:
           # The companion's LaunchAgent rides here too — the postinstall reads
           # every plist it installs out of this one directory.
           cp agents/roomler-agent/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
+          # The update half (root LaunchDaemon, DEFAULT ON, opt-out marker
+          # /etc/roomler-agent/disable-auto-update). Owns check+download+
+          # install so no agent process ever execs its own replacement.
+          cp agents/roomler-agent/packaging/macos/com.roomler.update.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
