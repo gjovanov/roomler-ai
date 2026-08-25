@@ -6,8 +6,8 @@ use bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler_ai_db::models::MediaSettings;
 use roomler_ai_db::models::role::permissions;
+use roomler_ai_db::models::{MediaSettings, RoomVisibility};
 use roomler_ai_services::dao::base::PaginationParams;
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +26,10 @@ pub struct RoomResponse {
     pub path: String,
     pub parent_id: Option<String>,
     pub is_open: bool,
+    /// Who may read the room. The UI padlock renders from THIS, not from
+    /// `is_open` — that one is "listed in Explore" and drawing a lock for it
+    /// claimed a privacy the server never enforced.
+    pub visibility: RoomVisibility,
     pub member_count: u32,
     pub message_count: u64,
     pub has_media: bool,
@@ -47,7 +51,34 @@ pub async fn list(
     }
 
     let rooms = state.rooms.find_by_tenant(tid).await?;
-    let response: Vec<RoomResponse> = rooms.into_iter().map(to_response).collect();
+
+    // A Secret room must not appear to someone who is not in it — its
+    // existence is the thing being kept. Private rooms DO stay listed: that is
+    // the difference between the two, and it is what lets someone ask to be
+    // let in. Filtered here rather than in the query because the membership
+    // test is per-room; the `any_secret` guard keeps the extra reads off the
+    // common path, where every room is Public.
+    let any_secret = rooms.iter().any(|r| r.visibility.hidden_from_non_members());
+    let visible = if any_secret {
+        let mut keep = Vec::with_capacity(rooms.len());
+        for room in rooms {
+            if room.visibility.hidden_from_non_members() {
+                let rid = match room.id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                if !state.rooms.is_member(tid, rid, auth.user_id).await? {
+                    continue;
+                }
+            }
+            keep.push(room);
+        }
+        keep
+    } else {
+        rooms
+    };
+
+    let response: Vec<RoomResponse> = visible.into_iter().map(to_response).collect();
 
     Ok(Json(response))
 }
@@ -103,14 +134,25 @@ pub async fn join(
     // cross-tenant eavesdropping. Binding the room to the path tenant closes
     // that.
     //
-    // Deliberately NOT gated on `room.is_open`: whether a tenant member may
-    // self-join a CLOSED room is a product policy question, not a security
-    // one, and rooms created through the API default to `is_open: false`
-    // (`CreateRoomRequest` derives it from `#[serde(default)]`), so requiring
-    // it would stop members joining most channels. If closed rooms should be
-    // invite-only, that belongs with a room-membership model — the same
-    // decision as room-level read authorization — not bolted on here.
-    super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    // Resolved WITHOUT the visibility gate, deliberately: joining is how
+    // someone becomes a member, so requiring membership here would make a
+    // Private room unjoinable — visible in the list, unreadable, and with no
+    // way in. That is the one place `resolve_room_in_tenant` may be used.
+    let room = super::helpers::resolve_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+
+    // Still NOT gated on `is_open` — that flag means "listed in Explore", not
+    // "who may enter", and rooms created through the API default to `false`,
+    // so gating on it would stop members joining most channels.
+    //
+    // Secret IS gated. A Secret room's whole property is that a non-member
+    // cannot learn it exists; letting one walk in by guessing an id would give
+    // that away and hand them the contents. 404 for the same reason the read
+    // path uses 404 — a 403 would confirm the room is there.
+    if room.visibility.hidden_from_non_members()
+        && !state.rooms.is_member(tid, rid, auth.user_id).await?
+    {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
 
     state.rooms.join(tid, rid, auth.user_id).await?;
 
@@ -144,11 +186,12 @@ pub async fn get(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::Forbidden("Not a member".to_string()));
-    }
-
-    let room = state.rooms.base.find_by_id_in_tenant(tid, rid).await?;
+    // Goes through the shared guard rather than re-implementing the tenant
+    // check: this is the single-room READ, so it is exactly where a
+    // Private/Secret room would otherwise be handed to a non-member. The
+    // hand-rolled `is_member` + `find_by_id_in_tenant` pair it used to have
+    // was equivalent for tenant scope and silently blind to room scope.
+    let room = super::helpers::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     Ok(Json(to_response(room)))
 }
@@ -161,6 +204,8 @@ pub struct UpdateRoomRequest {
     pub is_open: Option<bool>,
     pub is_archived: Option<bool>,
     pub is_read_only: Option<bool>,
+    /// Who may read the room. Absent = unchanged.
+    pub visibility: Option<RoomVisibility>,
 }
 
 pub async fn update(
@@ -184,6 +229,17 @@ pub async fn update(
     )
     .await?;
 
+    // Closing a room must not lock its own admin out. Adding the actor BEFORE
+    // the write means there is no window in which the room is members-only
+    // with no members — and `join` is idempotent-ish here because a duplicate
+    // row would only widen nothing (same user, same room).
+    if let Some(v) = body.visibility
+        && v.requires_membership()
+        && !state.rooms.is_member(tid, rid, auth.user_id).await?
+    {
+        state.rooms.join(tid, rid, auth.user_id).await?;
+    }
+
     state
         .rooms
         .update(
@@ -195,6 +251,7 @@ pub async fn update(
             body.is_open,
             body.is_archived,
             body.is_read_only,
+            body.visibility,
         )
         .await?;
 
@@ -788,6 +845,7 @@ fn to_response(r: roomler_ai_db::models::Room) -> RoomResponse {
         path: r.path,
         parent_id: r.parent_id.map(|p| p.to_hex()),
         is_open: r.is_open,
+        visibility: r.visibility,
         member_count: r.member_count,
         message_count: r.message_count,
         has_media: r.media_settings.is_some(),

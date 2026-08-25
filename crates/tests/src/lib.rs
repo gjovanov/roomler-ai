@@ -66,6 +66,8 @@ mod remote_control_tests;
 #[cfg(test)]
 mod role_tests;
 #[cfg(test)]
+mod room_visibility_tests;
+#[cfg(test)]
 mod stats_tests;
 #[cfg(test)]
 mod tenant_archive_tests;
