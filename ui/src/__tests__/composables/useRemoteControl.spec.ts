@@ -2318,6 +2318,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     agentHwEncoders: [],
     viewerAv1Hw: false,
     viewerHevcHw: false,
+    viewerHevcDecodable: false,
     viewerVp9Hw: false,
     viewerVp9Decodable: false,
     viewerH264Hw: false,
@@ -2346,6 +2347,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
         agentHwEncoders: ['ffmpeg-hevc_nvenc', 'libvpx-vp9-444-sw'],
         viewerAv1Hw: true, // viewer could do AV1 — agent can't encode it
         viewerHevcHw: true,
+        viewerHevcDecodable: true,
         viewerVp9Hw: true,
         viewerVp9Decodable: true,
       }),
@@ -2489,9 +2491,49 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
       base({
         agentHwEncoders: ['ffmpeg-hevc_nvenc'],
         viewerHevcHw: true,
+        viewerHevcDecodable: true,
       }),
     )
     expect(r.transport).toBe('data-channel-hevc')
+  })
+
+  // THE CORPLAP-3 case (Edge, 2026-08-25): MediaCapabilities reports HEVC as
+  // hardware-smooth (Edge's platform pipeline has HEVC Video Extensions)
+  // while WebCodecs refuses `hev1` — the contract the DC worker actually
+  // configures against. The rank picked HEVC, configure() failed, the
+  // session went black, and the reconnect ladder re-picked it forever.
+  // Both halves are required.
+  it('HEVC-DC skipped when MediaCapabilities says HW but WebCodecs refuses (Edge)', () => {
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444', 'data-channel-hevc'],
+        agentHwEncoders: ['ffmpeg-hevc_videotoolbox', 'libvpx-vp9-444-sw'],
+        viewerHevcHw: true, // MC (the <video> pipeline) says yes…
+        viewerHevcDecodable: false, // …WebCodecs says no — MUST win
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+      }),
+    )
+    expect(r.transport).not.toBe('data-channel-hevc')
+    expect(r.transport).toBe('data-channel-vp9-444')
+  })
+
+  it('HEVC-DC still requires the MC hardware-smooth verdict (rc.186 property)', () => {
+    // WebCodecs accepting the config is not enough — isConfigSupported
+    // returns true for software / too-slow HEVC, and a weak iGPU then
+    // hangs (Iris Xe keyframe spiral). MC smooth+powerEfficient stays a
+    // conjunct, exactly as before.
+    const r = pickAutoTransport(
+      base({
+        agentTransports: ['data-channel-vp9-444', 'data-channel-hevc'],
+        agentHwEncoders: ['ffmpeg-hevc_nvenc', 'libvpx-vp9-444-sw'],
+        viewerHevcHw: false,
+        viewerHevcDecodable: true,
+        viewerVp9Hw: true,
+        viewerVp9Decodable: true,
+      }),
+    )
+    expect(r.transport).not.toBe('data-channel-hevc')
   })
 })
 
