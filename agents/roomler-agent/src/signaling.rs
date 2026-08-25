@@ -1524,6 +1524,7 @@ async fn connect_once(
                             };
                             handle_server_msg(
                                 ctx,
+                                &cfg.tenant_id,
                                 &mut ws,
                                 parsed,
                                 &mut peers,
@@ -1671,6 +1672,9 @@ fn report_config_status(
 #[allow(clippy::too_many_arguments)]
 async fn handle_server_msg(
     ctx: &OrgCtx,
+    // R4 — this org's tenant id (OrgCtx carries only the label); the
+    // quic-derp-v1 setup arm resolves its DERP mux by tenant.
+    tenant_id: &str,
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
@@ -2352,7 +2356,51 @@ async fn handle_server_msg(
             session_id,
             quic_auth_token,
             ice_servers,
+            transport,
+            client_derp_pubkey,
         } => {
+            // R4 — quic-derp-v1: the quinn server rides this node's
+            // ESTABLISHED `/derp` WS toward the client's pubkey. No TURN
+            // allocation, no permission dance. Any missing precondition
+            // logs + sends no ready — the client times out and soft-falls
+            // back to webrtc-dc, exactly the TURN-alloc-failure shape.
+            if transport.as_deref() == Some(tunnel_core::transport::TRANSPORT_QUIC_DERP_V1) {
+                let Some(handle) = crate::tunnel::netwatch::derp_tunnel_handle(tenant_id) else {
+                    warn!(%session_id, "tunnel quic-derp: no live derp mux for this tenant — no ready");
+                    return Ok(());
+                };
+                let Some(client_pk) = client_derp_pubkey
+                    .as_deref()
+                    .and_then(tunnel_core::transport::derp::parse_pubkey_hex)
+                else {
+                    warn!(%session_id, "tunnel quic-derp: missing/unparseable client_derp_pubkey — no ready");
+                    return Ok(());
+                };
+                let conn = handle.mux.tunnel_conn_for(client_pk);
+                let relay_conn: Arc<dyn relay::RelayConn> = Arc::new(conn);
+                match crate::tunnel::quic_peer::AgentQuicPeer::setup_over_derp(
+                    session_id,
+                    quic_auth_token,
+                    relay_conn,
+                    handle.self_pubkey_hex.clone(),
+                ) {
+                    Ok(peer) => {
+                        let ready = ClientMsg::TunnelQuicReady {
+                            session_id,
+                            cert_fingerprint: peer.cert_fingerprint().to_string(),
+                            addrs: peer.addrs(),
+                            derp_pubkey: peer.derp_pubkey_hex().map(str::to_string),
+                        };
+                        tunnel_quic_peers.insert(session_id, Arc::new(peer));
+                        let _ = outbound_tx.send(ready).await;
+                        info!(%session_id, "agent QUIC-over-DERP peer ready; rc:tunnel.quic.ready sent");
+                    }
+                    Err(e) => {
+                        warn!(%session_id, %e, "tunnel quic-derp: AgentQuicPeer setup failed");
+                    }
+                }
+                return Ok(());
+            }
             // Phase 3d: if the server minted coturn creds, ride QUIC over
             // a TURN relay (QUIC-over-TURN) so symmetric-NAT /
             // UDP-restricted hosts are reachable; the relay peer
@@ -2403,6 +2451,7 @@ async fn handle_server_msg(
                         session_id,
                         cert_fingerprint: peer.cert_fingerprint().to_string(),
                         addrs: peer.addrs(),
+                        derp_pubkey: None,
                     };
                     tunnel_quic_peers.insert(session_id, Arc::new(peer));
                     let _ = outbound_tx.send(ready).await;

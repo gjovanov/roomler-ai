@@ -624,6 +624,15 @@ pub enum ClientMsg {
         /// pre-P3b-2 server/client stays byte-identical.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         open_nonce: Option<String>,
+        /// R4 (`quic-derp-v1`): the CLIENT's overlay/DERP pubkey (64
+        /// lowercase hex chars), so the agent can address its tunnel QUIC
+        /// endpoint at this client over the established `/derp` WS. Only
+        /// sent when the client can serve the derp flavor; the server
+        /// copies it into `TunnelQuicSetup.client_derp_pubkey` when the
+        /// flavor is negotiated. Absent ⇒ omitted on the wire (pre-R4
+        /// byte-identical).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derp_pubkey: Option<String>,
     },
 
     /// Client → server (forwarded to agent): open one TCP forward.
@@ -817,6 +826,12 @@ pub enum ClientMsg {
         cert_fingerprint: String,
         /// `ip:port` candidates the client may dial (priority order).
         addrs: Vec<String>,
+        /// R4 (`quic-derp-v1`): the AGENT's overlay/DERP pubkey (64 hex),
+        /// which the client's DERP-backed QUIC endpoint addresses. Only
+        /// present on derp-flavor sessions; absent ⇒ omitted (pre-R4
+        /// byte-identical).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derp_pubkey: Option<String>,
     },
 
     /// Tunnel-client → server → agent: the client's own QUIC candidate
@@ -1632,6 +1647,18 @@ pub enum ServerMsg {
         /// direct"). Phase 3c.
         #[serde(default)]
         ice_servers: Vec<IceServer>,
+        /// R4: the negotiated transport flavor when it is NOT the default
+        /// QUIC-over-TURN path — today only `quic-derp-v1`. A pre-R4 agent
+        /// never receives it (the server version-gates the flavor), and a
+        /// pre-R4 SERVER omits it, which a new agent reads as the classic
+        /// TURN/direct path. Absent ⇒ omitted on the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transport: Option<String>,
+        /// R4 (`quic-derp-v1`): the CLIENT's overlay/DERP pubkey (64 hex),
+        /// copied verbatim from `TunnelOpen.derp_pubkey` — the peer the
+        /// agent's DERP-backed QUIC endpoint serves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_derp_pubkey: Option<String>,
     },
 
     /// Server → tunnel-client: relays the agent's `TunnelQuicReady`
@@ -1643,6 +1670,10 @@ pub enum ServerMsg {
         session_id: ObjectId,
         cert_fingerprint: String,
         addrs: Vec<String>,
+        /// R4 — see `ClientMsg::TunnelQuicReady::derp_pubkey` (relayed
+        /// verbatim).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        derp_pubkey: Option<String>,
     },
 
     /// Server → agent: relays the tunnel-client's `TunnelQuicCandidate`
@@ -2935,6 +2966,7 @@ mod tests {
             agent_id,
             transport: "webrtc-dc-v1".into(),
             open_nonce: None,
+            derp_pubkey: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(!s.contains("$oid"), "extended JSON leaked: {s}");
@@ -3234,6 +3266,7 @@ mod tests {
             agent_id: ObjectId::new(),
             transport: "webrtc-dc-v1".into(),
             open_nonce: Some("nonce-7f3a".into()),
+            derp_pubkey: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""open_nonce":"nonce-7f3a""#));
@@ -3253,6 +3286,7 @@ mod tests {
             agent_id: ObjectId::new(),
             transport: "webrtc-dc-v1".into(),
             open_nonce: None,
+            derp_pubkey: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -3336,6 +3370,7 @@ mod tests {
             session_id: ObjectId::new(),
             cert_fingerprint: "ab".repeat(32),
             addrs: vec!["203.0.113.7:51820".into(), "192.168.1.5:51820".into()],
+            derp_pubkey: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:tunnel.quic.ready""#));
@@ -3352,6 +3387,73 @@ mod tests {
         }
     }
 
+    /// R4 wire lock — the derp-flavor fields: absent ⇒ omitted (pre-R4
+    /// byte-identical wire), present ⇒ they survive serialization + parse on
+    /// BOTH enums. The server relays `ClientMsg::TunnelQuicReady` by
+    /// REBUILDING `ServerMsg::TunnelQuicReady` — a lagging server struct is
+    /// exactly where the field would silently vanish, so both sides lock.
+    #[test]
+    fn tunnel_derp_fields_lock_omission_and_presence() {
+        let pk = "ab".repeat(32);
+        let m = ClientMsg::TunnelOpen {
+            agent_id: ObjectId::new(),
+            transport: "quic-derp-v1".into(),
+            open_nonce: None,
+            derp_pubkey: Some(pk.clone()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(&format!(r#""derp_pubkey":"{pk}""#)));
+
+        let m = ServerMsg::TunnelQuicSetup {
+            session_id: ObjectId::new(),
+            quic_auth_token: "tok".into(),
+            ice_servers: vec![],
+            transport: Some("quic-derp-v1".into()),
+            client_derp_pubkey: Some(pk.clone()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""transport":"quic-derp-v1""#));
+        assert!(s.contains(&format!(r#""client_derp_pubkey":"{pk}""#)));
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::TunnelQuicSetup {
+                transport,
+                client_derp_pubkey,
+                ..
+            } => {
+                assert_eq!(transport.as_deref(), Some("quic-derp-v1"));
+                assert_eq!(client_derp_pubkey.as_deref(), Some(pk.as_str()));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // The agent→server ready and its server→client relay twin BOTH carry
+        // the pubkey; None omits it on both.
+        let m = ClientMsg::TunnelQuicReady {
+            session_id: ObjectId::new(),
+            cert_fingerprint: "cd".repeat(32),
+            addrs: vec![],
+            derp_pubkey: Some(pk.clone()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(&format!(r#""derp_pubkey":"{pk}""#)));
+        let m = ServerMsg::TunnelQuicReady {
+            session_id: ObjectId::new(),
+            cert_fingerprint: "cd".repeat(32),
+            addrs: vec![],
+            derp_pubkey: Some(pk.clone()),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(&format!(r#""derp_pubkey":"{pk}""#)));
+        let m = ServerMsg::TunnelQuicReady {
+            session_id: ObjectId::new(),
+            cert_fingerprint: "cd".repeat(32),
+            addrs: vec![],
+            derp_pubkey: None,
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(!s.contains("derp_pubkey"), "None leaked onto the wire: {s}");
+    }
+
     #[test]
     fn tunnel_quic_setup_is_server_to_agent() {
         let m = ServerMsg::TunnelQuicSetup {
@@ -3362,6 +3464,8 @@ mod tests {
                 username: Some("1780000000:agent".into()),
                 credential: Some("base64hmac".into()),
             }],
+            transport: None,
+            client_derp_pubkey: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:tunnel.quic.setup""#));
