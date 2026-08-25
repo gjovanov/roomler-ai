@@ -837,4 +837,63 @@ mod tests {
         reconcile_host(&mut host, None, &secret).await;
         assert!(host.is_none());
     }
+
+    /// The browser can only reach these ports if the SPA's `Content-Security-
+    /// Policy` permits them, and that policy lives in `files/nginx-pod.conf` —
+    /// a different language, a different crate, a different deploy artifact.
+    /// This test is the only thing joining them.
+    ///
+    /// It matters because the failure is SILENT. A `fetch` to a CSP-blocked
+    /// port does not error visibly: the probe just fails, the viewer falls
+    /// back to the far coturn, and nobody notices until somebody measures
+    /// relay quality on a corporate network. #242 is the precedent — a CSP
+    /// change exercised only against the dashboard broke this exact path in
+    /// production.
+    ///
+    /// The constants here are canonical (`ui/src/composables/useRemoteControl
+    /// .ts` mirrors them, locked by its own vitest), so this asserts from the
+    /// source of truth outward.
+    #[test]
+    fn the_deployed_csp_permits_every_port_we_serve_on() {
+        let conf_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../files/nginx-pod.conf");
+        let conf = std::fs::read_to_string(&conf_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", conf_path.display()));
+
+        let csp = conf
+            .lines()
+            .find(|l| l.contains("add_header Content-Security-Policy"))
+            .expect("no Content-Security-Policy in files/nginx-pod.conf");
+        let connect_src = csp
+            .split_once("connect-src ")
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(v, _)| v)
+            .expect("CSP has no connect-src directive");
+
+        for port in probe_ports() {
+            for host in ["127.0.0.1", "localhost"] {
+                let want = format!("http://{host}:{port}");
+                assert!(
+                    connect_src.split_whitespace().any(|s| s == want),
+                    "files/nginx-pod.conf connect-src is missing {want}. The loopback \
+                     probe to that port would be blocked — silently — and the viewer \
+                     would fall back to the far coturn. Change the CSP together with \
+                     PROBE_PORT / PROBE_PORT_FALLBACK / PROBE_PORT_BAND here and \
+                     LOCAL_RELAY_PROBE_PORTS in the UI.\nconnect-src was: {connect_src}"
+                );
+            }
+        }
+
+        // …and the wildcard must not creep back. Re-adding `127.0.0.1:*` would
+        // satisfy every assertion above while handing an XSS on the app's own
+        // origin the user's entire loopback again — which is the thing the
+        // enumeration exists to prevent, so it has to be asserted separately.
+        for wildcard in ["http://127.0.0.1:*", "http://localhost:*"] {
+            assert!(
+                !connect_src.contains(wildcard),
+                "connect-src allows {wildcard} again — the enumeration above exists \
+                 to replace exactly that"
+            );
+        }
+    }
 }
