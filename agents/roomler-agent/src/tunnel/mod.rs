@@ -30,6 +30,7 @@ pub mod acceptor;
 pub use roomler_agent_core::acl;
 pub mod client_mgr;
 pub mod dialer;
+pub(crate) mod netwatch;
 pub mod peer;
 pub mod quic_peer;
 pub mod route_reconciler;

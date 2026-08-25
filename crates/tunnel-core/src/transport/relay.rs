@@ -618,6 +618,62 @@ const UDP_ALLOC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 /// before we can try the next candidate (`:443`). Fail fast + move on.
 const TLS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// Cap on ONE DNS resolution during the ladder walk. `lookup_host` used to
+/// run UNBOUNDED before each candidate's own timeout even started — and a
+/// resolver gone stale across a VPN transition blocks, not NXDOMAINs
+/// (field 2026-08-21 on the corp laptop: a ~40 s theoretical walk measured
+/// at ~280 s, mostly here). Combined with the per-walk cache below, a walk
+/// now spends at most one bounded lookup per unique host.
+const DNS_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Cap on ONE WHOLE Tier-3 allocate (TCP connect + TLS handshake + TURN
+/// listen/allocate). [`TLS_CONNECT_TIMEOUT`] bounds only the connect — a
+/// middlebox that completes the SYN and then stalls the TLS handshake used
+/// to hang Tier 3 with NO cap at all, past the controller's 30 s
+/// `quic.ready` window with no way for this side to give up and move on.
+const TLS_ALLOC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Split a `host:port` candidate (v6 hosts may be bracketed). `None` on a
+/// malformed pair — the caller logs and skips the candidate.
+fn split_host_port(server: &str) -> Option<(&str, u16)> {
+    let (h, p) = server.rsplit_once(':')?;
+    let port: u16 = p.parse().ok()?;
+    let host = h
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(h);
+    Some((host, port))
+}
+
+/// Resolve one UDP candidate, IP literals short-circuiting and hostname
+/// lookups bounded by [`DNS_RESOLVE_TIMEOUT`] + cached per ladder walk in
+/// `dns` (candidates mostly share hosts: worker + generic × two ports). A
+/// cached `None` is remembered too — a dead resolver costs ONE bounded
+/// wait per unique host, not one per candidate.
+async fn resolve_udp_candidate(
+    dns: &mut std::collections::HashMap<String, Option<IpAddr>>,
+    server: &str,
+) -> Option<SocketAddr> {
+    let (host, port) = split_host_port(server)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    if let Some(cached) = dns.get(host) {
+        return cached.map(|ip| SocketAddr::new(ip, port));
+    }
+    let looked = match tokio::time::timeout(
+        DNS_RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(mut addrs)) => addrs.next().map(|sa| sa.ip()),
+        Ok(Err(_)) | Err(_) => None,
+    };
+    dns.insert(host.to_string(), looked);
+    looked.map(|ip| SocketAddr::new(ip, port))
+}
+
 /// Allocate a TURN relay from coturn ICE-server credentials, walking the
 /// connectivity tiers and trying EVERY candidate in each until one wins:
 /// * **Tier 2** — UDP relay (`turn:…?transport=udp`), each bounded by
@@ -659,13 +715,13 @@ pub async fn allocate_relay_from_ice_tiered(
     if tls_only {
         tracing::info!("TURN allocate: tier2-udp SKIPPED (TLS-first forced)");
     } else {
+        let mut dns: std::collections::HashMap<String, Option<IpAddr>> = Default::default();
         for server in turn_udp_servers(urls) {
-            let Some(resolved) = tokio::net::lookup_host(&server)
-                .await
-                .ok()
-                .and_then(|mut a| a.next())
-            else {
-                tracing::warn!(%server, "UDP TURN server unresolvable; trying next");
+            let Some(resolved) = resolve_udp_candidate(&mut dns, &server).await else {
+                tracing::warn!(
+                    %server,
+                    "UDP TURN server unresolvable (or DNS exceeded its bound); trying next"
+                );
                 continue;
             };
             match tokio::time::timeout(
@@ -728,27 +784,40 @@ pub async fn allocate_relay_from_ice_tiered(
     }
 
     // Tier 3: each TURNS/TCP relay candidate (:443 first; UDP-blocked nets).
+    // The WHOLE attempt is bounded by TLS_ALLOC_TIMEOUT — TLS_CONNECT_TIMEOUT
+    // inside covers only the TCP connect, and a middlebox that ACKs the SYN
+    // then stalls the TLS handshake (or the TURN allocate) otherwise hangs
+    // this loop unboundedly.
     for (host, port, pin) in turn_tls_servers(urls) {
-        match allocate_turn_relay_tls(
-            &host,
-            port,
-            pin,
-            username.to_string(),
-            credential.to_string(),
-            DEFAULT_TURN_REALM.to_string(),
+        match tokio::time::timeout(
+            TLS_ALLOC_TIMEOUT,
+            allocate_turn_relay_tls(
+                &host,
+                port,
+                pin,
+                username.to_string(),
+                credential.to_string(),
+                DEFAULT_TURN_REALM.to_string(),
+            ),
         )
         .await
         {
-            Ok(relay) => {
+            Ok(Ok(relay)) => {
                 tracing::info!(%host, port, ?pin, "TURN relay allocated (tier3-tls)");
                 return Ok(relay);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // `{:#}` surfaces the full anyhow chain incl. the underlying
                 // rustls error (e.g. "invalid peer certificate: NotValidForName"
                 // = SNI/cert-name mismatch, vs "UnknownIssuer"/handshake reset =
                 // a genuine middlebox block) — the signal that gates the fix.
                 tracing::warn!(%host, port, ?pin, e = format!("{e:#}"), "TURNS/TCP TURN allocate failed; trying next")
+            }
+            Err(_) => {
+                tracing::warn!(
+                    %host, port, ?pin,
+                    "TURNS/TCP TURN allocate deadline exceeded (stalled past connect); trying next"
+                )
             }
         }
     }
@@ -869,6 +938,87 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
         (Arc::new(UdpRelayConn(sock)), addr)
+    }
+
+    #[test]
+    fn split_host_port_handles_names_v6_and_garbage() {
+        assert_eq!(
+            split_host_port("coturn.roomler.ai:3478"),
+            Some(("coturn.roomler.ai", 3478))
+        );
+        assert_eq!(split_host_port("[::1]:443"), Some(("::1", 443)));
+        assert_eq!(
+            split_host_port("94.130.141.74:443"),
+            Some(("94.130.141.74", 443))
+        );
+        assert_eq!(split_host_port("no-port"), None);
+        // rsplit takes the LAST colon: ("bad:port", "x") → port parse fails.
+        assert_eq!(split_host_port("bad:port:x"), None);
+    }
+
+    /// IP literals never touch the resolver, and a per-walk cache entry —
+    /// including a cached FAILURE — is honored without a second lookup (the
+    /// resolve-once-per-walk contract: a dead resolver costs one bounded
+    /// wait per unique host, not one per candidate).
+    #[tokio::test]
+    async fn resolve_udp_candidate_uses_literals_and_cache() {
+        let mut dns = std::collections::HashMap::new();
+        let got = resolve_udp_candidate(&mut dns, "127.0.0.1:3478")
+            .await
+            .unwrap();
+        assert_eq!(got, "127.0.0.1:3478".parse::<SocketAddr>().unwrap());
+        assert!(dns.is_empty(), "literals must not populate the DNS cache");
+
+        dns.insert(
+            "cached.example".to_string(),
+            Some(IpAddr::from([10, 1, 2, 3])),
+        );
+        let got = resolve_udp_candidate(&mut dns, "cached.example:443")
+            .await
+            .unwrap();
+        assert_eq!(got, SocketAddr::from(([10, 1, 2, 3], 443)));
+
+        dns.insert("dead.example".to_string(), None);
+        assert!(
+            resolve_udp_candidate(&mut dns, "dead.example:3478")
+                .await
+                .is_none()
+        );
+    }
+
+    /// The HAZARD the outer `TLS_ALLOC_TIMEOUT` exists for: a listener that
+    /// completes the TCP connect and then stalls forever (a TLS-stalling
+    /// middlebox). The inner `TLS_CONNECT_TIMEOUT` does NOT fire — connect
+    /// succeeded — so without the outer bound the tiered walk hangs
+    /// unboundedly right here. If this test ever FAILS, an inner bound was
+    /// added to `allocate_turn_relay_tls`; re-examine whether the outer
+    /// bound in the tiered walk is still needed before deleting either.
+    #[tokio::test]
+    async fn tls_allocate_stalls_on_an_accept_only_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // hold open, never speak TLS
+            }
+        });
+        let attempt = allocate_turn_relay_tls(
+            "stall.test",
+            addr.port(),
+            Some(addr.ip()),
+            "u".into(),
+            "p".into(),
+            "r".into(),
+        );
+        // 400 ms is far above a loopback connect, far below the 10 s
+        // production bound — the attempt must still be running.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), attempt)
+                .await
+                .is_err(),
+            "allocate returned early — the stall hazard no longer reproduces"
+        );
     }
 
     /// `turn_udp_server` must pick the plain-UDP TURN url out of the
