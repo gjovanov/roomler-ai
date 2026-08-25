@@ -143,6 +143,18 @@ impl ScrapCapture {
                 let start = Instant::now();
                 #[cfg(target_os = "macos")]
                 let mut applied: u64 = 0;
+                // The display's TRUE pixel size, tracked independently of the
+                // stream's output size. This is what frames report as their
+                // `source` when the stream is opened at the encode box — the
+                // pump's cap decision keys on native dims, and feeding it the
+                // CAPPED dims closed a feedback loop that re-opened the stream
+                // every frame (capped frame ⇒ "no cap needed" ⇒ reopen native
+                // ⇒ native frame ⇒ "cap!" ⇒ reopen capped ⇒ …), ~30 rebuilds/s,
+                // no codec able to stream — field 2026-08-26 on the MacBook.
+                let mut native_w = w;
+                let mut native_h = h;
+                #[cfg(target_os = "macos")]
+                let mut last_reopen = Instant::now();
 
                 // Wait for capture requests.
                 while let Ok(res_tx) = cmd_rx.recv() {
@@ -155,28 +167,61 @@ impl ScrapCapture {
                     #[cfg(target_os = "macos")]
                     {
                         let want = desired_worker.load(std::sync::atomic::Ordering::Relaxed);
-                        if want != applied {
+                        // Rate-floor the rebuilds. With `source` reported
+                        // correctly the pump's target is stable and this never
+                        // engages; it exists so that any FUTURE feedback bug
+                        // degrades to one rebuild per second (a survivable
+                        // stream + a visible log cadence) instead of a rebuild
+                        // per frame (a dead session on every codec).
+                        if want != applied && last_reopen.elapsed() >= Duration::from_secs(1) {
                             let (nw, nh) = ((want >> 32) as u32, (want & 0xFFFF_FFFF) as u32);
+                            // Query the panel's true pixel size BEFORE the
+                            // display is consumed by the capturer build; a
+                            // SIZED stream reports the box, not the panel.
                             let rebuilt = if want == 0 {
-                                Display::primary().ok().and_then(|d| Capturer::new(d).ok())
+                                Display::primary().ok().map(|d| {
+                                    let pw = d.pixel_width() as u32;
+                                    let ph = d.pixel_height() as u32;
+                                    (Capturer::new(d).ok(), pw, ph)
+                                })
                             } else {
-                                Display::primary()
-                                    .ok()
-                                    .and_then(|d| Capturer::new_sized(d, nw as usize, nh as usize).ok())
+                                Display::primary().ok().map(|d| {
+                                    let pw = d.pixel_width() as u32;
+                                    let ph = d.pixel_height() as u32;
+                                    (
+                                        Capturer::new_sized(d, nw as usize, nh as usize).ok(),
+                                        pw,
+                                        ph,
+                                    )
+                                })
                             };
+                            last_reopen = Instant::now();
                             match rebuilt {
-                                Some(c) => {
+                                Some((Some(c), pw, ph)) => {
                                     w = c.width() as u32;
                                     h = c.height() as u32;
+                                    // Plain open delivers the panel itself —
+                                    // trust the capturer (it also tracks a
+                                    // display-mode change); sized open must
+                                    // take the queried panel size.
+                                    if want == 0 {
+                                        native_w = w;
+                                        native_h = h;
+                                    } else {
+                                        native_w = pw.max(1);
+                                        native_h = ph.max(1);
+                                    }
                                     cap = c;
                                     applied = want;
                                     tracing::info!(
                                         width = w,
                                         height = h,
+                                        native_w,
+                                        native_h,
                                         "capture: re-opened the stream at the encode box (CoreGraphics scales; no CPU resample)"
                                     );
                                 }
-                                None => {
+                                Some((None, _, _)) | None => {
                                     // Keep the WORKING capturer rather than
                                     // dropping the session: a refused resize
                                     // costs the optimisation, not the stream.
@@ -192,7 +237,8 @@ impl ScrapCapture {
                             }
                         }
                     }
-                    let reply = capture_one_blocking(&mut cap, w, h, start, downscale);
+                    let reply =
+                        capture_one_blocking(&mut cap, w, h, (native_w, native_h), start, downscale);
                     let _ = res_tx.send(reply);
                 }
             })
@@ -266,10 +312,19 @@ fn frame_stride(buf: &scrap::Frame<'_>, width: u32, height: u32) -> u32 {
     stride.max(width.saturating_mul(4))
 }
 
+/// The `Frame::source` a scaled delivery must carry: the TRUE panel size when
+/// the delivered dims differ from it, `None` for a 1:1 delivery. Feeding the
+/// pump capped dims as "native" is the feedback loop documented at the worker's
+/// rebuild site — this is the one place the truth gets stamped.
+fn native_source(native: (u32, u32), out: (u32, u32)) -> Option<(u32, u32)> {
+    (native != out && native.0 > 0 && native.1 > 0).then_some(native)
+}
+
 fn capture_one_blocking(
     cap: &mut Capturer,
     width: u32,
     height: u32,
+    native: (u32, u32),
     start: Instant,
     downscale: DownscalePolicy,
 ) -> CaptureReply {
@@ -309,7 +364,12 @@ fn capture_one_blocking(
                     // populate this from Direct3D11CaptureFrame::
                     // DirtyRegion() once it lands.
                     damage: Damage::Unknown,
-                    source: None,
+                    // The panel's true size whenever this delivery is scaled
+                    // (CG encode-box stream and/or the 2x CPU downscale) —
+                    // `Frame::native_dims()` is the pump's cap input and the
+                    // cursor pump's coordinate space, and both are wrong the
+                    // moment a scaled frame claims to BE native.
+                    source: native_source(native, (out_w, out_h)),
                 }));
             }
             Err(e) if e.kind() == WouldBlock => {
@@ -432,6 +492,25 @@ mod tests {
         // 0 is reserved for "no cap — deliver native" and must be
         // unreachable from any dimension the guard lets through (w,h >= 2).
         assert_ne!(pack_dims(2, 2), 0);
+    }
+
+    /// The feedback-loop lock (field 2026-08-26): a frame delivered at the
+    /// encode box MUST report the panel as its `source`, and a 1:1 delivery
+    /// must NOT carry one. The pump's cap decision keys on
+    /// `Frame::native_dims()`; a capped frame claiming to be native makes the
+    /// pump lift the cap, which re-opens the stream at native, which re-engages
+    /// the cap — ~30 stream rebuilds per second and a dead session on every
+    /// codec.
+    #[test]
+    fn scaled_delivery_reports_the_panel_as_source() {
+        let native = (3024u32, 1964u32);
+        // CG stream opened at the encode box → source = panel.
+        assert_eq!(native_source(native, (1926, 1252)), Some(native));
+        // 1:1 delivery → no source (own dims ARE native).
+        assert_eq!(native_source(native, native), None);
+        // Degenerate native must never be reported (a poisoned query would
+        // otherwise become the pump's cap input).
+        assert_eq!(native_source((0, 0), (1926, 1252)), None);
     }
 
     /// On a headless host there may be no $DISPLAY / X server, so we accept
