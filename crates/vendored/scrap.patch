@@ -1,6 +1,6 @@
 diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/quartz.rs
 --- upstream/src/common/quartz.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/common/quartz.rs	2026-08-25 21:20:03.435926600 +0200
++++ vendored/src/common/quartz.rs	2026-08-26 00:35:05.772337800 +0200
 @@ -9,16 +9,75 @@
  }
  
@@ -98,9 +98,30 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
  impl<'a> ops::Deref for Frame<'a> {
      type Target = [u8];
      fn deref(&self) -> &[u8] {
+@@ -97,4 +167,20 @@
+     pub fn height(&self) -> usize {
+         self.0.height()
+     }
++
++    /// ROOMLER PATCH: the display's TRUE pixel size (see `quartz::Display::
++    /// pixel_size` — `CGDisplayModeGetPixelWidth/Height`, with the point-size
++    /// fallback). `width()/height()` stay POINTS on purpose (pointer mapping);
++    /// these exist for callers that must know the panel's real resolution
++    /// INDEPENDENT of whatever size a capture stream was opened at — a
++    /// capturer opened at the encode box reports the box, and using that as
++    /// "native" is the feedback loop that re-opened the stream every frame
++    /// (field 2026-08-26).
++    pub fn pixel_width(&self) -> usize {
++        self.0.pixel_width()
++    }
++
++    pub fn pixel_height(&self) -> usize {
++        self.0.pixel_height()
++    }
+ }
 diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz/display.rs
 --- upstream/src/quartz/display.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/display.rs	2026-08-25 21:20:03.456325800 +0200
++++ vendored/src/quartz/display.rs	2026-08-26 00:35:05.840398000 +0200
 @@ -40,6 +40,48 @@
          unsafe { CGDisplayPixelsHigh(self.0) }
      }
@@ -152,7 +173,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz
      }
 diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi.rs
 --- upstream/src/quartz/ffi.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/ffi.rs	2026-08-25 21:20:03.458358600 +0200
++++ vendored/src/quartz/ffi.rs	2026-08-26 00:35:05.843639300 +0200
 @@ -9,6 +9,8 @@
  pub type CFNumberRef = *mut c_void;
  pub type CFStringRef = *mut c_void;
@@ -201,7 +222,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi
      pub fn IOSurfaceDecrementUseCount(buffer: IOSurfaceRef);
 diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/frame.rs
 --- upstream/src/quartz/frame.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/frame.rs	2026-08-25 21:20:03.454330600 +0200
++++ vendored/src/quartz/frame.rs	2026-08-26 00:35:05.824054100 +0200
 @@ -3,7 +3,9 @@
  
  pub struct Frame {
