@@ -1,5 +1,6 @@
 import router from '@/plugins/router'
 import { useSnackbar } from '@/composables/useSnackbar'
+import { clearSignedIn } from '@/api/session'
 
 const BASE_URL = '/api'
 
@@ -25,8 +26,16 @@ class ApiError extends Error {
   }
 }
 
-function getToken(): string | null {
-  return localStorage.getItem('access_token')
+/**
+ * End the session locally after the server has rejected it.
+ *
+ * Only clears the local hint — the cookie is `HttpOnly`, so the SERVER has to
+ * expire it, which is what `/auth/logout` is for. This path is the involuntary
+ * one (the credential was already refused), so there is nothing left to revoke.
+ */
+function endSessionLocally(): void {
+  clearSignedIn()
+  router.push({ name: 'login' })
 }
 
 /**
@@ -62,25 +71,19 @@ async function tryRefreshToken(): Promise<RefreshOutcome> {
 }
 
 async function doRefresh(): Promise<RefreshOutcome> {
-  const refreshToken = localStorage.getItem('refresh_token')
-  if (!refreshToken) return 'failed'
+  // No token to send and none to keep: the refresh credential is an HttpOnly
+  // cookie scoped to this exact endpoint, so the browser attaches it and the
+  // response replaces it. An empty body is the whole request.
   try {
     const resp = await fetch(`${BASE_URL}/auth/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      body: '{}',
     })
     if (resp.status === 429) return 'throttled'
     if (!resp.ok) return 'failed'
-    const data = await resp.json()
-    if (data.access_token) {
-      localStorage.setItem('access_token', data.access_token)
-      if (data.refresh_token) {
-        localStorage.setItem('refresh_token', data.refresh_token)
-      }
-      return 'ok'
-    }
-    return 'failed'
+    // The new access token arrives as a Set-Cookie; the body copy is ignored.
+    return 'ok'
   } catch {
     return 'failed'
   }
@@ -88,14 +91,14 @@ async function doRefresh(): Promise<RefreshOutcome> {
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, headers = {} } = options
-  const token = getToken()
 
+  // No Authorization header. `BASE_URL` is `/api`, so every call here is
+  // same-origin and the browser attaches the `access_token` cookie itself —
+  // which the server has always accepted. Reading a token in JS to put it back
+  // on the request bought nothing except a credential sitting in localStorage
+  // for an XSS to find.
   const fetchHeaders: Record<string, string> = {
     ...headers,
-  }
-
-  if (token) {
-    fetchHeaders['Authorization'] = `Bearer ${token}`
   }
 
   if (body && !(body instanceof FormData)) {
@@ -127,11 +130,11 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       // Try to refresh the token before giving up
       const outcome = await tryRefreshToken()
       if (outcome === 'ok') {
-        // Retry the original request with the new token
-        const retryHeaders = { ...fetchHeaders, Authorization: `Bearer ${getToken()}` }
+        // Retry. Nothing to re-attach: the refresh response replaced the
+        // session cookie, so the retry carries the new one automatically.
         const retryResp = await fetch(`${BASE_URL}${path}`, {
           method,
-          headers: retryHeaders,
+          headers: fetchHeaders,
           body: body instanceof FormData ? body : body ? JSON.stringify(body) : undefined,
         })
         if (retryResp.ok) {
@@ -146,9 +149,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
         showError('Too many requests. Please wait a moment and try again.')
       } else {
         // Refresh was genuinely rejected, or the retry failed — force logout
-        localStorage.removeItem('access_token')
-        localStorage.removeItem('refresh_token')
-        router.push({ name: 'login' })
+        endSessionLocally()
       }
     }
 
@@ -167,9 +168,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       // grant a permission the caller doesn't hold is a normal, expected
       // answer that the dialog already knows how to display. Logging the
       // user out instead would make a deliberate refusal look like a crash.
-      localStorage.removeItem('access_token')
-      localStorage.removeItem('refresh_token')
-      router.push({ name: 'login' })
+      endSessionLocally()
     }
 
     if (resp.status >= 500) {
