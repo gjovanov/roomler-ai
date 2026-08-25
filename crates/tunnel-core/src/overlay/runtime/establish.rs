@@ -2500,6 +2500,18 @@ impl OverlayRuntime {
                     peer = %nid, ?was,
                     "overlay relay: peer is relaying to us over /derp while we hold another carrier — following it onto DERP now (demote-follow)"
                 );
+                // #29 — and SUPPRESS the tier we are leaving. Otherwise
+                // make-before-break re-promotes it the moment its probe
+                // latches, the peer keeps relaying, and the two mechanisms flap
+                // the pair on MBB's cadence (field 2026-08-25: every 60 s for
+                // hours, from the minute #27 shipped). A latched probe proves
+                // the path CARRIES; it says nothing about whether the peer
+                // intends to use it, and the peer's own frames are the better
+                // evidence. Decaying, so direct returns on its own.
+                if let Some(t) = was.filter(|t| t.is_direct()) {
+                    let mbb = crate::overlay::direct::make_before_break_enabled();
+                    self.shadow(|s| s.mon.on_peer_relayed_instead(&nid, t, mbb, Instant::now()));
+                }
                 self.install_ready(wg, by_node, tun, link, relay_bq).await;
                 true
             }
