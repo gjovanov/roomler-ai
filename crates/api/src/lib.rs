@@ -3,6 +3,7 @@ pub mod cookies;
 pub mod error;
 pub mod extractors;
 pub mod media_stats;
+pub mod media_type;
 pub mod middleware;
 pub mod origin;
 pub mod rate_limit;
