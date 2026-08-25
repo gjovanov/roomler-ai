@@ -279,6 +279,16 @@ cascade's guarantees while replacing its reactive counters:
   onto DERP immediately (`RelayCoordinator::follow_peer_to_derp`). This is the
   carrier-layer twin of WireGuard endpoint roaming, which already existed for
   the direct plane (`carrier_plane` `SessionRoam`) and never for DERP.
+  ⚠️ A follow also **suppresses the direct tier it left** (#29). Without that,
+  make-before-break re-promotes the moment its probe latches, the peer keeps
+  relaying, the follow drags us back, and the pair flaps on MBB's cadence —
+  field 2026-08-25, every 60 s for hours, starting the minute the follow
+  shipped. A latched probe proves a path *carries*; it says nothing about
+  whether the peer intends to **use** it, and the peer's own frames are the
+  better evidence. The suppression decays (`on_peer_relayed_instead` books the
+  penalty but deliberately **no Q slam** — nothing died and the path may be
+  fine), so direct returns by itself once the peer does.
+
   It is safe to act on because the relay **stamps** the source pubkey from the
   sender's authenticated registration — it is not sender-chosen — so the signal
   can only name a node registered in this network whose ACL permits reaching
