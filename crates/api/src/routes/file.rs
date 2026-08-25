@@ -212,7 +212,7 @@ pub async fn upload(
         match name.as_str() {
             "file" => {
                 let filename = field.file_name().unwrap_or("unnamed").to_string();
-                let content_type = field
+                let claimed = field
                     .content_type()
                     .unwrap_or("application/octet-stream")
                     .to_string();
@@ -220,6 +220,9 @@ pub async fn upload(
                     .bytes()
                     .await
                     .map_err(|e| ApiError::BadRequest(format!("Failed to read file: {}", e)))?;
+                // The client wrote `claimed` into its own multipart part, so
+                // it is a claim. Store what the BYTES say instead.
+                let content_type = crate::media_type::resolve(&claimed, &filename, &bytes);
                 file_data = Some((filename, content_type, bytes.to_vec()));
             }
             "room_id" => {
@@ -403,7 +406,7 @@ pub async fn upload_room(
 
         if name == "file" {
             let filename = field.file_name().unwrap_or("unnamed").to_string();
-            let content_type = field
+            let claimed = field
                 .content_type()
                 .unwrap_or("application/octet-stream")
                 .to_string();
@@ -411,6 +414,9 @@ pub async fn upload_room(
                 .bytes()
                 .await
                 .map_err(|e| ApiError::BadRequest(format!("Failed to read file: {}", e)))?;
+            // The client wrote `claimed` into its own multipart part, so it is
+            // a claim. Store what the BYTES say instead.
+            let content_type = crate::media_type::resolve(&claimed, &filename, &bytes);
             file_data = Some((filename, content_type, bytes.to_vec()));
         }
     }
