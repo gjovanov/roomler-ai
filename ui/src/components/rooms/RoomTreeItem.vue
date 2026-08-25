@@ -96,7 +96,13 @@ const deleting = ref(false)
 const children = computed(() => roomStore.childrenOf(props.room.id))
 
 const roomIcon = computed(() => {
-  if (!props.room.is_open) return 'mdi-lock'
+  // The padlock renders from `visibility`, which the server ENFORCES — not
+  // from `is_open`, which only means "listed in Explore". Rooms created
+  // through the API default to `is_open: false`, so the old condition drew a
+  // lock on most rooms in the org while every member could read them: a
+  // padlock claiming a privacy that did not exist.
+  if (props.room.visibility === 'secret') return 'mdi-eye-off'
+  if (props.room.visibility === 'private') return 'mdi-lock'
   if (props.room.has_media) return 'mdi-video'
   if (props.room.parent_id === undefined) return 'mdi-folder'
   return 'mdi-pound'
