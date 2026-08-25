@@ -2132,6 +2132,7 @@ async fn relay_tunnel_msg_from_agent(state: &AppState, parsed: ClientMsg) -> Opt
             session_id,
             cert_fingerprint,
             addrs,
+            derp_pubkey,
         } => {
             relay_to_client(
                 state,
@@ -2140,6 +2141,9 @@ async fn relay_tunnel_msg_from_agent(state: &AppState, parsed: ClientMsg) -> Opt
                     session_id,
                     cert_fingerprint,
                     addrs,
+                    // R4 — relayed verbatim; the client needs the agent's
+                    // DERP identity to dial the quic-derp-v1 leg.
+                    derp_pubkey,
                 },
             )
             .await;

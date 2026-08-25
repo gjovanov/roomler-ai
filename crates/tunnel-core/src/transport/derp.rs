@@ -104,6 +104,60 @@ pub struct DerpConn {
     synth_peer: SocketAddr,
 }
 
+/// One peer's inbound routes on the mux — the WG/carrier consumer (today's
+/// [`DerpMux::conn_for`]) and, since R4, an optional TUNNEL consumer
+/// ([`DerpMux::tunnel_conn_for`]) carrying QUIC for the tunnel's
+/// `quic-derp-v1` flavor over the SAME established `/derp` WS. Split per
+/// frame by [`classify_payload`]; with no tunnel consumer registered the
+/// behavior is byte-identical to the pre-R4 single-route mux.
+#[derive(Default)]
+struct PeerRoutes {
+    wg: Option<mpsc::Sender<Vec<u8>>>,
+    tunnel: Option<mpsc::Sender<Vec<u8>>>,
+}
+
+/// Local copy of the disco magic (`overlay::disco::MAGIC`) — `transport` must
+/// compile without the `overlay` feature, so it cannot reference the module;
+/// a feature-gated test asserts the two never drift.
+const DISCO_MAGIC: &[u8; 8] = b"RMDISCO1";
+
+/// Which consumer an inbound DERP payload belongs to. WireGuard frames start
+/// with their LE u32 message type — first byte 1..=4 — and disco frames with
+/// the 8-byte `RMDISCO1` magic (designed disjoint from WG, doc'd in
+/// `overlay::disco`); both belong to the carrier/WG consumer. EVERYTHING else
+/// (QUIC long headers ≥0xC0, short headers 0x40..=0x7F, version-negotiation
+/// 0x80..=0xBF) is tunnel traffic — but only when a tunnel consumer is
+/// registered; otherwise it falls through to the WG consumer exactly as
+/// before R4 (boringtun discards non-WG bytes — harmless, and preserves the
+/// legacy path for anything unexpected). A QUIC short-header packet CAN start
+/// with 0x52 ('R'), which is why the disco check is the full 8-byte magic and
+/// runs first.
+pub fn payload_is_wg_or_disco(payload: &[u8]) -> bool {
+    matches!(payload.first(), Some(1..=4)) || payload.len() >= 8 && &payload[..8] == DISCO_MAGIC
+}
+
+/// R4 — everything the tunnel driver needs to run the `quic-derp-v1` flavor:
+/// the node's established DERP mux + its own pubkey (hex, as it travels on
+/// the wire). Built by the daemon (an overlay node); the standalone CLI has
+/// no overlay identity and passes `None`, keeping the classic ladder.
+#[derive(Clone)]
+pub struct DerpTunnelHandle {
+    pub mux: Arc<DerpMux>,
+    pub self_pubkey_hex: String,
+}
+
+/// Parse a 64-char lowercase-hex DERP/WG pubkey off the wire. `None` on any
+/// malformation — the caller falls back rather than panicking on peer input.
+pub fn parse_pubkey_hex(s: &str) -> Option<DerpPubKey> {
+    let bytes = hex::decode(s.trim()).ok()?;
+    bytes.try_into().ok()
+}
+
+/// Hex-encode a DERP pubkey for the wire.
+pub fn pubkey_hex(pk: &DerpPubKey) -> String {
+    hex::encode(pk)
+}
+
 /// A stable, non-routable synthetic `SocketAddr` derived from a pubkey:
 /// `127.<pk0>.<pk1>.<pk2|1>:<pk3pk4 | 0x8000>`. Deterministic + unique enough
 /// per peer; only used as a carrier "remote" placeholder.
@@ -194,7 +248,7 @@ pub struct DerpMux {
     /// path distinguish a reconnect blip from a sustained WSS outage — the
     /// U1 healer must not clear force-DERP pins on a flap (Phase A1).
     down_since: Mutex<Option<Instant>>,
-    peers: Mutex<HashMap<DerpPubKey, mpsc::Sender<Vec<u8>>>>,
+    peers: Mutex<HashMap<DerpPubKey, PeerRoutes>>,
     /// #27/#28 — where this mux reports [`MuxEvent`]s to the runtime. `None`
     /// until the runtime arms it (tests, and the tunnel-only paths that never
     /// demote, leave it unset).
@@ -258,7 +312,34 @@ impl DerpMux {
     /// the route — last one wins, so stale inbound senders never accumulate.
     pub fn conn_for(&self, peer_pubkey: DerpPubKey) -> DerpConn {
         let (in_tx, in_rx) = mpsc::channel(INBOUND_QUEUE);
-        self.peers.lock().unwrap().insert(peer_pubkey, in_tx);
+        self.peers
+            .lock()
+            .unwrap()
+            .entry(peer_pubkey)
+            .or_default()
+            .wg = Some(in_tx);
+        self.build_conn(peer_pubkey, in_rx)
+    }
+
+    /// R4 — vend a [`DerpConn`] for the TUNNEL's `quic-derp-v1` flavor toward
+    /// `peer_pubkey`, sharing this mux's established `/derp` WS with the WG
+    /// carrier for the same peer. Inbound frames are split per packet by
+    /// [`payload_is_wg_or_disco`]; outbound framing is identical (the far
+    /// end's mux does the same split). Last one wins per peer, like
+    /// [`Self::conn_for`] — a new tunnel session replaces the previous
+    /// session's route.
+    pub fn tunnel_conn_for(&self, peer_pubkey: DerpPubKey) -> DerpConn {
+        let (in_tx, in_rx) = mpsc::channel(INBOUND_QUEUE);
+        self.peers
+            .lock()
+            .unwrap()
+            .entry(peer_pubkey)
+            .or_default()
+            .tunnel = Some(in_tx);
+        self.build_conn(peer_pubkey, in_rx)
+    }
+
+    fn build_conn(&self, peer_pubkey: DerpPubKey, in_rx: mpsc::Receiver<Vec<u8>>) -> DerpConn {
         DerpConn {
             peer_pubkey,
             ws_out: self.ws_out.clone(),
@@ -267,6 +348,11 @@ impl DerpMux {
             synth_local: synth_addr(&self.self_pubkey),
             synth_peer: synth_addr(&peer_pubkey),
         }
+    }
+
+    /// This node's own DERP pubkey (the WG identity the mux registered with).
+    pub fn self_pubkey(&self) -> DerpPubKey {
+        self.self_pubkey
     }
 
     /// Route one inbound relay frame `[src_pubkey(32) || payload]` to the
@@ -297,10 +383,34 @@ impl DerpMux {
         }
         let mut src = [0u8; 32];
         src.copy_from_slice(&frame[..32]);
-        let sender = self.peers.lock().unwrap().get(&src).cloned();
-        match sender {
+        let payload = &frame[32..];
+        // R4 split: a non-WG/non-disco payload goes to the peer's TUNNEL
+        // consumer when one is registered. Tunnel drops are counted but
+        // never emit `Unrouted` — that event means "peer demoted, follow it
+        // onto DERP" and would send the overlay runtime chasing a carrier
+        // condition that doesn't exist; QUIC's own loss recovery owns the
+        // tunnel side.
+        let (wg_tx, tunnel_tx) = {
+            let peers = self.peers.lock().unwrap();
+            match peers.get(&src) {
+                Some(r) => (r.wg.clone(), r.tunnel.clone()),
+                None => (None, None),
+            }
+        };
+        // No tunnel consumer ⇒ pre-R4 behavior: everything falls through to
+        // the WG route (boringtun discards non-WG bytes; the Unrouted
+        // semantics below stay exactly as shipped in #27).
+        if !payload_is_wg_or_disco(payload)
+            && let Some(tx) = tunnel_tx
+        {
+            if tx.try_send(payload.to_vec()).is_err() {
+                self.dropped_backpressure.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        match wg_tx {
             Some(tx) => {
-                if tx.try_send(frame[32..].to_vec()).is_err() {
+                if tx.try_send(payload.to_vec()).is_err() {
                     // Full (the peer's carrier is not draining) or closed (the
                     // `DerpConn` was dropped when a better tier replaced this
                     // carrier — the registration outlives it by design, "last
@@ -373,6 +483,76 @@ mod tests {
 
     fn pk(b: u8) -> DerpPubKey {
         [b; 32]
+    }
+
+    fn frame(src: DerpPubKey, payload: &[u8]) -> Vec<u8> {
+        let mut f = src.to_vec();
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// The local disco-magic copy must never drift from the canonical one —
+    /// a drift would silently re-route disco frames into the tunnel consumer
+    /// and break carrier liveness for exactly the peers using the derp leg.
+    #[cfg(feature = "overlay")]
+    #[test]
+    fn disco_magic_matches_the_canonical_module() {
+        assert_eq!(DISCO_MAGIC, crate::overlay::disco::MAGIC);
+    }
+
+    /// R4 — per-frame demux: WG (first byte 1..=4) and disco (8-byte magic)
+    /// reach the WG consumer; QUIC-shaped payloads (short header 0x40+, long
+    /// header 0xC0+) reach the TUNNEL consumer when registered. A QUIC short
+    /// header may start with 0x52 ('R'), so the disco test is the full magic.
+    #[tokio::test]
+    async fn deliver_splits_wg_disco_and_tunnel_per_frame() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let peer = pk(0x02);
+        let wg_conn = mux.conn_for(peer);
+        let tun_conn = mux.tunnel_conn_for(peer);
+
+        let wg_payload = [1u8, 0, 0, 0, 0xAA]; // WG handshake-init shape
+        let quic_short = [0x52u8, 9, 9, 9, 9]; // 'R' but NOT the disco magic
+        let quic_long = [0xC3u8, 0, 0, 0, 1];
+        let mut disco = DISCO_MAGIC.to_vec();
+        disco.extend_from_slice(&[7; 24]);
+
+        mux.deliver(&frame(peer, &wg_payload));
+        mux.deliver(&frame(peer, &quic_short));
+        mux.deliver(&frame(peer, &quic_long));
+        mux.deliver(&frame(peer, &disco));
+
+        let mut buf = [0u8; 128];
+        let (n, _) = wg_conn.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &wg_payload, "WG frame → WG consumer");
+        let (n, _) = tun_conn.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &quic_short, "QUIC short header → tunnel");
+        let (n, _) = tun_conn.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &quic_long, "QUIC long header → tunnel");
+        let (n, _) = wg_conn.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &disco[..], "disco magic → WG consumer");
+    }
+
+    /// R4 — with NO tunnel consumer registered the mux behaves exactly as
+    /// pre-R4: every payload (including QUIC-shaped ones) goes to the WG
+    /// route, and misses report `Unrouted` as shipped in #27.
+    #[tokio::test]
+    async fn deliver_without_tunnel_consumer_is_pre_r4_behavior() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let peer = pk(0x02);
+        let wg_conn = mux.conn_for(peer);
+
+        let quic_short = [0x52u8, 9, 9, 9, 9];
+        mux.deliver(&frame(peer, &quic_short));
+        let mut buf = [0u8; 64];
+        let (n, _) = wg_conn.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &quic_short, "no tunnel route ⇒ WG consumer");
+
+        // An unknown peer still reports Unrouted (the #27 contract).
+        let (ev_tx, mut ev_rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(ev_tx);
+        mux.deliver(&frame(pk(0x03), &quic_short));
+        assert_eq!(ev_rx.try_recv().unwrap(), MuxEvent::Unrouted(pk(0x03)));
     }
 
     /// Phase A1 — `down_for` measures the WHOLE outage (repeated
