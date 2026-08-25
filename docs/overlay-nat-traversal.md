@@ -285,9 +285,17 @@ cascade's guarantees while replacing its reactive counters:
   field 2026-08-25, every 60 s for hours, starting the minute the follow
   shipped. A latched probe proves a path *carries*; it says nothing about
   whether the peer intends to **use** it, and the peer's own frames are the
-  better evidence. The suppression decays (`on_peer_relayed_instead` books the
-  penalty but deliberately **no Q slam** — nothing died and the path may be
-  fine), so direct returns by itself once the peer does.
+  better evidence. `on_peer_relayed_instead` books the penalty but deliberately
+  **no Q slam** — nothing died and the path may be fine.
+  ⚠️ The penalty ALONE does not hold, and believing it did cost a second field
+  round: `suppression_half_life` pins LAN-under-MBB to `H_ORDINARY` (60 s) by
+  the P8 never-strand rule, while MBB re-probes every ~70-80 s — so the tier is
+  eligible again by the next probe and the flap simply resumes. It therefore
+  also opens a hard `RELAYED_INSTEAD_HOLDOFF` window during which every direct
+  tier is **ineligible outright**. That is the honest shape anyway: where the
+  peer *is* is a fact, not a quality score. Every follow re-arms the window, so
+  it self-extends while the peer stays away and lapses once it stops relaying —
+  the next probe then promotes normally and nothing is stranded.
 
   It is safe to act on because the relay **stamps** the source pubkey from the
   sender's authenticated registration — it is not sender-chosen — so the signal
