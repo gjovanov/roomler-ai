@@ -405,6 +405,9 @@ impl LocalApiState for DaemonState {
                 .unwrap_or_default(),
             // PR-B1 — per-socket receive liveness + band-walk tripwire.
             direct_socks: self.overlay.borrow().direct_socks.clone(),
+            // #32 — the `/derp` inbound-drop counters, verbatim from the
+            // overlay view. `None` when the overlay isn't running.
+            derp_inbound_drops: self.overlay.borrow().derp_inbound_drops,
             direct_bind_walks: Some(
                 tunnel_core::evidence::DIRECT_BIND_WALKS.load(Ordering::Relaxed),
             ),
