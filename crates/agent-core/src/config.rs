@@ -302,6 +302,15 @@ pub struct AgentConfig {
     /// leg is field-proven. Client-side only (the flow supervisor reads it).
     #[serde(default)]
     pub tunnel_derp_fallback: Option<bool>,
+    /// R3 — keep established tunnel QUIC peers ALIVE across a control-WS
+    /// reattach instead of tearing them down on every transient WS drop
+    /// (`ROOMLER_NODE_TUNNEL_PEERS_SURVIVE_REATTACH`). QUIC flows self-signal
+    /// over their own streams (no welded control-WS sender), so a QUIC/derp
+    /// data plane survives a corp-VPN control-WS blip. Needs the server-side
+    /// grace (`ROOMLER__RC__TUNNEL_GRACE_SECS`) to be useful. Built-in
+    /// default: off while field-proven. Agent (target) side.
+    #[serde(default)]
+    pub tunnel_peers_survive_reattach: Option<bool>,
     /// Make-before-break carrier upgrades (`ROOMLER_NODE_OVERLAY_MBB`).
     /// Built-in default: on.
     #[serde(default)]
@@ -1512,6 +1521,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_derp_floor: None,
         overlay_netcheck: None,
         tunnel_derp_fallback: None,
+        tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
         overlay_lan_iface_filter: None,
         overlay_wsl_mirrored_guard: None,
@@ -1679,7 +1689,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 45] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 46] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
@@ -1697,6 +1707,10 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 45]
         ("OVERLAY_DERP_FLOOR", cfg.overlay_derp_floor),
         ("OVERLAY_NETCHECK", cfg.overlay_netcheck),
         ("TUNNEL_DERP_FALLBACK", cfg.tunnel_derp_fallback),
+        (
+            "TUNNEL_PEERS_SURVIVE_REATTACH",
+            cfg.tunnel_peers_survive_reattach,
+        ),
         ("OVERLAY_MBB", cfg.overlay_mbb),
         ("OVERLAY_LAN_IFACE_FILTER", cfg.overlay_lan_iface_filter),
         ("OVERLAY_WSL_MIRRORED_GUARD", cfg.overlay_wsl_mirrored_guard),
