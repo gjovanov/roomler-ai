@@ -41,6 +41,10 @@ use crate::transport::relay::RelayConn;
 /// 32-byte WireGuard public key — the DERP addressing unit.
 pub type DerpPubKey = [u8; 32];
 
+/// #32 — the `src_pubkey → inbound` registry, shared with every [`DerpConn`]
+/// so a conn can retire its own entry on drop (see that `Drop` impl).
+type PeerTable = Arc<Mutex<HashMap<DerpPubKey, mpsc::Sender<Vec<u8>>>>>;
+
 /// Depth of a node's shared outbound WS queue (frames waiting to hit the wire).
 /// Bounded so a stalled WS can't grow memory without bound; overflow drops the
 /// frame (WG/QUIC are loss-tolerant — a dropped carrier datagram retransmits).
@@ -102,6 +106,42 @@ pub struct DerpConn {
     /// rejects a family-mismatched or zero-port remote).
     synth_local: SocketAddr,
     synth_peer: SocketAddr,
+    /// #32 — the mux's registration table, plus OUR sender in it, so [`Drop`]
+    /// can retire exactly our own entry and never a newer peer's.
+    peers: PeerTable,
+    self_tx: mpsc::Sender<Vec<u8>>,
+}
+
+/// #32 — a registration must not outlive the conn that consumes it.
+///
+/// The table was written once and never cleaned: `conn_for` inserted, "last one
+/// wins" replaced, and nothing ever removed. That is fine only while a dropped
+/// `DerpConn` also closes its channel — and it does NOT if any `Arc` clone of
+/// it survives the carrier being replaced (the coordinator, a build-queue
+/// entry, a `relay_parts` tuple). Then `deliver` finds a live sender,
+/// `try_send` returns **Ok**, and the frame lands in a queue nobody drains:
+/// silent, and invisible to the #27 signal, which only reports on send
+/// FAILURE. Field 2026-08-25 (pc55331 VPN reconnect): the peer relayed to us
+/// with `initiate=true` for 18 s and the far end neither followed nor reported
+/// anything — this is the leading explanation.
+///
+/// Removing on drop makes the registration's lifetime the consumer's lifetime,
+/// which is the invariant `deliver` already assumed. Same class as
+/// "an `RTCPeerConnection` must be `close()`d": bookkeeping outliving its owner.
+impl Drop for DerpConn {
+    fn drop(&mut self) {
+        let mut peers = self.peers.lock().unwrap();
+        // ⚠️ Only if the entry is STILL ours. A rebuild registers the new conn
+        // before the old one drops ("last one wins"), and retiring the entry
+        // blindly would unregister the LIVE carrier — turning a fix for a
+        // silent drop into a guaranteed one.
+        if peers
+            .get(&self.peer_pubkey)
+            .is_some_and(|tx| tx.same_channel(&self.self_tx))
+        {
+            peers.remove(&self.peer_pubkey);
+        }
+    }
 }
 
 /// A stable, non-routable synthetic `SocketAddr` derived from a pubkey:
@@ -194,16 +234,18 @@ pub struct DerpMux {
     /// path distinguish a reconnect blip from a sustained WSS outage — the
     /// U1 healer must not clear force-DERP pins on a flap (Phase A1).
     down_since: Mutex<Option<Instant>>,
-    peers: Mutex<HashMap<DerpPubKey, mpsc::Sender<Vec<u8>>>>,
+    peers: PeerTable,
     /// #27/#28 — where this mux reports [`MuxEvent`]s to the runtime. `None`
     /// until the runtime arms it (tests, and the tunnel-only paths that never
     /// demote, leave it unset).
     events_tx: Mutex<Option<mpsc::Sender<MuxEvent>>>,
-    /// Lifetime count of frames dropped by `deliver`, split by cause. Read by
-    /// the LocalAPI/diagnostics; the point is that neither drop is silent any
-    /// more (they both were — see the `deliver` doc).
-    dropped_unrouted: Arc<std::sync::atomic::AtomicU64>,
-    dropped_backpressure: Arc<std::sync::atomic::AtomicU64>,
+    /// #32 — THIS mux's inbound-drop counts. Kept alongside the process-global
+    /// `evidence::DERP_INBOUND_*` (which is what the operator view reports, a
+    /// node holding several muxes) because a per-instance counter is the only
+    /// one a test can assert exactly — sharing one global made the unit tests
+    /// race each other, failing 1 run in 3.
+    dropped_unrouted: std::sync::atomic::AtomicU64,
+    dropped_backpressure: std::sync::atomic::AtomicU64,
 }
 
 impl DerpMux {
@@ -218,10 +260,10 @@ impl DerpMux {
             ws_out,
             alive: Arc::new(AtomicBool::new(true)),
             down_since: Mutex::new(None),
-            peers: Mutex::new(HashMap::new()),
+            peers: Arc::new(Mutex::new(HashMap::new())),
             events_tx: Mutex::new(None),
-            dropped_unrouted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            dropped_backpressure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_unrouted: std::sync::atomic::AtomicU64::new(0),
+            dropped_backpressure: std::sync::atomic::AtomicU64::new(0),
         });
         (mux, ws_out_rx)
     }
@@ -238,8 +280,10 @@ impl DerpMux {
     /// The channel depth callers should use for [`Self::set_event_sink`].
     pub const EVENT_SINK_DEPTH: usize = EVENT_QUEUE;
 
-    /// #27 — `(unrouted, backpressure)` inbound-drop counts for this mux,
-    /// cumulative for its lifetime.
+    /// #27/#32 — `(unrouted, backpressure)` inbound-drop counts, cumulative
+    /// since daemon start. PROCESS-global, not per-mux: a node holds several
+    /// (central + one per relay region) and the question an operator asks is
+    /// about the node. Surfaced through `NodeStatus::derp_inbound_drops`.
     pub fn drop_counts(&self) -> (u64, u64) {
         (
             self.dropped_unrouted.load(Ordering::Relaxed),
@@ -256,9 +300,15 @@ impl DerpMux {
     /// Vend a [`DerpConn`] pinned to `peer_pubkey`, registering its inbound
     /// route. A later `conn_for` for the same peer (a carrier rebuild) replaces
     /// the route — last one wins, so stale inbound senders never accumulate.
+    ///
+    /// #32 — and the conn RETIRES its own registration on drop, so the route's
+    /// lifetime is its consumer's. See `impl Drop for DerpConn`.
     pub fn conn_for(&self, peer_pubkey: DerpPubKey) -> DerpConn {
         let (in_tx, in_rx) = mpsc::channel(INBOUND_QUEUE);
-        self.peers.lock().unwrap().insert(peer_pubkey, in_tx);
+        self.peers
+            .lock()
+            .unwrap()
+            .insert(peer_pubkey, in_tx.clone());
         DerpConn {
             peer_pubkey,
             ws_out: self.ws_out.clone(),
@@ -266,6 +316,8 @@ impl DerpMux {
             alive: Arc::clone(&self.alive),
             synth_local: synth_addr(&self.self_pubkey),
             synth_peer: synth_addr(&peer_pubkey),
+            peers: Arc::clone(&self.peers),
+            self_tx: in_tx,
         }
     }
 
@@ -307,11 +359,13 @@ impl DerpMux {
                     // one wins"). A CLOSED channel is the same demote-lag
                     // condition as a missing one, so it reports too.
                     self.dropped_backpressure.fetch_add(1, Ordering::Relaxed);
+                    crate::evidence::DERP_INBOUND_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     self.emit(MuxEvent::Unrouted(src));
                 }
             }
             None => {
                 self.dropped_unrouted.fetch_add(1, Ordering::Relaxed);
+                crate::evidence::DERP_INBOUND_UNROUTED.fetch_add(1, Ordering::Relaxed);
                 self.emit(MuxEvent::Unrouted(src));
             }
         }
@@ -414,6 +468,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
         mux.set_event_sink(tx);
 
+        // #32 — the counters are PROCESS-global and cumulative, and the test
+        // binary shares them across parallel tests: diff, never assert an
+        // absolute (the same rule the field summaries follow).
+        let base = mux.drop_counts();
+
         // No conn for 0x02 — the demote-lag case.
         let mut frame = pk(0x02).to_vec();
         frame.extend_from_slice(&[1, 2, 3]);
@@ -423,7 +482,7 @@ mod tests {
             Some(MuxEvent::Unrouted(pk(0x02))),
             "unroutable src reported"
         );
-        assert_eq!(mux.drop_counts().0, 1, "counted as unrouted");
+        assert_eq!(mux.drop_counts().0 - base.0, 1, "counted as unrouted");
 
         // A live conn for 0x03 — routed, and deliberately SILENT.
         let _conn = mux.conn_for(pk(0x03));
@@ -434,11 +493,93 @@ mod tests {
             rx.try_recv().is_err(),
             "a routable frame must never look like a demote signal"
         );
-        assert_eq!(mux.drop_counts(), (1, 0), "no new drops");
+        let now = mux.drop_counts();
+        assert_eq!((now.0 - base.0, now.1 - base.1), (1, 0), "no new drops");
 
         // A short frame is malformed, not a demote signal.
         mux.deliver(&[0u8; 8]);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// #32 — the field case, reproduced. A `DerpConn` whose carrier was
+    /// replaced but whose `Arc` is still held somewhere (the coordinator, a
+    /// build-queue entry, a `relay_parts` tuple) used to leave a LIVE
+    /// registration: `try_send` returned Ok, the frame went into a queue nobody
+    /// drains, and the #27 signal — which only reports on send FAILURE — saw
+    /// nothing. That is a black hole one layer deeper than the one #27 closed.
+    ///
+    /// Retiring the registration on drop is what makes the miss observable. The
+    /// surviving-Arc case is the one that matters, so hold one explicitly.
+    #[tokio::test]
+    async fn a_dropped_conn_retires_its_registration_even_with_a_live_arc() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
+
+        // The carrier holds the conn behind an Arc, exactly as `Carrier::relay`
+        // does; a clone survives the carrier being replaced.
+        let base = mux.drop_counts();
+        let carrier: Arc<DerpConn> = Arc::new(mux.conn_for(pk(0x02)));
+        let survivor = Arc::clone(&carrier);
+
+        let mut frame = pk(0x02).to_vec();
+        frame.extend_from_slice(&[1]);
+        mux.deliver(&frame);
+        assert!(
+            rx.try_recv().is_err(),
+            "while the conn is live the frame routes and must stay silent"
+        );
+
+        // The direct tier is promoted: the carrier is replaced and dropped —
+        // but `survivor` keeps the channel OPEN, which is precisely why the
+        // closed-channel branch never fired in the field.
+        drop(carrier);
+        mux.deliver(&frame);
+        assert!(
+            rx.try_recv().is_err(),
+            "a still-referenced conn is still a valid consumer"
+        );
+
+        // Now the last reference goes. The registration must go with it.
+        drop(survivor);
+        mux.deliver(&frame);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MuxEvent::Unrouted(pk(0x02))),
+            "a retired conn must make the next frame REPORT, not vanish"
+        );
+        assert_eq!(
+            mux.drop_counts().0 - base.0,
+            1,
+            "and be counted as unrouted"
+        );
+    }
+
+    /// #32 — "last one wins" must survive the retirement. A rebuild registers
+    /// the NEW conn before the old one drops, so a blind remove-on-drop would
+    /// unregister the live carrier — converting a silent drop into a guaranteed
+    /// one. The identity check is what prevents that.
+    #[tokio::test]
+    async fn a_rebuild_keeps_the_new_registration_when_the_old_conn_drops() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
+
+        let old = mux.conn_for(pk(0x02));
+        let new = mux.conn_for(pk(0x02)); // rebuild: last one wins
+        drop(old); // …and only now does the old one go
+
+        let mut frame = pk(0x02).to_vec();
+        frame.extend_from_slice(&[7, 7]);
+        mux.deliver(&frame);
+        assert!(
+            rx.try_recv().is_err(),
+            "the surviving registration is the NEW conn's — nothing to report"
+        );
+
+        let mut buf = [0u8; 16];
+        let (n, _) = new.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[7, 7], "and the frame reaches the live conn");
     }
 
     /// #28 — `mark_up` emits `Recovered` on the down→up EDGE only. The WS owner
@@ -471,17 +612,22 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// #27 — the registration OUTLIVES its `DerpConn` by design ("last one
-    /// wins"), so a peer whose DERP carrier was replaced by a better tier
-    /// leaves a live entry pointing at a CLOSED channel. That is the same
-    /// demote-lag condition as a missing entry and must report too — otherwise
-    /// exactly the peers that once used DERP stay silently dark.
+    /// #27/#32 — a peer whose DERP carrier was replaced by a better tier must
+    /// report, or exactly the peers that once used DERP stay silently dark.
+    ///
+    /// ⚠️ The CLASSIFICATION changed with #32 and that is the point: this used
+    /// to land in the closed-channel (backpressure) branch, because the
+    /// registration outlived its conn. It is now `unrouted`, because the conn
+    /// retires its registration on drop. The old shape only reported when NO
+    /// `Arc` survived — and in the field one did, which is how a peer relayed
+    /// to us for 18 s with nothing logged.
     #[tokio::test]
-    async fn a_closed_conn_channel_reports_like_a_missing_one() {
+    async fn a_replaced_carrier_reports_as_unrouted() {
         let (mux, _out_rx) = DerpMux::new(pk(0x01));
         let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
         mux.set_event_sink(tx);
 
+        let base = mux.drop_counts();
         let conn = mux.conn_for(pk(0x02));
         drop(conn); // a better tier replaced this carrier
 
@@ -490,10 +636,40 @@ mod tests {
         mux.deliver(&frame);
 
         assert_eq!(rx.try_recv().ok(), Some(MuxEvent::Unrouted(pk(0x02))));
+        let now = mux.drop_counts();
         assert_eq!(
-            mux.drop_counts(),
-            (0, 1),
-            "counted as backpressure/closed, not as a missing registration"
+            (now.0 - base.0, now.1 - base.1),
+            (1, 0),
+            "the registration is retired, so this is a MISS — not backpressure"
+        );
+    }
+
+    /// #32 — the backpressure branch still exists and still reports: a LIVE
+    /// conn whose consumer has stalled is a different fault from a retired one
+    /// (the carrier is there but not draining), and collapsing the two would
+    /// hide it. Fill the queue past `INBOUND_QUEUE` without reading.
+    #[tokio::test]
+    async fn a_full_inbound_queue_still_reports_as_backpressure() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
+
+        let base = mux.drop_counts();
+        let _conn = mux.conn_for(pk(0x02)); // held, never read from
+        let mut frame = pk(0x02).to_vec();
+        frame.extend_from_slice(&[9]);
+        for _ in 0..(INBOUND_QUEUE + 2) {
+            mux.deliver(&frame);
+        }
+
+        let now = mux.drop_counts();
+        let (unrouted, backpressure) = (now.0 - base.0, now.1 - base.1);
+        assert_eq!(unrouted, 0, "the conn is live — nothing is unrouted");
+        assert!(backpressure >= 1, "a stalled consumer must be counted");
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MuxEvent::Unrouted(pk(0x02))),
+            "and reported, so a wedged carrier is not silent either"
         );
     }
 
