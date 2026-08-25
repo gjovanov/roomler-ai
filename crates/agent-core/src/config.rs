@@ -193,10 +193,52 @@ pub struct AgentConfig {
     /// `RunAs` type enforces everywhere else: never run as something more
     /// privileged than was actually asked for.
     ///
-    /// Server-minted grants are unaffected — they carry their own account mode
-    /// from the device's `SshPolicy`, which stays authoritative for that path.
+    /// Server-minted grants are unaffected by THIS key — they carry their own
+    /// account mode from the device's `SshPolicy`. See
+    /// [`Self::ssh_max_privilege`] for the device-owned ceiling that does
+    /// apply to them.
     #[serde(default)]
     pub ssh_account_mode: Option<String>,
+
+    /// The most privileged identity a SERVER-GRANTED ssh session may run as.
+    /// Default unset = no device-side limit.
+    ///
+    /// ## What this is for
+    ///
+    /// A grant arrives from the control plane carrying its own `account_mode`
+    /// and `consent_mode`, and until this key existed the device had no say in
+    /// either: a server that sent `account_mode: daemon` + `consent_mode: auto`
+    /// got an unattended SYSTEM/root shell, on every device, whatever the
+    /// device's owner had configured. `ssh_account_mode` did not help — it
+    /// governs only the key-list path.
+    ///
+    /// That is the whole M5 question: what does a device still refuse when the
+    /// server asking is the compromised thing? `ssh_enabled` and
+    /// `exec_enabled` are already answers of that shape — device-owned
+    /// switches a server cannot talk past. This is the same idea applied to
+    /// how much privilege a grant may claim.
+    ///
+    /// ## Values, and why unset is permissive
+    ///
+    /// `daemon` (or unset) — no additional limit; a grant may ask for
+    /// anything. `console_user` — a grant asking for the daemon identity is
+    /// REFUSED, not quietly downgraded, because a caller who asked for root
+    /// and silently got a user shell has been told something untrue about
+    /// their own session.
+    ///
+    /// ⚠️ Unset is permissive **so that shipping this changes nothing**. A
+    /// device-side default of `console_user` would have been the fail-safe
+    /// direction and matches how `ssh_enabled` / `exec_enabled` default, but
+    /// it would revoke a working configuration during a fleet update, and the
+    /// device you lose root SSH to may be the one you needed it for. Measured
+    /// on the fleet 2026-08-25: exactly ONE device is currently configured
+    /// `account_mode=daemon, consent_mode=auto`. Flipping this default is a
+    /// deliberate operator decision, not a side effect of an agent roll.
+    ///
+    /// The agent logs a WARN at startup naming this key whenever SSH is on and
+    /// no ceiling is set, so the exposure is visible rather than implicit.
+    #[serde(default)]
+    pub ssh_max_privilege: Option<String>,
 
     /// Report SSH session activity to the org (P8). Default **off**.
     ///
@@ -1454,6 +1496,7 @@ pub fn test_fixture() -> AgentConfig {
         ssh_authorized_keys: Vec::new(),
         ssh_host_key: None,
         ssh_account_mode: None,
+        ssh_max_privilege: None,
         ssh_activity_log: false,
         overlay_quic: None,
         overlay_direct: None,
