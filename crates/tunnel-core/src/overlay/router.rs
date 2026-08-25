@@ -334,9 +334,27 @@ impl Router {
     }
 
     /// Phase 1 — replace `pubkey`'s advertised subnet routes (empty clears them).
-    pub fn set_subnets(&mut self, pubkey: [u8; 32], cidrs: &[Cidr]) {
+    ///
+    /// Returns every claim that is now DUPLICATED — an identical CIDR also held
+    /// by a different peer, i.e. two subnet routers approved for the same
+    /// prefix. Both claims stay in the table (each claimant's RPF authority
+    /// must survive so its own return traffic isn't dropped by a table edit),
+    /// [`route`](Self::route) picks one winner deterministically, and the
+    /// CALLER must surface the conflict loudly: a duplicate claim is an admin
+    /// error the data plane cannot resolve, only expose. Field 2026-08-25: a
+    /// stale approval left two routers claiming the same corp `/32`s and
+    /// insertion order decided which one carried the traffic — a restart
+    /// lottery between a working and a dead egress.
+    pub fn set_subnets(&mut self, pubkey: [u8; 32], cidrs: &[Cidr]) -> Vec<(Cidr, [u8; 32])> {
         self.subnets.retain(|(_, pk)| *pk != pubkey);
+        let conflicts: Vec<(Cidr, [u8; 32])> = self
+            .subnets
+            .iter()
+            .filter(|(c, _)| cidrs.contains(c))
+            .map(|(c, pk)| (*c, *pk))
+            .collect();
         self.subnets.extend(cidrs.iter().map(|c| (*c, pubkey)));
+        conflicts
     }
 
     /// P5 exit-node (S3b) — set (or clear) the peer that carries this node's
@@ -369,6 +387,16 @@ impl Router {
 
     /// Which peer owns the overlay destination `ip`? Exact `/32` first, else the
     /// longest-prefix subnet route that contains it.
+    ///
+    /// Equal-prefix ties (two routers claiming the SAME prefix — see
+    /// [`set_subnets`](Self::set_subnets)) break on the pubkey, so the winner
+    /// is a function of the claims alone. It used to be positional (last
+    /// `set_subnets` won), which made the winner depend on peer-establish
+    /// order: every restart re-rolled which claimant carried the traffic AND
+    /// which one's replies [`rpf_check`](Self::rpf_check) denied (field
+    /// 2026-08-25, the `rx_denied` climb on the honest router). The choice
+    /// stays arbitrary — only the ADMIN can resolve a duplicate claim — but it
+    /// no longer flaps.
     pub fn route(&self, ip: &Ipv4Addr) -> Option<[u8; 32]> {
         if let Some(pk) = self.by_ip.get(ip) {
             return Some(*pk);
@@ -376,7 +404,7 @@ impl Router {
         self.subnets
             .iter()
             .filter(|(c, _)| c.contains(*ip))
-            .max_by_key(|(c, _)| c.prefix)
+            .max_by_key(|(c, pk)| (c.prefix, *pk))
             .map(|(_, pk)| *pk)
     }
 
@@ -540,6 +568,53 @@ mod tests {
         assert!(r.remove_by_pubkey(&gw));
         assert_eq!(r.route(&Ipv4Addr::new(192, 168, 2, 5)), None);
         assert_eq!(r.route(&Ipv4Addr::new(192, 168, 1, 9)), Some(other));
+    }
+
+    /// Two routers approved for the SAME prefix (field 2026-08-25: a stale
+    /// approval left both the old and the new CORP1 router claiming the corp
+    /// `/32`s). The winner must be a function of the claims, not of which peer
+    /// happened to establish last — and the duplicate must be REPORTED so the
+    /// caller can log it.
+    #[test]
+    fn duplicate_subnet_claim_is_reported_and_tie_breaks_deterministically() {
+        let (lo, hi) = ([1u8; 32], [2u8; 32]);
+        let c = Cidr::parse("10.66.51.147/32").unwrap();
+        let dst = Ipv4Addr::new(10, 66, 51, 147);
+
+        // Same claims, both insertion orders → same winner (higher pubkey).
+        let mut a = Router::new();
+        assert_eq!(a.set_subnets(lo, &[c]), vec![], "first claim is clean");
+        assert_eq!(
+            a.set_subnets(hi, &[c]),
+            vec![(c, lo)],
+            "the second claimant is told who it collides with"
+        );
+        let mut b = Router::new();
+        b.set_subnets(hi, &[c]);
+        assert_eq!(b.set_subnets(lo, &[c]), vec![(c, hi)]);
+        assert_eq!(a.route(&dst), Some(hi));
+        assert_eq!(
+            b.route(&dst),
+            Some(hi),
+            "insertion order must not pick the winner"
+        );
+
+        // Re-setting a peer's OWN claims is not a conflict…
+        assert_eq!(a.set_subnets(hi, &[c]), vec![(c, lo)]);
+        let mut solo = Router::new();
+        solo.set_subnets(hi, &[c]);
+        assert_eq!(solo.set_subnets(hi, &[c]), vec![], "self re-set is clean");
+
+        // …a DIFFERENT prefix is not a conflict…
+        assert_eq!(
+            a.set_subnets([3u8; 32], &[Cidr::parse("10.66.51.0/24").unwrap()]),
+            vec![],
+            "overlap without equality routes by longest-prefix, no conflict"
+        );
+
+        // …and removing the winner hands the CIDR to the surviving claimant.
+        assert!(a.remove_by_pubkey(&hi));
+        assert_eq!(a.route(&dst), Some(lo), "the loser takes over on removal");
     }
 
     #[test]
