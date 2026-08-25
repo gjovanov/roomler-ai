@@ -54,7 +54,7 @@ pub const TRANSPORT_QUIC_DERP_V1: &str = "quic-derp-v1";
 /// time — a too-low value makes the server negotiate derp toward agents
 /// that ignore the setup's `transport` field (the client then burns its
 /// 30 s ready-wait), a too-high one only delays adoption.
-pub const MIN_DERP_TUNNEL_AGENT_RC: u32 = 468;
+pub const MIN_DERP_TUNNEL_AGENT_RC: u32 = 469;
 
 /// Whether an agent reporting `version` (its `CARGO_PKG_VERSION`, e.g.
 /// `"0.3.0-rc.104"`) supports the QUIC tunnel data plane — i.e. whether
