@@ -17,6 +17,23 @@ use std::sync::atomic::AtomicU64;
 /// sockets. Nonzero on a quiet host is a bug signal, not noise.
 pub static DIRECT_BIND_WALKS: AtomicU64 = AtomicU64::new(0);
 
+/// #27/#32 — inbound `/derp` frames the mux could not hand to a consumer.
+///
+/// `UNROUTED`: no route for the source pubkey — a peer is relaying to us while
+/// we hold it on a different carrier. That IS the demote-follow.s input, so on
+/// a healthy mesh it ticks briefly around a transition and then stops; climbing
+/// steadily means follows are not converging the pair.
+///
+/// `BACKPRESSURE`: a LIVE consumer whose inbound queue is full — it stopped
+/// draining. A different fault, deliberately counted apart.
+///
+/// Process-global rather than per-mux because a node holds several (central +
+/// one per relay region) and the question an operator asks is about the NODE.
+/// They were per-mux and readable NOWHERE for a day, which is exactly why a
+/// real 2026-08-25 transition could not be diagnosed.
+pub static DERP_INBOUND_UNROUTED: AtomicU64 = AtomicU64::new(0);
+pub static DERP_INBOUND_BACKPRESSURE: AtomicU64 = AtomicU64::new(0);
+
 /// A3 — peer endpoints ADOPTED via WG-style roaming: an authenticated inbound
 /// from a source other than the peer's registered endpoint repointed the
 /// carrier. Expected to tick a few times as a symmetric-NAT peer's real
