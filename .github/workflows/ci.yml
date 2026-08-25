@@ -480,12 +480,14 @@ jobs:
           shared-key: ci-ffmpeg-encoder
           cache-on-failure: true
       - name: Install build deps (cached apt)
-        # libclang is bindgen's runtime requirement (ffmpeg-sys-next generates
-        # its FFI at build time); pkg-config is how the vendored tree is found.
+        # libclang is bindgen's runtime requirement (ffmpeg-sys-next and
+        # env-libvpx-sys both generate FFI at build time); pkg-config is how the
+        # vendored FFmpeg tree is found; libvpx-dev is needed because this lane
+        # lints WITH `vp9-444` — see the clippy step for why that matters.
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
-          packages: pkg-config libclang-dev
-          version: ci-ffmpeg-v1
+          packages: pkg-config libclang-dev libvpx-dev
+          version: ci-ffmpeg-v2
       - name: Fetch vendored FFmpeg 8.1.2
         env:
           GH_TOKEN: ${{ github.token }}
@@ -524,16 +526,25 @@ jobs:
             echo "::error::pkg-config resolved libavcodec to '$prefix', not the vendored tree — this lane would be testing the wrong library"
             exit 1
           fi
-      - name: Clippy agent --features ffmpeg-encoder (incl. tests)
+      - name: Clippy agent --features ffmpeg-encoder + vp9-444 (incl. tests)
         # This code was UNLINTED. `--workspace` clippy never compiles it (the
-        # feature is opt-in), and #672 added compile+test here but deliberately
-        # left lint out because the feature reported pre-existing warnings —
-        # which is how it stayed unlinted in the first place. Same trap as the
-        # Windows overlay lane above: opt-in features are exactly where lints
-        # accumulate unseen, because no default lane ever builds them.
+        # feature is opt-in), and #672 added compile+test here but left lint out
+        # because the feature "had pre-existing warnings" — which is circular:
+        # it stayed unlinted BECAUSE it was unlinted. Opt-in features are
+        # exactly where lints accumulate unseen; same argument as the Windows
+        # overlay lane above, where a dead-code warning sat invisible 5 rc's.
         #
-        # `--all-targets` so test-only lints fire too, matching the repo rule.
-        run: cargo clippy -p roomler-agent --features ffmpeg-encoder --all-targets -- -D warnings
+        # ⚠️ `vp9-444` is in the set ON PURPOSE, and dropping it makes this lane
+        # LIE. Four of the "pre-existing warnings" were `dead_code` on
+        # `on_encoder_rebuilt_mirror_only`, `PipelineKey::Vp9Dc`,
+        # `quality_state` and `min_quality` — all of which ARE used, from call
+        # sites inside `#[cfg(feature = "vp9-444")]` functions in peer.rs. Lint
+        # a feature set no one ships and you get findings that are artifacts of
+        # the configuration; "fixing" them by deleting would have broken every
+        # real build. Keep this set a subset of what release-agent.yml builds.
+        #
+        # `--all-targets` so test-only lints fire, matching the repo rule.
+        run: cargo clippy -p roomler-agent --features ffmpeg-encoder,vp9-444,vp9-444-bindgen --all-targets -- -D warnings
 
       - name: Test agent --features ffmpeg-encoder
         # Test, not merely check. The ten encoder names the cascade dispatches
