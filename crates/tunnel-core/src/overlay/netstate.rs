@@ -285,6 +285,33 @@ impl NetstateHandle {
     }
 }
 
+/// Yield the summary of the next MATERIAL+MAJOR delta on `rx`; pend forever
+/// when there is no subscription (or after the monitor closes — `rx` is set
+/// to `None` so callers stop polling a dead channel). Minor/immaterial
+/// deltas are absorbed. `Lagged` is treated AS a Major ("we may have missed
+/// one" — the conservative read for consumers that use this to react
+/// FASTER; a spurious early retry costs one attempt, a missed transition
+/// costs the whole backoff). Cancel-safe (broadcast `recv` is cancel-safe),
+/// so it can sit in a `tokio::select!` arm against a backoff sleep — the
+/// tunnel flow supervisor + route reconciler pattern (R1, 2026-08-25).
+pub async fn next_major(rx: &mut Option<broadcast::Receiver<NetDelta>>) -> String {
+    use tokio::sync::broadcast::error::RecvError;
+    while let Some(r) = rx.as_mut() {
+        match r.recv().await {
+            Ok(d) if d.material && d.severity == Severity::Major => return d.summary,
+            Ok(_) => continue,
+            Err(RecvError::Lagged(_)) => {
+                return "netstate deltas lagged — assuming a Major happened".to_string();
+            }
+            Err(RecvError::Closed) => {
+                *rx = None;
+                break;
+            }
+        }
+    }
+    std::future::pending().await
+}
+
 /// The process-wide instance, spawned lazily on first call (needs a tokio
 /// context). `None` = disabled by config or the OS backend failed to
 /// register — subscribers keep their timer fallbacks.
