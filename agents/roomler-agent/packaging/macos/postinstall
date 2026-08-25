@@ -124,6 +124,20 @@ if [ -f /etc/roomler-agent/enable-daemon ] || [ "${ROOMLER_MACOS_DAEMON:-0}" = "
     echo "WARNING: daemon requested but $DAEMON_PLIST_SOURCE is missing; skipping"
   else
     mkdir -p /etc/roomler-agent /var/log/roomler-agent
+    # PERSIST THE OPT-IN. Without this the marker is written by exactly one
+    # path (`install.sh --daemon-token`), so a daemon enabled the OTHER way —
+    # `ROOMLER_MACOS_DAEMON=1 installer …` — leaves no durable record of the
+    # choice. The next pkg install then takes the `else` branch below and
+    # DELETES it, which means a SELF-UPDATE silently uninstalls the root
+    # daemon: overlay and SSH both vanish, and because the daemon is the half
+    # that holds the overlay address, `roomler ssh` reports "has not published
+    # an SSH host key" rather than anything pointing at the real cause.
+    #
+    # Field-hit on a MacBook 2026-08-25 across an rc.458 → rc.460 self-update.
+    # The `else` branch's intent is right — an operator who opts OUT should
+    # not keep a root job — but an update is not an opt-out, and this is what
+    # makes the two distinguishable.
+    touch /etc/roomler-agent/enable-daemon
     cp "$DAEMON_PLIST_SOURCE" "$DAEMON_PLIST_TARGET"
     chown root:wheel "$DAEMON_PLIST_TARGET"
     chmod 644 "$DAEMON_PLIST_TARGET"
@@ -150,7 +164,10 @@ else
   if [ -f "$DAEMON_PLIST_TARGET" ]; then
     launchctl bootout system/com.roomler.daemon 2>/dev/null || true
     rm -f "$DAEMON_PLIST_TARGET"
-    echo "roomler system daemon disabled (no /etc/roomler-agent/enable-daemon)."
+    echo "roomler system daemon REMOVED — no /etc/roomler-agent/enable-daemon marker."
+    echo "  The overlay and SSH live in this daemon, so both are now gone."
+    echo "  If you did not intend to opt out, re-run the installer with"
+    echo "  ROOMLER_MACOS_DAEMON=1 (which now records the choice)."
   fi
 fi
 
