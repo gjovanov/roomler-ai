@@ -1537,6 +1537,42 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
     #[cfg(target_os = "macos")]
     {
         let path_str = installer_path.to_string_lossy().into_owned();
+
+        // `installer -target /` writes /Library and /usr/local, so it REFUSES
+        // to run as anyone but root — "Must be run as root to install this
+        // package" — and exits immediately.
+        //
+        // Checking first is not defensive politeness. `Command::spawn`
+        // SUCCEEDS here regardless, because the process really does start; it
+        // is the installer that then fails. So without this check the agent
+        // reads a guaranteed failure as a successful handoff and exits 0 —
+        // and the LaunchAgent's `KeepAlive{SuccessfulExit=false}` deliberately
+        // does NOT restart a clean exit. The two behaviours are individually
+        // right and together they take the device off the network until a
+        // human intervenes.
+        //
+        // Field-hit 2026-08-25: a per-user agent attempting rc.467 -> rc.468
+        // put a MacBook offline for ~25 minutes. `/var/log/install.log` had no
+        // entry at all, because the installer never got far enough to log one
+        // — which is also why it looked like a mysterious "failed handoff"
+        // rather than a permission error.
+        //
+        // The per-user half legitimately CANNOT self-update on macOS: the pkg
+        // is a system install. Returning Err routes into the caller's existing
+        // failure path, which logs, raises the operator sentinel, and keeps
+        // running on the current version — the correct outcome for an agent
+        // that cannot update. On a two-half install the ROOT daemon updates
+        // the shared bundle, so the host still moves forward.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            bail!(
+                "refusing to self-update: `installer -target /` requires root, but this \
+                 agent runs as uid {euid} (the per-user LaunchAgent). Exiting here would \
+                 take the agent offline without installing anything. Let the root daemon \
+                 update the shared bundle, or run `sudo roomlerd self-update` on the host."
+            );
+        }
+
         // `-target /`, NOT `CurrentUserHomeDirectory`.
         //
         // The pkg's payload is absolute: /Applications/roomler-agent.app plus
@@ -2008,6 +2044,35 @@ pub async fn run_periodic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-root macOS agent must FAIL the spawn rather than report a
+    /// successful handoff.
+    ///
+    /// This is the whole bug in one assertion: `installer -target /` cannot
+    /// run as the per-user LaunchAgent, but `Command::spawn` succeeds anyway
+    /// (the process starts, then dies), so the agent used to exit 0 — and
+    /// `KeepAlive{SuccessfulExit=false}` then declines to restart it. An
+    /// error here is what keeps the agent alive on the old version.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refuses_to_self_update_when_not_root() {
+        // Running as root is a legitimate configuration (the system daemon),
+        // and there the guard correctly does not apply — so skip rather than
+        // assert the opposite and make the test environment-dependent.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // The path is never touched: the euid check comes first, which is the
+        // point — a guaranteed-doomed install must not even be attempted.
+        let err = spawn_installer_inner(std::path::Path::new("/tmp/nonexistent-roomler.pkg"))
+            .expect_err("a non-root self-update must be an error, not a handoff");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires root"),
+            "the refusal must say WHY, so an operator reading the log knows the \
+             update did not silently fail — got: {msg}"
+        );
+    }
 
     #[test]
     fn resolve_check_interval_default_is_24h() {
