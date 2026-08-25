@@ -114,20 +114,148 @@ pub struct TokenPair {
     pub expires_in: u64,
 }
 
+/// One HMAC secret, plus the `kid` that names it on the wire.
+///
+/// The `kid` is DERIVED from the secret rather than configured beside it, so
+/// the two cannot drift: an operator sets secrets and nothing else, and a
+/// mislabelled key is unrepresentable. It is domain-separated and truncated —
+/// publishing it costs nothing (anyone holding a token can already test a
+/// candidate secret against its signature, which is the same one-hash oracle),
+/// but there is no reason to hand out a bare digest of the secret either.
+struct JwtKey {
+    kid: String,
+    encoding: EncodingKey,
+    decoding: DecodingKey,
+}
+
+impl JwtKey {
+    fn new(secret: &str) -> Self {
+        Self {
+            kid: kid_for(secret),
+            encoding: EncodingKey::from_secret(secret.as_bytes()),
+            decoding: DecodingKey::from_secret(secret.as_bytes()),
+        }
+    }
+}
+
+/// The one place a `jsonwebtoken` failure becomes an `AuthError`. Expiry is
+/// separated from every other rejection because callers act on it — a client
+/// refreshes on `TokenExpired` and gives up on `InvalidToken`.
+fn map_jwt_error(e: jsonwebtoken::errors::Error) -> AuthError {
+    match e.kind() {
+        jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+        _ => AuthError::InvalidToken(e.to_string()),
+    }
+}
+
+/// Stable short name for a secret. The prefix is domain separation: this digest
+/// must never collide with any other use of the same secret.
+fn kid_for(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"roomler-jwt-kid-v1\0");
+    h.update(secret.as_bytes());
+    hex::encode(&h.finalize()[..8])
+}
+
 pub struct AuthService {
     jwt_settings: JwtSettings,
-    encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
+    /// The key every NEW token is signed with.
+    signing: JwtKey,
+    /// Every key a token may be verified against — `signing` first, then the
+    /// retired secrets from `jwt.previous_secrets`, deduplicated by `kid`.
+    ///
+    /// Order matters twice: it is the try-order for a token that carries no
+    /// `kid` (see [`AuthService::decode_any`]), and putting the current key
+    /// first means the common case is one HMAC.
+    verifying: Vec<JwtKey>,
 }
 
 impl AuthService {
     pub fn new(jwt_settings: JwtSettings) -> Self {
-        let encoding_key = EncodingKey::from_secret(jwt_settings.secret.as_bytes());
-        let decoding_key = DecodingKey::from_secret(jwt_settings.secret.as_bytes());
+        let signing = JwtKey::new(&jwt_settings.secret);
+
+        let mut verifying = vec![JwtKey::new(&jwt_settings.secret)];
+        for prev in jwt_settings
+            .previous_secrets
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let key = JwtKey::new(prev);
+            // Dedupe by kid, so re-listing the current secret among the
+            // previous ones (the obvious mistake when writing a rotation) is a
+            // no-op rather than a duplicated HMAC on every request.
+            if verifying.iter().all(|k| k.kid != key.kid) {
+                verifying.push(key);
+            }
+        }
+
         Self {
             jwt_settings,
-            encoding_key,
-            decoding_key,
+            signing,
+            verifying,
+        }
+    }
+
+    /// The `kid` stamped on newly minted tokens, and how many keys are
+    /// accepted. Startup logs this so a rotation is visible in the record:
+    /// "signing changed, verify count went 1 → 2" is the shape of a correct
+    /// rotation, and "1 → 1 with a new kid" is the flag-day mistake.
+    pub fn key_summary(&self) -> (String, usize) {
+        (self.signing.kid.clone(), self.verifying.len())
+    }
+
+    /// Verify against the key the token NAMES, else against every key.
+    ///
+    /// ⚠️ `kid` is attacker-controlled, so it is only ever used to SELECT from
+    /// the server's own configured set — never to locate, fetch or derive key
+    /// material. An unknown `kid` falls through to trying everything, so a
+    /// forged header buys nothing; a known one only picks a key that would have
+    /// been tried anyway.
+    ///
+    /// Algorithm confusion is closed upstream of this: `Validation::default()`
+    /// pins `algorithms` to HS256, so `alg: none` and an RS256 token signed
+    /// with the public key are both rejected before a key is chosen.
+    fn decode_any<T: serde::de::DeserializeOwned>(
+        &self,
+        token: &str,
+        validation: &Validation,
+    ) -> Result<T, AuthError> {
+        let named = jsonwebtoken::decode_header(token)
+            .ok()
+            .and_then(|h| h.kid)
+            .and_then(|kid| self.verifying.iter().find(|k| k.kid == kid));
+
+        let candidates: Vec<&JwtKey> = match named {
+            Some(k) => vec![k],
+            None => self.verifying.iter().collect(),
+        };
+
+        let mut last = None;
+        for key in candidates {
+            match decode::<T>(token, &key.decoding, validation) {
+                Ok(data) => return Ok(data.claims),
+                // A signature mismatch is the ONLY reason to try the next key.
+                // Anything else means this key DID sign the token and the
+                // claims were rejected — reporting "invalid signature" for an
+                // expired token would send the reader somewhere useless.
+                Err(e) if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::InvalidSignature) => {
+                    last = Some(e);
+                }
+                Err(e) => return Err(map_jwt_error(e)),
+            }
+        }
+        Err(map_jwt_error(last.unwrap_or_else(|| {
+            jsonwebtoken::errors::ErrorKind::InvalidSignature.into()
+        })))
+    }
+
+    /// The header every token is minted with — HS256 plus the signing `kid`.
+    fn header(&self) -> Header {
+        Header {
+            kid: Some(self.signing.kid.clone()),
+            ..Header::default()
         }
     }
 
@@ -178,10 +306,10 @@ impl AuthService {
             token_type: TokenType::Refresh,
         };
 
-        let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
+        let access_token = encode(&self.header(), &access_claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
-        let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
+        let refresh_token = encode(&self.header(), &refresh_claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
 
         Ok(TokenPair {
@@ -191,18 +319,16 @@ impl AuthService {
         })
     }
 
-    pub fn verify_token(&self, token: &str) -> Result<Claims, AuthError> {
+    /// Issuer-pinned HS256 validation, shared by every verifier so a rule
+    /// added here cannot be missed by one audience.
+    fn validation(&self) -> Validation {
         let mut validation = Validation::default();
         validation.set_issuer(&[&self.jwt_settings.issuer]);
+        validation
+    }
 
-        let token_data = decode::<Claims>(token, &self.decoding_key, &validation).map_err(|e| {
-            match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                _ => AuthError::InvalidToken(e.to_string()),
-            }
-        })?;
-
-        Ok(token_data.claims)
+    pub fn verify_token(&self, token: &str) -> Result<Claims, AuthError> {
+        self.decode_any::<Claims>(token, &self.validation())
     }
 
     pub fn verify_access_token(&self, token: &str) -> Result<Claims, AuthError> {
@@ -242,26 +368,19 @@ impl AuthService {
             token_type: TokenType::Enrollment,
             jti: jti.clone(),
         };
-        let token = encode(&Header::default(), &claims, &self.encoding_key)
+        let token = encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
         Ok((token, jti))
     }
 
     pub fn verify_enrollment_token(&self, token: &str) -> Result<EnrollmentClaims, AuthError> {
-        let mut validation = Validation::default();
-        validation.set_issuer(&[&self.jwt_settings.issuer]);
-        let data = decode::<EnrollmentClaims>(token, &self.decoding_key, &validation).map_err(
-            |e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                _ => AuthError::InvalidToken(e.to_string()),
-            },
-        )?;
-        if data.claims.token_type != TokenType::Enrollment {
+        let claims = self.decode_any::<EnrollmentClaims>(token, &self.validation())?;
+        if claims.token_type != TokenType::Enrollment {
             return Err(AuthError::InvalidToken(
                 "Not an enrollment token".to_string(),
             ));
         }
-        Ok(data.claims)
+        Ok(claims)
     }
 
     /// Mint a long-lived agent token (default TTL from settings.refresh_token_ttl_secs
@@ -282,23 +401,16 @@ impl AuthService {
             iss: self.jwt_settings.issuer.clone(),
             token_type: TokenType::Agent,
         };
-        encode(&Header::default(), &claims, &self.encoding_key)
+        encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))
     }
 
     pub fn verify_agent_token(&self, token: &str) -> Result<AgentClaims, AuthError> {
-        let mut validation = Validation::default();
-        validation.set_issuer(&[&self.jwt_settings.issuer]);
-        let data = decode::<AgentClaims>(token, &self.decoding_key, &validation).map_err(|e| {
-            match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                _ => AuthError::InvalidToken(e.to_string()),
-            }
-        })?;
-        if data.claims.token_type != TokenType::Agent {
+        let claims = self.decode_any::<AgentClaims>(token, &self.validation())?;
+        if claims.token_type != TokenType::Agent {
             return Err(AuthError::InvalidToken("Not an agent token".to_string()));
         }
-        Ok(data.claims)
+        Ok(claims)
     }
 
     // ─── roomler-tunnel client tokens ─────────────────────────────────
@@ -323,7 +435,7 @@ impl AuthService {
             token_type: TokenType::TunnelEnrollment,
             jti: jti.clone(),
         };
-        let token = encode(&Header::default(), &claims, &self.encoding_key)
+        let token = encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
         Ok((token, jti))
     }
@@ -332,19 +444,13 @@ impl AuthService {
         &self,
         token: &str,
     ) -> Result<TunnelEnrollmentClaims, AuthError> {
-        let mut validation = Validation::default();
-        validation.set_issuer(&[&self.jwt_settings.issuer]);
-        let data = decode::<TunnelEnrollmentClaims>(token, &self.decoding_key, &validation)
-            .map_err(|e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                _ => AuthError::InvalidToken(e.to_string()),
-            })?;
-        if data.claims.token_type != TokenType::TunnelEnrollment {
+        let claims = self.decode_any::<TunnelEnrollmentClaims>(token, &self.validation())?;
+        if claims.token_type != TokenType::TunnelEnrollment {
             return Err(AuthError::InvalidToken(
                 "Not a tunnel-enrollment token".to_string(),
             ));
         }
-        Ok(data.claims)
+        Ok(claims)
     }
 
     /// Mint a long-lived tunnel-client token (default TTL 1 year, override
@@ -367,26 +473,18 @@ impl AuthService {
             iss: self.jwt_settings.issuer.clone(),
             token_type: TokenType::TunnelClient,
         };
-        encode(&Header::default(), &claims, &self.encoding_key)
+        encode(&self.header(), &claims, &self.signing.encoding)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))
     }
 
     pub fn verify_tunnel_client_token(&self, token: &str) -> Result<TunnelClientClaims, AuthError> {
-        let mut validation = Validation::default();
-        validation.set_issuer(&[&self.jwt_settings.issuer]);
-        let data =
-            decode::<TunnelClientClaims>(token, &self.decoding_key, &validation).map_err(|e| {
-                match e.kind() {
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                    _ => AuthError::InvalidToken(e.to_string()),
-                }
-            })?;
-        if data.claims.token_type != TokenType::TunnelClient {
+        let claims = self.decode_any::<TunnelClientClaims>(token, &self.validation())?;
+        if claims.token_type != TokenType::TunnelClient {
             return Err(AuthError::InvalidToken(
                 "Not a tunnel-client token".to_string(),
             ));
         }
-        Ok(data.claims)
+        Ok(claims)
     }
 }
 
@@ -402,9 +500,17 @@ fn uuid_v4_hex() -> String {
 mod tests {
     use super::*;
 
+    const SECRET_A: &str = "test-secret-for-unit-tests-do-not-use-in-prod";
+    const SECRET_B: &str = "the-rotated-to-secret-for-unit-tests";
+
     fn svc() -> AuthService {
+        svc_with(SECRET_A, "")
+    }
+
+    fn svc_with(secret: &str, previous: &str) -> AuthService {
         AuthService::new(JwtSettings {
-            secret: "test-secret-for-unit-tests-do-not-use-in-prod".to_string(),
+            secret: secret.to_string(),
+            previous_secrets: previous.to_string(),
             access_token_ttl_secs: 3600,
             refresh_token_ttl_secs: 604_800,
             issuer: "roomler-ai-test".to_string(),
@@ -645,5 +751,214 @@ mod tests {
             .unwrap();
         let err = s.verify_access_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    // ── Key rotation (`kid` + previous_secrets) ───────────────────────────
+
+    /// THE compatibility test. Every token minted before this change carries no
+    /// `kid` at all, and an agent token lives a **year** — so if a missing
+    /// `kid` did not verify, deploying this would knock the entire fleet
+    /// offline until every device re-enrolled by hand.
+    #[test]
+    fn a_token_with_no_kid_still_verifies() {
+        let a = svc_with(SECRET_A, "");
+        let claims = AgentClaims {
+            sub: ObjectId::new().to_hex(),
+            tenant_id: ObjectId::new().to_hex(),
+            iat: Utc::now().timestamp(),
+            exp: (Utc::now() + Duration::seconds(60)).timestamp(),
+            iss: "roomler-ai-test".to_string(),
+            token_type: TokenType::Agent,
+        };
+        // `Header::default()` is exactly what every pre-rotation mint used.
+        let legacy = encode(&Header::default(), &claims, &a.signing.encoding).unwrap();
+        assert!(
+            jsonwebtoken::decode_header(&legacy).unwrap().kid.is_none(),
+            "the fixture must actually lack a kid, or this proves nothing"
+        );
+
+        // Unrotated: trivially fine.
+        assert_eq!(a.verify_agent_token(&legacy).unwrap().sub, claims.sub);
+
+        // The case that actually bites. A year-old agent token has no `kid`,
+        // so nothing on it points at the secret that signed it — the ONLY way
+        // it survives a rotation is by trying every configured key. Asserting
+        // this against the current key alone would pass with the fallback
+        // deleted (measured), which is why it is asserted here instead.
+        let rotated = svc_with(SECRET_B, SECRET_A);
+        assert_eq!(
+            rotated.verify_agent_token(&legacy).unwrap().sub,
+            claims.sub,
+            "a kid-less token signed by a RETIRED secret must still verify — \
+             this is the whole fleet's one-year token on rotation day"
+        );
+    }
+
+    /// New tokens name their key, and the name is derived from the secret —
+    /// two services configured with the same secret agree, which is what makes
+    /// the 2-pod deployment work at all.
+    #[test]
+    fn minted_tokens_carry_a_kid_derived_from_the_secret() {
+        let a = svc_with(SECRET_A, "");
+        let b = svc_with(SECRET_B, "");
+        let t = a
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+        let kid = jsonwebtoken::decode_header(&t).unwrap().kid.expect("kid");
+
+        assert_eq!(kid, kid_for(SECRET_A));
+        assert_eq!(
+            kid,
+            svc_with(SECRET_A, "").key_summary().0,
+            "same secret ⇒ same kid"
+        );
+        assert_ne!(kid, kid_for(SECRET_B), "different secrets ⇒ different kids");
+        assert_ne!(kid, SECRET_A, "the kid must not BE the secret");
+        assert!(
+            !b.verify_agent_token(&t).is_ok(),
+            "a kid is not a credential"
+        );
+    }
+
+    /// The whole point: rotate the signing secret and yesterday's tokens keep
+    /// working. Without `previous_secrets` this is a flag day that logs out
+    /// every user and disconnects every agent.
+    #[test]
+    fn rotation_keeps_tokens_minted_under_the_previous_secret() {
+        let old = svc_with(SECRET_A, "");
+        let old_token = old
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+
+        // The flag day, for contrast: swap the secret and carry nothing over.
+        let naive = svc_with(SECRET_B, "");
+        assert!(
+            naive.verify_agent_token(&old_token).is_err(),
+            "without previous_secrets a rotation MUST invalidate old tokens — \
+             if this ever passes, the test below proves nothing"
+        );
+
+        // The rotation.
+        let rotated = svc_with(SECRET_B, SECRET_A);
+        assert!(rotated.verify_agent_token(&old_token).is_ok());
+
+        // …and it signs with the NEW key, not the retired one.
+        let fresh = rotated
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+        assert_eq!(
+            jsonwebtoken::decode_header(&fresh).unwrap().kid.unwrap(),
+            kid_for(SECRET_B)
+        );
+        assert!(
+            old.verify_agent_token(&fresh).is_err(),
+            "the old deployment must NOT accept new tokens — otherwise the \
+             retired secret was never actually retired"
+        );
+    }
+
+    /// `kid` is attacker-controlled. It may only SELECT among the server's own
+    /// keys; a forged or unknown one must not authenticate anything, and must
+    /// not turn into a lookup that reaches outside the configured set.
+    #[test]
+    fn a_forged_kid_buys_nothing() {
+        let s = svc_with(SECRET_A, "");
+        let foreign = svc_with(SECRET_B, "")
+            .issue_agent_token(ObjectId::new(), ObjectId::new(), Some(60))
+            .unwrap();
+
+        // Signed with B, but re-labelled to name A's key.
+        let mut parts = foreign.split('.');
+        let hdr = serde_json::json!({"alg":"HS256","typ":"JWT","kid": kid_for(SECRET_A)});
+        use base64::Engine as _;
+        let relabelled = format!(
+            "{}.{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hdr.to_string()),
+            parts.nth(1).unwrap(),
+            foreign.rsplit('.').next().unwrap(),
+        );
+        assert!(matches!(
+            s.verify_agent_token(&relabelled),
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        // A kid naming no configured key falls through to trying them all —
+        // which for a genuinely-signed token still succeeds, and for this one
+        // still fails. Either way the kid decided nothing on its own.
+        let hdr = serde_json::json!({"alg":"HS256","typ":"JWT","kid":"deadbeefdeadbeef"});
+        let unknown = format!(
+            "{}.{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hdr.to_string()),
+            foreign.split('.').nth(1).unwrap(),
+            foreign.rsplit('.').next().unwrap(),
+        );
+        assert!(s.verify_agent_token(&unknown).is_err());
+    }
+
+    /// Listing the current secret among the previous ones is the obvious
+    /// slip when writing a rotation. It must be a no-op, not a doubled HMAC
+    /// on every single request.
+    #[test]
+    fn re_listing_the_current_secret_is_deduplicated() {
+        assert_eq!(svc_with(SECRET_A, SECRET_A).key_summary().1, 1);
+        assert_eq!(svc_with(SECRET_A, "").key_summary().1, 1);
+        assert_eq!(svc_with(SECRET_A, SECRET_B).key_summary().1, 2);
+        // Blanks and spacing in a hand-edited env var must not create keys.
+        assert_eq!(
+            svc_with(SECRET_A, &format!("  {SECRET_B} , ,, "))
+                .key_summary()
+                .1,
+            2
+        );
+    }
+
+    /// An expired token must report expiry, not "invalid signature", even
+    /// though verification walks a key list. A client refreshes on the first
+    /// and gives up on the second, so confusing them breaks the refresh flow
+    /// for everyone the moment a second key is configured.
+    #[test]
+    fn an_expired_token_reports_expiry_not_a_signature_failure() {
+        let s = svc_with(SECRET_A, SECRET_B);
+        let claims = AgentClaims {
+            sub: ObjectId::new().to_hex(),
+            tenant_id: ObjectId::new().to_hex(),
+            iat: (Utc::now() - Duration::seconds(7200)).timestamp(),
+            exp: (Utc::now() - Duration::seconds(3600)).timestamp(),
+            iss: "roomler-ai-test".to_string(),
+            token_type: TokenType::Agent,
+        };
+        let expired = encode(&s.header(), &claims, &s.signing.encoding).unwrap();
+        assert!(matches!(
+            s.verify_agent_token(&expired),
+            Err(AuthError::TokenExpired)
+        ));
+    }
+
+    /// `alg: none` is the oldest JWT forgery there is. `jsonwebtoken` refuses
+    /// it unconditionally (`none` is not in its `Algorithm` enum) and
+    /// `Validation::default()` additionally pins HS256, so this test is a
+    /// GUARD, not a fix — it cannot be made to fail by misconfiguring the
+    /// validation, only by replacing the decoder. Kept because "we added a key
+    /// list, then hand-rolled header parsing" is precisely how this class
+    /// comes back.
+    #[test]
+    fn the_alg_none_forgery_is_refused() {
+        let s = svc();
+        let claims = serde_json::json!({
+            "sub": ObjectId::new().to_hex(),
+            "tenant_id": ObjectId::new().to_hex(),
+            "iat": Utc::now().timestamp(),
+            "exp": (Utc::now() + Duration::seconds(600)).timestamp(),
+            "iss": "roomler-ai-test",
+            "token_type": "agent",
+        });
+        use base64::Engine as _;
+        let b64 = |s: String| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        let forged = format!(
+            "{}.{}.",
+            b64(serde_json::json!({"alg":"none","typ":"JWT"}).to_string()),
+            b64(claims.to_string()),
+        );
+        assert!(s.verify_agent_token(&forged).is_err());
     }
 }
