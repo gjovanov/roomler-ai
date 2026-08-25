@@ -1,15 +1,35 @@
 use crate::fixtures::test_app::TestApp;
 
+/// The frontend origin these tests pin EXPLICITLY.
+///
+/// They used to spawn with `TestApp::spawn()` and hardcode a matching literal,
+/// which made them depend on two things they never named: that
+/// `Settings::load()` fails and falls through to the fixture, and that the
+/// config crate's `app.frontend_url` default happens to be that same value.
+/// Changing the default (it named Vite's scaffold port 5173 while the dev
+/// server has always been 5000) broke both. The property under test is "with
+/// no `cors_origins`, exactly the frontend origin is allowed" — so the test
+/// should SET the frontend origin and assert on it, not inherit one.
+const FRONTEND: &str = "http://localhost:5173";
+
+async fn spawn_with_frontend() -> TestApp {
+    TestApp::spawn_with_settings(|s| {
+        s.app.frontend_url = FRONTEND.to_string();
+        s.app.cors_origins = vec![];
+    })
+    .await
+}
+
 #[tokio::test]
 async fn preflight_options_returns_cors_headers() {
-    let app = TestApp::spawn().await;
+    let app = spawn_with_frontend().await;
 
-    // Preflight from the FRONTEND origin (the fixture's frontend_url) —
-    // the tightened default allows exactly that origin.
+    // Preflight from the FRONTEND origin — the tightened default allows
+    // exactly that origin.
     let resp = app
         .client
         .request(reqwest::Method::OPTIONS, app.url("/api/auth/login"))
-        .header("Origin", "http://localhost:5173")
+        .header("Origin", FRONTEND)
         .header("Access-Control-Request-Method", "POST")
         .header(
             "Access-Control-Request-Headers",
@@ -45,13 +65,13 @@ async fn preflight_options_returns_cors_headers() {
 /// server allows ONLY the frontend's own origin — no more Any fallback.
 #[tokio::test]
 async fn cors_default_allows_only_frontend_origin() {
-    let app = TestApp::spawn().await;
+    let app = spawn_with_frontend().await;
 
     // The frontend origin is allowed and echoed back exactly.
     let resp = app
         .client
         .get(app.url("/health"))
-        .header("Origin", "http://localhost:5173")
+        .header("Origin", FRONTEND)
         .send()
         .await
         .unwrap();
@@ -62,7 +82,7 @@ async fn cors_default_allows_only_frontend_origin() {
             .expect("frontend origin must be allowed")
             .to_str()
             .unwrap(),
-        "http://localhost:5173"
+        FRONTEND
     );
 
     // A random foreign origin gets NO allow-origin header.
