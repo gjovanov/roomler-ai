@@ -49,12 +49,34 @@ const OUTBOUND_QUEUE: usize = 512;
 /// Depth of a single peer's inbound payload queue. Same drop-on-overflow.
 const INBOUND_QUEUE: usize = 256;
 
-/// #27 — depth of the "a peer is reaching us over DERP that we hold no conn
-/// for" notice queue. Tiny on purpose: the consumer coalesces per peer anyway,
-/// and the signal is level-triggered in practice (a demoted peer keeps sending
-/// until we follow it), so dropping a notice under burst costs at most one more
-/// inbound frame's worth of delay, never the signal itself.
-const UNROUTED_QUEUE: usize = 32;
+/// #27 — depth of the mux→runtime event queue. Tiny on purpose: the consumer
+/// coalesces per peer anyway, and [`MuxEvent::Unrouted`] is level-triggered in
+/// practice (a demoted peer keeps sending until we follow it), so dropping a
+/// notice under burst costs at most one more inbound frame's worth of delay,
+/// never the signal itself.
+const EVENT_QUEUE: usize = 32;
+
+/// #27/#28 — something happened on this mux that the RUNTIME must react to.
+/// One channel rather than one per signal, so a mux acquired later (the
+/// coordinator arms each as it arrives) can never be half-wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxEvent {
+    /// #27 — a peer is relaying to us over DERP and we hold no [`DerpConn`] for
+    /// it, which means that peer has demoted and we have not followed. Carries
+    /// the RELAY-STAMPED source pubkey (see [`DerpMux::deliver`]).
+    Unrouted(DerpPubKey),
+    /// #28 — the `/derp` WS reconnected and re-registered after an outage.
+    /// EDGE-triggered (a `mark_up` that changes nothing emits nothing), so the
+    /// startup `mark_up` on a mux that was never down is silent.
+    ///
+    /// Worth waking the runtime for because every DERP build made while the WS
+    /// was down was WITHHELD (`try_build_derp` refuses over a dead WS — a
+    /// carrier born there convicts one-way and rebuilds forever), and those
+    /// peers otherwise wait for the next establish walk. Field 2026-08-24: the
+    /// WS was back in 1.5 s and the floor still took **5 s** more, because the
+    /// walk runs on the 5 s tick.
+    Recovered,
+}
 
 /// A [`RelayConn`] over a DERP relay, PINNED to one peer pubkey.
 ///
@@ -173,12 +195,10 @@ pub struct DerpMux {
     /// U1 healer must not clear force-DERP pins on a flap (Phase A1).
     down_since: Mutex<Option<Instant>>,
     peers: Mutex<HashMap<DerpPubKey, mpsc::Sender<Vec<u8>>>>,
-    /// #27 — where [`deliver`](Self::deliver) reports a frame it could not
-    /// route: a peer is relaying to US while we hold no [`DerpConn`] for it,
-    /// which means that peer has demoted to DERP and we have not followed.
-    /// `None` until the runtime subscribes (tests, and the tunnel-only paths
-    /// that never demote, leave it unset).
-    unrouted_tx: Mutex<Option<mpsc::Sender<DerpPubKey>>>,
+    /// #27/#28 — where this mux reports [`MuxEvent`]s to the runtime. `None`
+    /// until the runtime arms it (tests, and the tunnel-only paths that never
+    /// demote, leave it unset).
+    events_tx: Mutex<Option<mpsc::Sender<MuxEvent>>>,
     /// Lifetime count of frames dropped by `deliver`, split by cause. Read by
     /// the LocalAPI/diagnostics; the point is that neither drop is silent any
     /// more (they both were — see the `deliver` doc).
@@ -199,25 +219,24 @@ impl DerpMux {
             alive: Arc::new(AtomicBool::new(true)),
             down_since: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
-            unrouted_tx: Mutex::new(None),
+            events_tx: Mutex::new(None),
             dropped_unrouted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_backpressure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
         (mux, ws_out_rx)
     }
 
-    /// #27 — install the sink for the unroutable-inbound signal (see
-    /// [`Self::unrouted_tx`]). A SETTER rather than a subscribe-and-return
-    /// because a node holds several muxes (central + one per relay region) and
-    /// the runtime wants ONE channel for all of them; the coordinator installs
-    /// this on every mux as it arrives. A second call replaces the sender, so a
-    /// runtime rebuild re-points cleanly.
-    pub fn set_unrouted_sink(&self, tx: mpsc::Sender<DerpPubKey>) {
-        *self.unrouted_tx.lock().unwrap() = Some(tx);
+    /// #27/#28 — install the runtime's [`MuxEvent`] sink. A SETTER rather than
+    /// a subscribe-and-return because a node holds several muxes (central + one
+    /// per relay region) and the runtime wants ONE channel for all of them; the
+    /// coordinator installs this on every mux as it arrives. A second call
+    /// replaces the sender, so a runtime rebuild re-points cleanly.
+    pub fn set_event_sink(&self, tx: mpsc::Sender<MuxEvent>) {
+        *self.events_tx.lock().unwrap() = Some(tx);
     }
 
-    /// The channel depth callers should use for [`Self::set_unrouted_sink`].
-    pub const UNROUTED_SINK_DEPTH: usize = UNROUTED_QUEUE;
+    /// The channel depth callers should use for [`Self::set_event_sink`].
+    pub const EVENT_SINK_DEPTH: usize = EVENT_QUEUE;
 
     /// #27 — `(unrouted, backpressure)` inbound-drop counts for this mux,
     /// cumulative for its lifetime.
@@ -288,23 +307,23 @@ impl DerpMux {
                     // one wins"). A CLOSED channel is the same demote-lag
                     // condition as a missing one, so it reports too.
                     self.dropped_backpressure.fetch_add(1, Ordering::Relaxed);
-                    self.notify_unrouted(src);
+                    self.emit(MuxEvent::Unrouted(src));
                 }
             }
             None => {
                 self.dropped_unrouted.fetch_add(1, Ordering::Relaxed);
-                self.notify_unrouted(src);
+                self.emit(MuxEvent::Unrouted(src));
             }
         }
     }
 
-    /// Report an unroutable inbound src, if anyone is listening. Never blocks
-    /// and never errors: a full notice queue means a signal for this peer is
-    /// already pending, which is exactly what the notice would have said.
-    fn notify_unrouted(&self, src: DerpPubKey) {
-        let tx = self.unrouted_tx.lock().unwrap().clone();
+    /// Report a [`MuxEvent`], if anyone is listening. Never blocks and never
+    /// errors: a full queue means a signal is already pending, which is
+    /// exactly what this one would have said.
+    fn emit(&self, ev: MuxEvent) {
+        let tx = self.events_tx.lock().unwrap().clone();
         if let Some(tx) = tx {
-            let _ = tx.try_send(src);
+            let _ = tx.try_send(ev);
         }
     }
 
@@ -321,9 +340,17 @@ impl DerpMux {
     }
 
     /// Mark the node WS up again (after a reconnect + re-register).
+    ///
+    /// #28 — emits [`MuxEvent::Recovered`] on the down→up EDGE only. The WS
+    /// owner calls this after every successful connect, including the first, so
+    /// a level-triggered emit would fire a spurious walk at startup; `swap`
+    /// makes the edge the condition rather than a comment.
     pub fn mark_up(&self) {
-        self.alive.store(true, Ordering::Relaxed);
+        let was_down = !self.alive.swap(true, Ordering::Relaxed);
         *self.down_since.lock().unwrap() = None;
+        if was_down {
+            self.emit(MuxEvent::Recovered);
+        }
     }
 
     /// Whether the node WS is currently up.
@@ -384,8 +411,8 @@ mod tests {
     #[tokio::test]
     async fn unroutable_inbound_reports_the_src_and_routable_does_not() {
         let (mux, _out_rx) = DerpMux::new(pk(0x01));
-        let (tx, mut rx) = mpsc::channel(DerpMux::UNROUTED_SINK_DEPTH);
-        mux.set_unrouted_sink(tx);
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
 
         // No conn for 0x02 — the demote-lag case.
         let mut frame = pk(0x02).to_vec();
@@ -393,7 +420,7 @@ mod tests {
         mux.deliver(&frame);
         assert_eq!(
             rx.try_recv().ok(),
-            Some(pk(0x02)),
+            Some(MuxEvent::Unrouted(pk(0x02))),
             "unroutable src reported"
         );
         assert_eq!(mux.drop_counts().0, 1, "counted as unrouted");
@@ -414,6 +441,36 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// #28 — `mark_up` emits `Recovered` on the down→up EDGE only. The WS owner
+    /// calls it after EVERY successful connect, including the first on a mux
+    /// that starts alive, so a level-triggered emit would fire a pointless
+    /// establish walk at every startup.
+    #[tokio::test]
+    async fn mark_up_emits_recovered_only_on_the_down_to_up_edge() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
+
+        // Startup shape: the mux is born alive and the WS owner marks it up.
+        assert!(mux.is_alive());
+        mux.mark_up();
+        assert!(
+            rx.try_recv().is_err(),
+            "a mark_up that changes nothing must not wake the runtime"
+        );
+
+        // A real outage → recovery.
+        mux.mark_down();
+        assert!(rx.try_recv().is_err(), "going down is not a recovery");
+        mux.mark_up();
+        assert_eq!(rx.try_recv().ok(), Some(MuxEvent::Recovered));
+        assert_eq!(mux.down_for(), None, "and the outage clock cleared");
+
+        // Redundant repeats stay quiet.
+        mux.mark_up();
+        assert!(rx.try_recv().is_err());
+    }
+
     /// #27 — the registration OUTLIVES its `DerpConn` by design ("last one
     /// wins"), so a peer whose DERP carrier was replaced by a better tier
     /// leaves a live entry pointing at a CLOSED channel. That is the same
@@ -422,8 +479,8 @@ mod tests {
     #[tokio::test]
     async fn a_closed_conn_channel_reports_like_a_missing_one() {
         let (mux, _out_rx) = DerpMux::new(pk(0x01));
-        let (tx, mut rx) = mpsc::channel(DerpMux::UNROUTED_SINK_DEPTH);
-        mux.set_unrouted_sink(tx);
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
 
         let conn = mux.conn_for(pk(0x02));
         drop(conn); // a better tier replaced this carrier
@@ -432,7 +489,7 @@ mod tests {
         frame.extend_from_slice(&[1]);
         mux.deliver(&frame);
 
-        assert_eq!(rx.try_recv().ok(), Some(pk(0x02)));
+        assert_eq!(rx.try_recv().ok(), Some(MuxEvent::Unrouted(pk(0x02))));
         assert_eq!(
             mux.drop_counts(),
             (0, 1),
