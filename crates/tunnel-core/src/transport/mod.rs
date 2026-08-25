@@ -39,6 +39,23 @@ pub const TRANSPORT_QUIC_V1: &str = "quic-v1";
 /// `webrtc-dc-v1`. See [`agent_supports_quic`].
 pub const MIN_QUIC_AGENT_RC: u32 = 104;
 
+/// R4 — the tunnel's QUIC-over-DERP flavor: QUIC framed over the node's
+/// ESTABLISHED `/derp` WebSocket (the leg corp middleboxes leave alive when
+/// they capture every fresh TURN/TLS attempt — field 2026-08-25: 14 min of
+/// established-then-killed TURN sessions while the derp floor carried from
+/// minute two). Negotiated only when the client requests + advertises it AND
+/// the agent's version passes [`agent_supports_derp_tunnel`]; both ends must
+/// be overlay nodes (the addressing is their WG pubkeys). Rate-shaped by the
+/// server; MTU-clamped under the server's 2048-byte frame cap.
+pub const TRANSPORT_QUIC_DERP_V1: &str = "quic-derp-v1";
+
+/// First agent release whose `TunnelQuicSetup` handler understands the
+/// `quic-derp-v1` flavor. ⚠️ Set to the rc this actually ships in at tag
+/// time — a too-low value makes the server negotiate derp toward agents
+/// that ignore the setup's `transport` field (the client then burns its
+/// 30 s ready-wait), a too-high one only delays adoption.
+pub const MIN_DERP_TUNNEL_AGENT_RC: u32 = 468;
+
 /// Whether an agent reporting `version` (its `CARGO_PKG_VERSION`, e.g.
 /// `"0.3.0-rc.104"`) supports the QUIC tunnel data plane — i.e. whether
 /// the server may safely negotiate `quic-v1` for it rather than risking
@@ -58,6 +75,24 @@ pub const MIN_QUIC_AGENT_RC: u32 = 104;
 /// agent WS connect (`update_hello`) and a tunnel can only open to an
 /// *online* agent — so the version checked here is always current.
 pub fn agent_supports_quic(version: &str) -> bool {
+    supports_since_rc(version, MIN_QUIC_AGENT_RC)
+}
+
+/// R4 — whether an agent at `version` can serve the tunnel's `quic-derp-v1`
+/// flavor (QUIC multiplexed over the established `/derp` WS). Same
+/// version-gate mechanism as [`agent_supports_quic`]: the server refuses to
+/// negotiate the flavor toward an older agent, which would otherwise ignore
+/// the setup's `transport` field and stand up a TURN relay the client never
+/// dials.
+pub fn agent_supports_derp_tunnel(version: &str) -> bool {
+    supports_since_rc(version, MIN_DERP_TUNNEL_AGENT_RC)
+}
+
+/// Shared `0.3.0-rc.N`-line gate: `N >= min_rc`, releases after the 0.3.0
+/// line always pass, releases before never do, unparseable is conservative
+/// `false`. Extracted from `agent_supports_quic` verbatim (its tests lock
+/// the behavior).
+fn supports_since_rc(version: &str, min_rc: u32) -> bool {
     // Peel off the `-rc.<n>` pre-release tail, if present.
     let (core, rc) = match version.split_once("-rc.") {
         Some((core, n)) => (core, Some(n)),
@@ -73,14 +108,11 @@ pub fn agent_supports_quic(version: &str) -> bool {
     };
     use std::cmp::Ordering::{Equal, Greater, Less};
     match triple.cmp(&(0, 3, 0)) {
-        Greater => true, // 0.3.1+, 0.4.x, 1.x — after QUIC shipped
-        Less => false,   // 0.1.x / 0.2.x — before QUIC
+        Greater => true, // 0.3.1+, 0.4.x, 1.x — after the feature shipped
+        Less => false,   // 0.1.x / 0.2.x — before it
         Equal => match rc {
             None => true, // 0.3.0 final sorts after every 0.3.0-rc.*
-            Some(n) => n
-                .trim()
-                .parse::<u32>()
-                .is_ok_and(|n| n >= MIN_QUIC_AGENT_RC),
+            Some(n) => n.trim().parse::<u32>().is_ok_and(|n| n >= min_rc),
         },
     }
 }

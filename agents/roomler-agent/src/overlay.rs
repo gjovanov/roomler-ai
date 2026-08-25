@@ -106,6 +106,57 @@ struct RuntimeSlot {
 static RUNTIME_SLOTS: std::sync::Mutex<std::collections::BTreeMap<String, RuntimeSlot>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// R4 — the per-tenant CENTRAL DERP mux, exposed to the tunnel plane for the
+/// `quic-derp-v1` flavor. `Weak` so a mux that died with its runtime reads
+/// as absent instead of leaking; the stored hex is the node's own pubkey
+/// (the mux registered with it — one identity per tenant enrollment).
+static DERP_TUNNEL_MUXES: std::sync::Mutex<
+    std::collections::BTreeMap<
+        String,
+        (
+            std::sync::Weak<tunnel_core::transport::derp::DerpMux>,
+            String,
+        ),
+    >,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// R4 — the PRIMARY enrollment's tenant id, set once at daemon start. The
+/// tunnel plane's derp flavor is primary-org-scoped (declared routes are;
+/// the reconciler parks non-primary routes), and the flow supervisor has no
+/// per-org context — this is its bridge to the right mux.
+pub static PRIMARY_TENANT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn register_derp_tunnel_mux(tenant: &str, mux: &Arc<tunnel_core::transport::derp::DerpMux>) {
+    DERP_TUNNEL_MUXES.lock().unwrap().insert(
+        tenant.to_string(),
+        (
+            Arc::downgrade(mux),
+            tunnel_core::transport::derp::pubkey_hex(&mux.self_pubkey()),
+        ),
+    );
+}
+
+/// R4 — the PRIMARY org's live DERP mux + identity as a tunnel handle, or
+/// `None` when the overlay/derp is down or not yet started (callers fall
+/// back to the classic transport ladder).
+pub(crate) fn primary_derp_tunnel_handle() -> Option<tunnel_core::transport::derp::DerpTunnelHandle>
+{
+    derp_tunnel_handle(PRIMARY_TENANT_ID.get()?)
+}
+
+/// R4 — a specific tenant's live DERP mux + identity as a tunnel handle.
+pub(crate) fn derp_tunnel_handle(
+    tenant: &str,
+) -> Option<tunnel_core::transport::derp::DerpTunnelHandle> {
+    let slots = DERP_TUNNEL_MUXES.lock().unwrap();
+    let (weak, hex) = slots.get(tenant)?;
+    let mux = weak.upgrade()?;
+    Some(tunnel_core::transport::derp::DerpTunnelHandle {
+        mux,
+        self_pubkey_hex: hex.clone(),
+    })
+}
+
 /// Multi-org v2 — the ONE process-wide shared carrier plane every org's
 /// engine attaches to when `overlay_shared_carrier` is on (one stable
 /// direct-socket set for the whole daemon; receiver-index demux). Created on
@@ -299,6 +350,9 @@ pub async fn maybe_start(
         Some(Box::new(move || {
             let (mux, outbound_rx) = tunnel_core::transport::derp::DerpMux::new(pubkey);
             crate::derp::spawn(&ws_url, &token, &tenant, &mux, outbound_rx);
+            // R4 — expose this tenant's central mux to the tunnel plane
+            // (the quic-derp-v1 flavor multiplexes over it).
+            register_derp_tunnel_mux(&tenant, &mux);
             info!("overlay derp: /derp carrier opened (UDP-blocked tier, or the always-on floor)");
             mux
         }))
