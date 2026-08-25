@@ -19,12 +19,12 @@ fn secure_attr(state: &AppState) -> &'static str {
 }
 
 /// Read one cookie value out of the request `Cookie` header.
+///
+/// Thin alias over [`crate::cookies::get`] — the parser used to be spelled out
+/// here, and in the auth extractor, and in the `/ws` upgrade, each slightly
+/// differently. See that module for why one copy is the point.
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
-    let prefix = format!("{}=", name);
-    raw.split(';')
-        .map(str::trim)
-        .find_map(|pair| pair.strip_prefix(&prefix).map(str::to_string))
+    crate::cookies::get(headers, name)
 }
 
 #[derive(Debug, Deserialize)]

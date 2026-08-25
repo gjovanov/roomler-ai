@@ -27,26 +27,17 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app_state = AppState::from_ref(state);
 
-        // Try Authorization header first
+        // Try Authorization header first, then the session cookie. The SPA is
+        // moving to cookie-only, but the header stays accepted: scripts, the
+        // e2e helpers and any external caller use it, and it is the only
+        // option for a cross-origin client.
         let token = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(|s| s.to_string())
-            // Then try cookie
-            .or_else(|| {
-                parts
-                    .headers
-                    .get(header::COOKIE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|cookies| {
-                        cookies.split(';').find_map(|cookie| {
-                            let cookie = cookie.trim();
-                            cookie.strip_prefix("access_token=").map(|s| s.to_string())
-                        })
-                    })
-            })
+            .or_else(|| crate::cookies::get(&parts.headers, "access_token"))
             .ok_or_else(|| ApiError::Unauthorized("No token provided".to_string()))?;
 
         let claims = app_state.auth.verify_access_token(&token)?;
