@@ -9,7 +9,30 @@ pub struct Capturer {
 }
 
 impl Capturer {
+    /// ROOMLER PATCH: capture at an EXPLICIT size, letting CoreGraphics scale.
+    ///
+    /// `CGDisplayStreamCreateWithDispatchQueue` takes an arbitrary output
+    /// size and does the reduction itself — on the GPU, for free. Capturing
+    /// native and then resampling on the CPU is the expensive way to reach
+    /// the same picture: the pump's Lanczos-3 costs ~24x the SOURCE area
+    /// regardless of ratio, measured at **38 ms/frame** downscaling a
+    /// 3024x1964 Retina panel against a 16.7 ms budget at 60 fps — 2.3x over
+    /// budget before the encoder runs.
+    ///
+    /// ⚠️ That is why asking for a SMALLER picture made sessions slower than
+    /// asking for native: native is 1:1 and never resamples, while any
+    /// custom size fired the CPU path (field-measured 2026-08-25).
+    pub fn new_sized(display: Display, width: usize, height: usize) -> io::Result<Capturer> {
+        Self::build(display, width, height)
+    }
+
     pub fn new(display: Display) -> io::Result<Capturer> {
+        // Default: the display's true PIXEL size — see the note in `build`.
+        let (w, h) = (display.0.pixel_width(), display.0.pixel_height());
+        Self::build(display, w, h)
+    }
+
+    fn build(display: Display, out_w: usize, out_h: usize) -> io::Result<Capturer> {
         let frame = Arc::new(Mutex::new(None));
 
         let f = frame.clone();
@@ -26,8 +49,11 @@ impl Capturer {
             //
             // `Display::width()/height()` deliberately keep returning POINTS —
             // pointer injection maps normalised coordinates into that space.
-            display.0.pixel_width(),
-            display.0.pixel_height(),
+            //
+            // `new()` passes the display's pixel size here; `new_sized()`
+            // passes the encode box so CoreGraphics scales instead of the CPU.
+            out_w,
+            out_h,
             quartz::PixelFormat::Argb8888,
             // ROOMLER PATCH: composite the cursor INTO the frame.
             //
