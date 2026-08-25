@@ -26,9 +26,28 @@ on:
       - 'crates/**'
       - 'agents/roomler-agent/**'
       - '.github/workflows/integration-tests.yml'
+  # ⚠️ On PRs this used to fire ONLY for `crates/tests/**` — i.e. when someone
+  # edited the tests, not when they edited what the tests cover. A change to a
+  # DAO, a route or the WS layer went straight to master and turned THAT red
+  # after merging. A gate that only runs post-merge reports history, not risk;
+  # the lane found two real defects on day one and both would have been caught
+  # a step earlier here.
+  #
+  # Scoped by measurement rather than instinct, because this job is ~20 min.
+  # Over the last 90 days on master: these paths carry 170 of 1075 commits
+  # (16%), against 447 (42%) for all of `crates/**`. So it fires on roughly one
+  # commit in six — the ones touching what the suite actually exercises: the
+  # models/indexes, the DAOs, the HTTP routes and the WS handlers.
+  #
+  # ⚠️ If a new crate becomes part of what these tests drive, add it here.
+  # Otherwise the suite quietly goes back to being verified only after merge.
   pull_request:
     paths:
       - 'crates/tests/**'
+      - 'crates/db/**'
+      - 'crates/services/src/dao/**'
+      - 'crates/api/src/routes/**'
+      - 'crates/api/src/ws/**'
       - '.github/workflows/integration-tests.yml'
   workflow_dispatch:
     inputs:
