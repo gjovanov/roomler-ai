@@ -1568,8 +1568,10 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
             bail!(
                 "refusing to self-update: `installer -target /` requires root, but this \
                  agent runs as uid {euid} (the per-user LaunchAgent). Exiting here would \
-                 take the agent offline without installing anything. Let the root daemon \
-                 update the shared bundle, or run `sudo roomlerd self-update` on the host."
+                 take the agent offline without installing anything. Updates on macOS are \
+                 owned by the root update helper (com.roomler.update) — wake it with \
+                 `touch {MACOS_UPDATE_TRIGGER}` and watch /var/log/roomler-agent/update.log, \
+                 or install by hand: `sudo installer -pkg <pkg> -target /`."
             );
         }
 
@@ -1908,6 +1910,14 @@ pub async fn run_periodic(
     interval: Duration,
     mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
 ) {
+    // macOS: the agent processes install NOTHING — `com.roomler.update`
+    // (the root update helper) owns check+download+verify+install, and this
+    // loop reduces to forwarding rc:agent.update triggers to its wake file.
+    // A runtime `cfg!` (not an attribute) so both bodies stay type-checked
+    // on every platform.
+    if cfg!(target_os = "macos") {
+        return macos_forward_triggers(shutdown, trigger_rx).await;
+    }
     let mut first = true;
     let mut consecutive_defers: u32 = 0;
     // The recheck the LAST defer chose (fast for a net transition, the
@@ -2037,6 +2047,189 @@ pub async fn run_periodic(
         let outcome = check_once().await;
         if act_on_outcome(outcome, &shutdown_tx) {
             return;
+        }
+    }
+}
+
+// ─── macOS update half (`com.roomler.update` + `update-helper`) ──────────
+//
+// `installer -target /` needs root and the DEFAULT macOS install is the
+// per-user LaunchAgent alone, so an in-process self-update is structurally
+// impossible there (and on two-half Macs the exit-to-update dance raced
+// launchd — field 2026-08-24/25: four UpdateNow pushes knocked the MacBook
+// offline). The fix is a THIRD launchd unit the pkg installs by default:
+// a root, non-long-running helper that owns check+download+verify+install,
+// with the agents reduced to touching a wake file. No agent process is ever
+// the installer's parent and none exits for an update — the pkg postinstall
+// re-bootstraps both halves.
+
+/// The wake file the agents touch and `com.roomler.update`'s `WatchPaths`
+/// watches. Lives in the sticky world-writable /var/tmp ON PURPOSE: the
+/// per-user agent is not root, and the file is a pure WAKE SIGNAL —
+/// **its content is deliberately ignored**. Anything else would hand every
+/// local user a primitive: a pin honoured from here would let an
+/// unprivileged writer make root install a GENUINE-BUT-OLD release (the
+/// exact downgrade class `artifact_version` closed on Windows). Whoever
+/// writes it can cause an update CHECK, never choose what gets installed.
+pub const MACOS_UPDATE_TRIGGER: &str = "/private/var/tmp/roomler-update-check";
+
+/// Touch the update-helper wake file. Portable (plain fs) so the forwarder
+/// type-checks on every platform; only ever called on macOS at runtime.
+///
+/// O_NOFOLLOW + O_EXCL-free create: /var/tmp is sticky, another local user
+/// could have planted a symlink at this exact name — refuse to write
+/// through it rather than clobber whatever it points at with our bytes.
+pub fn macos_queue_update_check() -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(MACOS_UPDATE_TRIGGER)?;
+    // Timestamp only — human courtesy for whoever cats the file. The helper
+    // never reads it (see the const doc: content is not trusted).
+    writeln!(f, "{}", chrono::Utc::now().to_rfc3339())
+}
+
+/// macOS replacement for the [`run_periodic`] body: forward every
+/// `rc:agent.update` trigger to the wake file and do nothing else. The
+/// periodic cadence lives in the helper's own `StartInterval` — ONE owner
+/// of "check+download+verify+install", zero in-process installs.
+///
+/// Compiles on every platform (portable tokio + fs) so the whole updater
+/// keeps type-checking in cross-platform CI lanes; only macOS takes it.
+async fn macos_forward_triggers(
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut trigger_rx: tokio::sync::mpsc::Receiver<Option<String>>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+            }
+            maybe = trigger_rx.recv() => {
+                let Some(pin) = maybe else { return };
+                if let Some(tag) = pin {
+                    // Deliberate: pins do NOT cross the trigger boundary
+                    // (see MACOS_UPDATE_TRIGGER — content is untrusted).
+                    // The helper installs LATEST; a pinned downgrade on
+                    // macOS is a manual `sudo installer -pkg` by design.
+                    tracing::warn!(
+                        %tag,
+                        "rc:agent.update pin ignored on macOS — the update helper installs \
+                         the latest release; pinned installs are manual (sudo installer -pkg …)"
+                    );
+                }
+                match macos_queue_update_check() {
+                    Ok(()) => tracing::info!(
+                        trigger = MACOS_UPDATE_TRIGGER,
+                        "rc:agent.update queued for the root update helper (com.roomler.update); \
+                         watch /var/log/roomler-agent/update.log"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "could not write the update-helper wake file — if this Mac has \
+                         /etc/roomler-agent/disable-auto-update set, updates are manual"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// `roomler-agent update-helper` — the body of `com.roomler.update`.
+///
+/// Root-only, single-shot: consume the wake file, honour the opt-out marker
+/// and the install-storm cooldown, then check → download → verify →
+/// `installer -pkg … -target /` **waiting** on it (unlike every agent-side
+/// spawn there is nothing here the pkg replaces-and-restarts, so waiting is
+/// safe and gives us the real exit code). The pkg's postinstall restarts
+/// the agent halves; this process just reports and exits.
+#[cfg(target_os = "macos")]
+pub async fn run_update_helper() -> anyhow::Result<()> {
+    use anyhow::{Context, bail};
+
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        bail!(
+            "update-helper must run as root (launchd system domain); euid={euid}. \
+             This subcommand is the body of com.roomler.update — it is not meant \
+             to be run by hand except as `sudo roomler-agent update-helper`."
+        );
+    }
+
+    // Consume the wake file FIRST, unconditionally, content unread —
+    // `remove_file` does not follow symlinks, so a planted link is deleted,
+    // never dereferenced. Removing before the gates means a wake that loses
+    // to the cooldown doesn't re-fire the WatchPaths job in a tight loop.
+    let _ = std::fs::remove_file(MACOS_UPDATE_TRIGGER);
+
+    // The operator's opt-out. postinstall removes the launchd unit when this
+    // marker is set, but a loaded job can linger until reboot (it must not
+    // bootout its own ancestor mid-install) — so the helper honours the
+    // marker itself, making the lingering job harmless.
+    if std::path::Path::new("/etc/roomler-agent/disable-auto-update").exists() {
+        tracing::info!("auto-update opted out (/etc/roomler-agent/disable-auto-update) — exiting");
+        return Ok(());
+    }
+
+    if recent_update_attempt(STARTUP_UPDATE_COOLDOWN) {
+        tracing::info!(
+            cooldown_secs = STARTUP_UPDATE_COOLDOWN.as_secs(),
+            "update-helper: suppressed by recent-install cooldown"
+        );
+        return Ok(());
+    }
+
+    match check_once().await {
+        CheckOutcome::UpToDate { current, latest } => {
+            tracing::info!(%current, %latest, "update-helper: up to date");
+            Ok(())
+        }
+        CheckOutcome::Skipped(reason) => {
+            tracing::info!(%reason, "update-helper: check skipped");
+            Ok(())
+        }
+        CheckOutcome::UpdateReady {
+            current,
+            latest,
+            installer_path,
+        } => {
+            record_update_attempt();
+            tracing::warn!(
+                %current,
+                %latest,
+                pkg = %installer_path.display(),
+                "update-helper: installing (installer -pkg … -target /)"
+            );
+            let status = std::process::Command::new("installer")
+                .args(["-pkg"])
+                .arg(&installer_path)
+                .args(["-target", "/"])
+                .status()
+                .context("running installer(8)")?;
+            if !status.success() {
+                // Same operator sentinel act_on_outcome raises: a failed
+                // install is otherwise invisible — the fleet version simply
+                // never moves.
+                let _ = crate::notify::raise_attention_machine_aware(&format!(
+                    "Self-update to {latest} failed (installer exited {status}) and this \
+                     Mac is still on {current}. See /var/log/install.log."
+                ));
+                bail!(
+                    "installer(8) exited {status} installing {latest}; this Mac stays on \
+                     {current}. Details: /var/log/install.log"
+                );
+            }
+            tracing::info!(
+                %latest,
+                "update-helper: installed — postinstall re-bootstrapped the agent halves"
+            );
+            Ok(())
         }
     }
 }
