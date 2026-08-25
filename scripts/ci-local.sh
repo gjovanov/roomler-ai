@@ -87,8 +87,13 @@ if [ "$QUICK" = "0" ]; then
     cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
   run "test-tunnel-overlay" \
     cargo test -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --lib -- --test-threads=1
+  # `--all-targets`, matching CI. Without it the agent's TEST code is never
+  # compiled here, and CI's three agent lanes (Rust checks, Windows overlay
+  # clippy, ffmpeg-encoder) all build with tests — so a struct literal in
+  # `telemetry.rs`'s tests sailed past a green local gate and failed all three
+  # (2026-08-25). "Compiled somewhere" is not "compiled everywhere CI does".
   run "clippy-agent-overlay" \
-    cargo clippy -p roomler-agent --features overlay-l3 -- -D warnings
+    cargo clippy -p roomler-agent --features overlay-l3 --all-targets -- -D warnings
 fi
 
 echo

@@ -248,6 +248,7 @@ mod tests {
             srflx: None,
             warm_relay: None,
             direct_socks: Vec::new(),
+            derp_inbound_drops: None,
         };
         let out = s.sample(&view, (0, 0));
         assert_eq!(out.direct, 1);
@@ -284,6 +285,7 @@ mod tests {
             srflx: None,
             warm_relay: None,
             direct_socks: Vec::new(),
+            derp_inbound_drops: None,
         };
         let out = s.sample(&view, (0, 0));
         assert_eq!(out.links.len(), 3);
@@ -320,6 +322,7 @@ mod tests {
             srflx: None,
             warm_relay: None,
             direct_socks: Vec::new(),
+            derp_inbound_drops: None,
         };
         let out = s.sample(&view, (0, 0));
         assert_eq!(out.links.len(), 3);
@@ -360,6 +363,7 @@ mod tests {
             srflx: None,
             warm_relay: None,
             direct_socks: Vec::new(),
+            derp_inbound_drops: None,
         };
         let out = s.sample(&view, (0, 0));
         assert_eq!(out.links[0].relay.as_deref(), Some("turn/udp"));

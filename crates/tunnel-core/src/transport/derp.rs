@@ -102,7 +102,66 @@ pub struct DerpConn {
     /// rejects a family-mismatched or zero-port remote).
     synth_local: SocketAddr,
     synth_peer: SocketAddr,
+    /// #32 — the mux's route table, WHICH slot this conn owns, and OUR sender
+    /// in it, so [`Drop`] can retire exactly our own route and never a newer
+    /// one (nor the other consumer's).
+    peers: PeerTable,
+    route: RouteKind,
+    self_tx: mpsc::Sender<Vec<u8>>,
 }
+
+/// #32 — which of a peer's two inbound routes a [`DerpConn`] owns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RouteKind {
+    /// The WG/carrier consumer ([`DerpMux::conn_for`]).
+    Wg,
+    /// R4's tunnel consumer ([`DerpMux::tunnel_conn_for`]).
+    Tunnel,
+}
+
+/// #32 — a route must not outlive the conn that consumes it.
+///
+/// The table was written and never cleaned: the vend methods insert, "last one
+/// wins" replaces, and nothing ever removes. That is safe only while a dropped
+/// `DerpConn` also closes its channel — and `deliver` only *reports* a miss
+/// when `try_send` FAILS, so a route left pointing at a channel that is somehow
+/// still open would swallow frames in a queue nobody drains, silently. Making
+/// the route's lifetime the consumer's lifetime is the invariant `deliver`
+/// already assumes; nothing enforced it.
+///
+/// Same class as "an `RTCPeerConnection` must be `close()`d": bookkeeping
+/// outliving its owner.
+impl Drop for DerpConn {
+    fn drop(&mut self) {
+        let mut peers = self.peers.lock().unwrap();
+        let Some(routes) = peers.get_mut(&self.peer_pubkey) else {
+            return;
+        };
+        // ⚠️ Only OUR slot, and only if it is STILL ours. A rebuild registers
+        // the new conn BEFORE the old one drops ("last one wins"), so clearing
+        // blindly would unregister the LIVE consumer — turning a hypothetical
+        // silent drop into a guaranteed one. And the two slots are independent
+        // consumers: a WG carrier going away must not take R4's tunnel route
+        // with it.
+        let slot = match self.route {
+            RouteKind::Wg => &mut routes.wg,
+            RouteKind::Tunnel => &mut routes.tunnel,
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|tx| tx.same_channel(&self.self_tx))
+        {
+            *slot = None;
+        }
+        if routes.wg.is_none() && routes.tunnel.is_none() {
+            peers.remove(&self.peer_pubkey);
+        }
+    }
+}
+
+/// #32 — the route table, shared with every [`DerpConn`] so a conn can retire
+/// its own route on drop (see that `Drop` impl).
+type PeerTable = Arc<Mutex<HashMap<DerpPubKey, PeerRoutes>>>;
 
 /// One peer's inbound routes on the mux — the WG/carrier consumer (today's
 /// [`DerpMux::conn_for`]) and, since R4, an optional TUNNEL consumer
@@ -248,7 +307,7 @@ pub struct DerpMux {
     /// path distinguish a reconnect blip from a sustained WSS outage — the
     /// U1 healer must not clear force-DERP pins on a flap (Phase A1).
     down_since: Mutex<Option<Instant>>,
-    peers: Mutex<HashMap<DerpPubKey, PeerRoutes>>,
+    peers: PeerTable,
     /// #27/#28 — where this mux reports [`MuxEvent`]s to the runtime. `None`
     /// until the runtime arms it (tests, and the tunnel-only paths that never
     /// demote, leave it unset).
@@ -272,7 +331,7 @@ impl DerpMux {
             ws_out,
             alive: Arc::new(AtomicBool::new(true)),
             down_since: Mutex::new(None),
-            peers: Mutex::new(HashMap::new()),
+            peers: Arc::new(Mutex::new(HashMap::new())),
             events_tx: Mutex::new(None),
             dropped_unrouted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_backpressure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -317,8 +376,8 @@ impl DerpMux {
             .unwrap()
             .entry(peer_pubkey)
             .or_default()
-            .wg = Some(in_tx);
-        self.build_conn(peer_pubkey, in_rx)
+            .wg = Some(in_tx.clone());
+        self.build_conn(peer_pubkey, in_rx, RouteKind::Wg, in_tx)
     }
 
     /// R4 — vend a [`DerpConn`] for the TUNNEL's `quic-derp-v1` flavor toward
@@ -335,11 +394,17 @@ impl DerpMux {
             .unwrap()
             .entry(peer_pubkey)
             .or_default()
-            .tunnel = Some(in_tx);
-        self.build_conn(peer_pubkey, in_rx)
+            .tunnel = Some(in_tx.clone());
+        self.build_conn(peer_pubkey, in_rx, RouteKind::Tunnel, in_tx)
     }
 
-    fn build_conn(&self, peer_pubkey: DerpPubKey, in_rx: mpsc::Receiver<Vec<u8>>) -> DerpConn {
+    fn build_conn(
+        &self,
+        peer_pubkey: DerpPubKey,
+        in_rx: mpsc::Receiver<Vec<u8>>,
+        route: RouteKind,
+        self_tx: mpsc::Sender<Vec<u8>>,
+    ) -> DerpConn {
         DerpConn {
             peer_pubkey,
             ws_out: self.ws_out.clone(),
@@ -347,6 +412,9 @@ impl DerpMux {
             alive: Arc::clone(&self.alive),
             synth_local: synth_addr(&self.self_pubkey),
             synth_peer: synth_addr(&peer_pubkey),
+            peers: Arc::clone(&self.peers),
+            route,
+            self_tx,
         }
     }
 
@@ -405,6 +473,7 @@ impl DerpMux {
         {
             if tx.try_send(payload.to_vec()).is_err() {
                 self.dropped_backpressure.fetch_add(1, Ordering::Relaxed);
+                crate::evidence::DERP_INBOUND_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
@@ -417,11 +486,13 @@ impl DerpMux {
                     // one wins"). A CLOSED channel is the same demote-lag
                     // condition as a missing one, so it reports too.
                     self.dropped_backpressure.fetch_add(1, Ordering::Relaxed);
+                    crate::evidence::DERP_INBOUND_BACKPRESSURE.fetch_add(1, Ordering::Relaxed);
                     self.emit(MuxEvent::Unrouted(src));
                 }
             }
             None => {
                 self.dropped_unrouted.fetch_add(1, Ordering::Relaxed);
+                crate::evidence::DERP_INBOUND_UNROUTED.fetch_add(1, Ordering::Relaxed);
                 self.emit(MuxEvent::Unrouted(src));
             }
         }
@@ -483,6 +554,90 @@ mod tests {
 
     fn pk(b: u8) -> DerpPubKey {
         [b; 32]
+    }
+
+    /// #32 — a route must not outlive the conn that consumes it. Once the last
+    /// reference to a `DerpConn` goes, the next frame for that peer must be
+    /// REPORTED (so the demote-follow can act) rather than routed into a queue
+    /// nobody drains.
+    ///
+    /// The surviving-`Arc` shape is the one worth exercising: a carrier holds
+    /// its conn behind an `Arc`, and until every clone is gone the conn is
+    /// still a legitimate consumer.
+    #[tokio::test]
+    async fn a_dropped_conn_retires_its_route_even_with_a_live_arc() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
+        let base = mux.drop_counts();
+
+        let carrier: Arc<DerpConn> = Arc::new(mux.conn_for(pk(0x02)));
+        let survivor = Arc::clone(&carrier);
+
+        // A WG frame (first byte 1..=4 ⇒ the WG/disco consumer).
+        let mut frame = pk(0x02).to_vec();
+        frame.extend_from_slice(&[1, 0, 0, 0]);
+        mux.deliver(&frame);
+        assert!(
+            rx.try_recv().is_err(),
+            "while the conn is live the frame routes and must stay silent"
+        );
+
+        drop(carrier); // the direct tier is promoted: the carrier is replaced…
+        mux.deliver(&frame);
+        assert!(
+            rx.try_recv().is_err(),
+            "a still-referenced conn is still a valid consumer"
+        );
+
+        drop(survivor); // …and now the last reference goes.
+        mux.deliver(&frame);
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(MuxEvent::Unrouted(pk(0x02))),
+            "a retired route must make the next frame REPORT, not vanish"
+        );
+        assert_eq!(
+            mux.drop_counts().0 - base.0,
+            1,
+            "and be counted as unrouted"
+        );
+    }
+
+    /// #32 — "last one wins" must survive the retirement, and the two consumers
+    /// are INDEPENDENT. A rebuild registers the new conn before the old one
+    /// drops, so a blind clear would unregister the live one; and a WG carrier
+    /// going away must not take R4's tunnel route with it.
+    #[tokio::test]
+    async fn retirement_spares_a_rebuild_and_the_other_consumer() {
+        let (mux, _out_rx) = DerpMux::new(pk(0x01));
+        let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
+        mux.set_event_sink(tx);
+
+        // (a) rebuild: old drops AFTER new registered ⇒ new survives.
+        let old = mux.conn_for(pk(0x02));
+        let new = mux.conn_for(pk(0x02));
+        drop(old);
+        let mut wg = pk(0x02).to_vec();
+        wg.extend_from_slice(&[1, 0, 0, 0]);
+        mux.deliver(&wg);
+        assert!(rx.try_recv().is_err(), "the NEW route is live — no report");
+        let mut buf = [0u8; 32];
+        let (n, _) = new.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[1, 0, 0, 0], "and the frame reaches it");
+
+        // (b) independence: dropping the WG conn must leave the tunnel route.
+        let tunnel = mux.tunnel_conn_for(pk(0x02));
+        drop(new);
+        let mut quic = pk(0x02).to_vec();
+        quic.extend_from_slice(&[0xC0, 1, 2, 3]); // QUIC long header ⇒ tunnel
+        mux.deliver(&quic);
+        let (n, _) = tunnel.recv_from(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            &[0xC0, 1, 2, 3],
+            "the tunnel consumer must survive the WG carrier's retirement"
+        );
     }
 
     fn frame(src: DerpPubKey, payload: &[u8]) -> Vec<u8> {
@@ -651,16 +806,21 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// #27 — the registration OUTLIVES its `DerpConn` by design ("last one
-    /// wins"), so a peer whose DERP carrier was replaced by a better tier
-    /// leaves a live entry pointing at a CLOSED channel. That is the same
-    /// demote-lag condition as a missing entry and must report too — otherwise
-    /// exactly the peers that once used DERP stay silently dark.
+    /// #27/#32 — a peer whose DERP carrier was replaced by a better tier must
+    /// report, or exactly the peers that once used DERP stay silently dark.
+    ///
+    /// ⚠️ The CLASSIFICATION changed with #32, and that is the point. It used
+    /// to land in the closed-channel (backpressure) branch, because the route
+    /// outlived its conn and `deliver` only noticed when `try_send` failed. The
+    /// route is now retired on drop, so this is a genuine MISS — which is also
+    /// the only shape that reports when something still holds an `Arc` to the
+    /// conn and the channel therefore is not closed at all.
     #[tokio::test]
-    async fn a_closed_conn_channel_reports_like_a_missing_one() {
+    async fn a_replaced_carrier_reports_as_unrouted() {
         let (mux, _out_rx) = DerpMux::new(pk(0x01));
         let (tx, mut rx) = mpsc::channel(DerpMux::EVENT_SINK_DEPTH);
         mux.set_event_sink(tx);
+        let base = mux.drop_counts();
 
         let conn = mux.conn_for(pk(0x02));
         drop(conn); // a better tier replaced this carrier
@@ -670,10 +830,11 @@ mod tests {
         mux.deliver(&frame);
 
         assert_eq!(rx.try_recv().ok(), Some(MuxEvent::Unrouted(pk(0x02))));
+        let now = mux.drop_counts();
         assert_eq!(
-            mux.drop_counts(),
-            (0, 1),
-            "counted as backpressure/closed, not as a missing registration"
+            (now.0 - base.0, now.1 - base.1),
+            (1, 0),
+            "the route is retired, so this is a MISS — not backpressure"
         );
     }
 

@@ -356,6 +356,7 @@ mod tests {
             srflx: None,
             warm_relay: None,
             direct_socks: Vec::new(),
+            derp_inbound_drops: None,
         };
         assert_eq!(
             resolve_overlay_host(&view, "100.64.0.9"),
@@ -431,6 +432,7 @@ mod tests {
             srflx: None,
             warm_relay: None,
             direct_socks: Vec::new(),
+            derp_inbound_drops: None,
         });
         tokio::spawn(serve_socks5(handle_rx, view_rx, socks));
         (a, b, socks_addr, (handle_tx, view_tx))
