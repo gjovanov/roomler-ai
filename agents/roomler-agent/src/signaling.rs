@@ -1089,10 +1089,9 @@ async fn connect_once(
     // data plane — `TcpForwardForward` dispatch checks this map first
     // and falls back to the WebRTC `tunnel_peers` map. Same lifecycle:
     // live until `TunnelTerminate` / WS disconnect.
-    let mut tunnel_quic_peers: HashMap<
-        bson::oid::ObjectId,
-        Arc<crate::tunnel::quic_peer::AgentQuicPeer>,
-    > = HashMap::new();
+    // R3 — reclaim any QUIC peers stashed by a prior session's TRANSIENT exit
+    // (empty unless `tunnel_peers_survive_reattach` is on ⇒ pre-R3 identical).
+    let mut tunnel_quic_peers = reclaim_survived_quic_peers(&cfg.tenant_id);
 
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
@@ -1159,6 +1158,8 @@ async fn connect_once(
                     info!("shutdown signalled; closing ws");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
+                    // Terminal: a daemon shutdown must tear peers down, never
+                    // stash them (the process is going away).
                     close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
                     let _ = send_frame(&mut ws, Message::Close(None)).await;
                     return Ok(());
@@ -1204,7 +1205,7 @@ async fn connect_once(
                     );
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
-                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(anyhow::anyhow!(
                         "resume-from-suspend (napped ~{} s)",
                         (wall_gap - mono_gap).as_secs()
@@ -1218,7 +1219,7 @@ async fn connect_once(
                     );
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
-                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(anyhow::anyhow!(
                         "ws rx deadline: no inbound frames for {} s",
                         last_rx.elapsed().as_secs()
@@ -1244,7 +1245,7 @@ async fn connect_once(
                             );
                             close_all_peers(&mut peers, &indicator).await;
                             close_all_tunnel_peers(&mut tunnel_peers).await;
-                            close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                            park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                             return Err(ConnectError::Transient(anyhow::anyhow!(
                                 "net-change probe: {} windows of {} s unanswered after a \
                                  Major network change",
@@ -1264,7 +1265,7 @@ async fn connect_once(
                             warn!(%e, "net-change re-probe ping failed — reconnecting");
                             close_all_peers(&mut peers, &indicator).await;
                             close_all_tunnel_peers(&mut tunnel_peers).await;
-                            close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                            park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                             return Err(ConnectError::Transient(e.context("net-change re-probe")));
                         }
                         netchange_probe = Some((std::time::Instant::now(), misses));
@@ -1298,7 +1299,7 @@ async fn connect_once(
                             } else {
                                 close_all_peers(&mut peers, &indicator).await;
                                 close_all_tunnel_peers(&mut tunnel_peers).await;
-                                close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                                park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                                 return Err(ConnectError::Transient(anyhow::anyhow!(
                                     "control WS degraded: keepalive ping unanswered for {} s \
                                      ({} strikes) — cycling to a fresh connection",
@@ -1319,7 +1320,7 @@ async fn connect_once(
                         warn!(%e, "keepalive ping failed — will reconnect");
                         close_all_peers(&mut peers, &indicator).await;
                         close_all_tunnel_peers(&mut tunnel_peers).await;
-                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                        park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                         return Err(ConnectError::Transient(e.context("ws ping")));
                     }
                     outstanding_ping = Some(std::time::Instant::now());
@@ -1356,7 +1357,7 @@ async fn connect_once(
                         warn!(%e, "net-change probe ping failed — reconnecting");
                         close_all_peers(&mut peers, &indicator).await;
                         close_all_tunnel_peers(&mut tunnel_peers).await;
-                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                        park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                         return Err(ConnectError::Transient(e.context("net-change probe ping")));
                     }
                     if outstanding_ping.is_none() {
@@ -1410,7 +1411,7 @@ async fn connect_once(
                     warn!(%e, "heartbeat send failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
-                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(e.context("heartbeat send")));
                 }
                 // Wave 2 — one `rc:session.stats` per LIVE session, on the
@@ -1464,7 +1465,7 @@ async fn connect_once(
                     warn!(%e, "failed to flush peer-originated message — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
-                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(e.context("outbound flush")));
                 }
                 watchdog::tick(ctx.pump);
@@ -1557,7 +1558,7 @@ async fn connect_once(
                         warn!(%e, "pong reply failed — will reconnect");
                         close_all_peers(&mut peers, &indicator).await;
                         close_all_tunnel_peers(&mut tunnel_peers).await;
-                        close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                        park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                         return Err(ConnectError::Transient(e.context("ws pong")));
                     }
                     watchdog::tick(ctx.pump);
@@ -1566,13 +1567,13 @@ async fn connect_once(
                     info!("ws closed by peer");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
-                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Ok(());
                 }
                 Some(Err(e)) => {
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
-                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                    park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
                 }
                 Some(Ok(Message::Pong(payload))) => {
@@ -1604,7 +1605,7 @@ async fn connect_once(
                                 } else {
                                     close_all_peers(&mut peers, &indicator).await;
                                     close_all_tunnel_peers(&mut tunnel_peers).await;
-                                    close_all_tunnel_quic_peers(&mut tunnel_quic_peers).await;
+                                    park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                                     return Err(ConnectError::Transient(anyhow::anyhow!(
                                         "control WS degraded: pong rtt {} s ({} consecutive over \
                                          the {} s bound) — cycling to a fresh connection",
@@ -3026,12 +3027,7 @@ async fn close_all_tunnel_peers(
 /// accept task; the quinn endpoint drops with the last `Arc`), so
 /// unlike [`close_all_tunnel_peers`] there's no per-peer `.await`.
 /// Cheap no-op when the map is empty (normal for non-QUIC agents).
-async fn close_all_tunnel_quic_peers(
-    tunnel_quic_peers: &mut HashMap<
-        bson::oid::ObjectId,
-        Arc<crate::tunnel::quic_peer::AgentQuicPeer>,
-    >,
-) {
+async fn close_all_tunnel_quic_peers(tunnel_quic_peers: &mut TunnelQuicPeers) {
     if tunnel_quic_peers.is_empty() {
         return;
     }
@@ -3040,6 +3036,87 @@ async fn close_all_tunnel_quic_peers(
         peer.close();
     }
     info!(count, "torn down agent QUIC tunnel peers on ws disconnect");
+}
+
+/// R3 — per-tenant stash of QUIC tunnel peers that SURVIVE a transient
+/// control-WS reattach. QUIC flows self-signal over their own streams (no
+/// welded control-WS sender — see `tunnel_core::forward::run_flow_quic`), so
+/// an established QUIC/derp data plane keeps flowing while the control WS
+/// re-establishes; the server-side grace (`ROOMLER__RC__TUNNEL_GRACE_SECS`)
+/// keeps the session from being terminated meanwhile. Gated on
+/// `tunnel_peers_survive_reattach` (default off ⇒ pre-R3 byte-identical).
+/// Size-capped so a long agent outage (client re-opened elsewhere ⇒ orphaned
+/// peers) can't leak sockets without bound; a dropped peer self-closes via
+/// its #602 Drop.
+/// A control-WS session's live QUIC tunnel peers, keyed by tunnel session id.
+type TunnelQuicPeers = HashMap<bson::oid::ObjectId, Arc<crate::tunnel::quic_peer::AgentQuicPeer>>;
+
+static TUNNEL_QUIC_SURVIVAL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, TunnelQuicPeers>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+/// Max surviving QUIC sessions stashed per tenant (orphan-leak bound).
+const TUNNEL_QUIC_SURVIVAL_CAP: usize = 32;
+
+/// The R3 agent gate (`ROOMLER_NODE_TUNNEL_PEERS_SURVIVE_REATTACH`, default
+/// off). Read per exit so a live `roomler config set` + restart flips it.
+fn tunnel_peers_survive_enabled() -> bool {
+    tunnel_core::env::flag("TUNNEL_PEERS_SURVIVE_REATTACH", false)
+}
+
+/// Reclaim the tenant's stashed QUIC peers at the start of a control-WS
+/// session. Empty when the flag is off — pre-R3 behaviour byte-identical.
+fn reclaim_survived_quic_peers(tenant: &str) -> TunnelQuicPeers {
+    if !tunnel_peers_survive_enabled() {
+        return HashMap::new();
+    }
+    let map = TUNNEL_QUIC_SURVIVAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(tenant)
+        .unwrap_or_default();
+    if !map.is_empty() {
+        info!(
+            count = map.len(),
+            "R3: reclaimed surviving QUIC tunnel peers across control-WS reattach"
+        );
+    }
+    map
+}
+
+/// On a TRANSIENT control-WS exit (RX deadline, resume-skew, netstate probe,
+/// pong-RTT, read/write/pong error): STASH the QUIC peers so they survive to
+/// the next session (flag on), or close them as today (flag off). TERMINAL
+/// exits — shutdown and `Goodbye` — call [`close_all_tunnel_quic_peers`]
+/// directly instead (a re-registration or a delete must not keep peers).
+async fn park_survived_quic_peers(tunnel_quic_peers: &mut TunnelQuicPeers, tenant: &str) {
+    if !tunnel_peers_survive_enabled() {
+        close_all_tunnel_quic_peers(tunnel_quic_peers).await;
+        return;
+    }
+    if tunnel_quic_peers.is_empty() {
+        return;
+    }
+    let count = tunnel_quic_peers.len();
+    let mut stash = TUNNEL_QUIC_SURVIVAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let slot = stash.entry(tenant.to_string()).or_default();
+    for (sid, peer) in tunnel_quic_peers.drain() {
+        slot.insert(sid, peer);
+    }
+    while slot.len() > TUNNEL_QUIC_SURVIVAL_CAP {
+        let Some(k) = slot.keys().next().cloned() else {
+            break;
+        };
+        slot.remove(&k); // dropped peer self-closes (#602 Drop)
+    }
+    let stashed = slot.len();
+    drop(stash);
+    info!(
+        count,
+        stashed, "R3: parked QUIC tunnel peers to survive the control-WS reattach"
+    );
 }
 
 type Ws =

@@ -226,6 +226,15 @@ pub struct RcSettings {
     /// 11 RPCs in 15 s at one refusing owner in the 2026-08-04 incident).
     /// Env: `ROOMLER__RC__NUDGE_REQUESTER_THROTTLE_MS`.
     pub nudge_requester_throttle_ms: u64,
+    /// R3 — grace before a tunnel session is terminated when its TARGET
+    /// agent's control WS drops. `0` (default) = terminate immediately
+    /// (pre-R3 behaviour). `>0` = wait this many seconds, then terminate
+    /// ONLY if the agent is still offline everywhere (same-pod hub +
+    /// cross-pod Redis presence) — pairs with the agent's
+    /// `tunnel_peers_survive_reattach` so an established QUIC/derp session
+    /// rides out a corp-VPN control-WS blip instead of being re-opened.
+    /// Env: `ROOMLER__RC__TUNNEL_GRACE_SECS`.
+    pub tunnel_grace_secs: u64,
 }
 
 impl Default for RcSettings {
@@ -240,6 +249,7 @@ impl Default for RcSettings {
             nudge_max_attempts: 3,
             nudge_attempts_reset_secs: 600,
             nudge_requester_throttle_ms: 5000,
+            tunnel_grace_secs: 0,
         }
     }
 }
@@ -573,6 +583,7 @@ impl Settings {
             .set_default("rc.nudge_max_attempts", 3)?
             .set_default("rc.nudge_attempts_reset_secs", 600)?
             .set_default("rc.nudge_requester_throttle_ms", 5000)?
+            .set_default("rc.tunnel_grace_secs", 0)?
             .set_default("s3.enabled", false)?
             .set_default("s3.endpoint", "http://localhost:9000")?
             .set_default("s3.access_key", "minioadmin")?
