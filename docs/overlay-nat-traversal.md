@@ -288,6 +288,26 @@ cascade's guarantees while replacing its reactive counters:
   re-upgrades normally once the network settles. Both `deliver` drop classes
   now carry counters (`DerpMux::drop_counts`); they were silent, which is why
   this cost a day of field time to find.
+- **`/derp` recovery walks immediately (#28).** A VPN transition kills the
+  `/derp` WS too, and every DERP build attempted while it is down is
+  *withheld* — `try_build_derp` refuses over a dead WS, because a carrier born
+  there convicts one-way and rebuilds forever. Those peers are carrier-less the
+  moment the WS returns, and the establish walk is what re-floors them. So the
+  reconnect now wakes the runtime (`MuxEvent::Recovered`, **edge-triggered** so
+  the startup `mark_up` is silent): it opens a short fast-walk window and pulls
+  the fallback tick into it — the same two levers the netstate-Major lane uses,
+  and for the same reason. Without the window `install_peers` runs only every
+  6th tick (~30 s); without the pull-forward the window's first walk still waits
+  out the 5 s grid. Field 2026-08-24: the WS was back in **1.5 s** and the floor
+  took **5 s** more.
+- **A DERP carrier no longer convicts under a coturn diagnosis (#28).** It is
+  raw WG over the pubkey-addressed `/derp` WS — no allocation, no relayed port,
+  nothing to "re-allocate" — yet all four relay death messages asserted TURN
+  causes, and pointing "stale coturn port?" at a DERP carrier once sent the
+  field hunting through coturn for hours. `kind=` made the truth *available*;
+  the sentence now says it. On DERP the one-way cause is specifically **"the
+  peer is not reachable over /derp"** — its WS is down, or (pre-#27) it never
+  followed us here — which is a different investigation entirely.
 - **Resets.** An endpoint change (roam) clears penalties, strikes, and `Q` —
   new endpoints make old evidence stale. Forced-DERP remains a **server
   override**: the monitor annotates the pinned window and never selects
