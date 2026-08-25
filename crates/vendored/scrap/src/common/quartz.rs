@@ -29,7 +29,29 @@ impl Capturer {
             display.0.pixel_width(),
             display.0.pixel_height(),
             quartz::PixelFormat::Argb8888,
-            Default::default(),
+            // ROOMLER PATCH: composite the cursor INTO the frame.
+            //
+            // Upstream passes `Default::default()`, whose `cursor` is FALSE.
+            // On macOS that is not a cosmetic default — it is the only way a
+            // viewer ever sees the remote pointer, because the cursor tracker
+            // that streams a shape + position separately (`capture/cursor.rs`)
+            // is Windows-only and returns `None` here. With `ShowCursor` off
+            // and no tracker, a Mac session has no pointer at all: you cannot
+            // see where you are about to click.
+            //
+            // Field-reported 2026-08-25 — the pointer was missing both for a
+            // viewer AND when moving the Mac's own mouse, i.e. it was absent
+            // from the captured frames themselves.
+            //
+            // ⚠️ Ask for it EXPLICITLY rather than relying on whatever
+            // WindowServer happens to composite. Whether the hardware cursor
+            // plane lands in a capture is not a documented guarantee, and it
+            // can change with the stream's output size — which is exactly the
+            // knob the patch above turns.
+            quartz::Config {
+                cursor: true,
+                ..Default::default()
+            },
             move |inner| {
                 if let Ok(mut f) = f.lock() {
                     *f = Some(inner);

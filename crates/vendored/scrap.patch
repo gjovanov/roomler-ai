@@ -1,7 +1,7 @@
 diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/quartz.rs
 --- upstream/src/common/quartz.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/common/quartz.rs	2026-08-24 21:09:45.568993300 +0200
-@@ -15,8 +15,19 @@
++++ vendored/src/common/quartz.rs	2026-08-25 13:52:59.060797800 +0200
+@@ -15,10 +15,43 @@
          let f = frame.clone();
          let inner = quartz::Capturer::new(
              display.0,
@@ -21,9 +21,34 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
 +            display.0.pixel_width(),
 +            display.0.pixel_height(),
              quartz::PixelFormat::Argb8888,
-             Default::default(),
+-            Default::default(),
++            // ROOMLER PATCH: composite the cursor INTO the frame.
++            //
++            // Upstream passes `Default::default()`, whose `cursor` is FALSE.
++            // On macOS that is not a cosmetic default — it is the only way a
++            // viewer ever sees the remote pointer, because the cursor tracker
++            // that streams a shape + position separately (`capture/cursor.rs`)
++            // is Windows-only and returns `None` here. With `ShowCursor` off
++            // and no tracker, a Mac session has no pointer at all: you cannot
++            // see where you are about to click.
++            //
++            // Field-reported 2026-08-25 — the pointer was missing both for a
++            // viewer AND when moving the Mac's own mouse, i.e. it was absent
++            // from the captured frames themselves.
++            //
++            // ⚠️ Ask for it EXPLICITLY rather than relying on whatever
++            // WindowServer happens to composite. Whether the hardware cursor
++            // plane lands in a capture is not a documented guarantee, and it
++            // can change with the stream's output size — which is exactly the
++            // knob the patch above turns.
++            quartz::Config {
++                cursor: true,
++                ..Default::default()
++            },
              move |inner| {
-@@ -66,6 +77,17 @@
+                 if let Ok(mut f) = f.lock() {
+                     *f = Some(inner);
+@@ -66,6 +99,17 @@
      PhantomData<&'a [u8]>
  );
  
@@ -43,7 +68,7 @@ diff -ruN --strip-trailing-cr upstream/src/common/quartz.rs vendored/src/common/
      fn deref(&self) -> &[u8] {
 diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz/display.rs
 --- upstream/src/quartz/display.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/display.rs	2026-08-24 21:09:45.564949300 +0200
++++ vendored/src/quartz/display.rs	2026-08-25 13:52:59.066187200 +0200
 @@ -40,6 +40,48 @@
          unsafe { CGDisplayPixelsHigh(self.0) }
      }
@@ -95,7 +120,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/display.rs vendored/src/quartz
      }
 diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi.rs
 --- upstream/src/quartz/ffi.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/ffi.rs	2026-08-24 21:09:45.563949400 +0200
++++ vendored/src/quartz/ffi.rs	2026-08-25 13:52:59.066738600 +0200
 @@ -9,6 +9,8 @@
  pub type CFNumberRef = *mut c_void;
  pub type CFStringRef = *mut c_void;
@@ -144,7 +169,7 @@ diff -ruN --strip-trailing-cr upstream/src/quartz/ffi.rs vendored/src/quartz/ffi
      pub fn IOSurfaceDecrementUseCount(buffer: IOSurfaceRef);
 diff -ruN --strip-trailing-cr upstream/src/quartz/frame.rs vendored/src/quartz/frame.rs
 --- upstream/src/quartz/frame.rs	2018-01-03 06:28:23.000000000 +0100
-+++ vendored/src/quartz/frame.rs	2026-08-24 21:09:45.561841400 +0200
++++ vendored/src/quartz/frame.rs	2026-08-25 13:52:59.064982700 +0200
 @@ -3,7 +3,9 @@
  
  pub struct Frame {
