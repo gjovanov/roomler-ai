@@ -538,6 +538,41 @@ impl PathMonitor {
         p.hysteresis.record_switch(now);
     }
 
+    /// #29 — the peer is demonstrably NOT using the direct tier we hold it on:
+    /// it is relaying to us over `/derp` (see the demote-follow, #27), which a
+    /// peer only does once it has moved. Suppress that tier exactly as a
+    /// failure does — a DECAYING penalty, so direct is retried on its own once
+    /// the condition lapses (a corp VPN going away, or the server's force-DERP
+    /// pin on the peer's side expiring).
+    ///
+    /// Without this the two mechanisms fight: make-before-break promotes the
+    /// direct tier the moment its probe latches, the peer keeps relaying, the
+    /// follow drags us back, and the pair flaps on MBB's cadence. Field
+    /// 2026-08-25: exactly that, every 60 s for hours, starting the minute the
+    /// demote-follow shipped — a probe can prove a path CARRIES, and still say
+    /// nothing about whether the peer intends to USE it.
+    ///
+    /// Deliberately NOT [`on_death`](Self::on_death): nothing died and the tier
+    /// did not misbehave, so there is no Q slam — this is a selection fact, not
+    /// a quality one. It re-books on every follow, so a peer that stays away
+    /// keeps the tier suppressed while one that returns lets it decay back.
+    pub(crate) fn on_peer_relayed_instead(
+        &mut self,
+        peer: &ObjectId,
+        tier: DirectTier,
+        mbb: bool,
+        now: Instant,
+    ) {
+        if tier.is_direct() {
+            self.book_failure(peer, tier, mbb, now);
+        }
+        self.peers
+            .entry(*peer)
+            .or_default()
+            .hysteresis
+            .record_switch(now);
+    }
+
     /// The sweep advanced the peer's keepalive-inclusive last-heard marker.
     pub(crate) fn on_heard(&mut self, peer: &ObjectId, tier: DirectTier) {
         let p = self.peers.entry(*peer).or_default();
@@ -1285,6 +1320,49 @@ mod tests {
         m.on_death(&a, DirectTier::Lan, DeathReason::RxStale, true, t0);
         assert_eq!(m.strikes(&a, DirectTier::Lan), 1);
         assert!(!m.eligible(&a, DirectTier::Lan, t0 + Duration::from_secs(1)));
+    }
+
+    /// #29 — a peer relaying to us instead of using the direct tier we hold it
+    /// on suppresses that tier (a decaying penalty, so it comes back), but
+    /// books NO Q slam: nothing died and the tier did not misbehave — it is
+    /// simply not where the peer is. That distinction is the whole reason this
+    /// is not `on_death`, and a Q slam here would poison the ranking of a path
+    /// that may be perfectly good.
+    #[test]
+    fn relayed_instead_suppresses_the_tier_without_slamming_its_quality() {
+        for tier in DIRECT_TIERS {
+            let mut m = PathMonitor::default();
+            let a = oid(1);
+            let t0 = Instant::now();
+            m.on_peer_relayed_instead(&a, tier, true, t0);
+
+            let idx = tier_idx(tier).unwrap();
+            let p = m.peers.get(&a).expect("the peer is tracked");
+            assert!(
+                p.tiers[idx].penalty.is_some(),
+                "{tier:?} must be suppressed, or make-before-break re-promotes \
+                 it on its next probe and the pair flaps"
+            );
+            assert_eq!(m.strikes(&a, tier), 1, "{tier:?} books the strike");
+            assert_eq!(
+                p.tiers[idx].q.get(),
+                0.0,
+                "{tier:?} quality is UNTOUCHED — the path may be fine; the peer \
+                 is just not on it"
+            );
+            // Decaying, not sticky: far enough past the half-life it is
+            // eligible again, so a peer that comes back gets direct back.
+            assert!(
+                m.eligible(&a, tier, t0 + H_ESCALATED * 4),
+                "{tier:?} suppression must decay — direct returns on its own"
+            );
+        }
+        // The relay tier is not a direct tier: nothing to suppress, and no
+        // panic from the tier-index lookup.
+        let mut m = PathMonitor::default();
+        let b = oid(2);
+        m.on_peer_relayed_instead(&b, DirectTier::Relay, true, Instant::now());
+        assert_eq!(m.strikes(&b, DirectTier::Relay), 0);
     }
 
     /// R2 — `on_local_rebuild` clears every peer's DIRECT-tier evidence
