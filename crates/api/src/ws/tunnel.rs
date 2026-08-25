@@ -207,6 +207,7 @@ pub async fn handle_tunnel_client_socket(
                 agent_id,
                 transport,
                 open_nonce,
+                derp_pubkey,
             } => {
                 // The dedicated CLI is single-open, so `open_nonce` is
                 // normally None; the server echoes back whatever it sent.
@@ -216,6 +217,7 @@ pub async fn handle_tunnel_client_socket(
                     agent_id,
                     transport,
                     open_nonce,
+                    derp_pubkey,
                     &client_supported_transports,
                 )
                 .await;
@@ -508,6 +510,8 @@ async fn handle_tunnel_open(
     agent_id: ObjectId,
     transport: String,
     open_nonce: Option<String>,
+    // R4 - the client's DERP identity from TunnelOpen (quic-derp-v1 only).
+    derp_pubkey: Option<String>,
     client_supported: &[String],
 ) -> Option<TunnelSession> {
     // 1. Fetch the agent (any tenant — we need the row to enforce
@@ -682,7 +686,34 @@ async fn handle_tunnel_open(
     // and only an online agent can be tunneled to (send_to_agent fails
     // otherwise).
     let agent_speaks_quic = tunnel_core::transport::agent_supports_quic(&agent.agent_version);
-    let negotiated_transport = if transport == TRANSPORT_QUIC_V1 {
+    // R4 - quic-derp-v1: negotiated only when the client REQUESTED it,
+    // advertised it, sent its DERP identity, and the agent's version can
+    // serve it (a pre-R4 agent would ignore the setup's transport field,
+    // stand up a TURN relay, and the client would burn its 30s ready-wait).
+    // A derp request that cannot be honored degrades to plain quic-v1 when
+    // possible (better than webrtc through a captured path), else webrtc.
+    let agent_speaks_derp =
+        tunnel_core::transport::agent_supports_derp_tunnel(&agent.agent_version);
+    let derp_requested = transport == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1;
+    let negotiated_transport = if derp_requested {
+        if client_supported
+            .iter()
+            .any(|t| t == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1)
+            && agent_speaks_derp
+            && derp_pubkey.is_some()
+        {
+            tunnel_core::transport::TRANSPORT_QUIC_DERP_V1.to_string()
+        } else if client_supported.iter().any(|t| t == TRANSPORT_QUIC_V1) && agent_speaks_quic {
+            debug!(
+                %agent_id, agent_version = %agent.agent_version, agent_speaks_derp,
+                had_pubkey = derp_pubkey.is_some(),
+                "client requested quic-derp-v1 -> negotiating quic-v1 (derp leg unavailable)"
+            );
+            TRANSPORT_QUIC_V1.to_string()
+        } else {
+            TRANSPORT_WEBRTC_DC_V1.to_string()
+        }
+    } else if transport == TRANSPORT_QUIC_V1 {
         if client_supported.iter().any(|t| t == TRANSPORT_QUIC_V1) && agent_speaks_quic {
             TRANSPORT_QUIC_V1.to_string()
         } else {
@@ -699,7 +730,9 @@ async fn handle_tunnel_open(
     // the direct P2P link by string-equality (see
     // tunnel_core::transport::quic::server_authenticate). `None` for
     // webrtc-dc-v1 keeps those sessions byte-identical on the wire.
-    let quic_auth_token = if negotiated_transport == TRANSPORT_QUIC_V1 {
+    let quic_auth_token = if negotiated_transport == TRANSPORT_QUIC_V1
+        || negotiated_transport == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1
+    {
         Some(mint_quic_token())
     } else {
         None
@@ -804,6 +837,15 @@ async fn handle_tunnel_open(
                 session_id: tunnel_session_id,
                 quic_auth_token: token,
                 ice_servers: quic_ice_servers.clone(),
+                transport: (negotiated_transport == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1)
+                    .then(|| negotiated_transport.clone()),
+                client_derp_pubkey: if negotiated_transport
+                    == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1
+                {
+                    derp_pubkey.clone()
+                } else {
+                    None
+                },
             },
         )
     {
@@ -1565,6 +1607,7 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
             agent_id,
             transport,
             open_nonce,
+            derp_pubkey,
         } => {
             if let Some(s) = handle_tunnel_open(
                 state,
@@ -1572,6 +1615,7 @@ pub(crate) async fn relay_tunnel_client_msg_from_agent(
                 agent_id,
                 transport,
                 open_nonce,
+                derp_pubkey,
                 supported_transports,
             )
             .await
