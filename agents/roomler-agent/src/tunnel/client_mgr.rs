@@ -533,10 +533,12 @@ impl TunnelSignalingSink for DaemonSink {
                 agent_id,
                 transport,
                 open_nonce: _,
+                derp_pubkey,
             } => ClientMsg::TunnelOpen {
                 agent_id,
                 transport,
                 open_nonce: Some(self.nonce.clone()),
+                derp_pubkey,
             },
             other => other,
         };
@@ -602,12 +604,36 @@ async fn run_flow_supervisor(
     // floor: netstate damps to ≤1 material Major / 120 s (#506), and the
     // `session_ran` threshold (#602) still governs post-session resets.
     let mut net_rx = super::netwatch::subscribe();
+    // R4 — consecutive sessions that died young (or failed outright). Two in
+    // a row on `Auto` ⇒ lead the next attempt with quic-derp-v1: the classic
+    // TURN/ICE paths are exactly what a corp capture window kills seconds
+    // after establishment (field 2026-08-25: 14 min of established-then-dead
+    // TURN sessions while the derp floor carried from minute two). A session
+    // that RUNS ≥ `SESSION_RAN_THRESHOLD` resets the streak, so a later
+    // attempt tries the better ladder again once the window has passed.
+    let mut quick_deaths: u32 = 0;
     loop {
         *live.status.lock().unwrap() = FlowStatus::Connecting;
         // Wait for a live agent WS.
         let sink_tx = match wait_for_sink(&mut sink_rx).await {
             Some(tx) => tx,
             None => return, // hub dropped — the daemon is shutting down
+        };
+
+        let derp = if quick_deaths >= DERP_FALLBACK_AFTER_QUICK_DEATHS
+            && pref == TransportPref::Auto
+            && derp_fallback_enabled()
+        {
+            let h = super::netwatch::primary_derp_tunnel_handle();
+            if h.is_some() {
+                info!(
+                    flow = %flow_id, quick_deaths,
+                    "leading this attempt with quic-derp-v1 (repeated quick session deaths)"
+                );
+            }
+            h
+        } else {
+            None
         };
 
         let started = std::time::Instant::now();
@@ -621,6 +647,7 @@ async fn run_flow_supervisor(
             &target,
             pref,
             &live,
+            derp,
         )
         .await;
 
@@ -631,7 +658,9 @@ async fn run_flow_supervisor(
                 if session_ran(ran) {
                     info!(flow = %flow_id, ran_s = ran.as_secs(), "tunnel session ended; reconnecting");
                     backoff = RECONNECT_BACKOFF_MIN;
+                    quick_deaths = 0;
                 } else {
+                    quick_deaths = quick_deaths.saturating_add(1);
                     // Opened, then died on arrival. Reported at WARN because
                     // it is indistinguishable from a broken target and used to
                     // be invisible: the old code logged this at INFO as a
@@ -656,6 +685,7 @@ async fn run_flow_supervisor(
                     *live.fatal.lock().unwrap() = Some(reason);
                     return;
                 }
+                quick_deaths = quick_deaths.saturating_add(1);
                 warn!(flow = %flow_id, %e, backoff_s = backoff.as_secs(), "tunnel session failed; retrying");
             }
         }
@@ -677,6 +707,18 @@ async fn run_flow_supervisor(
             }
         }
     }
+}
+
+/// R4 — quick-death streak that flips the next `Auto` attempt to lead with
+/// `quic-derp-v1`. Two: one death can be anything; two in a row through a
+/// fresh path is the capture-window signature.
+const DERP_FALLBACK_AFTER_QUICK_DEATHS: u32 = 2;
+
+/// R4 — the client-side gate for the derp tunnel flavor
+/// (`tunnel_derp_fallback` config key via the env bridge; default OFF while
+/// the leg is field-proven).
+fn derp_fallback_enabled() -> bool {
+    tunnel_core::env::flag("TUNNEL_DERP_FALLBACK", false)
 }
 
 /// Deterministic 0–2 s spread for Major-triggered re-dials: hash of
@@ -739,7 +781,23 @@ async fn run_session_with_fallback(
     target: &Target,
     pref: TransportPref,
     live: &Arc<FlowLive>,
+    // R4 — `Some` when the supervisor decided this attempt should LEAD with
+    // the quic-derp-v1 flavor (repeated quick-deaths through a captured corp
+    // path). Only ever set for `TransportPref::Auto`; an explicit
+    // `--transport` is honored verbatim.
+    derp: Option<tunnel_core::transport::derp::DerpTunnelHandle>,
 ) -> Result<()> {
+    let (supported, request) = match &derp {
+        Some(_) => (
+            vec![
+                tunnel_core::transport::TRANSPORT_QUIC_DERP_V1.to_string(),
+                tunnel_core::transport::TRANSPORT_QUIC_V1.to_string(),
+                TRANSPORT_WEBRTC_DC_V1.to_string(),
+            ],
+            tunnel_core::transport::TRANSPORT_QUIC_DERP_V1,
+        ),
+        None => (pref.supported_transports(), pref.request_transport()),
+    };
     let outcome = drive_one(
         hub,
         flow_id,
@@ -748,9 +806,10 @@ async fn run_session_with_fallback(
         local,
         agent_id,
         target,
-        pref.supported_transports(),
-        pref.request_transport(),
+        supported,
+        request,
         live,
+        derp.clone(),
     )
     .await?;
     if matches!(outcome, SessionOutcome::QuicSetupFailed) {
@@ -767,6 +826,7 @@ async fn run_session_with_fallback(
                 vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
                 TRANSPORT_WEBRTC_DC_V1,
                 live,
+                None,
             )
             .await?;
             if matches!(fallback, SessionOutcome::QuicSetupFailed) {
@@ -793,6 +853,7 @@ async fn drive_one(
     supported: Vec<String>,
     request: &str,
     live: &Arc<FlowLive>,
+    derp: Option<tunnel_core::transport::derp::DerpTunnelHandle>,
 ) -> Result<SessionOutcome> {
     *attempt += 1;
     let nonce = format!("{flow_id}.{attempt}");
@@ -825,6 +886,7 @@ async fn drive_one(
             agent_id,
             target: target.clone(),
             client_version: hub.inner.client_version.clone(),
+            derp,
         },
         supported,
         request,

@@ -34,7 +34,7 @@ use crate::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
 use crate::transport::quic::{self, QuicConnection, QuicPeer};
 use crate::transport::relay;
 use crate::transport::webrtc_dc::TunnelPeer;
-use crate::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
+use crate::transport::{TRANSPORT_QUIC_DERP_V1, TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
 /// A `JoinHandle` that aborts its task when dropped.
 ///
@@ -255,6 +255,10 @@ pub struct SessionParams {
     /// This client's version string, advertised in `rc:tunnel.hello`. The CLI
     /// passes its `CARGO_PKG_VERSION`; the daemon its own.
     pub client_version: String,
+    /// R4 — the node's DERP mux + identity for the `quic-derp-v1` flavor.
+    /// `Some` only in the daemon (an overlay node with an established `/derp`
+    /// WS); the standalone CLI passes `None` and keeps the classic ladder.
+    pub derp: Option<crate::transport::derp::DerpTunnelHandle>,
 }
 
 /// One session attempt over a caller-supplied signaling link: handshake, open
@@ -302,6 +306,9 @@ pub async fn run_tunnel_session(
         // multiplexes many opens over one agent WS stamps a real nonce
         // (P3b-2 PR-C) and demuxes the reply by it.
         open_nonce: None,
+        // R4 — our DERP identity, so the server can hand it to the agent
+        // when the derp flavor is negotiated. Harmless on other flavors.
+        derp_pubkey: params.derp.as_ref().map(|d| d.self_pubkey_hex.clone()),
     })
     .await
     .context("send TunnelOpen")?;
@@ -354,6 +361,28 @@ pub async fn run_tunnel_session(
     let (session_id, negotiated_transport, ice_servers, quic_auth_token) = opened;
 
     // ────────────── Dispatch on the negotiated transport ───────────
+    if negotiated_transport == TRANSPORT_QUIC_DERP_V1 {
+        let Some(derp) = params.derp.clone() else {
+            // The server can only negotiate this flavor when WE requested +
+            // advertised it, so a missing handle here is a caller bug — but
+            // soft-fail like every other QUIC setup problem so the session
+            // re-opens over webrtc-dc instead of erroring the supervisor.
+            warn!("server negotiated quic-derp-v1 but this client has no derp handle");
+            return Ok(SessionOutcome::QuicSetupFailed);
+        };
+        return run_quic_session(
+            source,
+            sink.clone(),
+            session_id,
+            quic_auth_token,
+            ice_servers,
+            local,
+            &params.target,
+            session,
+            Some(derp),
+        )
+        .await;
+    }
     if negotiated_transport == TRANSPORT_QUIC_V1 {
         return run_quic_session(
             source,
@@ -364,6 +393,7 @@ pub async fn run_tunnel_session(
             local,
             &params.target,
             session,
+            None,
         )
         .await;
     }
@@ -1029,14 +1059,20 @@ async fn run_quic_session(
     local: u16,
     target: &Target,
     session: Arc<SessionThroughput>,
+    // R4 — `Some` iff the server negotiated `quic-derp-v1`: QUIC rides the
+    // established `/derp` WS toward the agent's pubkey instead of a TURN
+    // relay. Everything after the connection (auth, dispatcher, flows) is
+    // transport-agnostic and shared.
+    derp: Option<crate::transport::derp::DerpTunnelHandle>,
 ) -> Result<SessionOutcome> {
     let Some(token) = quic_auth_token else {
-        warn!("server negotiated quic-v1 but sent no quic_auth_token — cannot authenticate");
+        warn!("server negotiated a quic flavor but sent no quic_auth_token — cannot authenticate");
         return Ok(SessionOutcome::QuicSetupFailed);
     };
 
     // Await `rc:tunnel.quic.ready`: the agent's ephemeral cert
-    // fingerprint to pin + the dialable addrs.
+    // fingerprint to pin + the dialable addrs (+ the agent's derp pubkey
+    // on the derp flavor).
     let ready = tokio::time::timeout(QUIC_READY_TIMEOUT, async {
         loop {
             match source
@@ -1048,7 +1084,8 @@ async fn run_quic_session(
                     session_id: sid,
                     cert_fingerprint,
                     addrs,
-                } if sid == session_id => break anyhow::Ok((cert_fingerprint, addrs)),
+                    derp_pubkey,
+                } if sid == session_id => break anyhow::Ok((cert_fingerprint, addrs, derp_pubkey)),
                 ServerMsg::TunnelRevoked { reason } => {
                     bail!("tunnel revoked during quic setup: {reason}")
                 }
@@ -1060,7 +1097,7 @@ async fn run_quic_session(
         }
     })
     .await;
-    let (cert_fingerprint, addrs) = match ready {
+    let (cert_fingerprint, addrs, agent_derp_pubkey) = match ready {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             warn!(%e, "error awaiting rc:tunnel.quic.ready");
@@ -1074,6 +1111,7 @@ async fn run_quic_session(
     info!(
         addrs = ?addrs,
         fp_prefix = %cert_fingerprint.chars().take(12).collect::<String>(),
+        derp = agent_derp_pubkey.is_some(),
         "rc:tunnel.quic.ready"
     );
 
@@ -1084,7 +1122,49 @@ async fn run_quic_session(
     // the agent's direct host candidates (Phase 1e/2a). Either branch
     // yields a connected `(peer, conn)`; auth + the data plane below are
     // transport-agnostic.
-    let (peer, conn, path) = if let Some((urls, user, cred)) = pick_turn_creds(&ice_servers) {
+    let flavor = if derp.is_some() {
+        TRANSPORT_QUIC_DERP_V1
+    } else {
+        TRANSPORT_QUIC_V1
+    };
+    let (peer, conn, path) = if let Some(handle) = derp {
+        // R4 — quic-derp-v1: QUIC over the node's ESTABLISHED `/derp` WS,
+        // addressed at the agent's DERP pubkey. No TURN allocation, no
+        // permission dance (`quic.candidate` is not sent — the relay is
+        // pubkey-addressed), and the transport config is MTU-clamped under
+        // the server's 2048-byte frame cap.
+        let Some(agent_pk) = agent_derp_pubkey
+            .as_deref()
+            .and_then(crate::transport::derp::parse_pubkey_hex)
+        else {
+            warn!("quic-derp-v1 negotiated but the agent sent no parseable derp_pubkey");
+            return Ok(SessionOutcome::QuicSetupFailed);
+        };
+        let derp_conn = handle.mux.tunnel_conn_for(agent_pk);
+        let dial = derp_conn.synth_peer();
+        let relay_conn: Arc<dyn relay::RelayConn> = Arc::new(derp_conn);
+        let sock = match relay::RelayUdpSocket::new(relay_conn) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!(%e, "quic-derp: relay socket bridge");
+                return Ok(SessionOutcome::QuicSetupFailed);
+            }
+        };
+        let peer = match QuicPeer::client_over_derp(sock, &cert_fingerprint) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(%e, "quic-derp: endpoint over derp conn");
+                return Ok(SessionOutcome::QuicSetupFailed);
+            }
+        };
+        match peer.connect(dial).await {
+            Ok(conn) => (peer, conn, "derp"),
+            Err(e) => {
+                warn!(%e, "quic-derp: handshake over the derp leg failed");
+                return Ok(SessionOutcome::QuicSetupFailed);
+            }
+        }
+    } else if let Some((urls, user, cred)) = pick_turn_creds(&ice_servers) {
         info!("QUIC: server provided TURN creds — establishing QUIC-over-TURN (relay)");
         match setup_quic_over_relay(
             &urls,
@@ -1131,7 +1211,7 @@ async fn run_quic_session(
     // Tier 3) and our own relay address are in the adjacent
     // relay-allocation log lines; throughput follows in the 2 s logger.
     info!(
-        transport = "quic-v1",
+        transport = flavor,
         path,
         remote = %conn.remote_address(),
         "tunnel established"

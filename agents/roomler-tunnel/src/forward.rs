@@ -344,6 +344,9 @@ async fn run_session(
             agent_id,
             target: target.clone(),
             client_version: env!("CARGO_PKG_VERSION").to_string(),
+            // R4: the standalone CLI is not an overlay node — no DERP
+            // identity, no derp tunnel flavor; the classic ladder stands.
+            derp: None,
         },
         supported_transports,
         request_transport,
