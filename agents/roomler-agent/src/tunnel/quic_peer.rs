@@ -69,6 +69,11 @@ pub struct AgentQuicPeer {
     /// bootstrap datagram through the same allocation the endpoint uses.
     /// `None` for a direct (host-candidate) peer.
     relay: Option<Arc<dyn RelayConn>>,
+    /// R4 — `Some(self pubkey hex)` when this peer serves the
+    /// `quic-derp-v1` flavor; shipped in `TunnelQuicReady.derp_pubkey` so
+    /// the client knows which DERP identity to dial. `None` on the
+    /// TURN/direct paths.
+    derp_pubkey_hex: Option<String>,
 }
 
 /// Spawn the accept loop shared by [`AgentQuicPeer::setup`] and
@@ -155,6 +160,7 @@ impl AgentQuicPeer {
             accept_task,
             _peer: peer,
             relay: None,
+            derp_pubkey_hex: None,
         })
     }
 
@@ -199,7 +205,55 @@ impl AgentQuicPeer {
             accept_task,
             _peer: peer,
             relay: Some(relay),
+            derp_pubkey_hex: None,
         })
+    }
+
+    /// R4 — like [`setup_over_relay`](Self::setup_over_relay) but the quinn
+    /// server endpoint rides a DERP-backed conn (`DerpMux::tunnel_conn_for`
+    /// toward the CLIENT's pubkey) with the MTU-clamped derp transport
+    /// config. No TURN allocation, no [`permit`](Self::permit) step — DERP
+    /// is pubkey-addressed and has no permission model. `self_pubkey_hex`
+    /// is this node's own DERP identity, shipped in `TunnelQuicReady` so
+    /// the client knows whom to dial back over its own mux.
+    pub fn setup_over_derp(
+        session_id: ObjectId,
+        quic_auth_token: String,
+        relay: Arc<dyn RelayConn>,
+        self_pubkey_hex: String,
+    ) -> Result<Self> {
+        let local_addr = relay
+            .local_addr()
+            .context("agent quic derp: synth local_addr")?;
+        let sock = Arc::new(
+            RelayUdpSocket::new(Arc::clone(&relay)).context("agent quic derp: socket bridge")?,
+        );
+        let (peer, cert_fingerprint) = QuicPeer::server_over_derp(sock)
+            .context("agent quic derp: server endpoint over derp conn")?;
+        let peer = Arc::new(peer);
+        let rendezvous: Arc<Mutex<Rendezvous>> = Arc::new(Mutex::new(Rendezvous::default()));
+        let accept_task = spawn_accept_loop(
+            Arc::clone(&peer),
+            session_id,
+            quic_auth_token,
+            Arc::clone(&rendezvous),
+        );
+
+        Ok(Self {
+            session_id,
+            cert_fingerprint,
+            local_addr,
+            rendezvous,
+            accept_task,
+            _peer: peer,
+            relay: Some(relay),
+            derp_pubkey_hex: Some(self_pubkey_hex),
+        })
+    }
+
+    /// R4 — this peer's DERP identity when serving `quic-derp-v1`.
+    pub fn derp_pubkey_hex(&self) -> Option<&str> {
+        self.derp_pubkey_hex.as_deref()
     }
 
     /// SHA-256 fingerprint (hex) of the ephemeral cert — pinned by the
