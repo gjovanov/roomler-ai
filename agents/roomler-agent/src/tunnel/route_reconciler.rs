@@ -131,6 +131,13 @@ impl RouteReconciler {
                 declared = this.inner.routes.lock().unwrap().len(),
                 "route reconciler started"
             );
+            // R1: a netstate Major clears every Pending route's backoff and
+            // reconciles immediately — the failures that earned the backoff
+            // described a network that no longer exists. The clear is what
+            // makes the wake-up effective: `reconcile_pass` gates creation
+            // on `now >= next_retry`, so a bare kick would still see the
+            // route as not-due. Damped upstream (≤1 material Major/120 s).
+            let mut net_rx = super::netwatch::subscribe();
             loop {
                 this.reconcile_pass().await;
                 tokio::select! {
@@ -141,10 +148,35 @@ impl RouteReconciler {
                         }
                     }
                     _ = this.inner.kick.notified() => {}
+                    summary = super::netwatch::next_major(&mut net_rx) => {
+                        let cleared = this.clear_pending_backoffs();
+                        info!(%summary, cleared, "network changed — reconciling routes now");
+                    }
                     _ = tokio::time::sleep(RECONCILE_TICK) => {}
                 }
             }
         });
+    }
+
+    /// Clear the `next_retry` gate on every `Pending` route so the next
+    /// `reconcile_pass` re-creates them immediately. Returns how many were
+    /// cleared. Deliberately does NOT touch `consecutive_failures` (the
+    /// ladder resumes where it was if the new network fails too) and never
+    /// touches terminal `Failed` (operator-owned).
+    fn clear_pending_backoffs(&self) -> usize {
+        let mut runtime = self.inner.runtime.lock().unwrap();
+        let mut cleared = 0;
+        for rt in runtime.values_mut() {
+            if let RouteRuntime::Pending {
+                next_retry: next_retry @ Some(_),
+                ..
+            } = rt
+            {
+                *next_retry = None;
+                cleared += 1;
+            }
+        }
+        cleared
     }
 
     /// One reconcile pass: converge hub flows toward the declared set.
