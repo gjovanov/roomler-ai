@@ -384,6 +384,29 @@ pub(super) struct ExitRoutingState {
     pub(super) pinned_exit: Option<ObjectId>,
 }
 
+/// Surface a duplicate subnet claim — NEVER silently. Two live routers approved
+/// for the same CIDR is an admin error the data plane can only expose: the
+/// crypto-router keeps both claims and tie-breaks deterministically (higher
+/// pubkey wins), so the losing claimant's replies are RPF-denied — the field
+/// 2026-08-25 signature (`rx_denied` climbing on the honest router while corp
+/// egress looped through a claimant with no working uplink). The server refuses
+/// NEW duplicate approvals; this catches rows that pre-date the guard.
+pub(super) fn warn_subnet_conflicts(
+    node_id: ObjectId,
+    conflicts: &[(crate::overlay::router::Cidr, [u8; 32])],
+) {
+    for (cidr, other) in conflicts {
+        warn!(
+            peer = %node_id,
+            %cidr,
+            other_claimant = %crate::overlay::wg::short_key(other),
+            "overlay: TWO subnet routers claim this CIDR — the deterministic \
+             tie-break picks one carrier and the loser's replies RPF-deny; \
+             revoke the stale approval (one live router per CIDR)"
+        );
+    }
+}
+
 impl OverlayRuntime {
     /// Phase 1 — register a peer's approved subnet routes in the crypto-router
     /// (so packets to those CIDRs encapsulate to it) and install the matching OS
@@ -416,7 +439,8 @@ impl OverlayRuntime {
                  (exit-node routing is opt-in — a /0 is never auto-installed)"
             );
         }
-        wg.set_peer_subnets(pubkey, &filtered);
+        let conflicts = wg.set_peer_subnets(pubkey, &filtered);
+        warn_subnet_conflicts(node_id, &conflicts);
         for c in &filtered {
             let cidr = c.to_string();
             if let Err(e) = tun.add_cidr_route(&cidr).await {
@@ -531,7 +555,7 @@ impl OverlayRuntime {
         // set below — the routes themselves are identical either way.
         if !(state.split_default_installed && state.active_peer == Some(exit_id)) {
             let allowed = exit_peer_allowed_ips(&exit_np);
-            wg.set_peer_subnets(exit_pubkey, &allowed);
+            warn_subnet_conflicts(exit_id, &wg.set_peer_subnets(exit_pubkey, &allowed));
             for cidr in SPLIT_DEFAULT_V4.iter().chain(SPLIT_DEFAULT_V6.iter()) {
                 if let Err(e) = tun.add_cidr_route(cidr).await {
                     warn!(%cidr, %e, "overlay exit-node: split-default route not installed");
@@ -630,7 +654,7 @@ impl OverlayRuntime {
                 .into_iter()
                 .filter(|c| !c.is_default_route())
                 .collect();
-            wg.set_peer_subnets(inst.pubkey, &real);
+            warn_subnet_conflicts(id, &wg.set_peer_subnets(inst.pubkey, &real));
         }
         for ip in state.exemptions.drain() {
             tun.del_host_exemption(ip).await;
