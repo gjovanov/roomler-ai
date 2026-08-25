@@ -9,7 +9,10 @@
 # Usage: run-lab.sh <count> <hold-s> <rest-s> [branch]
 set -euo pipefail
 COUNT="${1:-2}"; HOLD="${2:-180}"; REST="${3:-120}"; BRANCH="${4:-vpn-lab}"
-EXEC="/c/rwexec/target/release/roomler.exe"
+# The installed CLI, not a build tree: `C:\rwexec` was a scratch worktree that
+# no longer exists, and the lab is normally driven from a checkout with no
+# built agent at all. Overridable for a host that installed elsewhere.
+EXEC="${EXEC:-/c/Program Files/Roomler/roomler.exe}"
 # Fleet device names the lab drives. Override to the real names at runtime so
 # no hostname is committed. LAB_TARGET = the laptop's `roomler exec` device
 # name; DEVBOX_NAME = how the dev box shows up in `roomler peers` output.
@@ -58,17 +61,31 @@ psexec "Get-Content '$RD\\events.csv' -ErrorAction SilentlyContinue" 60000 > "$O
 for t in 100_65_4_2 100_65_0_6; do
   psexec "Get-Content '$RD\\ping-$t.csv' -ErrorAction SilentlyContinue" 90000 > "$OUT/pc-ping-$t.csv" || true
 done
-psexec "Get-Content '$RD\\roomler-samples.txt' -ErrorAction SilentlyContinue | Select-String -Pattern '=== |version|srflx|warm|${DEVBOX_NAME}|org:' | ForEach-Object { \$_.Line }" 90000 > "$OUT/pc-roomler-samples.txt" || true
+# `derp drops` is in the pattern because the far end's unrouted counter is the
+# ONLY per-node evidence of "a peer relayed to us while we held another
+# carrier" — the demote-follow's input. Its absence left the 08-25 run's laptop
+# half silent on exactly the question that run was measuring, while the dev-box
+# half (read live) answered it. The counters are cumulative, so the value is in
+# the DIFF across samples — which is why every sample must be kept.
+psexec "Get-Content '$RD\\roomler-samples.txt' -ErrorAction SilentlyContinue | Select-String -Pattern '=== |version|srflx|warm|derp drops|${DEVBOX_NAME}|org:' | ForEach-Object { \$_.Line }" 90000 > "$OUT/pc-roomler-samples.txt" || true
 psexec "Get-Content '$RD\\trac-connect.log' -ErrorAction SilentlyContinue" 60000 > "$OUT/pc-trac.log" || true
 
-echo "== outage windows (>=3 s consecutive loss) =="
+echo "== outage windows (>=3 consecutive lost pings) =="
+# Measured LAST-OK -> FIRST-OK in wall clock, with the sample count reported
+# SEPARATELY. They are not the same number: a lost `ping -n 1 -w 1000` costs
+# ~2 s, not 1 s, so labelling the count as seconds understates a real outage by
+# about half — the 08-25 run printed "12 s" for a 25 s hole and had to be
+# recomputed by hand. Same 1:1 trap as reading timeout counts off a ping trace.
 for f in "$OUT"/pc-ping-*.csv "$OUT"/ping-*.csv; do
   [ -s "$f" ] || continue
   echo "-- $(basename "$f")"
   awk -F, '
-    $2!="Success" { if (!s) { s=$1 } ; n++ ; next }
-    { if (n>=3) printf "  %s -> %s (%d s)\n", s, $1, n ; s="" ; n=0 }
-    END { if (n>=3) printf "  %s -> end (%d s)\n", s, n }' "$f"
+    function ep(t) { gsub(/[-:TZ]/, " ", t); split(t, a, " ")
+                     return mktime(a[1]" "a[2]" "a[3]" "a[4]" "a[5]" "int(a[6])) }
+    $2!="Success" { if (!s) { s=$1; lastok=prev } ; n++ ; prev=$1 ; next }
+    { if (n>=3) printf "  %s -> %s = %d s wall (%d lost pings)\n", \
+        lastok, $1, ep($1) - ep(lastok), n ; s="" ; n=0 ; prev=$1 }
+    END { if (n>=3) printf "  %s -> end, still down (%d lost pings)\n", lastok, n }' "$f"
 done
 echo "== events =="
 cat "$OUT/pc-events.csv" 2>/dev/null || true
