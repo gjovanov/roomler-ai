@@ -10,7 +10,7 @@ export function useWebSocket() {
     () => auth.token,
     (token) => {
       if (token) {
-        ws.connect(token)
+        ws.connect()
       } else {
         ws.disconnect()
       }

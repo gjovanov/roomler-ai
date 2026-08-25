@@ -104,7 +104,7 @@ async function handleLogin() {
   if (!valid) return
   try {
     await auth.login(username.value, password.value)
-    ws.connect(auth.token!)
+    ws.connect()
     // Check for pending invite code
     const pendingInvite = (route.query.invite as string) || sessionStorage.getItem('pending_invite_code')
     // S2: a protected deep-link stashed by the router guard (e.g. the

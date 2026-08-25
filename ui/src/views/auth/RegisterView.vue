@@ -119,7 +119,7 @@ async function handleRegister() {
   if (!valid) return
   try {
     const result = await auth.register(email.value, username.value, password.value, displayName.value, inviteCode.value)
-    ws.connect(auth.token!)
+    ws.connect()
     sessionStorage.removeItem('pending_invite_code')
     if (result?.invite_tenant) {
       router.push(`/tenant/${result.invite_tenant.tenant_id}`)

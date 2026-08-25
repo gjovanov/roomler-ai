@@ -512,7 +512,14 @@ impl Settings {
             .set_default("app.port", 3000)?
             .set_default("app.cors_origins", Vec::<String>::new())?
             .set_default("app.environment", "development")?
-            .set_default("app.frontend_url", "http://localhost:5173")?
+            // The Vite dev server listens on 5000 (`ui/vite.config.ts`), not
+            // Vite's 5173 scaffold default. This value is the ONLY origin the
+            // CORS layer trusts when `cors_origins` is unset, and since #680
+            // it is also the only origin allowed to authenticate a `/ws`
+            // handshake with the session cookie — so a wrong default is a
+            // local-dev outage, not a cosmetic mismatch. Production overrides
+            // it via `ROOMLER__APP__FRONTEND_URL` and is unaffected.
+            .set_default("app.frontend_url", "http://localhost:5000")?
             .set_default("app.rate_limit_per_sec", 1)?
             .set_default("app.rate_limit_burst", 60)?
             .set_default("app.rate_limit_trusted_hops", 1)?
