@@ -524,6 +524,17 @@ jobs:
             echo "::error::pkg-config resolved libavcodec to '$prefix', not the vendored tree — this lane would be testing the wrong library"
             exit 1
           fi
+      - name: Clippy agent --features ffmpeg-encoder (incl. tests)
+        # This code was UNLINTED. `--workspace` clippy never compiles it (the
+        # feature is opt-in), and #672 added compile+test here but deliberately
+        # left lint out because the feature reported pre-existing warnings —
+        # which is how it stayed unlinted in the first place. Same trap as the
+        # Windows overlay lane above: opt-in features are exactly where lints
+        # accumulate unseen, because no default lane ever builds them.
+        #
+        # `--all-targets` so test-only lints fire too, matching the repo rule.
+        run: cargo clippy -p roomler-agent --features ffmpeg-encoder --all-targets -- -D warnings
+
       - name: Test agent --features ffmpeg-encoder
         # Test, not merely check. The ten encoder names the cascade dispatches
         # (`*_nvenc`/`*_qsv`/`*_amf` x h264/hevc/av1, plus `vp9_qsv`) are locked
