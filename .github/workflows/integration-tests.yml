@@ -218,28 +218,28 @@ jobs:
           # so concurrency here is concurrent DB churn against one Mongo on a
           # 2-core runner — which is what took it down on the first run.
           #
-          # The two skips were MEASURED here (run 32671814889: 289 passed,
-          # these 2 failed), not inherited from the build host — porting that
-          # box's list across would have been the same environment-assumption
-          # this lane exists to catch. Each needs a reason and a way out:
+          # The skips were MEASURED here (run 32671814889), not inherited from
+          # the build host — porting that box's list across would have been the
+          # same environment-assumption this lane exists to catch. There is now
+          # ONE, and it needs a reason and a way out:
           #
           #   conference … call_leave_cleans_up_participant_media
           #     Wants a live mediasoup worker; the runner has none, so it gets
           #     `media:error` where `media:router_capabilities` is expected.
           #     Un-skip if the worker is ever provisioned in CI.
           #
-          #   rate_limit … rate_limit_returns_429_after_burst
-          #     Timing-sensitive against tower_governor's per-second refill.
-          #     ⚠️ Skipping a timing test hides real rate-limit regressions —
-          #     prefer making it deterministic (inject the clock) over leaving
-          #     it skipped forever. Tracked, not resolved.
+          # (`rate_limit … returns_429_after_burst` used to be the second skip.
+          # It was not environmental: the test issued its 65 requests
+          # SEQUENTIALLY against a limiter that refills 1/s, so on a slow
+          # runner the loop outlasted the burst it was exhausting and nothing
+          # was ever limited. Fired concurrently it depends on the limiter
+          # rather than the runner, so the skip is gone.)
           #
           # ⚠️ Adding a third skip should feel expensive. If this list grows,
           # the lane is drifting back toward the unfalsifiable state it
           # replaced.
           cargo test -p roomler-ai-tests ${FILTER:+"$FILTER"} -- --test-threads=2 \
             --skip conference_tests::call_leave_cleans_up_participant_media \
-            --skip rate_limit_tests::rate_limit_returns_429_after_burst \
             2>&1 | tee /tmp/itest.log
 
       - name: The mongod watch log (READ THIS FIRST on a failure)
