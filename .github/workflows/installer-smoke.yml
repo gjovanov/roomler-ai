@@ -933,18 +933,41 @@ jobs:
           # and SSH both gone. Field-hit on a MacBook 2026-08-25 across an
           # rc.458 -> rc.460 self-update.
           #
+          # `installer` sends postinstall stdout to /var/log/install.log, NOT to
+          # this job's log, so a bare failure here says nothing about what the
+          # script actually decided. Dump the script's own lines after every
+          # install — the one diagnostic that turns "it failed" into a cause.
+          since=$(date -u "+%Y-%m-%d %H:%M:%S")
+          dump_log() {
+            echo "--- postinstall output from /var/log/install.log ---"
+            sudo awk -v s="$since" '$0 ~ /roomler|enable-daemon|daemon/ {print "    " $0}' \
+              /var/log/install.log 2>/dev/null | tail -25 || true
+          }
+
           # Install ENABLED, then install again PLAIN — exactly what an update
           # does — and require the daemon to still be there.
+          #
+          # NOTE the env var goes THROUGH sudo deliberately: `installer` passes
+          # its own environment down to package scripts, so the variable has to
+          # survive the privilege boundary to reach the postinstall at all.
           echo "=== install 1: enabled ==="
           sudo ROOMLER_MACOS_DAEMON=1 installer -verbose -pkg dist/smoke.pkg -target /
-          test -f /etc/roomler-agent/enable-daemon \
-            || { echo "::error::enabling the daemon did not record the opt-in marker"; exit 1; }
+          dump_log
+          if [ ! -f /etc/roomler-agent/enable-daemon ]; then
+            echo "::error::enabling the daemon did not record the opt-in marker"
+            echo "  (if the postinstall never logged 'daemon installed' above, the"
+            echo "   ROOMLER_MACOS_DAEMON env var did not reach the script — which"
+            echo "   would mean that enabling path never worked, a bigger finding"
+            echo "   than the marker itself.)"
+            exit 1
+          fi
           test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
-            || { echo "::error::daemon plist missing after an enabled install"; exit 1; }
+            || { echo "::error::daemon plist missing after an enabled install"; dump_log; exit 1; }
           echo "  marker recorded + daemon installed"
 
           echo "=== install 2: plain, i.e. what a self-update runs ==="
           sudo installer -verbose -pkg dist/smoke.pkg -target /
+          dump_log
           test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
             || { echo "::error::a plain re-install DELETED the enabled daemon — \
                  the self-update regression is back"; exit 1; }
@@ -956,6 +979,7 @@ jobs:
           echo "=== install 3: marker removed = a real opt-out ==="
           sudo rm -f /etc/roomler-agent/enable-daemon
           sudo installer -verbose -pkg dist/smoke.pkg -target /
+          dump_log
           if [ -f /Library/LaunchDaemons/com.roomler.daemon.plist ]; then
             echo "::error::opt-out no longer removes the daemon"
             exit 1
