@@ -62,4 +62,8 @@ ipnet = "2" # subnet-route CIDR validation for the mesh subnet-router admin API
 # the AmazonS3 implementation; MinIO speaks the same dialect via a custom
 # endpoint + path-style addressing. See `src/storage.rs`.
 object_store = { version = "0.12", features = ["aws"] }
+# Magic-byte content sniffing for uploads. A stored content-type that came
+# from the client is a claim, not a fact; this reads what the bytes actually
+# are. Pure Rust, no transitive deps, already in the lockfile.
+infer = "0.19"
 bytes = "1"
