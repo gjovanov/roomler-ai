@@ -183,25 +183,32 @@ pub(crate) fn ffmpeg_maxrate_bps(width: u32, height: u32, fps: u32, constrained:
 // Re-exported here so this module's callers keep their path.
 pub(crate) use crate::encode::rate_profile::ffmpeg_maxrate_bps_scaled;
 
-/// rc.86 — per-encoder private-option dictionary for constant-quality
-/// + low-latency + screen-content tuning. Keys mirror the FFmpeg CLI
-/// (`-cq`, `-preset`, `-tune`, `-spatial-aq`, `-maxrate`, …). Any option
-/// the encoder doesn't recognise on this FFmpeg build / driver combo
-/// makes `open_as_with` fail; `build_encoder` then retries a plain open
-/// so we degrade to defaults rather than failing the session.
+/// The three products of [`encoder_options`]: `(base, lowlat, summary)`.
+type EncoderOptions = (Vec<(String, String)>, Vec<(String, String)>, String);
+
+/// rc.86 — per-encoder private-option dictionary for constant-quality,
+/// low-latency, screen-content tuning. Keys mirror the FFmpeg CLI: `-cq`,
+/// `-preset`, `-tune`, `-spatial-aq`, `-maxrate` and friends. Any option the
+/// encoder doesn't recognise on this FFmpeg build / driver combo makes
+/// `open_as_with` fail; `build_encoder` then retries a plain open, so we
+/// degrade to defaults rather than failing the session.
 ///
-/// `preset`/`tune` are env-overridable so the field can trade quality
-/// vs latency vs CPU without a rebuild.
+/// `preset`/`tune` are env-overridable so the field can trade quality vs
+/// latency vs CPU without a rebuild.
 ///
-/// Returns the dict PLUS a human-readable `key=value …` summary string
-/// built as we go (so we don't depend on `Dictionary::iter()` — keeps
-/// the logging robust across ffmpeg-next minor versions).
-/// Returns `(base, lowlat, summary)`. `base` is the quality/tuning private
-/// options (incl. `forced-idr` — load-bearing for keyframe flagging).
-/// `lowlat` is the output-latency knobs that some older drivers reject;
-/// `build_encoder` applies them in a SEPARATE open tier so a rejection drops
-/// ONLY them. (A full-dict rejection would revert to encoder defaults and
-/// lose `forced-idr` → the NVENC black-screen IDR bug.) Pure — no ffmpeg API.
+/// Returns `(base, lowlat, summary)`:
+///
+/// * `base` — the quality/tuning private options, including `forced-idr`,
+///   which is load-bearing for keyframe flagging.
+/// * `lowlat` — the output-latency knobs some older drivers reject.
+///   `build_encoder` applies these in a SEPARATE open tier so a rejection
+///   drops ONLY them; a full-dict rejection would revert to encoder defaults
+///   and lose `forced-idr` — the NVENC black-screen IDR bug.
+/// * `summary` — a human-readable `key=value …` string built as we go, so the
+///   logging doesn't depend on `Dictionary::iter()` (whose shape has moved
+///   across ffmpeg-next minor versions).
+///
+/// Pure — no ffmpeg API calls.
 fn encoder_options(
     name: &str,
     maxrate_bps: usize,
@@ -209,7 +216,7 @@ fn encoder_options(
     qsv_low_power: bool,
     chroma444: bool,
     constrained: bool,
-) -> (Vec<(String, String)>, Vec<(String, String)>, String) {
+) -> EncoderOptions {
     // P3 — H.264 codes text visibly softer than HEVC at equal nominal
     // quality numbers; give the h264_* encoders a 2-step sharper CQ off the
     // shared FFMPEG_CQ base (env still sets the base — the adjust is
