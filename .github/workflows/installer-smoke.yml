@@ -689,6 +689,7 @@ jobs:
           cp agents/roomler-agent/packaging/macos/com.roomler.agent.plist "$APP/Contents/Resources/"
           cp agents/roomler-agent/packaging/macos/com.roomler.daemon.plist "$APP/Contents/Resources/"
           cp agents/roomler-agent/packaging/macos/com.roomler.desktop.plist "$APP/Contents/Resources/"
+          cp agents/roomler-agent/packaging/macos/com.roomler.update.plist "$APP/Contents/Resources/"
           cat > "$APP/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -867,6 +868,23 @@ jobs:
           fi
           echo "  privileged half correctly absent"
 
+      - name: Assert the update helper is installed BY DEFAULT
+        run: |
+          set -euo pipefail
+          # The update half is the OPPOSITE polarity of the overlay daemon:
+          # default ON, marker opts OUT. A default install must carry it, or
+          # the DEFAULT macOS flavour (per-user only) can never self-update —
+          # which is the exact state that left a Mac permanently stale.
+          test -f /Library/LaunchDaemons/com.roomler.update.plist \
+            || { echo "::error::com.roomler.update.plist missing — default install has no updater"; exit 1; }
+          # Loaded, not merely placed: RunAtLoad/StartInterval/WatchPaths all
+          # hang off the loaded job. (Its RunAtLoad fires the helper once here;
+          # the smoke binary's version >= the latest published release, so the
+          # helper reports up-to-date/skipped and exits — no install happens.)
+          launchctl print system/com.roomler.update >/dev/null 2>&1 \
+            || { echo "::error::com.roomler.update installed but not loaded"; exit 1; }
+          echo "  update helper installed + loaded (default ON)"
+
       - name: Assert the menu-bar companion shipped and registered
         run: |
           set -euo pipefail
@@ -979,4 +997,47 @@ jobs:
             exit 1
           fi
           echo "  opt-out still honoured"
+
+      - name: The update helper's opt-out round-trip (disable -> gone, enable -> back)
+        run: |
+          set -euo pipefail
+          since=$(date -u "+%Y-%m-%d %H:%M:%S")
+          dump_log() {
+            echo "--- postinstall output from /var/log/install.log ---"
+            sudo awk -v s="$since" '$0 ~ /roomler|update helper|disable-auto-update/ {print "    " $0}' \
+              /var/log/install.log 2>/dev/null | tail -25 || true
+          }
+
+          # The three installs above all ran WITHOUT the disable marker, so the
+          # helper must still be present at this point (regression guard for
+          # "an unrelated re-install dropped the updater").
+          test -f /Library/LaunchDaemons/com.roomler.update.plist \
+            || { echo "::error::update plist vanished across plain re-installs"; exit 1; }
+
+          echo "=== opt out: marker set -> the helper must GO ==="
+          sudo mkdir -p /etc/roomler-agent
+          sudo touch /etc/roomler-agent/disable-auto-update
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          dump_log
+          if [ -f /Library/LaunchDaemons/com.roomler.update.plist ]; then
+            echo "::error::disable-auto-update did not remove the helper plist"
+            exit 1
+          fi
+          # The idle job must have been booted out too (the in-flight guard
+          # only defers when an update is actually running, which none is here).
+          if launchctl print system/com.roomler.update >/dev/null 2>&1; then
+            echo "::error::helper job still loaded after opt-out"
+            exit 1
+          fi
+          echo "  opt-out removes the helper"
+
+          echo "=== opt back in: marker removed -> the helper must RETURN ==="
+          sudo rm -f /etc/roomler-agent/disable-auto-update
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          dump_log
+          test -f /Library/LaunchDaemons/com.roomler.update.plist \
+            || { echo "::error::helper plist not restored after removing the opt-out"; exit 1; }
+          launchctl print system/com.roomler.update >/dev/null 2>&1 \
+            || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
+          echo "  opt-in restores the helper"
 
