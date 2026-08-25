@@ -595,6 +595,13 @@ async fn run_flow_supervisor(
     let mut sink_rx = hub.inner.sink_tx.subscribe();
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut attempt: u64 = 0;
+    // R1: a netstate Major during the backoff sleep invalidates the failures
+    // that earned it (the old path is gone; the new one is untested) — cut
+    // the wait and retry at the floor, exactly the control-WS reconnect
+    // ladder's shape (`signaling.rs`). Guards against a flap pinning the
+    // floor: netstate damps to ≤1 material Major / 120 s (#506), and the
+    // `session_ran` threshold (#602) still governs post-session resets.
+    let mut net_rx = super::netwatch::subscribe();
     loop {
         *live.status.lock().unwrap() = FlowStatus::Connecting;
         // Wait for a live agent WS.
@@ -652,9 +659,36 @@ async fn run_flow_supervisor(
                 warn!(flow = %flow_id, %e, backoff_s = backoff.as_secs(), "tunnel session failed; retrying");
             }
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {
+                backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            }
+            summary = super::netwatch::next_major(&mut net_rx) => {
+                // Per-flow jitter (0–2 s, stable per flow+attempt) so N
+                // supervisors woken by ONE Major don't re-open through a
+                // just-transitioned corp path in the same instant.
+                let jitter = flow_retry_jitter(&flow_id, attempt);
+                info!(
+                    flow = %flow_id, %summary, jitter_ms = jitter.as_millis(),
+                    "network changed during retry backoff — retrying now"
+                );
+                tokio::time::sleep(jitter).await;
+                backoff = RECONNECT_BACKOFF_MIN;
+            }
+        }
     }
+}
+
+/// Deterministic 0–2 s spread for Major-triggered re-dials: hash of
+/// (flow id, attempt) — stable per flow so the herd spreads the same way
+/// every time, no RNG dependency. The exact distribution is irrelevant;
+/// only "not all at once" matters.
+fn flow_retry_jitter(flow_id: &str, attempt: u64) -> Duration {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    flow_id.hash(&mut h);
+    attempt.hash(&mut h);
+    Duration::from_millis(h.finish() % 2000)
 }
 
 /// Classify a session error as PERMANENT (`Some(reason)`) or retryable
