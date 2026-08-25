@@ -3113,12 +3113,12 @@ async fn media_pump_vp9_444_dc(
                     viewers,
                 );
                 let cdc = control_dc.lock().await.clone();
-                if let Some(cdc) = cdc {
-                    if cdc.send_text(payload.clone()).await.is_ok() {
-                        video_info_sent = true;
-                        // P5 — mirror to the followers' badges.
-                        pipeline.publish_video_info(payload);
-                    }
+                if let Some(cdc) = cdc
+                    && cdc.send_text(payload.clone()).await.is_ok()
+                {
+                    video_info_sent = true;
+                    // P5 — mirror to the followers' badges.
+                    pipeline.publish_video_info(payload);
                 }
             }
         }
@@ -4454,13 +4454,13 @@ async fn media_pump_ffmpeg_dc(
                     viewers,
                 );
                 let cdc = control_dc.lock().await.clone();
-                if let Some(cdc) = cdc {
-                    if cdc.send_text(payload.clone()).await.is_ok() {
-                        video_info_sent = true;
-                        // P5 — followers' badges mirror the owner's (their
-                        // stats chips describe the SAME shared stream).
-                        pipeline.publish_video_info(payload);
-                    }
+                if let Some(cdc) = cdc
+                    && cdc.send_text(payload.clone()).await.is_ok()
+                {
+                    video_info_sent = true;
+                    // P5 — followers' badges mirror the owner's (their
+                    // stats chips describe the SAME shared stream).
+                    pipeline.publish_video_info(payload);
                 }
             }
         }
