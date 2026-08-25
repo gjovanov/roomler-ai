@@ -106,10 +106,18 @@ echo "(the Roomler menu-bar app shows which of the two is missing, with a button
 # putting a root daemon on someone's Mac is a posture decision, not a side
 # effect of installing a remote-control agent.
 #
-# Enable with either:
+# Enable it by creating the marker, then (re-)running the installer:
 #   sudo mkdir -p /etc/roomler-agent && sudo touch /etc/roomler-agent/enable-daemon
-#   (then re-run the installer), or
-#   ROOMLER_MACOS_DAEMON=1 installer -pkg … -target /
+# `install.sh --daemon-token` does exactly that before it runs the pkg.
+#
+# ⚠️ There is NO environment-variable form, and there cannot be. This script
+# used to also honour `ROOMLER_MACOS_DAEMON=1 installer -pkg … -target /`,
+# which never worked: macOS runs package scripts from `package_script_service`
+# — a separate PackageKit daemon — so a script does NOT inherit the
+# environment of whoever invoked `installer`. Proven in CI 2026-08-25: an
+# install with the variable set produced the per-user log lines and none of
+# the daemon ones, i.e. the condition was simply false. It was removed rather
+# than left as a documented option that silently does nothing.
 #
 # The daemon gets its OWN config at /etc/roomler-agent/config.toml. It must
 # not share the user's: two processes on one enrollment identity would fight
@@ -119,7 +127,7 @@ echo "(the Roomler menu-bar app shows which of the two is missing, with a button
 DAEMON_PLIST_SOURCE="/Library/Roomler/roomler-agent.app/Contents/Resources/com.roomler.daemon.plist"
 DAEMON_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.daemon.plist"
 
-if [ -f /etc/roomler-agent/enable-daemon ] || [ "${ROOMLER_MACOS_DAEMON:-0}" = "1" ]; then
+if [ -f /etc/roomler-agent/enable-daemon ]; then
   if [ ! -f "$DAEMON_PLIST_SOURCE" ]; then
     echo "WARNING: daemon requested but $DAEMON_PLIST_SOURCE is missing; skipping"
   else
@@ -150,7 +158,14 @@ else
   if [ -f "$DAEMON_PLIST_TARGET" ]; then
     launchctl bootout system/com.roomler.daemon 2>/dev/null || true
     rm -f "$DAEMON_PLIST_TARGET"
-    echo "roomler system daemon disabled (no /etc/roomler-agent/enable-daemon)."
+    echo "roomler system daemon REMOVED — no /etc/roomler-agent/enable-daemon marker."
+    echo "  The overlay AND the SSH server live in this daemon, so both are now"
+    echo "  gone. Nothing else reports this: 'roomler ssh' will say the device"
+    echo "  'has not published an SSH host key', which describes the symptom and"
+    echo "  not the cause."
+    echo "  If you did not intend to opt out, restore the marker and re-install:"
+    echo "    sudo mkdir -p /etc/roomler-agent"
+    echo "    sudo touch /etc/roomler-agent/enable-daemon"
   fi
 fi
 
