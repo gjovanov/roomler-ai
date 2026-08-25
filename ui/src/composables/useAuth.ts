@@ -7,7 +7,7 @@ export function useAuth() {
   const ws = useWsStore()
 
   onMounted(async () => {
-    if (auth.token) {
+    if (auth.isAuthenticated) {
       await auth.fetchMe()
       if (auth.user) {
         ws.connect()
