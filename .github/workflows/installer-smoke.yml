@@ -53,6 +53,12 @@ on:
       - 'agents/roomler-agent/wix/**'
       - 'agents/roomler-agent/wix-perMachine/**'
       - 'agents/roomler-agent/packaging/windows/**'
+      # The macOS packaging was missing here, so the postinstall — the script
+      # that decides whether the root daemon lives or is DELETED — could change
+      # without this job ever running on the PR. That is the hole the warning
+      # above describes, and it cost a real regression: an rc.458 -> rc.460
+      # self-update silently removed the daemon on a field MacBook.
+      - 'agents/roomler-agent/packaging/macos/**'
       - 'agents/roomler-agent/build.rs'
       - '.github/workflows/installer-smoke.yml'
   workflow_dispatch: {}
@@ -915,3 +921,62 @@ jobs:
             exit 1
           fi
           echo "  permissions reported honestly"
+
+      - name: An enabled daemon must SURVIVE the next install (self-update)
+        run: |
+          set -euo pipefail
+          # The postinstall removes the root daemon when the marker is absent,
+          # which is correct for a real opt-out — but a SELF-UPDATE is not an
+          # opt-out, and it runs the very same pkg. Until the enabling branch
+          # recorded the choice, a daemon enabled via ROOMLER_MACOS_DAEMON=1
+          # left no marker, so the NEXT update silently deleted it: overlay
+          # and SSH both gone. Field-hit on a MacBook 2026-08-25 across an
+          # rc.458 -> rc.460 self-update.
+          #
+          # `installer` sends postinstall stdout to /var/log/install.log, NOT to
+          # this job's log, so a bare failure here says nothing about what the
+          # script actually decided. Dump the script's own lines after every
+          # install — the one diagnostic that turns "it failed" into a cause.
+          since=$(date -u "+%Y-%m-%d %H:%M:%S")
+          dump_log() {
+            echo "--- postinstall output from /var/log/install.log ---"
+            sudo awk -v s="$since" '$0 ~ /roomler|enable-daemon|daemon/ {print "    " $0}' \
+              /var/log/install.log 2>/dev/null | tail -25 || true
+          }
+
+          # Enable via the MARKER — the only mechanism that exists. There is no
+          # env-var form: macOS runs package scripts from package_script_service,
+          # a separate PackageKit daemon, so they never see the environment of
+          # whoever ran `installer`. This job proved that on 2026-08-25 — an
+          # install with ROOMLER_MACOS_DAEMON=1 logged the per-user lines and
+          # none of the daemon ones — and the dead condition was removed.
+          echo "=== install 1: enabled via the marker ==="
+          sudo mkdir -p /etc/roomler-agent
+          sudo touch /etc/roomler-agent/enable-daemon
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          dump_log
+          test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
+            || { echo "::error::daemon plist missing after an enabled install"; exit 1; }
+          echo "  daemon installed"
+
+          echo "=== install 2: plain, i.e. what a self-update runs ==="
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          dump_log
+          test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
+            || { echo "::error::a plain re-install DELETED the enabled daemon — \
+                 the self-update regression is back"; exit 1; }
+          echo "  daemon survived the update"
+
+          # And the opt-OUT path must still work: remove the marker, install,
+          # daemon goes. Otherwise this test would pass by making the removal
+          # branch unreachable, which is the opposite defect.
+          echo "=== install 3: marker removed = a real opt-out ==="
+          sudo rm -f /etc/roomler-agent/enable-daemon
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          dump_log
+          if [ -f /Library/LaunchDaemons/com.roomler.daemon.plist ]; then
+            echo "::error::opt-out no longer removes the daemon"
+            exit 1
+          fi
+          echo "  opt-out still honoured"
+
