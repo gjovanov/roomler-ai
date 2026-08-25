@@ -135,13 +135,7 @@ fn forbidden(why: &str) -> Response {
 
 /// The `access_token` session cookie, if the browser sent one.
 fn session_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    let raw = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())?;
-    raw.split(';')
-        .map(str::trim)
-        .find_map(|pair| pair.strip_prefix("access_token=").map(str::to_string))
-        .filter(|t| !t.is_empty())
+    crate::cookies::get(headers, "access_token")
 }
 
 /// Is this handshake coming from a page we serve?
