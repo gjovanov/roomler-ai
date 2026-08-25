@@ -311,6 +311,24 @@ cascade's guarantees while replacing its reactive counters:
   re-upgrades normally once the network settles. Both `deliver` drop classes
   now carry counters (`DerpMux::drop_counts`); they were silent, which is why
   this cost a day of field time to find.
+- **A route must not outlive the conn that consumes it (#32).** The mux's
+  `src_pubkey → {wg, tunnel}` table is written by the vend methods, replaced
+  "last one wins", and was never cleaned — it relied entirely on a dropped
+  `DerpConn` closing its channel, which is the invariant `deliver` assumes and
+  nothing enforced. `DerpConn` now retires its own route on drop. ⚠️ Only its
+  OWN slot and only if still its own sender (`Sender::same_channel`): a rebuild
+  registers the new conn *before* the old one drops, so a blind clear would
+  unregister the LIVE consumer, and the WG and tunnel routes are independent —
+  a carrier going away must not take R4's tunnel route with it.
+- **The counters are readable (#32).** `drop_counts()` shipped with the signal
+  and was surfaced nowhere for a day, so a real 2026-08-25 transition could only
+  be argued about from an absence of log lines. `NodeStatus.derp_inbound_drops`
+  carries `(unrouted, backpressure)` and `roomler status` prints a `derp drops`
+  line when either is non-zero — silent at zero, because a permanent zero line
+  is noise, but after a transition `unrouted` is the first thing to read.
+  ⚠️ Cumulative since daemon start: **diff two readings**, never judge the
+  absolute. ⚠️ And measure on a host whose network actually moves — the
+  reference box saw zero.
 - **`/derp` recovery walks immediately (#28).** A VPN transition kills the
   `/derp` WS too, and every DERP build attempted while it is down is
   *withheld* — `try_build_derp` refuses over a dead WS, because a carrier born
