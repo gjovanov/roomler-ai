@@ -529,6 +529,16 @@ const MAJOR_RECHECK_AFTER: Duration = Duration::from_millis(2_250);
 /// declined for a transient reason (mux mid-reconnect) retries promptly rather
 /// than waiting out the ordinary walk.
 const DERP_FOLLOW_COOLDOWN: Duration = Duration::from_secs(5);
+/// #28 — how soon after the `/derp` WS returns to pull the establish walk in.
+/// Short but not zero: the WS is registered by the time `mark_up` fires, and a
+/// small delay lets a burst of reconnects (central + regional muxes coming back
+/// together) coalesce into ONE walk instead of one apiece.
+const DERP_RECOVERY_RECHECK: Duration = Duration::from_millis(300);
+/// #28 — how long to keep walking every tick after a `/derp` recovery. Long
+/// enough to cover a second flap (the field case reconnected twice inside 2 s)
+/// without becoming a standing cost: outside this window the walk returns to
+/// its ~30 s cadence.
+const DERP_RECOVERY_WALK_WINDOW: Duration = Duration::from_secs(15);
 /// P8 — resume-from-suspend detection threshold: across one sweep interval,
 /// wall-clock advancing this much MORE than the monotonic clock means the host
 /// slept in between (monotonic clocks exclude suspend on Windows and Linux —
@@ -2131,10 +2141,11 @@ impl OverlayRuntime {
         // #27 — the demote-follow signal. ONE channel for every mux the
         // coordinator holds now or acquires later (central + regional); it
         // installs the sender as each arrives.
-        let (unrouted_tx, mut unrouted_rx) =
-            mpsc::channel::<[u8; 32]>(crate::transport::derp::DerpMux::UNROUTED_SINK_DEPTH);
+        let (mux_ev_tx, mut mux_ev_rx) = mpsc::channel::<crate::transport::derp::MuxEvent>(
+            crate::transport::derp::DerpMux::EVENT_SINK_DEPTH,
+        );
         if let Some(r) = relay.as_mut() {
-            r.set_unrouted_sink(unrouted_tx);
+            r.set_event_sink(mux_ev_tx);
         }
         // #27 — per-peer floor on how often a demote-follow may fire. The
         // signal is level-triggered (a demoted peer keeps relaying until we
@@ -2369,20 +2380,46 @@ impl OverlayRuntime {
                 // permits reaching us. The worst a misbehaving member can do is
                 // hold a pair on the relay it is already entitled to use, and
                 // make-before-break re-upgrades it anyway.
-                Some(pk) = unrouted_rx.recv() => {
+                Some(ev) = mux_ev_rx.recv() => {
                     let t_arm = Instant::now();
-                    let installed = self.demote_follow(
-                        pk, &mut wg, &mut by_node, &mut relay, &tun,
-                        &current_peers, &mut relay_bq, &mut derp_follow_cooldown,
-                    ).await;
-                    if installed {
-                        // Same tail as any other carrier flip: the relay set
-                        // may need a new exit exemption, and the LocalAPI view
-                        // must show the carrier the peer is actually on.
-                        self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
-                        self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
+                    match ev {
+                        crate::transport::derp::MuxEvent::Unrouted(pk) => {
+                            let installed = self.demote_follow(
+                                pk, &mut wg, &mut by_node, &mut relay, &tun,
+                                &current_peers, &mut relay_bq, &mut derp_follow_cooldown,
+                            ).await;
+                            if installed {
+                                // Same tail as any other carrier flip: the relay
+                                // set may need a new exit exemption, and the
+                                // LocalAPI view must show the carrier the peer
+                                // is actually on.
+                                self.reconcile_exit_routing(&mut wg, &tun, &by_node, &current_peers, &mut exit_state).await;
+                                self.publish_view(&self_ip, &by_node, &current_peers, &upgrade_probes, exit_node_status(self.exit_node.as_deref(), &exit_state), &wg);
+                            }
+                        }
+                        // #28 — the `/derp` WS is back. EVERY DERP build
+                        // attempted during the outage was withheld (a carrier
+                        // born over a dead WS convicts one-way and rebuilds
+                        // forever), so those peers are carrier-less RIGHT NOW
+                        // and the establish walk is what re-floors them.
+                        //
+                        // Open a short fast-walk window and pull the fallback
+                        // tick into it — the same two levers the netstate-Major
+                        // lane uses, for the same reason: without the window
+                        // `install_peers` only runs every 6th tick (~30 s), and
+                        // without the pull-forward the window's first walk
+                        // waits out the 5 s grid. Field 2026-08-24: the WS
+                        // returned in 1.5 s and the floor still took 5 s more.
+                        crate::transport::derp::MuxEvent::Recovered => {
+                            info!(
+                                "overlay derp: /derp WS recovered — walking now to rebuild the carriers withheld during the outage"
+                            );
+                            fast_reupgrade_until =
+                                Some(Instant::now() + DERP_RECOVERY_WALK_WINDOW);
+                            fallback.reset_after(DERP_RECOVERY_RECHECK);
+                        }
                     }
-                    warn_if_slow("arm:derp_demote_follow", t_arm);
+                    warn_if_slow("arm:derp_mux_event", t_arm);
                 },
                 // rc.218 — commit a finished OFF-LOOP relay ALLOCATE (the
                 // spawned DNS + TURN allocate — see `RelayAllocQueue`). Success
@@ -3986,6 +4023,27 @@ mod tests {
             MAJOR_RECHECK_AFTER - crate::overlay::lifecycle::MAJOR_POKE_DEADLINE
                 >= Duration::from_millis(100),
             "leave real margin over timer jitter — undershooting costs a whole FALLBACK_TICK"
+        );
+    }
+
+    /// #28 — the `/derp`-recovery levers must land where they can act. The
+    /// pull-forward is only an acceleration below the ordinary cadence, and the
+    /// walk window must outlast it or the tick it pulls in lands after the
+    /// window has already closed — which would leave `install_peers` back on
+    /// its ~30 s cadence and buy nothing at all.
+    #[test]
+    fn derp_recovery_levers_land_where_they_can_act() {
+        assert!(
+            DERP_RECOVERY_RECHECK < FALLBACK_TICK,
+            "a recheck at/after the ordinary cadence is not an acceleration"
+        );
+        assert!(
+            DERP_RECOVERY_WALK_WINDOW > DERP_RECOVERY_RECHECK,
+            "the pulled-forward tick must land INSIDE the fast-walk window"
+        );
+        assert!(
+            DERP_RECOVERY_WALK_WINDOW >= FALLBACK_TICK * 2,
+            "cover a second flap — the field case reconnected twice inside 2 s"
         );
     }
 
