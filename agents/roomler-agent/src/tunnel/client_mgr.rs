@@ -604,14 +604,16 @@ async fn run_flow_supervisor(
     // floor: netstate damps to ≤1 material Major / 120 s (#506), and the
     // `session_ran` threshold (#602) still governs post-session resets.
     let mut net_rx = super::netwatch::subscribe();
-    // R4 — consecutive sessions that died young (or failed outright). Two in
-    // a row on `Auto` ⇒ lead the next attempt with quic-derp-v1: the classic
-    // TURN/ICE paths are exactly what a corp capture window kills seconds
-    // after establishment (field 2026-08-25: 14 min of established-then-dead
-    // TURN sessions while the derp floor carried from minute two). A session
-    // that RUNS ≥ `SESSION_RAN_THRESHOLD` resets the streak, so a later
-    // attempt tries the better ladder again once the window has passed.
-    let mut quick_deaths: u32 = 0;
+    // R4 — is QUIC-over-TURN failing on this path? Set from what actually
+    // RAN each session (below): quic-v1 = healthy; webrtc-dc-v1 = quic fell
+    // back (a capture window, or a genuinely QUIC-hostile path); quic-derp-v1
+    // = the derp leg is carrying it (quic still failing underneath). While
+    // true and the flavor is enabled, LEAD with quic-derp-v1 to skip the
+    // doomed quic attempt. The old quick-death counter never fired in the
+    // field: webrtc-dc kept sessions alive ~30-60s (> SESSION_RAN_THRESHOLD)
+    // even while carrying no data (2026-08-25). The transport that ran is the
+    // honest signal.
+    let mut quic_over_turn_failing = false;
     loop {
         *live.status.lock().unwrap() = FlowStatus::Connecting;
         // Wait for a live agent WS.
@@ -620,16 +622,13 @@ async fn run_flow_supervisor(
             None => return, // hub dropped — the daemon is shutting down
         };
 
-        let derp = if quick_deaths >= DERP_FALLBACK_AFTER_QUICK_DEATHS
-            && pref == TransportPref::Auto
-            && derp_fallback_enabled()
-        {
+        // Resolve the /derp handle whenever the flavor is enabled — the
+        // fallback ladder inside `run_session_with_fallback` uses it on a
+        // quic-over-TURN failure even before we start LEADING with it.
+        let derp = if pref == TransportPref::Auto && derp_fallback_enabled() {
             let h = super::netwatch::primary_derp_tunnel_handle();
-            if h.is_some() {
-                info!(
-                    flow = %flow_id, quick_deaths,
-                    "leading this attempt with quic-derp-v1 (repeated quick session deaths)"
-                );
+            if h.is_none() && quic_over_turn_failing {
+                debug!(flow = %flow_id, "quic-derp-v1 wanted but no /derp handle yet (overlay derp starting?)");
             }
             h
         } else {
@@ -648,19 +647,31 @@ async fn run_flow_supervisor(
             pref,
             &live,
             derp,
+            quic_over_turn_failing,
         )
         .await;
 
         *live.status.lock().unwrap() = FlowStatus::Down;
+        // Update the derp-lead signal from the transport that actually ran.
+        match live.transport.lock().unwrap().as_deref() {
+            Some(t) if t == tunnel_core::transport::TRANSPORT_QUIC_V1 => {
+                quic_over_turn_failing = false
+            }
+            Some(t)
+                if t == TRANSPORT_WEBRTC_DC_V1
+                    || t == tunnel_core::transport::TRANSPORT_QUIC_DERP_V1 =>
+            {
+                quic_over_turn_failing = true
+            }
+            _ => {}
+        }
         match result {
             Ok(()) => {
                 let ran = started.elapsed();
                 if session_ran(ran) {
                     info!(flow = %flow_id, ran_s = ran.as_secs(), "tunnel session ended; reconnecting");
                     backoff = RECONNECT_BACKOFF_MIN;
-                    quick_deaths = 0;
                 } else {
-                    quick_deaths = quick_deaths.saturating_add(1);
                     // Opened, then died on arrival. Reported at WARN because
                     // it is indistinguishable from a broken target and used to
                     // be invisible: the old code logged this at INFO as a
@@ -685,7 +696,6 @@ async fn run_flow_supervisor(
                     *live.fatal.lock().unwrap() = Some(reason);
                     return;
                 }
-                quick_deaths = quick_deaths.saturating_add(1);
                 warn!(flow = %flow_id, %e, backoff_s = backoff.as_secs(), "tunnel session failed; retrying");
             }
         }
@@ -708,11 +718,6 @@ async fn run_flow_supervisor(
         }
     }
 }
-
-/// R4 — quick-death streak that flips the next `Auto` attempt to lead with
-/// `quic-derp-v1`. Two: one death can be anything; two in a row through a
-/// fresh path is the capture-window signature.
-const DERP_FALLBACK_AFTER_QUICK_DEATHS: u32 = 2;
 
 /// R4 — the client-side gate for the derp tunnel flavor
 /// (`tunnel_derp_fallback` config key via the env bridge; default OFF while
@@ -781,41 +786,76 @@ async fn run_session_with_fallback(
     target: &Target,
     pref: TransportPref,
     live: &Arc<FlowLive>,
-    // R4 — `Some` when the supervisor decided this attempt should LEAD with
-    // the quic-derp-v1 flavor (repeated quick-deaths through a captured corp
-    // path). Only ever set for `TransportPref::Auto`; an explicit
-    // `--transport` is honored verbatim.
+    // R4 — the live `/derp` tunnel handle when the flavor is enabled + the
+    // overlay's `/derp` mux is up. `None` disables the derp rungs below
+    // (classic quic → webrtc-dc ladder).
     derp: Option<tunnel_core::transport::derp::DerpTunnelHandle>,
+    // R4 — LEAD with quic-derp-v1 (skip the doomed quic-over-TURN attempt)
+    // once the supervisor has seen quic-over-TURN fail on this path. Ignored
+    // when `derp` is `None` or `pref != Auto`.
+    lead_derp: bool,
 ) -> Result<()> {
-    let (supported, request) = match &derp {
-        Some(_) => (
+    // An explicit `--transport` is honored verbatim (no derp, no fallback).
+    if pref != TransportPref::Auto {
+        let outcome = drive_one(
+            hub,
+            flow_id,
+            attempt,
+            sink_tx,
+            local,
+            agent_id,
+            target,
+            pref.supported_transports(),
+            pref.request_transport(),
+            live,
+            None,
+        )
+        .await?;
+        if matches!(outcome, SessionOutcome::QuicSetupFailed) {
+            bail!("QUIC setup failed and transport={pref:?} forbids fallback");
+        }
+        return Ok(());
+    }
+
+    // Auto. When leading with derp, request quic-derp first (still advertising
+    // quic + webrtc so the server can pick a working one if derp is somehow
+    // unavailable this session). Otherwise start on quic-over-TURN.
+    let (supported, request, first_derp) = if lead_derp && derp.is_some() {
+        info!(flow = %flow_id, "leading with quic-derp-v1 (QUIC-over-TURN failing on this path)");
+        (
             vec![
                 tunnel_core::transport::TRANSPORT_QUIC_DERP_V1.to_string(),
                 tunnel_core::transport::TRANSPORT_QUIC_V1.to_string(),
                 TRANSPORT_WEBRTC_DC_V1.to_string(),
             ],
             tunnel_core::transport::TRANSPORT_QUIC_DERP_V1,
-        ),
-        None => (pref.supported_transports(), pref.request_transport()),
+            derp.clone(),
+        )
+    } else {
+        (
+            TransportPref::Auto.supported_transports(),
+            TransportPref::Auto.request_transport(),
+            None,
+        )
     };
     let outcome = drive_one(
-        hub,
-        flow_id,
-        attempt,
-        sink_tx,
-        local,
-        agent_id,
-        target,
-        supported,
-        request,
-        live,
-        derp.clone(),
+        hub, flow_id, attempt, sink_tx, local, agent_id, target, supported, request, live,
+        first_derp,
     )
     .await?;
-    if matches!(outcome, SessionOutcome::QuicSetupFailed) {
-        if pref == TransportPref::Auto {
-            warn!(flow = %flow_id, "QUIC setup failed; re-opening over webrtc-dc-v1");
-            let fallback = drive_one(
+    if !matches!(outcome, SessionOutcome::QuicSetupFailed) {
+        return Ok(());
+    }
+
+    // QUIC-over-TURN failed. Try quic-derp over the ESTABLISHED /derp WS
+    // BEFORE webrtc-dc — in a corp capture window webrtc-dc rides the same
+    // TURN/ICE and dies identically (field 2026-08-25: webrtc-dc sessions
+    // "ran" but carried no data), while the derp leg rides the wss:443 floor
+    // that survives capture. Skipped if we already led with derp above.
+    if !lead_derp {
+        if let Some(handle) = derp {
+            info!(flow = %flow_id, "QUIC-over-TURN setup failed; trying quic-derp-v1 over the established /derp WS before webrtc-dc");
+            let derp_outcome = drive_one(
                 hub,
                 flow_id,
                 attempt,
@@ -823,18 +863,37 @@ async fn run_session_with_fallback(
                 local,
                 agent_id,
                 target,
-                vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
-                TRANSPORT_WEBRTC_DC_V1,
+                vec![tunnel_core::transport::TRANSPORT_QUIC_DERP_V1.to_string()],
+                tunnel_core::transport::TRANSPORT_QUIC_DERP_V1,
                 live,
-                None,
+                Some(handle),
             )
             .await?;
-            if matches!(fallback, SessionOutcome::QuicSetupFailed) {
-                bail!("webrtc-dc-v1 fallback unexpectedly reported QUIC-setup-failed");
+            if !matches!(derp_outcome, SessionOutcome::QuicSetupFailed) {
+                return Ok(());
             }
-        } else {
-            bail!("QUIC setup failed and transport={pref:?} forbids fallback");
+            warn!(flow = %flow_id, "quic-derp-v1 setup also failed; re-opening over webrtc-dc-v1");
         }
+    } else {
+        warn!(flow = %flow_id, "quic-derp-v1 lead failed; re-opening over webrtc-dc-v1");
+    }
+
+    let fallback = drive_one(
+        hub,
+        flow_id,
+        attempt,
+        sink_tx,
+        local,
+        agent_id,
+        target,
+        vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
+        TRANSPORT_WEBRTC_DC_V1,
+        live,
+        None,
+    )
+    .await?;
+    if matches!(fallback, SessionOutcome::QuicSetupFailed) {
+        bail!("webrtc-dc-v1 fallback unexpectedly reported QUIC-setup-failed");
     }
     Ok(())
 }
