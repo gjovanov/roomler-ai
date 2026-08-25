@@ -169,4 +169,73 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# The update half — DEFAULT ON, opt-out.
+#
+# `installer -target /` needs root, and the DEFAULT install is the per-user
+# LaunchAgent alone — which therefore could never self-update (field
+# 2026-08-25: a per-user agent trying took the Mac OFFLINE; since then it
+# refuses, which is safe and permanently stale). This tiny root unit is the
+# missing half of updating and nothing else: no enrollment, no network
+# identity — it polls the public release feed, verifies, installs, exits.
+# The agents signal it by touching /private/var/tmp/roomler-update-check.
+#
+# Default ON because this pkg is only ever installed BY root — the operator
+# consented to root code at install time, and an updater that runs as the
+# installer's identity is how system packages update everywhere. Opt out:
+#   sudo mkdir -p /etc/roomler-agent && sudo touch /etc/roomler-agent/disable-auto-update
+# then re-run the installer (same absence-removes semantics as the daemon
+# marker — the opposite polarity, because the default is the opposite).
+#
+# ⚠️ NEVER bootout a loaded com.roomler.update here: during a self-update
+# THIS script is a grandchild of that very job, and booting it kills the
+# whole process group — `installer` included, mid-payload. Bootstrap only
+# when not yet loaded; a changed plist takes effect at next boot.
+# ---------------------------------------------------------------------------
+UPDATE_PLIST_SOURCE="/Library/Roomler/roomler-agent.app/Contents/Resources/com.roomler.update.plist"
+UPDATE_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.update.plist"
+
+if [ ! -f /etc/roomler-agent/disable-auto-update ]; then
+  if [ ! -f "$UPDATE_PLIST_SOURCE" ]; then
+    echo "WARNING: $UPDATE_PLIST_SOURCE missing — auto-update helper not installed"
+  else
+    mkdir -p /var/log/roomler-agent
+    cp "$UPDATE_PLIST_SOURCE" "$UPDATE_PLIST_TARGET"
+    chown root:wheel "$UPDATE_PLIST_TARGET"
+    chmod 644 "$UPDATE_PLIST_TARGET"
+    if launchctl print system/com.roomler.update >/dev/null 2>&1; then
+      echo "roomler update helper already loaded — plist refreshed (takes effect at next boot)"
+    else
+      if launchctl bootstrap system "$UPDATE_PLIST_TARGET" 2>/tmp/roomler-update-bootstrap.err; then
+        echo "roomler update helper installed (unattended self-update, log: /var/log/roomler-agent/update.log)"
+      else
+        echo "roomler update helper installed, but launchctl bootstrap failed:"
+        echo "  $(cat /tmp/roomler-update-bootstrap.err 2>/dev/null)"
+        echo "  It will load at next boot. Until then updates are manual."
+      fi
+      rm -f /tmp/roomler-update-bootstrap.err
+    fi
+  fi
+else
+  if [ -f "$UPDATE_PLIST_TARGET" ]; then
+    rm -f "$UPDATE_PLIST_TARGET"
+    # Bootout ONLY when the helper job is idle. If an update is in flight the
+    # helper is this script's own ancestor — booting the job would kill the
+    # whole process group, this script included, and fail the install at its
+    # last step. An idle-but-loaded job that we cannot boot out is harmless:
+    # the helper checks the opt-out marker itself at startup and exits.
+    if launchctl print system/com.roomler.update 2>/dev/null | grep -q "state = running"; then
+      echo "roomler update helper opt-out recorded; the loaded job unloads at next boot"
+      echo "  (cannot bootout now — an update is in flight and the job is our ancestor)"
+    else
+      launchctl bootout system/com.roomler.update 2>/dev/null || true
+      echo "roomler update helper REMOVED — /etc/roomler-agent/disable-auto-update is set."
+    fi
+    echo "  This Mac will no longer self-update; new releases must be installed by hand:"
+    echo "    curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- --role daemon …"
+  else
+    echo "auto-update opted out (/etc/roomler-agent/disable-auto-update) — helper not installed"
+  fi
+fi
+
 exit 0

@@ -143,6 +143,15 @@ enum Command {
     /// already reports.
     #[command(hide = true, name = "caps-probe")]
     CapsProbe,
+    /// (internal, macOS) The body of the `com.roomler.update` LaunchDaemon:
+    /// consume the wake file, then check → download → verify → run
+    /// `installer -pkg … -target /` as root, waiting on it. Root-only and
+    /// single-shot; the pkg's postinstall restarts the agent halves.
+    /// Hidden: launchd is the caller — by hand it is
+    /// `sudo roomler-agent update-helper`, and running it non-root only
+    /// prints the refusal.
+    #[command(hide = true, name = "update-helper")]
+    UpdateHelper,
     /// Smoke-test the encoder cascade: open the preferred encoder at
     /// a small resolution, feed 10 synthetic frames, assert at least
     /// one IDR output. Exits non-zero if no encoder could be opened or
@@ -828,6 +837,19 @@ async fn main() -> Result<()> {
         Command::CapsProbe => {
             roomler_agent::encode::caps::print_probe_result();
             Ok(())
+        }
+        Command::UpdateHelper => {
+            #[cfg(target_os = "macos")]
+            {
+                updater::run_update_helper().await
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!(
+                    "update-helper is the macOS com.roomler.update LaunchDaemon body; \
+                     this platform's updater runs inside the agent itself"
+                )
+            }
         }
         Command::EncoderSmoke { encoder, codec } => encoder_smoke_cmd(&encoder, &codec).await,
         Command::SystemCaptureSmoke {
@@ -3164,6 +3186,31 @@ async fn netd_cmd() -> Result<()> {
 }
 
 async fn self_update_cmd(check_only: bool) -> Result<()> {
+    // macOS: installs are owned by the root update helper
+    // (com.roomler.update). A non-root invocation used to download the
+    // whole pkg and then fail the spawn on the euid guard — queue the
+    // helper instead and say where to watch. Root (`sudo … self-update`)
+    // keeps the direct path: it CAN install, and an operator running sudo
+    // wants the synchronous behaviour. `--check-only` also stays direct —
+    // it touches nothing, so any uid may ask.
+    #[cfg(target_os = "macos")]
+    if !check_only && unsafe { libc::geteuid() } != 0 {
+        return match updater::macos_queue_update_check() {
+            Ok(()) => {
+                println!(
+                    "Queued for the root update helper (com.roomler.update).\n\
+                     Watch: /var/log/roomler-agent/update.log\n\
+                     (If this Mac set /etc/roomler-agent/disable-auto-update, updates are manual:\n\
+                      sudo installer -pkg <pkg> -target /)"
+                );
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!(e).context(format!(
+                "could not write the update-helper wake file {}",
+                updater::MACOS_UPDATE_TRIGGER
+            ))),
+        };
+    }
     let outcome = updater::check_once().await;
     match outcome {
         updater::CheckOutcome::UpToDate { current, latest } => {
