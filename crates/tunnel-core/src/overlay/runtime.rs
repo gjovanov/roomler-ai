@@ -4604,6 +4604,19 @@ mod tests {
         );
         assert_eq!(e.tier, DirectTier::Relay);
 
+        // #29 — the follow must SUPPRESS the tier it left, or make-before-break
+        // re-promotes it on its next probe and the pair flaps on MBB's cadence
+        // (field: every 60 s for hours). Decaying, so direct returns by itself.
+        assert!(
+            rt.path_shadow
+                .lock()
+                .unwrap()
+                .mon
+                .strikes(&nid, DirectTier::Lan)
+                >= 1,
+            "following a peer onto DERP must suppress the direct tier we left"
+        );
+
         // Repeat notices are ordinary (frames in flight when we flipped) and
         // must be inert, not a rebuild loop.
         assert!(
