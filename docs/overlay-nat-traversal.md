@@ -296,6 +296,11 @@ cascade's guarantees while replacing its reactive counters:
   peer *is* is a fact, not a quality score. Every follow re-arms the window, so
   it self-extends while the peer stays away and lapses once it stops relaying —
   the next probe then promotes normally and nothing is stranded.
+  ⚠️ And the window **escalates** (3 → 6 → 12 min, capped at `H_ESCALATED`),
+  because a FIXED holdoff only moves the flap to its own boundary: the field
+  showed a pair retrying at exactly 3 min once the holdoff shipped. A gap
+  longer than `RELAYED_INSTEAD_MEMORY` resets it to the base rung, so a one-off
+  transition never inherits an escalated window.
 
   It is safe to act on because the relay **stamps** the source pubkey from the
   sender's authenticated registration — it is not sender-chosen — so the signal
