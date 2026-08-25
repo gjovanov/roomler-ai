@@ -189,6 +189,12 @@ pub(crate) const H_ESCALATED: Duration = Duration::from_secs(15 * 60);
 /// the peer stops relaying it lapses and the very next probe promotes, so the
 /// worst case for a peer that came back is one window on the relay.
 pub(crate) const RELAYED_INSTEAD_HOLDOFF: Duration = Duration::from_secs(3 * 60);
+/// #31 — a follow arriving within this long of the previous one is the SAME
+/// disagreement continuing, so the holdoff escalates (3 → 6 → 12 → capped at
+/// [`H_ESCALATED`]); quiet for longer and the ladder resets to the base.
+/// Deliberately longer than the capped holdoff, or an escalated pair would
+/// forget between its own retries and never climb past the first rung.
+pub(crate) const RELAYED_INSTEAD_MEMORY: Duration = Duration::from_secs(30 * 60);
 /// Strike thresholds ≡ legacy `DIRECT_MAX_FAILURES` / `SRFLX_MAX_FAILURES`.
 /// The LAN tier under make-before-break never escalates (P8 — fixed 60 s
 /// spacing on both ends guarantees bilateral punch alignment; see
@@ -366,6 +372,14 @@ struct PeerPath {
     /// the tier is eligible again by the next probe — which is exactly the flap
     /// #29 tried and failed to stop.
     relayed_instead_until: Option<Instant>,
+    /// #31 — consecutive demote-follows, and when the last one was. A pair
+    /// where the two ends persistently disagree (our probe latches, the peer
+    /// relays anyway) would otherwise retry at exactly the fixed holdoff
+    /// forever; these escalate the window instead. Reset by
+    /// [`RELAYED_INSTEAD_MEMORY`] of quiet, so a one-off transition never
+    /// leaves a peer on a long window.
+    relayed_instead_strikes: u32,
+    relayed_instead_at: Option<Instant>,
     /// Voluntary-switch hysteresis bookkeeping (disabled-at-flip machinery).
     hysteresis: Hysteresis,
 }
@@ -591,10 +605,24 @@ impl PathMonitor {
         // (field 2026-08-25, measured for 20 min after #29 shipped believing it
         // had fixed exactly this).
         //
-        // Re-armed by every follow, so it self-extends while the peer stays
-        // away and simply lapses once it stops relaying — at which point the
-        // next probe promotes normally. Nothing is stranded.
-        p.relayed_instead_until = Some(now + RELAYED_INSTEAD_HOLDOFF);
+        // #31 — and the window ESCALATES while the disagreement persists. A
+        // fixed holdoff only moves the flap to its own boundary: the field
+        // showed a pair retrying at exactly 3 min (12:22:30 / 12:25:45 /
+        // 12:29:00) once #30 shipped. Each follow inside `RELAYED_INSTEAD_MEMORY`
+        // doubles, capped at `H_ESCALATED`; a quiet gap resets to the base, so a
+        // one-off transition never leaves a peer on a long window.
+        let consecutive = match p.relayed_instead_at {
+            Some(prev) if now.saturating_duration_since(prev) <= RELAYED_INSTEAD_MEMORY => {
+                p.relayed_instead_strikes.saturating_add(1)
+            }
+            _ => 1,
+        };
+        p.relayed_instead_strikes = consecutive;
+        p.relayed_instead_at = Some(now);
+        let holdoff = (RELAYED_INSTEAD_HOLDOFF * 2u32.saturating_pow(consecutive - 1))
+            .min(H_ESCALATED)
+            .max(RELAYED_INSTEAD_HOLDOFF);
+        p.relayed_instead_until = Some(now + holdoff);
         p.hysteresis.record_switch(now);
     }
 
@@ -1404,6 +1432,47 @@ mod tests {
                     t0 + RELAYED_INSTEAD_HOLDOFF + Duration::from_secs(1)
                 ),
                 "{tier:?} must recover — nothing may be stranded on the relay"
+            );
+
+            // #31 — a PERSISTENT disagreement must ESCALATE, or the flap simply
+            // moves to the holdoff boundary: the field showed a pair retrying
+            // at exactly 3 min (12:22:30 / 12:25:45 / 12:29:00) on rc.465.
+            //
+            // Asserted on the WINDOW rather than through `eligible`, because
+            // eligibility also carries the penalty plane — and after a few
+            // strikes Public/Srflx are legitimately suppressed by THAT (their
+            // `suppression_half_life` escalates past `MAX_FAILURES`), which
+            // would mask whether the ladder itself did anything. Isolate the
+            // mechanism under test.
+            let window = |m: &PathMonitor, p: &ObjectId, at: Instant| {
+                m.peers[p].relayed_instead_until.unwrap() - at
+            };
+            let t1 = t0 + RELAYED_INSTEAD_HOLDOFF + Duration::from_secs(1);
+            m.on_peer_relayed_instead(&a, tier, true, t1);
+            assert!(
+                window(&m, &a, t1) > RELAYED_INSTEAD_HOLDOFF,
+                "{tier:?} a second follow must hold LONGER than the base window"
+            );
+            // …and it must CAP: a pair may never be stranded on the relay.
+            let mut t = t1;
+            for _ in 0..12 {
+                t += Duration::from_secs(60);
+                m.on_peer_relayed_instead(&a, tier, true, t);
+            }
+            assert_eq!(
+                window(&m, &a, t),
+                H_ESCALATED,
+                "{tier:?} the ladder must cap at H_ESCALATED"
+            );
+            // A gap longer than the memory resets to the base rung, so a
+            // one-off transition never inherits an escalated window.
+            let fresh = t + RELAYED_INSTEAD_MEMORY + Duration::from_secs(1);
+            m.on_peer_relayed_instead(&a, tier, true, fresh);
+            assert_eq!(
+                window(&m, &a, fresh),
+                RELAYED_INSTEAD_HOLDOFF,
+                "{tier:?} the ladder must RESET after a quiet period — a one-off \
+                 transition must not inherit an escalated window"
             );
         }
         // The relay tier is not a direct tier: nothing to suppress, and no
