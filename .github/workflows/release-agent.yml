@@ -1751,33 +1751,76 @@ jobs:
         # Windows is upstream-only-on-1.16, so brew's 1.15 works).
         run: brew install cmake libvpx pkg-config
 
-      # NO `ffmpeg-encoder` ON macOS -- deliberately, since rc.453.
+      - name: Fetch vendored FFmpeg 8.1.2 (macOS arm64 — VideoToolbox)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Built once by vendor-ffmpeg-macos.yml and reused here, same
+          # prebuild-once model as the Linux lane. That workflow configures
+          # --disable-autodetect --disable-xlib --disable-libxcb, so this
+          # artifact carries NO Homebrew dependency — which is the whole
+          # reason ffmpeg-encoder can come back to this platform at all.
+          #
+          # It is also minimal (--disable-everything + the three
+          # *_videotoolbox encoders): 775 KB packed, ~1.8 MB of dylibs,
+          # against ~20 MB for the untrimmed tree that would have doubled
+          # the .pkg.
+          mkdir -p /tmp/ffdl "$RUNNER_TEMP/roomler-ffmpeg"
+          gh release download vendored-ffmpeg-8.1.2 \
+            --repo "${{ github.repository }}" \
+            --pattern 'ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz' \
+            --dir /tmp/ffdl --clobber
+          # NOTE: no --strip-components. The macOS tarball is packed as
+          # `tar cJf … lib include` from the install prefix, so lib/ and
+          # include/ are already at the root — unlike the Linux one, which
+          # has a wrapping directory and does strip 1.
+          tar xf /tmp/ffdl/ffmpeg-8.1.2-macos-arm64-lgpl-shared.tar.xz \
+            -C "$RUNNER_TEMP/roomler-ffmpeg"
+          # BSD sed needs an explicit (empty) backup suffix; GNU `sed -i`
+          # would silently create files named after the next argument.
+          sed -i '' "s|^prefix=.*|prefix=$RUNNER_TEMP/roomler-ffmpeg|" \
+            "$RUNNER_TEMP/roomler-ffmpeg"/lib/pkgconfig/*.pc
+          {
+            echo "FFMPEG_DIR=$RUNNER_TEMP/roomler-ffmpeg"
+            echo "PKG_CONFIG_PATH=$RUNNER_TEMP/roomler-ffmpeg/lib/pkgconfig"
+          } >> "$GITHUB_ENV"
+          echo "=== vendored dylibs ==="
+          ls -1 "$RUNNER_TEMP/roomler-ffmpeg/lib"/*.dylib | sed 's|.*/|    |'
+          # Fail here rather than at link time if the artifact is the old
+          # poisoned build — it is the cheapest place to catch it, and the
+          # failure mode it prevents is every Mac dying at launch.
+          if grep -rqa -E '/opt/homebrew|/usr/local/' "$RUNNER_TEMP/roomler-ffmpeg/lib"/*.dylib; then
+            echo "::error::vendored FFmpeg carries Homebrew paths — re-run vendor-ffmpeg-macos.yml"
+            exit 1
+          fi
+          echo "  clean (no Homebrew/usr-local references)"
+
+      # `ffmpeg-encoder` is BACK on macOS as of this change. It was removed in
+      # rc.453 because it was both useless and actively fatal, and BOTH of
+      # those conditions have now been retired:
       #
-      # It never did anything here. `encode/ffmpeg/encoder.rs` dispatches by
-      # NAME, and every name in the four tables is NVIDIA/Intel/AMD
-      # (hevc_nvenc/hevc_qsv/hevc_amf, h264_*, av1_*, vp9_qsv) -- none of
-      # which exists on Apple Silicon, and none of which the vendored LGPL
-      # build even contains. `find_encoder_by_name` therefore returned None
-      # for all of them and the caps probe advertised nothing extra. The
-      # step's own comment claimed "HEVC via hevc_videotoolbox", but that
-      # name is not in HEVC_ENCODER_NAMES; CLAUDE.md's P3e note has called
-      # this dead weight since the size program measured it.
+      #   * Useless: `encode/ffmpeg/encoder.rs` dispatches by NAME, and every
+      #     name was NVIDIA/Intel/AMD — none of which exists on Apple silicon,
+      #     so `find_encoder_by_name` returned None for all of them. #674 added
+      #     the `*_videotoolbox` rungs, so HEVC and H.264 now resolve to Apple's
+      #     media engine. (`av1_videotoolbox` is in the table too but is NOT in
+      #     the registry on current SDKs — measured, not assumed; the cascade
+      #     falls through cleanly and caps.rs simply doesn't advertise AV1.)
       #
-      # It was not merely useless, it was ACTIVELY BREAKING the product: the
-      # six FFmpeg dylibs were built on a runner with Homebrew present, so
-      # configure autodetected X11 and baked
-      # /opt/homebrew/opt/libx11/lib/libX11.6.dylib into libavutil, libavcodec,
-      # libavformat, libavfilter, libswscale and libswresample (plus four
-      # libxcb* into libavdevice). None of those exist on an end-user Mac, so
-      # dyld aborted the process at launch. Field-hit on a brand-new MacBook,
-      # 2026-08-23, on rc.452.
+      #   * Fatal: the six dylibs were built on a runner with Homebrew, so
+      #     configure autodetected X11 and baked /opt/homebrew/... into them.
+      #     Nothing on an end-user Mac provides those, so dyld aborted at
+      #     launch — field-hit on a brand-new MacBook, 2026-08-23, on rc.452.
+      #     vendor-ffmpeg-macos.yml now configures --disable-autodetect (the
+      #     general fix, not just the two named libs), the fetch step above
+      #     re-checks the artifact, and the staging step's /opt scan is the
+      #     backstop on the assembled .app.
       #
-      # To bring it back, BOTH halves are required: add the *_videotoolbox
-      # names to the dispatch tables (a feature decision -- see CLAUDE.md),
-      # AND re-run vendor-ffmpeg-macos.yml, which now configures
-      # --disable-xlib --disable-libxcb so the artifact carries no Homebrew
-      # dependency to begin with.
-      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen, no ffmpeg-encoder)
+      # ⚠️ Keep all three of those checks. The launch crash was invisible on
+      # the builder — a Mac WITH Homebrew runs the poisoned binary fine, which
+      # is exactly why it shipped.
+      - name: Build agent (release, full + vp9-444 + vp9-444-bindgen + ffmpeg-encoder)
         # `vp9-444-bindgen` runs bindgen against brew's libvpx 1.16
         # headers — env-libvpx-sys's pre-generated bindings only cover
         # 1.13.0, so without bindgen the build script panics looking
@@ -1789,13 +1832,20 @@ jobs:
         # `overlay_enabled`), inert until an operator opts a host in.
         # `full` includes `audio` → cpal CoreAudio (in the OS SDK, no extra
         # lib) + audiopus (bundled libopus via CMake).
-        # Video on macOS is therefore SW-only: openh264 (statically linked,
-        # compiled from C source) for RTP H.264, libvpx for VP9-4:4:4 over
-        # the data channel. libvpx is the ONE dynamic non-system dependency,
-        # and the staging step below bundles it into the .app.
+        # Video on macOS is no longer SW-only. `ffmpeg-encoder` + the
+        # `*_videotoolbox` rungs put HEVC and H.264 on Apple's media engine
+        # for data-channel sessions; openh264 (statically linked) still
+        # serves the legacy RTP track, and libvpx still serves VP9-4:4:4,
+        # which stays the pick when a viewer asks for crisp 4:4:4 text
+        # (VideoToolbox HEVC has no 4:4:4).
+        #
+        # Dynamic non-system deps are now libvpx AND the four FFmpeg dylibs.
+        # Neither needs a staging line: the bundling step below walks
+        # `otool -L` recursively and copies whatever the binary actually
+        # links, which is why adding a library here required no change there.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server" --target aarch64-apple-darwin
+        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder" --target aarch64-apple-darwin
 
       # The `roomler` CLI. macOS shipped WITHOUT one until rc.454 — the pkg
       # payload was the .app and nothing else — so `roomler peers` was
@@ -1842,23 +1892,62 @@ jobs:
           # launch, so one unrewritten leaf is still a crash.
           FW="$APP/Contents/Frameworks"
           mkdir -p "$FW"
+          # Where an `@rpath/…` dependency can actually be found. A dylib built
+          # with `--install-name-dir=@rpath` (the vendored FFmpeg) advertises
+          # itself as `@rpath/libavcodec.62.dylib`, so `otool -L` on our binary
+          # reports that and NOT a filesystem path.
+          #
+          # ⚠️ Treating `@…` as "already handled" is wrong and was caught by the
+          # self-containment check below on the first VideoToolbox build:
+          # libvpx came from Homebrew with an absolute install name and got
+          # bundled, while the four FFmpeg dylibs were skipped as already-@rpath
+          # and NOTHING copied them — the staged binary then died
+          # `Library not loaded: @rpath/libavcodec.62.dylib`. `@rpath` says how
+          # to LOOK for a library, never that it is present.
+          RPATH_SEARCH="${FFMPEG_DIR:+$FFMPEG_DIR/lib}"
           bundle_deps() {
-            local target="$1" dep base
+            local target="$1" dep base src
             # otool -L: line 1 is the file itself; field 1 of the rest is the path.
-            otool -L "$target" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+            #
+            # Fed by process substitution, NOT a pipe: a piped `while` runs in a
+            # SUBSHELL, so the `exit 1` below would kill only that subshell and
+            # the step would sail on green. Same reason the /opt gate further
+            # down is written this way.
+            while read -r dep; do
               case "$dep" in
-                /usr/lib/*|/System/*|@*) continue ;;   # OS-provided or already relative
+                /usr/lib/*|/System/*) continue ;;     # OS-provided
+                @executable_path/*|@loader_path/*) continue ;;  # already bundle-relative
               esac
               base="$(basename "$dep")"
+              case "$dep" in
+                @rpath/*)
+                  # Resolve against the trees we know we linked against. If it
+                  # is already in Frameworks the reference is fine as-is.
+                  [ -f "$FW/$base" ] && continue
+                  src=""
+                  for d in $RPATH_SEARCH; do
+                    [ -f "$d/$base" ] && { src="$d/$base"; break; }
+                  done
+                  if [ -z "$src" ]; then
+                    echo "::error::@rpath dep $dep is not in Frameworks and not in \$RPATH_SEARCH ($RPATH_SEARCH)"
+                    exit 1
+                  fi
+                  ;;
+                *) src="$dep" ;;
+              esac
               if [ ! -f "$FW/$base" ]; then           # on-disk presence = the "seen" set
-                echo "    bundling $dep"
-                cp -L "$dep" "$FW/$base"              # -L: brew's opt path is a symlink into the Cellar
+                echo "    bundling $src"
+                cp -L "$src" "$FW/$base"             # -L: brew's opt path is a symlink into the Cellar
                 chmod u+w "$FW/$base"
                 install_name_tool -id "@rpath/$base" "$FW/$base"
                 bundle_deps "$FW/$base"               # recurse into the copy's own deps
               fi
-              install_name_tool -change "$dep" "@rpath/$base" "$target"
-            done
+              # An already-@rpath reference needs no rewrite; an absolute one does.
+              case "$dep" in
+                @rpath/*) ;;
+                *) install_name_tool -change "$dep" "@rpath/$base" "$target" ;;
+              esac
+            done < <(otool -L "$target" | tail -n +2 | awk '{print $1}')
           }
           echo "=== bundling non-system dylibs ==="
           install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomler-agent"
