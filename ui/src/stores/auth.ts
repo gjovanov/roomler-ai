@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { api } from '@/api/client'
 import router from '@/plugins/router'
 import { subscribePush, unsubscribePush } from '@/composables/usePush'
+import { markSignedIn, clearSignedIn, looksSignedIn } from '@/api/session'
 
 interface User {
   id: string
@@ -17,23 +18,33 @@ interface User {
 
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<User | null>(null)
-  const token = ref<string | null>(localStorage.getItem('access_token'))
   const loading = ref(false)
   const error = ref<string | null>(null)
 
-  const isAuthenticated = computed(() => !!token.value)
+  /**
+   * Does this browser believe it is signed in?
+   *
+   * Seeded from the local hint so a hard refresh can render the app shell
+   * without waiting for `/auth/me`, then corrected by the server: `fetchMe`
+   * logs out if the session is not real. The credential itself is an HttpOnly
+   * cookie this code cannot see — see `@/api/session`.
+   */
+  const signedIn = ref(looksSignedIn())
+  const isAuthenticated = computed(() => signedIn.value)
 
   async function login(username: string, password: string) {
     loading.value = true
     error.value = null
     try {
-      const data = await api.post<{ access_token: string; user: User }>('/auth/login', {
+      // The response still carries tokens; we deliberately ignore them. The
+      // session arrived as Set-Cookie on this same response.
+      const data = await api.post<{ user: User }>('/auth/login', {
         username,
         password,
       })
-      token.value = data.access_token
       user.value = data.user
-      localStorage.setItem('access_token', data.access_token)
+      signedIn.value = true
+      markSignedIn()
       subscribePush().catch(() => {})
     } catch (e) {
       error.value = (e as Error).message
@@ -62,14 +73,19 @@ export const useAuthStore = defineStore('auth', () => {
       if (inviteCode) body.invite_code = inviteCode
 
       const data = await api.post<{
-        access_token: string
-        user: User
+        access_token?: string
+        user?: User
         invite_tenant?: { tenant_id: string; tenant_name: string; tenant_slug: string }
       }>('/auth/register', body)
-      token.value = data.access_token
-      user.value = data.user
-      localStorage.setItem('access_token', data.access_token)
-      subscribePush().catch(() => {})
+      // Production registration returns no tokens and no user — the account
+      // needs email activation first, so this is NOT a session yet. Only the
+      // auto-verified path (e2e overlay) signs in, and it sets cookies.
+      if (data.user) {
+        user.value = data.user
+        signedIn.value = true
+        markSignedIn()
+        subscribePush().catch(() => {})
+      }
       return data
     } catch (e) {
       error.value = (e as Error).message
@@ -80,22 +96,41 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function fetchMe() {
-    if (!token.value) return
+    if (!signedIn.value) return
     try {
       user.value = await api.get<User>('/auth/me')
       subscribePush().catch(() => {})
     } catch {
-      logout()
+      // The hint said signed in and the server disagreed. It is the authority.
+      await logout()
     }
   }
 
-  function logout() {
+  /**
+   * Sign out.
+   *
+   * ⚠️ The `POST /auth/logout` call is the load-bearing part and it was
+   * MISSING: this used to clear `localStorage` and navigate, which looked like
+   * a logout only because the SPA then had no token to send. The session
+   * COOKIE survived — and the server has always accepted it — so the session
+   * was still live for its full 7 days. Now that the cookie IS the credential,
+   * a logout that does not ask the server to expire it does not log anyone out.
+   *
+   * Best-effort: if the request fails (offline, server down) we still clear
+   * locally rather than trapping the user in a session they asked to leave.
+   */
+  async function logout() {
     unsubscribePush().catch(() => {})
-    token.value = null
+    try {
+      await api.post('/auth/logout', {})
+    } catch {
+      /* clear locally regardless — see above */
+    }
     user.value = null
-    localStorage.removeItem('access_token')
+    signedIn.value = false
+    clearSignedIn()
     router.push({ name: 'login' })
   }
 
-  return { user, token, loading, error, isAuthenticated, login, register, fetchMe, logout }
+  return { user, loading, error, isAuthenticated, login, register, fetchMe, logout }
 })
