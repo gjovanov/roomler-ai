@@ -891,6 +891,74 @@ impl PathMonitor {
         base(tier) + q - penalty
     }
 
+    // -- explaining the decision ---------------------------------------------
+
+    /// Why this peer sits on the tier it sits on, as data (F / `roomler why`).
+    ///
+    /// Every field here is already consulted by [`Self::eligible`] and
+    /// [`Self::score`]; the point is that NONE of it was readable from
+    /// outside. Answering "why is this pair on relay and not LAN?" in the
+    /// field on 2026-08-26 took a `tcpdump` on one host plus log archaeology
+    /// on the other, and the decisive record — the demote-follow — is keyed by
+    /// node id with no overlay IP in the line, so an earlier grep by IP
+    /// concluded "0 follows" for a pair that was following continuously. A
+    /// wrong answer from a plausible-looking search is worse than no answer,
+    /// and the fix is to publish the decision rather than to grep harder for
+    /// its side effects.
+    ///
+    /// Pure read: no state is touched, so this is safe to call on every view
+    /// publish.
+    pub(crate) fn explain(&self, peer: &ObjectId, now: Instant) -> PathExplain {
+        let p = self.peers.get(peer);
+        let remaining = |until: Option<Instant>| {
+            until
+                .filter(|&u| u > now)
+                .map(|u| u.saturating_duration_since(now).as_secs())
+        };
+        let relayed_instead_s = remaining(p.and_then(|p| p.relayed_instead_until));
+        let tiers = DIRECT_TIERS
+            .iter()
+            .chain(std::iter::once(&DirectTier::Relay))
+            .map(|&tier| {
+                let penalty = tier_idx(tier)
+                    .and_then(|i| p.and_then(|p| p.tiers[i].penalty))
+                    .map(|pen| pen.value(now))
+                    .unwrap_or(0.0);
+                let eligible = self.eligible(peer, tier, now);
+                // The reason is resolved in the SAME order `eligible` tests,
+                // so the text can never disagree with the verdict it explains.
+                let blocked_by = if eligible {
+                    None
+                } else if relayed_instead_s.is_some() {
+                    Some(BlockedBy::PeerRelaysInstead)
+                } else {
+                    Some(BlockedBy::Penalty)
+                };
+                TierExplain {
+                    tier,
+                    eligible,
+                    blocked_by,
+                    base: base(tier),
+                    q: tier_idx(tier)
+                        .and_then(|i| p.map(|p| p.tiers[i].q.get()))
+                        .unwrap_or_else(|| p.map(|p| p.relay_q.get()).unwrap_or(0.0)),
+                    penalty,
+                    score: self.score(peer, tier, now),
+                    fails: tier_idx(tier)
+                        .and_then(|i| p.map(|p| p.tiers[i].fails))
+                        .unwrap_or(0),
+                }
+            })
+            .collect();
+        PathExplain {
+            tiers,
+            relayed_instead_s,
+            relayed_instead_strikes: p.map(|p| p.relayed_instead_strikes).unwrap_or(0),
+            forced_derp_s: remaining(p.and_then(|p| p.forced_derp_until)),
+            probing: p.and_then(|p| p.probe).map(|(t, _)| t),
+        }
+    }
+
     /// The path decision for one peer, given what the runtime currently sees:
     /// the incumbent carrier, which direct tiers have a dialable candidate,
     /// and the make-before-break env state. Shadow-compared against the
@@ -1206,6 +1274,62 @@ pub(crate) fn classify(legacy: PathAction, monitor: PathAction) -> DivergenceCla
     }
 }
 
+/// Why a direct tier is not currently allowed for a peer. Mirrors the order
+/// [`PathMonitor::eligible`] tests its gates, so the label and the verdict
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedBy {
+    /// #30 — the peer is demonstrably relaying to us instead of using ANY
+    /// direct tier, so every direct tier is held down until the window
+    /// passes. This is a fact about the PEER, not a quality judgement about
+    /// the path, which is why it reads differently from a penalty.
+    PeerRelaysInstead,
+    /// The tier's own penalty has pushed `base − penalty` below the relay
+    /// floor: this path misbehaved recently and is decaying back.
+    Penalty,
+}
+
+impl BlockedBy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            BlockedBy::PeerRelaysInstead => "peer-relays-instead",
+            BlockedBy::Penalty => "penalty",
+        }
+    }
+}
+
+/// One tier's side of [`PathExplain`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TierExplain {
+    pub(crate) tier: DirectTier,
+    pub(crate) eligible: bool,
+    pub(crate) blocked_by: Option<BlockedBy>,
+    pub(crate) base: f64,
+    pub(crate) q: f64,
+    pub(crate) penalty: f64,
+    pub(crate) score: f64,
+    pub(crate) fails: u32,
+}
+
+/// A readable account of one peer's path decision — see
+/// [`PathMonitor::explain`].
+#[derive(Debug, Clone)]
+pub(crate) struct PathExplain {
+    /// LAN, Public, Srflx, Relay — in that order, so a renderer can print the
+    /// ladder top-down without sorting.
+    pub(crate) tiers: Vec<TierExplain>,
+    /// Seconds left on the #30 demote-follow window, if it is open.
+    pub(crate) relayed_instead_s: Option<u64>,
+    /// Consecutive demote-follows inside `RELAYED_INSTEAD_MEMORY`. This is the
+    /// rung of the escalation ladder, and a climbing value is the signature of
+    /// a pair whose two ends persistently disagree.
+    pub(crate) relayed_instead_strikes: u32,
+    /// Seconds left on the server's forced-DERP pin, if any.
+    pub(crate) forced_derp_s: Option<u64>,
+    /// A probe is in flight for this peer, on this tier.
+    pub(crate) probing: Option<DirectTier>,
+}
+
 /// Rolling shadow counters, surfaced in the 10-minute summary log.
 #[derive(Default, Debug)]
 pub(crate) struct ShadowStats {
@@ -1253,6 +1377,17 @@ impl ShadowStats {
             .collect();
         cls.sort();
         cls.join(",")
+    }
+}
+
+/// Stable wire spelling for a tier. Kept next to the tiers themselves so a
+/// renamed variant cannot silently change a diagnostic's vocabulary.
+pub(crate) fn tier_label(t: DirectTier) -> &'static str {
+    match t {
+        DirectTier::Lan => "lan",
+        DirectTier::Public => "public",
+        DirectTier::Srflx => "srflx",
+        DirectTier::Relay => "relay",
     }
 }
 
@@ -1383,6 +1518,79 @@ mod tests {
         assert!(!m.eligible(&a, DirectTier::Lan, t0 + Duration::from_secs(1)));
     }
 
+    /// F — `explain` must never contradict the selector it describes. The
+    /// failure mode this guards is a diagnostic that says "eligible: no,
+    /// because penalty" while the real gate was the demote-follow window: an
+    /// operator would then go tuning path quality for a problem that lives at
+    /// the far end. So the reason is resolved in the same order `eligible`
+    /// tests its gates, and this asserts they agree in both states.
+    #[test]
+    fn explain_agrees_with_eligible_and_names_the_gate_that_actually_refused() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let t0 = Instant::now();
+
+        // Clean slate: everything eligible, nothing blamed.
+        let e = m.explain(&a, t0);
+        assert_eq!(e.tiers.len(), 4, "lan/public/srflx/relay, in ladder order");
+        for t in &e.tiers {
+            assert!(t.eligible, "{:?} should start eligible", t.tier);
+            assert!(t.blocked_by.is_none());
+            assert_eq!(t.eligible, m.eligible(&a, t.tier, t0));
+        }
+        assert!(e.relayed_instead_s.is_none());
+
+        // The peer relays to us instead: EVERY direct tier is held down, and
+        // the reason must be the peer, not the path.
+        m.on_peer_relayed_instead(&a, DirectTier::Lan, true, t0);
+        let t1 = t0 + Duration::from_secs(1);
+        let e = m.explain(&a, t1);
+        assert!(e.relayed_instead_s.is_some(), "window must be open");
+        assert_eq!(e.relayed_instead_strikes, 1);
+        for t in e.tiers.iter().filter(|t| t.tier.is_direct()) {
+            assert!(!t.eligible);
+            assert_eq!(
+                t.blocked_by.map(|b| b.as_str()),
+                Some("peer-relays-instead"),
+                "{:?} was refused by the demote-follow window, not by its own penalty",
+                t.tier
+            );
+        }
+        // The relay floor is never held down — it is what we fall back TO.
+        let relay = e
+            .tiers
+            .iter()
+            .find(|t| t.tier == DirectTier::Relay)
+            .unwrap();
+        assert!(relay.eligible);
+        assert!(relay.blocked_by.is_none());
+
+        // Every row still agrees with the selector, which is the invariant.
+        for t in &e.tiers {
+            assert_eq!(t.eligible, m.eligible(&a, t.tier, t1));
+            assert_eq!(t.score, m.score(&a, t.tier, t1));
+        }
+    }
+
+    /// A tier suppressed by its OWN failures must be blamed on the penalty,
+    /// not on the peer — the other half of the same confusion.
+    #[test]
+    fn explain_blames_the_penalty_when_no_peer_window_is_open() {
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        let t0 = Instant::now();
+        m.on_death(&a, DirectTier::Lan, DeathReason::RxStale, true, t0);
+        let t1 = t0 + Duration::from_secs(1);
+        let e = m.explain(&a, t1);
+        let lan = e.tiers.iter().find(|t| t.tier == DirectTier::Lan).unwrap();
+        assert!(!lan.eligible, "a fresh death suppresses the tier");
+        assert_eq!(lan.blocked_by.map(|b| b.as_str()), Some("penalty"));
+        assert!(
+            lan.penalty > 0.0,
+            "the penalty must be reported, not just named"
+        );
+        assert!(e.relayed_instead_s.is_none(), "no peer window is open here");
+    }
     /// #29 — a peer relaying to us instead of using the direct tier we hold it
     /// on suppresses that tier (a decaying penalty, so it comes back), but
     /// books NO Q slam: nothing died and the tier did not misbehave — it is

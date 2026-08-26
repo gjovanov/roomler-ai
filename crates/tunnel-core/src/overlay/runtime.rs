@@ -42,7 +42,8 @@ use super::wg::{
     WgDevice, overlay_quic_enabled,
 };
 use crate::localapi::{
-    ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PeerCarrierDebug, PeerInfo,
+    ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PeerCarrierDebug, PeerInfo, PeerWhy,
+    TierWhy,
 };
 use crate::transport::derp::DerpMux;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
@@ -1329,6 +1330,9 @@ fn build_overlay_view(
                     rx_denied: i.rx_denied,
                     rx_denied_noroute: i.rx_denied_noroute,
                 }),
+                // F — grafted on by `publish_view`, which holds the monitor;
+                // the pure builder cannot see the selector state.
+                why: None,
             }
         })
         .collect();
@@ -1602,6 +1606,41 @@ impl OverlayRuntime {
                 epoch_now_ms,
                 &relay_transport,
             );
+            // F — attach the path decision. `build_overlay_view` is pure over
+            // peers and holds no monitor, so like `exit_node`/`dns` this is
+            // grafted on here. Done for EVERY peer on every publish, not on
+            // demand: an incident capture is a `peers --json` taken while the
+            // fault is live, and the explanation is worth far more inside that
+            // snapshot than in a command someone had to know to run at the
+            // time. `explain` is a pure read of already-computed state.
+            self.shadow(|s| {
+                for p in &mut view.peers {
+                    let Ok(nid) = ObjectId::parse_str(&p.node_id) else {
+                        continue;
+                    };
+                    let e = s.mon.explain(&nid, now);
+                    p.why = Some(PeerWhy {
+                        tiers: e
+                            .tiers
+                            .iter()
+                            .map(|t| TierWhy {
+                                tier: path::tier_label(t.tier).to_string(),
+                                eligible: t.eligible,
+                                blocked_by: t.blocked_by.map(|b| b.as_str().to_string()),
+                                base: t.base,
+                                q: t.q,
+                                penalty: t.penalty,
+                                score: t.score,
+                                fails: t.fails,
+                            })
+                            .collect(),
+                        relayed_instead_s: e.relayed_instead_s,
+                        relayed_instead_strikes: e.relayed_instead_strikes,
+                        forced_derp_s: e.forced_derp_s,
+                        probing: e.probing.map(|t| path::tier_label(t).to_string()),
+                    });
+                }
+            });
             // S4 — the exit-node routing status the runtime holds (the view
             // builder is pure over peers, so this is grafted on after).
             view.exit_node = exit_status;

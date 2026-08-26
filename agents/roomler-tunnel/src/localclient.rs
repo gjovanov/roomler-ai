@@ -185,6 +185,151 @@ pub async fn peers(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `roomler why <peer>` — F: explain, for ONE pair, why it rides the carrier
+/// it rides.
+///
+/// Everything printed here was already being computed by the selector on every
+/// sweep and was readable nowhere. On 2026-08-26 answering "why is this Mac on
+/// relay when it is on the same Wi-Fi?" needed a `tcpdump` on one host and log
+/// archaeology on the other; worse, the decisive record — the demote-follow —
+/// carries only `peer=<node id>`, so an earlier search by overlay IP returned
+/// nothing and produced a confident WRONG answer. This command exists so that
+/// question costs one command on either end.
+pub async fn why(peer: &str, json: bool) -> Result<()> {
+    let mut client = localapi::connect().await.map_err(daemon_err)?;
+    let peers = client.peers().await.map_err(daemon_err)?;
+    let needle = peer.to_ascii_lowercase();
+    // Match on name, overlay IP or node id, and accept a unique prefix of the
+    // name — an operator reads the name out of `peers` and should not have to
+    // retype `macbook-1-local-daemon` exactly.
+    let matches: Vec<_> = peers
+        .iter()
+        .filter(|p| {
+            p.node_id.eq_ignore_ascii_case(&needle)
+                || p.overlay_ip.as_deref() == Some(peer)
+                || p.overlay_ip6.as_deref() == Some(peer)
+                || p.name.to_ascii_lowercase().contains(&needle)
+        })
+        .collect();
+    let p = match matches.as_slice() {
+        [one] => *one,
+        [] => {
+            anyhow::bail!(
+                "no peer matches {peer:?} — `roomler peers` lists them by name, overlay IP and node id"
+            )
+        }
+        many => {
+            // Name alone is NOT a disambiguator on this fleet: one physical
+            // host enrolled in two orgs appears once per org under the SAME
+            // name with different overlay IPs, so "matches 2 peers: mars,
+            // mars" is true and useless. Print what the caller can retype.
+            let rows: Vec<String> = many
+                .iter()
+                .map(|p| {
+                    let ip = p.overlay_ip.as_deref().unwrap_or("no-ip");
+                    match p.org.as_str() {
+                        "" => format!("{} ({ip})", p.name),
+                        org => format!("{} ({ip}, org {org})", p.name),
+                    }
+                })
+                .collect();
+            anyhow::bail!(
+                "{peer:?} matches {} peers — pass one of: {}",
+                many.len(),
+                rows.join(" | ")
+            )
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(p)?);
+        return Ok(());
+    }
+    print_why(p);
+    print_other_daemon_hint();
+    Ok(())
+}
+
+fn print_why(p: &PeerInfo) {
+    let ip = p.overlay_ip.as_deref().unwrap_or("—");
+    println!("{}  {}", p.name, ip);
+    let carried = match (&p.connection, p.relay_kind.as_deref()) {
+        (ConnectionType::Direct, _) => "direct".to_string(),
+        (ConnectionType::Relay, Some(k)) => format!("relay:{k}"),
+        (c, _) => format!("{c:?}").to_ascii_lowercase(),
+    };
+    let via = p
+        .debug
+        .as_ref()
+        .and_then(|d| d.dst.as_deref())
+        .map(|d| format!(" via {d}"))
+        .unwrap_or_default();
+    println!("  carrier   {carried}{via}");
+    if let Some(d) = &p.debug {
+        println!(
+            "  tier      {}   handshake {}   tx {} / rx {}   last heard {}s ago",
+            d.tier,
+            if d.hs_done { "done" } else { "NOT DONE" },
+            d.tx,
+            d.rx,
+            d.last_rx_age_s
+        );
+        // A one-way carrier is the single most misread state in the field: the
+        // CONN column looks healthy while nothing arrives.
+        if d.tx > 0 && d.rx == 0 {
+            println!("            ^ ONE-WAY: we are sending and receiving nothing");
+        }
+    }
+    let Some(w) = &p.why else {
+        println!("  (this daemon predates `why` — upgrade it to see the path decision)");
+        return;
+    };
+    println!();
+    println!("  TIER      ELIGIBLE  SCORE   = BASE  + Q      - PENALTY   WHY NOT");
+    for t in &w.tiers {
+        println!(
+            "  {:<9} {:<9} {:>6.1} = {:>5.0} {:>+7.1} {:>10.1}   {}",
+            t.tier,
+            if t.eligible { "yes" } else { "no" },
+            t.score,
+            t.base,
+            t.q,
+            t.penalty,
+            t.blocked_by.as_deref().unwrap_or("")
+        );
+    }
+    println!();
+    // The hold-downs, spelled out. Each of these is a legitimate reason the
+    // pair is NOT on the tier its raw scores would pick, and each has a
+    // different fix, so naming them is the whole point of the command.
+    if let Some(s) = w.relayed_instead_s {
+        println!(
+            "  HELD DOWN {s}s more: the peer is relaying to us over /derp while we hold\n\
+             \x20           another carrier, so we follow it rather than fight it (strike {}).\n\
+             \x20           Every direct tier is ineligible regardless of its own health.\n\
+             \x20           If the peer can reach us directly, the fix is at the PEER.",
+            w.relayed_instead_strikes
+        );
+    } else if w.relayed_instead_strikes > 0 {
+        println!(
+            "  {} recent demote-follow(s), window expired — the two ends have been\n\
+             \x20           disagreeing about this path.",
+            w.relayed_instead_strikes
+        );
+    }
+    if let Some(s) = w.forced_derp_s {
+        println!("  PINNED    {s}s more: the server has forced this pair onto /derp.");
+    }
+    if let Some(t) = &w.probing {
+        println!("  PROBING   a direct upgrade on {t} is in flight right now.");
+    }
+    if w.relayed_instead_s.is_none()
+        && w.forced_derp_s.is_none()
+        && w.tiers.iter().all(|t| t.eligible)
+    {
+        println!("  No hold-down is active: every tier is eligible.");
+    }
+}
+
 /// `roomler flows` — active forwards / SOCKS5 listeners + throughput. Empty on
 /// today's agent daemon until the tunnel data plane folds in (P3b).
 pub async fn flows(json: bool) -> Result<()> {
@@ -1287,6 +1432,7 @@ mod tests {
             relay_kind: None,
             relay_transport: None,
             relay_server: None,
+            why: None,
             debug: None,
         }
     }
@@ -1449,6 +1595,7 @@ mod tests {
             relay_kind: None,
             relay_transport: None,
             relay_server: None,
+            why: None,
             debug: None,
         };
         let row = fmt_peer_row(&online, now);
@@ -1478,6 +1625,7 @@ mod tests {
             relay_kind: None,
             relay_transport: None,
             relay_server: None,
+            why: None,
             debug: None,
         };
         let row = fmt_peer_row(&offline, now);
@@ -1507,6 +1655,7 @@ mod tests {
             relay_kind: None,
             relay_transport: None,
             relay_server: None,
+            why: None,
             debug: None,
         };
         let row = fmt_peer_row(&p, now);
@@ -1539,6 +1688,7 @@ mod tests {
             relay_kind: None,
             relay_transport: None,
             relay_server: None,
+            why: None,
             debug: None,
         };
         assert!(fmt_peer_row(&p, now).contains("stalled"));

@@ -1174,6 +1174,7 @@ mod tests {
                 relay_kind: None,
                 relay_transport: None,
                 relay_server: None,
+                why: None,
                 debug: None,
             }],
             exit_node: None,
@@ -1471,6 +1472,7 @@ mod tests {
                 relay_kind: None,
                 relay_transport: None,
                 relay_server: None,
+                why: None,
                 debug: None,
             }
         }
