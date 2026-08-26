@@ -12,6 +12,10 @@ export interface TunnelClient {
   tenant_id: string
   owner_user_id: string
   name: string
+  /** Admin-set friendly label; display-only. */
+  display_name?: string
+  /** Admin-set fleet labels. */
+  tags?: string[]
   machine_id: string
   os: TunnelClientOs
   client_version: string
@@ -73,6 +77,38 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
     )
   }
 
+  /** Name / display_name / tags in one PUT — the ONLY in-place tunnel-client
+   *  rename there is (a client-side rename derives a new machine_id and
+   *  enrolls a brand-new row). Reads the additive envelope
+   *  `{updated, client, dns_renamed, dns_name}`. */
+  async function updateClient(
+    tenantId: string,
+    clientId: string,
+    fields: { name?: string; display_name?: string; tags?: string[] },
+  ): Promise<{ dnsRenamed?: boolean; dnsName?: string }> {
+    const resp = await api.put<{
+      updated?: boolean
+      client?: TunnelClient
+      dns_renamed?: boolean | null
+      dns_name?: string | null
+    }>(`/tenant/${tenantId}/tunnel-client/${clientId}`, fields)
+    const idx = clients.value.findIndex((c) => c.id === clientId)
+    if (idx !== -1) {
+      if (resp?.client) {
+        clients.value[idx] = { ...clients.value[idx]!, ...resp.client }
+      } else {
+        if (fields.name !== undefined) clients.value[idx]!.name = fields.name
+        if (fields.display_name !== undefined)
+          clients.value[idx]!.display_name = fields.display_name || undefined
+        if (fields.tags !== undefined) clients.value[idx]!.tags = fields.tags
+      }
+    }
+    return {
+      dnsRenamed: resp?.dns_renamed ?? undefined,
+      dnsName: resp?.dns_name ?? undefined,
+    }
+  }
+
   // Remove a tunnel client from the fleet. The server evicts its overlay node
   // first — peers get a `removes` delta and its overlay address goes back to the
   // tenant's pool, so it may later be assigned to a different machine.
@@ -95,6 +131,7 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
     error,
     fetchTunnelClients,
     issueEnrollmentToken,
+    updateClient,
     deleteTunnelClient,
   }
 })

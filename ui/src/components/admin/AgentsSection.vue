@@ -13,15 +13,27 @@
       >
         Update all
       </v-btn>
-      <v-btn
-        prepend-icon="mdi-key-plus"
-        color="primary"
-        variant="flat"
-        size="small"
-        @click="openEnrollDialog"
-      >
-        Enroll device
-      </v-btn>
+      <!-- ONE enroll entry point for both kinds — the tunnel-clients card
+           (and its enroll button) is mobile-only now that desktop rows are
+           unified into the grid. -->
+      <v-menu>
+        <template #activator="{ props: menuProps }">
+          <v-btn
+            v-bind="menuProps"
+            prepend-icon="mdi-key-plus"
+            append-icon="mdi-menu-down"
+            color="primary"
+            variant="flat"
+            size="small"
+          >
+            Enroll
+          </v-btn>
+        </template>
+        <v-list density="compact">
+          <v-list-item prepend-icon="mdi-monitor" title="Device (remote desktop + mesh)" @click="openEnrollDialog" />
+          <v-list-item prepend-icon="mdi-lan-pending" title="Tunnel client (CLI-only)" @click="openTunnelEnrollDialog" />
+        </v-list>
+      </v-menu>
     </v-card-title>
 
     <v-card-text>
@@ -48,59 +60,85 @@
         {{ updateNotice }}
       </v-alert>
 
+      <!-- Mobile-only initial spinner — the desktop grid carries its own
+           :loading state and must render during the first fetch. -->
       <div
-        v-if="agentStore.loading && agentStore.agents.length === 0"
+        v-if="mobile && agentStore.loading && agentStore.agents.length === 0"
         class="d-flex justify-center pa-8"
       >
         <v-progress-circular indeterminate />
       </div>
 
-      <!-- Desktop / tablet (≥ sm): full table. Action column is leftmost so
-           it never falls off the right edge regardless of overflow; codec
-           chips collapse to "+N" on lgAndDown to reclaim ~200px on mid-width
-           viewports (was the field bug from the field-test host 2026-05-01: "cannot
-           select the last Laptop in the list, not possible to scroll").
-           Below sm we render the dedicated card list further down. -->
-      <v-table
-        v-else-if="agentStore.agents.length > 0 && !mobile"
-        density="compact"
-        class="agents-table"
-      >
-        <thead>
-          <tr>
-            <th class="agents-actions-col">Actions</th>
-            <th>Name</th>
-            <th>Status</th>
-            <th>OS</th>
-            <th>Overlay</th>
-            <th>Consent</th>
-            <th>Codecs</th>
-            <th>Last seen</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="a in agentStore.agents" :key="a.id">
-            <td class="agents-actions-col">
+      <!-- Desktop / tablet (≥ sm): the UNIFIED server-driven grid — agents +
+           tunnel clients in ONE v-data-table-server. Search / sort /
+           pagination run on the SERVER (GET /tenant/{tid}/device — q matches
+           across the overlay join incl. IP + MagicDNS), and column
+           visibility/order are per-user (useGridColumns → localStorage).
+           The grid rows are the lean DeviceRow feed; rich agent-only cells
+           (consent, codecs, the action menu) look the full Agent up from
+           agentStore by id. Action column stays LEFTMOST so it never falls
+           off the right edge (field bug 2026-05-01). Below sm the dedicated
+           card lists render further down. -->
+      <template v-else-if="!mobile">
+        <div class="d-flex align-center mb-2">
+          <v-text-field
+            v-model="gridSearch"
+            density="compact"
+            variant="outlined"
+            hide-details
+            clearable
+            prepend-inner-icon="mdi-magnify"
+            placeholder="Search name, tag, IP, MagicDNS…"
+            style="max-width: 340px"
+            aria-label="Search devices"
+          />
+          <v-spacer />
+          <span class="text-caption text-medium-emphasis mr-2">
+            {{ deviceStore.total }} {{ deviceStore.total === 1 ? 'device' : 'devices' }}
+          </span>
+          <v-btn
+            icon="mdi-cog-outline"
+            size="small"
+            variant="text"
+            :color="colsCustomized ? 'primary' : undefined"
+            title="Configure columns"
+            aria-label="Configure columns"
+            @click="colDialogOpen = true"
+          />
+        </div>
+        <v-data-table-server
+          v-model:page="gridPage"
+          v-model:items-per-page="gridPerPage"
+          :headers="effectiveHeaders"
+          :items="deviceStore.items"
+          :items-length="deviceStore.total"
+          :loading="deviceStore.loading"
+          :items-per-page-options="[10, 25, 50, 100]"
+          density="compact"
+          class="agents-table"
+          item-value="id"
+          @update:options="onGridOptions"
+        >
+          <template #item.actions="{ item }">
+            <div class="agents-actions-col d-flex align-center">
               <v-btn
+                v-if="item.kind === 'agent'"
                 icon="mdi-remote-desktop"
                 size="small"
                 variant="text"
                 color="primary"
-                :disabled="!a.is_online"
-                :to="{ name: 'agent-remote', params: { tenantId, agentId: a.id } }"
-                :aria-label="`Connect to agent ${a.name}`"
+                :disabled="!item.is_online"
+                :to="{ name: 'agent-remote', params: { tenantId, agentId: item.id } }"
+                :aria-label="`Connect to agent ${item.name}`"
               />
-              <!-- Everything but Connect lives in ONE grouped menu — the
-                   seven bare icons were unscannable and the mobile cards
-                   had silently drifted (they dropped Reassign owner). -->
-              <v-menu>
+              <v-menu v-if="item.kind === 'agent' && agentFor(item)">
                 <template #activator="{ props: menuProps }">
                   <v-btn
                     v-bind="menuProps"
                     icon="mdi-dots-vertical"
                     size="small"
                     variant="text"
-                    :aria-label="`Actions for ${a.name}`"
+                    :aria-label="`Actions for ${item.name}`"
                   />
                 </template>
                 <v-list density="compact" min-width="230">
@@ -108,45 +146,50 @@
                   <v-list-item
                     prepend-icon="mdi-update"
                     title="Update now"
-                    :disabled="updateBusy === a.id"
-                    @click="triggerUpdate(a)"
+                    :disabled="updateBusy === item.id"
+                    @click="triggerUpdate(agentFor(item)!)"
                   />
                   <v-list-subheader>Diagnostics</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-alert-circle-outline"
                     title="Crash reports"
-                    @click="openCrashes(a)"
+                    @click="openCrashes(agentFor(item)!)"
                   />
                   <v-list-item
                     prepend-icon="mdi-text-box-search-outline"
                     title="Agent logs"
-                    @click="openLogs(a)"
+                    @click="openLogs(agentFor(item)!)"
                   />
                   <v-list-item
                     prepend-icon="mdi-console"
                     title="Device console"
-                    @click="openConsole(a)"
+                    @click="openConsole(agentFor(item)!)"
                   />
                   <v-list-subheader>Access</v-list-subheader>
                   <v-list-item
+                    prepend-icon="mdi-rename-box"
+                    title="Edit name &amp; tags"
+                    @click="openEdit(item)"
+                  />
+                  <v-list-item
                     prepend-icon="mdi-domain-plus"
                     title="Add to another organization"
-                    @click="openJoinOrg(a)"
+                    @click="openJoinOrg(agentFor(item)!)"
                   />
                   <v-list-item
                     prepend-icon="mdi-account-switch"
                     title="Reassign owner"
-                    @click="openReassign(a)"
+                    @click="openReassign(agentFor(item)!)"
                   />
                   <v-list-item
                     prepend-icon="mdi-shield-key-outline"
                     title="Execution policy"
-                    @click="openExecPolicy(a)"
+                    @click="openExecPolicy(agentFor(item)!)"
                   />
                   <v-list-item
                     prepend-icon="mdi-console-network-outline"
                     title="SSH policy"
-                    @click="openSshPolicy(a)"
+                    @click="openSshPolicy(agentFor(item)!)"
                   />
                   <!-- Writes an INTENT the device may refuse (step 5 of
                        docs/remote-config.md) — unlike the two policies above,
@@ -155,171 +198,237 @@
                   <v-list-item
                     prepend-icon="mdi-cog-transfer-outline"
                     title="Device configuration"
-                    @click="openRemoteConfig(a)"
+                    @click="openRemoteConfig(agentFor(item)!)"
                   />
                   <v-list-subheader>Network</v-list-subheader>
                   <v-list-item
                     prepend-icon="mdi-ip-network-outline"
                     title="Tunnel mesh routes"
-                    @click="openRoutes(a)"
+                    @click="openRoutes(agentFor(item)!)"
                   />
                   <v-list-item
-                    v-if="nodeForAgent(a.id)"
+                    v-if="nodeForAgent(item.id)"
                     prepend-icon="mdi-lan-disconnect"
-                    :title="nodeForAgent(a.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
-                    @click="confirmEvict(nodeForAgent(a.id)!)"
+                    :title="nodeForAgent(item.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
+                    @click="confirmEvict(nodeForAgent(item.id)!)"
                   />
                   <v-list-item
-                    v-if="nodeForAgent(a.id)"
+                    v-if="nodeForAgent(item.id)"
                     prepend-icon="mdi-lan-connect"
                     title="Overlay routes"
-                    :to="{ path: `/tenant//network/subnet-routes`, query: { node: nodeForAgent(a.id)!.id } }"
+                    :to="{ path: `/tenant/${tenantId}/network/subnet-routes`, query: { node: nodeForAgent(item.id)!.id } }"
                   />
                   <v-list-item
                     prepend-icon="mdi-shield-lock-outline"
                     title="Overlay ACL"
-                    :to="{ path: `/tenant//network/acl`, query: { tab: 'overlay' } }"
+                    :to="{ path: `/tenant/${tenantId}/network/acl`, query: { tab: 'overlay' } }"
                   />
                   <v-divider />
                   <v-list-item
                     prepend-icon="mdi-delete"
                     title="Delete device"
                     base-color="error"
-                    @click="confirmDelete(a)"
+                    @click="confirmDelete(agentFor(item)!)"
                   />
                 </v-list>
               </v-menu>
-            </td>
-            <td>
-              <div class="d-flex align-center">
-                <v-icon
-                  :color="presenceColor(a)"
-                  size="small"
-                  class="mr-2"
-                  :title="presenceTitle(a)"
-                >
-                  {{ presenceIcon(a) }}
-                </v-icon>
-                <span class="font-weight-medium">{{ a.name }}</span>
-                <v-btn
-                  :icon="copiedAgentId === a.id ? 'mdi-check' : 'mdi-content-copy'"
-                  size="x-small"
-                  variant="text"
-                  :color="copiedAgentId === a.id ? 'success' : undefined"
-                  class="ml-1"
-                  @click="copyAgentId(a.id)"
-                  :aria-label="`Copy agent ID for ${a.name}`"
-                  :title="copiedAgentId === a.id
-                    ? 'Copied!'
-                    : `Copy agent ID — use with \`roomler-tunnel forward --agent <id>\``"
-                />
-              </div>
-              <div class="text-caption text-medium-emphasis d-flex align-center flex-wrap">
-                <span class="agent-id-preview" :title="`Agent ID: ${a.id}`">
-                  id: {{ shortId(a.id) }}
-                </span>
-                <span class="mx-1">·</span>
-                <span :title="`machine_id: ${a.machine_id}`">{{ shortId(a.machine_id) }}</span>
-                <span v-if="a.agent_version"> · v{{ a.agent_version }}</span>
-                <span
-                  v-if="a.relay_home"
-                  :title="`Nearest relay region (RTT-probed): ${a.relay_home}`"
-                >
-                  · {{ a.relay_home }}</span
-                >
-              </div>
-            </td>
-            <td>
-              <v-chip
+              <v-menu v-else-if="item.kind === 'tunnel_client'">
+                <template #activator="{ props: menuProps }">
+                  <v-btn
+                    v-bind="menuProps"
+                    icon="mdi-dots-vertical"
+                    size="small"
+                    variant="text"
+                    :aria-label="`Actions for ${item.name}`"
+                  />
+                </template>
+                <v-list density="compact" min-width="230">
+                  <v-list-item
+                    prepend-icon="mdi-rename-box"
+                    title="Edit name &amp; tags"
+                    @click="openEdit(item)"
+                  />
+                  <v-list-subheader>Network</v-list-subheader>
+                  <v-list-item
+                    v-if="nodeForTunnelClient(item.id)"
+                    prepend-icon="mdi-lan-disconnect"
+                    :title="nodeForTunnelClient(item.id)?.will_rejoin ? 'Evict / reassign overlay address' : 'Remove from mesh'"
+                    @click="confirmEvict(nodeForTunnelClient(item.id)!)"
+                  />
+                  <v-divider />
+                  <v-list-item
+                    v-if="clientFor(item)"
+                    prepend-icon="mdi-delete"
+                    title="Delete tunnel client"
+                    base-color="error"
+                    @click="confirmTunnelDelete(clientFor(item)!)"
+                  />
+                </v-list>
+              </v-menu>
+            </div>
+          </template>
+          <template #item.name="{ item }">
+            <div class="d-flex align-center">
+              <v-icon
+                :color="rowPresenceColor(item)"
                 size="small"
-                :color="statusColor(a)"
-                variant="flat"
-                :title="presenceTitle(a)"
+                class="mr-2"
+                :title="rowPresenceTitle(item)"
               >
-                {{ statusLabel(a) }}
+                {{ rowPresenceIcon(item) }}
+              </v-icon>
+              <span class="font-weight-medium">{{ item.display_name || item.name }}</span>
+              <v-btn
+                :icon="copiedAgentId === item.id ? 'mdi-check' : 'mdi-content-copy'"
+                size="x-small"
+                variant="text"
+                :color="copiedAgentId === item.id ? 'success' : undefined"
+                class="ml-1"
+                @click="copyAgentId(item.id)"
+                :aria-label="`Copy device ID for ${item.name}`"
+                :title="copiedAgentId === item.id ? 'Copied!' : 'Copy device ID'"
+              />
+            </div>
+            <div class="text-caption text-medium-emphasis d-flex align-center flex-wrap">
+              <span v-if="item.display_name" class="mr-1">{{ item.name }} ·</span>
+              <span class="agent-id-preview" :title="`Device ID: ${item.id}`">
+                id: {{ shortId(item.id) }}
+              </span>
+              <span class="mx-1">·</span>
+              <span :title="`machine_id: ${item.machine_id}`">{{ shortId(item.machine_id) }}</span>
+              <span v-if="item.version"> · v{{ item.version }}</span>
+            </div>
+          </template>
+          <template #item.kind="{ item }">
+            <v-chip size="x-small" variant="tonal" :color="item.kind === 'agent' ? 'primary' : 'secondary'">
+              {{ item.kind === 'agent' ? 'device' : 'tunnel' }}
+            </v-chip>
+          </template>
+          <template #item.status="{ item }">
+            <v-chip
+              size="small"
+              :color="rowStatusColor(item)"
+              variant="flat"
+              :title="rowPresenceTitle(item)"
+            >
+              {{ rowStatusLabel(item) }}
+            </v-chip>
+            <v-chip
+              v-if="item.kind === 'agent' && agentFor(item) && remoteConfigChip(agentFor(item)!)"
+              size="x-small"
+              variant="tonal"
+              class="mt-1"
+              :color="remoteConfigChip(agentFor(item)!)!.color"
+              :prepend-icon="remoteConfigChip(agentFor(item)!)!.icon"
+              :title="remoteConfigChip(agentFor(item)!)!.tooltip"
+              @click="openRemoteConfig(agentFor(item)!)"
+            >
+              {{ remoteConfigChip(agentFor(item)!)!.text }}
+            </v-chip>
+          </template>
+          <template #item.os="{ item }">
+            <v-chip size="x-small" :prepend-icon="osIcon(item.os as any)" variant="tonal">
+              {{ item.os }}
+            </v-chip>
+          </template>
+          <template #item.overlay_ip="{ item }">
+            <template v-if="item.overlay_ip">
+              <div class="text-caption font-mono">{{ item.overlay_ip }}</div>
+              <div
+                class="text-caption text-medium-emphasis font-mono"
+                :title="deriveOverlayV6(item.overlay_ip) ?? undefined"
+              >
+                {{ deriveOverlayV6(item.overlay_ip) }}
+              </div>
+            </template>
+            <span v-else class="text-caption text-medium-emphasis">—</span>
+          </template>
+          <template #item.magic_dns="{ item }">
+            <div v-if="item.magic_dns_fqdn" class="d-flex align-center">
+              <span class="text-caption font-mono">{{ item.magic_dns_fqdn }}</span>
+              <v-btn
+                :icon="copiedAgentId === item.magic_dns_fqdn ? 'mdi-check' : 'mdi-content-copy'"
+                size="x-small"
+                variant="text"
+                class="ml-1"
+                @click="copyAgentId(item.magic_dns_fqdn!)"
+                :aria-label="`Copy MagicDNS name for ${item.name}`"
+              />
+            </div>
+            <span v-else-if="item.magic_dns_name" class="text-caption font-mono" title="Tenant has no MagicDNS domain configured — bare overlay label">
+              {{ item.magic_dns_name }}
+            </span>
+            <span v-else class="text-caption text-medium-emphasis">—</span>
+          </template>
+          <template #item.tags="{ item }">
+            <div v-if="item.tags?.length" class="d-flex flex-wrap gap-1">
+              <v-chip v-for="t in item.tags.slice(0, 3)" :key="t" size="x-small" variant="tonal">
+                {{ t }}
               </v-chip>
-              <!-- Only states that need someone to DO something. A steady-state
-                   badge on every row is noise that trains people to stop
-                   reading the row. -->
               <v-chip
-                v-if="remoteConfigChip(a)"
+                v-if="item.tags.length > 3"
                 size="x-small"
                 variant="tonal"
-                class="mt-1"
-                :color="remoteConfigChip(a)!.color"
-                :prepend-icon="remoteConfigChip(a)!.icon"
-                :title="remoteConfigChip(a)!.tooltip"
-                @click="openRemoteConfig(a)"
+                :title="item.tags.slice(3).join(', ')"
               >
-                {{ remoteConfigChip(a)!.text }}
+                +{{ item.tags.length - 3 }}
               </v-chip>
-            </td>
-            <td>
-              <v-chip size="x-small" :prepend-icon="osIcon(a.os)" variant="tonal">
-                {{ a.os }}
-              </v-chip>
-            </td>
-            <td>
-              <template v-if="nodeForAgent(a.id)">
-                <div class="text-caption font-mono">{{ nodeForAgent(a.id)!.overlay_ip }}</div>
-                <div
-                  class="text-caption text-medium-emphasis font-mono"
-                  :title="deriveOverlayV6(nodeForAgent(a.id)!.overlay_ip) ?? undefined"
-                >
-                  {{ deriveOverlayV6(nodeForAgent(a.id)!.overlay_ip) }}
-                </div>
-              </template>
-              <span v-else class="text-caption text-medium-emphasis">—</span>
-            </td>
-            <td>
+            </div>
+            <span v-else class="text-caption text-medium-emphasis">—</span>
+          </template>
+          <template #item.consent="{ item }">
+            <template v-if="item.kind === 'agent' && agentFor(item)">
               <v-select
-                :model-value="a.access_policy.consent_mode ?? 'prompt'"
+                :model-value="agentFor(item)!.access_policy.consent_mode ?? 'prompt'"
                 :items="CONSENT_MODE_ITEMS"
                 density="compact"
                 variant="plain"
                 hide-details
-                :disabled="consentBusy === a.id"
-                :loading="consentBusy === a.id"
+                :disabled="consentBusy === item.id"
+                :loading="consentBusy === item.id"
                 class="consent-select"
-                :aria-label="`Consent mode for ${a.name}`"
-                @update:model-value="(m) => onConsentModeChange(a, m as ConsentMode)"
+                :aria-label="`Consent mode for ${item.name}`"
+                @update:model-value="(m) => onConsentModeChange(agentFor(item)!, m as ConsentMode)"
               />
               <!-- P6 — multi-user input mode (free-for-all | exclusive). -->
               <v-select
-                :model-value="a.access_policy.input_mode ?? 'free'"
+                :model-value="agentFor(item)!.access_policy.input_mode ?? 'free'"
                 :items="INPUT_MODE_ITEMS"
                 density="compact"
                 variant="plain"
                 hide-details
-                :disabled="consentBusy === a.id"
+                :disabled="consentBusy === item.id"
                 class="consent-select"
-                :aria-label="`Input mode for ${a.name}`"
-                @update:model-value="(m) => onInputModeChange(a, m as 'free' | 'exclusive')"
+                :aria-label="`Input mode for ${item.name}`"
+                @update:model-value="(m) => onInputModeChange(agentFor(item)!, m as 'free' | 'exclusive')"
               />
-            </td>
-            <td>
-              <div v-if="codecChips(a).length === 0" class="text-caption text-medium-emphasis">—</div>
+            </template>
+            <span v-else class="text-caption text-medium-emphasis">—</span>
+          </template>
+          <template #item.codecs="{ item }">
+            <template v-if="item.kind === 'agent' && agentFor(item)">
+              <div v-if="codecChips(agentFor(item)!).length === 0" class="text-caption text-medium-emphasis">—</div>
               <div v-else-if="lgAndDown" class="d-flex flex-wrap gap-1 align-center">
                 <v-chip
                   size="x-small"
-                  :color="codecChips(a)[0].color"
+                  :color="codecChips(agentFor(item)!)[0].color"
                   variant="tonal"
-                  :title="codecChips(a).map(c => c.tooltip).join(', ')"
+                  :title="codecChips(agentFor(item)!).map(c => c.tooltip).join(', ')"
                 >
-                  {{ codecChips(a)[0].label }}
+                  {{ codecChips(agentFor(item)!)[0].label }}
                 </v-chip>
                 <v-chip
-                  v-if="codecChips(a).length > 1"
+                  v-if="codecChips(agentFor(item)!).length > 1"
                   size="x-small"
                   variant="tonal"
-                  :title="codecChips(a).slice(1).map(c => c.tooltip).join(', ')"
+                  :title="codecChips(agentFor(item)!).slice(1).map(c => c.tooltip).join(', ')"
                 >
-                  +{{ codecChips(a).length - 1 }}
+                  +{{ codecChips(agentFor(item)!).length - 1 }}
                 </v-chip>
               </div>
               <div v-else class="d-flex flex-wrap gap-1">
                 <v-chip
-                  v-for="codec in codecChips(a)"
+                  v-for="codec in codecChips(agentFor(item)!)"
                   :key="codec.label"
                   size="x-small"
                   :color="codec.color"
@@ -332,9 +441,9 @@
               <!-- A device the OS has muzzled looks identical to a healthy one
                    until you connect and get a black screen, because macOS
                    reports success either way. Say it here instead. -->
-              <div v-if="permissionWarnings(a).length" class="d-flex flex-wrap gap-1 mt-1">
+              <div v-if="permissionWarnings(agentFor(item)!).length" class="d-flex flex-wrap gap-1 mt-1">
                 <v-chip
-                  v-for="w in permissionWarnings(a)"
+                  v-for="w in permissionWarnings(agentFor(item)!)"
                   :key="w.label"
                   size="x-small"
                   color="warning"
@@ -344,11 +453,29 @@
                   {{ w.label }}
                 </v-chip>
               </div>
-            </td>
-            <td class="text-caption" :title="fmtDate(a.last_seen_at)">{{ fmtRelative(a.last_seen_at) }}</td>
-          </tr>
-        </tbody>
-      </v-table>
+            </template>
+            <span v-else class="text-caption text-medium-emphasis">—</span>
+          </template>
+          <template #item.last_seen_at="{ item }">
+            <span class="text-caption" :title="fmtDate(item.last_seen_at)">{{ fmtRelative(item.last_seen_at) }}</span>
+          </template>
+          <template #no-data>
+            <div class="text-center pa-8 text-medium-emphasis">
+              <template v-if="gridSearch">
+                No devices match "{{ gridSearch }}".
+              </template>
+              <template v-else>
+                <v-icon size="48" color="grey-lighten-1" class="mb-2">mdi-desktop-classic</v-icon>
+                <p class="mb-1">No devices enrolled yet.</p>
+                <p class="text-body-2">
+                  Click "Enroll" for a one-line installer per platform — the
+                  machine appears here as soon as it enrolls.
+                </p>
+              </template>
+            </div>
+          </template>
+        </v-data-table-server>
+      </template>
 
       <!-- Mobile: stacked card list. Each card is a tappable target;
            Connect / Delete actions are full-width buttons at the bottom
@@ -610,11 +737,10 @@
     </v-card-text>
   </v-card>
 
-  <!-- Tunnel clients (2026-08-04): CLI-only endpoints folded into the
-       unified Devices page — /network/tunnel-clients redirects here. Same
-       overlay/last-seen columns; no remote-desktop/consent/codec cells
-       (those are agent-only capabilities). -->
-  <v-card class="mt-4">
+  <!-- Tunnel clients — MOBILE ONLY since the unified desktop grid absorbed
+       their rows (kind=tunnel). CLI-only endpoints, no remote-desktop/
+       consent/codec cells. -->
+  <v-card v-if="mobile" class="mt-4">
     <v-card-title class="d-flex align-center">
       <span>Tunnel clients</span>
       <v-spacer />
@@ -739,6 +865,23 @@
     @update:model-value="(v: boolean) => { if (!v) closeTunnelEnrollDialog() }"
   />
 
+  <!-- Per-user column visibility + order for the unified grid. -->
+  <GridColumnPickerDialog
+    v-model="colDialogOpen"
+    :entries="colEntries"
+    @toggle="colToggle"
+    @reorder="colReorder"
+    @reset="colReset"
+  />
+
+  <!-- Name / display-name / tags (both kinds; rename propagates to MagicDNS). -->
+  <DeviceEditDialog
+    v-model="editDialogOpen"
+    :tenant-id="tenantId"
+    :device="editTarget"
+    @saved="onDeviceSaved"
+  />
+
   <!-- Overlay eviction (lifted from MachinesSection; shared by devices and
        tunnel clients — the confirm copy branches on will_rejoin). -->
   <v-dialog v-model="evictDialogOpen" max-width="540">
@@ -856,7 +999,7 @@
     v-model="remoteConfigDialogOpen"
     :tenant-id="tenantId"
     :agent="remoteConfigTarget"
-    @saved="agentStore.fetchAgents(tenantId)"
+    @saved="agentStore.fetchAgents(tenantId); fetchGrid()"
   />
 
   <!-- S1a — Update-all confirmation -->
@@ -1154,12 +1297,170 @@ import {
   type TunnelClient,
   type TunnelEnrollmentToken,
 } from '@/stores/tunnelClients'
+import { useDeviceStore, type DeviceRow } from '@/stores/devices'
+import { useAuthStore } from '@/stores/auth'
+import { useGridColumns } from '@/composables/useGridColumns'
+import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.vue'
+import DeviceEditDialog, { type EditableDevice } from '@/components/admin/DeviceEditDialog.vue'
 
 const props = defineProps<{ tenantId: string }>()
 
 const agentStore = useAgentStore()
 const overlayStore = useOverlayRoutesStore()
 const tunnelClientStore = useTunnelClientStore()
+const deviceStore = useDeviceStore()
+const auth = useAuthStore()
+
+// ── Unified server-driven grid state ─────────────────────────────
+const gridSearch = ref('')
+const gridPage = ref(1)
+const gridPerPage = ref(25)
+const gridSort = ref<string | undefined>(undefined)
+const gridDir = ref<'asc' | 'desc' | undefined>(undefined)
+const colDialogOpen = ref(false)
+
+const deviceHeaders = computed(() => [
+  // Leftmost on purpose — see the template comment (field bug 2026-05-01).
+  { title: 'Actions', key: 'actions', sortable: false, width: 96 },
+  { title: 'Name', key: 'name', sortable: true },
+  { title: 'Kind', key: 'kind', sortable: true },
+  { title: 'Status', key: 'status', sortable: true },
+  { title: 'OS', key: 'os', sortable: true },
+  { title: 'Overlay', key: 'overlay_ip', sortable: true },
+  { title: 'MagicDNS', key: 'magic_dns', sortable: true },
+  { title: 'Tags', key: 'tags', sortable: false },
+  { title: 'Consent', key: 'consent', sortable: false },
+  { title: 'Codecs', key: 'codecs', sortable: false },
+  { title: 'Last seen', key: 'last_seen_at', sortable: true },
+])
+const {
+  effectiveHeaders,
+  entries: colEntries,
+  toggle: colToggle,
+  reorder: colReorder,
+  reset: colReset,
+  customized: colsCustomized,
+} = useGridColumns({
+  headers: deviceHeaders,
+  gridId: 'devices',
+  scope: () => `${auth.user?.id ?? 'anon'}:${props.tenantId}`,
+})
+
+function fetchGrid() {
+  deviceStore
+    .fetchDevices(props.tenantId, {
+      page: gridPage.value,
+      perPage: gridPerPage.value,
+      q: gridSearch.value || undefined,
+      sort: gridSort.value,
+      dir: gridDir.value,
+    })
+    .catch(() => {})
+}
+
+/** v-data-table-server fires this once on mount too — it is the grid's ONLY
+ *  fetch trigger for page/sort changes (a separate onMounted fetch would
+ *  double-load). */
+function onGridOptions(opts: {
+  page: number
+  itemsPerPage: number
+  sortBy: Array<{ key: string; order: 'asc' | 'desc' }>
+}) {
+  gridPage.value = opts.page
+  gridPerPage.value = opts.itemsPerPage
+  gridSort.value = opts.sortBy[0]?.key
+  gridDir.value = opts.sortBy[0]?.order
+  fetchGrid()
+}
+
+let gridSearchTimer: ReturnType<typeof setTimeout> | undefined
+watch(gridSearch, () => {
+  if (gridSearchTimer) clearTimeout(gridSearchTimer)
+  gridSearchTimer = setTimeout(() => {
+    // Back to page 1: if the page actually changes, the options handler
+    // fetches; when already there, fetch directly.
+    if (gridPage.value !== 1) gridPage.value = 1
+    else fetchGrid()
+  }, 300)
+})
+
+// Rich agent-only cells (consent selects, codec chips, the action menu)
+// need the FULL Agent — the grid rows are the lean DeviceRow feed.
+const agentById = computed(() => {
+  const m = new Map<string, Agent>()
+  for (const a of agentStore.agents) m.set(a.id, a)
+  return m
+})
+function agentFor(row: DeviceRow): Agent | undefined {
+  return row.kind === 'agent' ? agentById.value.get(row.id) : undefined
+}
+const clientById = computed(() => {
+  const m = new Map<string, TunnelClient>()
+  for (const c of tunnelClientStore.clients) m.set(c.id, c)
+  return m
+})
+function clientFor(row: DeviceRow): TunnelClient | undefined {
+  return row.kind === 'tunnel_client' ? clientById.value.get(row.id) : undefined
+}
+
+// Row-level presence rendering (DeviceRow carries presence directly).
+function rowPresenceColor(r: DeviceRow): string {
+  return r.presence === 'online' ? 'success' : r.presence === 'stale' ? 'warning' : 'grey'
+}
+function rowPresenceIcon(r: DeviceRow): string {
+  return r.presence === 'online'
+    ? 'mdi-circle'
+    : r.presence === 'stale'
+      ? 'mdi-circle-half-full'
+      : 'mdi-circle-outline'
+}
+function rowPresenceTitle(r: DeviceRow): string {
+  if (r.kind === 'tunnel_client')
+    return r.is_online ? 'Online (stored status)' : 'Offline (stored status)'
+  return r.presence === 'online'
+    ? 'Online — a control socket is registered'
+    : r.presence === 'stale'
+      ? 'Stale — heartbeat fresh but no socket registered'
+      : 'Offline'
+}
+function rowStatusColor(r: DeviceRow): string {
+  return rowPresenceColor(r)
+}
+function rowStatusLabel(r: DeviceRow): string {
+  return r.presence
+}
+
+// ── Edit name & tags ─────────────────────────────────────────────
+const editDialogOpen = ref(false)
+const editTarget = ref<EditableDevice | null>(null)
+function openEdit(row: DeviceRow) {
+  editTarget.value = {
+    kind: row.kind,
+    id: row.id,
+    name: row.name,
+    display_name: row.display_name,
+    tags: row.tags,
+  }
+  editDialogOpen.value = true
+}
+function onDeviceSaved(result: {
+  id: string
+  name: string
+  display_name?: string
+  tags: string[]
+  dnsRenamed?: boolean
+  dnsName?: string
+}) {
+  deviceStore.patchRow({
+    id: result.id,
+    name: result.name,
+    display_name: result.display_name,
+    tags: result.tags,
+    ...(result.dnsName ? { magic_dns_name: result.dnsName } : {}),
+  })
+  // Refetch so sort/search reflect the new values server-side.
+  fetchGrid()
+}
 
 // ── Unified-devices join (2026-08-04): overlay node per device row. The
 // wire's agent_id / tunnel_client_id FKs are the join key — the node NAME
@@ -1197,6 +1498,7 @@ async function performEvict() {
     evictDialogOpen.value = false
     evictTarget.value = null
     await overlayStore.fetchNodes(props.tenantId)
+    fetchGrid()
   } finally {
     evicting.value = false
   }
@@ -1246,6 +1548,7 @@ async function performTunnelDelete() {
       tunnelClientStore.fetchTunnelClients(props.tenantId),
       overlayStore.fetchNodes(props.tenantId),
     ])
+    fetchGrid()
   } finally {
     tunnelDeleting.value = false
   }
@@ -1622,6 +1925,7 @@ async function performDelete() {
     await agentStore.deleteAgent(props.tenantId, deleteTarget.value.id)
     deleteDialogOpen.value = false
     deleteTarget.value = null
+    fetchGrid()
   } finally {
     deleting.value = false
   }
@@ -1837,6 +2141,8 @@ async function saveRoutes() {
 }
 
 onMounted(() => {
+  // The GRID's own fetch fires from @update:options on mount — these load
+  // the rich per-device stores the action menus and mobile cards read.
   agentStore.fetchAgents(props.tenantId)
   agentStore.fetchTenantMembers(props.tenantId)
   overlayStore.fetchNodes(props.tenantId)
@@ -1848,6 +2154,10 @@ watch(() => props.tenantId, (tid) => {
     agentStore.fetchAgents(tid)
     overlayStore.fetchNodes(tid)
     tunnelClientStore.fetchTunnelClients(tid)
+    // Reset the grid to a clean first page for the new org.
+    gridSearch.value = ''
+    if (gridPage.value !== 1) gridPage.value = 1
+    else fetchGrid()
   }
 })
 </script>
