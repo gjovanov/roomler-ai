@@ -195,8 +195,12 @@ jobs:
           # for rc builds) — fails loudly otherwise so the mapping can't
           # silently collide.
           #
-          # ⚠️ THIS MAPPING HAS A SECOND COPY:
-          # agents/roomler-agent/src/artifact_version.rs::msi_product_version_for.
+          # ⚠️ THIS MAPPING HAS TWO MORE COPIES:
+          # agents/roomler-agent/src/artifact_version.rs::msi_product_version_for
+          # (download verification) and
+          # agents/roomler-agent/src/version_sweep.rs::own_msi_version
+          # (coexisting-MSI sweep — a divergence there makes an agent rank
+          # its OWN install as older and uninstall itself).
           # The self-updater reads the ProductVersion back out of the
           # downloaded MSI and refuses to install one that does not carry
           # the version the release manifest claimed — that is what stops a
@@ -219,7 +223,25 @@ jobs:
             fi
             msi_version="${vmajor}.${vminor}.${vrc}"
           elif [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            msi_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.65535"
+            # Finals — two eras, split at 0.4 (the rc train ended with
+            # 0.3.0-rc.*):
+            #  * 0.4+ ships plain MAJOR.MINOR.PATCH releases, so PATCH is
+            #    the build field (0.4.5 → 0.4.5): monotonic within the
+            #    minor, no two 0.4.x MSIs share a ProductVersion.
+            #  * pre-0.4 keeps the legacy 65535 rule so historical answers
+            #    never change.
+            # Mirrored in msi_product_version_for AND version_sweep's
+            # own_msi_version — all three MUST agree (see the warning above).
+            fmajor="${BASH_REMATCH[1]}"; fminor="${BASH_REMATCH[2]}"; fpatch="${BASH_REMATCH[3]}"
+            if (( fmajor > 0 || fminor >= 4 )); then
+              if (( fpatch > 65535 )); then
+                echo "::error::patch ${fpatch} exceeds the MSI build-field max (65535)"
+                exit 1
+              fi
+              msi_version="${fmajor}.${fminor}.${fpatch}"
+            else
+              msi_version="${fmajor}.${fminor}.65535"
+            fi
           else
             echo "::error::cannot derive an MSI version from '${version}' (expected MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N)"
             exit 1
