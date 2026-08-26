@@ -126,6 +126,58 @@ impl RoomDao {
             .await
     }
 
+    /// Server-side sidebar search/paging over the tenant's rooms. The secret-
+    /// room condition is pushed INTO the query (`$or` with the caller's own
+    /// room-membership set) rather than post-filtered, so a page can't
+    /// under-fill: a DB `limit` over a superset would return short pages
+    /// whenever secret rooms land in the window. An empty `query` skips the
+    /// text condition (pure paging). Sort mirrors `find_by_tenant`.
+    pub async fn search_for_tenant(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+        query: &str,
+        params: &PaginationParams,
+    ) -> DaoResult<Vec<Room>> {
+        let memberships = self
+            .members
+            .find_many(doc! { "tenant_id": tenant_id, "user_id": user_id }, None)
+            .await?;
+        let member_room_ids: Vec<ObjectId> = memberships.iter().map(|m| m.room_id).collect();
+
+        let mut conds = vec![doc! { "$or": [
+            // `$ne` also covers documents predating the field (same rule as
+            // `explore`): absent visibility is not secret.
+            { "visibility": { "$ne": "secret" } },
+            { "_id": { "$in": member_room_ids } },
+        ] }];
+        if !query.is_empty() {
+            let escaped = super::base::escape_regex(query);
+            conds.push(doc! { "$or": [
+                { "name": { "$regex": &escaped, "$options": "i" } },
+                { "purpose": { "$regex": &escaped, "$options": "i" } },
+                { "tags": { "$regex": &escaped, "$options": "i" } },
+            ] });
+        }
+        let filter = doc! {
+            "tenant_id": tenant_id,
+            "deleted_at": null,
+            "$and": conds,
+        };
+        let page = self
+            .base
+            .find_paginated(
+                // `_id` tiebreak: skip/limit over a non-unique sort (every
+                // default room has position 0) may repeat or drop rows
+                // across pages without it.
+                filter,
+                Some(doc! { "parent_id": 1, "position": 1, "_id": 1 }),
+                params,
+            )
+            .await?;
+        Ok(page.items)
+    }
+
     pub async fn find_user_rooms(
         &self,
         tenant_id: ObjectId,
@@ -258,16 +310,7 @@ impl RoomDao {
     }
 
     pub async fn explore(&self, tenant_id: ObjectId, query: &str) -> DaoResult<Vec<Room>> {
-        let escaped: String = query
-            .chars()
-            .flat_map(|c| {
-                if ".*+?^${}()|[]\\".contains(c) {
-                    vec!['\\', c]
-                } else {
-                    vec![c]
-                }
-            })
-            .collect();
+        let escaped = super::base::escape_regex(query);
 
         self.base
             .find_many(

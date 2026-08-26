@@ -8,6 +8,7 @@ pub mod auth;
 pub mod background_task;
 pub mod cluster;
 pub mod consent;
+pub mod device;
 pub mod export;
 pub mod file;
 pub mod giphy;
