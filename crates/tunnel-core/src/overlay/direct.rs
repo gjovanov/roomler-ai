@@ -1142,17 +1142,27 @@ pub fn session_trace_enabled() -> bool {
 }
 
 /// C2 — PROBE peers with out-of-tunnel disco echoes and record per-path
-/// loss + RTT (`ROOMLER_NODE_OVERLAY_DISCO_PROBE`; default **OFF**).
+/// loss + RTT (`ROOMLER_NODE_OVERLAY_DISCO_PROBE`; default **ON** since A).
 ///
 /// Strictly measurement: the table it fills is read by the LocalAPI and the
 /// summary log, never by anything that moves traffic. Scoring is C3 and
 /// authority is C6, each behind its own flag — that separation is why a bug
 /// here cannot repeat rc.346.
 ///
-/// Default OFF until the C1 responder is fleet-wide: a prober whose peers
-/// cannot answer measures nothing but its own deployment order.
+/// Default flipped ON once the C1 responder was measured live on both ends of
+/// a real pair (`disco_answered` 365 and 500 on 2026-08-26) — the gate this
+/// stage always had was "every peer can answer", and answering is what that
+/// counter proves. A prober shipped before that measures nothing but its own
+/// deployment order, which is why it waited.
+///
+/// It costs one small UDP frame per DIRECT peer per 5 s tick and cannot
+/// disturb a relay-parked pair, because [`disco_round`] only walks carriers
+/// that are already direct. ⚠️ That is also its present LIMIT: it can measure
+/// a direct path in use, but it cannot yet tell you whether a CANDIDATE path
+/// would work for a pair currently parked on relay — which is exactly the
+/// question the neo16↔MacBook investigation needed. Probing candidates is A2.
 pub fn disco_probe_enabled() -> bool {
-    crate::env::flag("OVERLAY_DISCO_PROBE", false)
+    crate::env::flag("OVERLAY_DISCO_PROBE", true)
 }
 
 /// C1 — answer out-of-tunnel disco echoes on the carrier socket
