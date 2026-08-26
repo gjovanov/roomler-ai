@@ -464,7 +464,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         // matchit gives the static `/enroll-token` above precedence over this
         // parameterised segment, so there is no shadowing.
-        .route("/{client_id}", delete(routes::tunnel::delete_tunnel_client));
+        .route(
+            "/{client_id}",
+            put(routes::tunnel::update_tunnel_client).delete(routes::tunnel::delete_tunnel_client),
+        );
     let tunnel_policy_routes = Router::new()
         .route(
             "/",

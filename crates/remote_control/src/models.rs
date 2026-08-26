@@ -571,6 +571,19 @@ pub struct Agent {
     #[serde(default)]
     pub enrolled_by: Option<ObjectId>,
     pub name: String,
+    /// Friendly label an admin sets purely for display. Never propagates —
+    /// `name` is what the overlay/MagicDNS label derives from. `None` = the
+    /// UI shows `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Free-form admin labels for fleet filtering/search.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// True once an admin renamed this device. `rehydrate` (re-enroll) then
+    /// stops overwriting `name` with the machine-reported one — without this
+    /// flag the next re-enroll silently reverted every admin rename.
+    #[serde(default)]
+    pub name_admin_set: bool,
     pub machine_id: String,
     pub os: OsKind,
     pub agent_version: String,
@@ -1102,6 +1115,18 @@ pub struct TunnelClient {
     /// recorded in every `tunnel_audit` row.
     pub owner_user_id: ObjectId,
     pub name: String,
+    /// Friendly label an admin sets purely for display (see `Agent::display_name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Free-form admin labels for fleet filtering/search.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// True once an admin renamed this client server-side (see
+    /// `Agent::name_admin_set` — same rehydrate-clobber protection; a
+    /// CLIENT-side rename can't rename in place at all, it derives a new
+    /// machine_id and enrolls a new row).
+    #[serde(default)]
+    pub name_admin_set: bool,
     pub machine_id: String,
     pub os: OsKind,
     pub client_version: String,
