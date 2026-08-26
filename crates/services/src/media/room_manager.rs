@@ -1,6 +1,7 @@
 use bson::oid::ObjectId;
 use dashmap::DashMap;
 use mediasoup::prelude::*;
+use mediasoup::types::data_structures::DtlsState;
 use mediasoup::webrtc_transport::{
     WebRtcTransportListenInfos, WebRtcTransportOptions, WebRtcTransportRemoteParameters,
 };
@@ -267,24 +268,75 @@ impl RoomManager {
 
         let remote_params = WebRtcTransportRemoteParameters { dtls_parameters };
 
-        if participant.send_transport.id() == tid {
-            participant
-                .send_transport
-                .connect(remote_params)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect send transport: {}", e))?;
+        let transport = if participant.send_transport.id() == tid {
+            participant.send_transport.clone()
         } else if participant.recv_transport.id() == tid {
-            participant
-                .recv_transport
-                .connect(remote_params)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to connect recv transport: {}", e))?;
+            participant.recv_transport.clone()
         } else {
             return Err(anyhow::anyhow!("Transport not found for this participant"));
-        }
+        };
+        // Connect on a cloned handle with the shard guards released — holding
+        // a DashMap guard across an await can deadlock against join/leave
+        // writers on the same shard (see sample_transports).
+        drop(participant);
+        drop(room);
+
+        transport
+            .connect(remote_params)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect transport: {}", e))?;
 
         debug!(?room_id, %connection_id, transport_id, "transport connected");
+        self.spawn_media_path_watchdog(*room_id, connection_id.to_string(), &transport);
         Ok(())
+    }
+
+    /// `connect_transport` only records the client's DTLS parameters — it says
+    /// nothing about packets. When the announced-IP path is dead (host DNAT /
+    /// firewall / RTC port range), every signalling step still succeeds and the
+    /// only symptom is black video, which is exactly how the missing RTC-range
+    /// DNAT on one node shipped broken and stayed invisible for weeks. This
+    /// watchdog turns that state into an operator-actionable log line: if DTLS
+    /// still hasn't established shortly after the client said it was dialing,
+    /// the media path — not the client — is the suspect.
+    fn spawn_media_path_watchdog(
+        &self,
+        room_id: ObjectId,
+        connection_id: String,
+        transport: &WebRtcTransport,
+    ) {
+        const DTLS_ESTABLISH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+        // Weak handle: the watchdog must not extend the transport's lifetime
+        // past the participant's leave.
+        let weak = transport.downgrade();
+        let announced_ip = self.announced_ip.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DTLS_ESTABLISH_DEADLINE).await;
+            let Some(transport) = weak.upgrade() else {
+                return; // participant already left — nothing to report
+            };
+            let dtls = transport.dtls_state();
+            if matches!(dtls, DtlsState::Connected | DtlsState::Closed) {
+                return;
+            }
+            tracing::warn!(
+                ?room_id,
+                %connection_id,
+                transport_id = %transport.id(),
+                ?dtls,
+                ice = ?transport.ice_state(),
+                announced_ip = ?announced_ip,
+                "media transport has no DTLS {}s after connect_transport — signalling is healthy but RTP cannot flow; check the announced-IP path (host DNAT / firewall / RTC port range) toward this pod",
+                DTLS_ESTABLISH_DEADLINE.as_secs()
+            );
+        });
+    }
+
+    /// The announced IP this pod resolved for its ICE candidates (S6 per-node
+    /// map), which is what clients actually dial — the static settings value
+    /// can differ on a multi-pod deployment.
+    pub fn announced_ip(&self) -> Option<&str> {
+        self.announced_ip.as_deref()
     }
 
     /// Creates a Producer on the participant's send transport.
