@@ -175,6 +175,21 @@ impl AimdController {
         }
     }
 
+    /// Update the floor (the area-scaled legibility minimum), pushed each
+    /// frame by the pump alongside the ceiling. Capped at the CURRENT
+    /// ceiling so a floor computed for a big direct session can never
+    /// invert a lower relay clamp (which would pin `desired` at the
+    /// ceiling and disable the multiplicative decrease). Raising it
+    /// clamps `desired` up immediately — a rate-limited-enough event
+    /// (dims change / transport flip) that `take_pending` emitting a
+    /// `set_bitrate` for it is fine.
+    pub fn set_floor(&mut self, floor_bps: u32) {
+        self.floor_bps = floor_bps.max(1).min(self.ceiling_bps);
+        if self.desired_bps < self.floor_bps {
+            self.desired_bps = self.floor_bps;
+        }
+    }
+
     /// If the desired bitrate has moved since the last apply, return it
     /// (and record it) so the pump calls `enc.set_bitrate`. The controller
     /// only moves `desired` on rate-limited MD/AI/ceiling events, so this
@@ -391,6 +406,42 @@ mod tests {
 
         c.observe(0, false, t0 + Duration::from_millis(10)); // no event
         assert_eq!(c.take_pending(), None);
+    }
+
+    // (6b) Floor: raising it pulls desired up at once, but it can never
+    // exceed the live ceiling (a relay clamp must keep its MD room).
+    #[test]
+    fn floor_raises_desired_and_respects_ceiling() {
+        let t0 = Instant::now();
+        let mut c = ctrl(12_000_000, 8, t0);
+        c.take_pending();
+
+        // Walk desired down to the 1.5 M construction floor.
+        let mut t = t0;
+        for _ in 0..40 {
+            t += Duration::from_millis(600);
+            c.observe(8, true, t);
+        }
+        assert_eq!(c.desired(), FLOOR);
+
+        // An area-scaled floor lifts it immediately and emits a pending
+        // apply.
+        c.set_floor(3_000_000);
+        assert_eq!(c.desired(), 3_000_000);
+        assert_eq!(c.take_pending(), Some(3_000_000));
+
+        // Transport flip to relay, in the governor's call order (floor
+        // first, then ceiling): the flat floor returns and the relay
+        // clamp lands in the same tick.
+        c.set_floor(1_500_000);
+        c.set_ceiling(2_000_000);
+        assert_eq!(c.desired(), 2_000_000);
+
+        // A floor request above the live ceiling is capped AT the
+        // ceiling — never past it (no relay-clamp inversion).
+        c.set_floor(5_000_000);
+        assert_eq!(c.desired(), 2_000_000);
+        assert!(c.desired() <= 2_000_000);
     }
 
     // (6) Ceiling clamp: lowering the ceiling pulls desired down at once.
