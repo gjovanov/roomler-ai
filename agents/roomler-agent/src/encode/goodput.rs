@@ -1,20 +1,16 @@
-//! Measured-rate stage 0 — estimate what the session is ACTUALLY
-//! delivering, and report it. Nothing here changes behaviour.
+//! Measured-rate v2 — estimate what the session is ACTUALLY delivering,
+//! and (stage 1) derive the bitrate ceiling from it.
 //!
 //! ## Why
 //!
-//! Every constrained-path decision today keys off a NOMINAL relay clamp
-//! (3 Mbps) and a boolean `constrained`, while the variable that matters
-//! is this session's delivered rate — field-measured at ~2 Mbps on relay
-//! sessions, and varying by PoP, VPN and hour. The AIMD only observes
-//! send-channel occupancy, and SCTP's buffer absorbs the mismatch, so it
-//! parks at the ceiling and never learns the pipe: a field capture shows
-//! `target_bps=3000000` constant across a session delivering 1.75 Mbps.
-//!
-//! Stage 0 adds the measurement and logs it. Stages 1+ derive the
-//! ceilings, queue budget, HRD window and settle time from it. Landing
-//! the estimator alone first is deliberate: the estimate can be checked
-//! against known truth in the field before anything depends on it.
+//! Every constrained-path decision keys off a NOMINAL relay clamp
+//! (3 Mbps) and a boolean `constrained`, and the DIRECT path had no
+//! absolute anchor at all: sessions (re)open at the resolution-derived
+//! ceiling (15 Mbps at 2880×1800) while the pipe drains ~10, and the
+//! whole mismatch lands as send-queue lag + production skips (field
+//! 2026-08-26, neo16↔Rozalina — the "sluggish, then chunky" drag).
+//! The AIMD only observes send-channel occupancy, so it rediscovers the
+//! pipe by congesting it on every burst.
 //!
 //! ## The one hard problem: a fast sample is not evidence
 //!
@@ -23,118 +19,110 @@
 //! computes to an absurd throughput that says nothing about the pipe —
 //! it is a LOWER BOUND ("at least this fast"), not a measurement.
 //!
-//! The fix is structural rather than a magic number: only measure across
-//! a **busy period** — an unbroken stretch where the send task always had
-//! another frame waiting — and only when that stretch lasted at least
-//! [`MIN_BUSY_PERIOD`]. A period that long can only end when the pipe
-//! drains, so its bytes-over-time IS the drain rate. Periods shorter than
-//! that are discarded rather than down-weighted, so no amount of idle
-//! traffic can bias the estimate upward.
+//! Stage 0 answered this with busy-period bracketing (only measure an
+//! unbroken ≥300 ms stretch where the queue never dried), which turned
+//! out to be structurally unsatisfiable on the sessions that need it:
+//! at 40 fps a ~30 KB frame drains in ~24 ms — just under the ~25 ms
+//! inter-arrival — so the queue momentarily dries between frames even
+//! while the CUMULATIVE deficit grows. Field heartbeats read
+//! `goodput_samples: "(0, N)"` all session.
+//!
+//! v2 keeps the philosophy and fixes the granularity: the send task
+//! times each frame's chunked `dc.send()` serialisation. A frame whose
+//! serialisation took at least [`MIN_BLOCKED_SEND`] was flow-controlled
+//! by SCTP for its whole transit — its bytes-over-time IS the drain
+//! rate during that window. Sub-threshold sends are buffer headroom and
+//! are DISCARDED at the source, so no amount of idle traffic can bias
+//! the estimate upward. The governor then folds one WINDOW at a time
+//! (its existing 1 s cadence): the window's samples are aggregated
+//! byte-weighted (Σbytes / Σelapsed) and the aggregate must carry at
+//! least [`MIN_WINDOW_BLOCKED`] of genuinely-blocked time to count —
+//! one lone borderline frame is not a window's worth of evidence.
 //!
 //! Consequences worth knowing:
 //!
-//! - On an unbound LAN link, periods never last that long, the estimate
-//!   stays `None`, and every derived quantity falls back to the nominal
-//!   band. Direct sessions are byte-identical to today, by construction.
-//! - ⚠️ **This next claim was WRONG, and it was the design's load-bearing
-//!   assumption.** It read: "on relay sessions the at-rest polish traffic
-//!   (~1.75 Mbps sustained) keeps periods alive, so the estimate survives
-//!   an idle viewer." Field-measured at rc.453 on a live relay session
-//!   (browser → CORPLAP-1, corp VPN, hevc_qsv): `goodput_bps=None`,
-//!   `goodput_samples=(0, 11597)` — **zero accepted**, and still zero
-//!   under forced motion. Frames serialise in ~14 µs because the
-//!   bottleneck is capture+encode *upstream* of the socket sampled here,
-//!   so the queue never fills. It was an assumption written as a finding,
-//!   and nothing here could have caught it — only a session could.
-//!   Locked now by `the_measured_field_shape_yields_no_estimate`.
-//!
-//! ## Where this leaves stage 0
-//!
-//! Reporting-only, and currently reporting `None` on exactly the sessions
-//! it was built for. **Stages 1+ must not be built on it as it stands** —
-//! `G=None` permanently means the nominal band 100 % of the time, i.e. a
-//! large change that is green, implemented, and inert, with the constants
-//! it was meant to replace still quietly in charge.
-//!
-//! The way out, analysed but NOT built: `B = min(nominal, 0.85 × G)` only
-//! ever LOWERS the clamp, so the estimator never needs to observe unused
-//! capacity — it needs evidence of *insufficiency*, which is precisely a
-//! congestion episode. So sample during **backpressure**, at its natural
-//! timescale, and the 300 ms floor can go with it (a queue-full episode is
-//! by construction not buffer headroom, which is what the floor stood in
-//! for). The pump already emits the signal: `frames_skipped_backpressure`,
-//! 94 of them in that same session. The arithmetic was never the problem —
-//! see `a_backpressure_episode_on_a_throttled_link_reads_the_throttle`.
+//! - On an idle/unbound link nothing qualifies, the estimate stays
+//!   `None`, and every derived quantity falls back to the nominal band.
+//! - Any sustained overrun (a drag burst, relay congestion) produces a
+//!   steady stream of qualifying samples within its first seconds.
 //!
 //! ## Asymmetric adaptation
 //!
 //! Down fast, up slow. A VPN throttling mid-session is something to
 //! believe immediately; one lucky burst is not evidence the pipe grew.
 //! The estimate also decays to `None` after [`CONFIDENCE_TTL`] without a
-//! qualifying sample, so a stale number can never outlive the conditions
+//! qualifying window, so a stale number can never outlive the conditions
 //! that produced it — silence reverts to the nominal band rather than
 //! pinning whatever was last true.
+//!
+//! ## Stage 1 — consumption
+//!
+//! [`derived_ceiling_bps`] turns the estimate into a bitrate ceiling:
+//! `0.85 × G`, floored at 1 Mbps (insurance against a pathological
+//! sample bricking video — the EWMA recovers in 2-3 windows anyway).
+//! The governor applies `ceiling := min(nominal, derived)` — the
+//! measurement may only ever LOWER the clamp, because the nominal clamp
+//! also protects the TURN path. Kill switch:
+//! `ROOMLER_AGENT_MEASURED_CEILING=0` / config `measured_ceiling`.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Shortest stretch that counts as a measurement.
-///
-/// Below this the sample is dominated by socket-buffer headroom rather
-/// than the pipe (see the module docs). 300 ms is ~9 frames at 30 fps —
-/// long enough that the buffer cannot have absorbed the whole stretch,
-/// short enough to still sample a brief congestion episode.
-pub const MIN_BUSY_PERIOD: Duration = Duration::from_millis(300);
+/// Per-frame source rule: a frame whose chunked serialisation took less
+/// than this was absorbed by buffer headroom and measures nothing. At
+/// 10 Mbps this is ~12.5 KB of genuinely-paced bytes — any motion frame
+/// under congestion qualifies easily.
+pub const MIN_BLOCKED_SEND: Duration = Duration::from_millis(10);
 
-/// How long an estimate outlives its last qualifying sample.
+/// Per-window aggregate rule: the governor folds one window (~1 s) of
+/// samples at a time; the window's summed blocked time must reach this
+/// before its byte-weighted rate counts as a measurement.
+pub const MIN_WINDOW_BLOCKED: Duration = Duration::from_millis(60);
+
+/// How long an estimate outlives its last qualifying window.
 pub const CONFIDENCE_TTL: Duration = Duration::from_secs(60);
 
-/// EWMA weight for a sample BELOW the current estimate — the pipe
+/// Stage-1 safety margin: the ceiling derived from a measurement is 85 %
+/// of it (same margin the REMB path uses), so the encoder converges just
+/// UNDER the pipe instead of riding it.
+pub const MEASURED_CEILING_PCT: u64 = 85;
+
+/// EWMA weight for a window BELOW the current estimate — the pipe
 /// shrank, believe it quickly.
 const ALPHA_DOWN: f64 = 0.50;
 
-/// EWMA weight for a sample ABOVE it — the pipe may have grown, or we
+/// EWMA weight for a window ABOVE it — the pipe may have grown, or we
 /// may have caught one good burst. Move slowly.
 const ALPHA_UP: f64 = 0.10;
 
-/// Most periods the sink will hold before dropping the oldest. Bounds
+/// Most samples the sink will hold before dropping the oldest. Bounds
 /// the memory if the folding side ever stops draining; the estimator
 /// only needs recent history, so the old ones are the right ones to lose.
-const MAX_PENDING: usize = 64;
+const MAX_PENDING: usize = 256;
 
-/// One completed busy period: how much left the send task, and over how
-/// long, with the queue never empty in between.
+/// [`MEASURED_CEILING_PCT`] of a measured rate, floored at 1 Mbps.
+pub fn derived_ceiling_bps(goodput_bps: u32) -> u32 {
+    (((goodput_bps as u64) * MEASURED_CEILING_PCT / 100) as u32).max(1_000_000)
+}
+
+/// One qualifying blocked send: how many bytes, serialised over how long
+/// with SCTP flow control engaged the whole way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BusyPeriod {
+pub struct BlockedSend {
     pub bytes: u64,
     pub elapsed: Duration,
 }
 
-impl BusyPeriod {
-    /// Delivered bits per second, or `None` if the period is too short
-    /// to mean anything (see [`MIN_BUSY_PERIOD`]) or carried no bytes.
-    pub fn bps(&self) -> Option<f64> {
-        if self.elapsed < MIN_BUSY_PERIOD || self.bytes == 0 {
-            return None;
-        }
-        let secs = self.elapsed.as_secs_f64();
-        if secs <= 0.0 {
-            return None;
-        }
-        Some((self.bytes as f64 * 8.0) / secs)
-    }
-}
-
-/// The hand-off between the send task (which observes busy periods) and
-/// the pump (which folds them at its existing 1 s cadence).
+/// The hand-off between the send task (which times each frame's
+/// serialisation) and the pump (which folds one window at its existing
+/// 1 s cadence).
 ///
 /// A plain `std::sync::Mutex` on purpose: the send task holds it for a
-/// push with no `.await` inside, once per busy period — far rarer than
-/// per frame — so an async mutex would buy nothing and cost a yield on
-/// the video path.
+/// push with no `.await` inside, at most once per frame, so an async
+/// mutex would buy nothing and cost a yield on the video path.
 #[derive(Clone, Default)]
 pub struct GoodputSink {
-    pending: Arc<Mutex<Vec<BusyPeriod>>>,
+    pending: Arc<Mutex<Vec<BlockedSend>>>,
 }
 
 impl GoodputSink {
@@ -142,22 +130,28 @@ impl GoodputSink {
         Self::default()
     }
 
-    /// Called by the send task when a busy period ends. Cheap and
+    /// Called by the send task after each frame that reached the wire.
+    /// The [`MIN_BLOCKED_SEND`] source rule is enforced HERE so callers
+    /// report every frame unconditionally — a sub-threshold send is
+    /// headroom, not evidence, and never enters the window. Cheap and
     /// infallible — a poisoned lock is ignored rather than propagated,
     /// because losing a telemetry sample must never take down the video
     /// path.
     pub fn record(&self, bytes: u64, elapsed: Duration) {
+        if elapsed < MIN_BLOCKED_SEND || bytes == 0 {
+            return;
+        }
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
         if pending.len() >= MAX_PENDING {
             pending.remove(0);
         }
-        pending.push(BusyPeriod { bytes, elapsed });
+        pending.push(BlockedSend { bytes, elapsed });
     }
 
     /// Called by the pump to take everything observed since last time.
-    pub fn drain(&self) -> Vec<BusyPeriod> {
+    pub fn drain(&self) -> Vec<BlockedSend> {
         let Ok(mut pending) = self.pending.lock() else {
             return Vec::new();
         };
@@ -170,12 +164,13 @@ impl GoodputSink {
 pub struct GoodputEstimator {
     ewma_bps: Option<f64>,
     last_sample_at: Option<Instant>,
-    /// Periods that qualified. Reported in the heartbeat so a field
-    /// reader can tell "no confidence because the link is idle" from
+    /// Windows that qualified. Reported in the heartbeat so a field
+    /// reader can tell "no confidence because the link is unbound" from
     /// "no confidence because nothing is wired up".
     accepted: u64,
-    /// Periods that were too short or empty. The ratio is the evidence
-    /// that the min-period rule is doing its job.
+    /// Non-empty windows whose blocked time was too thin to count. An
+    /// unbound link now shows `(0, 0)` — nothing blocked, nothing to
+    /// reject (the v1 signature was `(0, N)`).
     rejected: u64,
 }
 
@@ -184,14 +179,27 @@ impl GoodputEstimator {
         Self::default()
     }
 
-    /// Fold one busy period. Returns whether it qualified.
-    pub fn observe(&mut self, period: BusyPeriod, now: Instant) -> bool {
-        let Some(sample) = period.bps() else {
+    /// Fold one window's samples, byte-weighted. Returns whether the
+    /// window qualified. An EMPTY window is not evidence of anything and
+    /// counts as neither accepted nor rejected.
+    pub fn observe_window(&mut self, samples: &[BlockedSend], now: Instant) -> bool {
+        if samples.is_empty() {
+            return false;
+        }
+        let bytes: u64 = samples.iter().map(|s| s.bytes).sum();
+        let elapsed: Duration = samples.iter().map(|s| s.elapsed).sum();
+        if elapsed < MIN_WINDOW_BLOCKED || bytes == 0 {
             self.rejected += 1;
             return false;
-        };
+        }
+        let secs = elapsed.as_secs_f64();
+        if secs <= 0.0 {
+            self.rejected += 1;
+            return false;
+        }
+        let sample = (bytes as f64 * 8.0) / secs;
         self.ewma_bps = Some(match self.ewma_bps {
-            // First qualifying sample: adopt it outright. Seeding from a
+            // First qualifying window: adopt it outright. Seeding from a
             // nominal guess would bias every later reading toward a
             // number we are specifically trying to stop trusting.
             None => sample,
@@ -206,7 +214,7 @@ impl GoodputEstimator {
     }
 
     /// The current estimate, or `None` when there is no confidence —
-    /// either nothing has qualified yet, or the last one aged out.
+    /// either nothing has qualified yet, or the last window aged out.
     /// Callers treat `None` as "fall back to the nominal band".
     pub fn estimate_bps(&self, now: Instant) -> Option<u32> {
         let last = self.last_sample_at?;
@@ -232,122 +240,73 @@ impl GoodputEstimator {
 mod tests {
     use super::*;
 
-    fn period(bytes: u64, ms: u64) -> BusyPeriod {
-        BusyPeriod {
+    fn sample(bytes: u64, ms: u64) -> BlockedSend {
+        BlockedSend {
             bytes,
             elapsed: Duration::from_millis(ms),
         }
     }
 
-    fn period_us(bytes: u64, us: u64) -> BusyPeriod {
-        BusyPeriod {
-            bytes,
-            elapsed: Duration::from_micros(us),
-        }
-    }
-
-    /// **The rc.453 field read, made executable.**
-    ///
-    /// A live relay session (browser → CORPLAP-1, corp VPN, hevc_qsv) reported
-    /// `goodput_bps=None, goodput_samples=(0, 11597)` — not one period in
-    /// eleven thousand qualified, and forcing motion did not change it.
-    ///
-    /// The cause is the SHAPE, not the wiring. Frames serialise into the
-    /// socket in ~14 µs because the bottleneck is capture+encode *upstream*
-    /// of the socket this estimator samples, so the queue never fills and
-    /// every period measures a memcpy rather than the link. The module docs'
-    /// claim that "at-rest polish keeps periods alive on relay sessions" was
-    /// an assumption written as a finding.
-    ///
-    /// ⚠️ Kept so that cannot be re-derived the expensive way. If someone
-    /// lowers [`MIN_BUSY_PERIOD`] to "fix" the `None`, this fails — which is
-    /// correct: 1.5 KB in 14 µs computes to ~857 Mbps, i.e. the speed of
-    /// memory, and believing it once poisons the EWMA for a minute.
-    #[test]
-    fn the_measured_field_shape_yields_no_estimate() {
-        let mut est = GoodputEstimator::new();
-        let t0 = Instant::now();
-        for i in 0..11_597u64 {
-            // ~1.5 KB per frame, serialised in 14 µs, at a 30 fps cadence.
-            est.observe(period_us(1_500, 14), t0 + Duration::from_micros(i * 33_000));
-        }
-        assert_eq!(est.accepted(), 0, "the field read was (0, 11597)");
-        assert_eq!(est.rejected(), 11_597);
-        assert_eq!(
-            est.estimate_bps(t0),
-            None,
-            "eleven thousand memcpys are not evidence about a link"
-        );
-    }
-
-    /// The other half of the control, and the whole case for the redesign:
-    /// when the LINK is the bottleneck, the period worth measuring is exactly
-    /// the congestion episode. A 1 Mbps shaped link that backs up for two
-    /// seconds delivers 250 KB in that window — long enough to qualify, and
-    /// it reads the throttle rather than the memcpy.
-    ///
-    /// This is the unit-level form of the `tc` experiment: throttled must
-    /// read ≈ the throttle, and [`the_measured_field_shape_yields_no_estimate`]
-    /// is the same control's negative arm. Together they say the estimator's
-    /// arithmetic was never the problem — where it samples is.
-    #[test]
-    fn a_backpressure_episode_on_a_throttled_link_reads_the_throttle() {
-        let mut est = GoodputEstimator::new();
-        let t0 = Instant::now();
-        // 1 Mbps for 2 s = 250 000 bytes.
-        assert!(est.observe(period(250_000, 2_000), t0));
-        assert_eq!(est.estimate_bps(t0), Some(1_000_000));
-    }
-
     /// The whole design rests on this: a frame that serialised instantly
-    /// is buffer headroom, not capacity, and must not reach the estimate
-    /// at all. Not down-weighted — discarded.
+    /// is buffer headroom, not capacity, and must not reach the window
+    /// at all. Not down-weighted — discarded, at the source.
     #[test]
-    fn a_period_shorter_than_the_minimum_is_not_evidence() {
-        let mut est = GoodputEstimator::new();
-        let t0 = Instant::now();
+    fn a_fast_send_is_discarded_at_the_source() {
+        let sink = GoodputSink::new();
         // 250 KB in 1 ms computes to 2 Gbps. Believing it once would
         // poison the EWMA for minutes.
-        assert!(!est.observe(period(250_000, 1), t0));
-        assert_eq!(
-            est.estimate_bps(t0),
-            None,
-            "no confidence from a short period"
-        );
+        sink.record(250_000, Duration::from_millis(1));
+        sink.record(0, Duration::from_millis(50));
+        assert!(sink.drain().is_empty());
+        // A genuinely blocked send is kept.
+        sink.record(30_000, Duration::from_millis(24));
+        assert_eq!(sink.drain().len(), 1);
+    }
+
+    /// A congested drag second: ~40 frames of ~30 KB each taking ~24 ms
+    /// to serialise = a clean ~10 Mbps measurement.
+    #[test]
+    fn a_congested_window_measures_the_drain_rate() {
+        let mut est = GoodputEstimator::new();
+        let t0 = Instant::now();
+        let window: Vec<BlockedSend> = (0..40).map(|_| sample(30_000, 24)).collect();
+        assert!(est.observe_window(&window, t0));
+        let got = est.estimate_bps(t0).unwrap();
+        assert_eq!(got, 10_000_000, "40×30KB over 40×24ms = 10 Mbps");
+        assert_eq!(est.accepted(), 1);
+    }
+
+    /// A window with too little blocked time is rejected — one lone
+    /// borderline frame is not a window's worth of evidence.
+    #[test]
+    fn a_thin_window_is_rejected_not_believed() {
+        let mut est = GoodputEstimator::new();
+        let t0 = Instant::now();
+        assert!(!est.observe_window(&[sample(30_000, 24)], t0));
+        assert_eq!(est.estimate_bps(t0), None);
         assert_eq!(est.rejected(), 1);
         assert_eq!(est.accepted(), 0);
     }
 
-    /// An idle link produces only short periods, so the estimate never
-    /// forms — which is what keeps direct sessions byte-identical.
+    /// An EMPTY window (idle link) is neither accepted nor rejected —
+    /// the unbound-link heartbeat signature is now `(0, 0)`.
     #[test]
-    fn an_idle_link_never_gains_confidence() {
+    fn an_empty_window_counts_as_nothing() {
         let mut est = GoodputEstimator::new();
         let t0 = Instant::now();
-        for i in 0..200 {
-            est.observe(period(40_000, 5), t0 + Duration::from_millis(i * 33));
-        }
+        assert!(!est.observe_window(&[], t0));
+        assert_eq!((est.accepted(), est.rejected()), (0, 0));
         assert_eq!(est.estimate_bps(t0), None);
-        assert_eq!(est.accepted(), 0);
-    }
-
-    #[test]
-    fn a_qualifying_period_is_adopted_outright() {
-        let mut est = GoodputEstimator::new();
-        let t0 = Instant::now();
-        // 250 KB over 1 s = 2 Mbps — the field-measured relay figure.
-        assert!(est.observe(period(250_000, 1000), t0));
-        assert_eq!(est.estimate_bps(t0), Some(2_000_000));
     }
 
     /// Down fast: a VPN throttling mid-session is worth believing at
-    /// once. One sample must move the estimate most of the way.
+    /// once. One window must move the estimate most of the way.
     #[test]
     fn the_estimate_falls_fast() {
         let mut est = GoodputEstimator::new();
         let t0 = Instant::now();
-        est.observe(period(250_000, 1000), t0); // 2 Mbps
-        est.observe(period(125_000, 1000), t0); // 1 Mbps
+        est.observe_window(&[sample(250_000, 1000)], t0); // 2 Mbps
+        est.observe_window(&[sample(125_000, 1000)], t0); // 1 Mbps
         let got = est.estimate_bps(t0).unwrap();
         assert_eq!(got, 1_500_000, "ALPHA_DOWN=0.5 halves the gap in one step");
     }
@@ -357,8 +316,8 @@ mod tests {
     fn the_estimate_rises_slowly() {
         let mut est = GoodputEstimator::new();
         let t0 = Instant::now();
-        est.observe(period(125_000, 1000), t0); // 1 Mbps
-        est.observe(period(250_000, 1000), t0); // 2 Mbps
+        est.observe_window(&[sample(125_000, 1000)], t0); // 1 Mbps
+        est.observe_window(&[sample(250_000, 1000)], t0); // 2 Mbps
         let got = est.estimate_bps(t0).unwrap();
         assert_eq!(got, 1_100_000, "ALPHA_UP=0.1 moves a tenth of the gap");
         assert!(
@@ -371,10 +330,10 @@ mod tests {
     /// number that outlives its evidence would pin the session to a pipe
     /// that no longer exists.
     #[test]
-    fn confidence_expires_without_fresh_samples() {
+    fn confidence_expires_without_fresh_windows() {
         let mut est = GoodputEstimator::new();
         let t0 = Instant::now();
-        est.observe(period(250_000, 1000), t0);
+        est.observe_window(&[sample(250_000, 1000)], t0);
         assert!(
             est.estimate_bps(t0 + CONFIDENCE_TTL).is_some(),
             "still fresh at the boundary"
@@ -388,53 +347,52 @@ mod tests {
 
     /// ...and comes back when evidence does.
     #[test]
-    fn a_fresh_sample_restores_confidence() {
+    fn a_fresh_window_restores_confidence() {
         let mut est = GoodputEstimator::new();
         let t0 = Instant::now();
-        est.observe(period(250_000, 1000), t0);
+        est.observe_window(&[sample(250_000, 1000)], t0);
         let stale = t0 + CONFIDENCE_TTL + Duration::from_secs(1);
         assert_eq!(est.estimate_bps(stale), None);
-        est.observe(period(250_000, 1000), stale);
+        est.observe_window(&[sample(250_000, 1000)], stale);
         assert_eq!(est.estimate_bps(stale), Some(2_000_000));
     }
 
+    /// Stage 1's derivation: 85 % of the measurement, floored at 1 Mbps
+    /// so a pathological low can't brick video outright.
     #[test]
-    fn an_empty_period_is_rejected_not_counted_as_zero() {
-        let mut est = GoodputEstimator::new();
-        let t0 = Instant::now();
-        est.observe(period(250_000, 1000), t0);
-        assert!(!est.observe(period(0, 5000), t0));
-        assert_eq!(
-            est.estimate_bps(t0),
-            Some(2_000_000),
-            "a byteless period must not drag the estimate toward zero"
-        );
+    fn derived_ceiling_is_85_pct_with_a_floor() {
+        assert_eq!(derived_ceiling_bps(10_000_000), 8_500_000);
+        assert_eq!(derived_ceiling_bps(2_000_000), 1_700_000);
+        assert_eq!(derived_ceiling_bps(300_000), 1_000_000, "floored at 1M");
     }
 
     #[test]
     fn sink_round_trips_and_drains_once() {
         let sink = GoodputSink::new();
-        sink.record(1_000, Duration::from_millis(400));
-        sink.record(2_000, Duration::from_millis(500));
+        sink.record(30_000, Duration::from_millis(20));
+        sink.record(40_000, Duration::from_millis(30));
         let drained = sink.drain();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0], period(1_000, 400));
+        assert_eq!(drained[0], sample(30_000, 20));
         assert!(sink.drain().is_empty(), "drain must consume");
     }
 
     /// If the folding side ever stops draining, the sink must not grow
-    /// without bound — and it should keep the RECENT periods, since the
+    /// without bound — and it should keep the RECENT samples, since the
     /// estimator only cares about those.
     #[test]
     fn sink_is_bounded_and_drops_the_oldest() {
         let sink = GoodputSink::new();
         for i in 0..(MAX_PENDING as u64 + 10) {
-            sink.record(i, Duration::from_millis(400));
+            sink.record(10_000 + i, Duration::from_millis(20));
         }
         let drained = sink.drain();
         assert_eq!(drained.len(), MAX_PENDING);
-        assert_eq!(drained[0].bytes, 10, "oldest dropped");
-        assert_eq!(drained[MAX_PENDING - 1].bytes, MAX_PENDING as u64 + 9);
+        assert_eq!(drained[0].bytes, 10_010, "oldest dropped");
+        assert_eq!(
+            drained[MAX_PENDING - 1].bytes,
+            10_000 + MAX_PENDING as u64 + 9
+        );
     }
 
     /// The sink is shared across tasks; a clone must be the same sink,
@@ -443,7 +401,7 @@ mod tests {
     fn a_cloned_sink_shares_storage() {
         let sink = GoodputSink::new();
         let writer = sink.clone();
-        writer.record(1_000, Duration::from_millis(400));
+        writer.record(30_000, Duration::from_millis(20));
         assert_eq!(sink.drain().len(), 1);
     }
 }
