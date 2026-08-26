@@ -37,8 +37,12 @@ runs:
           exit 0
         fi
         fam="seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}"
-        pk="${RUNNER_TEMP:-/tmp}/seedpk"
-        mkdir -p "$pk"
+        # mktemp, NOT $RUNNER_TEMP: on Windows runners RUNNER_TEMP is
+        # `D:\a\_temp`, and GNU tar parses the `D:` in an -f path as a
+        # REMOTE HOST ("Cannot connect to D: resolve failed" — run
+        # 32967165070 lost every Windows publish to it). mktemp yields a
+        # POSIX path on all three runner OSes.
+        pk="$(mktemp -d)"
         # cargo-home subset: only what restore needs; guard each path so a
         # lane without e.g. git/db still packs.
         cargo_paths=""

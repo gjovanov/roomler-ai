@@ -29,8 +29,12 @@ runs:
           echo "GH_TOKEN not provided — building cold"
           exit 0
         fi
-        dl="${RUNNER_TEMP:-/tmp}/seeddl"
-        mkdir -p "$dl"
+        # mktemp, NOT $RUNNER_TEMP: on Windows runners RUNNER_TEMP is
+        # `D:\a\_temp`, and GNU tar parses the `D:` in an -f path as a
+        # REMOTE HOST ("Cannot connect to D: resolve failed" — run
+        # 32967165070 lost every Windows publish to it). mktemp yields a
+        # POSIX path on all three runner OSes.
+        dl="$(mktemp -d)"
         # Two assets per family — no tar path-transforms, so the same
         # commands work on GNU tar (linux) and bsdtar (macOS/windows):
         #   <fam>-cargo.tar.zst  → unpacked into ~/.cargo
