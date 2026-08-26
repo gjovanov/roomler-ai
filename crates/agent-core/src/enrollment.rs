@@ -136,6 +136,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_data_probe: None,
         overlay_disco_respond: None,
         overlay_disco_probe: None,
+        overlay_answer_while_followed: None,
         overlay_tun_stable_guid: None,
         overlay_route_evict: None,
         overlay_iface_metric: None,
