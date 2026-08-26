@@ -1,104 +1,80 @@
 name: seed-cache-restore
 description: >-
-  Restore the release-lane cargo seed. Key scheme:
-  seed-<shared-key>-<os>-<arch>-lock-<Cargo.lock hash>, with a prefix
-  restore-key so a lockfile drift still restores the NEWEST older
-  generation (cargo rebuilds only the delta). Deliberately NO environment
-  hash — runner-image variance flapped rust-cache's env hash run-to-run
-  (0c34b334 vs e76361e6, 2026-08-01) and made warm/cold a lottery. Why not
-  rust-cache: with add-rust-environment-hash-key:false its `key:` input is
-  folded into the dropped component and becomes a no-op (#482, re-proven
-  by probe run 31907241610), leaving only an immutable flat key — which
-  forced the #485 delete-before-restore dance and its absent-key race
-  (rc.382 went cold mid-window). Pair with seed-cache-save.
+  Restore the release-lane cargo seed from a RELEASE ASSET on the rolling
+  `seed-cache` release — deliberately OUTSIDE GitHub's 10 GB Actions-cache
+  pool. Thirteen incidents (2026-07-13 → 08-25) proved the shared pool
+  cannot host the seeds: whatever key scheme we used, the pool's LRU
+  eventually evicted a needed seed under pressure from the (legitimately
+  hot) CI caches — final straw rc.472: a rehearsal VERIFIED its Windows
+  save at 19:36 and the tag's restore found nothing at 20:05, evicted by
+  the next rehearsal's own sibling saves. Release assets have no LRU, no
+  budget, no reservations; retention is `--clobber` (exactly the
+  keep-newest-1 we always wanted); the pattern is field-proven here since
+  July by the vendored-ffmpeg releases. Pair with seed-cache-save; the
+  calling step must pass `env: GH_TOKEN` (soft-fallback to cold without
+  it).
 inputs:
   shared-key:
-    description: Cache family name (unique per job)
+    description: Seed family name (unique per job)
     required: true
 runs:
   using: composite
   steps:
-    - id: restore
-      uses: actions/cache/restore@v4
-      with:
-        path: |
-          ~/.cargo/registry/index
-          ~/.cargo/registry/cache
-          ~/.cargo/git/db
-          ~/.cargo/bin
-          target
-        # Run-salted primary key (always a miss — restores go through the
-        # restore-keys below; saves land under this unique key). The salt
-        # exists because 2026-08-24 a rehearsal was CANCELLED mid-upload by
-        # the #556 concurrency group and GitHub's reservation for the
-        # shared key stayed wedged: every later (green!) rehearsal failed
-        # its save with "Unable to reserve cache … another job may be
-        # creating this cache", no Windows generation persisted, and
-        # rc.460 built near-cold. Unique per-run keys make reservation
-        # contention structurally impossible; the keep-newest retirement
-        # in seed-cache-save prunes the salted siblings.
-        key: seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-r${{ github.run_id }}
-        restore-keys: |
-          seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-${{ hashFiles('**/Cargo.lock') }}-
-          seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}-lock-
-
-    - name: Surface a cold tag build
+    - name: Download + unpack the seed asset
       shell: bash
-      env:
-        MATCHED: ${{ steps.restore.outputs.cache-matched-key }}
       run: |
-        # A tag build that restores NOTHING is an SLO breach in the making
-        # (+~10 min) and, historically, the first visible symptom of a
-        # silent producer-side failure (rc.460: a wedged reservation had
-        # stopped every green rehearsal from persisting generations).
-        # Annotate the run page instead of leaving it to log archaeology.
-        if [ "${GITHUB_REF_TYPE:-branch}" = "tag" ] && [ -z "${MATCHED:-}" ]; then
-          echo "::warning title=Cold tag build (no cargo seed)::no seed generation matched for family '${{ inputs.shared-key }}' — this release build runs cold (~+10 min). Check the reseed rehearsals: gh run list --workflow=release-agent.yml (workflow_dispatch lanes), and the seed-cache-save 'save verified' lines."
-        elif [ -n "${MATCHED:-}" ]; then
-          echo "restored from: ${MATCHED}"
+        set -uo pipefail
+        fam="seed-${{ inputs.shared-key }}-${{ runner.os }}-${{ runner.arch }}"
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "GH_TOKEN not provided — building cold"
+          exit 0
         fi
+        dl="${RUNNER_TEMP:-/tmp}/seeddl"
+        mkdir -p "$dl"
+        # Two assets per family — no tar path-transforms, so the same
+        # commands work on GNU tar (linux) and bsdtar (macOS/windows):
+        #   <fam>-cargo.tar.zst  → unpacked into ~/.cargo
+        #   <fam>-target.tar.zst → unpacked into the workspace (./target)
+        if ! gh release download seed-cache --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${fam}-*.tar.zst" --dir "$dl" 2>/dev/null \
+           || [ ! -f "$dl/${fam}-target.tar.zst" ]; then
+          # First run ever, a clobber-gap of a few seconds, or a failed
+          # producer. A COLD TAG is an SLO breach in the making (+~10 min):
+          # put it on the run page, not in log archaeology.
+          if [ "${GITHUB_REF_TYPE:-branch}" = "tag" ]; then
+            echo "::warning title=Cold tag build (no cargo seed)::no '${fam}-*.tar.zst' on the seed-cache release — this release build runs cold (~+10 min). Check the reseed rehearsals' 'seed published' lines (gh run list --workflow=release-agent.yml, workflow_dispatch lanes)."
+          else
+            echo "no ${fam} seed yet — building cold (this run's save will publish it)"
+          fi
+          exit 0
+        fi
+        mkdir -p "$HOME/.cargo"
+        tar --zstd -xf "$dl/${fam}-cargo.tar.zst" -C "$HOME/.cargo" 2>/dev/null || true
+        tar --zstd -xf "$dl/${fam}-target.tar.zst" 2>/dev/null || true
+        rm -f "$dl/${fam}-cargo.tar.zst" "$dl/${fam}-target.tar.zst"
+        echo "restored from: ${fam} assets ($(du -sh target 2>/dev/null | cut -f1 || echo '?') target)"
 
     - name: Accretion GC (rehearsals only)
       shell: bash
       run: |
         # Each rehearsal restores the previous generation, builds the delta,
-        # and saves EVERYTHING — without a sweep, artifacts of superseded dep
-        # versions accrete monotonically (generations grew ~500 MB → 1.4-2.6 GB
-        # in four days; five of them = 7.4 GB, re-evicting the CI lane's caches
-        # whenever a save crested the 10 GB pool).
+        # and publishes EVERYTHING — without a sweep, artifacts of superseded
+        # dep versions accrete monotonically (generations grew ~500 MB →
+        # 1.4-2.6 GB in four days once).
         #
-        # ⚠️ 2026-08-20 — this used to be:
-        #
-        #     find target ~/.cargo/registry/cache -type f -mtime +4 -delete
-        #
-        # and it POISONED the seed for every downstream run. Deleting
-        # individual files inside `target` is unsound: cargo's decision to
-        # re-run a build script lives in `target/*/.fingerprint/`, not in the
-        # outputs, so removing an OUTPUT while leaving its fingerprint makes
-        # cargo skip the rebuild and the file is simply gone. The original
-        # premise — "the rehearsal rebuilds anything it deleted by mistake" —
-        # is exactly what cargo does NOT do.
-        #
-        # It hit `env-libvpx-sys`, whose build script writes `OUT_DIR/ffi.rs`.
-        # libvpx is pinned, so that file is never touched and always trips
-        # `-mtime +4`. A rehearsal deleted it and saved the hole; every later
-        # run restored it and died on
-        # `couldn't read .../out/ffi.rs` in ~2 min. Three releases in a row
-        # (rc.422/423/424) plus a dispatch run failed this way, and a re-run
-        # could not help — the poison was IN the cache.
-        #
-        # So: never touch individual files under `target`. The registry cache
-        # is safe to sweep by mtime (those are downloaded `.crate` archives;
-        # cargo re-fetches what it needs), and `target` is dropped WHOLESALE
-        # when it gets fat — one slow rehearsal, and a correct generation
-        # afterwards.
+        # ⚠️ Never delete individual files under `target`: cargo's decision
+        # to re-run a build script lives in `.fingerprint/`, not in the
+        # outputs — removing an OUTPUT while its fingerprint survives means
+        # cargo silently never rebuilds it (rc.422-424 died on a GC'd
+        # env-libvpx-sys OUT_DIR/ffi.rs baked into the seed). The registry
+        # cache IS safe to sweep by mtime (missing .crate = re-download);
+        # `target` is dropped WHOLESALE when fat — one slow rehearsal, then
+        # a correct lean generation.
         if [ "${GITHUB_REF_TYPE:-branch}" = "tag" ]; then
           echo "tag run — skipping accretion GC"
           exit 0
         fi
-        # Sound: cargo treats a missing .crate as "download it again".
         find ~/.cargo/registry/cache -type f -mtime +4 -delete 2>/dev/null || true
-        # All-or-nothing on target. A partial sweep is what broke the releases.
         TARGET_MB=$(du -sm target 2>/dev/null | cut -f1 || echo 0)
         if [ "${TARGET_MB:-0}" -gt "${SEED_TARGET_MAX_MB:-3000}" ]; then
           echo "target is ${TARGET_MB} MB (> ${SEED_TARGET_MAX_MB:-3000}) — dropping it whole"
