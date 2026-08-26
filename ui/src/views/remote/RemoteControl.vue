@@ -2603,11 +2603,19 @@ const resolutionButtonTitle = computed(() => {
 
 /** rc.35 — agent's native source dims, surfaced for the resolution UI
  *  so the operator can see why a 4K custom target on a 1080p-panel
- *  host doesn't change anything. Sourced from the VP9-444 worker's
- *  rolling stats when that path is active (post-decode VideoFrame
- *  dims), otherwise from the WebRTC track's `videoWidth/Height`
- *  carried via `mediaIntrinsicW/H`. Zero before the first frame. */
+ *  host doesn't change anything.
+ *
+ *  The agent's OWN report (`rc:video-info` native_w/h = its panel) is the
+ *  truth and is preferred. The decoded-stream dims below it are the ENCODE
+ *  BOX whenever a resolution cap engages — since the capture backend scales
+ *  server-side, labelling those "Agent native" told the operator their
+ *  3024×1964 panel was 1926×1252 (field 2026-08-26). Stream dims remain the
+ *  fallback for agents that never send video-info (legacy track + libvpx
+ *  paths), where they keep their old, then-accurate meaning. Zero before
+ *  the first frame / report. */
 const nativeSourceW = computed<number>(() => {
+  const vi = rc.videoInfo.value
+  if ((vi?.native_w ?? 0) > 0) return vi!.native_w
   if (rc.hevcActive.value && rc.hevcStats.value.width > 0) {
     return rc.hevcStats.value.width
   }
@@ -2617,6 +2625,8 @@ const nativeSourceW = computed<number>(() => {
   return rc.mediaIntrinsicW.value || 0
 })
 const nativeSourceH = computed<number>(() => {
+  const vi = rc.videoInfo.value
+  if ((vi?.native_h ?? 0) > 0) return vi!.native_h
   if (rc.hevcActive.value && rc.hevcStats.value.height > 0) {
     return rc.hevcStats.value.height
   }
