@@ -38,6 +38,9 @@ impl AgentDao {
             owner_user_id,
             enrolled_by: Some(owner_user_id),
             name,
+            display_name: None,
+            tags: Vec::new(),
+            name_admin_set: false,
             machine_id,
             os,
             agent_version,
@@ -93,9 +96,14 @@ impl AgentDao {
     }
 
     /// Refresh an existing agent row at re-enrollment time: clear `deleted_at`
-    /// (in case the row was soft-deleted), update name / os / agent_version
-    /// from the new enrollment payload, bump `updated_at`. Returns the updated
-    /// row so the caller can issue a fresh agent token against it.
+    /// (in case the row was soft-deleted), update os / agent_version from the
+    /// new enrollment payload, bump `updated_at`. Returns the updated row so
+    /// the caller can issue a fresh agent token against it.
+    ///
+    /// `name` is refreshed ONLY while `name_admin_set` is unset: machine-
+    /// reported names keep flowing for never-renamed devices, but a re-enroll
+    /// must not silently revert an admin rename (it used to — the rename
+    /// route existed while every re-enroll clobbered its effect).
     pub async fn rehydrate(
         &self,
         agent_id: ObjectId,
@@ -109,13 +117,21 @@ impl AgentDao {
                 agent_id,
                 doc! {
                     "$set": {
-                        "name": name,
                         "os": os_bson,
                         "agent_version": agent_version,
                         "updated_at": DateTime::now(),
                         "deleted_at": bson::Bson::Null,
                     }
                 },
+            )
+            .await?;
+        // Second, FILTERED update for the name half — update_by_id can't
+        // carry the extra predicate. Matching zero docs (admin-renamed row)
+        // is the intended no-op, not an error.
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "name_admin_set": { "$ne": true } },
+                doc! { "$set": { "name": name } },
             )
             .await?;
         self.base.find_by_id(agent_id).await
@@ -459,7 +475,41 @@ impl AgentDao {
         self.base
             .update_one(
                 doc! { "_id": agent_id, "tenant_id": tenant_id },
-                doc! { "$set": { "name": name } },
+                // The flag is what stops the next re-enroll's `rehydrate`
+                // from clobbering this rename with the machine-reported name.
+                doc! { "$set": { "name": name, "name_admin_set": true } },
+            )
+            .await
+    }
+
+    /// Set/clear the friendly display label. Display-only — never propagates
+    /// to the overlay/MagicDNS name.
+    pub async fn set_display_name(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        display_name: Option<&str>,
+    ) -> DaoResult<bool> {
+        let update = match display_name {
+            Some(v) => doc! { "$set": { "display_name": v } },
+            None => doc! { "$unset": { "display_name": "" } },
+        };
+        self.base
+            .update_one(doc! { "_id": agent_id, "tenant_id": tenant_id }, update)
+            .await
+    }
+
+    /// Replace the device's whole tag list (the UI edits it as a set).
+    pub async fn set_tags(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        tags: &[String],
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                doc! { "$set": { "tags": tags.to_vec() } },
             )
             .await
     }
