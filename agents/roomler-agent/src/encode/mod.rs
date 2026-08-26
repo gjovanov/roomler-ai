@@ -229,6 +229,19 @@ pub fn measured_ceiling_enabled() -> bool {
     tunnel_core::env::node_env("MEASURED_CEILING").as_deref() != Some("0")
 }
 
+/// Drag-latency P3 kill switch (2026-08-27): when on (default), a
+/// rebuild-bound bitrate apply (QSV/AMF — no in-place reconfigure)
+/// opens the replacement encoder on a BLOCKING THREAD while the current
+/// one keeps producing frames, and swaps between frames — no mid-drag
+/// stall, no dead air, and rate DROPS finally land DURING motion as
+/// smaller frames instead of production skips. `0` restores the rc.445
+/// motion-defer (applies held until 1.2 s of quiet, then a blocking
+/// re-open). Hatch: `ROOMLER_AGENT_BG_REBUILD=0` / config `bg_rebuild`.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub fn bg_rebuild_enabled() -> bool {
+    tunnel_core::env::node_env("BG_REBUILD").as_deref() != Some("0")
+}
+
 /// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (the field-test host) that
 /// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
 /// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
