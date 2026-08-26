@@ -9,6 +9,7 @@ import { useConferenceStore } from './conference'
 import { useTenantStore } from './tenant'
 import { useOrgBadgesStore } from './orgBadges'
 import { useAgentStore } from './agents'
+import { useDeviceStore } from './devices'
 
 type WsStatus = 'disconnected' | 'connecting' | 'connected'
 
@@ -301,6 +302,9 @@ export const useWsStore = defineStore('ws', () => {
         if (!dp.tenant_id || !dp.agents?.length) break
         if (dp.tenant_id === useTenantStore().current?.id) {
           useAgentStore().applyPresence(dp.agents)
+          // The unified devices grid renders from its own row feed — patch
+          // it too so presence dots stay live without a refetch.
+          useDeviceStore().applyPresence(dp.agents)
         } else {
           useOrgBadgesStore().noteDevicePresence(dp.tenant_id, dp.agents)
         }
