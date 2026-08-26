@@ -1,0 +1,403 @@
+//! Device naming: admin rename (fleet + overlay/MagicDNS propagation),
+//! display_name, tags — and the rehydrate-clobber rule.
+//!
+//! The rename route existed for months while every re-enroll silently
+//! reverted its effect (`rehydrate` unconditionally `$set` the machine-
+//! reported name). These tests lock the repaired contract: an admin rename
+//! is sticky (`name_admin_set`), a never-renamed device keeps following its
+//! machine-reported name, and a rename lands on the device's live overlay
+//! node (deduped within the network) so peers resolve the new label.
+
+use bson::oid::ObjectId;
+use roomler_ai_remote_control::models::NodeRef;
+use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
+use roomler_ai_services::dao::overlay_node::{NewOverlayNode, OverlayNodeDao};
+use serde_json::{Value, json};
+
+use crate::fixtures::test_app::TestApp;
+
+// ─── Helpers ────────────────────────────────────────────────────
+
+async fn mint_enroll_token(app: &TestApp, tenant_id: &str, admin_token: &str) -> String {
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{tenant_id}/agent/enroll-token"),
+            admin_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    et["enrollment_token"].as_str().unwrap().to_string()
+}
+
+/// Enroll (or re-enroll — same machine_id) an agent over HTTP; returns agent_id.
+async fn enroll(
+    app: &TestApp,
+    tenant_id: &str,
+    admin_token: &str,
+    machine_id: &str,
+    machine_name: &str,
+    version: &str,
+) -> String {
+    let token = mint_enroll_token(app, tenant_id, admin_token).await;
+    let resp: Value = app
+        .client
+        .post(app.url("/api/agent/enroll"))
+        .json(&json!({
+            "enrollment_token": token,
+            "machine_id": machine_id,
+            "machine_name": machine_name,
+            "os": "linux",
+            "agent_version": version,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    resp["agent_id"].as_str().expect("agent_id").to_string()
+}
+
+async fn get_agent(app: &TestApp, tenant_id: &str, agent_id: &str, token: &str) -> Value {
+    app.auth_get(&format!("/api/tenant/{tenant_id}/agent/{agent_id}"), token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+// ─── Tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn admin_rename_survives_reenroll_and_reports_in_responses() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname1").await;
+
+    let aid = enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-devname-1",
+        "Original Box",
+        "0.3.0",
+    )
+    .await;
+
+    // Rename via the update route — the response now carries the fresh row.
+    let resp: Value = app
+        .auth_put(
+            &format!("/api/tenant/{}/agent/{aid}", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "name": "renamed-device" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["updated"].as_bool(), Some(true));
+    assert_eq!(resp["agent"]["name"].as_str(), Some("renamed-device"));
+    // No overlay node exists for this device — the DNS half must say so
+    // by staying null, not by claiming a rename that never happened.
+    assert!(resp["dns_renamed"].is_null());
+
+    // Re-enroll the SAME machine with the machine-reported name + a newer
+    // version: the version half must refresh, the admin rename must survive.
+    enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-devname-1",
+        "Original Box",
+        "0.3.1",
+    )
+    .await;
+
+    let agent = get_agent(&app, &t.tenant_id, &aid, &t.admin.access_token).await;
+    assert_eq!(
+        agent["name"].as_str(),
+        Some("renamed-device"),
+        "re-enroll clobbered an admin rename"
+    );
+    assert_eq!(agent["agent_version"].as_str(), Some("0.3.1"));
+}
+
+#[tokio::test]
+async fn machine_reported_name_flows_when_never_renamed() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname2").await;
+
+    let aid = enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-devname-2",
+        "Old Hostname",
+        "0.3.0",
+    )
+    .await;
+
+    // No admin rename in between: a re-enroll under a new hostname is the
+    // machine renaming itself, and the fleet should follow it.
+    enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-devname-2",
+        "New Hostname",
+        "0.3.0",
+    )
+    .await;
+
+    let agent = get_agent(&app, &t.tenant_id, &aid, &t.admin.access_token).await;
+    assert_eq!(agent["name"].as_str(), Some("New Hostname"));
+}
+
+#[tokio::test]
+async fn display_name_and_tags_roundtrip_and_normalize() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname3").await;
+
+    let aid = enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-devname-3",
+        "Label Box",
+        "0.3.0",
+    )
+    .await;
+
+    // Tags are trimmed, de-duped (order kept), empties dropped.
+    let resp: Value = app
+        .auth_put(
+            &format!("/api/tenant/{}/agent/{aid}", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({
+            "display_name": "  Büro PC  ",
+            "tags": [" prod ", "prod", "", "vienna"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["agent"]["display_name"].as_str(), Some("Büro PC"));
+    assert_eq!(
+        resp["agent"]["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["prod", "vienna"]
+    );
+
+    // Empty string clears the display name; empty list clears tags — both
+    // then vanish from the wire (skip_serializing on empty).
+    let resp: Value = app
+        .auth_put(
+            &format!("/api/tenant/{}/agent/{aid}", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "display_name": "", "tags": [] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(resp["agent"]["display_name"].is_null());
+    assert!(resp["agent"]["tags"].is_null());
+
+    // A 41-char tag is refused.
+    let resp = app
+        .auth_put(
+            &format!("/api/tenant/{}/agent/{aid}", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "tags": ["x".repeat(41)] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn rename_propagates_to_live_overlay_node_with_dedup() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname4").await;
+
+    let aid = enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-devname-4",
+        "Mesh Box",
+        "0.3.0",
+    )
+    .await;
+    let aid_oid = ObjectId::parse_str(&aid).unwrap();
+    let tid_oid = ObjectId::parse_str(&t.tenant_id).unwrap();
+
+    // Seed the overlay side directly, as handle_overlay_join would (the WS
+    // join is exercised elsewhere; this test is about the rename hook).
+    let networks = OverlayNetworkDao::new(&app.db);
+    let nodes = OverlayNodeDao::new(&app.db);
+    let network_id = networks.get_or_create(tid_oid).await.unwrap().id.unwrap();
+    let mk_node = |node_ref: NodeRef, machine: &str, name: &str, ip: &str| NewOverlayNode {
+        tenant_id: tid_oid,
+        node_ref,
+        network_id,
+        machine_id: machine.to_string(),
+        name: name.to_string(),
+        overlay_ip: ip.to_string(),
+        wg_public_key: format!("pk-{machine}"),
+        key_epoch: 0,
+        endpoints: vec![],
+        supports_quic: false,
+        supports_relay_single: false,
+        supports_derp: false,
+        supports_forced_derp: false,
+        supports_server_relay_strategy: false,
+        supports_derp_floor: false,
+        supports_overlay_echo: false,
+        advertised_routes: vec![],
+    };
+    // A neighbour already OWNS the label the rename will want — forces the
+    // in-network de-dup onto the `-2` suffix.
+    nodes
+        .create(mk_node(
+            NodeRef::Agent {
+                agent_id: ObjectId::new(),
+            },
+            "mach-devname-4b",
+            "shiny-new-name",
+            "100.64.0.9",
+        ))
+        .await
+        .unwrap();
+    let node = nodes
+        .create(mk_node(
+            NodeRef::Agent { agent_id: aid_oid },
+            "mach-devname-4",
+            "mesh-box",
+            "100.64.0.8",
+        ))
+        .await
+        .unwrap();
+
+    let resp: Value = app
+        .auth_put(
+            &format!("/api/tenant/{}/agent/{aid}", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "name": "Shiny New Name" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["dns_renamed"].as_bool(), Some(true));
+    assert_eq!(resp["dns_name"].as_str(), Some("shiny-new-name-2"));
+
+    let renamed = nodes.base.find_by_id(node.id.unwrap()).await.unwrap();
+    assert_eq!(renamed.name, "shiny-new-name-2");
+
+    // No-op rename: the label must stay put (exclude-self in the de-dup),
+    // not walk to `-3`.
+    let resp: Value = app
+        .auth_put(
+            &format!("/api/tenant/{}/agent/{aid}", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "name": "Shiny New Name" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["dns_name"].as_str(), Some("shiny-new-name-2"));
+}
+
+#[tokio::test]
+async fn tunnel_client_update_renames_and_labels() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("devname5").await;
+
+    let et: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/tunnel-client/enroll-token", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let enrolled: Value = app
+        .client
+        .post(app.url("/api/tunnel-client/enroll"))
+        .json(&json!({
+            "enrollment_token": et["enrollment_token"].as_str().unwrap(),
+            "machine_id": "tunnel-mach-devname-5",
+            "machine_name": "Operator Laptop",
+            "os": "linux",
+            "client_version": "0.3.0-test",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cid = enrolled["tunnel_client_id"].as_str().unwrap();
+
+    let resp: Value = app
+        .auth_put(
+            &format!("/api/tenant/{}/tunnel-client/{cid}", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({
+            "name": "roadwarrior",
+            "display_name": "Goran's laptop",
+            "tags": ["laptop"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["updated"].as_bool(), Some(true));
+    assert_eq!(resp["client"]["name"].as_str(), Some("roadwarrior"));
+    assert_eq!(
+        resp["client"]["display_name"].as_str(),
+        Some("Goran's laptop")
+    );
+    assert_eq!(resp["client"]["tags"][0].as_str(), Some("laptop"));
+
+    // A plain member holds no MANAGE_AGENTS — refused.
+    let resp = app
+        .auth_put(
+            &format!("/api/tenant/{}/tunnel-client/{cid}", t.tenant_id),
+            &t.member.access_token,
+        )
+        .json(&json!({ "name": "hijack" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+}

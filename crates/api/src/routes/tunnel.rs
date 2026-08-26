@@ -240,11 +240,35 @@ pub struct TunnelClientResponse {
     pub tenant_id: String,
     pub owner_user_id: String,
     pub name: String,
+    /// Admin-set friendly label; display-only (see `AgentResponse`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Admin-set fleet labels.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub machine_id: String,
     pub os: OsKind,
     pub client_version: String,
     pub status: AgentStatus,
     pub last_seen_at: String,
+}
+
+fn to_tunnel_client_response(
+    c: roomler_ai_remote_control::models::TunnelClient,
+) -> TunnelClientResponse {
+    TunnelClientResponse {
+        id: c.id.map(|i| i.to_hex()).unwrap_or_default(),
+        tenant_id: c.tenant_id.to_hex(),
+        owner_user_id: c.owner_user_id.to_hex(),
+        name: c.name,
+        display_name: c.display_name,
+        tags: c.tags,
+        machine_id: c.machine_id,
+        os: c.os,
+        client_version: c.client_version,
+        status: c.status,
+        last_seen_at: c.last_seen_at.try_to_rfc3339_string().unwrap_or_default(),
+    }
 }
 
 /// GET /api/tenant/{tenant_id}/tunnel-client — paginated list of
@@ -267,17 +291,7 @@ pub async fn list_tunnel_clients(
     let items: Vec<TunnelClientResponse> = page
         .items
         .into_iter()
-        .map(|c| TunnelClientResponse {
-            id: c.id.map(|i| i.to_hex()).unwrap_or_default(),
-            tenant_id: c.tenant_id.to_hex(),
-            owner_user_id: c.owner_user_id.to_hex(),
-            name: c.name,
-            machine_id: c.machine_id,
-            os: c.os,
-            client_version: c.client_version,
-            status: c.status,
-            last_seen_at: c.last_seen_at.try_to_rfc3339_string().unwrap_or_default(),
-        })
+        .map(to_tunnel_client_response)
         .collect();
 
     Ok(Json(serde_json::json!({
@@ -286,6 +300,85 @@ pub async fn list_tunnel_clients(
         "page": page.page,
         "per_page": page.per_page,
         "total_pages": page.total_pages,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTunnelClientRequest {
+    pub name: Option<String>,
+    /// `Some("")` clears (same convention as the agent route).
+    pub display_name: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+/// PUT /api/tenant/{tenant_id}/tunnel-client/{client_id} — rename / relabel a
+/// tunnel client SERVER-side. This is the only in-place rename there is: a
+/// client-side rename derives a fresh machine_id and enrolls a brand-new row.
+/// Mirrors `remote_control::update_agent` incl. the overlay/MagicDNS
+/// propagation and the additive response envelope. `MANAGE_AGENTS`.
+pub async fn update_tunnel_client(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, client_id)): Path<(String, String)>,
+    Json(body): Json<UpdateTunnelClientRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let cid = ObjectId::parse_str(&client_id)
+        .map_err(|_| ApiError::BadRequest("Invalid client_id".to_string()))?;
+
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+
+    // Tenant-scope the target first — a bogus/foreign id 404s.
+    state.tunnel_clients.find_in_tenant(tid, cid).await?;
+
+    let mut dns_renamed: Option<bool> = None;
+    let mut dns_name: Option<String> = None;
+    if let Some(name) = body.name {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(ApiError::BadRequest("name must not be empty".to_string()));
+        }
+        state.tunnel_clients.rename(tid, cid, &name).await?;
+        if let Some(node) = state
+            .overlay_nodes
+            .find_live_by_tunnel_client(tid, cid)
+            .await?
+        {
+            match crate::ws::overlay::propagate_node_rename(&state, &node, &name).await {
+                Some(label) => {
+                    dns_renamed = Some(true);
+                    dns_name = Some(label);
+                }
+                None => dns_renamed = Some(false),
+            }
+        }
+    }
+    if let Some(display_name) = body.display_name {
+        let trimmed = display_name.trim();
+        state
+            .tunnel_clients
+            .set_display_name(tid, cid, (!trimmed.is_empty()).then_some(trimmed))
+            .await?;
+    }
+    if let Some(tags) = body.tags {
+        let normalized = crate::routes::remote_control::normalize_tags(tags)?;
+        state.tunnel_clients.set_tags(tid, cid, &normalized).await?;
+    }
+
+    let client = state.tunnel_clients.find_in_tenant(tid, cid).await?;
+    Ok(Json(serde_json::json!({
+        "updated": true,
+        "client": to_tunnel_client_response(client),
+        "dns_renamed": dns_renamed,
+        "dns_name": dns_name,
     })))
 }
 

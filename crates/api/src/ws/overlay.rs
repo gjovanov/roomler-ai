@@ -1108,6 +1108,60 @@ pub(crate) async fn refan_node(state: &AppState, node: &OverlayNode) {
     fan_upsert_shaped(state, node, next_epoch(), is_reachable(&reach, node)).await;
 }
 
+/// Propagate a fleet-level device rename onto the device's live overlay node:
+/// derive the new MagicDNS label from the new display name, de-dup it within
+/// the network (excluding the node itself, so a no-op rename keeps its label),
+/// write it, and re-fan the node so every peer's netmap + MagicDNS resolve the
+/// new name immediately.
+///
+/// Returns the label now on the node (`Some(new_or_unchanged_label)`) or
+/// `None` when even the index-race retry lost — the fleet rename stands
+/// either way, only the DNS label kept its old value.
+///
+/// ⚠️ Deliberately does NOT push a full netmap at the renamed node itself:
+/// `self_name` rides only `ServerMsg::OverlayNetmap` (join-time), and the
+/// client's mid-session full-netmap arm is field-untested. The device serves
+/// its own new self-name after its next reconnect; its PEERS see it live.
+pub(crate) async fn propagate_node_rename(
+    state: &AppState,
+    node: &OverlayNode,
+    new_display_name: &str,
+) -> Option<String> {
+    let node_id = node.id?;
+    let base = dns_label(new_display_name, &node.machine_id);
+    let wanted =
+        unique_node_name(state, node.tenant_id, node.network_id, &base, Some(node_id)).await;
+    if wanted == node.name {
+        return Some(wanted); // label unchanged — nothing to write or fan
+    }
+    let updated = match state.overlay_nodes.set_name(node_id, &wanted).await {
+        Ok(n) => n,
+        Err(DaoError::DuplicateKey(_)) => {
+            // Lost the in-flight race the best-effort de-dup couldn't see —
+            // an epoch suffix is unique by construction.
+            let fallback = format!("{base}-{}", next_epoch());
+            match state.overlay_nodes.set_name(node_id, &fallback).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(%e, node = %node_id.to_hex(),
+                        "overlay rename lost the unique-name race twice — keeping the old DNS label");
+                    return None;
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%e, node = %node_id.to_hex(),
+                "overlay rename failed — keeping the old DNS label");
+            return None;
+        }
+    };
+    let label = updated.name.clone();
+    tracing::info!(node = %node_id.to_hex(), old = %node.name, new = %label,
+        "overlay node renamed — refanning peers");
+    refan_node(state, &updated).await;
+    Some(label)
+}
+
 /// What a successful [`release_overlay_node`] freed — for the route responses
 /// and the operator-facing log line.
 pub(crate) struct ReleasedNode {
