@@ -683,28 +683,47 @@ interface SidebarDevice {
   presence: 'online' | 'stale' | 'offline'
 }
 
+// Both sidebar groups show the first 10 (+10 per "Load more"). The
+// pageSize MUST match each search fn's per_page — hasMore is inferred
+// from a full page.
+const SIDEBAR_PAGE = 10
+
 const roomNav = useCappedSearchList<Room>({
   all: computed(() => roomStore.rooms),
-  search: (q, page) => roomStore.searchRooms(tenantId.value, q, page),
+  search: (q, page) => roomStore.searchRooms(tenantId.value, q, page, SIDEBAR_PAGE),
+  pageSize: SIDEBAR_PAGE,
 })
 
+const PRESENCE_RANK = { online: 0, stale: 1, offline: 2 } as const
+
 const deviceNav = useCappedSearchList<SidebarDevice>({
-  // Live view over agentStore.agents — device:presence patches that store
-  // in place, so the dots stay honest without any sidebar-specific wiring.
+  // Live view over agentStore.agents, ONLINE FIRST (then stale, then
+  // offline; name-tiebroken). Because this is a computed over the store
+  // that device:presence patches in place, a device coming online
+  // re-sorts into the visible top-10 slice on its own — no extra wiring.
   all: computed<SidebarDevice[]>(() =>
-    agentStore.agents.map((a) => ({
-      id: a.id,
-      name: a.name,
-      presence: a.presence ?? (a.is_online ? 'online' : 'offline'),
-    })),
+    agentStore.agents
+      .map((a) => ({
+        id: a.id,
+        name: a.name,
+        presence: a.presence ?? ((a.is_online ? 'online' : 'offline') as SidebarDevice['presence']),
+      }))
+      .sort(
+        (x, y) =>
+          PRESENCE_RANK[x.presence] - PRESENCE_RANK[y.presence] ||
+          x.name.toLowerCase().localeCompare(y.name.toLowerCase()),
+      ),
   ),
   search: async (q, page) => {
-    // The unified device feed, agents only (tunnel clients have no /remote).
+    // The unified device feed, agents only (tunnel clients have no
+    // /remote). sort=status = the server's presence rank — search results
+    // lead with online devices too.
     const params = new URLSearchParams({
       q,
       page: String(page),
-      per_page: '20',
+      per_page: String(SIDEBAR_PAGE),
       kind: 'agent',
+      sort: 'status',
     })
     const resp = await api.get<{
       items: Array<{
@@ -720,6 +739,7 @@ const deviceNav = useCappedSearchList<SidebarDevice>({
       presence: r.presence,
     }))
   },
+  pageSize: SIDEBAR_PAGE,
 })
 const showNotifications = ref(false)
 const showSearch = ref(false)
