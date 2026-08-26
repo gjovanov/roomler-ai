@@ -55,8 +55,11 @@ export const useTunnelClientStore = defineStore('tunnelClients', () => {
     loading.value = true
     error.value = null
     try {
+      // per_page=100 (the server cap): the parameterless request defaulted
+      // to 25 server-side, so an online-count over `clients` against the
+      // server `total` was the silent-truncation bug class.
       const resp = await api.get<TunnelClientListResponse>(
-        `/tenant/${tenantId}/tunnel-client`,
+        `/tenant/${tenantId}/tunnel-client?per_page=100`,
       )
       clients.value = resp.items
       total.value = resp.total

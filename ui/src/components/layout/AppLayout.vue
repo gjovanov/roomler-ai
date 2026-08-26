@@ -109,12 +109,73 @@
           :title="$t('nav.dashboard')"
           exact
         />
-        <v-list-item
-          v-if="showFleetNav"
-          :to="`/tenant/${tenantId}/devices`"
-          prepend-icon="mdi-monitor-multiple"
-          :title="$t('nav.devices')"
-        />
+        <!-- Devices-first (2026-08-26): the flat Devices item became a
+             collapsible group listing the fleet's AGENTS (a tap lands in the
+             remote view; tunnel clients have none, so they live only on the
+             /devices page the header icon opens). Server-searchable with a
+             20-row cap + load-more; rows are a live view over
+             agentStore.agents so device:presence keeps the dots honest. -->
+        <v-list-group v-if="showFleetNav" value="devices">
+          <template #activator="{ props: groupProps }">
+            <v-list-item v-bind="groupProps" prepend-icon="mdi-monitor-multiple" :title="$t('nav.devices')">
+              <template #append>
+                <v-btn
+                  icon="mdi-view-grid-outline"
+                  size="x-small"
+                  variant="text"
+                  :to="`/tenant/${tenantId}/devices`"
+                  title="Open the devices page"
+                  aria-label="Open the devices page"
+                  @click.stop
+                />
+              </template>
+            </v-list-item>
+          </template>
+          <v-text-field
+            v-if="!rail"
+            v-model="deviceNav.query.value"
+            density="compact"
+            variant="solo-filled"
+            flat
+            hide-details
+            clearable
+            prepend-inner-icon="mdi-magnify"
+            :placeholder="$t('common.search')"
+            class="mx-3 my-1 nav-search"
+            aria-label="Search devices"
+          />
+          <v-list-item
+            v-for="d in deviceNav.items.value"
+            :key="d.id"
+            :to="`/tenant/${tenantId}/agent/${d.id}/remote`"
+            :title="d.name"
+            :disabled="d.presence === 'offline'"
+            density="compact"
+          >
+            <template #prepend>
+              <v-icon
+                size="x-small"
+                :color="d.presence === 'online' ? 'success' : d.presence === 'stale' ? 'warning' : 'grey'"
+              >
+                mdi-circle
+              </v-icon>
+            </template>
+          </v-list-item>
+          <v-list-item
+            v-if="deviceNav.searching.value"
+            density="compact"
+            :title="$t('common.loading')"
+            disabled
+          />
+          <v-list-item
+            v-else-if="deviceNav.hasMore.value"
+            density="compact"
+            class="text-medium-emphasis"
+            :title="$t('common.loadMore')"
+            prepend-icon="mdi-chevron-down"
+            @click="deviceNav.loadMore()"
+          />
+        </v-list-group>
         <!-- Analytics (stats PR-4): FAIL-CLOSED gating (canQueryAnalytics)
              — the stats query endpoints 404 without MANAGE_AGENTS and the
              api client logs out on 403, so this nav never leads a plain
@@ -136,13 +197,89 @@
           <v-list-item :to="`/tenant/${tenantId}/network/subnet-routes`" prepend-icon="mdi-lan-connect" :title="$t('nav.subnetRoutes')" />
           <v-list-item :to="`/tenant/${tenantId}/network/dns`" prepend-icon="mdi-dns" :title="$t('nav.magicDns')" />
         </v-list-group>
-        <v-list-group value="rooms">
+        <!-- `value` was "rooms" — freed for the Rooms group below (openGroups
+             keys collide otherwise). The Rooms PAGE entry moved onto the Rooms
+             group's header icon, mirroring the Devices group. -->
+        <v-list-group value="collab">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-forum" :title="$t('nav.collaboration')" />
           </template>
-          <v-list-item :to="`/tenant/${tenantId}/rooms`" prepend-icon="mdi-pound" :title="$t('nav.rooms')" />
           <v-list-item :to="`/tenant/${tenantId}/explore`" prepend-icon="mdi-compass" :title="$t('nav.explore')" />
           <v-list-item :to="`/tenant/${tenantId}/files`" prepend-icon="mdi-folder" :title="$t('nav.files')" />
+        </v-list-group>
+        <!-- The old flat "Your rooms" list, as a collapsible group: server-
+             searchable, first 20 + load-more. Rows keep the unread badges;
+             the header carries the total so a collapsed group still shows
+             there's something unread. The list under an EMPTY query is a
+             SLICE of roomStore.rooms — that store list stays complete
+             (dashboard tiles, the app-bar call menu and updateRoomCallStatus
+             iterate it), the cap is presentational only. -->
+        <v-list-group value="rooms">
+          <template #activator="{ props: groupProps }">
+            <v-list-item v-bind="groupProps" prepend-icon="mdi-pound" :title="$t('nav.rooms')">
+              <template #append>
+                <v-badge
+                  v-if="roomStore.totalUnread > 0"
+                  :content="roomStore.totalUnread"
+                  color="error"
+                  inline
+                />
+                <v-btn
+                  icon="mdi-view-grid-outline"
+                  size="x-small"
+                  variant="text"
+                  :to="`/tenant/${tenantId}/rooms`"
+                  title="Open the rooms page"
+                  aria-label="Open the rooms page"
+                  @click.stop
+                />
+              </template>
+            </v-list-item>
+          </template>
+          <v-text-field
+            v-if="!rail"
+            v-model="roomNav.query.value"
+            density="compact"
+            variant="solo-filled"
+            flat
+            hide-details
+            clearable
+            prepend-inner-icon="mdi-magnify"
+            :placeholder="$t('common.search')"
+            class="mx-3 my-1 nav-search"
+            aria-label="Search rooms"
+          />
+          <v-list-item
+            v-for="room in roomNav.items.value"
+            :key="room.id"
+            :to="`/tenant/${tenantId}/room/${room.id}`"
+            :title="room.name"
+            :prepend-icon="room.has_media ? 'mdi-video' : 'mdi-pound'"
+            density="compact"
+          >
+            <template #append>
+              <v-badge
+                v-if="(roomStore.unreadCounts[room.id] || 0) > 0"
+                :content="roomStore.unreadCounts[room.id]"
+                color="error"
+                inline
+              />
+            </template>
+          </v-list-item>
+          <v-list-item
+            v-if="roomNav.searching.value"
+            density="compact"
+            :title="$t('common.loading')"
+            disabled
+          />
+          <v-list-item
+            v-else-if="roomNav.hasMore.value"
+            density="compact"
+            class="text-medium-emphasis"
+            :title="$t('common.loadMore')"
+            prepend-icon="mdi-chevron-down"
+            @click="roomNav.loadMore()"
+          />
         </v-list-group>
         <!-- Top-level again (2026-08-26): the S4 IA pivot demoted Invites
              into the Collaboration group and users read that as "the invite
@@ -175,28 +312,6 @@
         />
       </v-list>
 
-      <!-- Rooms with unread badges -->
-      <v-divider v-if="!rail && roomStore.rooms.length > 0" />
-      <v-list v-if="!rail && roomStore.rooms.length > 0" density="compact" nav>
-        <v-list-subheader>Your rooms</v-list-subheader>
-        <v-list-item
-          v-for="room in roomStore.rooms"
-          :key="room.id"
-          :to="`/tenant/${tenantId}/room/${room.id}`"
-          :title="room.name"
-          :prepend-icon="room.has_media ? 'mdi-video' : 'mdi-pound'"
-          density="compact"
-        >
-          <template #append>
-            <v-badge
-              v-if="(roomStore.unreadCounts[room.id] || 0) > 0"
-              :content="roomStore.unreadCounts[room.id]"
-              color="error"
-              inline
-            />
-          </template>
-        </v-list-item>
-      </v-list>
 
       <template #append>
         <!-- Mini conference widget (visible when in call but navigated away) -->
@@ -383,7 +498,10 @@ import { useAuth } from '@/composables/useAuth'
 import { usePageViews } from '@/composables/usePageViews'
 import { useTenantStore } from '@/stores/tenant'
 import { canManageInvites, canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
-import { useRoomStore } from '@/stores/rooms'
+import { useRoomStore, type Room } from '@/stores/rooms'
+import { useAgentStore } from '@/stores/agents'
+import { useCappedSearchList } from '@/composables/useCappedSearchList'
+import { api } from '@/api/client'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
@@ -456,7 +574,58 @@ const drawer = ref(!mobile.value)
 const rail = ref(false)
 // S4 nav groups — Collaboration starts open (the day-to-day pages);
 // Network/Admin start collapsed. The user's toggles win afterwards.
-const openGroups = ref<string[]>(['rooms'])
+// Devices + Rooms default EXPANDED (they are the product's primary nav
+// now); Network/Collab/Admin start collapsed. "collab" is the renamed
+// Collaboration key — "rooms" belongs to the Rooms group.
+const openGroups = ref<string[]>(['devices', 'rooms'])
+
+// ── Sidebar capped lists (first 20 + load-more, server search) ──
+const agentStore = useAgentStore()
+
+interface SidebarDevice {
+  id: string
+  name: string
+  presence: 'online' | 'stale' | 'offline'
+}
+
+const roomNav = useCappedSearchList<Room>({
+  all: computed(() => roomStore.rooms),
+  search: (q, page) => roomStore.searchRooms(tenantId.value, q, page),
+})
+
+const deviceNav = useCappedSearchList<SidebarDevice>({
+  // Live view over agentStore.agents — device:presence patches that store
+  // in place, so the dots stay honest without any sidebar-specific wiring.
+  all: computed<SidebarDevice[]>(() =>
+    agentStore.agents.map((a) => ({
+      id: a.id,
+      name: a.name,
+      presence: a.presence ?? (a.is_online ? 'online' : 'offline'),
+    })),
+  ),
+  search: async (q, page) => {
+    // The unified device feed, agents only (tunnel clients have no /remote).
+    const params = new URLSearchParams({
+      q,
+      page: String(page),
+      per_page: '20',
+      kind: 'agent',
+    })
+    const resp = await api.get<{
+      items: Array<{
+        id: string
+        name: string
+        display_name?: string
+        presence: 'online' | 'stale' | 'offline'
+      }>
+    }>(`/tenant/${tenantId.value}/device?${params.toString()}`)
+    return resp.items.map((r) => ({
+      id: r.id,
+      name: r.display_name || r.name,
+      presence: r.presence,
+    }))
+  },
+})
 const showNotifications = ref(false)
 const showSearch = ref(false)
 
@@ -543,6 +712,24 @@ const canInvite = computed(() =>
   canManageInvites(tenantStore.myPermissions, tenantStore.isOwner),
 )
 const isPlatformAdmin = computed(() => auth.user?.is_platform_admin === true)
+
+// Sidebar Devices group data + capped-list resets. A SEPARATE watcher from
+// the rooms one above: this body reads `showFleetNav`, which is declared
+// between the two — folding it into the earlier immediate watcher would hit
+// the TDZ on first run. AppLayout never fetched agents before the group
+// existed; refetching on every tenant/permission flip is idempotent.
+watch(
+  [tenantId, showFleetNav] as const,
+  ([tid, fleet], prev) => {
+    const prevTid = prev?.[0]
+    if (tid && prevTid !== undefined && prevTid !== tid) {
+      roomNav.reset()
+      deviceNav.reset()
+    }
+    if (tid && fleet) void agentStore.fetchAgents(tid).catch(() => {})
+  },
+  { immediate: true },
+)
 
 const settingsRoute = computed(() =>
   tenantId.value ? `/tenant/${tenantId.value}/admin` : '/',
@@ -638,6 +825,10 @@ async function onWsReconnected() {
   // P4 — cross-org badges converge by refetch (no event replay).
   orgBadges.fetchSummary()
   if (!tenantId.value) return
+  // Sidebar search state is stale relative to the wholesale refetches below.
+  roomNav.reset()
+  deviceNav.reset()
+  if (showFleetNav.value) void agentStore.fetchAgents(tenantId.value).catch(() => {})
   await roomStore.fetchRooms(tenantId.value)
   roomStore.fetchAllUnreadCounts(tenantId.value)
   const messageStore = useMessageStore()
