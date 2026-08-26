@@ -720,3 +720,75 @@ async fn test_revoke_invite_no_permission() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
 }
+
+// ─── Email honesty + batch (PR-A, 2026-08-26) ───────────────────
+
+/// `email_sent` is ALWAYS serialized — a skipped-false would be
+/// indistinguishable from an old server. Test config has no email backend,
+/// so a targeted create must report `false`, not omit the field.
+#[tokio::test]
+async fn test_create_invite_reports_email_sent() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("invmail1").await;
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/invite", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({ "target_email": "target@test.local" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 201);
+    let body: Value = resp.json().await.unwrap();
+    // Field-presence assertion: as_bool() is None if the field were skipped.
+    assert_eq!(body["email_sent"].as_bool(), Some(false));
+}
+
+/// First coverage of the batch route at all. Locks: mixed link/targeted items
+/// both create, a bad item fails WITHOUT aborting the batch, the counts are
+/// per-item, and every created row carries the always-serialized `email_sent`.
+#[tokio::test]
+async fn test_batch_create_invites_mixed() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("invmail2").await;
+
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/invite/batch", seeded.tenant_id),
+            &seeded.admin.access_token,
+        )
+        .json(&serde_json::json!({
+            "invites": [
+                { "target_email": "a@test.local" },
+                { "max_uses": 5 },
+                { "target_email": "b@test.local", "assign_role_ids": ["not-an-oid"] },
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status().as_u16(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["created"].as_u64(), Some(2));
+    assert_eq!(body["failed"].as_u64(), Some(1));
+
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+
+    let targeted = &results[0]["invite"];
+    assert_eq!(targeted["target_email"].as_str(), Some("a@test.local"));
+    assert_eq!(targeted["max_uses"].as_u64(), Some(1)); // targeted ⇒ forced single-use
+    assert_eq!(targeted["email_sent"].as_bool(), Some(false));
+
+    let link = &results[1]["invite"];
+    assert!(link["target_email"].is_null());
+    assert_eq!(link["max_uses"].as_u64(), Some(5));
+    assert_eq!(link["email_sent"].as_bool(), Some(false));
+
+    assert!(results[2]["invite"].is_null());
+    assert!(!results[2]["error"].as_str().unwrap_or_default().is_empty());
+}
