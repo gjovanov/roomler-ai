@@ -705,7 +705,9 @@ const deviceNav = useCappedSearchList<SidebarDevice>({
     agentStore.agents
       .map((a) => ({
         id: a.id,
-        name: a.name,
+        // Display name when set, machine name otherwise — matching the
+        // grid and the search-mode rows.
+        name: a.display_name || a.name,
         presence: a.presence ?? ((a.is_online ? 'online' : 'offline') as SidebarDevice['presence']),
       }))
       .sort(

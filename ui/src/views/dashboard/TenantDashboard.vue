@@ -19,10 +19,12 @@
         </v-card>
       </v-col>
       <v-col cols="6" sm="4" md>
+        <!-- No `title` PROP here — on v-card it renders a whole title bar
+             and made this tile taller than its siblings. Lands on the
+             devices page pre-filtered to tunnels (?type=tunnel). -->
         <v-card
-          :to="showFleet ? `/tenant/${tenantId}/devices` : undefined"
+          :to="showFleet ? `/tenant/${tenantId}/devices?type=tunnel` : undefined"
           :hover="showFleet"
-          title="Enrolled tunnel clients (stored status — no liveness probe)"
         >
           <v-card-text class="text-center">
             <v-icon size="48" color="info">mdi-lan-pending</v-icon>
