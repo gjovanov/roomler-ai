@@ -38,10 +38,21 @@ pub struct RoomResponse {
     pub participant_count: u32,
 }
 
+/// Optional sidebar-search params. Flat (never `#[serde(flatten)]` behind
+/// axum `Query` — the postmortem lives on `agent_exec.rs`'s AuditQuery); all
+/// optional so a bare `GET /room` keeps its exact legacy behavior AND shape.
+#[derive(Debug, serde::Deserialize)]
+pub struct ListRoomsQuery {
+    pub q: Option<String>,
+    pub page: Option<u64>,
+    pub per_page: Option<u64>,
+}
+
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
+    Query(params): Query<ListRoomsQuery>,
 ) -> Result<Json<Vec<RoomResponse>>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -50,7 +61,34 @@ pub async fn list(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let rooms = state.rooms.find_by_tenant(tid).await?;
+    let search_mode = params
+        .q
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|q| !q.is_empty())
+        || params.page.is_some()
+        || params.per_page.is_some();
+    let rooms = if search_mode {
+        // Server-side search/paging for the capped sidebar: the secret-room
+        // visibility condition is pushed into the query so a page can't
+        // under-fill (the response stays a bare array; the client infers
+        // has_more from items.len() == per_page).
+        state
+            .rooms
+            .search_for_tenant(
+                tid,
+                auth.user_id,
+                params.q.as_deref().map(str::trim).unwrap_or(""),
+                &roomler_ai_services::dao::base::PaginationParams {
+                    page: params.page.unwrap_or(1).max(1),
+                    per_page: params.per_page.unwrap_or(20),
+                    before: None,
+                },
+            )
+            .await?
+    } else {
+        state.rooms.find_by_tenant(tid).await?
+    };
 
     // A Secret room must not appear to someone who is not in it — its
     // existence is the thing being kept. Private rooms DO stay listed: that is
