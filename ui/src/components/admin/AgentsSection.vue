@@ -1,7 +1,8 @@
 <template>
   <v-card>
+    <!-- No title text: the hosting view's h1 already says "Devices"
+         (consistent with /rooms and /analytics) — the bar holds actions only. -->
     <v-card-title class="d-flex align-center">
-      <span>Devices</span>
       <v-spacer />
       <v-btn
         prepend-icon="mdi-update"
@@ -80,7 +81,7 @@
            off the right edge (field bug 2026-05-01). Below sm the dedicated
            card lists render further down. -->
       <template v-else-if="!mobile">
-        <div class="d-flex align-center mb-2">
+        <div class="d-flex align-center mb-2 flex-wrap">
           <v-text-field
             v-model="gridSearch"
             density="compact"
@@ -92,9 +93,25 @@
             style="max-width: 340px"
             aria-label="Search devices"
           />
+          <!-- Kind filter. Default = devices WITHOUT tunnel clients — the
+               remote-desktop fleet is what this page is about day-to-day;
+               tunnels are one radio away. Server-side (`kind` param). -->
+          <v-radio-group
+            v-model="gridKind"
+            inline
+            hide-details
+            density="compact"
+            class="ml-4 flex-grow-0"
+            aria-label="Filter by device kind"
+          >
+            <v-radio label="Devices" value="agent" density="compact" />
+            <v-radio label="Tunnels" value="tunnel_client" density="compact" />
+            <v-radio label="Both" value="both" density="compact" />
+          </v-radio-group>
           <v-spacer />
           <span class="text-caption text-medium-emphasis mr-2">
-            {{ deviceStore.total }} {{ deviceStore.total === 1 ? 'device' : 'devices' }}
+            {{ deviceStore.total }}
+            {{ gridKind === 'tunnel_client' ? (deviceStore.total === 1 ? 'tunnel' : 'tunnels') : deviceStore.total === 1 ? 'device' : 'devices' }}
           </span>
           <v-btn
             icon="mdi-cog-outline"
@@ -290,7 +307,9 @@
               />
             </div>
             <div class="text-caption text-medium-emphasis d-flex align-center flex-wrap">
-              <span v-if="item.display_name" class="mr-1">{{ item.name }} ·</span>
+              <!-- The machine-reported title collapses away by default once a
+                   display name is set (column-picker checkbox). -->
+              <span v-if="item.display_name && !hideNameWhenDisplay" class="mr-1">{{ item.name }} ·</span>
               <span class="agent-id-preview" :title="`Device ID: ${item.id}`">
                 id: {{ shortId(item.id) }}
               </span>
@@ -872,7 +891,17 @@
     @toggle="colToggle"
     @reorder="colReorder"
     @reset="colReset"
-  />
+  >
+    <template #append>
+      <v-divider class="my-1" />
+      <v-checkbox-btn
+        v-model="hideNameWhenDisplay"
+        density="compact"
+        class="px-2"
+        label="Hide device name when a display name is set"
+      />
+    </template>
+  </GridColumnPickerDialog>
 
   <!-- Name / display-name / tags (both kinds; rename propagates to MagicDNS). -->
   <DeviceEditDialog
@@ -1317,7 +1346,37 @@ const gridPage = ref(1)
 const gridPerPage = ref(25)
 const gridSort = ref<string | undefined>(undefined)
 const gridDir = ref<'asc' | 'desc' | undefined>(undefined)
+/** Kind radio: devices-only by default — 'both' widens to tunnel clients. */
+const gridKind = ref<'agent' | 'tunnel_client' | 'both'>('agent')
 const colDialogOpen = ref(false)
+
+/** Column-picker extra: collapse the Name cell to the display name alone
+ *  when one is set (default ON — the machine-reported title is noise once
+ *  someone has named the device). Per user+org, like the column prefs. */
+const HIDE_NAME_KEY = () =>
+  `roomler:grid-name-pref:${auth.user?.id ?? 'anon'}:${props.tenantId}:devices`
+function loadHideName(): boolean {
+  try {
+    const v = localStorage.getItem(HIDE_NAME_KEY())
+    return v === null ? true : v === '1'
+  } catch {
+    return true
+  }
+}
+const hideNameWhenDisplay = ref(loadHideName())
+watch(hideNameWhenDisplay, (v) => {
+  try {
+    localStorage.setItem(HIDE_NAME_KEY(), v ? '1' : '0')
+  } catch {
+    /* private browsing */
+  }
+})
+watch(
+  () => props.tenantId,
+  () => {
+    hideNameWhenDisplay.value = loadHideName()
+  },
+)
 
 const deviceHeaders = computed(() => [
   // Leftmost on purpose — see the template comment (field bug 2026-05-01).
@@ -1354,9 +1413,15 @@ function fetchGrid() {
       q: gridSearch.value || undefined,
       sort: gridSort.value,
       dir: gridDir.value,
+      kind: gridKind.value === 'both' ? undefined : gridKind.value,
     })
     .catch(() => {})
 }
+
+watch(gridKind, () => {
+  if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+  else fetchGrid()
+})
 
 /** v-data-table-server fires this once on mount too — it is the grid's ONLY
  *  fetch trigger for page/sort changes (a separate onMounted fetch would
