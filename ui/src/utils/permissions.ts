@@ -244,6 +244,26 @@ export function canManageInvites(mask: number | null, isOwner: boolean): boolean
 }
 
 /**
+ * Nav gates for the Audit pages. FAIL-CLOSED like {@link canQueryAnalytics}
+ * and for the same reason: the audit endpoints 403 without their bit and the
+ * api client force-logs-out on GET 403. Two separate helpers because the
+ * server deliberately splits the bits — reviewing command history
+ * (VIEW_EXEC_AUDIT) and reviewing SSH sessions (VIEW_SSH_AUDIT) are
+ * different jobs.
+ */
+export function canViewExecAudit(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['VIEW_EXEC_AUDIT']))
+}
+
+export function canViewSshAudit(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['VIEW_SSH_AUDIT']))
+}
+
+/**
  * May this caller ask a device to turn exec / SSH ON?
  *
  * `MANAGE_AGENTS` alone is NOT enough, and that is the whole point. Enabling
