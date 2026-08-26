@@ -44,6 +44,12 @@ pub struct InviteResponse {
     pub assign_role_ids: Vec<String>,
     pub expires_at: Option<String>,
     pub created_at: String,
+    /// True only when THIS request dispatched an invite email — targeted
+    /// invite + a configured email backend. Always serialized (a skipped
+    /// false would be indistinguishable from an old server), so the UI can
+    /// stop claiming "sent" for invites that only ever existed as links.
+    /// List responses report false: the flag describes the create, not the row.
+    pub email_sent: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,27 +279,16 @@ pub async fn create_invite(
         )
         .await?;
 
-    // Send invite email if target_email is set and email service is configured
-    if let (Some(email_addr), Some(email_svc)) = (&target_email, &state.email) {
-        let inviter = state.users.base.find_by_id(auth.user_id).await.ok();
-        let inviter_name = inviter.map(|u| u.display_name).unwrap_or_default();
-        let tenant = state.tenants.base.find_by_id(tid).await.ok();
-        let tenant_name = tenant.map(|t| t.name).unwrap_or_default();
-        let invite_url = format!("{}/invite/{}", state.settings.oauth.base_url, invite.code,);
-        let email_svc = email_svc.clone();
-        let email_addr = email_addr.clone();
-        // Fire-and-forget — don't block the response on email delivery
-        tokio::spawn(async move {
-            if let Err(e) = email_svc
-                .send_invite(&email_addr, &inviter_name, &tenant_name, &invite_url)
-                .await
-            {
-                tracing::warn!(%e, "Failed to send invite email");
-            }
-        });
-    }
+    let email_sent = if target_email.is_some() {
+        let ctx = invite_email_ctx(&state, auth.user_id, tid).await;
+        spawn_invite_email(&state, &ctx, &invite)
+    } else {
+        false
+    };
 
-    Ok((StatusCode::CREATED, Json(invite_to_response(invite))))
+    let mut resp = invite_to_response(invite);
+    resp.email_sent = email_sent;
+    Ok((StatusCode::CREATED, Json(resp)))
 }
 
 /// POST /api/tenant/{tenant_id}/invite/batch — create multiple invites
@@ -316,6 +311,9 @@ pub async fn batch_create_invite(
     }
 
     let mut results: Vec<BatchInviteResult> = Vec::with_capacity(body.invites.len());
+    // Inviter/tenant display strings are per-REQUEST, not per-item — resolved
+    // lazily on the first targeted invite so a link-only batch costs nothing.
+    let mut email_ctx: Option<InviteEmailCtx> = None;
 
     for item in body.invites {
         let assign_role_ids: Result<Vec<ObjectId>, _> =
@@ -349,11 +347,23 @@ pub async fn batch_create_invite(
                     )
                     .await
                 {
-                    Ok(invite) => results.push(BatchInviteResult {
-                        invite: Some(invite_to_response(invite)),
-                        error: None,
-                        target_email: item.target_email,
-                    }),
+                    Ok(invite) => {
+                        let email_sent = if invite.target_email.is_some() {
+                            if email_ctx.is_none() {
+                                email_ctx = Some(invite_email_ctx(&state, auth.user_id, tid).await);
+                            }
+                            spawn_invite_email(&state, email_ctx.as_ref().unwrap(), &invite)
+                        } else {
+                            false
+                        };
+                        let mut resp = invite_to_response(invite);
+                        resp.email_sent = email_sent;
+                        results.push(BatchInviteResult {
+                            invite: Some(resp),
+                            error: None,
+                            target_email: item.target_email,
+                        })
+                    }
                     Err(e) => results.push(BatchInviteResult {
                         invite: None,
                         error: Some(e.to_string()),
@@ -447,6 +457,74 @@ pub async fn add_member(
 
 // ─── Helpers ────────────────────────────────────────────────────
 
+/// Display strings the invite email needs, resolved once per request — the
+/// batch route reuses one lookup across up to 50 sends.
+struct InviteEmailCtx {
+    inviter_name: String,
+    tenant_name: String,
+}
+
+async fn invite_email_ctx(state: &AppState, inviter_id: ObjectId, tid: ObjectId) -> InviteEmailCtx {
+    let inviter_name = state
+        .users
+        .base
+        .find_by_id(inviter_id)
+        .await
+        .ok()
+        .map(|u| u.display_name)
+        .unwrap_or_default();
+    let tenant_name = state
+        .tenants
+        .base
+        .find_by_id(tid)
+        .await
+        .ok()
+        .map(|t| t.name)
+        .unwrap_or_default();
+    InviteEmailCtx {
+        inviter_name,
+        tenant_name,
+    }
+}
+
+/// Fire-and-forget invite email. Returns whether a send was actually
+/// dispatched. Shared by the single and batch create routes so the two can't
+/// drift again — the batch route shipped for months sending nothing while its
+/// dialog said "N invites sent".
+fn spawn_invite_email(
+    state: &AppState,
+    ctx: &InviteEmailCtx,
+    invite: &roomler_ai_db::models::Invite,
+) -> bool {
+    let Some(email_addr) = invite.target_email.clone() else {
+        return false;
+    };
+    let Some(email_svc) = state.email.clone() else {
+        // A targeted invite with no email backend used to vanish silently —
+        // the id (never the code: the code IS the access grant) gives the
+        // operator something to grep for.
+        tracing::warn!(
+            invite_id = %invite.id.map(|i| i.to_hex()).unwrap_or_default(),
+            "invite targets an email address but no email backend is configured — nothing sent"
+        );
+        return false;
+    };
+    // The link must land on the SPA origin — every other user-facing mail
+    // builds from frontend_url (oauth.base_url is the API origin in dev).
+    let invite_url = format!("{}/invite/{}", state.settings.app.frontend_url, invite.code);
+    let inviter_name = ctx.inviter_name.clone();
+    let tenant_name = ctx.tenant_name.clone();
+    tokio::spawn(async move {
+        if let Err(e) = email_svc
+            .send_invite(&email_addr, &inviter_name, &tenant_name, &invite_url)
+            .await
+        {
+            tracing::warn!(%e, "Failed to send invite email");
+        }
+    });
+    true
+}
+
 fn parse_oid(s: &str) -> Result<ObjectId, ApiError> {
     ObjectId::parse_str(s).map_err(|_| ApiError::BadRequest(format!("Invalid ObjectId: {}", s)))
 }
@@ -492,5 +570,6 @@ fn invite_to_response(invite: roomler_ai_db::models::Invite) -> InviteResponse {
             .created_at
             .try_to_rfc3339_string()
             .unwrap_or_default(),
+        email_sent: false,
     }
 }
