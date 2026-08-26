@@ -19,7 +19,7 @@
 
     <v-row v-else>
       <v-col v-for="t in tenantStore.tenants" :key="t.id" cols="12" sm="6" md="4">
-        <v-card :to="`/tenant/${t.id}`" hover>
+        <v-card :to="`/tenant/${t.id}`" hover height="100%">
           <v-card-title>
             <v-icon class="mr-2">mdi-domain</v-icon>
             {{ t.name }}
@@ -29,11 +29,13 @@
         </v-card>
       </v-col>
       <!-- Creating a SECOND org used to be impossible: the create form
-           only rendered while you had zero tenants. -->
+           only rendered while you had zero tenants. height=100% on BOTH
+           card kinds keeps this one the same height as the org cards. -->
       <v-col cols="12" sm="6" md="4">
         <v-card
           variant="outlined"
           hover
+          height="100%"
           class="d-flex align-center justify-center"
           style="min-height: 96px; cursor: pointer"
           @click="showCreate = true"
