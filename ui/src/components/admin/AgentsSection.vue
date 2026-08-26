@@ -306,7 +306,7 @@
                 :title="copiedAgentId === item.id ? 'Copied!' : 'Copy device ID'"
               />
             </div>
-            <div class="text-caption text-medium-emphasis d-flex align-center flex-wrap">
+            <div class="text-caption text-medium-emphasis d-flex align-center flex-nowrap">
               <!-- The machine-reported title collapses away by default once a
                    display name is set (column-picker checkbox). -->
               <span v-if="item.display_name && !hideNameWhenDisplay" class="mr-1">{{ item.name }} ·</span>
@@ -380,7 +380,7 @@
             <span v-else class="text-caption text-medium-emphasis">—</span>
           </template>
           <template #item.tags="{ item }">
-            <div v-if="item.tags?.length" class="d-flex flex-wrap gap-1">
+            <div v-if="item.tags?.length" class="d-flex flex-nowrap gap-1">
               <v-chip v-for="t in item.tags.slice(0, 3)" :key="t" size="x-small" variant="tonal">
                 {{ t }}
               </v-chip>
@@ -427,7 +427,7 @@
           <template #item.codecs="{ item }">
             <template v-if="item.kind === 'agent' && agentFor(item)">
               <div v-if="codecChips(agentFor(item)!).length === 0" class="text-caption text-medium-emphasis">—</div>
-              <div v-else-if="lgAndDown" class="d-flex flex-wrap gap-1 align-center">
+              <div v-else-if="lgAndDown" class="d-flex flex-nowrap gap-1 align-center">
                 <v-chip
                   size="x-small"
                   :color="codecChips(agentFor(item)!)[0].color"
@@ -445,7 +445,7 @@
                   +{{ codecChips(agentFor(item)!).length - 1 }}
                 </v-chip>
               </div>
-              <div v-else class="d-flex flex-wrap gap-1">
+              <div v-else class="d-flex flex-nowrap gap-1">
                 <v-chip
                   v-for="codec in codecChips(agentFor(item)!)"
                   :key="codec.label"
@@ -460,7 +460,7 @@
               <!-- A device the OS has muzzled looks identical to a healthy one
                    until you connect and get a black screen, because macOS
                    reports success either way. Say it here instead. -->
-              <div v-if="permissionWarnings(agentFor(item)!).length" class="d-flex flex-wrap gap-1 mt-1">
+              <div v-if="permissionWarnings(agentFor(item)!).length" class="d-flex flex-nowrap gap-1 mt-1">
                 <v-chip
                   v-for="w in permissionWarnings(agentFor(item)!)"
                   :key="w.label"
@@ -2235,5 +2235,27 @@ watch(() => props.tenantId, (tid) => {
   width: 96px;
   min-width: 96px;
   white-space: nowrap;
+}
+
+/* Never squeeze the columns into the viewport — every cell keeps its
+   natural width (max two lines per cell: e.g. name over id·version,
+   consent over input mode) and the WRAPPER scrolls horizontally.
+   (House rule: wide tables scroll in their own container.) */
+.agents-table :deep(.v-table__wrapper) {
+  overflow-x: auto;
+}
+.agents-table :deep(table) {
+  width: max-content;
+  min-width: 100%;
+}
+.agents-table :deep(th),
+.agents-table :deep(td) {
+  white-space: nowrap;
+}
+
+/* The two stacked selects (consent / input mode) need room to render
+   their labels on one line each instead of clipping. */
+.agents-table :deep(.consent-select) {
+  min-width: 170px;
 }
 </style>
