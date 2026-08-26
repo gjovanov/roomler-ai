@@ -31,6 +31,9 @@ impl TunnelClientDao {
             tenant_id,
             owner_user_id,
             name,
+            display_name: None,
+            tags: Vec::new(),
+            name_admin_set: false,
             machine_id,
             os,
             client_version,
@@ -62,8 +65,11 @@ impl TunnelClientDao {
     }
 
     /// Refresh at re-enrollment: clear `deleted_at`, refresh
-    /// name / os / client_version, bump `updated_at`. Returns the
+    /// os / client_version, bump `updated_at`. Returns the
     /// updated row so the caller can mint a fresh tunnel-client token.
+    ///
+    /// `name` refreshes ONLY while `name_admin_set` is unset — same
+    /// rehydrate-clobber protection as `AgentDao::rehydrate`.
     pub async fn rehydrate(
         &self,
         client_id: ObjectId,
@@ -77,13 +83,18 @@ impl TunnelClientDao {
                 client_id,
                 doc! {
                     "$set": {
-                        "name": name,
                         "os": os_bson,
                         "client_version": client_version,
                         "updated_at": DateTime::now(),
                         "deleted_at": bson::Bson::Null,
                     }
                 },
+            )
+            .await?;
+        self.base
+            .update_one(
+                doc! { "_id": client_id, "name_admin_set": { "$ne": true } },
+                doc! { "$set": { "name": name } },
             )
             .await?;
         self.base.find_by_id(client_id).await
@@ -156,7 +167,38 @@ impl TunnelClientDao {
         self.base
             .update_one(
                 doc! { "_id": client_id, "tenant_id": tenant_id },
-                doc! { "$set": { "name": name } },
+                doc! { "$set": { "name": name, "name_admin_set": true } },
+            )
+            .await
+    }
+
+    /// Set/clear the friendly display label (display-only, like the agent's).
+    pub async fn set_display_name(
+        &self,
+        tenant_id: ObjectId,
+        client_id: ObjectId,
+        display_name: Option<&str>,
+    ) -> DaoResult<bool> {
+        let update = match display_name {
+            Some(v) => doc! { "$set": { "display_name": v } },
+            None => doc! { "$unset": { "display_name": "" } },
+        };
+        self.base
+            .update_one(doc! { "_id": client_id, "tenant_id": tenant_id }, update)
+            .await
+    }
+
+    /// Replace the client's whole tag list.
+    pub async fn set_tags(
+        &self,
+        tenant_id: ObjectId,
+        client_id: ObjectId,
+        tags: &[String],
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                doc! { "_id": client_id, "tenant_id": tenant_id },
+                doc! { "$set": { "tags": tags.to_vec() } },
             )
             .await
     }

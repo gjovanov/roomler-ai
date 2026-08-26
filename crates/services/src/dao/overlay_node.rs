@@ -408,6 +408,25 @@ impl OverlayNodeDao {
             .await
     }
 
+    /// Twin of [`Self::find_live_by_agent`] for tunnel-client-backed nodes —
+    /// keyed by node_ref (the `{tenant_id, "node_ref.id"}` index), not
+    /// machine_id, so it can't confuse an agent and a tunnel client that
+    /// coexist on one host with different machine-id derivations.
+    pub async fn find_live_by_tunnel_client(
+        &self,
+        tenant_id: ObjectId,
+        tunnel_client_id: ObjectId,
+    ) -> DaoResult<Option<OverlayNode>> {
+        self.base
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "node_ref.kind": "tunnel_client",
+                "node_ref.id": tunnel_client_id,
+                "deleted_at": bson::Bson::Null,
+            })
+            .await
+    }
+
     pub async fn set_relay_home_for_agent(
         &self,
         agent_id: ObjectId,
@@ -544,6 +563,23 @@ impl OverlayNodeDao {
     /// Phase 1 — set the admin-APPROVED subnet routes for a node and return the
     /// updated row. The caller must first verify the node belongs to the admin's
     /// tenant and that each route is among the node's `advertised_routes`.
+    /// Rename the node's MagicDNS label. The caller owns sanitization +
+    /// in-network de-dup (`ws::overlay::propagate_node_rename`); the unique
+    /// partial `(tenant, network, name)` index is the final arbiter — a lost
+    /// race surfaces as `DaoError::DuplicateKey` for the caller to retry.
+    pub async fn set_name(&self, node_id: ObjectId, name: &str) -> DaoResult<OverlayNode> {
+        self.base
+            .update_by_id(
+                node_id,
+                doc! { "$set": {
+                    "name": name,
+                    "updated_at": DateTime::now(),
+                } },
+            )
+            .await?;
+        self.base.find_by_id(node_id).await
+    }
+
     pub async fn set_approved_routes(
         &self,
         node_id: ObjectId,
