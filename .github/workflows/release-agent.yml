@@ -2169,8 +2169,15 @@ jobs:
           # an env var lost between steps would silently ship ad-hoc and
           # re-introduce the per-update TCC wipe.
           if [ "$SIGN_ID" != "-" ]; then
-            codesign -dv "$APP" 2>&1 | grep -q "Authority=Roomler Self-Signed Code Signing" || {
+            # ⚠️ Authority= lines only appear at --verbose=2 and above; plain
+            # `-dv` (verbosity 1) NEVER prints them, so the rc.478 assert
+            # failed on a perfectly-signed bundle. Same lesson as the smoke's
+            # own history: an assert that can't distinguish pass from fail
+            # must dump what it actually saw.
+            codesign -d --verbose=2 "$APP" 2>&1 | grep -q "Authority=Roomler Self-Signed Code Signing" || {
               echo "::error::bundle is not signed by the stable identity (Authority missing)"
+              echo "--- codesign -d --verbose=2 output ---"
+              codesign -d --verbose=2 "$APP" 2>&1 || true
               exit 1
             }
             echo "  sealed with the stable identity"
