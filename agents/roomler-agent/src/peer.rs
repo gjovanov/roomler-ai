@@ -3473,9 +3473,15 @@ async fn media_pump_vp9_444_dc(
                 base
             };
             let ceiling = quality::target_bitrate(q_now, base).min(bitrate_cap);
-            if let Some(applied) =
-                governor.pre_encode_tick(ceiling, send_tx.capacity(), std::time::Instant::now())
-            {
+            // 2026-08-26 — area-scaled AIMD floor (flat 1.5 M on a
+            // constrained transport; see `encode::area_min_bitrate_bps`).
+            let aimd_floor = crate::encode::area_min_bitrate_bps(w, h, constrained_transport);
+            if let Some(applied) = governor.pre_encode_tick(
+                ceiling,
+                aimd_floor,
+                send_tx.capacity(),
+                std::time::Instant::now(),
+            ) {
                 enc.set_bitrate(applied.bps);
                 if q_now != last_applied_quality || applied.changed {
                     info!(
@@ -4198,25 +4204,50 @@ async fn media_pump_ffmpeg_dc(
     // BUFFERED instead of shed (the "movement stutter"); a constrained relay-TCP
     // path stays shallow to shed fast rather than build a stale backlog. Input
     // rides a SEPARATE DC, so a deeper video queue adds no input lag.
-    let ffmpeg_send_depth = if constrained { 4 } else { 12 };
+    // 2026-08-26 (field, neo16↔Rozalina): direct 12 → 6. Twelve frames at
+    // 40 fps was ~300 ms of standing latency all by itself once the byte
+    // gate below started bounding the ledger — the burst-absorption job
+    // moved to the byte budget (time-denominated), the frame count is now
+    // only the item bound.
+    let ffmpeg_send_depth = if constrained { 4 } else { 6 };
     // rc.445 — items carry the send EPOCH they were encoded under; the send
     // task discards stale-epoch frames so a rebuild's first IDR never waits
-    // behind pre-rebuild deltas (see `send_epoch`).
+    // behind pre-rebuild deltas (see `send_epoch`). 2026-08-26 — items also
+    // carry their ENQUEUE instant so the send task can report queue-wait
+    // (the transport-added latency a viewer actually feels) per heartbeat.
     let (send_tx, mut send_rx) =
-        tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(ffmpeg_send_depth);
-    // Constrained byte-budget gate (field 2026-08-21, winhost-a/corplap): the
-    // channel's FRAME-count bound bounds nothing in BYTES — four native
-    // motion frames are ~0.5-1 MB ≈ 2-4 s of a ~2 Mbps relay, which is
-    // both the "drag starts, ~0.5 s in it freezes" lump (the pre-rung
-    // native flood queues here + in SCTP) and the "window drags seconds
-    // behind" lag. Track the bytes handed to the send task and skip
-    // production while more than `constrained_queue_ms` (default 450 ms)
-    // of the relay ceiling is still in flight — lag becomes an immediate,
-    // small fps reduction instead. Budget resolved once (env/config are
-    // process-stable); the gate only engages while `constrained`.
+        tokio::sync::mpsc::channel::<(u64, std::time::Instant, bytes::Bytes)>(ffmpeg_send_depth);
+    // Byte-budget gate (field 2026-08-21, winhost-a/corplap — extended to
+    // DIRECT 2026-08-26, neo16↔Rozalina): the channel's FRAME-count bound
+    // bounds nothing in BYTES — four native motion frames are ~0.5-1 MB
+    // ≈ 2-4 s of a ~2 Mbps relay, and on a LAN a drag burst at a stale
+    // maxrate queued 100-345 KB ≈ 100-300+ ms of standing lag. Track the
+    // bytes handed to the send task and skip production while more than
+    // the path's queue budget is still in flight — lag becomes an
+    // immediate, small fps reduction instead. Constrained budget is
+    // resolved once (450 ms of the relay ceiling; env/config are
+    // process-stable); the DIRECT budget is re-derived per iteration from
+    // the AIMD's live applied target (150 ms of it — the target tracks
+    // congestion down within ~2 s even while a rebuild-bound encoder's
+    // actual maxrate is motion-deferred), falling back to the policy
+    // ceiling before the first apply.
     let inflight_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let constrained_queue_budget =
         crate::encode::rate_profile::constrained_queue_budget_bytes(crate::encode::relay_max_bps());
+    // 2026-08-26 — queue-wait telemetry (P7 of the drag-latency design):
+    // enqueue→wire-complete per frame, accumulated by the send task and
+    // drained by the heartbeat. Sent frames only — a stale-dropped frame
+    // never rode the wire, and its wait would double-count the rebuild
+    // gap the epoch discard exists to erase.
+    let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The direct byte gate's reference rate: the last policy ceiling (the
+    // AIMD's applied target takes over once it exists). One-shot log the
+    // first time the direct gate actually sheds, so a field read can tell
+    // "gate bounded the queue" from "gate never engaged".
+    let mut last_ceiling_bps: u32 = 0;
+    let mut direct_gate_logged = false;
 
     // P8c — the rate governor owns the four rate controllers this pump
     // previously threaded by hand (see `encode::governor` module docs):
@@ -4271,6 +4302,9 @@ async fn media_pump_ffmpeg_dc(
         let send_errors = send_errors.clone();
         let inflight_bytes = inflight_bytes.clone();
         let send_epoch = send_epoch.clone();
+        let send_wait_us_sum = send_wait_us_sum.clone();
+        let send_wait_us_max = send_wait_us_max.clone();
+        let send_wait_frames = send_wait_frames.clone();
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
         tokio::spawn(async move {
@@ -4291,7 +4325,7 @@ async fn media_pump_ffmpeg_dc(
                 let busy_start = std::time::Instant::now();
                 let mut busy_bytes = 0u64;
                 let mut next = Some(first);
-                while let Some((epoch, wire)) = next.take() {
+                while let Some((epoch, enqueued_at, wire)) = next.take() {
                     let total = wire.len();
                     // rc.445 — a frame from a PREVIOUS encoder epoch is stale
                     // motion the rebuild obsoleted; drop it so the fresh IDR
@@ -4324,6 +4358,13 @@ async fn media_pump_ffmpeg_dc(
                             // Only bytes that reached the wire measure the
                             // pipe. A stale-dropped or failed frame did not.
                             busy_bytes += total as u64;
+                            // P7 — queue-wait: enqueue→wire-complete. This is
+                            // the transport-added latency the viewer feels;
+                            // the heartbeat drains it per window.
+                            let waited_us = enqueued_at.elapsed().as_micros() as u64;
+                            send_wait_us_sum.fetch_add(waited_us, Relaxed);
+                            send_wait_us_max.fetch_max(waited_us, Relaxed);
+                            send_wait_frames.fetch_add(1, Relaxed);
                         }
                     }
                     // Byte-budget ledger: the frame left the queue (delivered
@@ -4506,12 +4547,33 @@ async fn media_pump_ffmpeg_dc(
             );
             return;
         }
-        if send_tx.capacity() == 0
-            || pipeline.followers_congested()
-            || (constrained
-                && inflight_bytes.load(std::sync::atomic::Ordering::Relaxed)
-                    >= constrained_queue_budget)
-        {
+        // 2026-08-26 — the byte budget now bounds BOTH paths. Constrained
+        // keeps its once-resolved 450 ms-of-relay-ceiling budget; direct
+        // re-derives 150 ms of the AIMD's live applied target each
+        // iteration (fallback: the last policy ceiling before the first
+        // apply; unbounded until either exists).
+        let queue_budget = if constrained {
+            constrained_queue_budget
+        } else {
+            let rate = match governor.applied_bps() {
+                0 => last_ceiling_bps,
+                applied => applied,
+            };
+            crate::encode::rate_profile::direct_queue_budget_bytes(rate)
+        };
+        let inflight_now = inflight_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let byte_gate = inflight_now >= queue_budget;
+        if send_tx.capacity() == 0 || pipeline.followers_congested() || byte_gate {
+            if byte_gate && !constrained && !direct_gate_logged {
+                direct_gate_logged = true;
+                info!(
+                    %session_id,
+                    codec_label,
+                    inflight = inflight_now,
+                    budget = queue_budget,
+                    "FFmpeg DC pump: direct byte-budget gate engaged (bounding queue lag; first time this session)"
+                );
+            }
             frames_skipped_backpressure += 1;
             // Phase B — a FULL send channel is the real DC backpressure signal.
             // Drive the multiplicative decrease HERE, before the `continue`, so
@@ -4521,10 +4583,10 @@ async fn media_pump_ffmpeg_dc(
             // P5 — a congested FOLLOWER gates production the same way: the
             // shared stream paces to the slowest link (the pre-encode floor;
             // per-viewer delta drops would break that viewer's ref chain).
-            // The constrained BYTE budget (third arm) is the same congestion
-            // semantic judged in bytes: frame-count depth bounds nothing when
-            // native motion frames are 20× rung size, and the queue it allows
-            // is pure viewer lag on a clamped pipe.
+            // The BYTE budget (third arm, both transports since 2026-08-26)
+            // is the same congestion semantic judged in bytes: frame-count
+            // depth bounds nothing when native motion frames are 20× rung
+            // size, and the queue it allows is pure viewer lag.
             if let Some(applied) = governor.on_backpressure_skip(std::time::Instant::now())
                 && let Some(enc) = encoder.as_mut()
             {
@@ -4857,6 +4919,11 @@ async fn media_pump_ffmpeg_dc(
             ),
         );
         let ceiling = rate.ceiling_bps;
+        // 2026-08-26 — feed the direct byte gate's fallback reference and
+        // compute the area-scaled AIMD floor from the ACTUAL encode dims
+        // (see `encode::area_min_bitrate_bps` — flat 1.5 M on constrained).
+        last_ceiling_bps = ceiling;
+        let aimd_floor = crate::encode::area_min_bitrate_bps(w, h, constrained);
         let need_rebuild = match encoder_dims {
             Some((ew, eh)) => ew != w || eh != h,
             None => true,
@@ -5038,9 +5105,12 @@ async fn media_pump_ffmpeg_dc(
         // link down under congestion / back up on recovery. `set_bitrate`
         // coarsens the target to a ladder before reconfiguring, so applying it
         // every frame is cheap (a no-op unless the coarse bucket moved).
-        if let Some(applied) =
-            governor.pre_encode_tick(ceiling, send_tx.capacity(), std::time::Instant::now())
-        {
+        if let Some(applied) = governor.pre_encode_tick(
+            ceiling,
+            aimd_floor,
+            send_tx.capacity(),
+            std::time::Instant::now(),
+        ) {
             // rc.445 — QSV/AMF applies are motion-deferred (a ladder move
             // there is a blocking rebuild + IDR; see `deferred_bps`).
             if enc.supports_dynamic_bitrate() || last_motion_at.elapsed() >= DEFER_QUIET {
@@ -5271,7 +5341,11 @@ async fn media_pump_ffmpeg_dc(
                 encoded_dims_packed,
             );
             let wire_len = wire.len();
-            match send_tx.try_send((send_epoch.load(std::sync::atomic::Ordering::Relaxed), wire)) {
+            match send_tx.try_send((
+                send_epoch.load(std::sync::atomic::Ordering::Relaxed),
+                std::time::Instant::now(),
+                wire,
+            )) {
                 Ok(()) => {
                     // Byte-budget ledger (constrained gate): counted on entry,
                     // released by the send task once the frame leaves.
@@ -5336,6 +5410,21 @@ async fn media_pump_ffmpeg_dc(
             let avg_scale_ms = (scale_us / scale_ops.max(1)) as f64 / 1000.0;
             let avg_encode_ms = (encode_us / window_frames) as f64 / 1000.0;
             let avg_send_ms = (send_us / window_frames) as f64 / 1000.0;
+            // P7 (2026-08-26) — queue-wait per window: enqueue→wire-complete
+            // for frames that reached the wire. THE drag-latency number the
+            // byte gate exists to bound; read avg against max — a fat max
+            // with a small avg is one IDR's transit, both fat is a standing
+            // queue.
+            let sw_frames = send_wait_frames.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let send_wait_avg_ms = if sw_frames > 0 {
+                (send_wait_us_sum.swap(0, std::sync::atomic::Ordering::Relaxed) / sw_frames) as f64
+                    / 1000.0
+            } else {
+                send_wait_us_sum.store(0, std::sync::atomic::Ordering::Relaxed);
+                0.0
+            };
+            let send_wait_max_ms =
+                send_wait_us_max.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
             // rc.186 — step the encode-pressure controller off this window's
             // avg encode time; the new factor applies to the ceiling from the
             // next frame on (throttles a saturating encoder, restores when it
@@ -5386,6 +5475,7 @@ async fn media_pump_ffmpeg_dc(
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
                 frames_skipped_backpressure, frames_empty,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
+                send_wait_avg_ms, send_wait_max_ms,
                 encode_factor = governor.encode_factor(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
