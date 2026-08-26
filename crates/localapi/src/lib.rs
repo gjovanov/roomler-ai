@@ -339,7 +339,10 @@ pub struct WarmRelayStatus {
 }
 
 /// A peer device as this node currently sees it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+// NOTE: no `Eq` — `PeerWhy` carries the selector's f64 scores, and rounding
+// them to keep `Eq` would make the diagnostic lie about the numbers the
+// selector actually used. Nothing compares `PeerInfo` for total equality.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PeerInfo {
     pub node_id: String,
     pub name: String,
@@ -417,6 +420,99 @@ pub struct PeerInfo {
     /// daemon (wire-compatible both ways).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<PeerCarrierDebug>,
+    /// F — the path decision for this peer, in readable form
+    /// (`roomler why <peer>`). Always populated by a current daemon; `None`
+    /// from an older one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<PeerWhy>,
+    /// A — what the disco prober measures for this peer's path(s). Empty when
+    /// the prober is off, or before it has issued a round.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<PathProbe>,
+}
+
+/// A — the disco prober's measurement of one path to this peer (C2).
+///
+/// Measurement ONLY: nothing in the selector reads this. It is here so an
+/// operator (and `roomler why`) can see what the path actually does next to
+/// the decision the selector made about it — the two disagreeing is the
+/// interesting case, and until now the measurement was visible only in a
+/// 5-minute digest log line.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PathProbe {
+    /// The remote endpoint probed (`host:port`).
+    pub dst: String,
+    /// Windowed loss 0.0..=1.0. `None` until enough rounds to judge — an
+    /// UNMEASURED path must never read as a bad one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss: Option<f64>,
+    /// Smoothed round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    /// 95th percentile of the raw window — the EWMA above smooths spikes away
+    /// by design, and spikes are what make a path feel bad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_p95_ms: Option<f64>,
+    /// Worst raw round-trip in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_max_ms: Option<f64>,
+}
+
+/// F — why this peer sits on the tier it sits on (`roomler why <peer>`).
+///
+/// Populated on every view publish, like [`PeerCarrierDebug`], rather than
+/// computed on demand: an incident capture is usually a `peers --json` taken
+/// at the time, and the explanation is worth far more inside that snapshot
+/// than in a command someone had to know to run while the fault was live.
+///
+/// `None` from a daemon older than the field (`#[serde(default)]`, wire
+/// compatible both ways).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PeerWhy {
+    /// LAN, public, srflx, relay — already in ladder order.
+    pub tiers: Vec<TierWhy>,
+    /// Seconds left on the demote-follow hold-down, if open. While this is
+    /// set, EVERY direct tier is ineligible regardless of its own health —
+    /// the peer is relaying to us, so we follow it rather than fight it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayed_instead_s: Option<u64>,
+    /// Consecutive demote-follows inside the memory window — the rung of the
+    /// escalation ladder. A climbing value is the signature of a pair whose
+    /// two ends persistently disagree about the path, which is a different
+    /// problem from a path that is simply bad.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub relayed_instead_strikes: u32,
+    /// Seconds left on the server's forced-DERP pin, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_derp_s: Option<u64>,
+    /// A direct-upgrade probe is in flight on this tier right now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probing: Option<String>,
+}
+
+/// One tier's row in [`PeerWhy`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TierWhy {
+    /// `lan` | `public` | `srflx` | `relay`.
+    pub tier: String,
+    /// May this tier be attempted at all right now?
+    pub eligible: bool,
+    /// When not eligible, which gate refused: `peer-relays-instead` |
+    /// `penalty`. Resolved in the same order the selector tests them, so it
+    /// cannot contradict `eligible`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
+    /// The tier's fixed prior.
+    pub base: f64,
+    /// Measured-quality term (ranking only — never eligibility).
+    pub q: f64,
+    /// Decaying penalty from recent failures.
+    pub penalty: f64,
+    /// `base + q − penalty`; meaningful only among ELIGIBLE tiers.
+    pub score: f64,
+    /// Consecutive failures booked against this tier.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fails: u32,
 }
 
 /// rc.276 — per-carrier forensic fields (see [`PeerInfo::debug`]). Built for
@@ -786,7 +882,7 @@ pub struct ConfigEntry {
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
 /// (`Status`) or a sequence (`Peers` / `Flows`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "t", content = "d", rename_all = "snake_case")]
 pub enum Response {
     /// Boxed: `NodeStatus` is ~408 bytes against a 137-byte second-largest,
@@ -2035,6 +2131,8 @@ mod tests {
                 direct_bind_walks: None,
                 roam_adoptions: None,
                 disco_answered: None,
+                derp_inbound_drops: None,
+                netcheck: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -2057,6 +2155,8 @@ mod tests {
                     relay_kind: None,
                     relay_transport: None,
                     relay_server: None,
+                    why: None,
+                    probes: Vec::new(),
                     debug: None,
                 },
                 PeerInfo {
@@ -2077,6 +2177,8 @@ mod tests {
                     relay_kind: None,
                     relay_transport: None,
                     relay_server: None,
+                    why: None,
+                    probes: Vec::new(),
                     debug: None,
                 },
             ]
@@ -2289,6 +2391,75 @@ mod tests {
         );
     }
 
+    /// F/A — `why` and `probes` are wire-compatible in BOTH directions, which
+    /// is the property a mixed fleet actually depends on: an old daemon sends
+    /// neither field (a current CLI must read that as "unknown", not as "no
+    /// hold-down and a clean path"), and an old CLI must not choke on a
+    /// current daemon that sends both.
+    #[test]
+    fn peer_info_why_and_probes_wire_compat() {
+        // An old daemon's payload: both fields absent.
+        let old = r#"{"node_id":"n1","name":"pc","online":true,"connection":"relay"}"#;
+        let p: PeerInfo = serde_json::from_str(old).unwrap();
+        assert!(
+            p.why.is_none(),
+            "absent must be UNKNOWN, not 'nothing wrong'"
+        );
+        assert!(p.probes.is_empty());
+
+        let mut p2 = p.clone();
+        p2.why = Some(PeerWhy {
+            tiers: vec![TierWhy {
+                tier: "lan".into(),
+                eligible: false,
+                blocked_by: Some("peer-relays-instead".into()),
+                base: 400.0,
+                q: 0.0,
+                penalty: 0.0,
+                score: 400.0,
+                fails: 0,
+            }],
+            relayed_instead_s: Some(174),
+            relayed_instead_strikes: 3,
+            forced_derp_s: None,
+            probing: None,
+        });
+        p2.probes = vec![PathProbe {
+            dst: "192.168.68.129:43881".into(),
+            loss: Some(0.0),
+            rtt_ms: Some(7.8),
+            rtt_p95_ms: Some(98.0),
+            rtt_max_ms: Some(169.0),
+        }];
+        let round: PeerInfo = serde_json::from_str(&serde_json::to_string(&p2).unwrap()).unwrap();
+        assert_eq!(round, p2);
+
+        // An OLD reader (no such fields) must still parse a current payload.
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct OldPeerInfo {
+            node_id: String,
+            name: String,
+            online: bool,
+        }
+        let as_old: OldPeerInfo = serde_json::from_str(&serde_json::to_string(&p2).unwrap())
+            .expect("a current payload must not choke an older reader");
+        assert_eq!(as_old.node_id, "n1");
+
+        // A zero strike count and an empty probe list stay OFF the wire, so a
+        // healthy fleet's `peers --json` is unchanged by this feature.
+        let mut quiet = p.clone();
+        quiet.why = Some(PeerWhy {
+            tiers: vec![],
+            relayed_instead_s: None,
+            relayed_instead_strikes: 0,
+            forced_derp_s: None,
+            probing: None,
+        });
+        let json = serde_json::to_string(&quiet).unwrap();
+        assert!(!json.contains("relayed_instead_strikes"), "{json}");
+        assert!(!json.contains("probes"), "{json}");
+    }
     /// rc.276 — `PeerInfo.debug` is wire-compatible: absent (pre-rc.276
     /// daemon) ⇒ `None`; a populated snapshot round-trips.
     #[test]
