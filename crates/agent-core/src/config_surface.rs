@@ -480,6 +480,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "HRD/VBV window for DIRECT sessions (percent of maxrate, 25-200). Empty = built-in 100 - half the rc.234 2x window, which legalised drag-start bursts of seconds' worth of bits (the standing-queue lag). av1_* encoders are floored at 200 regardless (rc.443: Intel AV1 VDENC errors on an over-reservoir IDR instead of QP-clamping). Env: ROOMLER_NODE_DIRECT_HRD_PCT. Restart required.",
     ),
     (
+        "bg_rebuild",
+        "tribool",
+        "Background encoder rebuild (2026-08-27, drag-latency P3). Default ON: on encoders with no in-place bitrate reconfigure (QSV/AMF), a bitrate change opens the replacement on a blocking thread while the current encoder keeps producing, then swaps between frames - no mid-drag stall, and rate drops land DURING motion as smaller frames instead of production skips. false = the rc.445 motion-defer (applies held until 1.2s of quiet, then a blocking re-open). Env: ROOMLER_NODE_BG_REBUILD. Restart required.",
+    ),
+    (
         "measured_ceiling",
         "tribool",
         "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLER_NODE_MEASURED_CEILING. Restart required.",
@@ -688,6 +693,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "direct_hrd_pct" => cfg.direct_hrd_pct.map(|p| p.to_string()),
         "area_min_bitrate" => cfg.area_min_bitrate.map(fmt_bool),
         "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
+        "bg_rebuild" => cfg.bg_rebuild.map(fmt_bool),
         "priority_res_cap" => cfg.priority_res_cap.map(fmt_bool),
         "smoother_rate_pct" => cfg.smoother_rate_pct.map(|p| p.to_string()),
         "balanced_rate_pct" => cfg.balanced_rate_pct.map(|p| p.to_string()),
@@ -1039,6 +1045,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "direct_hrd_pct" => cfg.direct_hrd_pct = parse_u32_range(key, value, 25, 200)?,
         "area_min_bitrate" => cfg.area_min_bitrate = parse_tribool(value)?,
         "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
+        "bg_rebuild" => cfg.bg_rebuild = parse_tribool(value)?,
         "priority_res_cap" => cfg.priority_res_cap = parse_tribool(value)?,
         "smoother_rate_pct" => cfg.smoother_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,

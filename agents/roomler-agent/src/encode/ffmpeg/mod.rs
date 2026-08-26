@@ -35,7 +35,7 @@
 pub mod encoder;
 
 #[cfg(feature = "ffmpeg-encoder")]
-pub use encoder::FfmpegEncoder;
+pub use encoder::{FfmpegEncoder, RebuiltEncoder};
 
 /// rc.66 link probe. Returns libavcodec's compile-time version (e.g.
 /// `0x3E0000` for libavcodec 62.x = FFmpeg 8.1). Forces the linker to
