@@ -336,6 +336,8 @@ mod tests {
             relay_kind: None,
             relay_transport: None,
             relay_server: None,
+            why: None,
+            probes: Vec::new(),
             debug: None,
         }
     }
