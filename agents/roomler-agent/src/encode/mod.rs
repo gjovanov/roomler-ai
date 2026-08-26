@@ -176,6 +176,44 @@ pub(crate) fn initial_bitrate_for(width: u32, height: u32) -> u32 {
 /// minimum so a collapsing REMB signal can't drop encode quality into
 /// unusability while the link is still technically up.
 pub const MIN_BITRATE_BPS: u32 = 1_500_000;
+
+/// Area-scaled AIMD floor (field 2026-08-26, neo16 viewing Rozalina):
+/// [`MIN_BITRATE_BPS`] was tuned as a 1080p legibility floor, but the
+/// AIMD collapse rides it at ANY resolution — at 2880×1800 (5.2 MPix)
+/// 1.5 Mbps is 0.006 bpp, unreadable mush for the whole post-collapse
+/// phase of every drag burst. Scale the floor with the ENCODED area
+/// (~0.6 bit/pixel-second at the nominal 30–60 fps band), capped at
+/// 4 Mbps so huge panels don't demand more than a modest uplink:
+/// ≤2.5 MPix → 1.5 M (unchanged), 2560×1600 → ~2.5 M, 2880×1800 →
+/// ~3.1 M, 4K+ → 4 M.
+///
+/// UNCONSTRAINED sessions only — on a relay the 3 Mbps clamp is the
+/// physics and a floor above it would pin the target AT the clamp,
+/// disabling the multiplicative decrease entirely (the rc.171
+/// starvation class). The AIMD additionally caps the floor at its live
+/// ceiling, so a mid-session flip to relay can never invert the two.
+/// Hatch: `ROOMLER_AGENT_AREA_MIN_BITRATE=0` / config
+/// `area_min_bitrate` restores the flat 1.5 M floor.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn area_min_bitrate_bps(width: u32, height: u32, constrained: bool) -> u32 {
+    if constrained || !area_min_bitrate_enabled() {
+        return MIN_BITRATE_BPS;
+    }
+    let px = width as u64 * height as u64;
+    (((px * 3) / 5) as u32).clamp(MIN_BITRATE_BPS, 4_000_000)
+}
+
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+fn area_min_bitrate_enabled() -> bool {
+    tunnel_core::env::node_env("AREA_MIN_BITRATE").as_deref() != Some("0")
+}
+
 /// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (the field-test host) that
 /// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
 /// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
@@ -907,6 +945,25 @@ fn hw_auto_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AIMD floor scales with encoded area on unconstrained sessions
+    /// (1.5 M was a 1080p legibility tuning; at 5.2 MPix it is mush) and
+    /// stays flat on constrained ones (a floor above the relay clamp
+    /// would pin the target at the ceiling and disable the MD).
+    #[test]
+    fn area_min_bitrate_scales_unconstrained_only() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // ≤ ~2.5 MPix keeps the legacy floor.
+        assert_eq!(area_min_bitrate_bps(1920, 1200, false), MIN_BITRATE_BPS);
+        // 2880×1800 (the Rozalina panel) → ~3.1 Mbps.
+        assert_eq!(area_min_bitrate_bps(2880, 1800, false), 3_110_400);
+        // 4K caps at 4 Mbps.
+        assert_eq!(area_min_bitrate_bps(3840, 2160, false), 4_000_000);
+        // Constrained sessions are exempt regardless of area.
+        assert_eq!(area_min_bitrate_bps(3840, 2160, true), MIN_BITRATE_BPS);
+    }
 
     /// rc.443 — the encode-error ladder: retry twice, rebuild at 3 and 6,
     /// exit at 9; any success resets.
