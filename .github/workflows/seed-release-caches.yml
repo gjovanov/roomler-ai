@@ -30,6 +30,12 @@ on:
     paths:
       - 'rust-toolchain.toml'
       - '.github/workflows/release-agent.yml'
+      # The seed composites shape what a rehearsal builds and publishes —
+      # a fix landing there NEEDS a fresh rehearsal, and twice now one
+      # didn't fire (#677's annotations; #725's tar fix raced a rehearsal
+      # that had checked out pre-merge master and re-failed identically).
+      - '.github/actions/seed-cache-restore/**'
+      - '.github/actions/seed-cache-save/**'
 
 permissions:
   actions: write
