@@ -348,6 +348,22 @@ where
     }
 }
 
+/// Escape user input for a Mongo `$regex` filter — every PCRE metacharacter
+/// becomes literal. One shared implementation (lifted from `RoomDao::explore`)
+/// so search endpoints can't diverge on which characters they neutralize.
+pub fn escape_regex(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|c| {
+            if ".*+?^${}()|[]\\".contains(c) {
+                vec!['\\', c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod duplicate_key_tests {
     use super::*;

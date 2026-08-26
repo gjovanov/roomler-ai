@@ -288,3 +288,99 @@ async fn a_secret_room_cannot_be_joined_by_guessing_its_id() {
         "and it must still be unreadable afterwards"
     );
 }
+
+// ─── Server-side sidebar search (PR-D, 2026-08-26) ──────────────
+
+/// `GET /room?q=…&page=…` — the capped-sidebar search. The secret-room
+/// condition is pushed INTO the query, so results respect visibility at the
+/// same strength as the bare list, and the response stays a bare array
+/// (the client infers has_more from a full page).
+#[tokio::test]
+async fn list_with_q_searches_and_respects_secret_visibility() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("vis-search").await;
+
+    make_room(&app, &t, "growth-general").await;
+    make_room(&app, &t, "growth-metrics").await;
+    let secret = make_room(&app, &t, "growth-secret-plans").await;
+    set_visibility(&app, &t, &secret, "secret").await;
+
+    // A plain member searching the shared prefix sees the two public rooms,
+    // never the secret one.
+    let body: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/room?q=growth", t.tenant_id),
+            &t.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rooms = body.as_array().expect("search response stays a bare array");
+    let names: Vec<&str> = rooms.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"growth-general"));
+    assert!(names.contains(&"growth-metrics"));
+    assert!(
+        !names.contains(&"growth-secret-plans"),
+        "secret room leaked into member search"
+    );
+
+    // The admin (creator, hence member of the secret room) DOES see it.
+    let body: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/room?q=secret-plans", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1);
+
+    // Regex metacharacters in q are literal, not a pattern.
+    let body: Value = app
+        .auth_get(
+            &format!("/api/tenant/{}/room?q=.%2A", t.tenant_id), // ".*"
+            &t.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        0,
+        ".* must match nothing as a literal"
+    );
+
+    // Paging: per_page=1 walks disjoint results and can't under-fill past
+    // the secret room (the visibility condition is inside the query).
+    let mut seen = Vec::new();
+    for page in 1..=2 {
+        let body: Value = app
+            .auth_get(
+                &format!(
+                    "/api/tenant/{}/room?q=growth&per_page=1&page={page}",
+                    t.tenant_id
+                ),
+                &t.member.access_token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "page {page} under-filled");
+        seen.push(arr[0]["id"].as_str().unwrap().to_string());
+    }
+    seen.dedup();
+    assert_eq!(seen.len(), 2, "pages overlapped");
+}
