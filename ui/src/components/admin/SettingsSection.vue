@@ -61,8 +61,6 @@
       </v-card-text>
     </v-card>
 
-    <ExecAuditSection :tenant-id="tenantId" />
-
     <!-- Roomler SSH gate 1. A SEPARATE card from remote execution above, and
          a separate switch server-side: allowing bounded diagnostic commands
          is not the same decision as allowing interactive sessions, and one
@@ -108,9 +106,8 @@
       </v-card-text>
     </v-card>
 
-    <SshAuditSection :tenant-id="tenantId" />
-
-    <SshActivitySection :tenant-id="tenantId" />
+    <!-- The exec/SSH audit + activity sections moved to /tenant/{id}/audit
+         (2026-08-26) — history review is its own nav destination now. -->
   </div>
 </template>
 
@@ -118,9 +115,6 @@
 import { onMounted, ref } from 'vue'
 import { useTenantStore } from '@/stores/tenant'
 import { useAgentStore } from '@/stores/agents'
-import ExecAuditSection from './ExecAuditSection.vue'
-import SshAuditSection from './SshAuditSection.vue'
-import SshActivitySection from './SshActivitySection.vue'
 
 const props = defineProps<{ tenantId: string }>()
 const tenantStore = useTenantStore()

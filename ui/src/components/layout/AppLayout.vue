@@ -1,6 +1,20 @@
 <template>
   <v-app class="app-layout-root">
-    <v-navigation-drawer v-model="drawer" :rail="!mobile && rail" :permanent="!mobile" :temporary="mobile">
+    <v-navigation-drawer
+      v-model="drawer"
+      :rail="!mobile && rail"
+      :permanent="!mobile"
+      :temporary="mobile"
+      :width="navWidth"
+    >
+      <!-- Drag the right edge to resize (persisted). Hidden in rail mode —
+           rail width is Vuetify's own. -->
+      <div
+        v-if="!mobile && !rail"
+        class="nav-resize-handle"
+        aria-hidden="true"
+        @mousedown.prevent="startNavResize"
+      />
       <!-- Brand = way home (org picker at '/'); the chevron owns the rail
            toggle — the brand used to be ONLY a rail toggle, leaving the
            app with no route back to the root at all. -->
@@ -115,7 +129,7 @@
              /devices page the header icon opens). Server-searchable with a
              20-row cap + load-more; rows are a live view over
              agentStore.agents so device:presence keeps the dots honest. -->
-        <v-list-group v-if="showFleetNav" value="devices">
+        <v-list-group v-if="showFleetNav" value="devices" class="nav-entity-group">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-monitor-multiple" :title="$t('nav.devices')">
               <template #append>
@@ -141,7 +155,7 @@
             clearable
             prepend-inner-icon="mdi-magnify"
             :placeholder="$t('common.search')"
-            class="mx-3 my-1 nav-search"
+            class="mx-2 my-1 nav-search"
             aria-label="Search devices"
           />
           <v-list-item
@@ -176,16 +190,6 @@
             @click="deviceNav.loadMore()"
           />
         </v-list-group>
-        <!-- Analytics (stats PR-4): FAIL-CLOSED gating (canQueryAnalytics)
-             — the stats query endpoints 404 without MANAGE_AGENTS and the
-             api client logs out on 403, so this nav never leads a plain
-             member to a request they can't make. -->
-        <v-list-item
-          v-if="showAnalyticsNav"
-          :to="`/tenant/${tenantId}/analytics`"
-          prepend-icon="mdi-chart-areaspline"
-          :title="$t('nav.analytics')"
-        />
         <v-list-group v-if="showFleetNav" value="network">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-lan" :title="$t('nav.network')" />
@@ -197,16 +201,6 @@
           <v-list-item :to="`/tenant/${tenantId}/network/subnet-routes`" prepend-icon="mdi-lan-connect" :title="$t('nav.subnetRoutes')" />
           <v-list-item :to="`/tenant/${tenantId}/network/dns`" prepend-icon="mdi-dns" :title="$t('nav.magicDns')" />
         </v-list-group>
-        <!-- `value` was "rooms" — freed for the Rooms group below (openGroups
-             keys collide otherwise). The Rooms PAGE entry moved onto the Rooms
-             group's header icon, mirroring the Devices group. -->
-        <v-list-group value="collab">
-          <template #activator="{ props: groupProps }">
-            <v-list-item v-bind="groupProps" prepend-icon="mdi-forum" :title="$t('nav.collaboration')" />
-          </template>
-          <v-list-item :to="`/tenant/${tenantId}/explore`" prepend-icon="mdi-compass" :title="$t('nav.explore')" />
-          <v-list-item :to="`/tenant/${tenantId}/files`" prepend-icon="mdi-folder" :title="$t('nav.files')" />
-        </v-list-group>
         <!-- The old flat "Your rooms" list, as a collapsible group: server-
              searchable, first 20 + load-more. Rows keep the unread badges;
              the header carries the total so a collapsed group still shows
@@ -214,7 +208,7 @@
              SLICE of roomStore.rooms — that store list stays complete
              (dashboard tiles, the app-bar call menu and updateRoomCallStatus
              iterate it), the cap is presentational only. -->
-        <v-list-group value="rooms">
+        <v-list-group value="rooms" class="nav-entity-group">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-pound" :title="$t('nav.rooms')">
               <template #append>
@@ -236,6 +230,16 @@
               </template>
             </v-list-item>
           </template>
+          <!-- Explore lives INSIDE Rooms now (the Collaboration group is
+               gone) — it's "find rooms you're not in", the natural sibling
+               of the room list below the divider. -->
+          <v-list-item
+            :to="`/tenant/${tenantId}/explore`"
+            prepend-icon="mdi-compass"
+            :title="$t('nav.explore')"
+            density="compact"
+          />
+          <v-divider class="my-1" />
           <v-text-field
             v-if="!rail"
             v-model="roomNav.query.value"
@@ -246,7 +250,7 @@
             clearable
             prepend-inner-icon="mdi-magnify"
             :placeholder="$t('common.search')"
-            class="mx-3 my-1 nav-search"
+            class="mx-2 my-1 nav-search"
             aria-label="Search rooms"
           />
           <v-list-item
@@ -281,8 +285,13 @@
             @click="roomNav.loadMore()"
           />
         </v-list-group>
+        <v-list-item
+          :to="`/tenant/${tenantId}/files`"
+          prepend-icon="mdi-folder"
+          :title="$t('nav.files')"
+        />
         <!-- Top-level again (2026-08-26): the S4 IA pivot demoted Invites
-             into the Collaboration group and users read that as "the invite
+             into a collapsible group and users read that as "the invite
              page disappeared". FAIL-CLOSED gate (canManageInvites) — the
              list endpoint needs INVITE_MEMBERS and the api client logs out
              on GET 403, so this item must never show for a caller who can't
@@ -293,15 +302,19 @@
           prepend-icon="mdi-account-plus"
           :title="$t('nav.invites')"
         />
-        <v-list-group value="admin">
-          <template #activator="{ props: groupProps }">
-            <v-list-item v-bind="groupProps" prepend-icon="mdi-cog" :title="$t('nav.admin')" />
-          </template>
-          <v-list-item :to="`/tenant/${tenantId}/admin/settings`" prepend-icon="mdi-tune" :title="$t('nav.settings')" />
-          <v-list-item :to="`/tenant/${tenantId}/admin/members`" prepend-icon="mdi-account-group" :title="$t('nav.members')" />
-          <v-list-item :to="`/tenant/${tenantId}/admin/roles`" prepend-icon="mdi-shield-account" :title="$t('nav.roles')" />
-          <v-list-item :to="`/tenant/${tenantId}/billing`" prepend-icon="mdi-credit-card" :title="$t('nav.billing')" />
-        </v-list-group>
+
+        <!-- ── Insights section ─────────────────────────────────── -->
+        <v-divider v-if="showAnalyticsNav || isPlatformAdmin" class="my-1" />
+        <!-- Analytics (stats PR-4): FAIL-CLOSED gating (canQueryAnalytics)
+             — the stats query endpoints 404 without MANAGE_AGENTS and the
+             api client logs out on 403, so this nav never leads a plain
+             member to a request they can't make. -->
+        <v-list-item
+          v-if="showAnalyticsNav"
+          :to="`/tenant/${tenantId}/analytics`"
+          prepend-icon="mdi-chart-areaspline"
+          :title="$t('nav.analytics')"
+        />
         <!-- Platform observability (stats PR-4): visible only to the
              platform-operator allowlist; the server 404s everyone else. -->
         <v-list-item
@@ -310,6 +323,47 @@
           prepend-icon="mdi-chart-timeline-variant-shimmer"
           :title="$t('nav.observability')"
         />
+
+        <!-- ── Administration section ───────────────────────────── -->
+        <v-divider class="my-1" />
+        <!-- Settings left the group (2026-08-26) — it stays reachable via
+             the drawer-footer Settings entry; the group holds the people/
+             money residue. -->
+        <v-list-group value="admin">
+          <template #activator="{ props: groupProps }">
+            <v-list-item v-bind="groupProps" prepend-icon="mdi-cog" :title="$t('nav.admin')" />
+          </template>
+          <v-list-item :to="`/tenant/${tenantId}/admin/members`" prepend-icon="mdi-account-group" :title="$t('nav.members')" />
+          <v-list-item :to="`/tenant/${tenantId}/admin/roles`" prepend-icon="mdi-shield-account" :title="$t('nav.roles')" />
+          <v-list-item :to="`/tenant/${tenantId}/billing`" prepend-icon="mdi-credit-card" :title="$t('nav.billing')" />
+        </v-list-group>
+        <!-- Audit trails, out of Admin/Settings (2026-08-26). FAIL-CLOSED
+             per item on the SERVER's own bit split (VIEW_EXEC_AUDIT vs
+             VIEW_SSH_AUDIT — reviewing commands and reviewing SSH sessions
+             are different jobs); the group shows when either applies. -->
+        <v-list-group v-if="canSeeExecAudit || canSeeSshAudit" value="audit">
+          <template #activator="{ props: groupProps }">
+            <v-list-item v-bind="groupProps" prepend-icon="mdi-clipboard-text-clock" :title="$t('nav.audit')" />
+          </template>
+          <v-list-item
+            v-if="canSeeExecAudit"
+            :to="`/tenant/${tenantId}/audit/exec`"
+            prepend-icon="mdi-console-line"
+            :title="$t('nav.execAudit')"
+          />
+          <v-list-item
+            v-if="canSeeSshAudit"
+            :to="`/tenant/${tenantId}/audit/ssh`"
+            prepend-icon="mdi-key-chain"
+            :title="$t('nav.sshAudit')"
+          />
+          <v-list-item
+            v-if="canSeeSshAudit"
+            :to="`/tenant/${tenantId}/audit/ssh-activity`"
+            prepend-icon="mdi-pulse"
+            :title="$t('nav.sshActivity')"
+          />
+        </v-list-group>
       </v-list>
 
 
@@ -497,7 +551,13 @@ import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
 import { usePageViews } from '@/composables/usePageViews'
 import { useTenantStore } from '@/stores/tenant'
-import { canManageInvites, canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
+import {
+  canManageInvites,
+  canQueryAnalytics,
+  canSeeFleetNav,
+  canViewExecAudit,
+  canViewSshAudit,
+} from '@/utils/permissions'
 import { useRoomStore, type Room } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
 import { useCappedSearchList } from '@/composables/useCappedSearchList'
@@ -575,9 +635,45 @@ const rail = ref(false)
 // S4 nav groups — Collaboration starts open (the day-to-day pages);
 // Network/Admin start collapsed. The user's toggles win afterwards.
 // Devices + Rooms default EXPANDED (they are the product's primary nav
-// now); Network/Collab/Admin start collapsed. "collab" is the renamed
-// Collaboration key — "rooms" belongs to the Rooms group.
+// now); Network/Admin/Audit start collapsed.
 const openGroups = ref<string[]>(['devices', 'rooms'])
+
+// ── Resizable drawer ─────────────────────────────────────────────
+// Default 308 ≈ Vuetify's 256 + 20%; drag the right edge, persisted.
+const NAV_WIDTH_KEY = 'roomler-nav-width'
+const NAV_WIDTH_DEFAULT = 308
+function loadNavWidth(): number {
+  try {
+    const v = Number(localStorage.getItem(NAV_WIDTH_KEY))
+    if (Number.isFinite(v) && v >= 220 && v <= 520) return v
+  } catch {
+    /* private browsing */
+  }
+  return NAV_WIDTH_DEFAULT
+}
+const navWidth = ref(loadNavWidth())
+function onNavResizeMove(e: MouseEvent) {
+  // The drawer is anchored at the viewport's left edge, so the pointer's
+  // clientX IS the wanted width.
+  navWidth.value = Math.min(520, Math.max(220, e.clientX))
+}
+function stopNavResize() {
+  document.removeEventListener('mousemove', onNavResizeMove)
+  document.removeEventListener('mouseup', stopNavResize)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  try {
+    localStorage.setItem(NAV_WIDTH_KEY, String(navWidth.value))
+  } catch {
+    /* private browsing */
+  }
+}
+function startNavResize() {
+  document.addEventListener('mousemove', onNavResizeMove)
+  document.addEventListener('mouseup', stopNavResize)
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+}
 
 // ── Sidebar capped lists (first 20 + load-more, server search) ──
 const agentStore = useAgentStore()
@@ -710,6 +806,12 @@ const showAnalyticsNav = computed(() =>
 )
 const canInvite = computed(() =>
   canManageInvites(tenantStore.myPermissions, tenantStore.isOwner),
+)
+const canSeeExecAudit = computed(() =>
+  canViewExecAudit(tenantStore.myPermissions, tenantStore.isOwner),
+)
+const canSeeSshAudit = computed(() =>
+  canViewSshAudit(tenantStore.myPermissions, tenantStore.isOwner),
 )
 const isPlatformAdmin = computed(() => auth.user?.is_platform_admin === true)
 
@@ -859,6 +961,28 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* Drag strip on the drawer's right edge (resizable nav). */
+.nav-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 5px;
+  cursor: col-resize;
+  z-index: 10;
+}
+.nav-resize-handle:hover {
+  background: rgba(var(--v-theme-primary), 0.25);
+}
+
+/* Devices/Rooms group children: kill Vuetify's group indent so the row's
+   PREPEND icon (presence dot / room hash) left-aligns with the search
+   field's left edge above it (the search has mx-3 = 12px; nav lists add
+   4px side padding, so 8px inline padding puts the icon at 12px). */
+.nav-entity-group :deep(.v-list-group__items .v-list-item) {
+  padding-inline-start: 8px !important;
+}
+
 /* Neutralize the inner v-application__wrap's min-height: 100vh
    so the layout is constrained to the viewport height provided by the OUTER v-app in App.vue */
 .app-layout-root :deep(.v-application__wrap) {
