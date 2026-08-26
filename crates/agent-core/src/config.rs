@@ -637,6 +637,29 @@ pub struct AgentConfig {
     /// Sub-100 values are per-host experiments only.
     #[serde(default)]
     pub constrained_hrd_pct: Option<u32>,
+    /// 2026-08-26 drag-latency P1 — DIRECT-path send-queue byte budget,
+    /// in milliseconds of the AIMD's live target
+    /// (`ROOMLER_NODE_DIRECT_QUEUE_MS`). Built-in default: 150; 0 =
+    /// unbounded (the pre-P1 posture); clamped 0-2000. Bounds the
+    /// standing queue a drag burst can build on a direct session — the
+    /// field "sluggish, bulky" lag.
+    #[serde(default)]
+    pub direct_queue_ms: Option<u32>,
+    /// 2026-08-26 drag-latency P4 — HRD/VBV window for DIRECT sessions,
+    /// percent of maxrate (`ROOMLER_NODE_DIRECT_HRD_PCT`). Built-in
+    /// default: 100 (half the rc.234 2× window — the 2× reservoir
+    /// legalised the drag-start burst that became the standing queue);
+    /// clamped 25-200. `av1_*` encoders are floored at 200 regardless
+    /// (rc.443 — Intel AV1 VDENC errors on an over-reservoir IDR).
+    #[serde(default)]
+    pub direct_hrd_pct: Option<u32>,
+    /// 2026-08-26 drag-latency P4 — area-scaled AIMD bitrate floor
+    /// (`ROOMLER_NODE_AREA_MIN_BITRATE`). Default ON: the flat 1.5 Mbps
+    /// floor was a 1080p legibility tuning and is mush at 5+ MPix; the
+    /// scaled floor is ~3.1 M at 2880×1800, capped 4 M, direct-only.
+    /// `false` restores the flat floor.
+    #[serde(default)]
+    pub area_min_bitrate: Option<bool>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
     /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
@@ -1583,6 +1606,9 @@ pub fn test_fixture() -> AgentConfig {
         constrained_cq_relief: None,
         constrained_queue_ms: None,
         constrained_hrd_pct: None,
+        direct_queue_ms: None,
+        direct_hrd_pct: None,
+        area_min_bitrate: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -1698,9 +1724,10 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 47] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 48] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
+        ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
         ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
         ("IDLE_REFINE", cfg.idle_refine),
@@ -1761,7 +1788,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 47]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 20] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 22] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1784,6 +1811,8 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("CONSTRAINED_CQ_RELIEF", cfg.constrained_cq_relief),
         ("CONSTRAINED_QUEUE_MS", cfg.constrained_queue_ms),
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
+        ("DIRECT_QUEUE_MS", cfg.direct_queue_ms),
+        ("DIRECT_HRD_PCT", cfg.direct_hrd_pct),
         ("SMOOTHER_RATE_PCT", cfg.smoother_rate_pct),
         ("BALANCED_RATE_PCT", cfg.balanced_rate_pct),
         ("SCALE_THREADS", cfg.scale_threads),
