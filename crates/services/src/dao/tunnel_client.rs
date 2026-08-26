@@ -114,6 +114,18 @@ impl TunnelClientDao {
             .await
     }
 
+    /// Every non-tombstoned tunnel client in the tenant, unpaginated —
+    /// mirrors `AgentDao::list_all_active_for_tenant` for the unified device
+    /// list's in-memory compose.
+    pub async fn list_all_active_for_tenant(
+        &self,
+        tenant_id: ObjectId,
+    ) -> DaoResult<Vec<TunnelClient>> {
+        self.base
+            .find_many(doc! { "tenant_id": tenant_id, "deleted_at": null }, None)
+            .await
+    }
+
     /// S5 — active (non-tombstoned) tunnel clients in the tenant, for
     /// the plan cap check at enrollment.
     pub async fn count_active_for_tenant(&self, tenant_id: ObjectId) -> DaoResult<u64> {
