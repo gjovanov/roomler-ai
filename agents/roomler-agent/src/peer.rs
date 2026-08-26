@@ -2988,6 +2988,7 @@ async fn media_pump_vp9_444_dc(
     let mut governor = crate::encode::governor::RateGovernor::new(
         target_fps,
         send_depth,
+        crate::encode::measured_ceiling_enabled(),
         std::time::Instant::now(),
     );
     {
@@ -3000,17 +3001,16 @@ async fn media_pump_vp9_444_dc(
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
-            // Measured-rate stage 0 — see the twin in the FFmpeg pump for
-            // why the loop brackets busy periods rather than timing each
-            // frame: a frame handed to a buffer with headroom measures the
-            // buffer, not the pipe (`encode::goodput`).
+            // Measured-rate v2 — time each frame's chunked serialisation;
+            // the sink keeps only genuinely blocked sends (≥10 ms of SCTP
+            // flow control), so buffer headroom never biases the estimate
+            // (`encode::goodput`).
             while let Some(first) = send_rx.recv().await {
-                let busy_start = std::time::Instant::now();
-                let mut busy_bytes = 0u64;
                 let mut next = Some(first);
                 while let Some(wire) = next.take() {
                     if let Some(dc) = video_bytes_dc.lock().await.clone() {
                         let total = wire.len();
+                        let ser_start = std::time::Instant::now();
                         let mut off = 0usize;
                         let mut ok = true;
                         while off < total {
@@ -3026,12 +3026,11 @@ async fn media_pump_vp9_444_dc(
                         if ok {
                             frames_sent.fetch_add(1, Relaxed);
                             bytes_written.fetch_add(total as u64, Relaxed);
-                            busy_bytes += total as u64;
+                            goodput_sink.record(total as u64, ser_start.elapsed());
                         }
                     }
                     next = send_rx.try_recv().ok();
                 }
-                goodput_sink.record(busy_bytes, busy_start.elapsed());
             }
             tracing::debug!(session = %task_session, "VP9-444 DC send task exiting (channel closed)");
         });
@@ -4265,6 +4264,7 @@ async fn media_pump_ffmpeg_dc(
     let mut governor = crate::encode::governor::RateGovernor::new(
         target_fps,
         ffmpeg_send_depth,
+        crate::encode::measured_ceiling_enabled(),
         std::time::Instant::now(),
     );
     // rc.443 — consecutive-encode-error escalation (retry → rebuild →
@@ -4310,20 +4310,16 @@ async fn media_pump_ffmpeg_dc(
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
-            // Measured-rate stage 0 — bracket BUSY PERIODS. The outer
-            // `recv().await` is by definition the queue running dry, so a
-            // period runs from the frame that ends an idle wait until
-            // `try_recv` misses. Only across such a stretch does
-            // bytes/time mean the pipe's drain rate; a lone frame handed
-            // to a buffer with headroom serialises instantly and measures
-            // nothing (see `encode::goodput`).
-            //
-            // Equivalent to the previous `while let Some(..) = recv()`:
-            // same frames, same order, same awaits. The inner loop only
-            // takes what `recv().await` would have returned immediately.
+            // Measured-rate v2 — time each frame's chunked serialisation
+            // and report it; the sink keeps only genuinely blocked sends
+            // (≥10 ms of SCTP flow control), so buffer headroom never
+            // biases the estimate. Stage-0's busy-period bracketing was
+            // structurally unsatisfiable here: per-frame drain (~24 ms)
+            // sits just under inter-arrival (~25 ms), so the queue dried
+            // between frames and no ≥300 ms period ever formed — field
+            // heartbeats read `goodput_samples: "(0, N)"` all session
+            // (see `encode::goodput`).
             while let Some(first) = send_rx.recv().await {
-                let busy_start = std::time::Instant::now();
-                let mut busy_bytes = 0u64;
                 let mut next = Some(first);
                 while let Some((epoch, enqueued_at, wire)) = next.take() {
                     let total = wire.len();
@@ -4336,6 +4332,7 @@ async fn media_pump_ffmpeg_dc(
                     // open-guard re-requests a keyframe on its side); the frame
                     // is dropped but must still leave the in-flight ledger below.
                     if !stale && let Some(dc) = video_bytes_dc.lock().await.clone() {
+                        let ser_start = std::time::Instant::now();
                         let mut off = 0usize;
                         let mut ok = true;
                         while off < total {
@@ -4355,9 +4352,10 @@ async fn media_pump_ffmpeg_dc(
                         if ok {
                             frames_sent.fetch_add(1, Relaxed);
                             bytes_written.fetch_add(total as u64, Relaxed);
-                            // Only bytes that reached the wire measure the
-                            // pipe. A stale-dropped or failed frame did not.
-                            busy_bytes += total as u64;
+                            // Only a frame that reached the wire measures the
+                            // pipe; the sink discards sub-threshold (headroom)
+                            // sends itself.
+                            goodput_sink.record(total as u64, ser_start.elapsed());
                             // P7 — queue-wait: enqueue→wire-complete. This is
                             // the transport-added latency the viewer feels;
                             // the heartbeat drains it per window.
@@ -4372,15 +4370,11 @@ async fn media_pump_ffmpeg_dc(
                     // strictly precede the frame's entry into the channel, so
                     // this can't underflow.
                     inflight_bytes.fetch_sub(total, Relaxed);
-                    // Stay in the busy period only while the queue never
-                    // emptied. `try_recv` takes exactly what `recv().await`
-                    // would have returned immediately, so this is a
-                    // measurement boundary and not a scheduling change.
-                    // Disconnected falls out here too — the outer `recv`
-                    // then returns None and the task exits as before.
+                    // `try_recv` takes exactly what `recv().await` would have
+                    // returned immediately. Disconnected falls out here too —
+                    // the outer `recv` then returns None and the task exits.
                     next = send_rx.try_recv().ok();
                 }
-                goodput_sink.record(busy_bytes, busy_start.elapsed());
             }
             tracing::debug!(session = %task_session, "FFmpeg DC pump send task exiting (channel closed)");
         });
@@ -5478,11 +5472,11 @@ async fn media_pump_ffmpeg_dc(
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
                 bytes_inflight = inflight_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                // Measured-rate stage 0 — OBSERVED, not applied. Read
-                // against `target_bps` above: the gap between them is the
-                // open-loop error stage 1 exists to close. None = no
-                // confidence (expected on unbound/direct links); the
-                // sample counts distinguish that from a wiring fault.
+                // Measured-rate v2 — CONSUMED (stage 1): while an
+                // estimate holds, `target_bps` above is clamped to 85 %
+                // of it. None = no confidence (nothing blocked lately —
+                // an unbound link shows counts (0, 0)); rejected counts
+                // windows whose blocked time was too thin to trust.
                 goodput_bps = ?governor.measured_goodput_bps(std::time::Instant::now()),
                 goodput_samples = ?governor.goodput_samples(),
                 "FFmpeg DC pump heartbeat (≈2s window)"

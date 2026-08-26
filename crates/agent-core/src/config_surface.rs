@@ -480,6 +480,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "HRD/VBV window for DIRECT sessions (percent of maxrate, 25-200). Empty = built-in 100 - half the rc.234 2x window, which legalised drag-start bursts of seconds' worth of bits (the standing-queue lag). av1_* encoders are floored at 200 regardless (rc.443: Intel AV1 VDENC errors on an over-reservoir IDR instead of QP-clamping). Env: ROOMLER_NODE_DIRECT_HRD_PCT. Restart required.",
     ),
     (
+        "measured_ceiling",
+        "tribool",
+        "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLER_NODE_MEASURED_CEILING. Restart required.",
+    ),
+    (
         "area_min_bitrate",
         "tribool",
         "Area-scaled AIMD bitrate floor (2026-08-26). Default ON: the flat 1.5 Mbps floor was a 1080p legibility tuning and is unreadable mush at 5+ MPix; the scaled floor is ~3.1 Mbps at 2880x1800, capped 4 Mbps, unconstrained sessions only (a relay's 3 Mbps clamp keeps the flat floor so the MD keeps room). false = flat 1.5 Mbps floor. Env: ROOMLER_NODE_AREA_MIN_BITRATE. Restart required.",
@@ -682,6 +687,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "direct_queue_ms" => cfg.direct_queue_ms.map(|p| p.to_string()),
         "direct_hrd_pct" => cfg.direct_hrd_pct.map(|p| p.to_string()),
         "area_min_bitrate" => cfg.area_min_bitrate.map(fmt_bool),
+        "measured_ceiling" => cfg.measured_ceiling.map(fmt_bool),
         "priority_res_cap" => cfg.priority_res_cap.map(fmt_bool),
         "smoother_rate_pct" => cfg.smoother_rate_pct.map(|p| p.to_string()),
         "balanced_rate_pct" => cfg.balanced_rate_pct.map(|p| p.to_string()),
@@ -1032,6 +1038,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "direct_queue_ms" => cfg.direct_queue_ms = parse_u32_range(key, value, 0, 2000)?,
         "direct_hrd_pct" => cfg.direct_hrd_pct = parse_u32_range(key, value, 25, 200)?,
         "area_min_bitrate" => cfg.area_min_bitrate = parse_tribool(value)?,
+        "measured_ceiling" => cfg.measured_ceiling = parse_tribool(value)?,
         "priority_res_cap" => cfg.priority_res_cap = parse_tribool(value)?,
         "smoother_rate_pct" => cfg.smoother_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,
