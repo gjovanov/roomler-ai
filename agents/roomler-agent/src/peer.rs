@@ -5416,13 +5416,11 @@ async fn media_pump_ffmpeg_dc(
             // with a small avg is one IDR's transit, both fat is a standing
             // queue.
             let sw_frames = send_wait_frames.swap(0, std::sync::atomic::Ordering::Relaxed);
-            let send_wait_avg_ms = if sw_frames > 0 {
-                (send_wait_us_sum.swap(0, std::sync::atomic::Ordering::Relaxed) / sw_frames) as f64
-                    / 1000.0
-            } else {
-                send_wait_us_sum.store(0, std::sync::atomic::Ordering::Relaxed);
-                0.0
-            };
+            let send_wait_avg_ms = send_wait_us_sum
+                .swap(0, std::sync::atomic::Ordering::Relaxed)
+                .checked_div(sw_frames)
+                .map(|us| us as f64 / 1000.0)
+                .unwrap_or(0.0);
             let send_wait_max_ms =
                 send_wait_us_max.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
             // rc.186 — step the encode-pressure controller off this window's
