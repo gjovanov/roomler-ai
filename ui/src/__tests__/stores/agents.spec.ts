@@ -63,7 +63,9 @@ describe('useAgentStore', () => {
     })
     const s = useAgentStore()
     await s.fetchAgents(TENANT_ID)
-    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent`)
+    // per_page=100 (the server cap): without it the server defaulted to 25
+    // and every consumer saw a silently truncated fleet.
+    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent?per_page=100`)
     expect(s.agents).toHaveLength(2)
     expect(s.total).toBe(2)
   })
