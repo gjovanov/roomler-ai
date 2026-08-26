@@ -208,6 +208,19 @@ enum Command {
         #[command(flatten)]
         fmt: OutputFmt,
     },
+    /// Explain why ONE peer rides the carrier it rides: the tier ladder with
+    /// each tier's eligibility and score, and any hold-down that is
+    /// overriding the raw ranking (a demote-follow window, a server DERP pin,
+    /// a probe in flight).
+    ///
+    /// Accepts a device name (or a unique part of one), an overlay IP, or a
+    /// node id — whatever you can read out of `roomler peers`.
+    Why {
+        /// Peer to explain: name / name fragment / overlay IP / node id.
+        peer: String,
+        #[command(flatten)]
+        fmt: OutputFmt,
+    },
     /// Show this node's measured network capability vector (overlay v3
     /// netcheck): STUN reachability, the raw relay-band verdict the dialer
     /// role keys on, `/derp` floor health, NAT class, and the measurement's
@@ -605,6 +618,7 @@ where
             fmt,
         } => localclient::logs(source, max_bytes, grep, lines, fmt.json).await,
         Command::Peers { fmt } => localclient::peers(fmt.json).await,
+        Command::Why { peer, fmt } => localclient::why(&peer, fmt.json).await,
         Command::Netcheck { fmt } => localclient::netcheck(fmt.json).await,
         Command::Flows { fmt } => localclient::flows(fmt.json).await,
         Command::Rename { name } => localclient::rename(&name).await,
