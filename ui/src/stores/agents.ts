@@ -126,6 +126,11 @@ export interface Agent {
   tenant_id: string
   owner_user_id: string
   name: string
+  /** Admin-set friendly label; display-only (the technical `name` is what
+   *  MagicDNS derives from). Absent = show `name`. */
+  display_name?: string
+  /** Admin-set fleet labels. */
+  tags?: string[]
   machine_id: string
   os: AgentOs
   agent_version: string
@@ -524,7 +529,12 @@ export const useAgentStore = defineStore('agents', () => {
     loading.value = true
     error.value = null
     try {
-      const resp = await api.get<AgentListResponse>(`/tenant/${tenantId}/agent`)
+      // per_page=100 (the server cap): with no param the server defaulted to
+      // 25 and every consumer of this store silently saw a truncated fleet —
+      // the devices grid's menus, the dashboard tile, the pickers. Above 100
+      // agents the rich-store lookups degrade again; the unified /device
+      // endpoint is the paginated path for that scale.
+      const resp = await api.get<AgentListResponse>(`/tenant/${tenantId}/agent?per_page=100`)
       agents.value = resp.items
       total.value = resp.total
     } catch (e) {
@@ -557,6 +567,40 @@ export const useAgentStore = defineStore('agents', () => {
     await api.put(`/tenant/${tenantId}/agent/${agentId}`, { name })
     const idx = agents.value.findIndex((a) => a.id === agentId)
     if (idx !== -1) agents.value[idx]!.name = name
+  }
+
+  /** Name / display_name / tags in one PUT (the device edit dialog). Reads
+   *  the ADDITIVE update envelope — `{updated, agent, dns_renamed, dns_name}`
+   *  — patching the local row from the returned agent when present (old
+   *  servers omit it; the optimistic patch below still applies). Returns the
+   *  DNS half so the dialog can tell the operator what the MagicDNS label
+   *  became (or that the rename didn't reach the overlay). */
+  async function updateDevice(
+    tenantId: string,
+    agentId: string,
+    fields: { name?: string; display_name?: string; tags?: string[] },
+  ): Promise<{ dnsRenamed?: boolean; dnsName?: string }> {
+    const resp = await api.put<{
+      updated?: boolean
+      agent?: Agent
+      dns_renamed?: boolean | null
+      dns_name?: string | null
+    }>(`/tenant/${tenantId}/agent/${agentId}`, fields)
+    const idx = agents.value.findIndex((a) => a.id === agentId)
+    if (idx !== -1) {
+      if (resp?.agent) {
+        agents.value[idx] = { ...agents.value[idx]!, ...resp.agent }
+      } else {
+        if (fields.name !== undefined) agents.value[idx]!.name = fields.name
+        if (fields.display_name !== undefined)
+          agents.value[idx]!.display_name = fields.display_name || undefined
+        if (fields.tags !== undefined) agents.value[idx]!.tags = fields.tags
+      }
+    }
+    return {
+      dnsRenamed: resp?.dns_renamed ?? undefined,
+      dnsName: resp?.dns_name ?? undefined,
+    }
   }
 
   async function updateAccessPolicy(
@@ -923,6 +967,7 @@ export const useAgentStore = defineStore('agents', () => {
     applyPresence,
     issueEnrollmentToken,
     rename,
+    updateDevice,
     updateAccessPolicy,
     updateRoutes,
     updateOwner,
