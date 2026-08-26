@@ -100,6 +100,13 @@ pub(crate) fn own_msi_version(semver: &str) -> MsiVersion {
         Some(Some(rc)) => (major, minor, patch, rc),
         // Unknown pre-release label: legacy mapping (rc treated as 0).
         Some(None) => (major, minor, patch, 0),
+        // Finals, 0.4+ scheme: the pipeline stamps PATCH into the MSI build
+        // field (see artifact_version::msi_product_version_for — the eras
+        // split at 0.4). Mirroring it here is SELF-PROTECTION-critical: with
+        // the legacy 65535 answer a 0.4.5 agent would rank its OWN installed
+        // product (0.4.5) below itself (0.4.65535) and the sweep would
+        // uninstall the MSI it is running from.
+        None if (major, minor) >= (0, 4) => (major, minor, patch, 0),
         None => (major, minor, 65535, 0),
     }
 }
@@ -270,6 +277,20 @@ mod tests {
         // Legacy old-scheme products (rc in the 4th field) rank below
         // any new-scheme runner — sweepable leftovers, by design.
         assert!(parse_msi_version("0.3.0.99") < own_msi_version("0.3.0-rc.99"));
+    }
+
+    #[test]
+    fn point_four_finals_mirror_the_patch_in_build_field_scheme() {
+        // 0.4+ finals: PATCH is the build field (artifact_version's era
+        // split). SELF-PROTECTION: the running 0.4.5 must compare EQUAL to
+        // its own installed product or the sweep uninstalls itself.
+        assert_eq!(own_msi_version("0.4.5"), (0, 4, 5, 0));
+        assert_eq!(own_msi_version("0.4.5"), parse_msi_version("0.4.5"));
+        // Monotonic within the minor, and every rc-era install ranks below.
+        assert!(own_msi_version("0.4.1") < own_msi_version("0.4.2"));
+        assert!(own_msi_version("0.3.0-rc.482") < own_msi_version("0.4.0"));
+        // Pre-0.4 finals keep the legacy 65535 answer (historical).
+        assert_eq!(own_msi_version("0.3.0"), (0, 3, 65535, 0));
     }
 
     /// The exact field pile-up: eight perMachine versions, running
