@@ -1522,6 +1522,8 @@ impl OverlayRuntime {
         rx: &mut Option<mpsc::Receiver<super::disco::DiscoInbound>>,
         wg: &WgDevice,
         by_node: &HashMap<ObjectId, Installed>,
+        current_peers: &HashMap<ObjectId, NetmapPeer>,
+        direct_ctx: Option<&super::runtime::establish::DirectCtx>,
     ) {
         if !crate::overlay::direct::disco_probe_enabled() {
             return;
@@ -1532,16 +1534,81 @@ impl OverlayRuntime {
                 prober.on_pong(&p);
             }
         }
+        // Everything probed this round, per peer — the keep-set for pruning
+        // below. A peer contributes either its live carrier path or its
+        // candidate set, never both, but collecting them uniformly means the
+        // prune cannot depend on which branch ran.
+        let mut probed: HashMap<[u8; 32], Vec<std::net::SocketAddr>> = HashMap::new();
         for e in by_node.values().filter(|e| e.is_direct) {
             let (nonce, frame) =
                 prober.next_ping(&e.pubkey, &self.keypair.secret, &self.keypair.public);
             if let Some(dst) = wg.sender().send_disco_raw(&e.pubkey, &frame).await {
                 prober.sent(e.pubkey, dst, nonce);
-                // The carrier can move under us (NAT rebind, roam,
-                // re-establish). Anything we are no longer probing for this
-                // peer is stale — see `retain_path`.
-                prober.retain_path(&e.pubkey, dst);
+                probed.entry(e.pubkey).or_default().push(dst);
             }
+        }
+        // A2 — probe the CANDIDATE paths of peers parked on a relay.
+        //
+        // Until now the loop above was the whole prober, and it walks only
+        // carriers that are ALREADY direct. So the one question an operator
+        // actually asks — "this pair is on relay; would the LAN path work?" —
+        // was the one question disco could not answer, and answering it took a
+        // tcpdump on one host and log archaeology on the other (2026-08-26,
+        // neo16 ↔ MacBook, same Wi-Fi).
+        //
+        // This is measurement, NOT a dial: a disco ping is a stateless echo
+        // the peer answers to the packet's OBSERVED SOURCE, so it neither
+        // creates a carrier nor disturbs the relay one in use, and unlike a
+        // WireGuard handshake its reply cannot be routed to a stale endpoint.
+        // Nothing reads the result to make a decision — that is still C3/C6.
+        for (nid, np) in current_peers {
+            let Some(inst) = by_node.get(nid) else {
+                continue;
+            };
+            if inst.is_direct {
+                continue; // covered above, over the path it actually uses
+            }
+            let Some(cfg) = super::netmap::peer_config_from_netmap(np) else {
+                continue;
+            };
+            // Rotation 0 on purpose: the prober measures the PRIMARY candidate
+            // of each tier. Rotating here would sample a different endpoint
+            // every round and never accumulate a loss window on any of them,
+            // which is the opposite of what a loss window is for.
+            let cands = super::runtime::establish::resolve_direct_candidates(
+                direct_ctx,
+                &cfg,
+                Default::default(),
+            );
+            let Some(ctx) = direct_ctx else { continue };
+            // The LAN candidate carries the local interface IP to egress from,
+            // which is why it is shaped differently from the other two.
+            let lan = match cands.lan {
+                Some((local_ip, dst)) => {
+                    super::runtime::establish::lan_egress_socket(ctx, local_ip, dst)
+                        .await
+                        .map(|s| (dst, s))
+                }
+                None => None,
+            };
+            for pair in [
+                lan,
+                cands.public.zip(ctx.public_sock.clone()),
+                cands.srflx.zip(ctx.punch.clone().map(|(_, s)| s)),
+            ] {
+                let Some((dst, sock)) = pair else { continue };
+                let (nonce, frame) =
+                    prober.next_ping(&cfg.public_key, &self.keypair.secret, &self.keypair.public);
+                if sock.send_to(&frame, dst).await.is_ok() {
+                    prober.sent(cfg.public_key, dst, nonce);
+                    probed.entry(cfg.public_key).or_default().push(dst);
+                }
+            }
+        }
+        // Anything we are no longer probing for a peer is stale (the carrier
+        // moved, or a candidate went away) — see `retain_paths`.
+        for (pk, dsts) in &probed {
+            prober.retain_paths(pk, dsts);
         }
         // C2.s only observable: a periodic digest. Every 60 rounds ≈ 5 min
         // at the 5 s tick, so it is legible in a live journal without
@@ -2731,7 +2798,7 @@ impl OverlayRuntime {
                     // replies. MEASUREMENT ONLY — nothing below reads the
                     // table to make a routing decision (that is C3/C6, behind
                     // their own flags). Default OFF.
-                    self.disco_round(&mut disco, &mut disco_rx, &wg, &by_node).await;
+                    self.disco_round(&mut disco, &mut disco_rx, &wg, &by_node, &current_peers, direct_ctx.as_ref()).await;
                     // rc.208 — make-before-break: promote any upgrade probe whose
                     // handshake latched (cut over to direct, drop the relay) and
                     // expire any that missed its deadline (keep the relay). Inert
