@@ -102,20 +102,27 @@ pub struct RateGovernor {
     tier: DownscaleTier,
     auto_res_cap: Option<u32>,
 
-    // Measured-rate stage 0 — OBSERVE ONLY. Nothing above reads this
-    // yet; it is folded on the viewer-window tick and reported in the
-    // heartbeat so the estimate can be checked against known truth
-    // (relay sessions ≈ 2 Mbps, direct ⇒ None) before stage 1 derives
-    // the ceiling from it.
+    // Measured-rate v2 (2026-08-27) — CONSUMED at stage 1: the send
+    // task reports per-frame blocked sends, the viewer-window tick
+    // folds one window at a time, and `pre_encode_tick` clamps the
+    // nominal ceiling to `derived_ceiling_bps(G)` while an estimate
+    // holds. The heartbeat still reports the raw estimate + counts.
     goodput: GoodputEstimator,
     goodput_sink: GoodputSink,
+    /// Stage-1 kill switch, resolved once by the pump
+    /// (`encode::measured_ceiling_enabled` — env/config
+    /// `MEASURED_CEILING`). False = observe-and-report only.
+    measured_ceiling: bool,
 }
 
 /// The viewer-rate fold cadence (unchanged from the pump bodies).
 const VIEWER_WINDOW: Duration = Duration::from_secs(1);
 
 impl RateGovernor {
-    pub fn new(target_fps: u32, send_depth: usize, now: Instant) -> Self {
+    /// `measured_ceiling` gates stage-1 consumption of the goodput
+    /// estimate (the pumps resolve it once from env/config; tests pass
+    /// it explicitly so the governor stays pure).
+    pub fn new(target_fps: u32, send_depth: usize, measured_ceiling: bool, now: Instant) -> Self {
         Self {
             aimd: None,
             send_depth,
@@ -131,29 +138,32 @@ impl RateGovernor {
             auto_res_cap: None,
             goodput: GoodputEstimator::new(),
             goodput_sink: GoodputSink::new(),
+            measured_ceiling,
         }
     }
 
-    /// Hand to the send task at spawn. It records one busy period per
-    /// unbroken run of frames; the governor folds them on the viewer
-    /// window tick.
+    /// Hand to the send task at spawn. It reports every frame's
+    /// serialisation time; the sink keeps only genuinely blocked sends
+    /// (≥ `goodput::MIN_BLOCKED_SEND`) and the governor folds one
+    /// window per viewer tick.
     pub fn goodput_sink(&self) -> GoodputSink {
         self.goodput_sink.clone()
     }
 
     /// The measured delivered rate, or `None` for no confidence.
     ///
-    /// ⚠ Stage 0: **reported, never consumed.** When stage 1 wires this
-    /// into the budgets, the rule is `B = min(nominal, 0.85 × G)` —
-    /// measurement may only ever LOWER the clamp, because the clamp also
+    /// Stage 1 consumes this in [`Self::pre_encode_tick`] as
+    /// `ceiling := min(nominal, derived_ceiling_bps(G))` — measurement
+    /// may only ever LOWER the clamp, because the nominal clamp also
     /// protects the TURN path.
     pub fn measured_goodput_bps(&self, now: Instant) -> Option<u32> {
         self.goodput.estimate_bps(now)
     }
 
-    /// `(accepted, rejected)` busy periods — heartbeat telemetry. A high
-    /// rejected count with zero accepted is the healthy signature of an
-    /// unbound link, not a wiring fault.
+    /// `(accepted, rejected)` goodput WINDOWS — heartbeat telemetry.
+    /// `(0, 0)` is the healthy signature of an unbound link (nothing
+    /// ever blocked); rejected counts windows whose blocked time was
+    /// too thin to trust.
     pub fn goodput_samples(&self) -> (u64, u64) {
         (self.goodput.accepted(), self.goodput.rejected())
     }
@@ -188,6 +198,19 @@ impl RateGovernor {
         send_capacity: usize,
         now: Instant,
     ) -> Option<AppliedBitrate> {
+        // Stage 1 (2026-08-27) — clamp the nominal ceiling to the
+        // measured pipe while an estimate holds: the session then tops
+        // out just UNDER the drain rate instead of rediscovering it by
+        // congesting the send queue on every burst (the "chunky" skips).
+        // Only ever LOWERS the nominal; confidence decays via the
+        // estimator's TTL, so silence reverts to the nominal band.
+        let ceiling_bps = if self.measured_ceiling
+            && let Some(g) = self.goodput.estimate_bps(now)
+        {
+            ceiling_bps.min(super::goodput::derived_ceiling_bps(g))
+        } else {
+            ceiling_bps
+        };
         let depth = self.send_depth;
         let ctrl = self.aimd.get_or_insert_with(|| {
             AimdController::new(
@@ -258,13 +281,12 @@ impl RateGovernor {
             return None;
         }
         self.viewer_window_at = now;
-        // Stage 0: fold whatever the send task observed since the last
-        // window. Deliberately inside the window gate rather than per
+        // Fold the window's blocked-send samples in one byte-weighted
+        // aggregate. Deliberately inside the window gate rather than per
         // frame — the send task is a different task, and this is the
         // existing once-a-second rendezvous.
-        for period in self.goodput_sink.drain() {
-            self.goodput.observe(period, now);
-        }
+        let samples = self.goodput_sink.drain();
+        self.goodput.observe_window(&samples, now);
         let (reported_fps, struggling) = viewer_rate::unpack_report(take_report());
         let own_div = self
             .viewer_rate
@@ -349,7 +371,69 @@ mod tests {
     const CEILING: u32 = 12_000_000;
 
     fn gov(now: Instant) -> RateGovernor {
-        RateGovernor::new(30, DEPTH, now)
+        RateGovernor::new(30, DEPTH, true, now)
+    }
+
+    /// Stage 1: a held goodput estimate clamps the nominal ceiling to
+    /// 85 % of the measured drain, so the target converges just under
+    /// the pipe instead of congesting it every burst.
+    #[test]
+    fn measured_goodput_clamps_the_ceiling() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let sink = g.goodput_sink();
+        // One congested second: 40 × 30 KB frames, 24 ms serialisation
+        // each = a 10 Mbps drain measurement.
+        for _ in 0..40 {
+            sink.record(30_000, Duration::from_millis(24));
+        }
+        let t1 = start + Duration::from_secs(2);
+        assert!(g.tick_viewer_window(t1, 30, || 0, |o| o).is_some());
+        assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
+        let applied = g
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, t1)
+            .expect("initial apply");
+        assert_eq!(
+            applied.bps, 8_500_000,
+            "12M nominal clamped to 0.85 × 10M measured"
+        );
+    }
+
+    /// The kill switch keeps stage 1 observe-and-report only.
+    #[test]
+    fn measured_ceiling_disabled_keeps_nominal() {
+        let start = Instant::now();
+        let mut g = RateGovernor::new(30, DEPTH, false, start);
+        let sink = g.goodput_sink();
+        for _ in 0..40 {
+            sink.record(30_000, Duration::from_millis(24));
+        }
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, |o| o);
+        assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
+        let applied = g
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, t1)
+            .expect("initial apply");
+        assert_eq!(applied.bps, CEILING, "disabled = nominal band");
+    }
+
+    /// The measurement may only ever LOWER the clamp — a pipe measured
+    /// faster than the nominal ceiling changes nothing.
+    #[test]
+    fn measured_clamp_only_lowers() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let sink = g.goodput_sink();
+        // 40 × 60 KB over 24 ms each = 20 Mbps; derived 17M > 12M nominal.
+        for _ in 0..40 {
+            sink.record(60_000, Duration::from_millis(24));
+        }
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, |o| o);
+        let applied = g
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, t1)
+            .expect("initial apply");
+        assert_eq!(applied.bps, CEILING, "measurement never raises the ceiling");
     }
 
     #[test]
