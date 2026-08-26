@@ -44,6 +44,8 @@ mod cluster_tests;
 #[cfg(test)]
 mod cors_tests;
 #[cfg(test)]
+mod device_list_tests;
+#[cfg(test)]
 mod device_naming_tests;
 #[cfg(test)]
 mod invite_tests;
