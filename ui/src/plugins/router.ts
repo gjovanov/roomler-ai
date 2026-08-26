@@ -189,6 +189,20 @@ const routes: RouteRecordRaw[] = [
             ],
           },
           {
+            // Audit trails, OUT of Admin/Settings (2026-08-26): reviewing
+            // who ran/held what is a different job from configuring the
+            // org, and the sections were buried at the bottom of a long
+            // settings page. Same child-route shell as /admin.
+            path: 'audit',
+            redirect: { name: 'audit-exec' },
+            component: () => import('@/views/admin/AuditPanel.vue'),
+            children: [
+              { path: 'exec',         name: 'audit-exec',         props: true, component: () => import('@/components/admin/ExecAuditSection.vue') },
+              { path: 'ssh',          name: 'audit-ssh',          props: true, component: () => import('@/components/admin/SshAuditSection.vue') },
+              { path: 'ssh-activity', name: 'audit-ssh-activity', props: true, component: () => import('@/components/admin/SshActivitySection.vue') },
+            ],
+          },
+          {
             path: 'billing',
             name: 'billing',
             component: () => import('@/views/billing/BillingView.vue'),

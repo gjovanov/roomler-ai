@@ -9,6 +9,8 @@ import {
   canGrantDeviceExec,
   canGrantDeviceSsh,
   canManageInvites,
+  canViewExecAudit,
+  canViewSshAudit,
   canQueryAnalytics,
   canSeeFleetNav,
   describePermissions,
@@ -213,6 +215,34 @@ describe('canQueryAnalytics (org analytics gating — stats PR-4)', () => {
   it('plain member denied', () => {
     expect(canQueryAnalytics(DEFAULT_MEMBER, false)).toBe(false)
     expect(canQueryAnalytics(0, false)).toBe(false)
+  })
+})
+
+describe('canViewExecAudit / canViewSshAudit (Audit nav gating)', () => {
+  const VIEW_EXEC_AUDIT = 1 << 28
+  const VIEW_SSH_AUDIT = 1 << 30
+
+  it('fail CLOSED on a null mask (403 ⇒ forced logout)', () => {
+    expect(canViewExecAudit(null, false)).toBe(false)
+    expect(canViewSshAudit(null, false)).toBe(false)
+    expect(canViewExecAudit(null, true)).toBe(true)
+    expect(canViewSshAudit(null, true)).toBe(true)
+  })
+
+  it('the two bits are independent — one never implies the other', () => {
+    expect(canViewExecAudit(VIEW_EXEC_AUDIT, false)).toBe(true)
+    expect(canViewExecAudit(VIEW_SSH_AUDIT, false)).toBe(false)
+    expect(canViewSshAudit(VIEW_SSH_AUDIT, false)).toBe(true)
+    expect(canViewSshAudit(VIEW_EXEC_AUDIT, false)).toBe(false)
+  })
+
+  it('ADMINISTRATOR and DEFAULT_ADMIN pass both; plain member neither', () => {
+    expect(canViewExecAudit(ADMINISTRATOR, false)).toBe(true)
+    expect(canViewSshAudit(ADMINISTRATOR, false)).toBe(true)
+    expect(canViewExecAudit(DEFAULT_ADMIN, false)).toBe(true)
+    expect(canViewSshAudit(DEFAULT_ADMIN, false)).toBe(true)
+    expect(canViewExecAudit(DEFAULT_MEMBER, false)).toBe(false)
+    expect(canViewSshAudit(DEFAULT_MEMBER, false)).toBe(false)
   })
 })
 
