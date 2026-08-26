@@ -1307,13 +1307,112 @@ impl FfmpegEncoder {
     }
 }
 
+/// P3 (2026-08-27) — the parameters a BACKGROUND maxrate rebuild needs,
+/// captured from the live encoder so the blocking open can run off the
+/// pump task (`spawn_blocking`) while the current encoder keeps
+/// producing frames.
+#[derive(Debug, Clone, Copy)]
+pub struct RebuildSpec {
+    name: &'static str,
+    width: u32,
+    height: u32,
+    fps: i32,
+    maxrate_bps: usize,
+    cq: u32,
+    chroma444: bool,
+    constrained: bool,
+}
+
+/// P3 — a background-opened replacement encoder plus the parameters it
+/// was opened with, handed back to the pump for adoption between
+/// frames. Opaque outside this module so ffmpeg types never leak into
+/// peer.rs.
+pub struct RebuiltEncoder {
+    spec: RebuildSpec,
+    inner: codec::encoder::Video,
+}
+
+impl RebuiltEncoder {
+    pub fn maxrate_bps(&self) -> usize {
+        self.spec.maxrate_bps
+    }
+}
+
 impl FfmpegEncoder {
     /// rc.445 — whether `set_bitrate` applies IN PLACE (NVENC) or as a
     /// blocking rebuild (QSV/AMF). The pump defers rebuild-bound applies
     /// to quiet moments — a mid-motion QSV open stalls the stream
-    /// 0.65-0.87 s on Iris-Xe-class (field-measured).
+    /// 0.65-0.87 s on Iris-Xe-class (field-measured) — or, since P3,
+    /// routes them through the background swap (`rebuild_spec` /
+    /// `open_rebuilt` / `adopt_rebuilt`).
     pub fn supports_dynamic_bitrate(&self) -> bool {
         self.supports_dynamic_bitrate
+    }
+
+    /// P3 — capture the parameters a background maxrate rebuild needs.
+    /// Mirrors `set_bitrate`'s coarsen + change gate: `None` = the
+    /// target coarsens to the CURRENT rung, nothing to do.
+    pub(crate) fn rebuild_spec(&self, bps: u32) -> Option<RebuildSpec> {
+        let target = crate::encode::aimd::coarsen_bitrate(bps) as usize;
+        if crate::encode::aimd::coarsen_bitrate(self.maxrate_bps as u32) as usize == target {
+            return None;
+        }
+        Some(RebuildSpec {
+            name: self.encoder_name,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            maxrate_bps: target,
+            cq: self.cq,
+            chroma444: self.chroma444,
+            constrained: self.constrained,
+        })
+    }
+
+    /// P3 — BLOCKING open of the replacement encoder; run on
+    /// `spawn_blocking`, never on the pump task. Mirrors the sync
+    /// `set_bitrate` rebuild arm, including the P4 vp9_qsv
+    /// gop/low_power re-resolve (a process-stable OnceLock, so this
+    /// reproduces exactly the config the encoder was originally built
+    /// with).
+    pub(crate) fn open_rebuilt(spec: RebuildSpec) -> Result<RebuiltEncoder> {
+        let (qsv_gop, qsv_low_power) = Self::vp9_qsv_runtime_config();
+        let inner = Self::build_encoder(
+            spec.name,
+            spec.width,
+            spec.height,
+            spec.fps,
+            spec.maxrate_bps,
+            spec.cq,
+            qsv_low_power,
+            qsv_gop,
+            spec.chroma444,
+            spec.constrained,
+        )?;
+        Ok(RebuiltEncoder { spec, inner })
+    }
+
+    /// P3 — adopt a background-opened encoder between frames. Refuses
+    /// (returning `false` and keeping the current encoder) when the
+    /// session re-opened at different dims / a different backend /
+    /// different chroma while the open was in flight — the replacement
+    /// is stale. On adoption the state mirrors the sync rebuild arm:
+    /// fresh GOP, first frame a forced IDR (the browser resyncs cleanly
+    /// across the swap).
+    pub(crate) fn adopt_rebuilt(&mut self, rebuilt: RebuiltEncoder) -> bool {
+        let spec = rebuilt.spec;
+        if spec.width != self.width
+            || spec.height != self.height
+            || spec.name != self.encoder_name
+            || spec.chroma444 != self.chroma444
+        {
+            return false;
+        }
+        self.encoder = rebuilt.inner;
+        self.maxrate_bps = spec.maxrate_bps;
+        self.frame_count = 0;
+        self.force_keyframe = true;
+        true
     }
 
     /// P4 — the synchronous encode body (the async trait fn below never
