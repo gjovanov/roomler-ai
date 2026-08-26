@@ -7881,6 +7881,7 @@ dependencies = [
  "png 0.18.1",
  "rand 0.9.4",
  "reqwest 0.12.28",
+ "ring",
  "roomler-agent-core",
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",

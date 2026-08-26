@@ -64,6 +64,7 @@ pub mod org_join;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
 pub mod peer;
+pub mod pgp_verify;
 pub mod post_install;
 pub mod preflight;
 /// Pseudo-terminals for Roomler SSH interactive sessions (P4a, Unix only —
