@@ -1644,6 +1644,34 @@ fn epoch_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// #33 — answer a peer's direct handshake initiation even while that tier is
+/// suppressed, when accepting cannot cost us the relay
+/// (`ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED`; default **OFF**).
+///
+/// The #30 demote-follow hold-down exists to stop us PROMOTING into a flap. It
+/// also made `PathMonitor::inbound_init` refuse — and that verdict is
+/// authoritative for inbound, so the node stopped ANSWERING the peer's
+/// initiations entirely, on a window that escalates to 15 minutes. Two ends
+/// that have both followed therefore go mutually deaf.
+///
+/// Measured 2026-08-26, neo16 ↔ a MacBook on the same Wi-Fi, one metre apart:
+/// 3370 probe failures with `saw_inbound=false` against 3 with `true`, and
+/// WireGuard initiations visible in `tcpdump` flowing BOTH ways with zero
+/// responses — while disco, whose responder has no such gate, measured that
+/// same LAN path at 8 % loss. The path was never the problem.
+///
+/// ⚠️ Not entirely free: the accept occupies the peer's single probe slot for
+/// up to the handshake deadline, so a peer initiating on a genuinely bad tier
+/// can delay probing a better one. The alternative measured in the field is
+/// indefinite mutual deafness, which is strictly worse — but the slot cost is
+/// real, and is why this is default-OFF pending a soak.
+///
+/// Default OFF because this is carrier selection, where this codebase's
+/// regressions have been expensive: flag, two-host soak, field gate, then flip.
+pub fn answer_while_followed() -> bool {
+    crate::env::flag("OVERLAY_ANSWER_WHILE_FOLLOWED", false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
