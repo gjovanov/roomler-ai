@@ -3,8 +3,35 @@
     <h1 class="text-h5 text-md-h4 mb-1 mb-md-2">{{ tenantStore.current?.name }}</h1>
     <p class="text-subtitle-2 text-md-subtitle-1 text-medium-emphasis mb-2 mb-md-4">Workspace Overview</p>
 
+    <!-- Devices-first (2026-08-26): the tile order leads with the fleet —
+         Devices online | Tunnels | Rooms | Active calls | Messages. Five
+         tiles wrap 1/2/5-up. Devices counts come from the server-side stats
+         overview when available (accurate at any fleet size); the agents
+         store — capped at its fetch page — is only the fallback. -->
     <v-row>
-      <v-col cols="12" sm="6" md="3">
+      <v-col cols="6" sm="4" md>
+        <v-card :to="showFleet ? `/tenant/${tenantId}/devices` : undefined" :hover="showFleet">
+          <v-card-text class="text-center">
+            <v-icon size="48" color="warning">mdi-monitor-multiple</v-icon>
+            <div class="text-h4 mt-2">{{ devicesOnlineLabel }}</div>
+            <div class="text-subtitle-2">Devices Online</div>
+          </v-card-text>
+        </v-card>
+      </v-col>
+      <v-col cols="6" sm="4" md>
+        <v-card
+          :to="showFleet ? `/tenant/${tenantId}/devices` : undefined"
+          :hover="showFleet"
+          title="Enrolled tunnel clients (stored status — no liveness probe)"
+        >
+          <v-card-text class="text-center">
+            <v-icon size="48" color="info">mdi-lan-pending</v-icon>
+            <div class="text-h4 mt-2">{{ tunnelsLabel }}</div>
+            <div class="text-subtitle-2">Tunnels</div>
+          </v-card-text>
+        </v-card>
+      </v-col>
+      <v-col cols="6" sm="4" md>
         <v-card :to="`/tenant/${tenantId}/rooms`" hover>
           <v-card-text class="text-center">
             <v-icon size="48" color="primary">mdi-pound</v-icon>
@@ -13,7 +40,7 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col cols="12" sm="6" md="3">
+      <v-col cols="6" sm="4" md>
         <v-card>
           <v-card-text class="text-center">
             <v-icon size="48" color="secondary">mdi-video</v-icon>
@@ -22,21 +49,12 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col cols="12" sm="6" md="3">
+      <v-col cols="6" sm="4" md>
         <v-card :to="`/tenant/${tenantId}/rooms`" hover>
           <v-card-text class="text-center">
             <v-icon size="48" color="accent">mdi-message-text</v-icon>
             <div class="text-h4 mt-2">{{ totalMessageCount }}</div>
             <div class="text-subtitle-2">Messages</div>
-          </v-card-text>
-        </v-card>
-      </v-col>
-      <v-col cols="12" sm="6" md="3">
-        <v-card :to="showFleet ? `/tenant/${tenantId}/devices` : undefined" :hover="showFleet">
-          <v-card-text class="text-center">
-            <v-icon size="48" color="warning">mdi-monitor-multiple</v-icon>
-            <div class="text-h4 mt-2">{{ onlineDevices }}</div>
-            <div class="text-subtitle-2">Devices Online</div>
           </v-card-text>
         </v-card>
       </v-col>
@@ -152,7 +170,9 @@
         </v-card>
       </v-col>
       <v-col v-if="showFleet" cols="12" sm="6" md="3">
-        <v-card :to="`/tenant/${tenantId}/network/machines`" hover>
+        <!-- /network (the ACL landing) — /network/machines has been a
+             redirect stub since the S4 fold-in. -->
+        <v-card :to="`/tenant/${tenantId}/network`" hover>
           <v-card-text>
             <v-icon color="primary" class="mr-2">mdi-lan</v-icon>
             <span class="text-subtitle-1 font-weight-medium">Network</span>
@@ -207,6 +227,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useTenantStore } from '@/stores/tenant'
 import { useRoomStore } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
+import { useTunnelClientStore } from '@/stores/tunnelClients'
 import { useStatsStore } from '@/stores/stats'
 import { usePolling } from '@/composables/usePolling'
 import { canManageInvites, canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
@@ -218,6 +239,7 @@ const router = useRouter()
 const tenantStore = useTenantStore()
 const roomStore = useRoomStore()
 const agentStore = useAgentStore()
+const tunnelClientStore = useTunnelClientStore()
 const statsStore = useStatsStore()
 
 const tenantId = computed(() => route.params.tenantId as string)
@@ -228,6 +250,21 @@ const totalMessageCount = computed(
   () => roomStore.rooms.reduce((sum, r) => sum + (r.message_count || 0), 0),
 )
 const onlineDevices = computed(() => agentStore.agents.filter((a) => a.is_online).length)
+/** "online/total" from the server-side stats overview when it's on —
+ *  accurate at any fleet size; the (page-capped) agents store is the
+ *  fallback when stats are disabled. */
+const devicesOnlineLabel = computed(() => {
+  const m = statsStore.overview?.machines
+  if (m) return `${m.online}/${m.total}`
+  return String(onlineDevices.value)
+})
+/** Enrolled tunnel clients, online-by-stored-status/total. No liveness
+ *  probe exists for tunnel clients (the tunnel.rs "T2" gap) — the tile's
+ *  tooltip says so instead of pretending. */
+const tunnelsLabel = computed(() => {
+  const online = tunnelClientStore.clients.filter((c) => c.status === 'online').length
+  return `${online}/${tunnelClientStore.total}`
+})
 const showFleet = computed(() => canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner))
 const showAnalytics = computed(() =>
   canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
@@ -292,7 +329,10 @@ async function startCall() {
 onMounted(() => {
   if (tenantId.value) {
     roomStore.fetchRooms(tenantId.value)
-    if (showFleet.value) agentStore.fetchAgents(tenantId.value).catch(() => {})
+    if (showFleet.value) {
+      agentStore.fetchAgents(tenantId.value).catch(() => {})
+      tunnelClientStore.fetchTunnelClients(tenantId.value)
+    }
   }
 })
 </script>

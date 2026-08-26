@@ -90,6 +90,25 @@ export const useRoomStore = defineStore('rooms', () => {
     }
   }
 
+  /** Server-side sidebar search (`GET /room?q=…&page=…`) — respects
+   *  secret-room visibility server-side and returns a bare page of rooms.
+   *  Deliberately does NOT touch `rooms`: that list must stay COMPLETE
+   *  (dashboard tiles, app-bar call menu and unread accounting iterate it);
+   *  callers keep search results in their own state. */
+  async function searchRooms(
+    tenantId: string,
+    q: string,
+    page = 1,
+    perPage = 20,
+  ): Promise<Room[]> {
+    const params = new URLSearchParams({
+      q,
+      page: String(page),
+      per_page: String(perPage),
+    })
+    return api.get<Room[]>(`/tenant/${tenantId}/room?${params.toString()}`)
+  }
+
   async function createRoom(tenantId: string, payload: Partial<Room> & { has_media?: boolean }) {
     const body: Record<string, unknown> = { ...payload }
     if (body.has_media) {
@@ -295,6 +314,7 @@ export const useRoomStore = defineStore('rooms', () => {
     // Room operations
     childrenOf,
     fetchRooms,
+    searchRooms,
     createRoom,
     deleteRoom,
     joinRoom,
