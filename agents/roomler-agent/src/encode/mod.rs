@@ -214,6 +214,21 @@ fn area_min_bitrate_enabled() -> bool {
     tunnel_core::env::node_env("AREA_MIN_BITRATE").as_deref() != Some("0")
 }
 
+/// Measured-rate stage 1 kill switch (2026-08-27): when on (default),
+/// the governor clamps the nominal bitrate ceiling to 85 % of the
+/// session's MEASURED drain rate while an estimate holds — the session
+/// tops out just under the pipe instead of rediscovering it by
+/// congesting the send queue on every drag burst. See
+/// `encode::goodput` for the sampling rules. Hatch:
+/// `ROOMLER_AGENT_MEASURED_CEILING=0` / config `measured_ceiling`.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn measured_ceiling_enabled() -> bool {
+    tunnel_core::env::node_env("MEASURED_CEILING").as_deref() != Some("0")
+}
+
 /// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (the field-test host) that
 /// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
 /// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
