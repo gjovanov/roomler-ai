@@ -339,7 +339,10 @@ pub struct WarmRelayStatus {
 }
 
 /// A peer device as this node currently sees it.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+// NOTE: no `Eq` — `PeerWhy` carries the selector's f64 scores, and rounding
+// them to keep `Eq` would make the diagnostic lie about the numbers the
+// selector actually used. Nothing compares `PeerInfo` for total equality.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PeerInfo {
     pub node_id: String,
     pub name: String,
@@ -417,6 +420,68 @@ pub struct PeerInfo {
     /// daemon (wire-compatible both ways).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<PeerCarrierDebug>,
+    /// F — the path decision for this peer, in readable form
+    /// (`roomler why <peer>`). Always populated by a current daemon; `None`
+    /// from an older one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<PeerWhy>,
+}
+
+/// F — why this peer sits on the tier it sits on (`roomler why <peer>`).
+///
+/// Populated on every view publish, like [`PeerCarrierDebug`], rather than
+/// computed on demand: an incident capture is usually a `peers --json` taken
+/// at the time, and the explanation is worth far more inside that snapshot
+/// than in a command someone had to know to run while the fault was live.
+///
+/// `None` from a daemon older than the field (`#[serde(default)]`, wire
+/// compatible both ways).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PeerWhy {
+    /// LAN, public, srflx, relay — already in ladder order.
+    pub tiers: Vec<TierWhy>,
+    /// Seconds left on the demote-follow hold-down, if open. While this is
+    /// set, EVERY direct tier is ineligible regardless of its own health —
+    /// the peer is relaying to us, so we follow it rather than fight it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relayed_instead_s: Option<u64>,
+    /// Consecutive demote-follows inside the memory window — the rung of the
+    /// escalation ladder. A climbing value is the signature of a pair whose
+    /// two ends persistently disagree about the path, which is a different
+    /// problem from a path that is simply bad.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub relayed_instead_strikes: u32,
+    /// Seconds left on the server's forced-DERP pin, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_derp_s: Option<u64>,
+    /// A direct-upgrade probe is in flight on this tier right now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probing: Option<String>,
+}
+
+/// One tier's row in [`PeerWhy`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TierWhy {
+    /// `lan` | `public` | `srflx` | `relay`.
+    pub tier: String,
+    /// May this tier be attempted at all right now?
+    pub eligible: bool,
+    /// When not eligible, which gate refused: `peer-relays-instead` |
+    /// `penalty`. Resolved in the same order the selector tests them, so it
+    /// cannot contradict `eligible`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
+    /// The tier's fixed prior.
+    pub base: f64,
+    /// Measured-quality term (ranking only — never eligibility).
+    pub q: f64,
+    /// Decaying penalty from recent failures.
+    pub penalty: f64,
+    /// `base + q − penalty`; meaningful only among ELIGIBLE tiers.
+    pub score: f64,
+    /// Consecutive failures booked against this tier.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub fails: u32,
 }
 
 /// rc.276 — per-carrier forensic fields (see [`PeerInfo::debug`]). Built for
@@ -786,7 +851,7 @@ pub struct ConfigEntry {
 
 /// A LocalAPI response. Adjacently tagged so a payload may be a struct
 /// (`Status`) or a sequence (`Peers` / `Flows`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "t", content = "d", rename_all = "snake_case")]
 pub enum Response {
     /// Boxed: `NodeStatus` is ~408 bytes against a 137-byte second-largest,
@@ -2035,6 +2100,8 @@ mod tests {
                 direct_bind_walks: None,
                 roam_adoptions: None,
                 disco_answered: None,
+                derp_inbound_drops: None,
+                netcheck: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -2057,6 +2124,7 @@ mod tests {
                     relay_kind: None,
                     relay_transport: None,
                     relay_server: None,
+                    why: None,
                     debug: None,
                 },
                 PeerInfo {
@@ -2077,6 +2145,7 @@ mod tests {
                     relay_kind: None,
                     relay_transport: None,
                     relay_server: None,
+                    why: None,
                     debug: None,
                 },
             ]
