@@ -1122,7 +1122,7 @@ pub async fn turn_credentials(
 /// (TTL-enforced) directory record on ANY pod. Redis down / timeout ⇒
 /// empty set — `to_agent_response` then degrades to the pre-A-1
 /// heartbeat disjunction, never to hard-offline.
-async fn agent_presence_batch(
+pub(crate) async fn agent_presence_batch(
     state: &AppState,
     agents: &[roomler_ai_remote_control::models::Agent],
 ) -> std::collections::HashSet<ObjectId> {
@@ -1153,22 +1153,24 @@ async fn agent_presence_batch(
     }
 }
 
-fn to_agent_response(
+/// Phase A-1 three-state presence, shared by the agent response and the
+/// unified device list (`routes/device.rs`) so the derivations can't drift.
+/// "online" = an rc socket is REGISTERED somewhere (this pod's hub, or any
+/// pod's fresh Redis directory record) — the state in which Connect will
+/// actually work. "stale" = the Mongo heartbeat trail is fresh but no pod
+/// claims the socket (half-open middlebox leg, directory outage, or a pod
+/// that died without cleanup) — visible, amber, Connect disabled. "offline"
+/// = neither. With Redis down `redis_fresh` is always false, so the presence
+/// degrades to the pre-A-1 heartbeat disjunction (a cross-pod agent shows
+/// "stale" instead of "online" — degraded, never lying green on a dead
+/// socket ONLY, and never hard-offline). The returned bool is the back-compat
+/// `is_online` = the reachable state only (pre-A-1 it also counted
+/// heartbeat-only agents, which is what lied green).
+pub(crate) fn derive_agent_presence(
     state: &AppState,
-    a: roomler_ai_remote_control::models::Agent,
+    a: &roomler_ai_remote_control::models::Agent,
     redis_fresh: bool,
-) -> AgentResponse {
-    let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
-    // Phase A-1 three-state presence. "online" = an rc socket is
-    // REGISTERED somewhere (this pod's hub, or any pod's fresh Redis
-    // directory record) — the state in which Connect will actually work.
-    // "stale" = the Mongo heartbeat trail is fresh but no pod claims the
-    // socket (half-open middlebox leg, directory outage, or a pod that
-    // died without cleanup) — visible, amber, Connect disabled. "offline"
-    // = neither. With Redis down `redis_fresh` is always false, so the
-    // presence degrades to the pre-A-1 heartbeat disjunction (a cross-pod
-    // agent shows "stale" instead of "online" — degraded, never lying
-    // green on a dead socket ONLY, and never hard-offline).
+) -> (AgentPresence, bool) {
     let hub_online =
         a.id.map(|i| state.rc_hub.is_agent_online(i))
             .unwrap_or(false);
@@ -1186,9 +1188,17 @@ fn to_agent_response(
     } else {
         AgentPresence::Offline
     };
-    // Back-compat: `is_online` = the reachable state only. (Pre-A-1 it
-    // was `hub_online || recently_seen`, which is what lied green.)
     let is_online = matches!(presence, AgentPresence::Online);
+    (presence, is_online)
+}
+
+fn to_agent_response(
+    state: &AppState,
+    a: roomler_ai_remote_control::models::Agent,
+    redis_fresh: bool,
+) -> AgentResponse {
+    let id = a.id.map(|i| i.to_hex()).unwrap_or_default();
+    let (presence, is_online) = derive_agent_presence(state, &a, redis_fresh);
     // Resolved before the struct literal moves `capabilities`: the
     // remote-config state depends on which verbs this device advertises.
     let remote_config = remote_config_view(a.desired_config, a.config_report, &a.capabilities);

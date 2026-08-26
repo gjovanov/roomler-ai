@@ -606,7 +606,9 @@ async fn user_names(state: &AppState, ids: &HashSet<ObjectId>) -> HashMap<Object
 }
 
 async fn agent_names(state: &AppState, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
-    names(state, "agents", ids, &["name", "hostname", "machine_id"]).await
+    // "hostname" was projected here for as long as this helper existed, but
+    // no such field has ever been on the Agent model — harmless, misleading.
+    names(state, "agents", ids, &["name", "machine_id"]).await
 }
 
 async fn tenant_names(state: &AppState, ids: &HashSet<ObjectId>) -> HashMap<ObjectId, String> {
