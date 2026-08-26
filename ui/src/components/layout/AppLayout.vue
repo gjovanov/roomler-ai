@@ -143,8 +143,19 @@
           <v-list-item :to="`/tenant/${tenantId}/rooms`" prepend-icon="mdi-pound" :title="$t('nav.rooms')" />
           <v-list-item :to="`/tenant/${tenantId}/explore`" prepend-icon="mdi-compass" :title="$t('nav.explore')" />
           <v-list-item :to="`/tenant/${tenantId}/files`" prepend-icon="mdi-folder" :title="$t('nav.files')" />
-          <v-list-item :to="`/tenant/${tenantId}/invites`" prepend-icon="mdi-account-plus" :title="$t('nav.invites')" />
         </v-list-group>
+        <!-- Top-level again (2026-08-26): the S4 IA pivot demoted Invites
+             into the Collaboration group and users read that as "the invite
+             page disappeared". FAIL-CLOSED gate (canManageInvites) — the
+             list endpoint needs INVITE_MEMBERS and the api client logs out
+             on GET 403, so this item must never show for a caller who can't
+             make the request it leads to. -->
+        <v-list-item
+          v-if="canInvite"
+          :to="`/tenant/${tenantId}/invites`"
+          prepend-icon="mdi-account-plus"
+          :title="$t('nav.invites')"
+        />
         <v-list-group value="admin">
           <template #activator="{ props: groupProps }">
             <v-list-item v-bind="groupProps" prepend-icon="mdi-cog" :title="$t('nav.admin')" />
@@ -371,7 +382,7 @@ import { useTheme, useDisplay } from 'vuetify'
 import { useAuth } from '@/composables/useAuth'
 import { usePageViews } from '@/composables/usePageViews'
 import { useTenantStore } from '@/stores/tenant'
-import { canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
+import { canManageInvites, canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
 import { useRoomStore } from '@/stores/rooms'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
@@ -527,6 +538,9 @@ const showFleetNav = computed(() =>
 )
 const showAnalyticsNav = computed(() =>
   canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
+)
+const canInvite = computed(() =>
+  canManageInvites(tenantStore.myPermissions, tenantStore.isOwner),
 )
 const isPlatformAdmin = computed(() => auth.user?.is_platform_admin === true)
 
