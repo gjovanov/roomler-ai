@@ -247,7 +247,28 @@ if [ ! -f /etc/roomler-agent/disable-auto-update ]; then
     chown root:wheel "$UPDATE_PLIST_TARGET"
     chmod 644 "$UPDATE_PLIST_TARGET"
     if launchctl print system/com.roomler.update >/dev/null 2>&1; then
-      echo "roomler update helper already loaded — plist refreshed (takes effect at next boot)"
+      # Loaded already. If it is RUNNING it is our own ancestor (this very
+      # install) and must not be touched — booting the job kills the whole
+      # process group, `installer` included. If it is IDLE, re-cycle it:
+      # launchd LATCHES a "failed init" on a job whose spawn ever failed
+      # (field 2026-08-26: a trigger raced a pkg's atomic bundle shove, the
+      # executable was transiently absent, and from then on EVERY wake was
+      # an instant synthetic exit(78) with "already handled failed init,
+      # ignoring" — the updater was dead until a manual bootout). A
+      # bootout+bootstrap clears the latch AND applies the refreshed plist,
+      # so every install ends with a provably-armed updater.
+      if launchctl print system/com.roomler.update 2>/dev/null | grep -q "state = running"; then
+        echo "roomler update helper is running (this very install) — leaving it; plist applies at its next load"
+      else
+        launchctl bootout system/com.roomler.update 2>/dev/null || true
+        if launchctl bootstrap system "$UPDATE_PLIST_TARGET" 2>/tmp/roomler-update-bootstrap.err; then
+          echo "roomler update helper re-cycled (refreshed plist live; any failed-init latch cleared)"
+        else
+          echo "WARNING: update helper bootout+bootstrap failed: $(cat /tmp/roomler-update-bootstrap.err 2>/dev/null)"
+          echo "  Re-arm by hand: sudo launchctl bootstrap system $UPDATE_PLIST_TARGET"
+        fi
+        rm -f /tmp/roomler-update-bootstrap.err
+      fi
     else
       if launchctl bootstrap system "$UPDATE_PLIST_TARGET" 2>/tmp/roomler-update-bootstrap.err; then
         echo "roomler update helper installed (unattended self-update, log: /var/log/roomler-agent/update.log)"
