@@ -279,6 +279,32 @@ fn print_why(p: &PeerInfo) {
             println!("            ^ ONE-WAY: we are sending and receiving nothing");
         }
     }
+    // A — what the prober actually measured, printed next to the decision.
+    // A clean path the selector will not use is the single most useful thing
+    // this command can show, and it is only visible if the two sit together.
+    if !p.probes.is_empty() {
+        println!();
+        println!("  MEASURED PATH          LOSS    RTT     p95     max");
+        for pr in &p.probes {
+            let pct = |v: Option<f64>| {
+                v.map(|v| format!("{:.0}%", v * 100.0))
+                    .unwrap_or_else(|| "—".into())
+            };
+            let ms = |v: Option<f64>| v.map(|v| format!("{v:.0}ms")).unwrap_or_else(|| "—".into());
+            println!(
+                "  {:<22} {:>5}  {:>6}  {:>6}  {:>6}",
+                pr.dst,
+                pct(pr.loss),
+                ms(pr.rtt_ms),
+                ms(pr.rtt_p95_ms),
+                ms(pr.rtt_max_ms)
+            );
+        }
+        // An unmeasured path must never read as a bad one.
+        if p.probes.iter().all(|pr| pr.loss.is_none()) {
+            println!("  (— = not enough rounds yet to judge, NOT a bad path)");
+        }
+    }
     let Some(w) = &p.why else {
         println!("  (this daemon predates `why` — upgrade it to see the path decision)");
         return;
@@ -1433,6 +1459,7 @@ mod tests {
             relay_transport: None,
             relay_server: None,
             why: None,
+            probes: Vec::new(),
             debug: None,
         }
     }
@@ -1596,6 +1623,7 @@ mod tests {
             relay_transport: None,
             relay_server: None,
             why: None,
+            probes: Vec::new(),
             debug: None,
         };
         let row = fmt_peer_row(&online, now);
@@ -1626,6 +1654,7 @@ mod tests {
             relay_transport: None,
             relay_server: None,
             why: None,
+            probes: Vec::new(),
             debug: None,
         };
         let row = fmt_peer_row(&offline, now);
@@ -1656,6 +1685,7 @@ mod tests {
             relay_transport: None,
             relay_server: None,
             why: None,
+            probes: Vec::new(),
             debug: None,
         };
         let row = fmt_peer_row(&p, now);
@@ -1689,6 +1719,7 @@ mod tests {
             relay_transport: None,
             relay_server: None,
             why: None,
+            probes: Vec::new(),
             debug: None,
         };
         assert!(fmt_peer_row(&p, now).contains("stalled"));
