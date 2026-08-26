@@ -683,6 +683,10 @@ jobs:
           }
           install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/roomler-agent"
           bundle_deps "$APP/Contents/MacOS/roomler-agent"
+          # Deliberately AD-HOC here, diverging from the release lane's stable
+          # self-signed identity: identity stability is a FLEET property (TCC
+          # grants surviving updates), meaningless on a throwaway runner — and
+          # fork PRs have no secrets, so requiring the cert would break them.
           find "$APP" -type f \( -name '*.dylib' -o -name 'roomler-agent' \) \
             -exec codesign --force --sign - {} \;
 
