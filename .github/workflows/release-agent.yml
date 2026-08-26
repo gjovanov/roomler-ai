@@ -694,7 +694,15 @@ jobs:
     # Workflow-level permissions make every unlisted scope `none`, so id-token
     # must be granted explicitly. Per-job to keep the OIDC blast radius small.
     permissions:
-      contents: read      # `gh release download` for the vendored FFmpeg/libvpx
+      # contents:WRITE (was read): seed-cache-save publishes the cargo seed
+      # tarballs to the rolling `seed-cache` release — with read, every
+      # Windows upload died `HTTP 403: Resource not accessible by
+      # integration` (run 32981405188) while linux/macos (workflow-level
+      # perms) published fine. Read sufficed only while seeds lived in
+      # actions/cache. Widens this signing-identity job's blast radius from
+      # read to write on repo contents — reviewed trade-off; the workflow
+      # default was contents:write before the OIDC narrowing.
+      contents: write
       id-token: write     # azure/login OIDC inside ./.github/actions/sign-windows
       actions: write      # seed-cache-save retires old cache generations via `gh api DELETE`
     env:
@@ -1536,7 +1544,9 @@ jobs:
     # See build-windows: the signing FIC is bound to this environment.
     environment: release
     permissions:
-      contents: read
+      # contents:WRITE — seed-cache-save publishes to the seed-cache
+      # release; read 403'd every upload (see build-windows note).
+      contents: write
       id-token: write     # azure/login OIDC inside ./.github/actions/sign-windows
       actions: write      # seed-cache-save generation retirement
     env:
