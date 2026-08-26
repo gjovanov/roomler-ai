@@ -85,6 +85,9 @@ thiserror = { workspace = true }
 # Hashing (for machine_id derivation)
 sha2 = { workspace = true }
 hex = { workspace = true }
+# ed25519 verify for the pinned-key `.asc` check (`pgp_verify`). Already in
+# the graph via remote_control/derp-relay — a direct dep adds no compilation.
+ring = "0.17"
 
 # ObjectId for session keys (mirrors the shared protocol)
 bson = { workspace = true }
