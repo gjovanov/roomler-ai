@@ -633,10 +633,9 @@ function returnToCall() {
 const drawer = ref(!mobile.value)
 const rail = ref(false)
 // S4 nav groups — Collaboration starts open (the day-to-day pages);
-// Network/Admin start collapsed. The user's toggles win afterwards.
-// Devices + Rooms default EXPANDED (they are the product's primary nav
-// now); Network/Admin/Audit start collapsed.
-const openGroups = ref<string[]>(['devices', 'rooms'])
+// Only Devices starts EXPANDED (the primary nav destination); Rooms /
+// Network / Admin / Audit start collapsed. The user's toggles win afterwards.
+const openGroups = ref<string[]>(['devices'])
 
 // ── Resizable drawer ─────────────────────────────────────────────
 // Default 308 ≈ Vuetify's 256 + 20%; drag the right edge, persisted.
@@ -975,12 +974,14 @@ onUnmounted(() => {
   background: rgba(var(--v-theme-primary), 0.25);
 }
 
-/* Devices/Rooms group children: kill Vuetify's group indent so the row's
-   PREPEND icon (presence dot / room hash) left-aligns with the search
-   field's left edge above it (the search has mx-3 = 12px; nav lists add
-   4px side padding, so 8px inline padding puts the icon at 12px). */
+/* Devices/Rooms group children: replace Vuetify's group indent so the row's
+   PREPEND icon (presence dot / room hash) sits in a vertical line with the
+   MAGNIFY icon inside the search field above: field box starts at 16px
+   (8px nav-list pad + mx-2 8px) and the solo field pads its prepend-inner
+   icon a further 12px (--v-field-padding-start) → icon column at ~28px.
+   Items carry the 8px list pad, so 20px inline padding lands there. */
 .nav-entity-group :deep(.v-list-group__items .v-list-item) {
-  padding-inline-start: 8px !important;
+  padding-inline-start: 20px !important;
 }
 
 /* Neutralize the inner v-application__wrap's min-height: 100vh
