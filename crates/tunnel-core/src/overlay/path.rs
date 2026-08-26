@@ -1235,7 +1235,34 @@ impl PathMonitor {
                 p.tiers[idx].fails = 0;
             }
         }
-        if !self.eligible(peer, tier, now) {
+        // #33 — the suppression planes must gate what WE PROMOTE, never
+        // whether we ANSWER the peer.
+        //
+        // This verdict is authoritative for inbound: `None` means the caller
+        // returns WITHOUT answering the peer's handshake initiation. So while
+        // a tier is suppressed — by the #30 demote-follow window, or by the
+        // penalty that `on_peer_relayed_instead` books alongside it — the node
+        // goes DEAF on that tier, and two ends that have both followed cannot
+        // hear each other for a window that escalates to 15 minutes. Measured
+        // 2026-08-26 on neo16 ↔ a MacBook one metre away: 3370 probe failures
+        // with `saw_inbound=false` against 3 with `true`, WireGuard initiations
+        // visible in tcpdump flowing BOTH ways with zero responses — while
+        // disco, whose responder has no such gate, measured that same LAN path
+        // at 8 % loss. The path was never the problem.
+        //
+        // Answering is FREE in the non-destructive case: under
+        // make-before-break an init for a relay-carried peer is accepted as a
+        // SHADOW probe with its own `Tunn`, and the relay stands unless that
+        // probe LATCHES. So the latch is the real gate, and it is untouched —
+        // nothing moves traffic on the strength of this. The init is also
+        // live evidence that the tier carries peer→us right now, which is the
+        // same reasoning D9 already applies to srflx just above.
+        //
+        // `eligible` still governs every outbound decision, so the hold-down
+        // keeps its whole purpose: we do not PROMOTE into a flap.
+        let free_to_answer =
+            mbb && incumbent == Incumbent::Relay && super::direct::answer_while_followed();
+        if !free_to_answer && !self.eligible(peer, tier, now) {
             return None;
         }
         if self.peers.get(peer).is_some_and(|p| p.probe.is_some()) {
@@ -2526,6 +2553,95 @@ mod tests {
         assert!(!m.forced_derp_active(&a, now + Duration::from_secs(1801)));
     }
 
+    /// #33 — the demote-follow hold-down must not make a node DEAF.
+    ///
+    /// This is the mutual-deafness deadlock, in miniature. `inbound_init`'s
+    /// verdict is authoritative for inbound: `None` means the caller returns
+    /// WITHOUT answering the peer's handshake initiation. So while the #30
+    /// window is open, a node refuses to answer — and when both ends have
+    /// followed, neither can hear the other for a window that escalates to 15
+    /// minutes. Field 2026-08-26, neo16 ↔ a MacBook on the same Wi-Fi: 3370
+    /// probe failures with `saw_inbound=false` against 3 with `true`, while
+    /// disco measured that same LAN path at 8 % loss.
+    ///
+    /// Accepting is non-destructive under make-before-break (it becomes a
+    /// shadow probe; the relay stands), so the window keeps its purpose — no
+    /// promotion into a flap — without costing the pair its hearing.
+    #[test]
+    fn a_followed_peer_is_still_answered_when_accepting_costs_nothing() {
+        let key = "ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED";
+        let restore = std::env::var(key).ok();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+
+        // A peer we just demote-followed: the window is open.
+        let mut m = PathMonitor::default();
+        let a = oid(1);
+        m.on_peer_relayed_instead(&a, DirectTier::Lan, true, t0);
+        assert!(!m.eligible(&a, DirectTier::Lan, t1), "window must be open");
+
+        // OFF — today's behaviour: refuse, i.e. do not answer. This is the
+        // deadlock, asserted so the fix cannot be mistaken for a no-op.
+        unsafe { std::env::set_var(key, "0") };
+        assert_eq!(
+            m.inbound_init(&a, DirectTier::Lan, Incumbent::Relay, true, t1),
+            None,
+            "with the flag off the node stays deaf — the behaviour being fixed"
+        );
+
+        // ON — answer it, as a PROBE (never a destructive install: the relay
+        // must survive, which is what makes answering free).
+        unsafe { std::env::set_var(key, "1") };
+        let mut m = PathMonitor::default();
+        m.on_peer_relayed_instead(&a, DirectTier::Lan, true, t0);
+        assert_eq!(
+            m.inbound_init(&a, DirectTier::Lan, Incumbent::Relay, true, t1),
+            Some(PathAction::Probe(DirectTier::Lan)),
+            "a followed peer must still be ANSWERED, as a non-destructive probe"
+        );
+
+        // The window still gates PROMOTION — the whole point of #30 survives.
+        assert!(
+            !m.eligible(&a, DirectTier::Lan, t1),
+            "the hold-down must still refuse anything that MOVES traffic"
+        );
+
+        // And the exemption is only for the non-destructive case: with no
+        // relay to protect, accepting would be a destructive re-point, so the
+        // window must still refuse.
+        let mut m = PathMonitor::default();
+        m.on_peer_relayed_instead(&a, DirectTier::Lan, true, t0);
+        assert_eq!(
+            m.inbound_init(&a, DirectTier::Lan, Incumbent::None, true, t1),
+            None,
+            "no relay to protect ⇒ accepting is destructive ⇒ still refused"
+        );
+
+        // A tier suppressed by its OWN failures is ALSO answered, because the
+        // reasoning is the same: answering does not move traffic, and the
+        // peer's authenticated init is live evidence the tier carries peer→us
+        // right now, which is fresher than the penalty that suppressed it.
+        // ⚠️ This is the part of #33 that is NOT free — the accept occupies
+        // the peer's single probe slot for up to the handshake deadline, so a
+        // peer initiating on a genuinely bad tier can delay a probe of a
+        // better one. Weigh that in the soak: the alternative measured in the
+        // field is indefinite mutual deafness, which is strictly worse, but
+        // the slot cost is real and is why this ships default-OFF.
+        let mut m = PathMonitor::default();
+        m.on_death(&a, DirectTier::Lan, DeathReason::RxStale, true, t0);
+        assert!(!m.eligible(&a, DirectTier::Lan, t1), "still suppressed");
+        assert_eq!(
+            m.inbound_init(&a, DirectTier::Lan, Incumbent::Relay, true, t1),
+            Some(PathAction::Probe(DirectTier::Lan)),
+            "answering is free of TRAFFIC consequences, so a suppressed tier is \
+             still answered — the latch, not this verdict, decides what carries"
+        );
+
+        match restore {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
     /// D9 — an inbound srflx init clears the srflx suppression outright (even
     /// a sticky one) and accepts; LAN/public inits still honour their
     /// suppression window exactly like the legacy cooldown gate.
