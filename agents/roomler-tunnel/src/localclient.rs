@@ -343,7 +343,19 @@ fn print_why(p: &PeerInfo) {
         );
     }
     if let Some(s) = w.forced_derp_s {
-        println!("  PINNED    {s}s more: the server has forced this pair onto /derp.");
+        // Deliberately spelled out. The pin selects which RELAY FLAVOUR this
+        // pair uses; it does NOT hold the pair off a direct tier —
+        // `PathMonitor` keeps it as an annotation and direct decisions ignore
+        // it entirely. Read live on 2026-08-26 against a pair that was
+        // DIRECT at the time with 1311 s still on the pin, and the first
+        // wording ("forced this pair onto /derp") invited exactly the
+        // misreading this whole command exists to prevent: blaming a visible
+        // knob for a landing it did not cause.
+        println!(
+            "  PINNED    {s}s more: the server pins this pair's RELAY flavour to /derp.\n\
+             \x20           This does NOT hold the pair off a direct tier — if it is on\n\
+             \x20           relay, look above for the reason, not here."
+        );
     }
     if let Some(t) = &w.probing {
         println!("  PROBING   a direct upgrade on {t} is in flight right now.");
