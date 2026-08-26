@@ -564,22 +564,18 @@ impl Prober {
         ))
     }
 
-    /// Drop every row for `peer` except the endpoint we are CURRENTLY probing.
+    /// Keep only the paths we are STILL probing for `peer`.
     ///
-    /// We only ever probe a peer's current direct carrier, so a row for any
-    /// other endpoint is stale by construction — the carrier moved (NAT
-    /// rebind, roam, re-establish). Left in place it keeps its last loss
-    /// reading forever, and the digest reports a dead endpoint that nothing
-    /// is probing as though it were a live lossy path.
-    ///
-    /// Field 2026-08-12: fleet-host-2 reported `100.65.0.5@37.63.112.129:62349
-    /// loss=47%` for 25 minutes after winhost-a had rebound to `:59669` —
-    /// indistinguishable, in the digest, from a genuinely failing carrier.
-    /// `forget` only covers peers that LEFT the mesh; this covers a peer that
-    /// stayed and moved.
-    pub(crate) fn retain_path(&mut self, peer: &[u8; 32], keep: SocketAddr) {
-        self.table.retain(|(p, d), _| p != peer || *d == keep);
-        self.pending.retain(|_, (p, d, _)| p != peer || *d == keep);
+    /// A2 generalised this from a single `keep` to a set: a peer parked on
+    /// relay is probed on several CANDIDATE endpoints at once (lan / public /
+    /// srflx), and pruning to one would throw away all but the last every
+    /// round, so no candidate would ever accumulate enough rounds to earn a
+    /// loss figure. An installed direct carrier simply passes a one-element
+    /// set, which is the old behaviour exactly.
+    pub(crate) fn retain_paths(&mut self, peer: &[u8; 32], keep: &[SocketAddr]) {
+        self.table.retain(|(p, d), _| p != peer || keep.contains(d));
+        self.pending
+            .retain(|_, (p, d, _)| p != peer || keep.contains(d));
     }
 
     /// Drop state for a peer that left the mesh.
@@ -679,6 +675,65 @@ mod tests {
         assert!(parse(&bad_kind, &ba).is_none());
     }
 
+    /// A2 — a peer parked on relay is probed on SEVERAL candidate endpoints at
+    /// once, so the prune must keep a set. The failure mode this guards is
+    /// silent and total: pruning to one dst per peer (the pre-A2 behaviour)
+    /// throws away all but the last candidate every round, so no candidate
+    /// ever accumulates enough rounds to earn a loss figure and every one of
+    /// them reads `None` — indistinguishable from "not probed yet" forever.
+    #[test]
+    fn retain_paths_keeps_every_candidate_still_being_probed() {
+        let mut p = Prober::new();
+        let peer = [7u8; 32];
+        let other = [9u8; 32];
+        let lan: SocketAddr = "192.168.68.129:43881".parse().unwrap();
+        let public: SocketAddr = "37.63.112.129:43881".parse().unwrap();
+        let srflx: SocketAddr = "37.63.112.129:51000".parse().unwrap();
+        let gone: SocketAddr = "10.0.0.9:1234".parse().unwrap();
+
+        for (i, dst) in [lan, public, srflx, gone].into_iter().enumerate() {
+            p.sent(peer, dst, [i as u8; 8]);
+        }
+        p.sent(other, lan, [99u8; 8]);
+
+        // Still probing three of the four.
+        p.retain_paths(&peer, &[lan, public, srflx]);
+
+        let dsts: Vec<SocketAddr> = p
+            .paths()
+            .iter()
+            .filter(|s| s.peer == peer)
+            .map(|s| s.dst)
+            .collect();
+        assert_eq!(
+            dsts.len(),
+            3,
+            "all three live candidates must survive: {dsts:?}"
+        );
+        for d in [lan, public, srflx] {
+            assert!(dsts.contains(&d), "{d} was pruned while still being probed");
+        }
+        assert!(
+            !dsts.contains(&gone),
+            "a candidate we stopped probing must go"
+        );
+
+        // Pruning one peer must never touch another's table.
+        assert!(
+            p.paths().iter().any(|s| s.peer == other && s.dst == lan),
+            "another peer's path on the same endpoint was collaterally pruned"
+        );
+
+        // The one-element case is the installed-direct carrier, unchanged.
+        p.retain_paths(&peer, &[public]);
+        let dsts: Vec<SocketAddr> = p
+            .paths()
+            .iter()
+            .filter(|s| s.peer == peer)
+            .map(|s| s.dst)
+            .collect();
+        assert_eq!(dsts, vec![public]);
+    }
     /// THE regression lock. rc.346 counted CONSECUTIVE misses, so a path that
     /// delivered ~20 % (the real grox carrier: `tx=17..22 rx=3..4`) reset the
     /// counter roughly every fifth round and was never detected. A windowed
@@ -844,7 +899,7 @@ mod tests {
         // The carrier moves; the next round goes to the new endpoint.
         let (nonce, _f) = pr.next_ping(&peer, &a_s, &a_p);
         pr.sent(peer, new, nonce);
-        pr.retain_path(&peer, new);
+        pr.retain_paths(&peer, &[new]);
 
         let p = pr.paths();
         assert_eq!(p.len(), 1, "the dead endpoint must not linger");
