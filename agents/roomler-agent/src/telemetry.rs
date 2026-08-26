@@ -215,6 +215,7 @@ mod tests {
             relay_transport: None,
             relay_server: None,
             why: None,
+            probes: Vec::new(),
             debug: kind.map(|k| PeerCarrierDebug {
                 tier: "relay".into(),
                 initiated: true,

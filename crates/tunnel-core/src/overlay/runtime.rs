@@ -42,8 +42,8 @@ use super::wg::{
     WgDevice, overlay_quic_enabled,
 };
 use crate::localapi::{
-    ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PeerCarrierDebug, PeerInfo, PeerWhy,
-    TierWhy,
+    ConnectionType, DnsStatus, ExitNodeStatus, OverlayView, PathProbe, PeerCarrierDebug, PeerInfo,
+    PeerWhy, TierWhy,
 };
 use crate::transport::derp::DerpMux;
 use roomler_ai_remote_control::signaling::{ClientMsg, IceServer, NetmapPeer, OverlayNetworkInfo};
@@ -1201,6 +1201,11 @@ pub struct OverlayRuntime {
     carrier_plane: Option<Arc<super::carrier_plane::CarrierPlane>>,
     /// C2 — disco rounds completed, for the periodic summary cadence.
     disco_rounds: std::sync::atomic::AtomicU64,
+    /// A — the prober's latest table, republished by `disco_round` so
+    /// `publish_view` (which has no access to the run loop's prober) can
+    /// attach it to the peer view. Measurement only: nothing in the selector
+    /// reads this.
+    disco_paths: std::sync::Mutex<Vec<super::disco::PathSample>>,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1333,6 +1338,7 @@ fn build_overlay_view(
                 // F — grafted on by `publish_view`, which holds the monitor;
                 // the pure builder cannot see the selector state.
                 why: None,
+                probes: Vec::new(),
             }
         })
         .collect();
@@ -1393,6 +1399,7 @@ impl OverlayRuntime {
             warm_relay_status: None,
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
+            disco_paths: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1422,6 +1429,7 @@ impl OverlayRuntime {
             warm_relay_status: None,
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
+            disco_paths: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1554,6 +1562,12 @@ impl OverlayRuntime {
             info!("overlay disco: {s}");
         }
 
+        // A — republish the table so `publish_view` can attach it to the peer
+        // view. Done every round (cheap: a few entries), so a reader never
+        // sees a table older than one tick.
+        if let Ok(mut g) = self.disco_paths.lock() {
+            *g = prober.paths();
+        }
         // Forget peers that left, so the table can't grow without bound.
         let live: std::collections::HashSet<[u8; 32]> =
             by_node.values().map(|e| e.pubkey).collect();
@@ -1606,6 +1620,45 @@ impl OverlayRuntime {
                 epoch_now_ms,
                 &relay_transport,
             );
+            // A — attach the disco measurements, keyed peer-pubkey → view row.
+            // Deliberately alongside `why`: the interesting case is the two
+            // DISAGREEING (a path the prober says is clean that the selector
+            // will not use), and that is unreadable if they live apart.
+            {
+                let table = self
+                    .disco_paths
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                if !table.is_empty() {
+                    let pk_of: HashMap<String, [u8; 32]> = view
+                        .peers
+                        .iter()
+                        .filter_map(|p| {
+                            ObjectId::parse_str(&p.node_id)
+                                .ok()
+                                .and_then(|n| by_node.get(&n))
+                                .map(|i| (p.node_id.clone(), i.pubkey))
+                        })
+                        .collect();
+                    for p in &mut view.peers {
+                        let Some(pk) = pk_of.get(&p.node_id) else {
+                            continue;
+                        };
+                        p.probes = table
+                            .iter()
+                            .filter(|s| &s.peer == pk)
+                            .map(|s| PathProbe {
+                                dst: s.dst.to_string(),
+                                loss: s.loss,
+                                rtt_ms: s.rtt_ms,
+                                rtt_p95_ms: s.rtt_p95_ms,
+                                rtt_max_ms: s.rtt_max_ms,
+                            })
+                            .collect();
+                    }
+                }
+            }
             // F — attach the path decision. `build_overlay_view` is pure over
             // peers and holds no monitor, so like `exit_node`/`dns` this is
             // grafted on here. Done for EVERY peer on every publish, not on
