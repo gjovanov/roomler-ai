@@ -1940,12 +1940,30 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN" login.keychain
           security set-key-partition-list -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # A self-signed cert has NO trust settings, and both
+          # `find-identity -v -p codesigning` and codesign itself require the
+          # cert to pass codesigning TRUST evaluation — on a dev Mac the
+          # Keychain Assistant adds that trust invisibly when it mints the
+          # cert, in CI nobody does, so the rc.477 run imported the identity
+          # ("1 identity imported.") and then could not SEE it. Trust the
+          # committed public cert in the System keychain (runners have
+          # passwordless sudo); `-p codeSign` scopes the trust to exactly the
+          # policy we need.
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain \
+            scripts/signing/macos/roomler-selfsign-cert.pem
           # Identity presence is the gate: a p12 that imported but yields no
-          # signing identity must fail HERE, not as a cryptic codesign error
-          # three steps later.
+          # VALID signing identity must fail HERE, not as a cryptic codesign
+          # error three steps later. Dump what the keychain does hold on
+          # failure so the next person is not diagnosing blind.
           security find-identity -v -p codesigning "$KEYCHAIN" \
             | grep -q "Roomler Self-Signed Code Signing" \
-            || { echo "::error::imported p12 yields no 'Roomler Self-Signed Code Signing' identity"; exit 1; }
+            || {
+              echo "::error::imported p12 yields no VALID 'Roomler Self-Signed Code Signing' identity"
+              echo "--- all identities in $KEYCHAIN (unfiltered) ---"
+              security find-identity "$KEYCHAIN" || true
+              exit 1
+            }
           echo 'SIGN_ID=Roomler Self-Signed Code Signing' >> "$GITHUB_ENV"
           echo "stable signing identity imported"
 
