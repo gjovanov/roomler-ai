@@ -221,9 +221,22 @@ pub fn msi_product_version_for(release: &str) -> Option<String> {
     let patch: u64 = parts[2].parse().ok()?;
 
     match pre {
-        // A final release maps the build field to 65535 so it outranks every
-        // rc of that minor.
-        None => Some(format!("{major}.{minor}.65535")),
+        // 0.4+ scheme: the PATCH is the counter, and it goes straight into the
+        // MSI build field — `0.4.7` → `0.4.7`. Monotonic across a whole minor,
+        // which is what WiX MajorUpgrade needs.
+        //
+        // This replaced a `{major}.{minor}.65535` mapping whose purpose was to
+        // let a final release outrank every rc of that minor. That property is
+        // retired with the rc scheme itself: under 65535 EVERY `0.4.x` collapsed
+        // to the same `0.4.65535`, so MajorUpgrade would never see a newer
+        // product and rc-era builds would pile up again (8 perMachine versions
+        // coexisting on one host, 2026-06-01).
+        //
+        // ⚠️ The two schemes must not be mixed inside one minor: `0.4.0-rc.7`
+        // and `0.4.7` both map to `0.4.7`. Nothing can produce that today (rc
+        // is retired at 0.3), and the rc branch is kept only so legacy 0.3 tags
+        // still verify.
+        None => Some(format!("{major}.{minor}.{patch}")),
         Some(pre) => {
             // Only `rc.N`. The workflow's regex is equally strict and fails
             // the build for anything else, so a `-beta.1` release cannot
@@ -404,16 +417,31 @@ mod tests {
     }
 
     #[test]
-    fn final_releases_take_the_top_of_the_build_field() {
-        // 65535 so a final release outranks every rc of that minor — the
-        // property the workflow's mapping exists to preserve.
+    fn a_plain_release_puts_the_patch_in_the_build_field() {
+        // The 0.4+ scheme: the patch IS the counter, so successive releases
+        // are monotonic to WiX MajorUpgrade.
         assert_eq!(
-            msi_product_version_for("agent-v0.3.0").as_deref(),
-            Some("0.3.65535")
+            msi_product_version_for("agent-v0.4.0").as_deref(),
+            Some("0.4.0")
         );
         assert_eq!(
-            msi_product_version_for("1.2.3").as_deref(),
-            Some("1.2.65535")
+            msi_product_version_for("agent-v0.4.7").as_deref(),
+            Some("0.4.7")
+        );
+        assert_eq!(msi_product_version_for("1.2.3").as_deref(), Some("1.2.3"));
+
+        // ⚠️ The migration property: the FIRST 0.4 release must outrank the
+        // last rc of 0.3 as an MSI ProductVersion, or no Windows host upgrades
+        // into the new scheme. 0.3.484 -> 0.4.0 wins on the MINOR field.
+        let last_rc = msi_product_version_for("agent-v0.3.0-rc.484").unwrap();
+        let first_new = msi_product_version_for("agent-v0.4.0").unwrap();
+        let key = |v: &str| {
+            let p: Vec<u64> = v.split('.').map(|x| x.parse().unwrap()).collect();
+            (p[0], p[1], p[2])
+        };
+        assert!(
+            key(&first_new) > key(&last_rc),
+            "0.4.0 ({first_new}) must outrank the last rc ({last_rc}) or the fleet cannot upgrade"
         );
     }
 

@@ -47,20 +47,33 @@ mod windows_version_info {
     ///
     /// Use the same MAJOR.MINOR.RC remap `release-agent.yml` already applies
     /// to the MSI ProductVersion, so the EXE's file version and the MSI's
-    /// product version agree: `0.3.0-rc.238` -> `0.3.238.0`. A final release
-    /// maps the build field to 65535 so it outranks every rc of that minor.
-    /// `release-agent.yml` asserts the two agree, so this cannot drift
-    /// silently.
+    /// product version agree: `0.4.7` -> `0.4.7.0`. The PATCH is the counter
+    /// under the 0.4+ scheme and goes straight into the build field, so
+    /// successive releases are monotonic; a legacy `0.3.0-rc.N` still maps its
+    /// rc there. `release-agent.yml` asserts the two agree, so this cannot
+    /// drift silently.
+    ///
+    /// ⚠️ THIS IS THE THIRD COPY of the mapping, alongside
+    /// `artifact_version.rs::msi_product_version_for` and the workflow's
+    /// "Derive the MSI ProductVersion" step. All three change together.
     fn file_version(pkg_version: &str) -> (u16, u16, u16) {
         let (core, rc) = match pkg_version.split_once("-rc.") {
-            Some((core, rc)) => (core, rc.parse::<u32>().unwrap_or(0).min(65535) as u16),
-            // Not an rc: a final release outranks every rc of the same minor.
-            None => (pkg_version, 65535u16),
+            Some((core, rc)) => (core, Some(rc.parse::<u32>().unwrap_or(0).min(65535) as u16)),
+            // 0.4+: no pre-release — the patch below is the counter.
+            None => (pkg_version, None),
         };
         let mut parts = core.split('.');
         let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major, minor, rc)
+        // rc when there was one; otherwise the PATCH is the counter (0.4+).
+        let build = rc.unwrap_or_else(|| {
+            parts
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(65535) as u16
+        });
+        (major, minor, build)
     }
 
     pub fn embed() {
