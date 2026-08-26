@@ -2428,8 +2428,20 @@ jobs:
       # apt-level trust. It is an integrity check a human or a script can run
       # that does not depend on GitHub being honest, which is exactly the gap
       # the .sha256 sidecars leave (they are served by the same host they
-      # attest). Key setup: scripts/signing/70-gpg-release-key.sh. Absent key
-      # => skip with a notice (attestations below still cover provenance).
+      # attest). Key setup: scripts/signing/70-gpg-release-key.sh.
+      #
+      # ⚠️ These sidecars stopped being optional at rc.476. `updater.rs`
+      # REQUIRES a verifying `.asc` on Linux/macOS, so a tag published without
+      # them does not degrade — it freezes every Linux and macOS agent in the
+      # fleet on its current version, silently, until someone notices the
+      # updates stopped. Skipping with a notice was right while nothing
+      # consumed them and is a fleet outage now.
+      #
+      # So: absent key is still a graceful skip on a BRANCH dispatch (that is
+      # how the pipeline is rehearsed without secrets), and a hard FAILURE on a
+      # tag. Same shape as the Windows lane's `require` gate, and for the same
+      # reason — a release that would ship unsigned must fail loudly at build
+      # time, not quietly at 20 devices' update checks.
       - name: GPG-sign release artifacts
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
@@ -2437,7 +2449,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
-            echo "::notice::GPG_PRIVATE_KEY not configured -- publishing without .asc signatures."
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              echo "::error::GPG_PRIVATE_KEY is not configured, but this is a release tag."
+              echo "::error::Publishing without .asc sidecars would freeze every Linux/macOS"
+              echo "::error::agent: updater.rs requires a verifying signature since rc.476."
+              exit 1
+            fi
+            echo "::notice::GPG_PRIVATE_KEY not configured -- publishing without .asc signatures (not a tag)."
             exit 0
           fi
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
@@ -2450,6 +2468,26 @@ jobs:
           # Republish the public key alongside the assets so verification
           # never depends on a checkout of this repo.
           gpg --batch --armor --export > release/roomler-release-pubkey.asc
+
+          # Assert the loop actually produced sidecars. `set -e` covers a gpg
+          # that FAILS, but not the case that matters here — a `release/` whose
+          # installers arrived under an unexpected name, or a glob that matched
+          # nothing, leaves the step green with zero signatures and the freeze
+          # lands on the fleet instead. Count what the updater will look for.
+          missing=0
+          for f in release/*.deb release/*.pkg release/*.msi; do
+            [ -e "$f" ] || continue
+            if [ ! -e "$f.asc" ]; then
+              echo "::error::no signature produced for $f"
+              missing=$((missing + 1))
+            fi
+          done
+          signed=$(ls release/*.asc 2>/dev/null | grep -vc 'roomler-release-pubkey' || true)
+          echo "signed $signed asset(s); $missing installer(s) unsigned"
+          if [ "$missing" -gt 0 ] || [ "$signed" -eq 0 ]; then
+            echo "::error::refusing to publish a release the fleet would refuse to install."
+            exit 1
+          fi
 
       # SLSA build provenance for EVERY asset (all platforms in one step) --
       # ties each artifact to this exact workflow run + commit, verifiable
