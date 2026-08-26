@@ -330,6 +330,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Probe peers with out-of-tunnel disco echoes and record per-path loss + RTT. Measurement only — nothing acts on the table (scoring is a later stage). Built-in default: off; enable only where every peer already answers.",
     ),
     (
+        "overlay_answer_while_followed",
+        "tribool",
+        "Answer a peer's direct handshake even while that tier is suppressed, when accepting cannot cost the relay (it becomes a shadow probe). The demote-follow hold-down otherwise stops this node ANSWERING for up to 15 min, so two followed ends go mutually deaf and a good LAN pair sits on relay. Built-in default: off, pending a soak.",
+    ),
+    (
         "overlay_tun_stable_guid",
         "tribool",
         "Stable Wintun adapter identity (constant requested GUID + boot stray-adapter sweep; Windows). Built-in default: on.",
@@ -627,6 +632,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_session_trace" => cfg.overlay_session_trace.map(fmt_bool),
         "overlay_disco_respond" => cfg.overlay_disco_respond.map(fmt_bool),
         "overlay_disco_probe" => cfg.overlay_disco_probe.map(fmt_bool),
+        "overlay_answer_while_followed" => cfg.overlay_answer_while_followed.map(fmt_bool),
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid.map(fmt_bool),
         "overlay_route_evict" => cfg.overlay_route_evict.map(fmt_bool),
         "overlay_route_reclaim" => cfg.overlay_route_reclaim.map(fmt_bool),
@@ -967,6 +973,9 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_session_trace" => cfg.overlay_session_trace = parse_tribool(value)?,
         "overlay_disco_respond" => cfg.overlay_disco_respond = parse_tribool(value)?,
         "overlay_disco_probe" => cfg.overlay_disco_probe = parse_tribool(value)?,
+        "overlay_answer_while_followed" => {
+            cfg.overlay_answer_while_followed = parse_tribool(value)?
+        }
         "overlay_tun_stable_guid" => cfg.overlay_tun_stable_guid = parse_tribool(value)?,
         "overlay_route_evict" => cfg.overlay_route_evict = parse_tribool(value)?,
         "overlay_route_reclaim" => cfg.overlay_route_reclaim = parse_tribool(value)?,
