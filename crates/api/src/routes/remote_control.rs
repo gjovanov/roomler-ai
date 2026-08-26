@@ -244,6 +244,13 @@ pub struct AgentResponse {
     pub tenant_id: String,
     pub owner_user_id: String,
     pub name: String,
+    /// Admin-set friendly label; display-only (the technical `name` is what
+    /// the overlay/MagicDNS label derives from). Absent = show `name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Admin-set fleet labels.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub machine_id: String,
     pub os: OsKind,
     pub agent_version: String,
@@ -539,6 +546,11 @@ pub async fn get_agent(
 #[derive(Debug, Deserialize)]
 pub struct UpdateAgentRequest {
     pub name: Option<String>,
+    /// Friendly display-only label. `Some("")` clears it (JSON has no clean
+    /// "unset" distinct from absent through Option once, so empty = clear).
+    pub display_name: Option<String>,
+    /// Replace the whole tag list. Entries are trimmed, de-duped, capped.
+    pub tags: Option<Vec<String>>,
     pub access_policy: Option<AccessPolicy>,
     /// Reassign the device owner (hex user id). `MANAGE_AGENTS` only.
     pub owner_user_id: Option<String>,
@@ -546,6 +558,34 @@ pub struct UpdateAgentRequest {
     /// is validated + canonicalized by `normalize_routes`; an invalid CIDR
     /// fails the whole request with 400. `MANAGE_AGENTS` only.
     pub routes: Option<Vec<String>>,
+}
+
+/// Trim / drop-empties / de-dup (order-preserving) / cap a client-supplied
+/// tag list. Shared by the agent and tunnel-client update routes.
+pub(crate) fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, ApiError> {
+    const MAX_TAGS: usize = 16;
+    const MAX_TAG_LEN: usize = 40;
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.chars().count() > MAX_TAG_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "Tag too long (max {MAX_TAG_LEN} chars)"
+            )));
+        }
+        if !out.iter().any(|e| e == t) {
+            out.push(t.to_string());
+        }
+    }
+    if out.len() > MAX_TAGS {
+        return Err(ApiError::BadRequest(format!(
+            "Too many tags (max {MAX_TAGS})"
+        )));
+    }
+    Ok(out)
 }
 
 pub async fn update_agent(
@@ -573,8 +613,40 @@ pub async fn update_agent(
             .map_err(|_| ApiError::BadRequest("Invalid owner_user_id".to_string()))?;
         state.agents.update_owner(tid, aid, owner_id).await?;
     }
+    // Rename outcome for the response: was there a live overlay node, and
+    // what label does it carry now? Additive next to `updated` — nothing
+    // read the old body, but a shape swap would still be a needless hazard.
+    let mut dns_renamed: Option<bool> = None;
+    let mut dns_name: Option<String> = None;
     if let Some(name) = body.name {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(ApiError::BadRequest("name must not be empty".to_string()));
+        }
         state.agents.rename(tid, aid, &name).await?;
+        // Best-effort propagation onto the live overlay node: peers see the
+        // new MagicDNS label immediately (delta re-fan); the device itself
+        // re-learns its self-name on its next reconnect.
+        if let Some(node) = state.overlay_nodes.find_live_by_agent(tid, aid).await? {
+            match crate::ws::overlay::propagate_node_rename(&state, &node, &name).await {
+                Some(label) => {
+                    dns_renamed = Some(true);
+                    dns_name = Some(label);
+                }
+                None => dns_renamed = Some(false),
+            }
+        }
+    }
+    if let Some(display_name) = body.display_name {
+        let trimmed = display_name.trim();
+        state
+            .agents
+            .set_display_name(tid, aid, (!trimmed.is_empty()).then_some(trimmed))
+            .await?;
+    }
+    if let Some(tags) = body.tags {
+        let normalized = normalize_tags(tags)?;
+        state.agents.set_tags(tid, aid, &normalized).await?;
     }
     if let Some(policy) = body.access_policy {
         state.agents.update_access_policy(tid, aid, &policy).await?;
@@ -584,7 +656,17 @@ pub async fn update_agent(
         state.agents.update_routes(tid, aid, &normalized).await?;
     }
 
-    Ok(Json(serde_json::json!({ "updated": true })))
+    // Hand back the refreshed row so the UI can patch without a refetch —
+    // additive around the legacy `{"updated": true}`.
+    let agent = state.agents.find_in_tenant(tid, aid).await?;
+    let redis_fresh = agent_presence_batch(&state, std::slice::from_ref(&agent)).await;
+    let fresh = agent.id.map(|i| redis_fresh.contains(&i)).unwrap_or(false);
+    Ok(Json(serde_json::json!({
+        "updated": true,
+        "agent": to_agent_response(&state, agent, fresh),
+        "dns_renamed": dns_renamed,
+        "dns_name": dns_name,
+    })))
 }
 
 /// DELETE /api/tenant/{tid}/agent/{agent_id} — remove a device from the fleet.
@@ -1116,6 +1198,8 @@ fn to_agent_response(
         tenant_id: a.tenant_id.to_hex(),
         owner_user_id: a.owner_user_id.to_hex(),
         name: a.name,
+        display_name: a.display_name,
+        tags: a.tags,
         machine_id: a.machine_id,
         os: a.os,
         agent_version: a.agent_version,
