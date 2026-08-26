@@ -453,6 +453,14 @@ pub struct AgentConfig {
     /// already running the C1 responder).
     #[serde(default)]
     pub overlay_disco_probe: Option<bool>,
+    /// #33 — answer a peer's direct handshake initiation even while that tier
+    /// is suppressed, when accepting cannot cost us the relay
+    /// (`ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED`). The demote-follow
+    /// hold-down otherwise makes this node stop ANSWERING for up to 15 min, so
+    /// two followed ends go mutually deaf and a perfectly good LAN pair sits on
+    /// relay. Built-in default: off, pending a two-host soak.
+    #[serde(default)]
+    pub overlay_answer_while_followed: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
     /// stray-adapter sweep, Windows only
     /// (`ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID`). Built-in default: on.
@@ -1545,6 +1553,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_data_probe: None,
         overlay_disco_respond: None,
         overlay_disco_probe: None,
+        overlay_answer_while_followed: None,
         overlay_tun_stable_guid: None,
         overlay_route_evict: None,
         overlay_route_reclaim: None,
@@ -1689,7 +1698,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 46] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 47] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
@@ -1729,6 +1738,10 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 46]
         ("OVERLAY_SESSION_TRACE", cfg.overlay_session_trace),
         ("OVERLAY_DISCO_RESPOND", cfg.overlay_disco_respond),
         ("OVERLAY_DISCO_PROBE", cfg.overlay_disco_probe),
+        (
+            "OVERLAY_ANSWER_WHILE_FOLLOWED",
+            cfg.overlay_answer_while_followed,
+        ),
         ("OVERLAY_TUN_STABLE_GUID", cfg.overlay_tun_stable_guid),
         ("OVERLAY_ROUTE_EVICT", cfg.overlay_route_evict),
         ("OVERLAY_ROUTE_RECLAIM", cfg.overlay_route_reclaim),
