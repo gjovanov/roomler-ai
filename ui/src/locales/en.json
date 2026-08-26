@@ -105,6 +105,12 @@
     "cancel": "Cancel",
     "confirm": "Confirm",
     "search": "Search",
-    "loading": "Loading..."
+    "loading": "Loading...",
+    "close": "Close",
+    "loadMore": "Load more"
+  },
+  "grid": {
+    "columns": "Columns",
+    "reset": "Reset"
   }
 }
