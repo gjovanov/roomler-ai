@@ -722,10 +722,7 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
     // is deliberately the safe direction — a false negative costs an update
     // cycle, a false positive costs the fleet.
     //
-    // Windows only for now. The `.deb`/`.pkg` ship detached GPG `.asc`
-    // signatures, but verifying those needs the release public key pinned in
-    // this binary; until that lands those platforms keep the previous
-    // behaviour rather than blocking on a check that cannot run.
+    // Windows: Authenticode + the signer-name check.
     #[cfg(windows)]
     {
         use crate::code_signature::{EXPECTED_PUBLISHER, verify_publisher};
@@ -737,6 +734,58 @@ pub(crate) async fn download_asset(asset: &GithubAsset, claimed_release: &str) -
                 let _ = std::fs::remove_file(&path);
                 bail!(
                     "refusing to install {}: {e}. The download was discarded and this \
+                     agent keeps its current version.",
+                    asset.name
+                );
+            }
+        }
+    }
+
+    // Linux/macOS: the detached GPG `.asc` verified against the key PINNED
+    // in this binary (`pgp_verify`). Same fail-closed direction as Windows,
+    // and the sidecar is REQUIRED: every release since rc.458 ships one, the
+    // updater only ever moves FORWARD, and "the .asc is missing" means the
+    // release's signing job failed — freezing on it, loudly, is correct.
+    // (⚠️ the release workflow skips GPG signing gracefully when its secret
+    // is absent; from this change on, that grace would freeze Linux/macOS
+    // updates — the freeze is visible here as a refusal + sentinel, which is
+    // the intended alarm, not a silent stall.)
+    //
+    // The sidecar URL is derived (`<asset-url>.asc` — GitHub names release
+    // assets verbatim) and fetched over the SAME channel as the artifact.
+    // That is fine: the point of the pin is that the channel cannot mint a
+    // signature, only withhold one — and withholding is a refusal, not an
+    // install.
+    #[cfg(not(windows))]
+    {
+        let asc_url = format!("{}.asc", asset.browser_download_url);
+        let asc = async {
+            let resp = client
+                .get(&asc_url)
+                .send()
+                .await
+                .context("GET .asc sidecar")?;
+            if !resp.status().is_success() {
+                bail!("sidecar download returned {}", resp.status());
+            }
+            resp.text().await.context("reading .asc body")
+        }
+        .await;
+        let verdict = match asc {
+            Ok(asc) => crate::pgp_verify::verify_release_artifact(&bytes, &asc),
+            Err(e) => Err(e.context(format!("fetching {asc_url}"))),
+        };
+        match verdict {
+            Ok(()) => {
+                tracing::info!(
+                    asset = %asset.name,
+                    "installer .asc verified against the pinned release signing key"
+                );
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                bail!(
+                    "refusing to install {}: {e:#}. The download was discarded and this \
                      agent keeps its current version.",
                     asset.name
                 );
