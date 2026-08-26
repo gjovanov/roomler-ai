@@ -135,22 +135,41 @@ pub async fn self_update(cfg: &TunnelConfig, check_only: bool) -> Result<()> {
     Ok(())
 }
 
-/// True when `latest` is strictly newer than `current`. Both are
-/// `MAJOR.MINOR.PATCH-rc.N`; compare the rc integer when the base matches, else
-/// fall back to "different string ⇒ update".
+/// True when `latest` strictly outranks `current` — a real ordered compare
+/// (mirrors the agent updater's `parse_version` tuple: final ranks above
+/// every rc of the same core, `0.4.0 > 0.3.0-rc.482`). The old "different
+/// string ⇒ update" fallback meant a stale manifest could DOWNGRADE a final
+/// build; with the 0.4.x scheme finals are the common case, so the
+/// comparator has to actually order them. Unparseable versions compare as
+/// not-newer, so a malformed manifest can't force anything.
 fn is_newer(latest: &str, current: &str) -> bool {
-    match (rc_num(latest), rc_num(current)) {
-        (Some(l), Some(c)) if base(latest) == base(current) => l > c,
-        _ => latest != current,
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
     }
 }
 
-fn rc_num(v: &str) -> Option<u64> {
-    v.rsplit_once("rc.").and_then(|(_, n)| n.parse().ok())
-}
-
-fn base(v: &str) -> &str {
-    v.split("-rc.").next().unwrap_or(v)
+/// `(major, minor, patch, pre_rank)`; `pre_rank` = the rc number for
+/// `-rc.N`, `u64::MAX` for a final (or an unknown pre-release label, so a
+/// forward-compat tag never ranks below an rc).
+fn parse_version(v: &str) -> Option<(u64, u64, u64, u64)> {
+    let s = v.trim_start_matches("tunnel-").trim_start_matches('v');
+    let (core, pre) = match s.find('-') {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let mut it = core.split('.');
+    let major: u64 = it.next()?.parse().ok()?;
+    let minor: u64 = it.next()?.parse().ok()?;
+    let patch: u64 = it.next()?.parse().ok()?;
+    let pre_rank = match pre {
+        None => u64::MAX,
+        Some(p) => p
+            .strip_prefix("rc.")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(u64::MAX),
+    };
+    Some((major, minor, patch, pre_rank))
 }
 
 /// Verify `bytes` hash matches `expected` (`sha256:<hex>` or a bare `<hex>`).
@@ -217,8 +236,18 @@ mod tests {
         assert!(!is_newer("0.3.0-rc.149", "0.3.0-rc.150"));
         // rc integer compare, not lexical (rc.9 < rc.100).
         assert!(is_newer("0.3.0-rc.100", "0.3.0-rc.9"));
-        // Different base ⇒ any difference is an update.
+        // Ordered across cores now (was "different string ⇒ update").
         assert!(is_newer("0.4.0-rc.1", "0.3.0-rc.150"));
+        // The 0.4.x final scheme: finals outrank every rc of their core,
+        // order among themselves, and a stale manifest can no longer
+        // DOWNGRADE (the old fallback made any different string an update).
+        assert!(is_newer("0.4.0", "0.3.0-rc.482"));
+        assert!(is_newer("0.4.0", "0.4.0-rc.3"));
+        assert!(is_newer("0.4.2", "0.4.1"));
+        assert!(!is_newer("0.4.0", "0.4.1"));
+        assert!(!is_newer("0.3.0-rc.482", "0.4.0"));
+        // Malformed input can't force an update.
+        assert!(!is_newer("banana", "0.4.0"));
     }
 
     #[test]
