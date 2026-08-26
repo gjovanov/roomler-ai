@@ -166,9 +166,28 @@ fn verify_msi(_path: &Path, _claimed: &str) -> Result<String, VersionError> {
 /// Windows Installer's version is three numeric fields (`MAJOR.MINOR.BUILD`,
 /// build ≤ 65535) and it IGNORES a 4th, so `0.3.0-rc.458` cannot be stored
 /// literally. `release-agent.yml` therefore maps the rc number into the build
-/// field — `MAJOR.MINOR.RC`, a final release taking 65535 so it outranks every
-/// rc of that minor — and passes the result to `cargo wix --install-version`,
-/// which lands it in `Product/@Version`.
+/// field — `MAJOR.MINOR.RC` — and passes the result to
+/// `cargo wix --install-version`, which lands it in `Product/@Version`.
+///
+/// A FINAL (non-rc) release maps EXACTLY — `MAJOR.MINOR.PATCH` — because
+/// since 2026-08-27 the project versions releases as a rolling
+/// `0.4.<counter>` starting fresh at `0.4.1` (the `0.3.0-rc.N` scheme is
+/// retired; `agent-v0.3.0-rc.484` is the last rc). Ordering stays monotonic
+/// across the transition because the MINOR bumps (`0.3.484 < 0.4.z` for any
+/// `z`, as semver AND as MSI ProductVersion), and within 0.4 the counter
+/// itself is the order. The version binding below becomes EXACT for finals
+/// instead of minor-granular.
+///
+/// ## ⚠️ The transition rides `rc.484`
+///
+/// Agents at ≤ rc.483 carry the RETIRED final rule (`X.Y.Z → X.Y.65535`), so
+/// they would REFUSE any `0.4.x` MSI (expected `0.4.65535`, found `0.4.x`).
+/// A Windows host must pass through rc.484+ (this rule) before its next
+/// update; a straggler that jumps from ≤ rc.483 straight at a `0.4.x` latest
+/// keeps its current version, raises the attention sentinel, and needs a
+/// manual push. Shipping `0.4.65535` instead was rejected: Windows Installer
+/// would then refuse every later `0.4.x` MajorUpgrade as a downgrade — the
+/// 65535 would poison the whole minor.
 ///
 /// ⚠️ This function and the workflow's `Resolve version` step ("Derive the MSI
 /// ProductVersion") are two copies of one rule and MUST move together. If they
@@ -221,9 +240,15 @@ pub fn msi_product_version_for(release: &str) -> Option<String> {
     let patch: u64 = parts[2].parse().ok()?;
 
     match pre {
-        // A final release maps the build field to 65535 so it outranks every
-        // rc of that minor.
-        None => Some(format!("{major}.{minor}.65535")),
+        // A final release maps EXACTLY (the 0.4.<counter> scheme, 2026-08-27
+        // — see the doc comment's transition note). The build field caps at
+        // 65535, same hard error the workflow raises.
+        None => {
+            if patch > 65535 {
+                return None;
+            }
+            Some(format!("{major}.{minor}.{patch}"))
+        }
         Some(pre) => {
             // Only `rc.N`. The workflow's regex is equally strict and fails
             // the build for anything else, so a `-beta.1` release cannot
@@ -404,17 +429,26 @@ mod tests {
     }
 
     #[test]
-    fn final_releases_take_the_top_of_the_build_field() {
-        // 65535 so a final release outranks every rc of that minor — the
-        // property the workflow's mapping exists to preserve.
+    fn final_releases_map_exactly_for_the_0_4_scheme() {
+        // 2026-08-27 — finals carry their own rolling counter in the patch
+        // field (`0.4.1`, `0.4.2`, …), so the MSI ProductVersion is the
+        // version itself and the binding is exact. The retired rule mapped
+        // every final to X.Y.65535, which would have poisoned Windows
+        // Installer against every later 0.4.x MajorUpgrade.
         assert_eq!(
-            msi_product_version_for("agent-v0.3.0").as_deref(),
-            Some("0.3.65535")
+            msi_product_version_for("agent-v0.4.1").as_deref(),
+            Some("0.4.1")
         );
+        assert_eq!(msi_product_version_for("1.2.3").as_deref(), Some("1.2.3"));
+        // Monotonic across the transition: the last rc (MSI 0.3.484) < the
+        // first 0.4 final (MSI 0.4.1) — the MINOR bump dominates, both as
+        // semver and as MSI ProductVersion.
         assert_eq!(
-            msi_product_version_for("1.2.3").as_deref(),
-            Some("1.2.65535")
+            msi_product_version_for("agent-v0.3.0-rc.484").as_deref(),
+            Some("0.3.484")
         );
+        // The build field still caps at 65535, same as the workflow.
+        assert_eq!(msi_product_version_for("agent-v0.4.65536"), None);
     }
 
     #[test]

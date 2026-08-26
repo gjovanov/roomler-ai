@@ -187,13 +187,24 @@ jobs:
           # prior one, and rc builds piled up (8 perMachine versions
           # found coexisting on a host 2026-06-01). Fix: put the rc in
           # the 3rd (build) field so MSI ProductVersions are monotonic —
-          # `MAJOR.MINOR.RC`. A final (non-rc) release maps the build
-          # field to 65535 so it outranks every rc of that minor. Only
-          # the MSI-internal ProductVersion changes; the .msi *filename*
-          # keeps the readable semver (see the rename steps below).
-          # Assumes the project's `MAJOR.MINOR.0-rc.N` scheme (patch == 0
-          # for rc builds) — fails loudly otherwise so the mapping can't
-          # silently collide.
+          # `MAJOR.MINOR.RC`.
+          #
+          # 2026-08-27 — the rc scheme is RETIRED after agent-v0.3.0-rc.484;
+          # releases are now a rolling `0.4.<counter>` starting fresh at
+          # 0.4.1, and a FINAL maps EXACTLY: `MAJOR.MINOR.PATCH`. Ordering
+          # stays monotonic across the transition because the MINOR bumps
+          # (MSI 0.3.484 < 0.4.z for any z), and the self-updater's version
+          # binding becomes exact.
+          # The retired rule mapped finals to X.Y.65535 — kept OUT on
+          # purpose: one 65535 install would make Windows Installer refuse
+          # every later 0.4.x MajorUpgrade as a downgrade. ⚠️ Agents ≤ rc.483
+          # bake the retired rule and REFUSE 0.4.x MSIs — a Windows host
+          # must pass through rc.484+ before its next update (stragglers
+          # keep running, raise the sentinel, and need a manual push).
+          # Only the MSI-internal ProductVersion changes; the .msi
+          # *filename* keeps the readable semver (see the rename steps
+          # below). rc builds still require patch == 0 — fails loudly
+          # otherwise so the mapping can't silently collide.
           #
           # ⚠️ THIS MAPPING HAS A SECOND COPY:
           # agents/roomler-agent/src/artifact_version.rs::msi_product_version_for.
@@ -219,7 +230,11 @@ jobs:
             fi
             msi_version="${vmajor}.${vminor}.${vrc}"
           elif [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            msi_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.65535"
+            if (( BASH_REMATCH[3] > 65535 )); then
+              echo "::error::patch ${BASH_REMATCH[3]} exceeds the MSI build-field max (65535)"
+              exit 1
+            fi
+            msi_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
           else
             echo "::error::cannot derive an MSI version from '${version}' (expected MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N)"
             exit 1

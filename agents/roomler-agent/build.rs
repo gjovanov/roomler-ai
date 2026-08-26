@@ -45,22 +45,33 @@ mod windows_version_info {
     /// the fourth for comparison, so `CARGO_PKG_VERSION_*` would render every
     /// single rc of `0.3.0-rc.N` as the identical `0.3.0.0`.
     ///
-    /// Use the same MAJOR.MINOR.RC remap `release-agent.yml` already applies
-    /// to the MSI ProductVersion, so the EXE's file version and the MSI's
-    /// product version agree: `0.3.0-rc.238` -> `0.3.238.0`. A final release
-    /// maps the build field to 65535 so it outranks every rc of that minor.
+    /// Use the same remap `release-agent.yml` already applies to the MSI
+    /// ProductVersion, so the EXE's file version and the MSI's product
+    /// version agree: `0.3.0-rc.238` -> `0.3.238.0`, and under the rolling
+    /// `0.4.<counter>` scheme (2026-08-27, rc scheme retired at rc.484) a
+    /// final maps EXACTLY: `0.4.1` -> `0.4.1.0`. The retired rule sent
+    /// finals to 65535 — kept out on purpose, it would poison Windows
+    /// Installer against every later upgrade of the minor.
     /// `release-agent.yml` asserts the two agree, so this cannot drift
     /// silently.
     fn file_version(pkg_version: &str) -> (u16, u16, u16) {
-        let (core, rc) = match pkg_version.split_once("-rc.") {
+        let (core, build) = match pkg_version.split_once("-rc.") {
             Some((core, rc)) => (core, rc.parse::<u32>().unwrap_or(0).min(65535) as u16),
-            // Not an rc: a final release outranks every rc of the same minor.
-            None => (pkg_version, 65535u16),
+            // Not an rc: the patch IS the rolling counter — map it exactly.
+            None => {
+                let patch = pkg_version
+                    .split('.')
+                    .nth(2)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0)
+                    .min(65535) as u16;
+                (pkg_version, patch)
+            }
         };
         let mut parts = core.split('.');
         let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major, minor, rc)
+        (major, minor, build)
     }
 
     pub fn embed() {

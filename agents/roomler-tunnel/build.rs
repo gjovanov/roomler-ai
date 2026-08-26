@@ -26,18 +26,28 @@ mod windows_version_info {
     use std::fs;
     use std::path::PathBuf;
 
-    /// `0.3.0-rc.238` -> `(0, 3, 238)`; a final release -> `(major, minor,
-    /// 65535)`. Mirrors the MSI ProductVersion remap in `release-agent.yml`
-    /// so the EXE file version and the MSI product version agree.
+    /// `0.3.0-rc.238` -> `(0, 3, 238)`; a final release maps EXACTLY under
+    /// the rolling `0.4.<counter>` scheme (2026-08-27): `0.4.1` ->
+    /// `(0, 4, 1)`. Mirrors the MSI ProductVersion remap in
+    /// `release-agent.yml` so the EXE file version and the MSI product
+    /// version agree.
     fn file_version(pkg_version: &str) -> (u16, u16, u16) {
-        let (core, rc) = match pkg_version.split_once("-rc.") {
+        let (core, build) = match pkg_version.split_once("-rc.") {
             Some((core, rc)) => (core, rc.parse::<u32>().unwrap_or(0).min(65535) as u16),
-            None => (pkg_version, 65535u16),
+            None => {
+                let patch = pkg_version
+                    .split('.')
+                    .nth(2)
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0)
+                    .min(65535) as u16;
+                (pkg_version, patch)
+            }
         };
         let mut parts = core.split('.');
         let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major, minor, rc)
+        (major, minor, build)
     }
 
     pub fn embed() {

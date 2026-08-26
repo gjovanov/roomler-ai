@@ -78,8 +78,13 @@ pub(crate) fn parse_msi_version(v: &str) -> MsiVersion {
 ///   3rd field — Windows Installer IGNORES the 4th field for upgrade
 ///   comparison, which is why the pipeline moved it; the workflow hard-
 ///   fails rc builds with patch != 0).
-/// * final `MAJOR.MINOR.PATCH` → MSI `MAJOR.MINOR.65535` (outranks every
-///   rc of that minor).
+/// * final `MAJOR.MINOR.PATCH` → MSI `MAJOR.MINOR.PATCH`, exact — the
+///   rolling `0.4.<counter>` scheme (2026-08-27; the rc scheme retired
+///   at rc.484). ⚠️ The retired rule mapped finals to 65535; under the
+///   new scheme that arm would rank a 0.4.x agent's OWN installed
+///   product (0.4.x) strictly below its computed self-version
+///   (0.4.65535) and the sweep would UNINSTALL ITSELF — the structural
+///   self-protection below relies on own comparing EQUAL.
 ///
 /// Pre-scheme-change products registered the legacy `MAJOR.MINOR.0.N`
 /// DisplayVersion; those parse to `(maj, min, 0, N)` and correctly rank
@@ -100,7 +105,7 @@ pub(crate) fn own_msi_version(semver: &str) -> MsiVersion {
         Some(Some(rc)) => (major, minor, patch, rc),
         // Unknown pre-release label: legacy mapping (rc treated as 0).
         Some(None) => (major, minor, patch, 0),
-        None => (major, minor, 65535, 0),
+        None => (major, minor, patch, 0),
     }
 }
 
@@ -262,8 +267,11 @@ mod tests {
         // rc → MAJOR.MINOR.RC (3rd field), matching release-agent.yml.
         assert_eq!(own_msi_version("0.3.0-rc.99"), (0, 3, 99, 0));
         assert_eq!(own_msi_version("0.3.0-rc.254"), (0, 3, 254, 0));
-        // Final release → MAJOR.MINOR.65535 (outranks every rc).
-        assert_eq!(own_msi_version("0.3.0"), (0, 3, 65535, 0));
+        // Final release → exact (the 0.4.<counter> scheme). The retired
+        // 65535 arm would have made a 0.4.x agent sweep ITSELF (own
+        // installed product 0.4.x < computed 0.4.65535).
+        assert_eq!(own_msi_version("0.4.1"), (0, 4, 1, 0));
+        assert_eq!(own_msi_version("0.3.0"), (0, 3, 0, 0));
         // The own-mapping and the DisplayVersion parse agree, so an
         // installed product's tuple equals the running tuple → kept.
         assert_eq!(own_msi_version("0.3.0-rc.99"), parse_msi_version("0.3.99"));
