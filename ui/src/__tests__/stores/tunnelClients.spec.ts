@@ -47,7 +47,7 @@ describe('useTunnelClientStore', () => {
     })
     const store = useTunnelClientStore()
     await store.fetchTunnelClients(TENANT_ID)
-    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/tunnel-client`)
+    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/tunnel-client?per_page=100`)
     expect(store.clients).toHaveLength(2)
     expect(store.total).toBe(2)
   })
