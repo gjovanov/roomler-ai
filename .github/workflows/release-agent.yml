@@ -219,7 +219,16 @@ jobs:
             fi
             msi_version="${vmajor}.${vminor}.${vrc}"
           elif [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-            msi_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.65535"
+            # 0.4+ scheme: the PATCH is the counter and goes straight into the
+            # MSI build field (0.4.7 -> 0.4.7), so successive releases are
+            # monotonic. This replaced a `.65535` mapping that collapsed every
+            # 0.4.x onto ONE ProductVersion, which would stop MajorUpgrade
+            # seeing a newer product and pile builds up again.
+            if (( ${BASH_REMATCH[3]} > 65535 )); then
+              echo "::error::patch ${BASH_REMATCH[3]} exceeds the MSI build-field max (65535)"
+              exit 1
+            fi
+            msi_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
           else
             echo "::error::cannot derive an MSI version from '${version}' (expected MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-rc.N)"
             exit 1

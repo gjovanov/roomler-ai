@@ -2508,6 +2508,19 @@ mod tests {
         assert_eq!(parse_version("v1.2.x"), None);
     }
 
+    /// The 0.3-rc → 0.4 migration, at the version-comparison layer: a plain
+    /// `0.4.x` must outrank the last `0.3.0-rc.N`, or no agent even offers
+    /// itself the update. (The MSI ProductVersion half of the same migration
+    /// is asserted in `artifact_version`.)
+    #[test]
+    fn the_first_plain_release_outranks_the_last_rc() {
+        assert!(is_newer("agent-v0.4.0", "agent-v0.3.0-rc.484"));
+        assert!(is_newer("agent-v0.4.1", "agent-v0.4.0"));
+        // And the scheme stays monotonic well past the old rc counter.
+        assert!(is_newer("agent-v0.4.500", "agent-v0.4.499"));
+        // A stale rc must never look newer than the scheme that replaced it.
+        assert!(!is_newer("agent-v0.3.0-rc.999", "agent-v0.4.0"));
+    }
     #[test]
     fn is_newer_compares_major_minor_patch() {
         assert!(is_newer("agent-v0.2.0", "agent-v0.1.99"));
