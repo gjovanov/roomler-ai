@@ -33,7 +33,11 @@
     "settings": "Settings",
     "members": "Members",
     "roles": "Roles",
-    "billing": "Billing"
+    "billing": "Billing",
+    "audit": "Audit",
+    "execAudit": "Command audit",
+    "sshAudit": "SSH audit",
+    "sshActivity": "SSH activity"
   },
   "room": {
     "create": "Create Room",
