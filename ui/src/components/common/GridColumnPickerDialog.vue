@@ -39,6 +39,8 @@
             </v-list-item>
           </template>
         </draggable>
+        <!-- Host-provided extras (e.g. grid-specific display toggles). -->
+        <slot name="append" />
       </v-card-text>
       <v-card-actions class="px-4 py-2">
         <v-btn variant="text" prepend-icon="mdi-restore" @click="emit('reset')">{{ $t('grid.reset') }}</v-btn>
