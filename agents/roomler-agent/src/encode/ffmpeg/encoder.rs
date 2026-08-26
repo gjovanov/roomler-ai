@@ -239,10 +239,23 @@ fn encoder_options(
     // quality-floored AV1 IDR exceeds a sub-1× reservoir and Intel's AV1
     // VDENC errors rather than clamping). The default is back to 200 %
     // both ways; `constrained_hrd_pct` remains a per-host experiment knob.
+    // Direct-path window (field 2026-08-26, neo16↔Rozalina): the fixed 2×
+    // reservoir legalised drag-start bursts of seconds' worth of bits —
+    // the 100-345 KB standing send queue the viewer feels as lag. Direct
+    // sessions now default to 1× (`direct_hrd_pct`, env/config tunable);
+    // constrained keeps its own knob. `av1_*` is floored at 200 BOTH ways:
+    // Intel's AV1 VDENC ERRORS (then hangs the driver) on a forced IDR
+    // that exceeds the reservoir instead of QP-clamping — the rc.443
+    // incident; H.264/HEVC clamp gracefully.
     let hrd_pct: usize = if constrained {
         crate::encode::rate_profile::constrained_hrd_pct()
     } else {
-        200
+        crate::encode::rate_profile::direct_hrd_pct()
+    };
+    let hrd_pct = if name.starts_with("av1_") {
+        hrd_pct.max(200)
+    } else {
+        hrd_pct
     };
     let buf = (maxrate_bps.saturating_mul(hrd_pct) / 100).to_string();
     let cq_s = cq.to_string();
@@ -1604,23 +1617,29 @@ mod tests {
         );
     }
 
-    /// Constrained-transport HRD default is UNTRIMMED (rc.443): rc.442's
-    /// 75 % window made av1_qsv error out (`Invalid data`) on its first
-    /// settle IDR and then hang the driver — see
-    /// `rate_profile::constrained_hrd_pct` for the field evidence. Both
-    /// transports must default to the rc.234 2× window; the env/config
-    /// knob remains for per-host experiments.
+    /// HRD windows per transport (2026-08-26 drag-latency work): DIRECT
+    /// defaults to 1× maxrate (`direct_hrd_pct` — the 2× reservoir was
+    /// manufacturing the drag-start standing queue), CONSTRAINED keeps
+    /// the rc.234 2× default (rc.443: a sub-1× window made av1_qsv error
+    /// out on its first settle IDR and hang the driver), and `av1_*` is
+    /// floored at 2× on BOTH transports because Intel's AV1 VDENC errors
+    /// rather than QP-clamping on an over-reservoir IDR.
     #[test]
-    fn constrained_hrd_window_defaults_untrimmed() {
+    fn hrd_window_defaults_per_transport() {
         let (_, _, summary) = encoder_options("hevc_qsv", 3_000_000, 22, true, false, false);
         assert!(
-            summary.contains("bufsize=6000000"),
-            "direct keeps the 2x HRD window, got: {summary}"
+            summary.contains("bufsize=3000000"),
+            "direct defaults to the 1x HRD window, got: {summary}"
         );
         let (_, _, summary) = encoder_options("hevc_qsv", 3_000_000, 22, true, false, true);
         assert!(
             summary.contains("bufsize=6000000"),
-            "constrained must ALSO default to the 2x window (rc.443 av1_qsv IDR kill), got: {summary}"
+            "constrained keeps the 2x window (rc.443 av1_qsv IDR kill), got: {summary}"
+        );
+        let (_, _, summary) = encoder_options("av1_qsv", 3_000_000, 22, true, false, false);
+        assert!(
+            summary.contains("bufsize=6000000"),
+            "av1 is floored at the 2x window even on direct, got: {summary}"
         );
     }
 
