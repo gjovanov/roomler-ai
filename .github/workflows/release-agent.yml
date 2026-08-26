@@ -276,6 +276,11 @@ jobs:
         # step is at the end of this job.
         continue-on-error: true
         uses: ./.github/actions/seed-cache-restore
+        # GH_TOKEN: the asset-based restore downloads from the seed-cache
+        # release (probe run 32903453670 built cold on every lane for want
+        # of it — the old actions/cache restore needed no token).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-linux
 
@@ -562,6 +567,11 @@ jobs:
         # step is at the end of this job.
         continue-on-error: true
         uses: ./.github/actions/seed-cache-restore
+        # GH_TOKEN: the asset-based restore downloads from the seed-cache
+        # release (probe run 32903453670 built cold on every lane for want
+        # of it — the old actions/cache restore needed no token).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-linux-arm64
 
@@ -915,6 +925,11 @@ jobs:
         # step is at the end of this job.
         continue-on-error: true
         uses: ./.github/actions/seed-cache-restore
+        # GH_TOKEN: the asset-based restore downloads from the seed-cache
+        # release (probe run 32903453670 built cold on every lane for want
+        # of it — the old actions/cache restore needed no token).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-windows-vp9-444
 
@@ -1544,6 +1559,11 @@ jobs:
         # step is at the end of this job.
         continue-on-error: true
         uses: ./.github/actions/seed-cache-restore
+        # GH_TOKEN: the asset-based restore downloads from the seed-cache
+        # release (probe run 32903453670 built cold on every lane for want
+        # of it — the old actions/cache restore needed no token).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: installer-smoke-windows
 
@@ -1740,6 +1760,11 @@ jobs:
         # step is at the end of this job.
         continue-on-error: true
         uses: ./.github/actions/seed-cache-restore
+        # GH_TOKEN: the asset-based restore downloads from the seed-cache
+        # release (probe run 32903453670 built cold on every lane for want
+        # of it — the old actions/cache restore needed no token).
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           shared-key: agent-macos
 
