@@ -1873,6 +1873,49 @@ fn unindex_session_target(
 /// the ack still end their session on our terminate, and their entry is
 /// swept on their own disconnect, exactly as today).
 pub(crate) async fn terminate_sessions_targeting_agent(state: &AppState, agent_id: ObjectId) {
+    // R3 — optional grace before terminating sessions when the target agent's
+    // control WS drops. `0` (default) = terminate immediately (pre-R3). `>0` =
+    // keep the sessions (their QUIC data plane + the nudge busy-gate index rely
+    // on it) and terminate only if the agent is STILL offline after the window.
+    // A same-pod re-register (hub) or cross-pod one (fresh foreign Redis
+    // presence) cancels it — no explicit cancel registry needed. Pairs with the
+    // agent's `tunnel_peers_survive_reattach`.
+    let grace = state.settings.rc.tunnel_grace_secs;
+    if grace == 0 {
+        terminate_agent_sessions_now(state, agent_id).await;
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
+        if state.rc_hub.is_agent_online(agent_id) {
+            debug!(%agent_id, "R3 grace: agent re-registered on this pod — tunnel sessions kept");
+            return;
+        }
+        // A fresh FOREIGN presence record ⇒ the agent re-registered on another
+        // pod; keep the sessions (its reclaimed peers serve them). A wedged or
+        // unreachable Redis falls through to terminate — fail-safe: never keep a
+        // session alive on an unverifiable presence — bounded by the same 250 ms
+        // as the open-time rehome probe.
+        if let Some(redis) = &state.redis_pubsub
+            && let Ok(Ok(Some(_))) = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                redis.agent_presence_foreign(&agent_id.to_hex()),
+            )
+            .await
+        {
+            debug!(%agent_id, "R3 grace: agent re-registered on another pod — tunnel sessions kept");
+            return;
+        }
+        info!(%agent_id, grace_secs = grace, "R3 grace expired — agent still offline; terminating tunnel sessions");
+        terminate_agent_sessions_now(&state, agent_id).await;
+    });
+}
+
+/// Immediately terminate every tunnel session targeting `agent_id`: drop the
+/// by-target index and push `TunnelTerminate` to each client. The pre-R3
+/// behaviour, now also the grace-expiry path.
+async fn terminate_agent_sessions_now(state: &AppState, agent_id: ObjectId) {
     let Some((_, session_ids)) = state.tunnel_sessions_by_target_agent.remove(&agent_id) else {
         return;
     };

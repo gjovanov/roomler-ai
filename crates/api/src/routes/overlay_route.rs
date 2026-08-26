@@ -224,13 +224,16 @@ pub async fn set_approved_routes(
         .ok_or_else(|| ApiError::Internal("overlay network missing _id".into()))?;
 
     // Scope the lookup to the tenant's network — tenant-safe by construction.
+    // Keep the full live list: the duplicate-claim guard below needs the
+    // OTHER nodes' approvals.
     let nodes = state
         .overlay_nodes
         .list_active_in_network(tid, network_id)
         .await?;
     let node = nodes
-        .into_iter()
+        .iter()
         .find(|n| n.id == Some(nid))
+        .cloned()
         .ok_or_else(|| ApiError::NotFound("overlay node not found".into()))?;
 
     // Only routes the node advertised may be approved (dedup, preserve order).
@@ -253,6 +256,31 @@ pub async fn set_approved_routes(
         }
         if !approved.contains(r) {
             approved.push(r.clone());
+        }
+    }
+    // One LIVE subnet router per CIDR (the `wg_key_taken_by_other` pattern).
+    // Approving the same route on a second node turns every client's routing
+    // into a tie-break between the claimants — and the field incident behind
+    // this guard (2026-08-25) was exactly that: a stale approval left on a
+    // superseded router's row made clients loop corp traffic through a host
+    // with no working uplink, nondeterministically per restart. The 409 names
+    // the current holder so the operator revokes there first. Exact-string
+    // match, same as the advertised-routes check above — approvals are stored
+    // and compared as literal CIDR strings on this whole surface. Exit-node
+    // `/0`s are exempt by construction: they are rejected from `approved`
+    // above (plural exit nodes are by design — clients CHOOSE their exit).
+    for r in &approved {
+        if let Some(holder) = nodes
+            .iter()
+            .filter(|n| n.id != Some(nid))
+            .find(|n| n.approved_routes.iter().any(|a| a == r))
+        {
+            return Err(ApiError::Conflict(format!(
+                "route {r} is already approved on live node \"{}\" ({}) — \
+                 revoke it there first (one live subnet router per CIDR)",
+                holder.name,
+                holder.id.map(|i| i.to_hex()).unwrap_or_default(),
+            )));
         }
     }
     // Preserve an existing exit-node `/0` approval across a subnet-route edit
