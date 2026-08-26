@@ -4295,6 +4295,19 @@ async fn media_pump_ffmpeg_dc(
     // the dead cascade prefix (corplap field: an av1_nvenc tiered-open attempt
     // burned ~100-300 ms of every rebuild before av1_qsv opened).
     let mut last_encoder_name: Option<&'static str> = None;
+    // P3 (2026-08-27) — background-swap state for rebuild-bound bitrate
+    // applies (see the loop-top block). While a replacement opens on a
+    // blocking thread the CURRENT encoder keeps producing; `swap_wanted`
+    // holds the latest target (latest wins), and the cooldown bounds the
+    // IDR rate adoptions can demand (each adoption ships a fresh IDR —
+    // the biggest frame in the stream).
+    let bg_rebuild = crate::encode::bg_rebuild_enabled();
+    let mut pending_swap: Option<
+        tokio::task::JoinHandle<anyhow::Result<crate::encode::ffmpeg::RebuiltEncoder>>,
+    > = None;
+    let mut swap_wanted: Option<u32> = None;
+    let mut last_swap_at = std::time::Instant::now() - Duration::from_secs(60);
+    const SWAP_MIN_INTERVAL: Duration = Duration::from_secs(3);
     {
         let video_bytes_dc = video_bytes_dc.clone();
         let frames_sent = frames_sent.clone();
@@ -4392,6 +4405,67 @@ async fn media_pump_ffmpeg_dc(
             rebuild_after_encode_error = false;
             encoder = None;
             encoder_dims = None;
+        }
+        // P3 (2026-08-27) — background bitrate rebuild for rebuild-bound
+        // encoders (QSV/AMF): the replacement opens on a blocking thread
+        // while the CURRENT encoder keeps producing frames, then swaps in
+        // here, between frames — no mid-drag stall, no dead air, and the
+        // AIMD's rate DROPS land DURING motion as smaller frames instead
+        // of production skips. Replaces the rc.445 motion-defer when
+        // `bg_rebuild` is on; the defer machinery stays as the
+        // kill-switch fallback (`ROOMLER_AGENT_BG_REBUILD=0`).
+        if bg_rebuild {
+            if let Some(handle) = pending_swap.as_ref()
+                && handle.is_finished()
+            {
+                let handle = pending_swap.take().unwrap();
+                last_swap_at = std::time::Instant::now();
+                match handle.await {
+                    Ok(Ok(rebuilt)) => {
+                        let maxrate = rebuilt.maxrate_bps();
+                        if let Some(enc) = encoder.as_mut() {
+                            if enc.adopt_rebuilt(rebuilt) {
+                                // Stale pre-swap frames yield to the fresh
+                                // IDR, exactly like the sync rebuild path.
+                                send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                video_info_sent = false;
+                                info!(
+                                    %session_id, codec_label, maxrate_bps = maxrate,
+                                    "FFmpeg DC pump: background-rebuilt encoder adopted (bitrate swap, zero stall)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    %session_id, codec_label,
+                                    "FFmpeg DC pump: background rebuild stale (dims/backend changed) — discarded"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            %session_id, codec_label, %e,
+                            "FFmpeg DC pump: background rebuild failed — keeping current encoder"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            %session_id, codec_label, %e,
+                            "FFmpeg DC pump: background rebuild task panicked — keeping current encoder"
+                        );
+                    }
+                }
+            }
+            if pending_swap.is_none()
+                && let Some(bps) = swap_wanted
+                && last_swap_at.elapsed() >= SWAP_MIN_INTERVAL
+            {
+                swap_wanted = None;
+                if let Some(spec) = encoder.as_ref().and_then(|e| e.rebuild_spec(bps)) {
+                    pending_swap = Some(tokio::task::spawn_blocking(move || {
+                        crate::encode::ffmpeg::FfmpegEncoder::open_rebuilt(spec)
+                    }));
+                }
+            }
         }
         // Relay-escape — twin of the VP9 pump's loop-top block: re-read the
         // selected ICE pair every TRANSPORT_RECHECK_INTERVAL and follow a
@@ -4585,9 +4659,12 @@ async fn media_pump_ffmpeg_dc(
                 && let Some(enc) = encoder.as_mut()
             {
                 // rc.445 — congestion here means motion almost surely;
-                // rebuild-bound encoders defer (see `deferred_bps`).
+                // rebuild-bound encoders swap in the background (P3) or,
+                // with the hatch off, defer (see `deferred_bps`).
                 if enc.supports_dynamic_bitrate() {
                     enc.set_bitrate(applied.bps);
+                } else if bg_rebuild {
+                    swap_wanted = Some(applied.bps);
                 } else {
                     deferred_bps = Some(applied.bps);
                 }
@@ -5105,9 +5182,17 @@ async fn media_pump_ffmpeg_dc(
             send_tx.capacity(),
             std::time::Instant::now(),
         ) {
-            // rc.445 — QSV/AMF applies are motion-deferred (a ladder move
-            // there is a blocking rebuild + IDR; see `deferred_bps`).
-            if enc.supports_dynamic_bitrate() || last_motion_at.elapsed() >= DEFER_QUIET {
+            // P3 — rebuild-bound applies (QSV/AMF) go through the
+            // background swap so rate moves land DURING motion with zero
+            // stall; NVENC still reconfigures in place. With the hatch
+            // off, the rc.445 motion-defer applies (held while frames
+            // flow, flushed at 1.2 s of quiet as a blocking re-open).
+            if enc.supports_dynamic_bitrate() {
+                deferred_bps = None;
+                enc.set_bitrate(applied.bps);
+            } else if bg_rebuild {
+                swap_wanted = Some(applied.bps);
+            } else if last_motion_at.elapsed() >= DEFER_QUIET {
                 deferred_bps = None;
                 enc.set_bitrate(applied.bps);
             } else {
@@ -5364,10 +5449,13 @@ async fn media_pump_ffmpeg_dc(
                     // frame the link can't drain) is a secondary congestion
                     // signal; note it to the AIMD (rate-limited MD internally).
                     // `enc` is in scope from the encode above. rc.445 — an
-                    // overflow IS motion; rebuild-bound encoders defer.
+                    // overflow IS motion; rebuild-bound encoders swap in the
+                    // background (P3) or, hatch off, defer.
                     if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
                         if enc.supports_dynamic_bitrate() {
                             enc.set_bitrate(applied.bps);
+                        } else if bg_rebuild {
+                            swap_wanted = Some(applied.bps);
                         } else {
                             deferred_bps = Some(applied.bps);
                         }
