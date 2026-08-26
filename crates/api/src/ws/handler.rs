@@ -1023,7 +1023,12 @@ async fn handle_media_join(
     info!(
         %connection_id,
         force_relay,
-        announced_ip = %state.settings.mediasoup.announced_ip,
+        // The RESOLVED per-pod announced IP (S6 map), not the static setting —
+        // on a multi-pod deployment they differ and the static one misleads.
+        announced_ip = %state
+            .room_manager
+            .announced_ip()
+            .unwrap_or(state.settings.mediasoup.announced_ip.as_str()),
         turn_url = ?state.settings.turn.url,
         send_ice_candidates = %transport_pair.send_transport.ice_candidates,
         recv_ice_candidates = %transport_pair.recv_transport.ice_candidates,
