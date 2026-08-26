@@ -355,6 +355,61 @@ pub fn constrained_hrd_pct() -> usize {
         .unwrap_or(200)
 }
 
+/// DIRECT-path twin of [`constrained_queue_ms`] (field 2026-08-26,
+/// neo16 viewing Rozalina, LAN direct): the direct pump had a
+/// frame-count send bound only, so a drag burst at a stale-high maxrate
+/// queued 100–345 KB ≈ 100–300+ ms of standing latency — the "sluggish,
+/// bulky" drag. Budgeting the in-flight bytes converts that lag into an
+/// immediate production skip, exactly the rc.442 constrained rationale.
+/// Tighter default than the relay's 450 (a LAN's round trip is ~1 ms —
+/// there is no transit to hide the queue behind). Env
+/// `ROOMLER_AGENT_DIRECT_QUEUE_MS` / config `direct_queue_ms`
+/// (default 150, 0 = unbounded, max 2000).
+pub fn direct_queue_ms() -> u64 {
+    tunnel_core::env::node_env("DIRECT_QUEUE_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.min(2000))
+        .unwrap_or(150)
+}
+
+/// [`direct_queue_ms`] resolved against a REFERENCE RATE into a byte
+/// budget for the direct arm of the pump's backpressure gate. The
+/// reference is the AIMD's currently-applied target (it tracks
+/// congestion down within ~2 s even while a rebuild-bound encoder's
+/// actual maxrate is motion-deferred), falling back to the policy
+/// ceiling before the first apply; `0` for either input disables the
+/// gate (`usize::MAX`). Floored at 48 KiB so a post-IDR drain at a
+/// collapsed target doesn't stall production longer than the IDR's own
+/// transit.
+pub fn direct_queue_budget_bytes(rate_bps: u32) -> usize {
+    let ms = direct_queue_ms();
+    if ms == 0 || rate_bps == 0 {
+        return usize::MAX;
+    }
+    (((rate_bps as u64).saturating_mul(ms) / 8000) as usize).max(48 * 1024)
+}
+
+/// HRD/VBV window for DIRECT sessions, as a percent of `maxrate`.
+/// Default 100 — HALF the rc.234 2× window. Field 2026-08-26 (neo16
+/// viewing Rozalina, hevc_qsv 2880×1800 direct): the 2× reservoir
+/// legalises drag-start bursts of seconds' worth of bits, which is
+/// exactly the 100–345 KB standing send queue the viewer feels as lag;
+/// 1× still lets a transient spend a full second's budget (the blur fix
+/// stands) while halving the worst-case queue a burst can manufacture.
+///
+/// ⚠ NOT applied to `av1_*` encoders — `encoder_options` floors their
+/// window at 200 regardless: Intel's AV1 VDENC ERRORS (then hangs the
+/// driver) on a forced IDR that exceeds the reservoir instead of
+/// QP-clamping like the H.264/HEVC paths — the rc.443 incident. Env
+/// `ROOMLER_AGENT_DIRECT_HRD_PCT` / config `direct_hrd_pct`
+/// (clamp [25, 200]).
+pub fn direct_hrd_pct() -> usize {
+    tunnel_core::env::node_env("DIRECT_HRD_PCT")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(25, 200))
+        .unwrap_or(100)
+}
+
 /// Real frames since the last settle that make a motion episode "a burst"
 /// worth an idle-settle resync IDR. A window-drag produces hundreds; a caret
 /// blink, a clock tick, or a couple of keystrokes produce 1-3 and must NOT
@@ -1098,6 +1153,22 @@ mod tests {
         // see `constrained_hrd_pct`).
         assert_eq!(constrained_cq_relief(), 4);
         assert_eq!(constrained_hrd_pct(), 200);
+    }
+
+    #[test]
+    fn direct_queue_budget_and_hrd_defaults() {
+        let _guard = crate::encode::RELAY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Default 150 ms of an 8 Mbps reference = 150,000 bytes.
+        assert_eq!(direct_queue_budget_bytes(8_000_000), 150_000);
+        // Floored at 48 KiB so a collapsed target can't stall production
+        // longer than an IDR's own transit.
+        assert_eq!(direct_queue_budget_bytes(1_500_000), 48 * 1024);
+        // No reference rate yet (pre-first-frame) = unbounded gate.
+        assert_eq!(direct_queue_budget_bytes(0), usize::MAX);
+        // Direct HRD default is 1× maxrate; constrained keeps the rc.234 2×.
+        assert_eq!(direct_hrd_pct(), 100);
     }
 
     fn gate() -> SettleKeyframeGate {

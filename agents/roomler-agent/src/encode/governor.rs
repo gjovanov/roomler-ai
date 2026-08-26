@@ -173,13 +173,18 @@ impl RateGovernor {
 
     /// Pre-encode tick, every frame that reaches the encoder: lazily
     /// construct the AIMD at the session's first ceiling, push the
-    /// current ceiling (quality preference × relay clamp — lowering
-    /// clamps desired down immediately), and feed a non-full occupancy
-    /// sample so the additive increase can recover once the link
-    /// drains.
+    /// current floor (area-scaled legibility minimum — see
+    /// `encode::area_min_bitrate_bps`; the controller caps it at the
+    /// live ceiling) and ceiling (quality preference × relay clamp —
+    /// lowering clamps desired down immediately), and feed a non-full
+    /// occupancy sample so the additive increase can recover once the
+    /// link drains. Floor BEFORE ceiling so a transport flip to relay
+    /// resolves both in one tick (the flat floor lands first, then the
+    /// clamp isn't maxed against a stale big-screen floor).
     pub fn pre_encode_tick(
         &mut self,
         ceiling_bps: u32,
+        floor_bps: u32,
         send_capacity: usize,
         now: Instant,
     ) -> Option<AppliedBitrate> {
@@ -193,6 +198,7 @@ impl RateGovernor {
                 now,
             )
         });
+        ctrl.set_floor(floor_bps);
         ctrl.set_ceiling(ceiling_bps);
         ctrl.observe(
             depth.saturating_sub(send_capacity) as u32,
@@ -354,20 +360,23 @@ mod tests {
         // last_applied=0 makes take_pending emit the initial target
         // exactly once.
         let applied = g
-            .pre_encode_tick(CEILING, DEPTH, now)
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
             .expect("initial apply");
         assert_eq!(applied.bps, CEILING);
         assert!(applied.changed);
         assert_eq!(g.applied_bps(), CEILING);
         // Same conditions again — change-gated, nothing to apply.
-        assert!(g.pre_encode_tick(CEILING, DEPTH, now).is_none());
+        assert!(
+            g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+                .is_none()
+        );
     }
 
     #[test]
     fn sustained_full_channel_walks_bitrate_down_never_below_floor() {
         let start = Instant::now();
         let mut g = gov(start);
-        g.pre_encode_tick(CEILING, DEPTH, start);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, start);
         let mut last = g.applied_bps();
         // Full-channel gate arms spaced past the MD rate limit walk the
         // target down monotonically; the floor holds no matter how long
@@ -390,30 +399,61 @@ mod tests {
     fn lowering_the_ceiling_clamps_the_target_immediately() {
         let now = Instant::now();
         let mut g = gov(now);
-        g.pre_encode_tick(CEILING, DEPTH, now);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now);
         // A transport flip to relay shrinks the ceiling; the very next
         // tick must emit the clamped target (refine can raise dims —
         // and thereby the requested ceiling — but the constrained
         // clamp always wins; see also the policy-level flatness test).
         let relay_ceiling = 3_000_000;
         let applied = g
-            .pre_encode_tick(relay_ceiling, DEPTH, now)
+            .pre_encode_tick(relay_ceiling, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
             .expect("clamp emits");
         assert_eq!(applied.bps, relay_ceiling);
+    }
+
+    /// The area-scaled floor rides the same tick: a collapsed target is
+    /// lifted to the floor immediately, and a relay flip (flat floor +
+    /// low ceiling, same call order as the pumps) restores MD room.
+    #[test]
+    fn floor_passes_through_to_the_controller() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, start);
+        // Sustained congestion walks the target to the flat floor.
+        let mut now = start;
+        for _ in 0..40 {
+            now += Duration::from_millis(600);
+            g.on_backpressure_skip(now);
+        }
+        assert_eq!(g.applied_bps(), crate::encode::MIN_BITRATE_BPS);
+        // A big-screen floor lifts it on the next tick.
+        let applied = g
+            .pre_encode_tick(CEILING, 3_000_000, DEPTH, now)
+            .expect("floor lift emits");
+        assert_eq!(applied.bps, 3_000_000);
+        // Relay flip: flat floor + 2 M ceiling in one tick — the clamp
+        // wins, the stale floor cannot pin the target above it.
+        let applied = g
+            .pre_encode_tick(2_000_000, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+            .expect("clamp emits");
+        assert_eq!(applied.bps, 2_000_000);
     }
 
     #[test]
     fn rebuild_forces_a_reapply_of_the_current_target() {
         let now = Instant::now();
         let mut g = gov(now);
-        g.pre_encode_tick(CEILING, DEPTH, now);
-        assert!(g.pre_encode_tick(CEILING, DEPTH, now).is_none());
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now);
+        assert!(
+            g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+                .is_none()
+        );
         // A fresh encoder starts at its constructor maxrate — the
         // governor must re-emit the (unchanged) desired target so the
         // pump re-applies it.
         g.on_encoder_rebuilt();
         let applied = g
-            .pre_encode_tick(CEILING, DEPTH, now)
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
             .expect("post-rebuild reapply");
         assert_eq!(applied.bps, CEILING);
         assert!(
