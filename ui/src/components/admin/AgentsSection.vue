@@ -1301,6 +1301,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import {
   useAgentStore,
@@ -1339,6 +1340,10 @@ const overlayStore = useOverlayRoutesStore()
 const tunnelClientStore = useTunnelClientStore()
 const deviceStore = useDeviceStore()
 const auth = useAuthStore()
+// Declared before the grid state below — gridKind's initializer reads
+// route.query.
+const route = useRoute()
+const router = useRouter()
 
 // ── Unified server-driven grid state ─────────────────────────────
 const gridSearch = ref('')
@@ -1346,9 +1351,31 @@ const gridPage = ref(1)
 const gridPerPage = ref(25)
 const gridSort = ref<string | undefined>(undefined)
 const gridDir = ref<'asc' | 'desc' | undefined>(undefined)
-/** Kind radio: devices-only by default — 'both' widens to tunnel clients. */
-const gridKind = ref<'agent' | 'tunnel_client' | 'both'>('agent')
+/** Kind radio: devices-only by default — 'both' widens to tunnel clients.
+ *  Mirrored to/from the `?type=` querystring (device | tunnel | both) so the
+ *  dashboard's Tunnels tile can land here pre-filtered and the URL stays
+ *  shareable. */
+const gridKind = ref<'agent' | 'tunnel_client' | 'both'>(kindFromQuery(route.query.type))
 const colDialogOpen = ref(false)
+
+function kindFromQuery(v: unknown): 'agent' | 'tunnel_client' | 'both' {
+  return v === 'tunnel' ? 'tunnel_client' : v === 'both' ? 'both' : 'agent'
+}
+// Query → radio (e.g. in-app navigation to ?type=tunnel while mounted).
+watch(
+  () => route.query.type,
+  (t) => {
+    const k = kindFromQuery(t)
+    if (k !== gridKind.value) gridKind.value = k
+  },
+)
+// Radio → query (replace, not push — a filter flip is not a history entry).
+watch(gridKind, (k) => {
+  const wanted = k === 'tunnel_client' ? 'tunnel' : k === 'both' ? 'both' : undefined
+  if ((route.query.type ?? undefined) !== wanted) {
+    router.replace({ query: { ...route.query, type: wanted } })
+  }
+})
 
 /** Column-picker extra: collapse the Name cell to the display name alone
  *  when one is set (default ON — the machine-reported title is noise once
