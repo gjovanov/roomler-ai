@@ -221,8 +221,31 @@ pub fn msi_product_version_for(release: &str) -> Option<String> {
     let patch: u64 = parts[2].parse().ok()?;
 
     match pre {
-        // A final release maps the build field to 65535 so it outranks every
-        // rc of that minor.
+        // Finals. Two eras, split at 0.4 (the rc train ended with
+        // 0.3.0-rc.*):
+        //
+        //  * 0.4+ — the project ships plain `MAJOR.MINOR.PATCH` releases, so
+        //    the PATCH is the build field: 0.4.5 → `0.4.5`. The old
+        //    every-final-is-65535 rule would collapse ALL 0.4.x MSIs into
+        //    one ProductVersion — Windows MajorUpgrade would never see a
+        //    newer version within the minor, and any 0.4.x MSI would verify
+        //    as any other (the substitution ambiguity this check exists to
+        //    prevent).
+        //  * pre-0.4 — legacy rule kept: build = 65535 so a hypothetical
+        //    0.3 final outranks every 0.3 rc. No such final was ever
+        //    published; the arm exists so historical answers don't change.
+        //
+        // ⚠️ Rollout note: agents ≤ 0.3.0-rc.485 carry the legacy rule and
+        // EXPECT `x.y.65535` for any 0.4.x tag — they refuse a 0.4.x MSI
+        // (CheckOutcome::Skipped, attention sentinel) until they are first
+        // moved to a transition rc that has this arm. Push the transition
+        // rc pinned to any laggard before pointing it at 0.4.
+        None if (major, minor) >= (0, 4) => {
+            if patch > 65535 {
+                return None;
+            }
+            Some(format!("{major}.{minor}.{patch}"))
+        }
         None => Some(format!("{major}.{minor}.65535")),
         Some(pre) => {
             // Only `rc.N`. The workflow's regex is equally strict and fails
@@ -405,16 +428,34 @@ mod tests {
 
     #[test]
     fn final_releases_take_the_top_of_the_build_field() {
-        // 65535 so a final release outranks every rc of that minor — the
-        // property the workflow's mapping exists to preserve.
+        // Legacy (pre-0.4) rule only: 65535 so a final outranks every rc of
+        // that minor. Historical answers must not change.
         assert_eq!(
             msi_product_version_for("agent-v0.3.0").as_deref(),
             Some("0.3.65535")
         );
         assert_eq!(
-            msi_product_version_for("1.2.3").as_deref(),
-            Some("1.2.65535")
+            msi_product_version_for("0.2.7").as_deref(),
+            Some("0.2.65535")
         );
+    }
+
+    #[test]
+    fn point_four_finals_map_patch_into_the_build_field() {
+        // The 0.4+ scheme: PATCH is the build field, so ProductVersions are
+        // monotonic WITHIN the minor (0.4.0 < 0.4.1 < …) — MajorUpgrade
+        // keeps upgrading and no two 0.4.x MSIs share a version.
+        assert_eq!(
+            msi_product_version_for("agent-v0.4.0").as_deref(),
+            Some("0.4.0")
+        );
+        assert_eq!(
+            msi_product_version_for("agent-v0.4.17").as_deref(),
+            Some("0.4.17")
+        );
+        assert_eq!(msi_product_version_for("v1.2.3").as_deref(), Some("1.2.3"));
+        // Build-field ceiling still applies.
+        assert_eq!(msi_product_version_for("0.4.65536"), None);
     }
 
     #[test]
