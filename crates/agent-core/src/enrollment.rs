@@ -169,6 +169,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         direct_hrd_pct: None,
         area_min_bitrate: None,
         measured_ceiling: None,
+        bg_rebuild: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,

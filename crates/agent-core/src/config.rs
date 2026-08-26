@@ -670,6 +670,16 @@ pub struct AgentConfig {
     /// = observe-and-report only (the pre-P2 posture).
     #[serde(default)]
     pub measured_ceiling: Option<bool>,
+    /// 2026-08-27 drag-latency P3 — background encoder rebuild
+    /// (`ROOMLER_NODE_BG_REBUILD`). Default ON: on encoders with no
+    /// in-place bitrate reconfigure (QSV/AMF), a bitrate change opens
+    /// the replacement on a blocking thread while the current encoder
+    /// keeps producing, then swaps between frames — no mid-drag stall,
+    /// and rate drops land DURING motion as smaller frames instead of
+    /// production skips. `false` restores the rc.445 motion-defer
+    /// (applies held until 1.2 s of quiet, then a blocking re-open).
+    #[serde(default)]
+    pub bg_rebuild: Option<bool>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
     /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
@@ -1620,6 +1630,7 @@ pub fn test_fixture() -> AgentConfig {
         direct_hrd_pct: None,
         area_min_bitrate: None,
         measured_ceiling: None,
+        bg_rebuild: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -1735,11 +1746,12 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 49] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 50] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
         ("MEASURED_CEILING", cfg.measured_ceiling),
+        ("BG_REBUILD", cfg.bg_rebuild),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
         ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
         ("IDLE_REFINE", cfg.idle_refine),
