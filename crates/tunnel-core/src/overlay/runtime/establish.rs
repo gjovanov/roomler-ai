@@ -2495,6 +2495,37 @@ impl OverlayRuntime {
             );
             return false;
         };
+        // #34 — a carrier we JUST promoted is not evidence of disagreement.
+        //
+        // The peer has to complete its own probe → latch → cutover, which was
+        // measured at 4.2-7.4 s on a healthy LAN. Until it does, it is still
+        // sending over the relay, and those frames are exactly what this
+        // handler reads as "the peer relays instead". Caught live 2026-08-26:
+        //
+        //   22:59:01  accepted inbound direct handshake as a PROBE
+        //   22:59:06  direct carrier PROMOTED (relay held throughout)
+        //   22:59:06  peer is relaying to us over /derp — following it (demote-follow)
+        //
+        // Promote and follow in the SAME SECOND, on a pair whose peer had just
+        // INITIATED the direct handshake — i.e. a peer that demonstrably wanted
+        // direct. Every such round also books a `relayed_instead` strike, and
+        // #31 escalates the hold-down 3→6→12→15 min, so the pair ends up
+        // pinned to a relay for a quarter of an hour by its own convergence.
+        //
+        // A promotion is therefore given a grace period: comfortably longer
+        // than the observed latch, short enough that a peer which genuinely
+        // stays on the relay is still followed within a sweep or two.
+        if by_node
+            .get(&nid)
+            .is_some_and(|e| e.is_direct && e.since.elapsed() < PROMOTE_FOLLOW_GRACE)
+        {
+            debug!(
+                peer = %nid,
+                "overlay relay: /derp frame within the promote grace — the peer is still \
+                 cutting over, not disagreeing"
+            );
+            return false;
+        }
         // Already on DERP ⇒ nothing to follow. This is the ordinary shape of a
         // repeat notice: the peer keeps relaying until we converge, and frames
         // already in flight when we flipped still arrive.

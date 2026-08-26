@@ -530,6 +530,14 @@ const MAJOR_RECHECK_AFTER: Duration = Duration::from_millis(2_250);
 /// declined for a transient reason (mux mid-reconnect) retries promptly rather
 /// than waiting out the ordinary walk.
 const DERP_FOLLOW_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// #34 — how long a freshly PROMOTED direct carrier is immune to the
+/// demote-follow. The peer still has its own probe → latch → cutover to
+/// finish (measured 4.2-7.4 s on a healthy LAN) and is legitimately still on
+/// the relay until then; without this, our own promotion is torn down by the
+/// peer's in-flight relay frames in the same second, and each round books a
+/// strike that escalates the hold-down toward 15 minutes.
+pub(crate) const PROMOTE_FOLLOW_GRACE: Duration = Duration::from_secs(15);
 /// #28 — how soon after the `/derp` WS returns to pull the establish walk in.
 /// Short but not zero: the WS is registered by the time `mark_up` fires, and a
 /// small delay lets a burst of reconnects (central + regional muxes coming back
@@ -4652,6 +4660,150 @@ mod tests {
         );
     }
 
+    /// A minimal netmap peer for the demote-follow tests: derp-capable and
+    /// reachable, with no endpoints (the follow resolves by pubkey, not by
+    /// candidate). Shared so the two tests cannot drift apart on the fields
+    /// that gate the path under test.
+    fn test_netmap_peer(nid: ObjectId, overlay_ip: Ipv4Addr, kp: &WgKeypair) -> NetmapPeer {
+        NetmapPeer {
+            node_id: nid,
+            overlay_ip: overlay_ip.to_string(),
+            name: "pc".into(),
+            wg_public_key: kp.public_base64(),
+            supports_derp: true,
+            supports_derp_floor: true,
+            reachable: true,
+            endpoints: vec![],
+            lan_endpoints: vec![],
+            srflx_endpoints: vec![],
+            srflx_nat: None,
+            udp_dialer_ok: None,
+            relay_home: None,
+            warm_relay_endpoint: None,
+            supports_quic: false,
+            supports_relay_single: false,
+            supports_forced_derp: false,
+            caps: None,
+            supports_overlay_echo: false,
+            relay_strategy: None,
+            routes: vec![],
+            agent_id: None,
+            ingress_rules: None,
+        }
+    }
+
+    /// #34 — a carrier we JUST promoted must survive the peer catching up.
+    ///
+    /// The peer has its own probe → latch → cutover to finish (4.2-7.4 s
+    /// measured on a healthy LAN) and is legitimately still sending over the
+    /// relay until then. Without a grace those in-flight frames read as "the
+    /// peer relays instead" and tear down the promotion we just made — caught
+    /// live 2026-08-26, promote and follow in the SAME SECOND, on a pair whose
+    /// peer had itself INITIATED the direct handshake:
+    ///
+    ///   22:59:01  accepted inbound direct handshake as a PROBE
+    ///   22:59:06  direct carrier PROMOTED (relay held throughout)
+    ///   22:59:06  peer is relaying to us over /derp — following it (demote-follow)
+    ///
+    /// Each such round also books a strike, and #31 escalates the hold-down
+    /// 3→6→12→15 min, so a pair pins itself to a relay for a quarter of an
+    /// hour by the act of converging. Six laptops on one table sat on relay
+    /// because of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_just_promoted_carrier_is_not_torn_down_by_the_peer_catching_up() {
+        let kp = WgKeypair::generate();
+        let peer_kp = WgKeypair::generate();
+        let pk = peer_kp.public.to_bytes();
+        let (out_tx, _out_rx) = mpsc::channel::<ClientMsg>(16);
+        let (tun_mock, _inj, _del) = MockTun::new();
+        let tf: TunFactory = {
+            let m = tun_mock.clone();
+            Box::new(move |_, _, _| Ok(m.clone() as Arc<dyn TunIo>))
+        };
+        let rt = OverlayRuntime::new_relay(kp.clone(), out_tx.clone(), tf, 1280);
+        let mux = DerpMux::new(kp.public.to_bytes()).0;
+        let mut relay = Some(RelayCoordinator::new(
+            out_tx,
+            kp.public.to_bytes(),
+            true,
+            vec![],
+            Some(mux),
+        ));
+        let (mut wg, _tun_rx) = WgDevice::new(kp.secret.clone());
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        wg.ensure_direct_demux(sock.clone());
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let overlay_ip = Ipv4Addr::new(100, 65, 4, 34);
+        wg.add_direct_peer(sock.clone(), pk, overlay_ip, dst, true)
+            .await;
+        let nid = ObjectId::from_bytes([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
+        current_peers.insert(nid, test_netmap_peer(nid, overlay_ip, &peer_kp));
+        let tun: Arc<dyn TunIo> = tun_mock;
+        let mut bq = test_relay_bq();
+        let mut cooldown: HashMap<ObjectId, Instant> = HashMap::new();
+
+        // Promoted one second ago — the peer is still cutting over.
+        let mut by_node = HashMap::new();
+        by_node.insert(
+            nid,
+            Installed::base(
+                pk,
+                overlay_ip,
+                DirectTier::Lan,
+                Instant::now() - Duration::from_secs(1),
+            ),
+        );
+        assert!(
+            !rt.demote_follow(
+                pk,
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                &current_peers,
+                &mut bq,
+                &mut cooldown,
+            )
+            .await,
+            "a carrier promoted 1 s ago must NOT be torn down by the peer's \
+             in-flight relay frames"
+        );
+        assert!(
+            by_node[&nid].is_direct,
+            "and it must still be the direct carrier afterwards"
+        );
+        assert!(
+            cooldown.is_empty(),
+            "no strike, no cooldown — nothing disagreed"
+        );
+
+        // Past the grace, the same signal IS a real disagreement and is followed.
+        by_node.insert(
+            nid,
+            Installed::base(
+                pk,
+                overlay_ip,
+                DirectTier::Lan,
+                Instant::now() - PROMOTE_FOLLOW_GRACE - Duration::from_secs(1),
+            ),
+        );
+        assert!(
+            rt.demote_follow(
+                pk,
+                &mut wg,
+                &mut by_node,
+                &mut relay,
+                &tun,
+                &current_peers,
+                &mut bq,
+                &mut cooldown,
+            )
+            .await,
+            "past the grace, a peer still relaying to us is a genuine disagreement"
+        );
+    }
+
     /// #27 — the demote-follow, end to end. A peer we hold on a DIRECT carrier
     /// that is relaying to us over `/derp` flips onto DERP immediately, instead
     /// of waiting for our own passive detectors — which, on the end whose
@@ -4696,7 +4848,15 @@ mod tests {
         let mut by_node = HashMap::new();
         by_node.insert(
             nid,
-            Installed::base(pk, overlay_ip, DirectTier::Lan, Instant::now()),
+            // #34 — AGED past `PROMOTE_FOLLOW_GRACE`: this test is about a peer that
+            // genuinely disagrees, not one still cutting over. The grace case is
+            // covered by `a_just_promoted_carrier_is_not_torn_down_by_the_peer_catching_up`.
+            Installed::base(
+                pk,
+                overlay_ip,
+                DirectTier::Lan,
+                Instant::now() - PROMOTE_FOLLOW_GRACE - Duration::from_secs(1),
+            ),
         );
 
         let mut current_peers: HashMap<ObjectId, NetmapPeer> = HashMap::new();
