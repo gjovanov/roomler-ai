@@ -229,6 +229,21 @@ export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolea
 }
 
 /**
+ * Nav gate for the Invites surface (sidebar item + dashboard card).
+ * Deliberately FAIL-CLOSED on `mask === null`, like {@link canQueryAnalytics}
+ * and unlike {@link canSeeFleetNav}: `list_invites` requires INVITE_MEMBERS
+ * and the api client force-logs-out on any GET 403 — so an ungated entry
+ * turned a plain member's click into a logout, which users read as "the
+ * invite page disappeared". Server gate: `INVITE_MEMBERS`
+ * (owner/ADMINISTRATOR bypass included).
+ */
+export function canManageInvites(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return false
+  return hasPermission(mask, byKeys(['INVITE_MEMBERS']))
+}
+
+/**
  * May this caller ask a device to turn exec / SSH ON?
  *
  * `MANAGE_AGENTS` alone is NOT enough, and that is the whole point. Enabling

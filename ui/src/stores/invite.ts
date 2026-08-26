@@ -25,6 +25,9 @@ interface Invite {
   assign_role_ids: string[]
   expires_at?: string
   created_at: string
+  /** Set by create/batch responses: whether THIS request dispatched an
+   *  email. Optional — absent on old servers and on list responses. */
+  email_sent?: boolean
 }
 
 interface InviteList {
