@@ -173,7 +173,9 @@
           </v-card-text>
         </v-card>
       </v-col>
-      <v-col cols="12" sm="6" md="3">
+      <!-- Same FAIL-CLOSED gate as the sidebar item: the invites list needs
+           INVITE_MEMBERS and the api client logs out on GET 403. -->
+      <v-col v-if="canInvite" cols="12" sm="6" md="3">
         <v-card :to="`/tenant/${tenantId}/invites`" hover>
           <v-card-text>
             <v-icon color="primary" class="mr-2">mdi-email-plus</v-icon>
@@ -207,7 +209,7 @@ import { useRoomStore } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
 import { useStatsStore } from '@/stores/stats'
 import { usePolling } from '@/composables/usePolling'
-import { canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
+import { canManageInvites, canQueryAnalytics, canSeeFleetNav } from '@/utils/permissions'
 import TimeSeriesChart from '@/components/stats/TimeSeriesChart.vue'
 import MeshGraph, { type MeshNode } from '@/components/stats/MeshGraph.vue'
 
@@ -229,6 +231,9 @@ const onlineDevices = computed(() => agentStore.agents.filter((a) => a.is_online
 const showFleet = computed(() => canSeeFleetNav(tenantStore.myPermissions, tenantStore.isOwner))
 const showAnalytics = computed(() =>
   canQueryAnalytics(tenantStore.myPermissions, tenantStore.isOwner),
+)
+const canInvite = computed(() =>
+  canManageInvites(tenantStore.myPermissions, tenantStore.isOwner),
 )
 
 // Insights panel: member-safe overview, refreshed every 60 s (paused

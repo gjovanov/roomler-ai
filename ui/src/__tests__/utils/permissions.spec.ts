@@ -8,6 +8,7 @@ import {
   PERMISSION_GROUPS,
   canGrantDeviceExec,
   canGrantDeviceSsh,
+  canManageInvites,
   canQueryAnalytics,
   canSeeFleetNav,
   describePermissions,
@@ -212,6 +213,33 @@ describe('canQueryAnalytics (org analytics gating — stats PR-4)', () => {
   it('plain member denied', () => {
     expect(canQueryAnalytics(DEFAULT_MEMBER, false)).toBe(false)
     expect(canQueryAnalytics(0, false)).toBe(false)
+  })
+})
+
+describe('canManageInvites (invites nav gating)', () => {
+  const INVITE_MEMBERS = 1 << 6
+
+  it('fails CLOSED while the membership has not loaded (null mask)', () => {
+    // Same convention as canQueryAnalytics: list_invites needs
+    // INVITE_MEMBERS and the api client logs out on GET 403 — an
+    // optimistic nav entry turns a member's click into a logout.
+    expect(canManageInvites(null, false)).toBe(false)
+  })
+
+  it('owner always allowed, even before the mask loads', () => {
+    expect(canManageInvites(null, true)).toBe(true)
+    expect(canManageInvites(0, true)).toBe(true)
+  })
+
+  it('INVITE_MEMBERS or ADMINISTRATOR allowed — DEFAULT_ADMIN carries it', () => {
+    expect(canManageInvites(INVITE_MEMBERS, false)).toBe(true)
+    expect(canManageInvites(ADMINISTRATOR, false)).toBe(true)
+    expect(canManageInvites(DEFAULT_ADMIN, false)).toBe(true)
+  })
+
+  it('plain member denied — INVITE_MEMBERS is deliberately not in DEFAULT_MEMBER', () => {
+    expect(canManageInvites(DEFAULT_MEMBER, false)).toBe(false)
+    expect(canManageInvites(0, false)).toBe(false)
   })
 })
 

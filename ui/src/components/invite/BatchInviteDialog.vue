@@ -180,17 +180,32 @@ async function send() {
       error: r.error,
     }))
 
+    // "Sent" is a claim about EMAILS, not rows — for months the batch route
+    // created rows and dispatched nothing while this dialog said "N sent".
+    // Count what the server says it actually dispatched (absent on an old
+    // server ⇒ 0 ⇒ the honest created-only wording).
+    const emailsSent = response.results.filter((r) => r.invite?.email_sent).length
+    const sentNote =
+      emailsSent === response.created
+        ? ''
+        : emailsSent > 0
+          ? ` ${emailsSent} email${emailsSent === 1 ? '' : 's'} sent.`
+          : ' No emails sent — email delivery is not configured; share the invite links from the list.'
     if (response.failed === 0) {
-      resultType.value = 'success'
-      resultMessage.value = `All ${response.created} invites created successfully.`
-      showSuccess(`${response.created} invites sent`)
+      resultType.value = emailsSent === response.created ? 'success' : 'warning'
+      resultMessage.value = `All ${response.created} invites created.${sentNote}`
+      showSuccess(
+        emailsSent === response.created
+          ? `${response.created} invites sent`
+          : `${response.created} invites created`,
+      )
     } else if (response.created === 0) {
       resultType.value = 'error'
       resultMessage.value = `All ${response.failed} invites failed.`
       showError('All invites failed')
     } else {
       resultType.value = 'warning'
-      resultMessage.value = `${response.created} created, ${response.failed} failed.`
+      resultMessage.value = `${response.created} created, ${response.failed} failed.${sentNote}`
     }
   } catch {
     resultType.value = 'error'
