@@ -6,7 +6,7 @@ use bson::{doc, oid::ObjectId};
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
-use roomler_ai_services::dao::base::PaginationParams;
+// PaginationParams no longer used here — MemberListQuery is flat (FR-11).
 
 #[derive(Debug, Serialize)]
 pub struct MemberResponse {
@@ -16,8 +16,36 @@ pub struct MemberResponse {
     /// The user's display name (falls back to username), resolved from the users
     /// collection — so member pickers can show a name, not a raw id.
     pub display_name: String,
+    /// FR-11: shown on the members grid — org members see each other's
+    /// addresses; that is what the page is for. Empty when the user row is
+    /// gone (defensive).
+    pub email: String,
     pub role_ids: Vec<String>,
     pub joined_at: String,
+}
+
+/// FR-11 members-grid params. Flat on purpose — never `#[serde(flatten)]
+/// PaginationParams` behind axum's `Query` (the AuditQuery postmortem).
+/// All optional/defaulted: a parameterless request behaves as before.
+#[derive(Debug, Deserialize)]
+pub struct MemberListQuery {
+    #[serde(default = "member_default_page")]
+    pub page: u64,
+    #[serde(default = "member_default_per_page")]
+    pub per_page: u64,
+    /// Case-insensitive substring over display name, username, nickname and
+    /// email.
+    pub q: Option<String>,
+    /// `name` | `email` | `joined_at` (default). Unknown → 400.
+    pub sort: Option<String>,
+    /// `asc` (default) | `desc`.
+    pub dir: Option<String>,
+}
+fn member_default_page() -> u64 {
+    1
+}
+fn member_default_per_page() -> u64 {
+    25
 }
 
 #[derive(Debug, Serialize)]
@@ -44,7 +72,7 @@ pub async fn list_members(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<MemberListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -53,44 +81,145 @@ pub async fn list_members(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let result = state
+    let sort_key = params.sort.as_deref();
+    if let Some(k) = sort_key
+        && !matches!(k, "name" | "email" | "joined_at")
+    {
+        return Err(ApiError::BadRequest(format!("Unknown sort key: {k}")));
+    }
+    let desc = match params.dir.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!("Unknown dir: {other}")));
+        }
+    };
+    let per_page = params.per_page.clamp(1, 100);
+    let page = params.page.max(1);
+
+    // FR-11: in-memory compose, like the devices grid — the search/sort
+    // columns (name, email) live in the USERS collection while the rows are
+    // tenant_members, and per-tenant membership is tens of rows.
+    let members = state
         .tenants
         .members
-        .find_paginated(
-            doc! { "tenant_id": tid },
-            Some(doc! { "joined_at": 1 }),
-            &params,
-        )
+        .find_many(doc! { "tenant_id": tid }, Some(doc! { "joined_at": 1 }))
         .await?;
-
-    // Resolve display names in one batch so the response carries names, not just
-    // ids (used by member pickers, e.g. the agent owner-reassign dialog).
-    let user_ids: Vec<ObjectId> = result.items.iter().map(|m| m.user_id).collect();
-    let names = state
+    let user_ids: Vec<ObjectId> = members.iter().map(|m| m.user_id).collect();
+    let facts = state
         .users
-        .find_display_names(&user_ids)
+        .find_member_facts(&user_ids)
         .await
         .unwrap_or_default();
-    let items: Vec<MemberResponse> = result
-        .items
+
+    let mut rows: Vec<MemberResponse> = members
         .into_iter()
-        .map(|m| MemberResponse {
-            id: m.id.unwrap().to_hex(),
-            user_id: m.user_id.to_hex(),
-            nickname: m.nickname,
-            display_name: names.get(&m.user_id).cloned().unwrap_or_default(),
-            role_ids: m.role_ids.iter().map(|r| r.to_hex()).collect(),
-            joined_at: m.joined_at.try_to_rfc3339_string().unwrap_or_default(),
+        .map(|m| {
+            let f = facts.get(&m.user_id);
+            MemberResponse {
+                id: m.id.unwrap().to_hex(),
+                user_id: m.user_id.to_hex(),
+                nickname: m.nickname,
+                display_name: f.map(|f| f.display_name.clone()).unwrap_or_default(),
+                email: f.map(|f| f.email.clone()).unwrap_or_default(),
+                role_ids: m.role_ids.iter().map(|r| r.to_hex()).collect(),
+                joined_at: m.joined_at.try_to_rfc3339_string().unwrap_or_default(),
+            }
         })
         .collect();
 
+    if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        let needle = q.to_lowercase();
+        rows.retain(|r| {
+            r.display_name.to_lowercase().contains(&needle)
+                || r.email.to_lowercase().contains(&needle)
+                || r.nickname
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().contains(&needle))
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        let ord = match sort_key {
+            Some("name") => a
+                .display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase()),
+            Some("email") => a.email.to_lowercase().cmp(&b.email.to_lowercase()),
+            // Default AND explicit joined_at: the pre-FR order.
+            _ => a.joined_at.cmp(&b.joined_at),
+        };
+        let ord = if desc { ord.reverse() } else { ord };
+        ord.then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = rows.len() as u64;
+    let total_pages = total.div_ceil(per_page).max(1);
+    let start = ((page - 1) * per_page) as usize;
+    let items: Vec<MemberResponse> = if start >= rows.len() {
+        Vec::new()
+    } else {
+        rows.into_iter()
+            .skip(start)
+            .take(per_page as usize)
+            .collect()
+    };
+
     Ok(Json(serde_json::json!({
         "items": items,
-        "total": result.total,
-        "page": result.page,
-        "per_page": result.per_page,
-        "total_pages": result.total_pages,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
     })))
+}
+
+/// DELETE /api/tenant/{tid}/member/{user_id} — remove a member (FR-11).
+///
+/// First consumer of `KICK_MEMBERS`. The tenant OWNER cannot be removed
+/// (409 — ownership transfer is a different operation); removing YOURSELF is
+/// allowed and simply means leaving. Room-membership rows are left in place:
+/// tenant `is_member` is the access gate on every read/write path, so a
+/// removed user loses access structurally (cascade is a noted follow-up).
+pub async fn remove_member(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((tenant_id, member_user_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let target = ObjectId::parse_str(&member_user_id)
+        .map_err(|_| ApiError::BadRequest("Invalid user_id".to_string()))?;
+
+    // Self-removal (leave) needs no permission; kicking someone else does.
+    if target != auth.user_id {
+        let perms = state
+            .tenants
+            .get_member_permissions(tid, auth.user_id)
+            .await?;
+        if !roomler_ai_db::models::role::permissions::has(
+            perms,
+            roomler_ai_db::models::role::permissions::KICK_MEMBERS,
+        ) {
+            return Err(ApiError::Forbidden(
+                "Missing KICK_MEMBERS permission".to_string(),
+            ));
+        }
+    }
+
+    let tenant = state.tenants.base.find_by_id(tid).await?;
+    if tenant.owner_id == target {
+        return Err(ApiError::Conflict(
+            "The organization owner cannot be removed".to_string(),
+        ));
+    }
+
+    let removed = state.tenants.remove_member(tid, target).await?;
+    if !removed {
+        return Err(ApiError::NotFound("Not a member".to_string()));
+    }
+    tracing::info!(admin = %auth.user_id, tenant = %tid, user = %target, "member removed");
+    Ok(Json(serde_json::json!({ "removed": true })))
 }
 
 pub async fn get_profile(

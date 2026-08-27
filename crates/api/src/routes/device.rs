@@ -43,7 +43,8 @@ pub struct DeviceListQuery {
     pub q: Option<String>,
     /// One of: name | kind | os | status | version | overlay_ip | magic_dns
     /// | last_seen_at | created_at. Unknown values 400 rather than silently
-    /// sorting by something else.
+    /// sorting by something else. ABSENT = the compound default: online →
+    /// stale → offline, then name within each bucket (FR-11).
     pub sort: Option<String>,
     /// `asc` (default) | `desc`.
     pub dir: Option<String>,
@@ -110,7 +111,11 @@ pub async fn list_devices(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let sort_key = params.sort.as_deref().unwrap_or("name");
+    // FR-11: NO sort param = the compound default — online first, then
+    // name (the sidebar's exact order). An explicit `sort=name` stays a
+    // pure name sort; the two are distinguishable only by keeping the
+    // Option here instead of the old `unwrap_or("name")`.
+    let sort_key = params.sort.as_deref();
     const SORT_KEYS: &[&str] = &[
         "name",
         "kind",
@@ -122,10 +127,10 @@ pub async fn list_devices(
         "last_seen_at",
         "created_at",
     ];
-    if !SORT_KEYS.contains(&sort_key) {
-        return Err(ApiError::BadRequest(format!(
-            "Unknown sort key: {sort_key}"
-        )));
+    if let Some(k) = sort_key
+        && !SORT_KEYS.contains(&k)
+    {
+        return Err(ApiError::BadRequest(format!("Unknown sort key: {k}")));
     }
     let desc = match params.dir.as_deref() {
         None | Some("asc") => false,
@@ -217,8 +222,18 @@ pub async fn list_devices(
 
     // ── Sort (stable; id tiebreak keeps pages disjoint) ─────────
     rows.sort_by(|a, b| {
-        let ord = cmp_rows(a, b, sort_key);
-        let ord = if desc { ord.reverse() } else { ord };
+        let ord = match sort_key {
+            // FR-11 default: online → stale → offline, name within each
+            // bucket. `dir` still applies to an explicit-sort request only;
+            // the default ignores `desc` (there is no param to flip it).
+            None => presence_rank(&a.presence)
+                .cmp(&presence_rank(&b.presence))
+                .then_with(|| effective_name(a).cmp(&effective_name(b))),
+            Some(k) => {
+                let ord = cmp_rows(a, b, k);
+                if desc { ord.reverse() } else { ord }
+            }
+        };
         ord.then_with(|| a.id.cmp(&b.id))
     });
 

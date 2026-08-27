@@ -306,6 +306,18 @@ impl TenantDao {
         Ok(count > 0)
     }
 
+    /// FR-11: drop a user's membership row. Hard delete — `TenantMember` has
+    /// no `deleted_at`, and a removed member re-added later is a NEW
+    /// membership (fresh joined_at/roles), not a revival. Returns whether a
+    /// row was actually removed. Owner/permission policy lives in the route.
+    pub async fn remove_member(&self, tenant_id: ObjectId, user_id: ObjectId) -> DaoResult<bool> {
+        let n = self
+            .members
+            .hard_delete(doc! { "tenant_id": tenant_id, "user_id": user_id })
+            .await?;
+        Ok(n > 0)
+    }
+
     pub async fn assign_role(
         &self,
         tenant_id: ObjectId,

@@ -72,7 +72,15 @@ pub struct CreateInviteRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct AddMemberRequest {
-    pub user_id: String,
+    /// Exactly one of `user_id` / `email` (FR-11 added the email form: the
+    /// members page adds a known account directly, no invite round-trip).
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// Resolved via the users collection's unique, PROVEN email reservation
+    /// — only a verified account can hold an address, so adding by email is
+    /// adding a verified account. Unknown address → 404 pointing at Invites.
+    #[serde(default)]
+    pub email: Option<String>,
     #[serde(default)]
     pub role_ids: Vec<String>,
 }
@@ -217,17 +225,75 @@ pub async fn accept_invite(
 
 // ─── Tenant-scoped handlers (require INVITE_MEMBERS) ───────────
 
+/// FR-11 invite-grid params. Flat (never `#[serde(flatten)]` behind axum
+/// `Query`); all optional/defaulted — a parameterless request behaves as
+/// before.
+#[derive(Debug, Deserialize)]
+pub struct InviteListQuery {
+    #[serde(default = "invite_default_page")]
+    pub page: u64,
+    #[serde(default = "invite_default_per_page")]
+    pub per_page: u64,
+    /// Case-insensitive substring over code/target_email.
+    pub q: Option<String>,
+    /// Exact status filter: active | expired | revoked | exhausted.
+    pub status: Option<String>,
+    /// `created_at` (default, desc) | `target_email` | `status`. Unknown → 400.
+    pub sort: Option<String>,
+    /// `asc` | `desc`.
+    pub dir: Option<String>,
+}
+fn invite_default_page() -> u64 {
+    1
+}
+fn invite_default_per_page() -> u64 {
+    25
+}
+
 /// GET /api/tenant/{tenant_id}/invite — list tenant invites
 pub async fn list_invites(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<InviteListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = parse_oid(&tenant_id)?;
     require_invite_permission(&state, tid, auth.user_id).await?;
 
-    let result = state.invites.list_by_tenant(tid, &params).await?;
+    let sort = params.sort.as_deref();
+    if let Some(k) = sort
+        && !matches!(k, "created_at" | "target_email" | "status")
+    {
+        return Err(ApiError::BadRequest(format!("Unknown sort key: {k}")));
+    }
+    if let Some(s) = params.status.as_deref()
+        && !matches!(s, "active" | "expired" | "revoked" | "exhausted")
+    {
+        return Err(ApiError::BadRequest(format!("Unknown status: {s}")));
+    }
+    let desc = match params.dir.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!("Unknown dir: {other}")));
+        }
+    };
+    let page_params = PaginationParams {
+        page: params.page.max(1),
+        per_page: params.per_page.clamp(1, 100),
+        before: None,
+    };
+    let result = state
+        .invites
+        .list_by_tenant(
+            tid,
+            &page_params,
+            params.q.as_deref(),
+            params.status.as_deref(),
+            sort,
+            desc,
+        )
+        .await?;
 
     let items: Vec<InviteResponse> = result.items.into_iter().map(invite_to_response).collect();
 
@@ -417,7 +483,26 @@ pub async fn add_member(
     let tid = parse_oid(&tenant_id)?;
     let held = require_invite_permission(&state, tid, auth.user_id).await?;
 
-    let user_id = parse_oid(&body.user_id)?;
+    let user_id = match (&body.user_id, &body.email) {
+        (Some(uid), None) => parse_oid(uid)?,
+        (None, Some(email)) => {
+            // Normalized like the auth flows normalize at signup, so the
+            // lookup matches how the reservation was written.
+            let email = email.trim().to_lowercase();
+            let user = state.users.find_by_email(&email).await.map_err(|_| {
+                ApiError::NotFound(
+                    "No account with that email address — use Invites to bring them in".to_string(),
+                )
+            })?;
+            user.id
+                .ok_or_else(|| ApiError::Internal("user missing _id".to_string()))?
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "Provide exactly one of user_id or email".to_string(),
+            ));
+        }
+    };
 
     // Check not already a member
     if state.tenants.is_member(tid, user_id).await? {

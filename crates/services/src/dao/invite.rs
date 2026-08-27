@@ -70,17 +70,42 @@ impl InviteDao {
             .ok_or(DaoError::NotFound)
     }
 
+    /// FR-11: `q` = escaped-regex over code/target_email; `status` = exact
+    /// match on the snake_case enum string; `sort` maps a route-whitelisted
+    /// key (default: created_at desc, today's order). `_id` tiebreak keeps
+    /// pages disjoint.
     pub async fn list_by_tenant(
         &self,
         tenant_id: ObjectId,
         params: &PaginationParams,
+        q: Option<&str>,
+        status: Option<&str>,
+        sort: Option<&str>,
+        desc: bool,
     ) -> DaoResult<PaginatedResult<Invite>> {
+        let mut filter = doc! { "tenant_id": tenant_id };
+        if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
+            let escaped = super::base::escape_regex(q);
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "code": { "$regex": &escaped, "$options": "i" } },
+                    doc! { "target_email": { "$regex": &escaped, "$options": "i" } },
+                ],
+            );
+        }
+        if let Some(s) = status.map(str::trim).filter(|s| !s.is_empty()) {
+            filter.insert("status", s);
+        }
+        let dir = if desc { -1 } else { 1 };
+        let sort_doc = match sort {
+            Some("target_email") => doc! { "target_email": dir, "_id": dir },
+            Some("status") => doc! { "status": dir, "_id": dir },
+            Some("created_at") => doc! { "created_at": dir, "_id": dir },
+            _ => doc! { "created_at": -1, "_id": -1 },
+        };
         self.base
-            .find_paginated(
-                doc! { "tenant_id": tenant_id },
-                Some(doc! { "created_at": -1 }),
-                params,
-            )
+            .find_paginated(filter, Some(sort_doc), params)
             .await
     }
 

@@ -42,6 +42,14 @@ pub struct UserDao {
     pub base: BaseDao<User>,
 }
 
+/// FR-11: what the member grid needs per user, batched.
+#[derive(Debug, Clone)]
+pub struct MemberFacts {
+    pub display_name: String,
+    pub username: String,
+    pub email: String,
+}
+
 impl UserDao {
     pub fn new(db: &Database) -> Self {
         Self {
@@ -395,6 +403,50 @@ impl UserDao {
                 if !name.is_empty() {
                     result.insert(id, name);
                 }
+            }
+        }
+        Ok(result)
+    }
+
+    /// FR-11: the member grid's batch — display name (username fallback),
+    /// username and EMAIL per user id. Email exposure is deliberate here:
+    /// the caller is the tenant-member list, and members of an org see each
+    /// other's addresses (that is what the page is for).
+    pub async fn find_member_facts(
+        &self,
+        user_ids: &[ObjectId],
+    ) -> DaoResult<std::collections::HashMap<ObjectId, MemberFacts>> {
+        use futures::TryStreamExt;
+        let mut result = std::collections::HashMap::new();
+        if user_ids.is_empty() {
+            return Ok(result);
+        }
+        let ids_bson: Vec<bson::Bson> = user_ids
+            .iter()
+            .map(|id| bson::Bson::ObjectId(*id))
+            .collect();
+        let filter = doc! { "_id": { "$in": ids_bson }, "deleted_at": null };
+        let projection = doc! { "_id": 1, "display_name": 1, "username": 1, "email": 1 };
+        let coll = self.base.collection().clone_with_type::<bson::Document>();
+        let mut cursor = coll.find(filter).projection(projection).await?;
+        while let Some(doc) = cursor.try_next().await? {
+            if let Ok(id) = doc.get_object_id("_id") {
+                let display_name = doc.get_str("display_name").unwrap_or("").to_string();
+                let username = doc.get_str("username").unwrap_or("").to_string();
+                let email = doc.get_str("email").unwrap_or("").to_string();
+                let name = if display_name.is_empty() {
+                    username.clone()
+                } else {
+                    display_name
+                };
+                result.insert(
+                    id,
+                    MemberFacts {
+                        display_name: name,
+                        username,
+                        email,
+                    },
+                );
             }
         }
         Ok(result)

@@ -792,3 +792,123 @@ async fn test_batch_create_invites_mixed() {
     assert!(results[2]["invite"].is_null());
     assert!(!results[2]["error"].as_str().unwrap_or_default().is_empty());
 }
+
+// ─── FR-11 (#784): invite grid — q, status filter, sort ──────────────────
+
+/// The invite list is a grid feed now: `q` over code/target_email, exact
+/// `status` filter, whitelisted sort. Defaults stay byte-compatible
+/// (created_at desc).
+#[tokio::test]
+async fn invite_list_supports_q_status_and_sort() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("invgrid").await;
+    let invite_url = format!("/api/tenant/{}/invite", t.tenant_id);
+
+    // Two targeted invites + one link invite.
+    let mut ids = Vec::new();
+    for email in ["zoe@invgrid.test", "adam@invgrid.test"] {
+        let resp = app
+            .auth_post(&invite_url, &t.admin.access_token)
+            .json(&serde_json::json!({ "target_email": email }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 201);
+        let json: Value = resp.json().await.unwrap();
+        ids.push(json["id"].as_str().unwrap().to_string());
+    }
+    let resp = app
+        .auth_post(&invite_url, &t.admin.access_token)
+        .json(&serde_json::json!({ "max_uses": 5 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+
+    // Revoke the first targeted invite (zoe).
+    let resp = app
+        .auth_delete(&format!("{}/{}", invite_url, ids[0]), &t.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // q by email fragment, case-insensitive.
+    let resp = app
+        .auth_get(&format!("{invite_url}?q=ADAM"), &t.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["total"].as_u64(), Some(1));
+    assert_eq!(json["items"][0]["target_email"], "adam@invgrid.test");
+
+    // status filter is exact.
+    let resp = app
+        .auth_get(
+            &format!("{invite_url}?status=revoked"),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["total"].as_u64(), Some(1));
+    assert_eq!(json["items"][0]["target_email"], "zoe@invgrid.test");
+
+    let resp = app
+        .auth_get(
+            &format!("{invite_url}?status=active"),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["total"].as_u64(), Some(2));
+
+    // Unknown status / sort / dir all 400.
+    for bad in ["status=bogus", "sort=evil", "dir=sideways"] {
+        let resp = app
+            .auth_get(&format!("{invite_url}?{bad}"), &t.admin.access_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "?{bad} must 400");
+    }
+
+    // sort=target_email desc: zoe before adam; the link invite (no email)
+    // sorts last under desc (Mongo puts missing values first under asc).
+    let resp = app
+        .auth_get(
+            &format!("{invite_url}?sort=target_email&dir=desc"),
+            &t.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    let emails: Vec<Option<&str>> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["target_email"].as_str())
+        .collect();
+    assert_eq!(
+        emails,
+        vec![Some("zoe@invgrid.test"), Some("adam@invgrid.test"), None]
+    );
+
+    // No params → default created_at desc (newest = the link invite first)
+    // and the full envelope.
+    let resp = app
+        .auth_get(&invite_url, &t.admin.access_token)
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["total"].as_u64(), Some(3));
+    assert!(json["items"][0]["target_email"].is_null());
+    assert!(json["total_pages"].is_number());
+}
