@@ -2611,6 +2611,25 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
     }
   })
 
+  it('FR-15 P2: the probe round trip rides along with the age', () => {
+    // The agent cannot tell a real path floor from a clock-biased one
+    // without it — half of this is the smallest age the path can produce.
+    const m = decodeStatWireMessage(30, false, { avgMs: 120, minMs: 61 }, 88.6)
+    expect(m.probe_rtt_ms).toBe(89)
+  })
+
+  it('FR-15 P2: no round trip is sent without an age, or before a probe lands', () => {
+    // Meaningless on its own, and an absent value must read as "no bound"
+    // on the agent rather than as a 0 ms path.
+    expect(decodeStatWireMessage(30, false, null, 88).probe_rtt_ms).toBeUndefined()
+    expect(
+      decodeStatWireMessage(30, false, { avgMs: 120, minMs: 61 }, null).probe_rtt_ms,
+    ).toBeUndefined()
+    expect(
+      decodeStatWireMessage(30, false, { avgMs: 120, minMs: 61 }, NaN).probe_rtt_ms,
+    ).toBeUndefined()
+  })
+
   it('FR-15: clamps the age into the u16 the agent packs it into', () => {
     const m = decodeStatWireMessage(30, false, { avgMs: 999_999, minMs: -5 })
     expect(m.age_ms).toBe(65535)

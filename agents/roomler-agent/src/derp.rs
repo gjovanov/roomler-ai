@@ -182,6 +182,9 @@ async fn run(
     // per-frame decision, and re-reading the env per frame would be the hot
     // path of the whole carrier.
     let max_queue_age = tunnel_core::transport::derp::queue_max_age();
+    // FR-18 — last value reported, so the keepalive log is change-gated
+    // rather than a line every 25 s on a carrier that shed nothing.
+    let mut last_reported_stale: u64 = 0;
     let mut backoff = Duration::from_secs(1);
     loop {
         // The mux is gone (runtime torn down) ⇒ stop reconnecting.
@@ -262,6 +265,25 @@ async fn run(
                                     "overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting"
                                 );
                                 break;
+                            }
+                            // FR-18 — report the shed count on the keepalive
+                            // tick, change-gated so a healthy carrier stays
+                            // silent. Without a reader the counter proves
+                            // nothing in the field, and "the carrier shed
+                            // stale load" has to be distinguishable from "the
+                            // carrier stalled" — they look identical from the
+                            // pump's side and want opposite responses.
+                            if let Some(m) = mux.upgrade() {
+                                let shed = m.stale_drops();
+                                if shed != last_reported_stale {
+                                    info!(
+                                        %relay,
+                                        dropped_stale = shed,
+                                        since_last = shed - last_reported_stale,
+                                        "overlay derp: shed stale carrier frames (queue age bound)"
+                                    );
+                                    last_reported_stale = shed;
+                                }
                             }
                             if tx.send(Message::Ping(Vec::new().into())).await.is_err() {
                                 warn!(%relay, "overlay derp: keepalive ping failed; reconnecting");
