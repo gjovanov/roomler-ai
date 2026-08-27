@@ -497,7 +497,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "relay_idr_thrift",
         "tribool",
-        "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CLK bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_IDR_THRIFT. Restart required.",
+        "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CORPLAP-3 bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_IDR_THRIFT. Restart required.",
     ),
     (
         "relay_age_feedback",

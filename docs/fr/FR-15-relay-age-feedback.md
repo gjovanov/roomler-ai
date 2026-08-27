@@ -13,13 +13,13 @@ queue in layers **below every agent counter** (WG-over-DERP socket, the DERP ser
 TCP toward the viewer's egress), and the viewer watches frames get progressively older.
 Nothing on the agent can see it; the FR-1 P7 age pill can.
 
-## Evidence (2026-08-27, first age-pill field read — operator + CLK heartbeats + carrier probes)
+## Evidence (2026-08-27, first age-pill field read — operator + CORPLAP-3 heartbeats + carrier probes)
 
-- **neo16 → CLK** (relay, 85 ms): age starts ~60 ms, **climbs to ~120 ms and the
+- **neo16 → CORPLAP-3** (relay, 85 ms): age starts ~60 ms, **climbs to ~120 ms and the
   sluggishness starts with the climb**. +60 ms at 3 Mbps ≈ 22 KB — matches the agent's
   observed inflight excursions (max 26 KB). Mild: path ≈ nominal, queue small but felt.
-- **pc50045 → CLK** (both corp-VPN, relay): age **>200 ms sustained, spikes >1000 ms**.
-  During that exact session (14:38–14:41Z, AV1 @ 3 Mbps) CLK's agent pipeline was
+- **CORPLAP-1 → CORPLAP-3** (both corp-VPN, relay): age **>200 ms sustained, spikes >1000 ms**.
+  During that exact session (14:38–14:41Z, AV1 @ 3 Mbps) CORPLAP-3's agent pipeline was
   EMPTY — `bytes_inflight` avg 1.5–9 KB / max 26 KB, `send_wait_max` <10 ms, zero
   skips, `settle_kf_suppressed` active — while the overlay pair's RTT probe bounced
   **111 → 196 → 382 ms**. A 26 KB agent queue cannot make 1000 ms of age: the backlog
@@ -74,7 +74,7 @@ physically impossible for the path, and the loop misbehaving accordingly:
   fires: `target_bps` is visibly parked at the 1.5 M area floor in windows where
   `send_wait` and `bytes_inflight` say the path was fine. **The loop cuts quality on a
   healthy session.**
-- **Poisoned HIGH** — MacBook → pc50045 learned `viewer_age_floor_ms 1111` while the
+- **Poisoned HIGH** — MacBook → CORPLAP-1 learned `viewer_age_floor_ms 1111` while the
   window average was 1 134–13 485 ms. A session that starts congested teaches the loop
   that congestion IS the floor; `min(ring)` can only ever be as good as the best window
   observed, so a uniformly-bad session can never trigger on excess alone.
@@ -104,9 +104,9 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
 
 ## Acceptance criteria
 
-- [ ] neo16 → CLK: age plateaus ≤ ~90 ms during sustained drag (was: climbs to 120);
+- [ ] neo16 → CORPLAP-3: age plateaus ≤ ~90 ms during sustained drag (was: climbs to 120);
       no felt sluggishness onset.
-- [ ] pc50045 → CLK: no >1000 ms age excursions; sustained age within ~2× that pair's
+- [ ] CORPLAP-1 → CORPLAP-3: no >1000 ms age excursions; sustained age within ~2× that pair's
       floor; heartbeats show `target_bps` stepping DOWN during the viewer's age spikes
       (the loop visibly reacting).
 - [ ] A struggling/absent-age viewer (old web) leaves relay behaviour byte-identical
@@ -118,4 +118,4 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
 | date | build | result |
 |---|---|---|
 | 2026-08-27 | 0.4.7 | Baseline: the two readings above; FR filed. |
-| 2026-08-27 | 0.4.8 (#796) | Implemented. Field gate pending: read `viewer_age_ms` / `viewer_age_floor_ms` in the pump heartbeats, and expect `target_bps` to step DOWN while the viewer's age is spiking — that pairing IS the loop working. Agent half needs 0.4.8 on the TARGET (CLK), viewer half needs the web deploy. |
+| 2026-08-27 | 0.4.8 (#796) | Implemented. Field gate pending: read `viewer_age_ms` / `viewer_age_floor_ms` in the pump heartbeats, and expect `target_bps` to step DOWN while the viewer's age is spiking — that pairing IS the loop working. Agent half needs 0.4.8 on the TARGET (CORPLAP-3), viewer half needs the web deploy. |

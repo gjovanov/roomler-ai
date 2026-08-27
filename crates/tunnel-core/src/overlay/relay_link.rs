@@ -1210,7 +1210,7 @@ impl RelayCoordinator {
     /// the 600 s cooldown, so the instant it lapses the regrade re-fires,
     /// re-churns, and is re-pinned — a ~30-minute cycle that makes a pair which
     /// was STABLE on DERP permanently unstable. Field-observed on DEVBOX
-    /// (devbox-wsl, regal, corplap-01) within an hour of the rc.314 rollout.
+    /// (devbox-wsl, regal, corplap-3) within an hour of the rc.314 rollout.
     ///
     /// Called from [`force_derp`](Self::force_derp), which is the only place a
     /// pin is applied; a pin for a peer we did NOT just regrade is left alone.
@@ -2882,7 +2882,7 @@ mod tests {
         assert_eq!(b_blocked_anchor, Some(true));
     }
 
-    /// Dialer honesty (field 2026-08-16, CORPLAP-01): a srflx candidate only
+    /// Dialer honesty (field 2026-08-16, CORPLAP-3): a srflx candidate only
     /// proves UDP to a well-known port — a host whose raw dials toward the
     /// coturn relay band never land must ANCHOR, and the verdict only applies
     /// when the peer carries the honesty field at all (mixed-version pairs

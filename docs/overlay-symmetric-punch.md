@@ -15,7 +15,7 @@ receives the symmetric side's punch from a source no netmap ever advertised,
 ignores it as a candidate, and keeps aiming at the (wrong) advertised
 address.
 
-Field case (2026-08-15, corplap-01 / Cisco AnyConnect full tunnel): the
+Field case (2026-08-15, corplap-3 / Cisco AnyConnect full tunnel): the
 ORF corporate egress `192.164.201.1` maps one fresh socket to ports
 8467 / 8646 / 8614 across three coturn destinations — per-destination, no
 usable stride, so port prediction is off the table. Observed-src completion
@@ -87,7 +87,7 @@ Receiver-side completion; the symmetric side needs no protocol change.
 - Unit tests: spoofed/unauthenticated source rejected; authenticated
   observed accepted + bound to the receiving socket; LRU/TTL eviction;
   promote epoch guard; both-symmetric pairs still skipped.
-- Field gate: corplap-01 (on VPN) ↔ a cone peer (devbox / cluster) reaches
+- Field gate: corplap-3 (on VPN) ↔ a cone peer (devbox / cluster) reaches
   `direct` with the observed-src 5-tuple visible in `roomler peers`
   detail; no regression in the cone↔cone acceptance sweep.
 

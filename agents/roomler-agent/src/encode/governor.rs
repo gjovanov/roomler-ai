@@ -240,7 +240,7 @@ impl RateGovernor {
         // Only ever LOWERS the nominal; confidence decays via the
         // estimator's TTL, so silence reverts to the nominal band.
         //
-        // DIRECT-ONLY (field 2026-08-27, CLK + PC55331 over the corp
+        // DIRECT-ONLY (field 2026-08-27, CORPLAP-3 + CORPLAP-2 over the corp
         // relay, same day the clamp shipped): per-frame samples through
         // a lumpy TURN-TCP pipe read near-zero during TCP stalls, the
         // down-fast EWMA crashed the estimate, and the ceiling rode the

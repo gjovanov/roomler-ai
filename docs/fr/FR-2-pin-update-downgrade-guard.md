@@ -98,7 +98,7 @@ forced push, so there is nothing operational to disable.
   200; newer rc.484 → 200 (deliberately left pinned — it is the transition
   rung that host needs before a 0.4.x MSI); bulk scoped to it with the stale
   pin → `refused:1` + per-row reason, `delivered:0`. Live-agent half:
-  stale pin vs **PC55331 (online, 0.4.4)** → 409 — refused server-side
+  stale pin vs **CORPLAP-2 (online, 0.4.4)** → 409 — refused server-side
   before any push, zero device side effects. "Current pin still delivers"
   evidenced by the 08-26/27 shepherding pushes (rc.484 → 0.4.1 → 0.4.2,
   `delivered:true` fleet-wide) that ran through this same route.

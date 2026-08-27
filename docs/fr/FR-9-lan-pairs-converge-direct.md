@@ -66,8 +66,8 @@ this pair on relay" needed a `tcpdump` on one host and log archaeology on the ot
 
 ## Edge cases
 
-- A peer whose LAN path genuinely does not carry must STAY on the relay. Verified: pc55331
-  and clk measure 100 % loss on their LAN candidates (both corp-VPN laptops) and correctly
+- A peer whose LAN path genuinely does not carry must STAY on the relay. Verified: CORPLAP-2
+  and CORPLAP-3 measure 100 % loss on their LAN candidates (both corp-VPN laptops) and correctly
   remain relayed.
 - A peer that genuinely keeps relaying must still be followed — the grace is 15 s, not
   indefinite, and the hold-down still gates promotion.
@@ -89,8 +89,8 @@ Reproduce the operator's own test — `ping <overlay-ip>` from one end — and r
 
 | pair | before | after |
 |---|---|---|
-| pc50045 | 108 ms avg (relay) | **6.7 ms** direct |
-| pc55331 | 145 ms (relay) | **6.5 ms** direct |
+| CORPLAP-1 | 108 ms avg (relay) | **6.7 ms** direct |
+| CORPLAP-2 | 145 ms (relay) | **6.5 ms** direct |
 | MacBook | 113 ms avg (relay) | **direct**, 4-5 ms floor |
 | rozalina | 4-7 ms direct (control) | unchanged |
 

@@ -326,7 +326,7 @@ enum Command {
     ///   Host *.roomler
     ///     ProxyCommand roomler proxy %h %p
     ///
-    ///   scp report.pdf corplap-01.roomler:/tmp/
+    ///   scp report.pdf corplap-3.roomler:/tmp/
     ///
     /// Transport and name resolution only: `ProxyCommand` cannot supply an
     /// identity or a host key, so this uses keys YOU manage. For a

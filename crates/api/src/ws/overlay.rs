@@ -2457,7 +2457,7 @@ mod tests {
     /// instead of the row vanishing, which is what a `removes` delta did.
     #[test]
     fn leave_upsert_is_the_same_row_marked_unreachable() {
-        let n = node("corplap-01-wsl", "100.64.0.7");
+        let n = node("corplap-3-wsl", "100.64.0.7");
         let peer = to_netmap_peer(&n, false);
 
         assert!(
@@ -2468,7 +2468,7 @@ mod tests {
         // already holds and the delta silently creates a duplicate/no-op.
         assert_eq!(peer.node_id, n.id.unwrap());
         assert_eq!(peer.overlay_ip, "100.64.0.7");
-        assert_eq!(peer.name, "corplap-01-wsl");
+        assert_eq!(peer.name, "corplap-3-wsl");
         assert_eq!(peer.wg_public_key, "cHVia2V5");
     }
 

@@ -2056,7 +2056,7 @@ pub struct NetmapPeer {
     /// back to the presence rules whenever this is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caps: Option<CapVectorWire>,
-    /// Dialer honesty (field 2026-08-16, CORPLAP-01) — can this peer
+    /// Dialer honesty (field 2026-08-16, CORPLAP-3) — can this peer
     /// raw-UDP-dial ARBITRARY high ports (the single-relay DIALER's job:
     /// its raw socket sends straight to a coturn relay-band port)? A srflx
     /// candidate only proves UDP to WELL-KNOWN ports (a corp egress that

@@ -256,7 +256,7 @@ pub fn par_convert_enabled() -> bool {
 /// run IDR-thrifty — the idle-settle keyframe is suppressed (on a reliable
 /// ordered DC it is a quality refresh, not a correctness need; the
 /// request-driven resync stays) and deferred bitrate applies are spaced
-/// (see [`relay_deferred_apply_allowed`]). Field (CLK, 2026-08-27): each
+/// (see [`relay_deferred_apply_allowed`]). Field (CORPLAP-3, 2026-08-27): each
 /// such IDR was a single ~300 KB frame ≈ 1.2–1.5 s of a ~2 Mbps relay —
 /// the "bulky" lumps. `0` restores the previous relay behaviour. Hatch:
 /// `ROOMLER_AGENT_RELAY_IDR_THRIFT=0` / config `relay_idr_thrift`.

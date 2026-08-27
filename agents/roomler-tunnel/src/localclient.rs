@@ -466,7 +466,7 @@ async fn run_remote(node: &str, shell: &str, command: &str, timeout_ms: u64) -> 
 /// Resolve a roomler device NAME to its overlay address (P6c).
 ///
 /// Case-insensitive, matching the server's `resolve_exec_target`, because
-/// device names are display strings and nobody types `CORPLAP-01`.
+/// device names are display strings and nobody types `CORPLAP-3`.
 /// `Ok(None)` = no such peer — the caller must report that rather than dial
 /// something arbitrary.
 pub async fn resolve_overlay_ip(name: &str) -> Result<Option<String>> {

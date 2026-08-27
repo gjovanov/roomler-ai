@@ -41,7 +41,7 @@ try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 -Uri '$RAW' -OutFile 'C:
 # so every cross-host comparison — "who lost the path first", "did the far end
 # recover before we convicted" — is meaningless without it.
 #
-# This is not hypothetical. Measured 2026-08-25: pc50045 sat **21.4 s behind**
+# This is not hypothetical. Measured 2026-08-25: CORPLAP-1 sat **21.4 s behind**
 # the dev box, stable across three samples. That skew alone manufactured a
 # reading in which the laptop appeared to still be reaching the dev box while
 # the dev box's own carrier had gone one-way — an impossible pair of facts that

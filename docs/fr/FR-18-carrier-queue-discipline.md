@@ -13,8 +13,8 @@ loopback and its LAN address, then probed from each VPN host over Fleet RPC.
 
 | host | VPN client | LAN route | result |
 |---|---|---|---|
-| CLK00017265 | Cisco AnyConnect | `192.168.68.0/24 → 10.138.80.1` (VPN gw) **metric 1**, beating the on-link WLAN route at metric 256 | unreachable — every LAN target, including the router |
-| PC50045 | Check Point Endpoint | clean: only the on-link WLAN route | reachable on paper, **times out in practice** |
+| CORPLAP-3 | Cisco AnyConnect | `192.168.68.0/24 → 10.138.80.1` (VPN gw) **metric 1**, beating the on-link WLAN route at metric 256 | unreachable — every LAN target, including the router |
+| CORPLAP-1 | Check Point Endpoint | clean: only the on-link WLAN route | reachable on paper, **times out in practice** |
 
 The listener recorded only neo16's own two self-tests; neither VPN host ever arrived.
 neo16 holds live ARP entries for both machines (`192.168.68.106`, `.119`), so L2 is fine
@@ -37,8 +37,8 @@ A video frame crosses three stacked buffers on its way out, and the first two ar
 | kernel TCP send buffer on the DERP WS (no `SO_SNDBUF` cap) | autotuned, often MBs | 0.5–2 s |
 | SCTP reliable+ordered queue above (FR-17 #799) | unbounded | seconds under loss |
 
-Measured consequence: `send_wait_max_ms` of **10 263 ms** on PC50045 (hevc_qsv), 4 740
-(vp9_qsv), 1 870 (h264_qsv), 907 on CLK (av1_qsv) — the time ONE frame spent inside the
+Measured consequence: `send_wait_max_ms` of **10 263 ms** on CORPLAP-1 (hevc_qsv), 4 740
+(vp9_qsv), 1 870 (h264_qsv), 907 on CORPLAP-3 (av1_qsv) — the time ONE frame spent inside the
 DataChannel send call, while encode ran 8–12 ms and our own `bytes_inflight` held tens
 of KB. The agent is healthy; it cannot hand bytes to the wire.
 
@@ -83,7 +83,7 @@ are.
 
 ## Acceptance criteria
 
-- [ ] On the pc50045 ↔ CLK relay pair under drag: `send_wait` p99 < 250 ms
+- [ ] On the CORPLAP-1 ↔ CORPLAP-3 relay pair under drag: `send_wait` p99 < 250 ms
       (was: 10 263 ms max) and no `send_wait` sample above 1 s.
 - [ ] `dropped_stale` becomes non-zero under load while delivered fps does NOT fall —
       shedding stale frames must replace waiting, not replace delivery.
@@ -99,4 +99,4 @@ are.
 | date | build | result |
 |---|---|---|
 | 2026-08-27 | 0.4.9 | LAN-relay test negative (above); baseline `send_wait` numbers recorded; FR filed. |
-| 2026-08-28 | 0.4.10 | **Partial pass.** Operator: "it works much much smoother now." Same host, same pair, split by emitting version: CLK `send_wait` **p99 2 995 → 200 ms**, max 7 826 → 1 778 ms, p50 unchanged (0.158 → 0.164 — the gate costs nothing at steady state), viewer age max 4 087 → 2 185 ms, skips 2 → 58 (the intended trade). PC50045 on 0.4.10: `send_wait` max 1.66 ms. **Not closed**: max is still 1 778 ms (target: no sample > 1 s) and age excursions are still multi-second; residual belongs to the layers this FR does not touch (SCTP HOL, FR-17 #799) plus the FR-15 floor bug, observed live here as `viewer_age_floor_ms = 2` on a 44 ms-per-leg path. ⚠️ `dropped_stale` could NOT be evaluated — the counter was added without a reader (`stale_drops()` has no consumers); that instrumentation gap must close before the shed-vs-deliver criterion means anything. |
+| 2026-08-28 | 0.4.10 | **Partial pass.** Operator: "it works much much smoother now." Same host, same pair, split by emitting version: CORPLAP-3 `send_wait` **p99 2 995 → 200 ms**, max 7 826 → 1 778 ms, p50 unchanged (0.158 → 0.164 — the gate costs nothing at steady state), viewer age max 4 087 → 2 185 ms, skips 2 → 58 (the intended trade). CORPLAP-1 on 0.4.10: `send_wait` max 1.66 ms. **Not closed**: max is still 1 778 ms (target: no sample > 1 s) and age excursions are still multi-second; residual belongs to the layers this FR does not touch (SCTP HOL, FR-17 #799) plus the FR-15 floor bug, observed live here as `viewer_age_floor_ms = 2` on a 44 ms-per-leg path. ⚠️ `dropped_stale` could NOT be evaluated — the counter was added without a reader (`stale_drops()` has no consumers); that instrumentation gap must close before the shed-vs-deliver criterion means anything. |

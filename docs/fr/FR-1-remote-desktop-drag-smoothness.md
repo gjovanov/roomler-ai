@@ -68,9 +68,9 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 - [x] AIMD tops out just under the measured pipe on direct (no more 15 M restarts /
       floor visits in steady state)
 - [x] Field: direct drag "definitively faster" (rc.483) and "much better" (0.4.x,
-      verified from neo16, pc50045 AND the MacBook viewing Rozalina)
-- [x] Relay unaffected vs rc.483 (0.4.3 gating; regression caught same-day on CLK +
-      PC55331 and reverted)
+      verified from neo16, CORPLAP-1 AND the MacBook viewing Rozalina)
+- [x] Relay unaffected vs rc.483 (0.4.3 gating; regression caught same-day on CORPLAP-3 +
+      CORPLAP-2 and reverted)
 - [ ] P5: ≥45 fps at 2880×1800 on Iris-Xe-class with even cadence (WGC drop ratio no
       longer ~33 % random; `avg_encode_ms` ≤ ~17 at native)
 - [ ] P6: pointer send rate independent of viewer rAF load
@@ -98,7 +98,7 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 | Release | Result |
 |---|---|
 | rc.483 (P1+P4) | "definitively feels faster movement, but still bulky in several ms chunks/steps" — the byte gate converting queue-lag into skips against the still-unmeasured overrun |
-| rc.484 (P2+P3) | ROZALINA direct = better; CLK + PC55331 over corp relay = WORSE than rc.483 (both mechanisms relay-hostile — see relay note) |
-| 0.4.3 (relay gating) | Rozalina "much better now", verified from neo16, pc50045 and MacBook; relay reverted to rc.483 posture (re-test pending) |
+| rc.484 (P2+P3) | ROZALINA direct = better; CORPLAP-3 + CORPLAP-2 over corp relay = WORSE than rc.483 (both mechanisms relay-hostile — see relay note) |
+| 0.4.3 (relay gating) | Rozalina "much better now", verified from neo16, CORPLAP-1 and MacBook; relay reverted to rc.483 posture (re-test pending) |
 | 0.4.4 (P5) | **field PASS 2026-08-27**: "Rozalina's screen works nicely now" (direct); relay pairs handled by FR-10 (0.4.5, its own field PASS) |
-| 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (ROZALINA ≈ 40–70 ms direct; CLK-from-neo16 ≈ 120–180 ms relay; pc50045 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |
+| 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (ROZALINA ≈ 40–70 ms direct; CORPLAP-3-from-neo16 ≈ 120–180 ms relay; CORPLAP-1 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |

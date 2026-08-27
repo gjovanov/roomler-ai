@@ -335,7 +335,7 @@ pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
 ///
 /// ⚠ rc.442 shipped this at 75 % to bound the refine IDR's relay transit
 /// (the crystallize-latency lever) and rc.443 REVERTED it the same day:
-/// field 2026-08-21, corplap-01 (Iris Xe) — the FIRST session whose
+/// field 2026-08-21, corplap-3 (Iris Xe) — the FIRST session whose
 /// av1_qsv ran with a sub-1× window died on its first settle IDR with
 /// `send_frame: Invalid data found when processing input` (a quality-
 /// floored native AV1 IDR is ~2 Mbit, larger than the whole 1.5 Mbit
@@ -873,7 +873,7 @@ impl IdleRefine {
     }
 
     /// A QUIET tick: an idle keepalive, OR a real frame that neither
-    /// significance leg noted (field corplap-01, 2026-08-21: GDI/scrap-
+    /// significance leg noted (field corplap-3, 2026-08-21: GDI/scrap-
     /// class backends return a "real" frame on EVERY poll — `frames_empty=0`
     /// — so the keepalive arm never ran and refine was structurally inert;
     /// judging quiet by the SIGNAL — 48-byte encodes of a still screen —
@@ -1799,7 +1799,7 @@ mod tests {
 
     #[test]
     fn quiet_ticks_from_insignificant_frames_refine_an_always_some_backend() {
-        // Field corplap-01: the capture returns a "real" frame on every
+        // Field corplap-3: the capture returns a "real" frame on every
         // poll, so the keepalive arm never runs. The pump now feeds
         // on_keepalive after every insignificant frame — a stream of
         // 48-byte still-screen re-encodes must reach Up purely through

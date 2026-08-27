@@ -1,5 +1,5 @@
 //! Dialer honesty — process-wide "can this HOST raw-UDP-dial relay-band
-//! ports?" latch (field 2026-08-16, CORPLAP-01).
+//! ports?" latch (field 2026-08-16, CORPLAP-3).
 //!
 //! A srflx candidate only proves UDP reached a WELL-KNOWN port (STUN:3478);
 //! a corp egress that whitelists STUN still drops the coturn relay band

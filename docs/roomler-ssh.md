@@ -12,7 +12,7 @@ audit log, host-key verification, the `roomler ssh` / `roomler proxy` clients,
 SFTP/scp, port forwarding, the device-reported session-activity log, and the
 admin UI for all of it.
 
-**Field-proven on `corplap-01`** (a corp-managed laptop with no `sshd`, all
+**Field-proven on `corplap-3`** (a corp-managed laptop with no `sshd`, all
 three firewall profiles enabled, and WSL holding loopback `:22`): a session
 opened through the full gate chain returns `orfnet\extjovanov` — the signed-in
 domain user — with **no listener bound on the SSH port** and no firewall rule
@@ -34,7 +34,7 @@ the fleet on 2026-08-19, by actually binding those addresses:
 |---|---|---|
 | buildhost / fleet-host-2 / fleet-host-1 | **EADDRINUSE**, on *both* orgs' addresses | `sshd` holds `0.0.0.0:22`, which covers every local address |
 | devbox | **EADDRINUSE** | `sshd` is bound to `100.65.4.2:22` — the overlay address itself |
-| corplap-01 | free, but useless | no `sshd` at all (`OpenSSH.Server` capability is `NotPresent`, corp-managed), WSL's `wslrelay` holds loopback `:22`, and all three firewall profiles are enabled so a new listener needs a rule an ordinary user cannot add |
+| corplap-3 | free, but useless | no `sshd` at all (`OpenSSH.Server` capability is `NotPresent`, corp-managed), WSL's `wslrelay` holds loopback `:22`, and all three firewall profiles are enabled so a new listener needs a rule an ordinary user cannot add |
 | winhost-a / winhost-b | free | `sshd` installed but `Stopped/Manual` |
 
 On four of seven hosts a bound socket is impossible. So roomler takes the
@@ -639,7 +639,7 @@ is the row an operator is usually hunting for.
 Host *.roomler
   ProxyCommand roomler proxy %h %p
 
-scp report.pdf corplap-01.roomler:/tmp/
+scp report.pdf corplap-3.roomler:/tmp/
 ```
 
 Resolves a device **name** to its overlay address and pipes stdio. A literal

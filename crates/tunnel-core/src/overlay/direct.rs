@@ -1233,7 +1233,7 @@ pub fn warm_relay_enabled() -> bool {
 /// R2 (corp-laptop program) — rescue the srflx gather via the wildcard
 /// PUBLIC-DIAL socket when every LAN-bound vantage yields nothing
 /// (`ROOMLER_NODE_OVERLAY_VPN_VANTAGE`; default **ON**). A full-tunnel
-/// endpoint VPN (field 2026-08-15: corplap-01, Cisco AnyConnect with
+/// endpoint VPN (field 2026-08-15: corplap-3, Cisco AnyConnect with
 /// local-LAN access disabled) filters the physical NICs BOTH directions
 /// while the tunnel itself passes UDP — so the LAN-bound socks are dead but
 /// the UNSPECIFIED-bound public dialer (routed via the captured default =
@@ -1672,7 +1672,7 @@ fn epoch_ms_now() -> u64 {
 ///
 /// | pair | before | after |
 /// |---|---|---|
-/// | neo16 ↔ pc50045 | 80 probe failures, all `saw_inbound=false`; relay 108 ms | direct, **6.7 ms** |
+/// | neo16 ↔ CORPLAP-1 | 80 probe failures, all `saw_inbound=false`; relay 108 ms | direct, **6.7 ms** |
 /// | neo16 ↔ MacBook | relay, 113 ms avg | direct, **4 ms** floor |
 ///
 /// The `false` value remains the kill switch, per this crate's convention for

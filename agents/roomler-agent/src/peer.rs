@@ -662,7 +662,7 @@ impl AgentPeer {
         // forwarded with no record, so "which candidates did this host
         // actually produce?" could only be answered from the far end's
         // `chrome://webrtc-internals` — and only if a browser was involved at
-        // all. Field 2026-08-02 (CORPLAP-01, Cisco AnyConnect full tunnel):
+        // all. Field 2026-08-02 (CORPLAP-3, Cisco AnyConnect full tunnel):
         // the agent contributed ONLY an overlay host candidate and a relay —
         // no srflx — even though a hand-run STUN Binding from its VPN adapter
         // reached coturn fine (40-byte reply). Nothing in the log could say
@@ -4308,7 +4308,7 @@ async fn media_pump_ffmpeg_dc(
     let mut last_paced_logged: Option<Option<u32>> = None;
     // FR-10 — relay IDR thrift: suppress settle-IDRs and space deferred
     // applies on constrained sessions (each such IDR was a 1.2-1.5 s lump
-    // on CLK's ~2 Mbps relay).
+    // on CORPLAP-3's ~2 Mbps relay).
     let relay_idr_thrift = crate::encode::relay_idr_thrift_enabled();
     let mut last_deferred_apply_at: Option<std::time::Instant> = None;
     let mut settle_kf_suppressed: u64 = 0;
@@ -4733,8 +4733,8 @@ async fn media_pump_ffmpeg_dc(
                 // rc.445 — congestion here means motion almost surely;
                 // rebuild-bound encoders swap in the background (P3,
                 // DIRECT only — on a relay a swap's IDR is a multi-second
-                // lump through the thin pipe; field 2026-08-27, CLK +
-                // PC55331 got WORSE) or defer (see `deferred_bps`).
+                // lump through the thin pipe; field 2026-08-27, CORPLAP-3 +
+                // CORPLAP-2 got WORSE) or defer (see `deferred_bps`).
                 if enc.supports_dynamic_bitrate() {
                     enc.set_bitrate(applied.bps);
                 } else if bg_rebuild && !constrained {
@@ -4785,7 +4785,7 @@ async fn media_pump_ffmpeg_dc(
         let mut area_judged = false;
         // Did EITHER significance leg count this frame as motion? A real
         // frame that stays false is QUIET EVIDENCE and feeds the refine
-        // up-flip tick post-encode (field corplap-01: GDI/scrap-class
+        // up-flip tick post-encode (field corplap-3: GDI/scrap-class
         // backends return a frame on EVERY poll — frames_empty=0 — so the
         // keepalive arm never ran and refine was structurally inert).
         let mut frame_significant = false;
@@ -5300,8 +5300,8 @@ async fn media_pump_ffmpeg_dc(
             // background swap so rate moves land DURING motion with zero
             // stall; NVENC still reconfigures in place. DIRECT only:
             // each adoption ships a fresh IDR, which on a ~2 Mbps relay
-            // is a multi-second lump mid-motion (field 2026-08-27, CLK +
-            // PC55331 over the corp relay felt WORSE than the rc.483
+            // is a multi-second lump mid-motion (field 2026-08-27, CORPLAP-3 +
+            // CORPLAP-2 over the corp relay felt WORSE than the rc.483
             // defer) — relay keeps the rc.445 motion-defer below, the
             // posture that was field-proven there. Also the fallback
             // with the hatch off.
@@ -5331,7 +5331,7 @@ async fn media_pump_ffmpeg_dc(
         {
             // FR-10 — relay IDR thrift: each flush is a re-open whose first
             // frame is an IDR — a single ~300 KB frame ≈ 1.2-1.5 s of a
-            // ~2 Mbps relay (field CLK 2026-08-27). Thrifty constrained
+            // ~2 Mbps relay (field CORPLAP-3 2026-08-27). Thrifty constrained
             // sessions space small moves to ≥15 s; a ≥40 % move (genuine
             // collapse/recovery) still lands promptly. Held targets stay in
             // `deferred_bps` and re-evaluate every loop.
@@ -5474,7 +5474,7 @@ async fn media_pump_ffmpeg_dc(
         }
         // QUIET tick — a real frame neither leg counted is stillness
         // evidence (a 48-byte re-encode of an unchanged screen). Field
-        // corplap-01 2026-08-21: its GDI/scrap-class capture returns a
+        // corplap-3 2026-08-21: its GDI/scrap-class capture returns a
         // frame on EVERY poll (frames_empty=0), the keepalive arm never
         // ran, and refine was structurally inert. Judging quiet by the
         // SIGNAL instead of capture cadence fixes that class — and lets

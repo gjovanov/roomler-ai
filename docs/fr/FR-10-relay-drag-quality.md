@@ -6,12 +6,12 @@ gated the direct-path rate machinery off relay and left goodput observe-only the
 
 ## Goal
 
-Window-drag over a RELAY session (corp-VPN hosts: CLK, PC55331) should feel as smooth
+Window-drag over a RELAY session (corp-VPN hosts: CORPLAP-3, CORPLAP-2) should feel as smooth
 as the pipe's physics allow — no multi-second "lumps" — while keeping the crisp-text
-properties of the direct path. Field read (2026-08-27, neo16 → CLK on 0.4.x): direct
-paths are "nice"; CLK via relay is "slightly bulky".
+properties of the direct path. Field read (2026-08-27, neo16 → CORPLAP-3 on 0.4.x): direct
+paths are "nice"; CORPLAP-3 via relay is "slightly bulky".
 
-## Root cause (from CLK's own heartbeats, session `6a9021e6…`, 11:39–11:40Z)
+## Root cause (from CORPLAP-3's own heartbeats, session `6a9021e6…`, 11:39–11:40Z)
 
 av1_qsv 1920×1200@30, relay RTT 88–105 ms, target ≈ pipe (~1.5–2 Mbps delivered):
 
@@ -60,7 +60,7 @@ direct path entirely, and every FR-1 mechanism.
 - [x] Relay drag session heartbeats: `bytes_inflight` spikes >150 KB only for
       requested resyncs; zero `idle-settle keyframe` lines while constrained
       (counter climbing instead); ≤1 `deferred bitrate applied` per 15 s
-- [x] Field: CLK-from-neo16 drag no longer "bulky" (or clearly reduced); post-motion
+- [x] Field: CORPLAP-3-from-neo16 drag no longer "bulky" (or clearly reduced); post-motion
       text still crystallises within ~1–2 s via deltas
 - [x] Direct sessions byte-identical in behaviour (settle IDRs still fire there)
 - [ ] `relay_idr_thrift=0` restores the previous relay behaviour
@@ -81,4 +81,4 @@ direct path entirely, and every FR-1 mechanism.
 
 | Release | Result |
 |---|---|
-| 0.4.5 (relay_idr_thrift) | ✅ FIELD PASS: CLK-from-neo16 "very smooth now". PC50045→CLK session measured post-fix: agent EXONERATED (max inflight 36 KB vs 334 KB pre-fix, send_wait ≤0.38 ms, zero skips, thrift active, no viewer-rate struggle) — the residual "a bit sluggish" there is 98–164 ms DERP RTT with BOTH endpoints corp-VPN d (pair cannot go direct; input-to-photon ≈ 250–350 ms is path physics, out of scope per spec) |
+| 0.4.5 (relay_idr_thrift) | ✅ FIELD PASS: CORPLAP-3-from-neo16 "very smooth now". CORPLAP-1→CORPLAP-3 session measured post-fix: agent EXONERATED (max inflight 36 KB vs 334 KB pre-fix, send_wait ≤0.38 ms, zero skips, thrift active, no viewer-rate struggle) — the residual "a bit sluggish" there is 98–164 ms DERP RTT with BOTH endpoints corp-VPN d (pair cannot go direct; input-to-photon ≈ 250–350 ms is path physics, out of scope per spec) |

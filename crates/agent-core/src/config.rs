@@ -361,7 +361,7 @@ pub struct AgentConfig {
     /// R2 — srflx gather falls back to the wildcard public-dial socket when
     /// every LAN-bound vantage is dead (full-tunnel VPN rescue: AnyConnect-
     /// class clients filter the physical NICs while the tunnel passes UDP;
-    /// field corplap-01 2026-08-15). Built-in default: on
+    /// field corplap-3 2026-08-15). Built-in default: on
     /// (`ROOMLER_NODE_OVERLAY_VPN_VANTAGE`).
     #[serde(default)]
     pub overlay_vpn_vantage: Option<bool>,
@@ -706,7 +706,7 @@ pub struct AgentConfig {
     /// a correctness need on a reliable DC — the request-driven resync
     /// stays) and space deferred bitrate re-opens to ≥15 s unless the
     /// move is ≥40 % — each such IDR was a single ~300 KB frame ≈
-    /// 1.2–1.5 s of a ~2 Mbps relay (the CLK "bulky" lumps). `false`
+    /// 1.2–1.5 s of a ~2 Mbps relay (the CORPLAP-3 "bulky" lumps). `false`
     /// restores the previous relay behaviour. Direct sessions unaffected.
     #[serde(default)]
     pub relay_idr_thrift: Option<bool>,

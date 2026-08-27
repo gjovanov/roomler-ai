@@ -1287,7 +1287,7 @@ impl CarrierPlane {
             // R2 — full-tunnel rescue: every LAN-bound sock came up empty for
             // this vantage. The UNSPECIFIED public dialer egresses via the
             // captured default route (the tunnel), which on AnyConnect-class
-            // hosts is the ONLY path that passes UDP (field corplap-01
+            // hosts is the ONLY path that passes UDP (field corplap-3
             // 2026-08-15: physical NICs filtered both directions, tunnel UDP
             // fine — srflx sat at NONE because nothing ever asked the one
             // socket that could answer). Outside the per-server budget above
@@ -1851,7 +1851,7 @@ mod tests {
     /// wildcard public-dial socket (which the OS routes via the captured
     /// default = the VPN tunnel) can reach STUN, the gather promotes ITS
     /// mapping instead of reporting NONE, and attributes it. Field
-    /// corplap-01 2026-08-15: AnyConnect filtered the physical NICs both
+    /// corplap-3 2026-08-15: AnyConnect filtered the physical NICs both
     /// directions while the ORF tunnel passed UDP fine — srflx sat at NONE
     /// purely because the gather never asked the one socket that could
     /// answer. The fake STUN server here ignores the "LAN" sock (the

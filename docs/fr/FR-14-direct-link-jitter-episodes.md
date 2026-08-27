@@ -12,9 +12,9 @@ roaming) alternates between two bad states: **lag lumps** (a send stall arrives
 while the pipe is full at nominal rate) and **blur phases** (the rate controller
 crashes to the area floor and takes ~70 s to climb back). Steady links don't see
 either; relay links are already protected (FR-10). The user-felt verdict on the
-reference pair: "pc50045's screen from neo16 is a bit sluggish".
+reference pair: "CORPLAP-1's screen from neo16 is a bit sluggish".
 
-## Evidence (2026-08-27, pc50045 as agent, neo16 viewing, direct profile 1920×1200@60, hevc_qsv)
+## Evidence (2026-08-27, CORPLAP-1 as agent, neo16 viewing, direct profile 1920×1200@60, hevc_qsv)
 
 From `agent_logs` FFmpeg-pump heartbeats (2 s windows), hour-bucketed:
 
@@ -62,11 +62,11 @@ the lump), and they compose.
 
 ## Acceptance criteria
 
-- [ ] On a VPN-churning direct pair (pc50045-class), `target_bps` never crashes
+- [ ] On a VPN-churning direct pair (CORPLAP-1-class), `target_bps` never crashes
       to the area floor during a 30-min drag session (no min=floor heartbeat
       windows like 12:00Z above).
 - [ ] `bytes_inflight` p99 < 80 KB on that pair (was: max 164 KB).
-- [ ] Field: dragging on pc50045-from-neo16 *during* VPN churn shows no
+- [ ] Field: dragging on CORPLAP-1-from-neo16 *during* VPN churn shows no
       multi-hundred-ms lumps.
 - [ ] Relay/constrained behaviour byte-identical (everything gated
       `!constrained`).

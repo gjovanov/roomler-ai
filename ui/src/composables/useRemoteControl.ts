@@ -1739,7 +1739,7 @@ export interface AutoTransportInputs {
    *  Extensions) makes MC report supported+smooth while WebCodecs still
    *  refuses `hev1`, so the rank picked a transport whose worker then
    *  failed `configure()` — a black session the watchdog re-picked
-   *  forever (field: CLK, 2026-08-25). Same shape as P2's
+   *  forever (field: CORPLAP-3, 2026-08-25). Same shape as P2's
    *  `viewerH264Hw = MC && accepted avc1 config`. */
   viewerHevcDecodable: boolean
   viewerVp9Hw: boolean

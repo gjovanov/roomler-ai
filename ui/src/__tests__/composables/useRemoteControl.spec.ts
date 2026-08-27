@@ -2510,7 +2510,7 @@ describe('pickAutoTransport (rc.190 HW×HW codec auto-rank)', () => {
     expect(r.transport).toBe('data-channel-hevc')
   })
 
-  // THE CLK case (Edge, 2026-08-25): MediaCapabilities reports HEVC as
+  // THE CORPLAP-3 case (Edge, 2026-08-25): MediaCapabilities reports HEVC as
   // hardware-smooth (Edge's platform pipeline has HEVC Video Extensions)
   // while WebCodecs refuses `hev1` — the contract the DC worker actually
   // configures against. The rank picked HEVC, configure() failed, the

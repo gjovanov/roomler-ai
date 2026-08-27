@@ -9,17 +9,17 @@ Prod `agent_logs`, 2026-08-27, both hosts on 0.4.9, 1920×1200@30 over a DERP re
 
 | host | encoder | `send_wait_max_ms` | `bytes_inflight` max | `avg_encode_ms` |
 |---|---|---|---|---|
-| PC50045 | hevc_qsv | **10 263** | 38 011 | 8–10 |
-| PC50045 | vp9_qsv | **4 740** | 71 517 | 12–18 |
-| PC50045 | h264_qsv | 1 870 | 3 800 | 9–12 |
-| CLK00017265 | av1_qsv | 907 | 43 170 | 12 |
+| CORPLAP-1 | hevc_qsv | **10 263** | 38 011 | 8–10 |
+| CORPLAP-1 | vp9_qsv | **4 740** | 71 517 | 12–18 |
+| CORPLAP-1 | h264_qsv | 1 870 | 3 800 | 9–12 |
+| CORPLAP-3 | av1_qsv | 907 | 43 170 | 12 |
 
 `send_wait` is the time a SINGLE frame spent inside the DataChannel send call — not
 queued in our channel, not waiting on the encoder. Ten seconds. Encode was 8–12 ms and
 our own queue held tens of KB throughout: **the agent is healthy and simply cannot hand
 bytes to the wire.**
 
-The contrast that sizes the prize: the same PC50045 on a **direct** carrier the same
+The contrast that sizes the prize: the same CORPLAP-1 on a **direct** carrier the same
 afternoon ran 1920×1200@**60** at 12 Mbps with a **7 ms** end-to-end age.
 
 ## Root cause
@@ -71,7 +71,7 @@ what makes the reassembler independent of that assumption.
 
 - [ ] Stage A ships with the assembler proving gap detection on a synthetic gap, and
       byte-identical behaviour on the wire otherwise.
-- [ ] On the pc50045 ↔ CLK relay pair under FR-16's deterministic fast-motion profile:
+- [ ] On the CORPLAP-1 ↔ CORPLAP-3 relay pair under FR-16's deterministic fast-motion profile:
       `send_wait` p99 drops below 250 ms (was: 10 263 ms max), and age p99 drops below
       300 ms.
 - [ ] No IDR-storm regression: keyframe rate under sustained loss stays bounded, and

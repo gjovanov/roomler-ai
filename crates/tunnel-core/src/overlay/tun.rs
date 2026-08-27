@@ -448,7 +448,7 @@ mod system {
         /// rc.288 — a metric mismatch is fixed **IN PLACE** via
         /// `SetIpForwardEntry2`, NOT delete-then-re-add. The delete opened a
         /// window with NO route for the prefix, and on a host whose corp VPN
-        /// runs a route monitor that window is fatal: CORPLAP-01 (AnyConnect)
+        /// runs a route monitor that window is fatal: CORPLAP-3 (AnyConnect)
         /// came back from the rc.287 update with **no `/32` at all** for any
         /// peer — ours never got re-added and Cisco withdrew its mirrors once
         /// ours vanished — so every peer fell through to Cisco's captured
@@ -484,7 +484,7 @@ mod system {
         /// write.
         ///
         /// rc.291 — this fires for EVERY metric, not just 0. Field
-        /// (CORPLAP-01 / Cisco AnyConnect, 2026-08-02): `New-NetRoute`
+        /// (CORPLAP-3 / Cisco AnyConnect, 2026-08-02): `New-NetRoute`
         /// succeeds and the row is gone within ~1 s, for both a v4 `/32` and a
         /// v6 `/128`. The agent's own adds meet the same fate, and because
         /// `add_peer_route`'s result is `.ok()`d by the caller, the host
@@ -586,7 +586,7 @@ mod system {
         /// rc.287 — eviction-WARN throttle state. The rc.279 WARN assumed a
         /// competitor re-adds at most once per VPN connect ("self-limiting");
         /// Cisco AnyConnect's route monitor re-adds within MILLISECONDS of
-        /// every deletion (CORPLAP-01, 2026-08-01: 25,197 WARNs in one day).
+        /// every deletion (CORPLAP-3, 2026-08-01: 25,197 WARNs in one day).
         /// Emit at most one WARN per prefix per minute, carrying the count of
         /// evictions suppressed since the last one — the war stays visible,
         /// the log stays readable.
@@ -725,7 +725,7 @@ mod system {
         /// **/24s** (plus broadcast /32s and learned per-flow host routes):
         /// prefixes we never defended, out-prefixing the /22 floor for any
         /// destination without a /32 winner, steering overlay traffic into
-        /// the corp gateway where it dies (field: CORPLAP-01, four peers
+        /// the corp gateway where it dies (field: CORPLAP-3, four peers
         /// unreachable while their carriers ran). Same kill-switch
         /// (`overlay_route_evict`) and the same WARN-on-actual-deletion
         /// contract; the CALLER gates on `floor_safe` so a CGNAT uplink
@@ -1687,7 +1687,7 @@ mod system {
     /// `overlay_route_metric0`).
     ///
     /// **rc.289: default flipped to OFF.** Field result on the only host that
-    /// motivated it (CORPLAP-01, Cisco AnyConnect): the VPN's route monitor
+    /// motivated it (CORPLAP-3, Cisco AnyConnect): the VPN's route monitor
     /// DELETES any route of ours that would out-rank its own, so metric 0
     /// bought nothing there — and left the prefix unrouted, which broke even
     /// INBOUND replies (remote support into the host stopped working). No
@@ -1703,7 +1703,7 @@ mod system {
     /// 1 — a FULL tie against our metric-1 rows that Windows breaks in
     /// Cisco's favor (lower ifIndex), and its route monitor re-adds within
     /// milliseconds of an eviction, so the 2 s guard can never hold the FIB
-    /// (CORPLAP-01, 2026-08-01: 25,197 evictions in one day; node-initiated
+    /// (CORPLAP-3, 2026-08-01: 25,197 evictions in one day; node-initiated
     /// egress 100 % captured while REPLIES escaped via strong-host
     /// source-constrained routing). Metric 0 wins outright (0+1 < 1+1): no
     /// tie-break, no deletion race. Inert on hosts with no competing routes.
@@ -2458,7 +2458,7 @@ mod system {
                 // prefix — and AnyConnect mirrors the whole /10 at effective
                 // metric 2 while our connected route sits at 257, so the
                 // fall-through lands in the corp tunnel. That is exactly how
-                // CORPLAP-01 looked after rc.287: no /32 anywhere, every
+                // CORPLAP-3 looked after rc.287: no /32 anywhere, every
                 // peer resolving to Cisco's /10. Metric 0 makes the overlay
                 // win the fall-through too; gate-off restores 256.
                 if let Some((net, plen)) = self.connected_v4 {

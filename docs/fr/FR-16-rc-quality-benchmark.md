@@ -13,15 +13,15 @@ argued from one person's impression of one drag.
 
 ## Why the current method cannot answer the question
 
-Field session 2026-08-27, six machines on ONE desk sharing one Wi-Fi (neo16, CLK[vpn],
-pc50045[vpn], pc55331, MacBook, ROZALINA), operator driving each pair by hand:
+Field session 2026-08-27, six machines on ONE desk sharing one Wi-Fi (neo16, CORPLAP-3[vpn],
+CORPLAP-1[vpn], CORPLAP-2, MacBook, ROZALINA), operator driving each pair by hand:
 
 | pair | result |
 |---|---|
-| neo16 → CLK | fine |
-| pc50045 → CLK | 60 ms baseline, 600+ ms spikes |
-| pc50045 → ROZALINA | 1–2 s frozen at drag start, then ~80 ms, "not smooth" |
-| MacBook → pc50045 (H.265) | **20 000+ ms**; VP9 HW better but still sluggish |
+| neo16 → CORPLAP-3 | fine |
+| CORPLAP-1 → CORPLAP-3 | 60 ms baseline, 600+ ms spikes |
+| CORPLAP-1 → ROZALINA | 1–2 s frozen at drag start, then ~80 ms, "not smooth" |
+| MacBook → CORPLAP-1 (H.265) | **20 000+ ms**; VP9 HW better but still sluggish |
 
 Three properties of that data make hand-testing structurally unable to compare cells:
 
@@ -85,7 +85,7 @@ ranked table and a regression gate rather than a wall of numbers.
       encoder cost table, including a host where an advertised HW encoder actually
       falls back (proving the check can fail).
 - [ ] L2 produces an N×N pair matrix with carrier + RTT + goodput.
-- [ ] L3 reproduces a known-bad cell (MacBook → pc50045 H.265) and a known-good cell
+- [ ] L3 reproduces a known-bad cell (MacBook → CORPLAP-1 H.265) and a known-good cell
       (a direct pair) with scores on opposite ends of the ladder — the harness must
       first REPRODUCE the field results, or it is measuring something else.
 - [ ] Two consecutive runs of the same cell agree within a stated tolerance
