@@ -3,6 +3,36 @@
     <div class="d-flex align-center flex-wrap ga-2 mb-2 mb-md-4">
       <h2 class="text-h5">Invite Links</h2>
       <v-spacer />
+      <!-- FR-11: server-side search over code / target email + status filter. -->
+      <v-text-field
+        v-model="gridSearch"
+        density="compact"
+        hide-details
+        clearable
+        prepend-inner-icon="mdi-magnify"
+        placeholder="Search code or email"
+        style="max-width: 220px"
+        class="flex-grow-0"
+      />
+      <v-select
+        v-model="gridStatus"
+        :items="statusOptions"
+        density="compact"
+        hide-details
+        clearable
+        placeholder="Status"
+        style="max-width: 150px"
+        class="flex-grow-0"
+      />
+      <v-btn
+        icon="mdi-table-cog"
+        size="small"
+        variant="text"
+        :color="colsCustomized ? 'primary' : undefined"
+        title="Configure columns"
+        aria-label="Configure columns"
+        @click="colDialogOpen = true"
+      />
       <v-btn
         variant="outlined"
         color="primary"
@@ -22,11 +52,19 @@
     </v-alert>
 
     <v-card>
-      <v-data-table-virtual
-            :headers="headers"
-            :items="inviteStore.invites"
-            :loading="inviteStore.loading"
-          >
+      <v-data-table-server
+        v-model:page="gridPage"
+        v-model:items-per-page="gridPerPage"
+        :headers="effectiveHeaders"
+        :items="inviteStore.invites"
+        :items-length="inviteStore.total"
+        :loading="inviteStore.loading"
+        :items-per-page-options="[10, 25, 50, 100]"
+        density="compact"
+        class="invites-table"
+        item-value="id"
+        @update:options="onGridOptions"
+      >
             <template #item.code="{ item }">
               <div class="d-flex align-center">
                 <code class="text-body-2">{{ item.code }}</code>
@@ -55,6 +93,9 @@
             <template #item.target_email="{ item }">
               {{ item.target_email || 'Anyone' }}
             </template>
+            <template #item.created_at="{ item }">
+              {{ new Date(item.created_at).toLocaleDateString() }}
+            </template>
             <template #item.actions="{ item }">
               <v-btn
                 v-if="item.status === 'active'"
@@ -67,8 +108,16 @@
                 <v-icon>mdi-close-circle</v-icon>
               </v-btn>
             </template>
-      </v-data-table-virtual>
+      </v-data-table-server>
     </v-card>
+
+    <GridColumnPickerDialog
+      v-model="colDialogOpen"
+      :entries="colEntries"
+      @toggle="colToggle"
+      @reorder="colReorder"
+      @reset="colReset"
+    />
 
     <!-- Create invite dialog -->
     <v-dialog v-model="showCreateDialog" max-width="500">
@@ -124,17 +173,21 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useInviteStore } from '@/stores/invite'
 import { useRoleStore } from '@/stores/role'
+import { useAuthStore } from '@/stores/auth'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'
+import { useGridColumns } from '@/composables/useGridColumns'
+import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.vue'
 import BatchInviteDialog from '@/components/invite/BatchInviteDialog.vue'
 
 const route = useRoute()
 const inviteStore = useInviteStore()
 const roleStore = useRoleStore()
+const auth = useAuthStore()
 const { showSuccess, showError } = useSnackbar()
 const { rules } = useValidation()
 
@@ -148,14 +201,87 @@ const targetEmail = ref('')
 const maxUses = ref<number | undefined>(undefined)
 const expiresInHours = ref<number | undefined>(undefined)
 
-const headers = [
+// ── grid state (devices-grid kit, FR-11) ───────────────────────────
+
+const gridPage = ref(1)
+const gridPerPage = ref(25)
+const gridSearch = ref('')
+const gridStatus = ref<string | null>(null)
+const gridSort = ref<string | undefined>(undefined)
+const gridDir = ref<'asc' | 'desc' | undefined>(undefined)
+
+const statusOptions = ['active', 'expired', 'revoked', 'exhausted']
+
+const inviteHeaders = computed(() => [
   { title: 'Code', key: 'code', sortable: false },
-  { title: 'Status', key: 'status' },
-  { title: 'Target', key: 'target_email', sortable: false },
+  // Sortable keys double as the server whitelist (status | target_email | created_at).
+  { title: 'Status', key: 'status', sortable: true },
+  { title: 'Target', key: 'target_email', sortable: true },
   { title: 'Usage', key: 'usage', sortable: false },
-  { title: 'Created', key: 'created_at' },
-  { title: '', key: 'actions', sortable: false, width: 60 },
-]
+  { title: 'Created', key: 'created_at', sortable: true },
+  { title: 'Actions', key: 'actions', sortable: false, width: 60 },
+])
+const colDialogOpen = ref(false)
+const {
+  effectiveHeaders,
+  entries: colEntries,
+  toggle: colToggle,
+  reorder: colReorder,
+  reset: colReset,
+  customized: colsCustomized,
+} = useGridColumns({
+  headers: inviteHeaders,
+  gridId: 'invites',
+  scope: () => `${auth.user?.id ?? 'anon'}:${tenantId.value}`,
+})
+
+function fetchGrid() {
+  void inviteStore
+    .listInvites(tenantId.value, {
+      page: gridPage.value,
+      perPage: gridPerPage.value,
+      q: gridSearch.value || undefined,
+      status: gridStatus.value || undefined,
+      sort: gridSort.value,
+      dir: gridDir.value,
+    })
+    .catch(() => {})
+}
+
+/** v-data-table-server fires this once on mount too — it is the grid's ONLY
+ *  fetch trigger for page/sort changes (a separate onMounted fetch would
+ *  double-load). */
+function onGridOptions(opts: {
+  page: number
+  itemsPerPage: number
+  sortBy: Array<{ key: string; order: 'asc' | 'desc' }>
+}) {
+  gridPage.value = opts.page
+  gridPerPage.value = opts.itemsPerPage
+  gridSort.value = opts.sortBy[0]?.key
+  gridDir.value = opts.sortBy[0]?.order
+  fetchGrid()
+}
+
+let gridSearchTimer: ReturnType<typeof setTimeout> | undefined
+watch(gridSearch, () => {
+  if (gridSearchTimer) clearTimeout(gridSearchTimer)
+  gridSearchTimer = setTimeout(() => {
+    if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+    else fetchGrid()
+  }, 300)
+})
+
+watch(gridStatus, () => {
+  if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+  else fetchGrid()
+})
+
+// Batch creation happens inside the dialog — refresh the grid when it
+// closes so new rows appear without a manual reload.
+watch(showBatchDialog, (open) => {
+  if (!open) fetchGrid()
+})
 
 function statusColor(status: string) {
   switch (status) {
@@ -191,6 +317,7 @@ async function handleCreate() {
     maxUses.value = undefined
     expiresInHours.value = undefined
     showSuccess('Invite created')
+    fetchGrid()
   } catch (e) {
     showError(e instanceof Error ? e.message : 'Failed to create invite')
   } finally {
@@ -208,7 +335,25 @@ async function handleRevoke(inviteId: string) {
 }
 
 onMounted(() => {
-  inviteStore.listInvites(tenantId.value)
+  // The grid's own fetch fires from @update:options on mount — only the
+  // roles (for the batch dialog) load here.
   roleStore.fetchRoles(tenantId.value)
 })
 </script>
+
+<style scoped>
+/* Never squeeze the columns into the viewport — cells keep their natural
+   width and the WRAPPER scrolls horizontally (house rule: wide tables
+   scroll in their own container). */
+.invites-table :deep(.v-table__wrapper) {
+  overflow-x: auto;
+}
+.invites-table :deep(table) {
+  width: max-content;
+  min-width: 100%;
+}
+.invites-table :deep(th),
+.invites-table :deep(td) {
+  white-space: nowrap;
+}
+</style>

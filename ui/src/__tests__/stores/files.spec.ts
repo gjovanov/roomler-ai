@@ -46,12 +46,13 @@ describe('useFileStore', () => {
   describe('fetchFiles', () => {
     it('should fetch files for a tenant and room', async () => {
       const items = [makeFile({ id: 'f1' }), makeFile({ id: 'f2', filename: 'image.png' })]
-      mockApi.get.mockResolvedValueOnce({ items })
+      mockApi.get.mockResolvedValueOnce({ items, total: items.length, page: 1, per_page: 25, total_pages: 1 })
 
       const store = useFileStore()
       await store.fetchFiles('t1', 'r1')
 
-      expect(mockApi.get).toHaveBeenCalledWith('/tenant/t1/room/r1/file')
+      // FR-11: the list is a server grid now — pagination params always ride along.
+      expect(mockApi.get).toHaveBeenCalledWith('/tenant/t1/room/r1/file?page=1&per_page=25')
       expect(store.files).toEqual(items)
     })
 
@@ -63,7 +64,7 @@ describe('useFileStore', () => {
       const promise = store.fetchFiles('t1', 'r1')
       expect(store.loading).toBe(true)
 
-      resolvePromise!({ items: [] })
+      resolvePromise!({ items: [], total: 0, page: 1, per_page: 25, total_pages: 1 })
       await promise
       expect(store.loading).toBe(false)
     })
@@ -80,7 +81,7 @@ describe('useFileStore', () => {
       const store = useFileStore()
       store.files = [makeFile({ id: 'old' })]
 
-      mockApi.get.mockResolvedValueOnce({ items: [makeFile({ id: 'new' })] })
+      mockApi.get.mockResolvedValueOnce({ items: [makeFile({ id: 'new' })], total: 1, page: 1, per_page: 25, total_pages: 1 })
       await store.fetchFiles('t1', 'r1')
 
       expect(store.files).toHaveLength(1)
@@ -152,5 +153,49 @@ describe('useFileStore', () => {
       const url = store.downloadUrl('t1', 'f1')
       expect(url).toBe('/api/tenant/t1/file/f1/download')
     })
+  })
+})
+
+// ─── FR-11 (#784): server-grid params ────────────────────────────────────
+
+describe('useFileStore FR-11 grid params', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  function envelope(items: unknown[] = []) {
+    return { items, total: items.length, page: 1, per_page: 25, total_pages: 1 }
+  }
+
+  it('fetchTenantFiles builds q/sort/dir params (server whitelist keys)', async () => {
+    mockApi.get.mockResolvedValueOnce(envelope())
+    const store = useFileStore()
+    await store.fetchTenantFiles('t1', { page: 2, perPage: 50, q: 'report', sort: 'size', dir: 'desc' })
+    expect(mockApi.get).toHaveBeenCalledWith(
+      '/tenant/t1/file?page=2&per_page=50&q=report&sort=size&dir=desc',
+    )
+  })
+
+  it('omits q and sort when unset (byte-compatible default request)', async () => {
+    mockApi.get.mockResolvedValueOnce(envelope())
+    const store = useFileStore()
+    await store.fetchTenantFiles('t1')
+    expect(mockApi.get).toHaveBeenCalledWith('/tenant/t1/file?page=1&per_page=25')
+  })
+
+  it('a stale response never clobbers a newer one (seq guard)', async () => {
+    const store = useFileStore()
+    let resolveSlow: (v: unknown) => void
+    mockApi.get.mockReturnValueOnce(new Promise((r) => { resolveSlow = r }))
+    const slow = store.fetchTenantFiles('t1', { q: 'old' })
+
+    mockApi.get.mockResolvedValueOnce(envelope([makeFile({ id: 'fresh' })]))
+    await store.fetchTenantFiles('t1', { q: 'new' })
+    expect(store.files.map((f) => f.id)).toEqual(['fresh'])
+
+    resolveSlow!(envelope([makeFile({ id: 'stale' })]))
+    await slow
+    expect(store.files.map((f) => f.id)).toEqual(['fresh'])
   })
 })
