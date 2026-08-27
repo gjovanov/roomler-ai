@@ -195,6 +195,7 @@ impl RateGovernor {
         &mut self,
         ceiling_bps: u32,
         floor_bps: u32,
+        constrained: bool,
         send_capacity: usize,
         now: Instant,
     ) -> Option<AppliedBitrate> {
@@ -204,7 +205,18 @@ impl RateGovernor {
         // congesting the send queue on every burst (the "chunky" skips).
         // Only ever LOWERS the nominal; confidence decays via the
         // estimator's TTL, so silence reverts to the nominal band.
+        //
+        // DIRECT-ONLY (field 2026-08-27, CLK + PC55331 over the corp
+        // relay, same day the clamp shipped): per-frame samples through
+        // a lumpy TURN-TCP pipe read near-zero during TCP stalls, the
+        // down-fast EWMA crashed the estimate, and the ceiling rode the
+        // 1 Mbps floor — relay sessions got WORSE than the nominal
+        // clamp they had before. The nominal relay clamp already IS the
+        // physics bound there; the estimate stays OBSERVED on relay
+        // (heartbeat `goodput_bps`) as the dataset for a future
+        // lumpiness-robust design.
         let ceiling_bps = if self.measured_ceiling
+            && !constrained
             && let Some(g) = self.goodput.estimate_bps(now)
         {
             ceiling_bps.min(super::goodput::derived_ceiling_bps(g))
@@ -391,7 +403,7 @@ mod tests {
         assert!(g.tick_viewer_window(t1, 30, || 0, |o| o).is_some());
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
-            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, t1)
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
             .expect("initial apply");
         assert_eq!(
             applied.bps, 8_500_000,
@@ -412,9 +424,33 @@ mod tests {
         g.tick_viewer_window(t1, 30, || 0, |o| o);
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
-            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, t1)
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
             .expect("initial apply");
         assert_eq!(applied.bps, CEILING, "disabled = nominal band");
+    }
+
+    /// Relay sessions IGNORE the measured clamp (field 2026-08-27: the
+    /// lumpy TURN-TCP pipe produced near-zero samples during stalls and
+    /// the clamp rode the floor — worse than the nominal relay clamp).
+    /// The estimate itself still folds (observe-only there).
+    #[test]
+    fn constrained_sessions_ignore_the_measured_clamp() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let sink = g.goodput_sink();
+        for _ in 0..40 {
+            sink.record(30_000, Duration::from_millis(24));
+        }
+        let t1 = start + Duration::from_secs(2);
+        g.tick_viewer_window(t1, 30, || 0, |o| o);
+        assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
+        let applied = g
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t1)
+            .expect("initial apply");
+        assert_eq!(
+            applied.bps, CEILING,
+            "constrained = nominal band, measurement observed but not consumed"
+        );
     }
 
     /// The measurement may only ever LOWER the clamp — a pipe measured
@@ -431,7 +467,7 @@ mod tests {
         let t1 = start + Duration::from_secs(2);
         g.tick_viewer_window(t1, 30, || 0, |o| o);
         let applied = g
-            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, t1)
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
             .expect("initial apply");
         assert_eq!(applied.bps, CEILING, "measurement never raises the ceiling");
     }
@@ -444,14 +480,14 @@ mod tests {
         // last_applied=0 makes take_pending emit the initial target
         // exactly once.
         let applied = g
-            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, now)
             .expect("initial apply");
         assert_eq!(applied.bps, CEILING);
         assert!(applied.changed);
         assert_eq!(g.applied_bps(), CEILING);
         // Same conditions again — change-gated, nothing to apply.
         assert!(
-            g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+            g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, now)
                 .is_none()
         );
     }
@@ -460,7 +496,7 @@ mod tests {
     fn sustained_full_channel_walks_bitrate_down_never_below_floor() {
         let start = Instant::now();
         let mut g = gov(start);
-        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, start);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, start);
         let mut last = g.applied_bps();
         // Full-channel gate arms spaced past the MD rate limit walk the
         // target down monotonically; the floor holds no matter how long
@@ -483,14 +519,20 @@ mod tests {
     fn lowering_the_ceiling_clamps_the_target_immediately() {
         let now = Instant::now();
         let mut g = gov(now);
-        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, now);
         // A transport flip to relay shrinks the ceiling; the very next
         // tick must emit the clamped target (refine can raise dims —
         // and thereby the requested ceiling — but the constrained
         // clamp always wins; see also the policy-level flatness test).
         let relay_ceiling = 3_000_000;
         let applied = g
-            .pre_encode_tick(relay_ceiling, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+            .pre_encode_tick(
+                relay_ceiling,
+                crate::encode::MIN_BITRATE_BPS,
+                false,
+                DEPTH,
+                now,
+            )
             .expect("clamp emits");
         assert_eq!(applied.bps, relay_ceiling);
     }
@@ -502,7 +544,7 @@ mod tests {
     fn floor_passes_through_to_the_controller() {
         let start = Instant::now();
         let mut g = gov(start);
-        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, start);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, start);
         // Sustained congestion walks the target to the flat floor.
         let mut now = start;
         for _ in 0..40 {
@@ -512,13 +554,13 @@ mod tests {
         assert_eq!(g.applied_bps(), crate::encode::MIN_BITRATE_BPS);
         // A big-screen floor lifts it on the next tick.
         let applied = g
-            .pre_encode_tick(CEILING, 3_000_000, DEPTH, now)
+            .pre_encode_tick(CEILING, 3_000_000, false, DEPTH, now)
             .expect("floor lift emits");
         assert_eq!(applied.bps, 3_000_000);
         // Relay flip: flat floor + 2 M ceiling in one tick — the clamp
         // wins, the stale floor cannot pin the target above it.
         let applied = g
-            .pre_encode_tick(2_000_000, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+            .pre_encode_tick(2_000_000, crate::encode::MIN_BITRATE_BPS, false, DEPTH, now)
             .expect("clamp emits");
         assert_eq!(applied.bps, 2_000_000);
     }
@@ -527,9 +569,9 @@ mod tests {
     fn rebuild_forces_a_reapply_of_the_current_target() {
         let now = Instant::now();
         let mut g = gov(now);
-        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now);
+        g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, now);
         assert!(
-            g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+            g.pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, now)
                 .is_none()
         );
         // A fresh encoder starts at its constructor maxrate — the
@@ -537,7 +579,7 @@ mod tests {
         // pump re-applies it.
         g.on_encoder_rebuilt();
         let applied = g
-            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, DEPTH, now)
+            .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, now)
             .expect("post-rebuild reapply");
         assert_eq!(applied.bps, CEILING);
         assert!(
