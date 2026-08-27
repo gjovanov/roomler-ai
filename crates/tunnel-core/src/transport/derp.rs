@@ -44,7 +44,35 @@ pub type DerpPubKey = [u8; 32];
 /// Depth of a node's shared outbound WS queue (frames waiting to hit the wire).
 /// Bounded so a stalled WS can't grow memory without bound; overflow drops the
 /// frame (WG/QUIC are loss-tolerant — a dropped carrier datagram retransmits).
+///
+/// FR-18 — this bound is a MEMORY bound, not a latency one, and the difference
+/// cost us seconds: 512 frames is ~33 ms of a 160 Mbps link but ~1.8 s of a
+/// 3 Mbps relay, which is exactly where the corp-VPN hosts live. Latency is
+/// bounded in TIME by [`queue_max_age`] at the writer instead, so this stays
+/// large enough to absorb a legitimate burst.
 const OUTBOUND_QUEUE: usize = 512;
+
+/// FR-18 — a queued carrier frame plus the instant it was enqueued. The WS
+/// writer discards frames older than [`queue_max_age`] rather than sending
+/// them: a real-time carrier must shed stale load, and a frame that has already
+/// waited longer than its useful life is worse than nothing (it occupies the
+/// wire that the CURRENT frame needs, and the receiver would discard it).
+pub type OutboundFrame = (Instant, Vec<u8>);
+
+/// FR-18 — how long a frame may wait in the outbound queue before the writer
+/// drops it instead of sending. Bounds this layer's latency contribution
+/// independently of the link rate. `0` disables the check entirely (the
+/// pre-FR-18 behaviour) — the kill switch.
+///
+/// Default 100 ms: comfortably above a healthy relay's queueing (measured
+/// sub-ms on a drained pipe) and far below the multi-second stalls that
+/// motivated it.
+pub fn queue_max_age() -> Option<Duration> {
+    let ms = crate::env::node_env("DERP_QUEUE_MAX_AGE_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(100);
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
 
 /// Depth of a single peer's inbound payload queue. Same drop-on-overflow.
 const INBOUND_QUEUE: usize = 256;
@@ -88,7 +116,7 @@ pub enum MuxEvent {
 pub struct DerpConn {
     peer_pubkey: DerpPubKey,
     /// The node's shared WS write queue (cloned from the [`DerpMux`]).
-    ws_out: mpsc::Sender<Vec<u8>>,
+    ws_out: mpsc::Sender<OutboundFrame>,
     /// This peer's demuxed inbound payloads (the mux routes frames whose
     /// `src_pubkey == peer_pubkey` here).
     inbound: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
@@ -256,7 +284,7 @@ impl RelayConn for DerpConn {
         let mut frame = Vec::with_capacity(32 + buf.len());
         frame.extend_from_slice(&self.peer_pubkey);
         frame.extend_from_slice(buf);
-        match self.ws_out.try_send(frame) {
+        match self.ws_out.try_send((Instant::now(), frame)) {
             Ok(()) => Ok(buf.len()),
             // Backpressure: drop this datagram (loss-tolerant carrier). NOT an
             // error — a full transient queue must not latch the carrier dead.
@@ -301,7 +329,7 @@ impl RelayConn for DerpConn {
 /// the `DerpConn`→WS path.
 pub struct DerpMux {
     self_pubkey: DerpPubKey,
-    ws_out: mpsc::Sender<Vec<u8>>,
+    ws_out: mpsc::Sender<OutboundFrame>,
     alive: Arc<AtomicBool>,
     /// When the CURRENT outage began (`None` while up). Lets the evidence
     /// path distinguish a reconnect blip from a sustained WSS outage — the
@@ -317,6 +345,12 @@ pub struct DerpMux {
     /// more (they both were — see the `deliver` doc).
     dropped_unrouted: Arc<std::sync::atomic::AtomicU64>,
     dropped_backpressure: Arc<std::sync::atomic::AtomicU64>,
+    /// FR-18 — OUTBOUND frames the WS writer discarded because they had waited
+    /// longer than [`queue_max_age`]. Deliberately a separate counter from the
+    /// inbound ones above: a rising `dropped_stale` with steady delivered fps is
+    /// the carrier shedding load correctly, which reads nothing like a drop
+    /// caused by a full queue or a missing route.
+    dropped_stale: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DerpMux {
@@ -324,7 +358,7 @@ impl DerpMux {
     /// outbound frame receiver the WS owner must drain for the mux's lifetime.
     /// Starts `alive = true` (the owner sets it `false`/`true` around a
     /// reconnect).
-    pub fn new(self_pubkey: DerpPubKey) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>) {
+    pub fn new(self_pubkey: DerpPubKey) -> (Arc<Self>, mpsc::Receiver<OutboundFrame>) {
         let (ws_out, ws_out_rx) = mpsc::channel(OUTBOUND_QUEUE);
         let mux = Arc::new(Self {
             self_pubkey,
@@ -335,6 +369,7 @@ impl DerpMux {
             events_tx: Mutex::new(None),
             dropped_unrouted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_backpressure: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_stale: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
         (mux, ws_out_rx)
     }
@@ -358,6 +393,19 @@ impl DerpMux {
             self.dropped_unrouted.load(Ordering::Relaxed),
             self.dropped_backpressure.load(Ordering::Relaxed),
         )
+    }
+
+    /// FR-18 — the WS owner calls this when it discards a frame that waited
+    /// past [`queue_max_age`]. The mux owns the counter (not the writer task)
+    /// because the writer is rebuilt on every reconnect and the count must
+    /// survive that.
+    pub fn note_stale_drop(&self) {
+        self.dropped_stale.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// FR-18 — lifetime count of outbound frames shed for staleness.
+    pub fn stale_drops(&self) -> u64 {
+        self.dropped_stale.load(Ordering::Relaxed)
     }
 
     /// The first frame to send on a fresh `/derp` WS: this node's own pubkey
@@ -863,9 +911,26 @@ mod tests {
             .await
             .unwrap();
 
-        let framed = out_rx.recv().await.unwrap();
+        let (queued_at, framed) = out_rx.recv().await.unwrap();
         assert_eq!(&framed[..32], &pk(0x02), "outbound frame targets the peer");
         assert_eq!(&framed[32..], &[1, 2, 3]);
+        // FR-18 — the enqueue stamp is what lets the WS writer shed stale
+        // frames; a frame that arrives without one cannot be aged out.
+        assert!(queued_at.elapsed() < Duration::from_secs(5));
+    }
+
+    /// FR-18 — the queue-age bound is the kill switch AND the latency
+    /// contract, so both ends of it are locked here rather than left to the
+    /// deployment to discover.
+    #[test]
+    fn queue_max_age_defaults_on_and_zero_disables() {
+        // Default (no env set in the test process): the bound is active and
+        // small enough to matter on a 3 Mbps relay.
+        let d = queue_max_age().expect("age bound on by default");
+        assert!(
+            d >= Duration::from_millis(20) && d <= Duration::from_millis(500),
+            "default {d:?} is outside the useful band"
+        );
     }
 
     #[tokio::test]
