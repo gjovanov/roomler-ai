@@ -1,7 +1,7 @@
 # FR-12 — Onboarding tutorial ("Welcome tour")
 
 **Issue:** [#788](https://github.com/gjovanov/roomler-ai/issues/788)
-**Status:** DESIGN + PLAN (this FR is the design; implementation phases below)
+**Status:** P1 IMPLEMENTED (view + entry points + auto-open + progress); P2/P3 planned
 
 ## Goal
 
@@ -75,7 +75,7 @@ devices.
 
 | Phase | Content | Kill switch | Status |
 |-------|---------|-------------|--------|
-| P1 | Tutorial view (8 chapters, 4 reused SVGs), app-bar `?` + user-menu entries, first-login auto-open, localStorage progress | auto-open reads one localStorage flag; the route/nav entries are plain UI | planned |
+| P1 | Tutorial view (8 chapters, 4 reused SVGs), app-bar `?` + user-menu entries, first-login auto-open, localStorage progress | auto-open reads one localStorage flag; the route/nav entries are plain UI | **shipped** — PR #797 |
 | P2 | Spotlight micro-tours for enroll/connect/forward on the live pages (dependency-free, ~100-line helper) | per-tour "skip"; entry only from the Tutorial | planned |
 | P3 | New same-style SVGs for ACL/rooms/calls/chat chapters; server-side progress | none needed (additive) | planned |
 
