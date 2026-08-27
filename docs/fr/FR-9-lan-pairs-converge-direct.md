@@ -1,6 +1,6 @@
 # FR-9: Two nodes sharing a LAN converge to a direct carrier
 
-**Status:** implemented — #746 / #758 / #765 / #782 — field-verified on 0.4.2.
+**Status:** CLOSED — #741 / #744 / #746 / #747 / #758 / #765 / #782 — field-verified, shipped rc.480 → 0.4.8.
 
 Renumbered from `FR-01` by the registry tie-break: #767 claimed `FR-1` 98 s earlier, and the
 lower issue id keeps the number.
