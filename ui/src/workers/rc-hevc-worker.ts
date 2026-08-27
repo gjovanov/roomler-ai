@@ -37,6 +37,8 @@ import {
   HopStats,
   ctxOptionsFor,
   epochNowMs,
+  epochNowUs,
+  frameAgeMs,
   normalizeCtxMode,
   normalizeIntKnob,
   round1,
@@ -94,12 +96,15 @@ type ChunkMessage = {
 type ViewportMessage = { type: 'viewport'; cssW: number; cssH: number; dpr: number }
 /** P7 — live sharpen-mode/sharpness change from the settings UI. */
 type RenderModeMessage = { type: 'render-mode'; sharpen?: string; sharpness?: number }
+/** FR-1 P7 — agent-clock offset from the main thread's rc:clock probe. */
+type ClockOffsetMessage = { type: 'clock-offset'; offsetUs: number | null }
 type CloseMessage = { type: 'close' }
 type IncomingMessage =
   | InitCanvasMessage
   | ChunkMessage
   | ViewportMessage
   | RenderModeMessage
+  | ClockOffsetMessage
   | CloseMessage
 
 const HEADER_BYTES = 13
@@ -247,6 +252,11 @@ let perFrameMsg = false
 const paintStats = new HopStats()
 const fwdStats = new HopStats()
 const decodeStats = new HopStats()
+// FR-1 P7 — end-to-end age. The offset arrives from the main thread's
+// rc:clock probe; until the first echo it stays null and the stats
+// message reports `age: null` (HUD shows nothing rather than garbage).
+const ageStats = new HopStats()
+let clockOffsetUs: number | null = null
 let outGapMaxMs = 0
 const pendingDecodeAt = new Map<number, number>()
 
@@ -292,6 +302,8 @@ function maybeEmitStats(): void {
     paint: paintStats.snapshotAndReset(),
     fwd: fwdStats.snapshotAndReset(),
     decode: decodeStats.snapshotAndReset(),
+    // FR-1 P7 — end-to-end frame age; null until the clock probe lands.
+    age: clockOffsetUs !== null ? ageStats.snapshotAndReset() : null,
     outGapMaxMs: round1(outGapMaxMs),
     ctxMode,
     // P7 — the active render path + actual backing size, for the stats
@@ -345,6 +357,8 @@ workerScope.onmessage = (e) => {
   } else if (msg.type === 'viewport') {
     // P7 — cache the element box; the sizing policy runs per paint.
     viewport = { cssW: msg.cssW, cssH: msg.cssH, dpr: msg.dpr }
+  } else if (msg.type === 'clock-offset') {
+    clockOffsetUs = typeof msg.offsetUs === 'number' ? msg.offsetUs : null
   } else if (msg.type === 'render-mode') {
     if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
     if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
@@ -441,9 +455,17 @@ function initDecoder() {
       }
       statsLastWidth = renderW
       statsLastHeight = renderH
+      // FR-1 P7 — capture the wire timestamp BEFORE paint can close the
+      // frame; a closed VideoFrame reports 0 (the rc.100 lesson).
+      const wireTsUs = frame.timestamp
       const paintT0 = performance.now()
       paintFrame(render, renderW, renderH)
       paintStats.add(performance.now() - paintT0)
+      // Age at paint on the agent's clock (mapped via the rc:clock probe):
+      // framing → send queue → network → decode → paint, end to end.
+      if (clockOffsetUs !== null) {
+        ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, epochNowUs()))
+      }
       if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
       if (firstFrameMsg) {
         workerScope.postMessage(firstFrameMsg)
@@ -718,6 +740,8 @@ function teardown(): void {
   paintStats.snapshotAndReset()
   fwdStats.snapshotAndReset()
   decodeStats.snapshotAndReset()
+  ageStats.snapshotAndReset()
+  clockOffsetUs = null
   outGapMaxMs = 0
   // P7 — release the GL renderer; a fresh session re-creates lazily and
   // gets a fresh unavailability verdict (a new tab/GPU state may differ).
