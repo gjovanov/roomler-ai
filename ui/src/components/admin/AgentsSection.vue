@@ -1348,7 +1348,9 @@ const router = useRouter()
 // ── Unified server-driven grid state ─────────────────────────────
 const gridSearch = ref('')
 const gridPage = ref(1)
-const gridPerPage = ref(25)
+// Default 10 (operator, 2026-08-27): the devices page leads the product —
+// a screenful beats a scroll; the footer still offers 25/50/100.
+const gridPerPage = ref(10)
 const gridSort = ref<string | undefined>(undefined)
 const gridDir = ref<'asc' | 'desc' | undefined>(undefined)
 /** Kind radio: devices-only by default — 'both' widens to tunnel clients.
