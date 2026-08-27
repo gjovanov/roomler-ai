@@ -233,20 +233,29 @@ pub fn unpack_report(raw: u32) -> (u32, bool) {
 // the rest of the stack already knows: an fps cap (instant, no re-open) and a
 // multiplicative decrease (applied under the FR-10 quiet/spacing rules).
 
-/// Pack a viewer age report (window avg + window min, ms) into the shared
-/// `viewer_age` atomic. `0` is the swap-reset / no-report sentinel, so a
-/// genuine measurement is floored at 1 ms — sub-ms end-to-end age is not
-/// physically possible, so nothing real is lost.
-pub fn pack_age(age_ms: u16, age_min_ms: u16) -> u32 {
-    (age_ms.max(1) as u32) | ((age_min_ms.max(1) as u32) << 16)
+/// Pack a viewer age report — window avg, window min, and the viewer's own
+/// measured probe ROUND TRIP, all ms — into the shared `viewer_age` cell.
+/// `0` is the swap-reset / no-report sentinel, so a genuine measurement is
+/// floored at 1 ms; sub-ms end-to-end age is not physically possible, so
+/// nothing real is lost.
+///
+/// The round trip rides along because P2's whole correction depends on it:
+/// only the path's own timing says whether a reported floor is physically
+/// possible, and the viewer is the one measuring it.
+pub fn pack_age(age_ms: u16, age_min_ms: u16, rtt_ms: u16) -> u64 {
+    (age_ms.max(1) as u64) | ((age_min_ms.max(1) as u64) << 16) | ((rtt_ms as u64) << 32)
 }
 
-/// Inverse of [`pack_age`]; `0` (no report this window) → `None`.
-pub fn unpack_age(raw: u32) -> Option<(u16, u16)> {
+/// Inverse of [`pack_age`] → `(avg, min, one_way)`; `0` (no report) → `None`.
+pub fn unpack_age(raw: u64) -> Option<(u16, u16, u16)> {
     if raw == 0 {
         return None;
     }
-    Some(((raw & 0xFFFF) as u16, (raw >> 16) as u16))
+    Some((
+        (raw & 0xFFFF) as u16,
+        ((raw >> 16) & 0xFFFF) as u16,
+        ((raw >> 32) & 0xFFFF) as u16,
+    ))
 }
 
 /// Everything one viewer tells the agent about how the stream is actually
@@ -259,7 +268,7 @@ pub fn unpack_age(raw: u32) -> Option<(u16, u16)> {
 #[derive(Debug, Default)]
 pub struct ViewerFeedback {
     report: std::sync::atomic::AtomicU32,
-    age: std::sync::atomic::AtomicU32,
+    age: std::sync::atomic::AtomicU64,
 }
 
 impl ViewerFeedback {
@@ -286,12 +295,12 @@ impl ViewerFeedback {
     }
 
     /// FR-15 — overwrite the paint-age report (see [`pack_age`]).
-    pub fn store_age(&self, packed: u32) {
+    pub fn store_age(&self, packed: u64) {
         self.age.store(packed, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// FR-15 — consume the paint-age report.
-    pub fn take_age(&self) -> u32 {
+    pub fn take_age(&self) -> u64 {
         self.age.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -309,6 +318,17 @@ const AGE_OVER_WINDOWS: u8 = 2;
 /// minute instead of over-triggering forever.
 const AGE_FLOOR_RING: usize = 30;
 
+/// P2 — a session sitting at this multiple of its own one-way delay is
+/// over-queued no matter what floor it managed to learn. Without an
+/// absolute rule, a session that starts congested teaches the loop that
+/// congestion IS the floor and can then never trigger on excess: field
+/// 2026-08-27, a viewer reported a learned floor of 1111 ms while its
+/// window average ran 1 134–13 485 ms, and the loop stayed silent.
+const AGE_OVER_QUEUE_MULTIPLE: u16 = 3;
+/// Absolute floor for that rule, so a very short path still needs a
+/// genuinely bad age before the loop fires on it.
+const AGE_OVER_QUEUE_MIN_MS: u16 = 250;
+
 /// FR-15 — the constrained-transport age loop. Feed one `observe` per
 /// viewer window; it learns the session's age floor (min over the ring —
 /// the floor is propagation+decode, not queue) and reports `true` once the
@@ -321,6 +341,11 @@ pub struct AgeLoop {
     len: usize,
     idx: usize,
     over_streak: u8,
+    /// P2 — floor samples rejected as physically impossible. Surfaced in
+    /// the heartbeat: a climbing count is the clock probe being biased by
+    /// the very congestion it rides through, which is a different fault
+    /// from "the path is slow" and wants a different fix.
+    implausible: u32,
 }
 
 impl Default for AgeLoop {
@@ -336,21 +361,48 @@ impl AgeLoop {
             len: 0,
             idx: 0,
             over_streak: 0,
+            implausible: 0,
         }
     }
 
     /// Fold one viewer window. `age_ms` = window average, `age_min_ms` =
     /// window minimum (the floor sample — even a queued window usually
     /// contains one frame that rode a momentarily drained pipe).
-    pub fn observe(&mut self, age_ms: u16, age_min_ms: u16) -> bool {
-        self.ring[self.idx] = age_min_ms.max(1);
-        self.idx = (self.idx + 1) % AGE_FLOOR_RING;
-        if self.len < AGE_FLOOR_RING {
-            self.len += 1;
+    ///
+    /// `one_way_ms` is half the viewer's own measured probe round trip: the
+    /// smallest age the path can physically produce, since a frame cannot
+    /// reach the screen faster than the wire allows. P2 uses it two ways.
+    ///
+    /// **A floor sample below it is rejected, not learned.** The `rc:clock`
+    /// probe rides the SAME congested channel as the video it measures, so
+    /// its midpoint assumption skews low exactly when the pipe is full;
+    /// the resulting sub-physical ages then became the floor and made the
+    /// loop hair-trigger. Field 2026-08-27: learned floors of 1–15 ms on
+    /// relays whose own round trip was 86–210 ms, with the target visibly
+    /// parked at the area floor in windows the path was fine.
+    ///
+    /// **And an age far above it fires regardless of the floor**, so a
+    /// session that begins congested — and therefore never sees a good
+    /// window to learn from — is still caught.
+    pub fn observe(&mut self, age_ms: u16, age_min_ms: u16, one_way_ms: u16) -> bool {
+        if age_min_ms >= one_way_ms {
+            self.ring[self.idx] = age_min_ms.max(1);
+            self.idx = (self.idx + 1) % AGE_FLOOR_RING;
+            if self.len < AGE_FLOOR_RING {
+                self.len += 1;
+            }
+        } else {
+            self.implausible = self.implausible.saturating_add(1);
         }
-        let floor = self.floor_ms().unwrap_or(age_min_ms.max(1));
-        let over = age_ms.saturating_sub(floor) >= AGE_SLACK_MS;
-        self.over_streak = if over {
+        // Fall back to the physical bound while nothing plausible has been
+        // learned — never to the sample we just rejected.
+        let floor = self.floor_ms().unwrap_or(one_way_ms.max(1));
+        let over_excess = age_ms.saturating_sub(floor) >= AGE_SLACK_MS;
+        let over_queued = age_ms
+            >= one_way_ms
+                .saturating_mul(AGE_OVER_QUEUE_MULTIPLE)
+                .max(AGE_OVER_QUEUE_MIN_MS);
+        self.over_streak = if over_excess || over_queued {
             self.over_streak.saturating_add(1)
         } else {
             0
@@ -361,6 +413,11 @@ impl AgeLoop {
     /// The learned path floor (min of the ring), None before any report.
     pub fn floor_ms(&self) -> Option<u16> {
         self.ring[..self.len].iter().copied().min()
+    }
+
+    /// P2 — floor samples rejected as below the path's physical minimum.
+    pub fn implausible_samples(&self) -> u32 {
+        self.implausible
     }
 }
 
@@ -561,16 +618,21 @@ mod tests {
 
     // ── FR-15 — age packing + loop ──────────────────────────────────────
 
+    /// Half of a 100 ms round trip — the shape of the relays this loop runs
+    /// on, so the ~60 ms floors below are legal and a 2 ms one is not.
+    const ONE_WAY: u16 = 50;
+
     #[test]
     fn age_pack_roundtrips_and_zero_is_no_report() {
-        assert_eq!(unpack_age(pack_age(120, 62)), Some((120, 62)));
+        assert_eq!(unpack_age(pack_age(120, 62, 90)), Some((120, 62, 90)));
         assert_eq!(unpack_age(0), None);
         // A genuine 0 ms input is floored to 1 so it cannot collide with
-        // the swap-reset sentinel.
-        assert_eq!(unpack_age(pack_age(0, 0)), Some((1, 1)));
+        // the swap-reset sentinel. An absent round trip stays 0 — the
+        // agent reads that as "no bound", not as "a 0 ms path".
+        assert_eq!(unpack_age(pack_age(0, 0, 0)), Some((1, 1, 0)));
         assert_eq!(
-            unpack_age(pack_age(u16::MAX, u16::MAX)),
-            Some((u16::MAX, u16::MAX))
+            unpack_age(pack_age(u16::MAX, u16::MAX, u16::MAX)),
+            Some((u16::MAX, u16::MAX, u16::MAX))
         );
     }
 
@@ -578,43 +640,93 @@ mod tests {
     fn age_loop_needs_two_consecutive_over_windows() {
         let mut l = AgeLoop::new();
         // Establish a ~60 ms floor.
-        assert!(!l.observe(62, 60));
-        assert!(!l.observe(64, 61));
+        assert!(!l.observe(62, 60, ONE_WAY));
+        assert!(!l.observe(64, 61, ONE_WAY));
         assert_eq!(l.floor_ms(), Some(60));
         // One over-window (140 vs floor 60 = +80 ≥ slack 70) is a blip…
-        assert!(!l.observe(140, 62));
+        assert!(!l.observe(140, 62, ONE_WAY));
         // …a clean window resets the streak…
-        assert!(!l.observe(65, 61));
-        assert!(!l.observe(150, 63));
+        assert!(!l.observe(65, 61, ONE_WAY));
+        assert!(!l.observe(150, 63, ONE_WAY));
         // …and only the SECOND consecutive over-window triggers.
-        assert!(l.observe(155, 64));
+        assert!(l.observe(155, 64, ONE_WAY));
         // Staying over keeps triggering (one MD per window by design).
-        assert!(l.observe(160, 64));
+        assert!(l.observe(160, 64, ONE_WAY));
         // Recovery clears it immediately.
-        assert!(!l.observe(70, 61));
+        assert!(!l.observe(70, 61, ONE_WAY));
     }
 
     #[test]
     fn age_loop_floor_rebaselines_after_a_path_change() {
         let mut l = AgeLoop::new();
-        l.observe(60, 55);
-        // A path change raises the true floor to ~200 ms. The stale 55 ms
-        // sample ages out of the 30-window ring, after which 205 vs the new
-        // floor is within slack and the loop stops treating it as overload.
+        // A path whose true floor is ~220 ms — one-way 210 ms, so the
+        // physical bound does not reject its own samples.
+        let one_way = 210;
+        l.observe(220, 215, one_way);
         for _ in 0..30 {
-            l.observe(205, 200);
+            l.observe(225, 220, one_way);
         }
-        assert_eq!(l.floor_ms(), Some(200));
-        assert!(!l.observe(205, 200));
+        assert_eq!(l.floor_ms(), Some(220));
+        // 225 vs a 220 floor is within slack, and well under 3× one-way.
+        assert!(!l.observe(225, 220, one_way));
     }
 
     #[test]
     fn age_loop_within_slack_never_triggers() {
         let mut l = AgeLoop::new();
-        l.observe(60, 58);
+        l.observe(60, 58, ONE_WAY);
         for _ in 0..50 {
-            // +65 ms of climb stays under the 70 ms slack.
-            assert!(!l.observe(123, 58));
+            // +65 ms of climb stays under the 70 ms slack, and 123 is under
+            // the absolute 250 ms over-queue rule.
+            assert!(!l.observe(123, 58, ONE_WAY));
         }
+    }
+
+    // ── P2 — the floor has to be physically possible ────────────────────
+
+    /// The bug this closes: the `rc:clock` probe rides the congested
+    /// channel, skews low, and the sub-physical age became the floor —
+    /// after which a healthy window read as a huge excess and the loop cut
+    /// quality on a fine path. Field 2026-08-27: 1–15 ms floors on relays
+    /// whose round trip was 86–210 ms.
+    #[test]
+    fn a_sub_physical_floor_sample_is_rejected_not_learned() {
+        let mut l = AgeLoop::new();
+        // Legitimate floor first.
+        l.observe(62, 60, ONE_WAY);
+        assert_eq!(l.floor_ms(), Some(60));
+        // Now the clock-skewed nonsense: a 2 ms floor on a 100 ms path.
+        assert!(!l.observe(64, 2, ONE_WAY));
+        assert_eq!(l.floor_ms(), Some(60), "the impossible sample was learned");
+        assert_eq!(l.implausible_samples(), 1);
+        // And a healthy window is still healthy — with the 2 ms floor it
+        // would have read as +62 and started a trigger streak.
+        assert!(!l.observe(70, 61, ONE_WAY));
+        assert!(!l.observe(70, 61, ONE_WAY));
+    }
+
+    /// The other direction: a session congested from its FIRST window never
+    /// sees a good sample, so `min(ring)` learns the congestion as the
+    /// floor and excess can never grow. Field: a learned floor of 1111 ms
+    /// against window averages of 1 134–13 485 ms, loop silent.
+    #[test]
+    fn a_session_congested_from_the_start_still_fires() {
+        let mut l = AgeLoop::new();
+        // Every sample is terrible, so the floor is terrible too.
+        assert!(!l.observe(1134, 1111, ONE_WAY));
+        // Second consecutive over-window trips it on the absolute rule
+        // (1134 ≫ 3× the 50 ms one-way), despite zero excess over floor.
+        assert!(l.observe(13485, 1111, ONE_WAY));
+    }
+
+    /// A viewer that reports no round trip (older web, or before the first
+    /// probe lands) must not have its floors rejected — the bound goes
+    /// inert and the loop behaves exactly as it did before P2.
+    #[test]
+    fn a_missing_round_trip_leaves_the_bound_inert() {
+        let mut l = AgeLoop::new();
+        assert!(!l.observe(62, 2, 0));
+        assert_eq!(l.floor_ms(), Some(2), "nothing to reject against");
+        assert_eq!(l.implausible_samples(), 0);
     }
 }
