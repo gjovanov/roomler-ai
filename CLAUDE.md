@@ -346,10 +346,13 @@ Every substantial feature or multi-step program (a new capability, a performance
 protocol/scheme change — anything bigger than a one-PR fix) gets a **Functional
 Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`:
 
-1. **Spec doc first**: `docs/fr/FR-NN-<slug>.md` on master (next free NN across `docs/fr/`)
-   — Goal, root-cause/field evidence, key design with `file:line` anchors verified against
-   master, a phase/status table with each phase's kill switch, acceptance criteria as
-   checkboxes, open decisions, out-of-scope, and a field-verification log.
+1. **Spec doc first**: `docs/fr/FR-N-<slug>.md` on master — Goal, root-cause/field
+   evidence, key design with `file:line` anchors verified against master, a phase/status
+   table with each phase's kill switch, acceptance criteria as checkboxes, open decisions,
+   out-of-scope, and a field-verification log. **Numbering: unpadded `FR-N`; next N = max
+   across BOTH `docs/fr/` AND `gh issue list --state all --search "FR-"` — sessions run in
+   parallel, and day one produced an FR-1/FR-01 collision (#767 vs #768) because the issue
+   list wasn't checked. Search immediately before creating, same discipline as the tag race.**
 2. **GitHub issue** `FR-NN: <title>` in `gjovanov/roomler-ai/issues` (labels:
    `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
    Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
