@@ -63,10 +63,27 @@ interface BatchCreateResponse {
   failed: number
 }
 
+/** FR-11 grid params — mirrors the server's flat InviteListQuery. */
+export interface InviteFetchOpts {
+  page?: number
+  perPage?: number
+  q?: string
+  /** Exact filter: active | expired | revoked | exhausted. */
+  status?: string
+  /** Server whitelist: created_at | target_email | status. */
+  sort?: string
+  dir?: 'asc' | 'desc'
+}
+
 export const useInviteStore = defineStore('invite', () => {
   const inviteInfo = ref<InviteInfo | null>(null)
   const invites = ref<Invite[]>([])
   const total = ref(0)
+  const page = ref(1)
+  const perPage = ref(25)
+  const totalPages = ref(1)
+  // Stale-response guard (devices-grid pattern): the LAST issued list wins.
+  let listSeq = 0
   const loading = ref(false)
   const error = ref<string | null>(null)
 
@@ -96,20 +113,37 @@ export const useInviteStore = defineStore('invite', () => {
     }
   }
 
-  async function listInvites(tenantId: string, page = 1) {
+  async function listInvites(tenantId: string, opts: InviteFetchOpts | number = {}) {
+    // Back-compat: the pre-FR-11 signature was (tenantId, page).
+    const o: InviteFetchOpts = typeof opts === 'number' ? { page: opts } : opts
+    const mySeq = ++listSeq
     loading.value = true
     error.value = null
     try {
+      const params = new URLSearchParams()
+      params.set('page', String(o.page ?? 1))
+      params.set('per_page', String(o.perPage ?? perPage.value))
+      if (o.q) params.set('q', o.q)
+      if (o.status) params.set('status', o.status)
+      if (o.sort) {
+        params.set('sort', o.sort)
+        if (o.dir) params.set('dir', o.dir)
+      }
       const data = await api.get<InviteList>(
-        `/tenant/${tenantId}/invite?page=${page}`,
+        `/tenant/${tenantId}/invite?${params.toString()}`,
       )
+      if (mySeq !== listSeq) return
       invites.value = data.items
       total.value = data.total
+      page.value = data.page
+      perPage.value = data.per_page
+      totalPages.value = data.total_pages
     } catch (e) {
+      if (mySeq !== listSeq) return
       error.value = (e as Error).message
       throw e
     } finally {
-      loading.value = false
+      if (mySeq === listSeq) loading.value = false
     }
   }
 
@@ -173,6 +207,9 @@ export const useInviteStore = defineStore('invite', () => {
     inviteInfo,
     invites,
     total,
+    page,
+    perPage,
+    totalPages,
     loading,
     error,
     fetchInviteInfo,
