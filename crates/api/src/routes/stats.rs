@@ -784,7 +784,7 @@ pub async fn tenant_mesh(
             doc! { "$match": { "tenant_id": tid, "deleted_at": Bson::Null } },
             doc! { "$set": { "id": { "$toString": "$_id" } } },
             doc! { "$project": {
-                "_id": 0, "id": 1, "name": 1, "last_presence": 1,
+                "_id": 0, "id": 1, "name": 1, "display_name": 1, "last_presence": 1,
                 "agent_version": 1, "relay_home": 1, "os": 1,
             }},
             doc! { "$limit": 500 },

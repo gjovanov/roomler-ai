@@ -64,20 +64,55 @@ impl FileDao {
         self.base.find_by_id(id).await
     }
 
+    /// FR-11: optional name search + sort shared by the file lists. `q` is
+    /// escaped-regex over filename/display_name; sort whitelist is owned by
+    /// the routes (this just maps key→field). `_id` tiebreak keeps skip/limit
+    /// pages disjoint under ties.
+    fn q_filter(mut filter: bson::Document, q: Option<&str>) -> bson::Document {
+        if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
+            let escaped = super::base::escape_regex(q);
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "filename": { "$regex": &escaped, "$options": "i" } },
+                    doc! { "display_name": { "$regex": &escaped, "$options": "i" } },
+                ],
+            );
+        }
+        filter
+    }
+
+    fn sort_doc(sort: Option<&str>, desc: bool) -> bson::Document {
+        let dir = if desc { -1 } else { 1 };
+        match sort {
+            Some("filename") => doc! { "filename": dir, "_id": dir },
+            Some("size") => doc! { "size": dir, "_id": dir },
+            Some("created_at") => doc! { "created_at": dir, "_id": dir },
+            // Default: today's order, unchanged.
+            _ => doc! { "created_at": -1, "_id": -1 },
+        }
+    }
+
     pub async fn find_by_room(
         &self,
         tenant_id: ObjectId,
         room_id: ObjectId,
         params: &PaginationParams,
+        q: Option<&str>,
+        sort: Option<&str>,
+        desc: bool,
     ) -> DaoResult<PaginatedResult<models::File>> {
         self.base
             .find_paginated(
-                doc! {
-                    "tenant_id": tenant_id,
-                    "context.room_id": room_id,
-                    "deleted_at": null,
-                },
-                Some(doc! { "created_at": -1 }),
+                Self::q_filter(
+                    doc! {
+                        "tenant_id": tenant_id,
+                        "context.room_id": room_id,
+                        "deleted_at": null,
+                    },
+                    q,
+                ),
+                Some(Self::sort_doc(sort, desc)),
                 params,
             )
             .await
@@ -106,14 +141,20 @@ impl FileDao {
         &self,
         tenant_id: ObjectId,
         params: &PaginationParams,
+        q: Option<&str>,
+        sort: Option<&str>,
+        desc: bool,
     ) -> DaoResult<PaginatedResult<models::File>> {
         self.base
             .find_paginated(
-                doc! {
-                    "tenant_id": tenant_id,
-                    "deleted_at": null,
-                },
-                Some(doc! { "created_at": -1 }),
+                Self::q_filter(
+                    doc! {
+                        "tenant_id": tenant_id,
+                        "deleted_at": null,
+                    },
+                    q,
+                ),
+                Some(Self::sort_doc(sort, desc)),
                 params,
             )
             .await
