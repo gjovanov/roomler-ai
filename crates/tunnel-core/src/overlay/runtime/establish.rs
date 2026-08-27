@@ -1940,6 +1940,7 @@ impl OverlayRuntime {
                 wg.probe_handshake_done(&p.pubkey) == Some(true),
                 now.duration_since(p.since),
                 p.tier,
+                p.initiated,
             );
             if verdict == ProbeVerdict::Promote {
                 // P3 PR-B — read the probe's REAL latch latency (recv-path
