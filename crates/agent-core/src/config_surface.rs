@@ -495,6 +495,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "fps-first cadence pacing on HW encoders (2026-08-27, drag-latency P5). Default ON: when the encoder cannot hold target fps, frames are consumed on an EVEN grid at the sustainable rate (5 fps steps, floor 15) instead of dropping ~33% at random phases - even cadence beats a jittery higher rate. While engaged the encode-pressure bitrate factor is masked at 1.0 (pixels-bound HW encode time does not respond to bitrate); the resolution tier stays the second lever. false = unpaced pre-P5 behaviour. Env: ROOMLER_NODE_FPS_PACE. Restart required.",
     ),
     (
+        "relay_idr_thrift",
+        "tribool",
+        "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CLK bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_IDR_THRIFT. Restart required.",
+    ),
+    (
         "measured_ceiling",
         "tribool",
         "Measured-rate stage 1 (2026-08-27). Default ON: the bitrate ceiling is clamped to 85% of the session's MEASURED drain rate while an estimate holds, so the encoder converges just under the pipe instead of congesting the send queue on every drag burst (the chunky production skips). Only ever lowers the nominal ceiling; confidence decays after 60s without evidence. false = observe-and-report only. Env: ROOMLER_NODE_MEASURED_CEILING. Restart required.",
@@ -706,6 +711,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "bg_rebuild" => cfg.bg_rebuild.map(fmt_bool),
         "par_convert" => cfg.par_convert.map(fmt_bool),
         "fps_pace" => cfg.fps_pace.map(fmt_bool),
+        "relay_idr_thrift" => cfg.relay_idr_thrift.map(fmt_bool),
         "priority_res_cap" => cfg.priority_res_cap.map(fmt_bool),
         "smoother_rate_pct" => cfg.smoother_rate_pct.map(|p| p.to_string()),
         "balanced_rate_pct" => cfg.balanced_rate_pct.map(|p| p.to_string()),
@@ -1060,6 +1066,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "bg_rebuild" => cfg.bg_rebuild = parse_tribool(value)?,
         "par_convert" => cfg.par_convert = parse_tribool(value)?,
         "fps_pace" => cfg.fps_pace = parse_tribool(value)?,
+        "relay_idr_thrift" => cfg.relay_idr_thrift = parse_tribool(value)?,
         "priority_res_cap" => cfg.priority_res_cap = parse_tribool(value)?,
         "smoother_rate_pct" => cfg.smoother_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,
