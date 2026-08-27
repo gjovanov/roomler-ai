@@ -92,10 +92,24 @@ pub(crate) fn filter_component_releases(
     releases: Vec<AgentRelease>,
     prefix: &str,
 ) -> Vec<AgentRelease> {
-    releases
+    let mut out: Vec<AgentRelease> = releases
         .into_iter()
         .filter(|r| !r.draft && r.tag_name.starts_with(prefix))
-        .collect()
+        .collect();
+    // ⚠ GitHub's REST `/releases` orders by tag name LEXICOGRAPHICALLY, not by
+    // recency — so the "newest first" the doc comment above once relied on is
+    // false the moment a patch number reaches two digits: measured 2026-08-27,
+    // `agent-v0.4.10` (the newest by every other measure) landed NINTH, between
+    // `0.4.2` and `0.4.1`, because "10" < "2" as text. Anything taking
+    // `.first()`/`.find()` then serves a stale release, and the rolling
+    // `0.4.<counter>` scheme guarantees double digits early.
+    //
+    // Sorting HERE makes every consumer correct by construction rather than
+    // each having to remember. Unparseable tags sort last but keep their
+    // relative order (`sort_by_key` is stable), so a hand-made tag is still
+    // reachable by explicit version — it just never wins "latest".
+    out.sort_by_key(|r| std::cmp::Reverse(super::remote_control::release_ord(&r.tag_name)));
+    out
 }
 
 // ─── installer download proxy ─────────────────────────────────────────────────
@@ -348,6 +362,52 @@ mod tests {
         let tunnel = filter_component_releases(releases, "tunnel-v");
         assert_eq!(tunnel.len(), 1);
         assert_eq!(tunnel.first().unwrap().tag_name, "tunnel-v0.3.0-rc.167");
+    }
+
+    /// Regression, measured on prod 2026-08-27: GitHub's REST `/releases`
+    /// orders by tag name as TEXT, so the first double-digit patch of the
+    /// rolling `0.4.<counter>` scheme sank below its own predecessors —
+    /// `agent-v0.4.10` came back NINTH, between `0.4.2` and `0.4.1`. Every
+    /// consumer that took the first match (`?version=latest` for the wizard
+    /// and fresh installs, the cache-bust report) then served 0.4.9 while
+    /// 0.4.10 was current. This fixture IS the order GitHub returned.
+    #[test]
+    fn filter_component_releases_orders_by_version_not_github_text_order() {
+        let releases = vec![
+            release("agent-v0.4.9", false, &[]),
+            release("agent-v0.4.2", false, &[]),
+            release("agent-v0.4.10", false, &[]),
+            release("agent-v0.4.1", false, &[]),
+            release("agent-v0.3.0-rc.484", false, &[]),
+        ];
+        let agent = filter_component_releases(releases, "agent-v");
+        assert_eq!(
+            agent
+                .iter()
+                .map(|r| r.tag_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "agent-v0.4.10",
+                "agent-v0.4.9",
+                "agent-v0.4.2",
+                "agent-v0.4.1",
+                "agent-v0.3.0-rc.484",
+            ],
+            "double-digit patch must outrank single-digit, and finals outrank rc"
+        );
+    }
+
+    /// An unparseable tag must not be able to win "latest" by sorting first,
+    /// and must not disappear either — explicit `?version=` still finds it.
+    #[test]
+    fn unparseable_tags_sort_last_but_survive() {
+        let releases = vec![
+            release("agent-vNIGHTLY", false, &[]),
+            release("agent-v0.4.10", false, &[]),
+        ];
+        let agent = filter_component_releases(releases, "agent-v");
+        assert_eq!(agent.first().unwrap().tag_name, "agent-v0.4.10");
+        assert_eq!(agent.len(), 2, "the odd tag is still reachable by name");
     }
 
     #[test]
