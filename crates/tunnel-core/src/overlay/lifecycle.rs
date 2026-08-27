@@ -562,12 +562,46 @@ pub(crate) enum ProbeVerdict {
     Wait,
 }
 
-/// The probe transition: latch ⇒ promote, past the tier deadline ⇒ expire,
-/// else wait.
-pub(crate) fn probe_tick(handshake_done: bool, since: Duration, tier: DirectTier) -> ProbeVerdict {
+/// #35 — the deadline for a probe we ACCEPTED rather than initiated.
+///
+/// The tier deadlines are sized for an INITIATED probe, which must get an
+/// initiation out through whatever NAT is in the way and wait for the reply.
+/// An accepted probe has already had the peer's initiation delivered — it
+/// needs one response and the peer's follow-up, not a traversal.
+///
+/// Measured over one day on the reference host, successful probes:
+///
+/// | kind | n | mean | max |
+/// |---|---|---|---|
+/// | accepted | 38 | 4115 ms | **4921 ms** |
+/// | initiated | 34 | 5035 ms | 12398 ms |
+///
+/// So 8 s is ~1.6× the observed accepted maximum while cutting the slot hold
+/// roughly in half. It matters because the probe slot is ONE PER PEER: an
+/// accepted probe on a tier the peer chose blocks us from probing a tier we
+/// would rather have, for as long as it runs. Erring short is cheap — the
+/// peer retransmits its initiation every ~5 s (WG's rekey timeout) and we
+/// accept again — whereas erring long starves the better tier.
+pub(crate) const ACCEPTED_PROBE_DEADLINE: Duration = Duration::from_secs(8);
+
+/// The probe transition: latch ⇒ promote, past the deadline ⇒ expire, else
+/// wait. `initiated` selects the deadline — see [`ACCEPTED_PROBE_DEADLINE`].
+pub(crate) fn probe_tick(
+    handshake_done: bool,
+    since: Duration,
+    tier: DirectTier,
+    initiated: bool,
+) -> ProbeVerdict {
+    let deadline = if initiated {
+        tier.handshake_deadline()
+    } else {
+        // `min` so a tier whose own deadline is already shorter keeps it —
+        // this may only ever SHORTEN the wait, never extend one.
+        ACCEPTED_PROBE_DEADLINE.min(tier.handshake_deadline())
+    };
     if handshake_done {
         ProbeVerdict::Promote
-    } else if since > tier.handshake_deadline() {
+    } else if since > deadline {
         ProbeVerdict::Expire
     } else {
         ProbeVerdict::Wait
@@ -673,6 +707,55 @@ mod tests {
         assert_eq!(carrier_tick(&i).death, Some(DeathReason::HardDead));
     }
 
+    /// #35 — an ACCEPTED probe gets a shorter deadline than an initiated one,
+    /// because it needs one response rather than a NAT traversal.
+    ///
+    /// This matters for a reason that is not about the probe itself: the probe
+    /// slot is ONE PER PEER, so an accepted probe on whatever tier the PEER
+    /// chose blocks us from probing a tier we would rather have, for as long
+    /// as it runs. Measured over a day, successful accepted probes latched in
+    /// ≤ 4921 ms (n=38) while initiated ones reached 12398 ms (n=34) — the
+    /// tier deadlines are sized for the latter.
+    #[test]
+    fn an_accepted_probe_expires_sooner_than_an_initiated_one() {
+        let tier = DirectTier::Srflx;
+        let tier_deadline = tier.handshake_deadline();
+        assert!(
+            ACCEPTED_PROBE_DEADLINE < tier_deadline,
+            "the whole point is that it is shorter"
+        );
+        // Past the observed accepted maximum (4.9 s) but inside the tier's:
+        // initiated waits, accepted gives up.
+        let t = ACCEPTED_PROBE_DEADLINE + Duration::from_secs(1);
+        assert_eq!(probe_tick(false, t, tier, true), ProbeVerdict::Wait);
+        assert_eq!(probe_tick(false, t, tier, false), ProbeVerdict::Expire);
+
+        // Comfortably inside both — nobody gives up on a probe that is still
+        // within the measured latch range.
+        let early = Duration::from_millis(4_921);
+        assert_eq!(probe_tick(false, early, tier, true), ProbeVerdict::Wait);
+        assert_eq!(
+            probe_tick(false, early, tier, false),
+            ProbeVerdict::Wait,
+            "the slowest accepted probe ever measured must still be waited for"
+        );
+
+        // A latch always promotes, whoever initiated and however late.
+        assert_eq!(
+            probe_tick(true, tier_deadline * 2, tier, false),
+            ProbeVerdict::Promote
+        );
+
+        // It may only ever SHORTEN: a tier whose own deadline is already
+        // under the cap keeps its own.
+        for t in [DirectTier::Lan, DirectTier::Public, DirectTier::Srflx] {
+            let effective = ACCEPTED_PROBE_DEADLINE.min(t.handshake_deadline());
+            assert!(
+                effective <= t.handshake_deadline(),
+                "{t:?}: an accepted probe must never wait LONGER than an initiated one"
+            );
+        }
+    }
     #[test]
     fn handshake_deadline_fires_only_pre_handshake_per_tier() {
         for (tier, deadline_s) in [
@@ -919,22 +1002,22 @@ mod tests {
             (DirectTier::Public, 30),
         ] {
             assert_eq!(
-                probe_tick(true, Duration::ZERO, tier),
+                probe_tick(true, Duration::ZERO, tier, true),
                 ProbeVerdict::Promote,
                 "latch promotes immediately"
             );
             assert_eq!(
-                probe_tick(false, Duration::from_secs(deadline_s - 1), tier),
+                probe_tick(false, Duration::from_secs(deadline_s - 1), tier, true),
                 ProbeVerdict::Wait
             );
             assert_eq!(
-                probe_tick(false, Duration::from_secs(deadline_s + 1), tier),
+                probe_tick(false, Duration::from_secs(deadline_s + 1), tier, true),
                 ProbeVerdict::Expire
             );
             // A latch exactly at/past the deadline still promotes — the latch
             // check runs first (pre-P2 branch order).
             assert_eq!(
-                probe_tick(true, Duration::from_secs(deadline_s + 5), tier),
+                probe_tick(true, Duration::from_secs(deadline_s + 5), tier, true),
                 ProbeVerdict::Promote
             );
         }
