@@ -6,6 +6,7 @@
       :permanent="!mobile"
       :temporary="mobile"
       :width="navWidth"
+      class="app-nav"
     >
       <!-- Drag the right edge to resize (persisted). Hidden in rail mode —
            rail width is Vuetify's own. -->
@@ -982,6 +983,32 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* The nav's scrollbar was the OS default — thick and permanently visible
+   once Devices is expanded. Thin overlay style instead, thumb shown only
+   while the pointer is over the drawer. The 6px webkit width stays
+   reserved even when the thumb is transparent, so nothing shifts on
+   hover. */
+.app-nav :deep(.v-navigation-drawer__content) {
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: transparent transparent;
+}
+.app-nav:hover :deep(.v-navigation-drawer__content) {
+  scrollbar-color: rgba(var(--v-theme-on-surface), 0.25) transparent;
+}
+.app-nav :deep(.v-navigation-drawer__content)::-webkit-scrollbar {
+  width: 6px;
+}
+.app-nav :deep(.v-navigation-drawer__content)::-webkit-scrollbar-track {
+  background: transparent;
+}
+.app-nav :deep(.v-navigation-drawer__content)::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+}
+.app-nav:hover :deep(.v-navigation-drawer__content)::-webkit-scrollbar-thumb {
+  background: rgba(var(--v-theme-on-surface), 0.25);
+}
+
 /* Drag strip on the drawer's right edge (resizable nav). */
 .nav-resize-handle {
   position: absolute;
