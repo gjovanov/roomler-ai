@@ -105,4 +105,13 @@ labels plan-gated features as such); localization beyond the existing en.json.
 
 ## Field-verification log
 
-- (pending P1)
+- **2026-08-27, prod (`v20260827-cb368eefea67`) — P1 live.** `/tenant/{tid}/tutorial`
+  serves 200 through the SPA fallback; the route's own lazy chunk
+  (`TutorialView-*.js`) is referenced from the entry bundle, and all four
+  hero SVGs return 200 at their built sizes (10.2–12.6 KB), i.e. the
+  README artwork really ships rather than 404-ing behind a broken import.
+  Chapter deep links are contract-tested against the route table, so a
+  renamed route fails the build rather than dead-ending a reader.
+  Remaining for closure: an operator read-through of the eight chapters
+  (prose/accuracy), and one fresh-org account to watch the auto-open fire
+  exactly once — both need a human, not a probe.
