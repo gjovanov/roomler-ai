@@ -2708,6 +2708,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     const c = agent?.value?.capabilities?.clipboard
     return Array.isArray(c) ? c : []
   })
+
+  /** FR-13 (#789): the host is a Mac — its primary modifier is Cmd. */
+  const hostIsMac: ComputedRef<boolean> = computed(() => agent?.value?.os === 'macos')
+  /** FR-13: translate the viewer's Ctrl to the mac host's Cmd (default ON
+   *  for mac hosts; the toolbar toggle restores literal Ctrl for terminal
+   *  work — SIGINT et al). No effect on non-mac hosts. */
+  const ctrlAsCmd = ref(true)
+  // Release-consistency state for translateModifierForHost — keyed on what
+  // was actually sent, so a mid-hold toggle flip can't strand a held Cmd.
+  const ctrlSubState = { ctrlHeldAsCmd: false }
   const supportsClipboardAck = computed(() => clipboardCaps.value.includes('ack'))
   const supportsClipboardEvents = computed(() => clipboardCaps.value.includes('events'))
   const supportsClipboardImages = computed(() => clipboardCaps.value.includes('images'))
@@ -7875,8 +7885,18 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (action.kind === 'text') {
         sendInput({ t: 'key_text', text: action.text })
       } else {
-        sendInput({ t: 'key', code: action.code, down: action.down, mods: action.mods })
-        heldInputs.key(action.code, action.down)
+        // FR-13 (#789): on a mac host, rewrite Ctrl→Cmd (0xe0/0xe4→0xe3)
+        // unless the operator disabled translation. The held tracker
+        // records the SUBSTITUTED code so focus-loss release matches what
+        // the host believes is down.
+        const code = translateModifierForHost(
+          action.code,
+          action.down,
+          hostIsMac.value && ctrlAsCmd.value,
+          ctrlSubState,
+        )
+        sendInput({ t: 'key', code, down: action.down, mods: action.mods })
+        heldInputs.key(code, action.down)
       }
       // rc.18: after a Ctrl+C-over-viewer is forwarded to the host,
       // schedule the auto-mirror of the host's clipboard back to the
@@ -9310,6 +9330,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     keyboardLockActive,
     enableKeyboardLock,
     disableKeyboardLock,
+    /** FR-13 (#789): mac-host Ctrl→Cmd translation — flag + the
+     *  per-session toggle the toolbar renders for mac hosts only. */
+    hostIsMac,
+    ctrlAsCmd,
     /** rc.227 Ã¢ÂÂ remote keyboard-layout state (null on old agents /
      *  non-Windows hosts) + the manual switch sender. */
     remoteLayout,
@@ -9886,6 +9910,42 @@ export function decideKeyAction(
   const mods =
     (ev.ctrlKey ? 1 : 0) | (ev.shiftKey ? 2 : 0) | (ev.altKey ? 4 : 0) | (ev.metaKey ? 8 : 0)
   return { kind: 'key', code, down, mods }
+}
+
+/**
+ * FR-13 (#789): wholesale Ctrl→Cmd substitution for macOS hosts.
+ *
+ * A Windows/Linux viewer's Ctrl chords reach a mac host as literal
+ * Control — which is SIGINT in a terminal and Emacs bindings in Cocoa
+ * text views, never copy/paste. macOS's primary modifier is Command, so
+ * when enabled the LEFT/RIGHT CONTROL usages (0xe0/0xe4) are rewritten
+ * to LeftGui (0xe3 — `Key::Meta` → kVK_Command on the agent, mapped
+ * since 0.1.x, so every deployed agent understands it). This is the
+ * same trade RustDesk/CRD/Parsec ship as "translate mode": Ctrl+C in a
+ * remote mac Terminal becomes Cmd+C (copy) — the per-session toggle
+ * restores literal Ctrl for terminal work.
+ *
+ * The release half is keyed on what was actually SENT, not on the
+ * toggle's current value — flipping the toggle mid-hold must release
+ * the key the host believes is down, or Cmd sticks.
+ */
+export function translateModifierForHost(
+  code: number,
+  down: boolean,
+  enabled: boolean,
+  state: { ctrlHeldAsCmd: boolean },
+): number {
+  if (code !== 0xe0 && code !== 0xe4) return code
+  if (down) {
+    if (!enabled) return code
+    state.ctrlHeldAsCmd = true
+    return 0xe3
+  }
+  if (state.ctrlHeldAsCmd) {
+    state.ctrlHeldAsCmd = false
+    return 0xe3
+  }
+  return code
 }
 
 export { browserButton, kbdCodeToHid }
