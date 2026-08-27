@@ -295,7 +295,8 @@ const meshNodes = computed<MeshNode[]>(() => {
     const agent = n.agent_id_hex ? agentById.get(n.agent_id_hex) : undefined
     return {
       id: n.id,
-      name: agent?.name || n.name || n.overlay_ip || n.id.slice(-6),
+      // FR-11: the operator's display name wins when set.
+      name: agent?.display_name || agent?.name || n.name || n.overlay_ip || n.id.slice(-6),
       online: agent?.last_presence === 'online',
       relay_home: agent?.relay_home ?? n.relay_home ?? null,
       version: agent?.agent_version ?? null,
