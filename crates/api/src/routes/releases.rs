@@ -267,13 +267,19 @@ pub struct NewestTags {
 }
 
 impl NewestTags {
-    /// GitHub returns newest-first, so the first match per prefix is the
-    /// newest — the same assumption `filter_component_releases` documents.
+    /// Highest VERSION per prefix — deliberately not "GitHub's first match",
+    /// which is what this used to do. GitHub's REST `/releases` orders by tag
+    /// name lexicographically, so `agent-v0.4.10` sorts below `agent-v0.4.2`
+    /// and the first match stops being the newest as soon as a patch number
+    /// reaches two digits (measured 2026-08-27). This report is how an
+    /// operator confirms a cache bust actually took, so it reporting a stale
+    /// tag would send them looking for the wrong bug.
     pub fn from_releases(releases: &[AgentRelease]) -> Self {
         let newest = |prefix: &str| {
             releases
                 .iter()
-                .find(|r| !r.draft && r.tag_name.starts_with(prefix))
+                .filter(|r| !r.draft && r.tag_name.starts_with(prefix))
+                .max_by_key(|r| super::remote_control::release_ord(&r.tag_name))
                 .map(|r| r.tag_name.clone())
         };
         Self {
