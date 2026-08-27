@@ -3478,6 +3478,7 @@ async fn media_pump_vp9_444_dc(
             if let Some(applied) = governor.pre_encode_tick(
                 ceiling,
                 aimd_floor,
+                constrained_transport,
                 send_tx.capacity(),
                 std::time::Instant::now(),
             ) {
@@ -4455,7 +4456,13 @@ async fn media_pump_ffmpeg_dc(
                     }
                 }
             }
-            if pending_swap.is_none()
+            // Relay (field 2026-08-27): never START a swap — its adoption
+            // IDR is a multi-second lump through the thin pipe; the apply
+            // arms route relay rate moves through the rc.445 defer instead.
+            // A transport flip mid-flight also drops any stale wanted value.
+            if constrained {
+                swap_wanted = None;
+            } else if pending_swap.is_none()
                 && let Some(bps) = swap_wanted
                 && last_swap_at.elapsed() >= SWAP_MIN_INTERVAL
             {
@@ -4659,11 +4666,13 @@ async fn media_pump_ffmpeg_dc(
                 && let Some(enc) = encoder.as_mut()
             {
                 // rc.445 — congestion here means motion almost surely;
-                // rebuild-bound encoders swap in the background (P3) or,
-                // with the hatch off, defer (see `deferred_bps`).
+                // rebuild-bound encoders swap in the background (P3,
+                // DIRECT only — on a relay a swap's IDR is a multi-second
+                // lump through the thin pipe; field 2026-08-27, CORPLAP-3 +
+                // CORPLAP-2 got WORSE) or defer (see `deferred_bps`).
                 if enc.supports_dynamic_bitrate() {
                     enc.set_bitrate(applied.bps);
-                } else if bg_rebuild {
+                } else if bg_rebuild && !constrained {
                     swap_wanted = Some(applied.bps);
                 } else {
                     deferred_bps = Some(applied.bps);
@@ -5179,18 +5188,23 @@ async fn media_pump_ffmpeg_dc(
         if let Some(applied) = governor.pre_encode_tick(
             ceiling,
             aimd_floor,
+            constrained,
             send_tx.capacity(),
             std::time::Instant::now(),
         ) {
             // P3 — rebuild-bound applies (QSV/AMF) go through the
             // background swap so rate moves land DURING motion with zero
-            // stall; NVENC still reconfigures in place. With the hatch
-            // off, the rc.445 motion-defer applies (held while frames
-            // flow, flushed at 1.2 s of quiet as a blocking re-open).
+            // stall; NVENC still reconfigures in place. DIRECT only:
+            // each adoption ships a fresh IDR, which on a ~2 Mbps relay
+            // is a multi-second lump mid-motion (field 2026-08-27, CORPLAP-3 +
+            // CORPLAP-2 over the corp relay felt WORSE than the rc.483
+            // defer) — relay keeps the rc.445 motion-defer below, the
+            // posture that was field-proven there. Also the fallback
+            // with the hatch off.
             if enc.supports_dynamic_bitrate() {
                 deferred_bps = None;
                 enc.set_bitrate(applied.bps);
-            } else if bg_rebuild {
+            } else if bg_rebuild && !constrained {
                 swap_wanted = Some(applied.bps);
             } else if last_motion_at.elapsed() >= DEFER_QUIET {
                 deferred_bps = None;
@@ -5450,11 +5464,12 @@ async fn media_pump_ffmpeg_dc(
                     // signal; note it to the AIMD (rate-limited MD internally).
                     // `enc` is in scope from the encode above. rc.445 — an
                     // overflow IS motion; rebuild-bound encoders swap in the
-                    // background (P3) or, hatch off, defer.
+                    // background (P3, direct only — see the loop-top block)
+                    // or defer.
                     if let Some(applied) = governor.on_send_overflow(std::time::Instant::now()) {
                         if enc.supports_dynamic_bitrate() {
                             enc.set_bitrate(applied.bps);
-                        } else if bg_rebuild {
+                        } else if bg_rebuild && !constrained {
                             swap_wanted = Some(applied.bps);
                         } else {
                             deferred_bps = Some(applied.bps);
