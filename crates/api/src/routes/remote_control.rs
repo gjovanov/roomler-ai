@@ -744,6 +744,56 @@ pub struct TriggerUpdateRequest {
     /// latest. Forwarded verbatim to the agent.
     #[serde(default)]
     pub pin: Option<String>,
+    /// A pin that is strictly OLDER than what the agent runs is refused with
+    /// 409 unless this is set — a deliberate-downgrade escape hatch (crash
+    /// rollback, repro of an old build). FR-2: on 2026-08-27 a stale
+    /// operator script pinned rc.484 at a fleet already on 0.4.1 and five
+    /// hosts downgraded; the server is the one place that always knows both
+    /// versions at push time.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Order a release tag / bare semver as `(major, minor, patch, pre_rank)` —
+/// the same tuple the agent updater's `parse_version` uses (`rc.N` ranks N,
+/// a final ranks `u64::MAX`, so `0.3.0-rc.482 < 0.4.0 < 0.4.1`). `None` for
+/// anything unparseable — the guard then stays out of the way (it can't
+/// claim "downgrade" about an ordering it can't compute; the agent's own
+/// verifier still gates what actually installs).
+pub(crate) fn release_ord(v: &str) -> Option<(u64, u64, u64, u64)> {
+    let s = v
+        .trim()
+        .trim_start_matches("agent-")
+        .trim_start_matches('v');
+    let (core, pre) = match s.find('-') {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let mut it = core.split('.');
+    let major: u64 = it.next()?.parse().ok()?;
+    let minor: u64 = it.next()?.parse().ok()?;
+    let patch: u64 = it.next()?.parse().ok()?;
+    let pre_rank = match pre {
+        None => u64::MAX,
+        Some(p) => p
+            .strip_prefix("rc.")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(u64::MAX),
+    };
+    Some((major, minor, patch, pre_rank))
+}
+
+/// FR-2 downgrade guard: `Some(reason)` when `pin` is strictly older than
+/// the version the agent reports. Equal is ALLOWED (re-install is a normal
+/// recovery move); unknown orderings are allowed (see `release_ord`).
+fn pin_downgrade(pin: &str, agent_version: &str) -> Option<String> {
+    match (release_ord(pin), release_ord(agent_version)) {
+        (Some(p), Some(c)) if p < c => Some(format!(
+            "pin {pin} is older than the agent's current {agent_version} — a stale pin \
+             would DOWNGRADE this device; pass force=true to do it deliberately"
+        )),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -753,6 +803,11 @@ pub struct TriggerUpdateResult {
     /// full outbound queue); offline agents pick the release up on their own
     /// periodic check anyway.
     pub delivered: bool,
+    /// FR-2: set (with the reason) when the push was NOT sent because the
+    /// pin would downgrade this agent and `force` wasn't given. Additive —
+    /// absent on delivered/offline rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// POST /api/tenant/{tid}/agent/{agent_id}/update — push `rc:agent.update`
@@ -782,7 +837,15 @@ pub async fn trigger_agent_update(
     .await?;
 
     // Tenant-scope the target (404 for a foreign agent id).
-    let _ = state.agents.find_in_tenant(tid, aid).await?;
+    let agent = state.agents.find_in_tenant(tid, aid).await?;
+
+    // FR-2: refuse a stale pin that would downgrade, unless forced.
+    if let Some(pin) = body.pin.as_deref()
+        && !body.force
+        && let Some(reason) = pin_downgrade(pin, &agent.agent_version)
+    {
+        return Err(ApiError::Conflict(reason));
+    }
 
     let pin = body.pin;
     let delivered = state
@@ -799,6 +862,7 @@ pub async fn trigger_agent_update(
     Ok(Json(TriggerUpdateResult {
         agent_id: aid.to_hex(),
         delivered,
+        refused: None,
     }))
 }
 
@@ -810,6 +874,12 @@ pub struct BulkTriggerUpdateRequest {
     pub agent_ids: Option<Vec<String>>,
     #[serde(default)]
     pub pin: Option<String>,
+    /// FR-2: allow pins that downgrade (see `TriggerUpdateRequest::force`).
+    /// Bulk refusals are PER-AGENT (`results[].refused`) rather than failing
+    /// the whole request — a fleet-wide push must not be all-or-nothing over
+    /// one already-updated device.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -817,6 +887,9 @@ pub struct BulkTriggerUpdateResponse {
     pub results: Vec<TriggerUpdateResult>,
     pub requested: usize,
     pub delivered: usize,
+    /// FR-2: how many targets were skipped because the pin would downgrade
+    /// them (additive; 0 when force or no pin).
+    pub refused: usize,
 }
 
 /// POST /api/tenant/{tid}/agent/update — push `rc:agent.update` to selected
@@ -840,15 +913,16 @@ pub async fn trigger_agents_update(
     )
     .await?;
 
-    let target_ids: Vec<ObjectId> = match body.agent_ids {
+    // (id, running version) — the FR-2 guard needs the version per target.
+    let targets: Vec<(ObjectId, String)> = match body.agent_ids {
         Some(ids) if !ids.is_empty() => {
             let mut out = Vec::with_capacity(ids.len());
             for id in ids {
                 let aid = ObjectId::parse_str(&id)
                     .map_err(|_| ApiError::BadRequest(format!("Invalid agent_id: {id}")))?;
                 // Tenant-scope every explicit target.
-                let _ = state.agents.find_in_tenant(tid, aid).await?;
-                out.push(aid);
+                let a = state.agents.find_in_tenant(tid, aid).await?;
+                out.push((aid, a.agent_version));
             }
             out
         }
@@ -864,13 +938,31 @@ pub async fn trigger_agents_update(
                     },
                 )
                 .await?;
-            page.items.into_iter().filter_map(|a| a.id).collect()
+            page.items
+                .into_iter()
+                .filter_map(|a| a.id.map(|i| (i, a.agent_version)))
+                .collect()
         }
     };
 
-    let mut results = Vec::with_capacity(target_ids.len());
+    let mut results = Vec::with_capacity(targets.len());
     let mut delivered = 0usize;
-    for aid in &target_ids {
+    let mut refused = 0usize;
+    for (aid, version) in &targets {
+        // FR-2: skip (never fail the batch) targets a stale pin would
+        // downgrade.
+        if let Some(pin) = body.pin.as_deref()
+            && !body.force
+            && let Some(reason) = pin_downgrade(pin, version)
+        {
+            refused += 1;
+            results.push(TriggerUpdateResult {
+                agent_id: aid.to_hex(),
+                delivered: false,
+                refused: Some(reason),
+            });
+            continue;
+        }
         let ok = state
             .rc_hub
             .send_to_agent(
@@ -886,16 +978,18 @@ pub async fn trigger_agents_update(
         results.push(TriggerUpdateResult {
             agent_id: aid.to_hex(),
             delivered: ok,
+            refused: None,
         });
     }
     tracing::info!(
         admin = %auth.user_id, tenant = %tid,
-        requested = target_ids.len(), delivered, pin = ?body.pin,
+        requested = targets.len(), delivered, refused, pin = ?body.pin,
         "operator-triggered bulk agent self-update"
     );
     Ok(Json(BulkTriggerUpdateResponse {
         requested: results.len(),
         delivered,
+        refused,
         results,
     }))
 }
@@ -1480,5 +1574,36 @@ mod tests {
             normalize_routes(vec!["".to_string(), "   ".to_string()]).unwrap(),
             Vec::<String>::new()
         );
+    }
+}
+
+#[cfg(test)]
+mod fr2_downgrade_guard_tests {
+    use super::{pin_downgrade, release_ord};
+
+    #[test]
+    fn ordering_matches_the_agent_updater() {
+        // rc train < finals; finals order by patch; tags and bare semvers
+        // both parse.
+        assert!(release_ord("agent-v0.3.0-rc.482") < release_ord("agent-v0.4.0"));
+        assert!(release_ord("0.4.0") < release_ord("0.4.1"));
+        assert!(release_ord("agent-v0.4.1") < release_ord("v0.4.2"));
+        assert!(release_ord("0.3.0-rc.9") < release_ord("0.3.0-rc.100"));
+        assert_eq!(release_ord("agent-v0.4.2"), release_ord("0.4.2"));
+        assert_eq!(release_ord("not-a-version"), None);
+    }
+
+    #[test]
+    fn strict_downgrades_are_named_everything_else_passes() {
+        // The 2026-08-27 incident shape: rc.484 pinned at a 0.4.1 fleet.
+        assert!(pin_downgrade("agent-v0.3.0-rc.484", "0.4.1").is_some());
+        assert!(pin_downgrade("agent-v0.4.0", "0.4.1").is_some());
+        // Upgrades and re-installs pass.
+        assert!(pin_downgrade("agent-v0.4.2", "0.4.1").is_none());
+        assert!(pin_downgrade("agent-v0.4.1", "0.4.1").is_none());
+        // Unknown orderings stay out of the way — the guard cannot claim
+        // "downgrade" about what it cannot compare.
+        assert!(pin_downgrade("agent-vNEXT", "0.4.1").is_none());
+        assert!(pin_downgrade("agent-v0.4.0", "custom-build").is_none());
     }
 }
