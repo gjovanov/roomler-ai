@@ -43,7 +43,7 @@ instead: a reader who meets `FR-4` in an old commit message must land on the rig
 | FR | Issue | Title | Status |
 |---|---|---|---|
 | [FR-1](FR-1-remote-desktop-drag-smoothness.md) | [#767](https://github.com/gjovanov/roomler-ai/issues/767) | RustDesk-parity remote-desktop drag smoothness | in progress — P1–P4 shipped + field-verified, P5–P7 open |
-| FR-2 | [#770](https://github.com/gjovanov/roomler-ai/issues/770) | Pin-update downgrade guard | in progress — spec lands with PR #771 |
+| [FR-2](FR-2-pin-update-downgrade-guard.md) | [#770](https://github.com/gjovanov/roomler-ai/issues/770) | Pin-update downgrade guard | closed — shipped (#771) + field-verified on prod 2026-08-27 |
 | ~~FR-3~~ | — | *vacated* — the #773/#774 collision; both claimants renumbered | never reuse |
 | [FR-4](FR-4-conference-media-path-integrity.md) | [#776](https://github.com/gjovanov/roomler-ai/issues/776) | Conference media-path integrity | closed — shipped + field-verified (retrospective) |
 | [FR-5](FR-5-macos-unattended-update-chain.md) | [#774](https://github.com/gjovanov/roomler-ai/issues/774) | macOS unattended update chain | closed — field-closed at agent rc.482 (retrospective) |
@@ -52,3 +52,7 @@ instead: a reader who meets `FR-4` in an old commit message must land on the rig
 | [FR-8](FR-8-claude-session-restore.md) | [#780](https://github.com/gjovanov/roomler-ai/issues/780) | Claude session restore after reboot (`crestore`) | closed — shipped (retrospective); renumbered from FR-7, which #778 claimed 147 s earlier |
 | FR-9 | [#768](https://github.com/gjovanov/roomler-ai/issues/768) | Two nodes sharing a LAN converge to a direct carrier | acceptance criteria met; renumbered from `FR-01`; **spec lands with PR #769** |
 
+| [FR-10](FR-10-relay-drag-quality.md) | [#783](https://github.com/gjovanov/roomler-ai/issues/783) | Relay drag quality — IDR thrift on constrained transports | in progress — spec on master (`2366859d`); kept FR-10 by the lower-issue-id rule vs #784 |
+| [FR-11](FR-11-server-grids-members-files-invites.md) | [#784](https://github.com/gjovanov/roomler-ai/issues/784) | Server-side grids — members/files/invites, devices online-first default sort, mesh display names | in progress — P1 backend in PR; renumbered from FR-10 (lower-issue-id rule, #783 keeps it) |
+| [FR-12](FR-12-onboarding-tutorial.md) | [#788](https://github.com/gjovanov/roomler-ai/issues/788) | Onboarding tutorial — guided welcome tour, callable anytime | design+plan — spec lands with the FR-11 P1 PR |
+| [FR-13](FR-13-rc-keyboard-hid-mapping-mac-chords.md) | [#789](https://github.com/gjovanov/roomler-ai/issues/789) | RC keyboard: unmapped HID usages type garbage (CapsLock→`9`); mac Ctrl→Cmd chords | investigated — root causes pinned in spec; fix = agent half + viewer half |
