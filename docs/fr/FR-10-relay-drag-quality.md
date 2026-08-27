@@ -1,6 +1,6 @@
 # FR-10: Relay drag quality — IDR thrift on constrained transports
 
-**Status:** spec'd from field evidence 2026-08-27; implementation in progress.
+**Status:** shipped in `agent-v0.4.5` (#785); field gate pending.
 Tracking issue: `FR-10` in gjovanov/roomler-ai/issues. Child of FR-1 (#767), which
 gated the direct-path rate machinery off relay and left goodput observe-only there.
 
@@ -81,4 +81,4 @@ direct path entirely, and every FR-1 mechanism.
 
 | Release | Result |
 |---|---|
-| (pending) | |
+| 0.4.5 (relay_idr_thrift) | shipped — field gate pending: CORPLAP-3 drag from neo16 (settle_kf_suppressed climbing, bytes_inflight lumps gone, bulky feel reduced) |
