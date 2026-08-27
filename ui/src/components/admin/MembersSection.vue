@@ -1,8 +1,37 @@
 <template>
   <v-card>
-    <v-card-title class="d-flex align-center">
+    <v-card-title class="d-flex align-center flex-wrap ga-2">
       <span>Members</span>
       <v-spacer />
+      <!-- FR-11: server-side search over display name / email / nickname. -->
+      <v-text-field
+        v-model="gridSearch"
+        density="compact"
+        hide-details
+        clearable
+        prepend-inner-icon="mdi-magnify"
+        placeholder="Search name or email"
+        style="max-width: 260px"
+        class="flex-grow-0"
+      />
+      <v-btn
+        icon="mdi-table-cog"
+        size="small"
+        variant="text"
+        :color="colsCustomized ? 'primary' : undefined"
+        title="Configure columns"
+        aria-label="Configure columns"
+        @click="colDialogOpen = true"
+      />
+      <v-btn
+        v-if="canAdd"
+        color="primary"
+        size="small"
+        prepend-icon="mdi-account-plus"
+        @click="openAddDialog"
+      >
+        Add member
+      </v-btn>
       <span class="text-body-2 text-medium-emphasis">{{ membersStore.total }} total</span>
     </v-card-title>
 
@@ -35,80 +64,131 @@
         Assign roles to grant permissions — device access (remote control,
         device management, audit) is role-driven. Changing roles needs the
         <span class="font-weight-medium">Manage roles</span> permission. New
-        people join via Invites.
+        people join via Invites, or add an existing account by email.
       </p>
 
-      <div v-if="membersStore.loading && membersStore.items.length === 0" class="d-flex justify-center pa-8">
-        <v-progress-circular indeterminate />
-      </div>
-
-      <p
-        v-else-if="membersStore.items.length === 0"
-        class="text-medium-emphasis pa-4 pa-md-6"
+      <v-data-table-server
+        v-model:page="gridPage"
+        v-model:items-per-page="gridPerPage"
+        :headers="effectiveHeaders"
+        :items="membersStore.items"
+        :items-length="membersStore.total"
+        :loading="membersStore.loading"
+        :items-per-page-options="[10, 25, 50, 100]"
+        density="compact"
+        class="members-table"
+        item-value="id"
+        @update:options="onGridOptions"
       >
-        No members found.
-      </p>
-
-      <template v-else>
-        <v-table density="compact">
-          <thead>
-            <tr>
-              <th>Member</th>
-              <th>Roles</th>
-              <th>Joined</th>
-              <th class="text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="member in membersStore.items" :key="member.id">
-              <td>
-                <div class="font-weight-medium">{{ member.display_name || '(unknown)' }}</div>
-                <div v-if="member.nickname" class="text-caption text-medium-emphasis">
-                  {{ member.nickname }}
-                </div>
-              </td>
-              <td>
-                <template v-if="member.role_ids.length">
-                  <v-chip
-                    v-for="role in rolesOf(member)"
-                    :key="role.id"
-                    size="x-small"
-                    variant="tonal"
-                    class="mr-1 mb-1"
-                    :style="chipStyle(role)"
-                  >
-                    {{ role.name }}
-                  </v-chip>
-                </template>
-                <span v-else class="text-caption text-medium-emphasis">—</span>
-              </td>
-              <td class="text-no-wrap">{{ joinedLabel(member.joined_at) }}</td>
-              <td class="text-right text-no-wrap">
-                <v-btn
-                  size="small"
-                  variant="text"
-                  prepend-icon="mdi-shield-account"
-                  @click="openRolesDialog(member)"
-                >
-                  Roles
-                </v-btn>
-              </td>
-            </tr>
-          </tbody>
-        </v-table>
-
-        <div v-if="membersStore.totalPages > 1" class="d-flex justify-center mt-4">
-          <v-pagination
-            :model-value="membersStore.page"
-            :length="membersStore.totalPages"
-            density="compact"
-            total-visible="7"
-            @update:model-value="(p: number) => membersStore.fetchMembers(props.tenantId, p)"
-          />
-        </div>
-      </template>
+        <template #item.name="{ item }">
+          <div class="font-weight-medium">{{ item.display_name || '(unknown)' }}</div>
+          <div v-if="item.nickname" class="text-caption text-medium-emphasis">
+            {{ item.nickname }}
+          </div>
+        </template>
+        <template #item.email="{ item }">
+          <span v-if="item.email">{{ item.email }}</span>
+          <span v-else class="text-caption text-medium-emphasis">—</span>
+        </template>
+        <template #item.roles="{ item }">
+          <template v-if="item.role_ids.length">
+            <v-chip
+              v-for="role in rolesOf(item)"
+              :key="role.id"
+              size="x-small"
+              variant="tonal"
+              class="mr-1 mb-1"
+              :style="chipStyle(role)"
+            >
+              {{ role.name }}
+            </v-chip>
+          </template>
+          <span v-else class="text-caption text-medium-emphasis">—</span>
+        </template>
+        <template #item.joined_at="{ item }">
+          {{ joinedLabel(item.joined_at) }}
+        </template>
+        <template #item.actions="{ item }">
+          <div class="text-no-wrap">
+            <v-btn
+              size="small"
+              variant="text"
+              prepend-icon="mdi-shield-account"
+              @click="openRolesDialog(item)"
+            >
+              Roles
+            </v-btn>
+            <!-- The owner is unremovable (server 409s as the backstop);
+                 removing YOURSELF is "leave". -->
+            <v-btn
+              v-if="item.user_id !== ownerId"
+              size="small"
+              variant="text"
+              color="error"
+              :prepend-icon="item.user_id === myUserId ? 'mdi-exit-run' : 'mdi-account-remove'"
+              @click="askRemove(item)"
+            >
+              {{ item.user_id === myUserId ? 'Leave' : 'Remove' }}
+            </v-btn>
+            <v-tooltip v-else text="The organization owner cannot be removed" location="top">
+              <template #activator="{ props: tipProps }">
+                <v-icon v-bind="tipProps" size="small" class="ml-2 text-medium-emphasis">
+                  mdi-crown
+                </v-icon>
+              </template>
+            </v-tooltip>
+          </div>
+        </template>
+      </v-data-table-server>
     </v-card-text>
   </v-card>
+
+  <GridColumnPickerDialog
+    v-model="colDialogOpen"
+    :entries="colEntries"
+    @toggle="colToggle"
+    @reorder="colReorder"
+    @reset="colReset"
+  />
+
+  <!-- FR-11: add an existing account by email — no invite round-trip. -->
+  <v-dialog v-model="addDialog" max-width="440">
+    <v-card>
+      <v-card-title>Add member by email</v-card-title>
+      <v-card-text>
+        <v-alert v-if="addError" type="error" variant="tonal" density="compact" class="mb-4">
+          {{ addError }}
+        </v-alert>
+        <p class="text-body-2 text-medium-emphasis mb-3">
+          Adds an account that already exists on this server. For someone
+          without an account, use Invites instead.
+        </p>
+        <v-text-field
+          v-model="addEmail"
+          label="Email address"
+          type="email"
+          autofocus
+          :rules="[rules.email]"
+          @keydown.enter="submitAdd"
+        />
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="addDialog = false">Cancel</v-btn>
+        <v-btn color="primary" :loading="addBusy" :disabled="!addEmail" @click="submitAdd">
+          Add
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <ConfirmDialog
+    v-model="removeDialog"
+    :title="removeTarget?.user_id === myUserId ? 'Leave organization' : 'Remove member'"
+    :message="removeMessage"
+    confirm-color="error"
+    @confirm="doRemove"
+  />
 
   <!-- Per-member role assignment -->
   <v-dialog v-model="rolesDialog" max-width="500">
@@ -170,14 +250,96 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useMembersStore, type Member } from '@/stores/members'
 import { useRoleStore, type Role } from '@/stores/role'
+import { useTenantStore } from '@/stores/tenant'
+import { useAuthStore } from '@/stores/auth'
+import { useValidation } from '@/composables/useValidation'
+import { canManageInvites } from '@/utils/permissions'
+import { useGridColumns } from '@/composables/useGridColumns'
+import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.vue'
+import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 
 const props = defineProps<{ tenantId: string }>()
 
 const membersStore = useMembersStore()
 const roleStore = useRoleStore()
+const tenantStore = useTenantStore()
+const auth = useAuthStore()
+const { rules } = useValidation()
+
+const myUserId = computed(() => auth.user?.id)
+const ownerId = computed(() => tenantStore.current?.owner_id)
+const canAdd = computed(() => canManageInvites(tenantStore.myPermissions, tenantStore.isOwner))
+
+// ── grid state (devices-grid kit) ──────────────────────────────────
+
+const gridPage = ref(1)
+const gridPerPage = ref(25)
+const gridSearch = ref('')
+const gridSort = ref<string | undefined>(undefined)
+const gridDir = ref<'asc' | 'desc' | undefined>(undefined)
+
+const memberHeaders = computed(() => [
+  // Keys double as the server sort keys (name | email | joined_at).
+  { title: 'Member', key: 'name', sortable: true },
+  { title: 'Email', key: 'email', sortable: true },
+  { title: 'Roles', key: 'roles', sortable: false },
+  { title: 'Joined', key: 'joined_at', sortable: true },
+  { title: 'Actions', key: 'actions', sortable: false, align: 'end' as const },
+])
+const colDialogOpen = ref(false)
+const {
+  effectiveHeaders,
+  entries: colEntries,
+  toggle: colToggle,
+  reorder: colReorder,
+  reset: colReset,
+  customized: colsCustomized,
+} = useGridColumns({
+  headers: memberHeaders,
+  gridId: 'members',
+  scope: () => `${auth.user?.id ?? 'anon'}:${props.tenantId}`,
+})
+
+function fetchGrid() {
+  void membersStore.fetchMembers(props.tenantId, {
+    page: gridPage.value,
+    perPage: gridPerPage.value,
+    q: gridSearch.value || undefined,
+    sort: gridSort.value,
+    dir: gridDir.value,
+  })
+}
+
+/** v-data-table-server fires this once on mount too — it is the grid's ONLY
+ *  fetch trigger for page/sort changes (a separate onMounted fetch would
+ *  double-load). */
+function onGridOptions(opts: {
+  page: number
+  itemsPerPage: number
+  sortBy: Array<{ key: string; order: 'asc' | 'desc' }>
+}) {
+  gridPage.value = opts.page
+  gridPerPage.value = opts.itemsPerPage
+  gridSort.value = opts.sortBy[0]?.key
+  gridDir.value = opts.sortBy[0]?.order
+  fetchGrid()
+}
+
+let gridSearchTimer: ReturnType<typeof setTimeout> | undefined
+watch(gridSearch, () => {
+  if (gridSearchTimer) clearTimeout(gridSearchTimer)
+  gridSearchTimer = setTimeout(() => {
+    if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+    else fetchGrid()
+  }, 300)
+})
+
+// Roles for the chips — cheap and idempotent if the Roles section already
+// loaded them. (The grid itself first fetches from @update:options.)
+void roleStore.fetchRoles(props.tenantId)
 
 const sortedRoles = computed(() =>
   [...roleStore.roles].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name)),
@@ -195,6 +357,63 @@ function chipStyle(role: Role) {
 function joinedLabel(iso: string): string {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString()
+}
+
+// ── add by email (FR-11) ───────────────────────────────────────────
+
+const addDialog = ref(false)
+const addEmail = ref('')
+const addError = ref<string | null>(null)
+const addBusy = ref(false)
+
+function openAddDialog() {
+  addEmail.value = ''
+  addError.value = null
+  addDialog.value = true
+}
+
+async function submitAdd() {
+  if (!addEmail.value || addBusy.value) return
+  addBusy.value = true
+  addError.value = null
+  try {
+    await membersStore.addByEmail(props.tenantId, addEmail.value.trim())
+    addDialog.value = false
+    fetchGrid()
+  } catch (e) {
+    addError.value = (e as Error).message
+  } finally {
+    addBusy.value = false
+  }
+}
+
+// ── remove / leave (FR-11) ─────────────────────────────────────────
+
+const removeDialog = ref(false)
+const removeTarget = ref<Member | null>(null)
+
+const removeMessage = computed(() => {
+  const m = removeTarget.value
+  if (!m) return ''
+  return m.user_id === myUserId.value
+    ? 'Leave this organization? You lose access until someone re-adds or re-invites you.'
+    : `Remove ${m.display_name || m.email || 'this member'} from the organization? Their account is untouched — they just lose access here.`
+})
+
+function askRemove(member: Member) {
+  removeTarget.value = member
+  removeDialog.value = true
+}
+
+async function doRemove() {
+  const m = removeTarget.value
+  if (!m) return
+  try {
+    await membersStore.removeMember(props.tenantId, m.user_id)
+    fetchGrid()
+  } catch (e) {
+    membersStore.error = (e as Error).message
+  }
 }
 
 // ── per-member role dialog ─────────────────────────────────────────
@@ -235,13 +454,6 @@ async function toggleRole(role: Role, on: boolean) {
     busyRoleId.value = null
   }
 }
-
-onMounted(() => {
-  void membersStore.fetchMembers(props.tenantId)
-  // Role names/colors for the chips — cheap and idempotent if the Roles
-  // section already loaded them.
-  void roleStore.fetchRoles(props.tenantId)
-})
 </script>
 
 <style scoped>
@@ -250,5 +462,20 @@ onMounted(() => {
   width: 10px;
   height: 10px;
   border-radius: 50%;
+}
+
+/* Never squeeze the columns into the viewport — cells keep their natural
+   width and the WRAPPER scrolls horizontally (house rule: wide tables
+   scroll in their own container). */
+.members-table :deep(.v-table__wrapper) {
+  overflow-x: auto;
+}
+.members-table :deep(table) {
+  width: max-content;
+  min-width: 100%;
+}
+.members-table :deep(th),
+.members-table :deep(td) {
+  white-space: nowrap;
 }
 </style>
