@@ -349,7 +349,14 @@ Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`.
 **Creating the FR is a step of the PLAN**, alongside the implementation steps — not a
 write-up produced afterwards. Plan it, open it, then build against it:
 
-1. **Spec doc first**: `docs/fr/FR-N-<slug>.md` on master — Goal, root-cause/field
+0. **Open the issue BEFORE you implement.** The FR is part of the plan, not paperwork
+   filed after the fact, and it is the only collision guard that actually works: on
+   2026-08-26 two sessions independently built the same feature from the same recorded
+   decision in a memory file (#724 vs a branch that was discarded). A memory file is
+   invisible to the other session; an open issue is not. Re-fetch master and list open FR
+   issues before starting.
+1. **Spec doc**: `docs/fr/FR-N-<slug>.md` — on master up front where the design is known,
+   with the implementation PR where it is not (#770); the issue body says which. Goal, root-cause/field
    evidence, key design with `file:line` anchors verified against master, a phase/status
    table with each phase's kill switch, acceptance criteria as checkboxes, open decisions,
    out-of-scope, and a field-verification log. **Claim the number by adding your row to
@@ -367,10 +374,17 @@ write-up produced afterwards. Plan it, open it, then build against it:
 2. **GitHub issue** `FR-N: <title>` in `gjovanov/roomler-ai/issues` (labels:
    `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
    Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
-3. **Comment as you ship**: every merged PR and release gets a comment on the issue with
-   what landed, the knobs, and the FIELD RESULT once measured (CI green ≠ done — quote the
-   operator's read or the heartbeat numbers). Update the spec's status table + check off
-   acceptance criteria in the same breath.
+3. **Comment as you ship — every step, not just the finish.** Two shapes, both already in
+   use on #768:
+   - a **`## Step log`** table (`# | step | PR | outcome`) appended to as each PR merges,
+     so the arc is readable without archaeology through `git log`;
+   - a **`## Result — field-verified on <version>`** comment carrying the actual
+     measurement (before/after table, the operator's own read, heartbeat numbers) with the
+     acceptance criteria ticked off.
+   ⚠️ **CI green is not a result.** A field test must be shown to FAIL on the current
+   deploy first, or its pass proves nothing — record both runs. Record the wrong turns
+   too; a dead end documented is often the most valuable line in the log. Update the
+   spec's status table and check off acceptance criteria in the same breath.
 4. **Close** the issue only when the acceptance criteria are field-verified; a regression
    reopens it with the evidence.
 
