@@ -233,7 +233,7 @@ pub struct AgentPeer {
     /// packed as `(fps & 0xFFFF) | (struggling << bit)`. Held so session
     /// telemetry can report the fps the USER actually saw rather than
     /// what we hoped to send.
-    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
 }
 
 /// One `rc:session.stats` sample: what this session actually did.
@@ -498,7 +498,7 @@ impl AgentPeer {
         // `viewer_rate::ViewerRateController`, which caps send-fps to what the
         // viewer can actually sustain. Packing: `(fps & 0xFFFF) | (struggling <<
         // VIEWER_STRUGGLE_BIT)`; 0 = no signal this window (treated as clean).
-        let viewer_report = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let viewer_report = Arc::new(crate::encode::viewer_rate::ViewerFeedback::new());
         // rc.199 — viewer "Priority" dial (`rc:priority`). The control handler
         // decodes the wire mode into this per-session atomic; both DC video
         // pumps read it to resolve the relay resolution cap they feed
@@ -1179,7 +1179,7 @@ impl AgentPeer {
         }
         // Low 16 bits = decoded fps; 0 = the viewer reported nothing in
         // the last window (a paused tab), which is not a measured zero.
-        out.fps = f32::from((self.viewer_report.load(Ordering::Relaxed) & 0xFFFF) as u16);
+        out.fps = f32::from(self.viewer_report.peek_fps() as u16);
         let c = session_telemetry::counters(self.session_id);
         out.keyframe_requests = c.keyframe_requests.load(Ordering::Relaxed);
         out.input_events = c.input_events.load(Ordering::Relaxed);
@@ -1621,7 +1621,7 @@ async fn media_pump(
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
     // rc.188 — packed viewer decode report (`rc:decodestat`); the DC pumps
     // fold it into the viewer-rate fps cap. Only the DC pumps consume it.
-    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     // rc.199 — per-session Priority dial (`rc:priority`); forwarded to whichever
     // DC pump this session routes to. Like `viewer_report`, only the DC pumps
     // consume it (relay resolution cap), so the signalling-only build parks it.
@@ -2574,7 +2574,7 @@ async fn run_ffmpeg_dc_session(
     pc: Arc<RTCPeerConnection>,
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
-    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     priority: Arc<std::sync::atomic::AtomicU8>,
     // P7 — the viewer's HEVC Rext 4:4:4 request (chroma_pref == "yuv444" on
     // the hevc transport). Keys the shared pipeline (a Rext stream and a
@@ -2655,7 +2655,7 @@ async fn run_vp9_444_dc_session(
     pc: Arc<RTCPeerConnection>,
     capture_native_dims: Arc<std::sync::atomic::AtomicU64>,
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
-    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     priority: Arc<std::sync::atomic::AtomicU8>,
 ) {
     loop {
@@ -2747,7 +2747,7 @@ async fn media_pump_vp9_444_dc(
     // rc.190 — publish the ACTUAL encoded dims (post caps) for the cursor pump.
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
     // rc.188 — packed viewer decode report for the viewer-rate fps cap.
-    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     // rc.199 — per-session Priority dial (`rc:priority`); resolves the relay
     // resolution cap this pump feeds `effective_target_resolution`.
     priority: Arc<std::sync::atomic::AtomicU8>,
@@ -3017,6 +3017,7 @@ async fn media_pump_vp9_444_dc(
         target_fps,
         send_depth,
         crate::encode::measured_ceiling_enabled(),
+        crate::encode::relay_age_feedback_enabled(),
         std::time::Instant::now(),
     );
     {
@@ -3465,14 +3466,23 @@ async fn media_pump_vp9_444_dc(
         if let Some(vw) = governor.tick_viewer_window(
             std::time::Instant::now(),
             target_fps,
-            || viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed),
+            || viewer_report.take_report(),
+            // FR-15 — the viewer's paint age; acted on only when the
+            // transport is constrained (direct has its own measured
+            // ceiling + byte gate), learned always so the heartbeat can
+            // report it on every transport.
+            || viewer_report.take_age(),
+            constrained_transport,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
-        ) && (vw.changed || vw.struggling)
+        ) && (vw.changed || vw.struggling || vw.age_over)
         {
             info!(
                 %session_id,
                 reported_fps = vw.reported_fps,
                 struggling = vw.struggling,
+                age_over = vw.age_over,
+                age_ms = vw.age_ms.map(|(a, _)| a),
+                age_floor_ms = vw.age_ms.and(governor.viewer_age().map(|(_, f)| f)),
                 cap_fps = vw.cap_fps,
                 skip_divisor = vw.skip_divisor,
                 frames_skipped_decode = governor.frames_skipped_decode(),
@@ -3798,6 +3808,10 @@ async fn media_pump_vp9_444_dc(
                 target_bps = governor.applied_bps(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,
+                // FR-15 — the viewer's own paint age + the learned path
+                // floor. None = pre-FR-15 viewer (the loop stays off).
+                viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
+                viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             qp_sum = 0;
@@ -4013,7 +4027,7 @@ async fn media_pump_ffmpeg_dc(
     // rc.190 — publish the ACTUAL encoded dims (post caps) for the cursor pump.
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
     // rc.188 — packed viewer decode report for the viewer-rate fps cap.
-    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     // rc.199 — per-session Priority dial (`rc:priority`); resolves the relay
     // resolution cap this pump feeds `effective_target_resolution`.
     priority: Arc<std::sync::atomic::AtomicU8>,
@@ -4316,6 +4330,7 @@ async fn media_pump_ffmpeg_dc(
         target_fps,
         ffmpeg_send_depth,
         crate::encode::measured_ceiling_enabled(),
+        crate::encode::relay_age_feedback_enabled(),
         std::time::Instant::now(),
     );
     // rc.443 — consecutive-encode-error escalation (retry → rebuild →
@@ -5238,15 +5253,22 @@ async fn media_pump_ffmpeg_dc(
         if let Some(vw) = governor.tick_viewer_window(
             std::time::Instant::now(),
             target_fps,
-            || viewer_report.swap(0, std::sync::atomic::Ordering::Relaxed),
+            || viewer_report.take_report(),
+            // FR-15 — see the VP9 pump: acted on only when constrained,
+            // learned on every transport.
+            || viewer_report.take_age(),
+            constrained,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
-        ) && (vw.changed || vw.struggling)
+        ) && (vw.changed || vw.struggling || vw.age_over)
         {
             info!(
                 %session_id,
                 codec_label,
                 reported_fps = vw.reported_fps,
                 struggling = vw.struggling,
+                age_over = vw.age_over,
+                age_ms = vw.age_ms.map(|(a, _)| a),
+                age_floor_ms = vw.age_ms.and(governor.viewer_age().map(|(_, f)| f)),
                 cap_fps = vw.cap_fps,
                 skip_divisor = vw.skip_divisor,
                 frames_skipped_decode = governor.frames_skipped_decode(),
@@ -5711,6 +5733,11 @@ async fn media_pump_ffmpeg_dc(
                 // windows whose blocked time was too thin to trust.
                 goodput_bps = ?governor.measured_goodput_bps(std::time::Instant::now()),
                 goodput_samples = ?governor.goodput_samples(),
+                // FR-15 — the viewer's own paint age (window avg) and the
+                // learned path floor. The excess between them is what the
+                // constrained age loop acts on; None = pre-FR-15 viewer.
+                viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
+                viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
@@ -5961,7 +5988,7 @@ fn attach_control_handler(
     // rc.188 — written on every `rc:decodestat` (packed decoded fps + a
     // struggling bit via `viewer_rate::pack_report`); the DC video pumps swap+
     // decode it to drive the viewer-rate fps cap.
-    viewer_report: Arc<std::sync::atomic::AtomicU32>,
+    viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     // rc.199 — per-session Priority dial; the `rc:priority` match arm writes it.
     priority: Arc<std::sync::atomic::AtomicU8>,
 ) {
@@ -6238,10 +6265,21 @@ fn attach_control_handler(
                         .get("struggling")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    viewer_report.store(
-                        crate::encode::viewer_rate::pack_report(fps, struggling),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    viewer_report
+                        .store_report(crate::encode::viewer_rate::pack_report(fps, struggling));
+                    // FR-15 — the viewer's paint-age for the window (avg +
+                    // the window's minimum, the floor sample). Absent from
+                    // pre-FR-15 viewers and from a window that painted
+                    // nothing: leave the age slot at its swap-reset 0 so the
+                    // loop reads "no report" rather than a fabricated 0 ms.
+                    let age = val.get("age_ms").and_then(|v| v.as_u64());
+                    let age_min = val.get("age_min_ms").and_then(|v| v.as_u64());
+                    if let (Some(a), Some(m)) = (age, age_min) {
+                        viewer_report.store_age(crate::encode::viewer_rate::pack_age(
+                            a.min(u16::MAX as u64) as u16,
+                            m.min(u16::MAX as u64) as u16,
+                        ));
+                    }
                 }
                 "rc:display-match" => {
                     // rc.191 — viewer asked the host to switch its display to

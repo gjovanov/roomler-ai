@@ -268,6 +268,14 @@ pub fn relay_idr_thrift_enabled() -> bool {
     tunnel_core::env::node_env("RELAY_IDR_THRIFT").as_deref() != Some("0")
 }
 
+/// FR-15 — whether the constrained-transport age loop (viewer paint-age →
+/// fps cap + multiplicative decrease) is active. Default ON; kill switch
+/// `relay_age_feedback=false` / `ROOMLER_AGENT_RELAY_AGE_FEEDBACK=0`
+/// reverts relay rate control to the open-loop 0.4.7 posture.
+pub fn relay_age_feedback_enabled() -> bool {
+    tunnel_core::env::node_env("RELAY_AGE_FEEDBACK").as_deref() != Some("0")
+}
+
 /// FR-10 — whether a deferred (quiet-flushed) bitrate apply may land on a
 /// thrifty CONSTRAINED session. Each apply is a QSV/AMF re-open whose first
 /// frame is an IDR — a lump on a thin pipe — so small moves wait out a

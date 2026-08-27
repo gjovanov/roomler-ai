@@ -67,6 +67,18 @@ pub struct ViewerWindow {
     /// Divisor moved this window — the pump's log condition is
     /// `changed || struggling`.
     pub changed: bool,
+    /// FR-15 — the viewer's paint-age report this window (avg, floor-sample),
+    /// ms. None = viewer sent no age (old web, or no frames painted).
+    pub age_ms: Option<(u16, u16)>,
+    /// FR-15 — the age loop judged the transport over-rate this window
+    /// (constrained only). Two responses, both through machinery that
+    /// already exists: it folds into the fps-cap `struggling` path (an
+    /// instant, re-open-free byte cut) and it feeds the AIMD a congestion
+    /// sample, so the decrease reaches the encoder through the pump's
+    /// NORMAL apply arms on the next frame — including, on a thrifty
+    /// constrained QSV session, the FR-10 deferral that keeps a re-open
+    /// lump out of the middle of a drag.
+    pub age_over: bool,
 }
 
 /// Outcome of a heartbeat tier step, emitted only when the
@@ -95,6 +107,14 @@ pub struct RateGovernor {
     skip_divisor: u32,
     skip_counter: u32,
     frames_skipped_decode: u64,
+    // Loop 2b (FR-15) — constrained-transport age feedback.
+    age_loop: viewer_rate::AgeLoop,
+    /// Last viewer age (window avg, learned floor) for the heartbeat.
+    last_viewer_age: Option<(u16, u16)>,
+    /// FR-15 kill switch, resolved once by the pump
+    /// (`encode::relay_age_feedback_enabled` — env/config
+    /// `RELAY_AGE_FEEDBACK`). False = learn + report only, never act.
+    age_feedback: bool,
 
     // Loops 3+4 — encode pressure + auto-downscale tier.
     pressure: EncodePressure,
@@ -123,9 +143,16 @@ const VIEWER_WINDOW: Duration = Duration::from_secs(1);
 
 impl RateGovernor {
     /// `measured_ceiling` gates stage-1 consumption of the goodput
-    /// estimate (the pumps resolve it once from env/config; tests pass
-    /// it explicitly so the governor stays pure).
-    pub fn new(target_fps: u32, send_depth: usize, measured_ceiling: bool, now: Instant) -> Self {
+    /// estimate; `age_feedback` gates the FR-15 constrained age loop.
+    /// The pumps resolve both once from env/config; tests pass them
+    /// explicitly so the governor stays pure.
+    pub fn new(
+        target_fps: u32,
+        send_depth: usize,
+        measured_ceiling: bool,
+        age_feedback: bool,
+        now: Instant,
+    ) -> Self {
         Self {
             aimd: None,
             send_depth,
@@ -135,6 +162,9 @@ impl RateGovernor {
             skip_divisor: 1,
             skip_counter: 0,
             frames_skipped_decode: 0,
+            age_loop: viewer_rate::AgeLoop::new(),
+            last_viewer_age: None,
+            age_feedback,
             pressure: EncodePressure::new(),
             encode_factor: 1.0,
             tier: DownscaleTier::new(),
@@ -291,6 +321,8 @@ impl RateGovernor {
         now: Instant,
         target_fps: u32,
         take_report: impl FnOnce() -> u32,
+        take_age: impl FnOnce() -> u32,
+        constrained: bool,
         fold_followers: impl FnOnce(u32) -> u32,
     ) -> Option<ViewerWindow> {
         if now.duration_since(self.viewer_window_at) < VIEWER_WINDOW {
@@ -304,19 +336,52 @@ impl RateGovernor {
         let samples = self.goodput_sink.drain();
         self.goodput.observe_window(&samples, now);
         let (reported_fps, struggling) = viewer_rate::unpack_report(take_report());
+        // FR-15 — the viewer's paint age is the only sensor that sees the
+        // whole constrained path (WG-over-DERP/TCP queues sit below every
+        // agent counter). Sustained age over the learned floor drives BOTH
+        // existing responses: the fps cap (folded into `struggling` — an
+        // instant, re-open-free byte cut) and a rate-limited MD (returned
+        // as `age_md` so the pump applies it under its normal — on thrifty
+        // relay, FR-10-deferred — rules). Direct transports keep their own
+        // machinery; the loop still LEARNS there so the heartbeat can show
+        // ages on every transport.
+        let age_ms = viewer_rate::unpack_age(take_age());
+        let mut age_over = false;
+        if let Some((avg, min)) = age_ms {
+            let triggered = self.age_loop.observe(avg, min);
+            age_over = triggered && constrained && self.age_feedback;
+        }
+        self.last_viewer_age = age_ms.map(|(avg, _)| (avg, self.age_loop.floor_ms().unwrap_or(0)));
         let own_div = self
             .viewer_rate
-            .observe(reported_fps, struggling, target_fps);
+            .observe(reported_fps, struggling || age_over, target_fps);
         let new_div = own_div.max(fold_followers(own_div));
         let changed = new_div != self.skip_divisor;
         self.skip_divisor = new_div;
+        // Feed the AIMD a congestion sample and STOP — deliberately no
+        // `take_pending` here: consuming the move would mark it applied
+        // while the encoder never heard about it. The pump's own
+        // `pre_encode_tick` picks it up one frame later (≤33 ms) and
+        // routes it through the existing apply arms.
+        if age_over && let Some(ctrl) = self.aimd.as_mut() {
+            ctrl.note_buffer_overflow(now);
+        }
         Some(ViewerWindow {
             reported_fps,
             struggling,
             cap_fps: self.viewer_rate.cap_fps(),
             skip_divisor: new_div,
             changed,
+            age_ms,
+            age_over,
         })
+    }
+
+    /// FR-15 — the last viewer age report (window avg, learned floor), ms,
+    /// for the pump heartbeats: field verification reads the loop from
+    /// `agent_logs` instead of the viewer's screen.
+    pub fn viewer_age(&self) -> Option<(u16, u16)> {
+        self.last_viewer_age
     }
 
     /// The decode-pressure frame-skip gate: keep 1 of every
@@ -417,7 +482,7 @@ mod tests {
     const CEILING: u32 = 12_000_000;
 
     fn gov(now: Instant) -> RateGovernor {
-        RateGovernor::new(30, DEPTH, true, now)
+        RateGovernor::new(30, DEPTH, true, true, now)
     }
 
     /// Stage 1: a held goodput estimate clamps the nominal ceiling to
@@ -434,7 +499,10 @@ mod tests {
             sink.record(30_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        assert!(g.tick_viewer_window(t1, 30, || 0, |o| o).is_some());
+        assert!(
+            g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o)
+                .is_some()
+        );
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
@@ -449,13 +517,13 @@ mod tests {
     #[test]
     fn measured_ceiling_disabled_keeps_nominal() {
         let start = Instant::now();
-        let mut g = RateGovernor::new(30, DEPTH, false, start);
+        let mut g = RateGovernor::new(30, DEPTH, false, true, start);
         let sink = g.goodput_sink();
         for _ in 0..40 {
             sink.record(30_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, |o| o);
+        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o);
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
@@ -476,7 +544,7 @@ mod tests {
             sink.record(30_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, |o| o);
+        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o);
         assert_eq!(g.measured_goodput_bps(t1), Some(10_000_000));
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t1)
@@ -499,7 +567,7 @@ mod tests {
             sink.record(60_000, Duration::from_millis(24));
         }
         let t1 = start + Duration::from_secs(2);
-        g.tick_viewer_window(t1, 30, || 0, |o| o);
+        g.tick_viewer_window(t1, 30, || 0, || 0, false, |o| o);
         let applied = g
             .pre_encode_tick(CEILING, crate::encode::MIN_BITRATE_BPS, false, DEPTH, t1)
             .expect("initial apply");
@@ -636,6 +704,8 @@ mod tests {
                 consumed += 1;
                 0
             },
+            || 0,
+            false,
             |own| own,
         );
         assert!(r.is_none());
@@ -647,6 +717,8 @@ mod tests {
                 consumed += 1;
                 0
             },
+            || 0,
+            false,
             |own| own,
         );
         assert!(r.is_some());
@@ -660,7 +732,7 @@ mod tests {
         // Fold a follower divisor of 3 in (own report healthy → own
         // divisor 1; the shared stream paces to the slowest viewer).
         let w = g
-            .tick_viewer_window(start + Duration::from_secs(2), 30, || 0, |_| 3)
+            .tick_viewer_window(start + Duration::from_secs(2), 30, || 0, || 0, false, |_| 3)
             .expect("window due");
         assert_eq!(w.skip_divisor, 3);
         assert!(w.changed);
@@ -687,7 +759,14 @@ mod tests {
         for i in 1..=30u64 {
             let now = start + Duration::from_secs(2 * i);
             // A viewer reporting 1 fps and struggling, forever.
-            let w = g.tick_viewer_window(now, 30, || viewer_rate::pack_report(1, true), |own| own);
+            let w = g.tick_viewer_window(
+                now,
+                30,
+                || viewer_rate::pack_report(1, true),
+                || 0,
+                false,
+                |own| own,
+            );
             let w = w.expect("2 s apart — every window due");
             assert!(
                 w.skip_divisor <= 3,
@@ -713,6 +792,138 @@ mod tests {
             let _ = g.heartbeat(8.0, true, 60, start + Duration::from_secs(2 * i));
         }
         assert_eq!(g.paced_fps(), None, "recovered encoder releases the pace");
+    }
+
+    /// FR-15 — sustained viewer age over the learned floor on a
+    /// CONSTRAINED transport lowers the target, and the decrease reaches
+    /// the pump through the ordinary `pre_encode_tick` apply path (the
+    /// window tick must never consume it itself).
+    #[test]
+    fn constrained_age_excess_lowers_the_target_through_the_normal_apply() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        // Establish the AIMD at the relay-ish ceiling.
+        let ceiling = 3_000_000;
+        let first = g
+            .pre_encode_tick(ceiling, crate::encode::MIN_BITRATE_BPS, true, DEPTH, start)
+            .expect("initial apply");
+        assert_eq!(first.bps, ceiling);
+        // Two windows at a ~60 ms floor, then sustained 200 ms age.
+        let mut applied = first.bps;
+        for (i, (avg, min)) in [(62u16, 60u16), (64, 61), (200, 62), (205, 63), (210, 63)]
+            .into_iter()
+            .enumerate()
+        {
+            let t = start + Duration::from_millis(1100 * (i as u64 + 1));
+            let w = g
+                .tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || viewer_rate::pack_age(avg, min),
+                    true,
+                    |o| o,
+                )
+                .expect("window due");
+            assert_eq!(w.age_ms, Some((avg, min)));
+            if let Some(a) =
+                g.pre_encode_tick(ceiling, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t)
+            {
+                applied = a.bps;
+            }
+        }
+        assert!(
+            applied < ceiling,
+            "sustained age excess left the target at the open-loop ceiling ({applied})"
+        );
+        assert_eq!(g.viewer_age().map(|(_, f)| f), Some(60), "floor learned");
+    }
+
+    /// FR-15 — the same age history on a DIRECT transport changes
+    /// nothing (direct owns the measured ceiling + byte gate), and the
+    /// kill switch reverts constrained sessions to the same open loop.
+    #[test]
+    fn age_loop_is_constrained_only_and_respects_the_kill_switch() {
+        let ceiling = 3_000_000;
+        let ages = [(62u16, 60u16), (64, 61), (200, 62), (205, 63), (210, 63)];
+        for (label, constrained, feedback) in
+            [("direct", false, true), ("kill switch", true, false)]
+        {
+            let start = Instant::now();
+            let mut g = RateGovernor::new(30, DEPTH, false, feedback, start);
+            let mut applied = g
+                .pre_encode_tick(
+                    ceiling,
+                    crate::encode::MIN_BITRATE_BPS,
+                    constrained,
+                    DEPTH,
+                    start,
+                )
+                .expect("initial apply")
+                .bps;
+            for (i, (avg, min)) in ages.into_iter().enumerate() {
+                let t = start + Duration::from_millis(1100 * (i as u64 + 1));
+                let w = g
+                    .tick_viewer_window(
+                        t,
+                        30,
+                        || viewer_rate::pack_report(30, false),
+                        || viewer_rate::pack_age(avg, min),
+                        constrained,
+                        |o| o,
+                    )
+                    .expect("window due");
+                assert!(!w.age_over, "{label}: age must not act");
+                if let Some(a) = g.pre_encode_tick(
+                    ceiling,
+                    crate::encode::MIN_BITRATE_BPS,
+                    constrained,
+                    DEPTH,
+                    t,
+                ) {
+                    applied = a.bps;
+                }
+            }
+            assert_eq!(applied, ceiling, "{label}: target moved anyway");
+            // The floor is still LEARNED everywhere — the heartbeat reports
+            // ages on every transport, it just doesn't act on them.
+            assert_eq!(g.viewer_age().map(|(_, f)| f), Some(60), "{label}");
+        }
+    }
+
+    /// FR-15 — a viewer that reports no age (pre-FR-15 web) leaves the
+    /// constrained session byte-identical to the open-loop posture.
+    #[test]
+    fn absent_age_report_leaves_the_loop_off() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        let ceiling = 3_000_000;
+        let mut applied = g
+            .pre_encode_tick(ceiling, crate::encode::MIN_BITRATE_BPS, true, DEPTH, start)
+            .expect("initial apply")
+            .bps;
+        for i in 1..=6u64 {
+            let t = start + Duration::from_millis(1100 * i);
+            let w = g
+                .tick_viewer_window(
+                    t,
+                    30,
+                    || viewer_rate::pack_report(30, false),
+                    || 0, // no age slot written this window
+                    true,
+                    |o| o,
+                )
+                .expect("window due");
+            assert_eq!(w.age_ms, None);
+            assert!(!w.age_over);
+            if let Some(a) =
+                g.pre_encode_tick(ceiling, crate::encode::MIN_BITRATE_BPS, true, DEPTH, t)
+            {
+                applied = a.bps;
+            }
+        }
+        assert_eq!(applied, ceiling);
+        assert_eq!(g.viewer_age(), None);
     }
 
     #[test]
