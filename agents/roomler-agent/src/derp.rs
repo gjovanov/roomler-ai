@@ -29,6 +29,13 @@ use tunnel_core::transport::derp::DerpMux;
 /// Hard upper bound on a single `/derp` connect attempt (mirrors the control
 /// WS's `WS_CONNECT_TIMEOUT`): a hung TLS handshake must not stall the backoff.
 const DERP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// FR-18 — ceiling for the `/derp` TCP socket's send buffer. Sized well above
+/// the bandwidth-delay product of the paths this carrier actually serves
+/// (3 Mbps × 200 ms ≈ 75 KB) so throughput is untouched, and far below the
+/// megabytes autotuning would otherwise allow to accumulate as latency.
+const DERP_SNDBUF_BYTES: usize = 256 * 1024;
+
 /// Reconnect backoff ceiling. Deliberately LOW: the `/derp` WS is the relay
 /// FLOOR — with a force-DERP pin active the pinned pair has no other tier, and
 /// (post-#497) its build is withheld for exactly as long as this mux is down.
@@ -49,6 +56,33 @@ const DERP_KEEPALIVE: Duration = Duration::from_secs(25);
 /// ACKing our pings after its upstream leg died, so send-success proves
 /// nothing — reconnect must key on frames RECEIVED.
 const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
+
+/// FR-18 — request the [`DERP_SNDBUF_BYTES`] ceiling on the socket under the
+/// (possibly TLS-wrapped) WebSocket. Best-effort by design: an OS may clamp or
+/// ignore the request, and a carrier that works with a big buffer must not fail
+/// to start because we could not shrink it.
+fn cap_send_buffer(
+    ws: &tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    relay: &str,
+) {
+    use socket2::SockRef;
+    use tokio_tungstenite::MaybeTlsStream;
+    let tcp = match ws.get_ref() {
+        MaybeTlsStream::Plain(s) => s,
+        MaybeTlsStream::Rustls(s) => s.get_ref().0,
+        // `MaybeTlsStream` is `#[non_exhaustive]`; an unknown wrapper just
+        // keeps the OS default rather than blocking the connection.
+        _ => {
+            debug!(%relay, "overlay derp: unrecognised TLS wrapper — send buffer left at the OS default");
+            return;
+        }
+    };
+    if let Err(e) = SockRef::from(tcp).set_send_buffer_size(DERP_SNDBUF_BYTES) {
+        debug!(%relay, %e, "overlay derp: set_send_buffer_size failed — OS default retained");
+    }
+}
 
 /// Derive the `/derp` WSS URL from the control `ws_url` (`wss://host/ws`).
 fn derp_url_from_ws(ws_url: &str) -> String {
@@ -71,7 +105,7 @@ pub fn spawn(
     agent_token: &str,
     tenant_id: &str,
     mux: &Arc<DerpMux>,
-    outbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
     // S6 — `tid` = tenant-affinity key for the front LB. DERP relays are
     // pod-local, so both mesh peers must land on the SAME pod; hashing
@@ -103,7 +137,7 @@ pub fn spawn_regional(
     ticket_slot: DerpTicketSlot,
     tenant_id: &str,
     mux: &Arc<DerpMux>,
-    outbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
     let base = derp_url.to_string();
     // Host part only — the ticket query string must never reach a log line.
@@ -142,8 +176,12 @@ async fn run(
     url_for_attempt: Box<dyn Fn() -> Option<String> + Send>,
     reg_frame: Vec<u8>,
     mux: Weak<DerpMux>,
-    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
+    mut outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
+    // FR-18 — resolved once: the queue-age bound is a deployment knob, not a
+    // per-frame decision, and re-reading the env per frame would be the hot
+    // path of the whole carrier.
+    let max_queue_age = tunnel_core::transport::derp::queue_max_age();
     let mut backoff = Duration::from_secs(1);
     loop {
         // The mux is gone (runtime torn down) ⇒ stop reconnecting.
@@ -162,6 +200,14 @@ async fn run(
         match tokio::time::timeout(DERP_CONNECT_TIMEOUT, connect_async(&url)).await {
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1);
+                // FR-18 — bound the KERNEL's send buffer too. Shedding stale
+                // frames above is pointless if a frame we did choose to send
+                // then sits for seconds in a socket buffer the age check can no
+                // longer reach: Windows autotuning happily grows this into the
+                // megabytes, which at a 3 Mbps relay is multiple seconds of
+                // committed latency. The BDP of these paths is tens of KB
+                // (3 Mbps × 200 ms ≈ 75 KB), so this cap costs no throughput.
+                cap_send_buffer(&ws, &relay);
                 let (mut tx, mut rx) = ws.split();
                 // Register our pubkey as the first frame.
                 if tx
@@ -224,7 +270,30 @@ async fn run(
                         }
                         out = outbound_rx.recv() => match out {
                             // A carrier frame to relay: [peer_pubkey||payload].
-                            Some(frame) => {
+                            Some((queued_at, frame)) => {
+                                // FR-18 — shed stale load. A frame that has
+                                // already waited longer than its useful life is
+                                // worse than nothing: it occupies the wire the
+                                // CURRENT frame needs, and by the time it lands
+                                // the receiver has moved on. Dropping here is
+                                // also what turns the bounded-but-deep queue
+                                // into drop-OLDEST semantics — under overload
+                                // the writer discards the stale head quickly and
+                                // reaches fresh frames, instead of faithfully
+                                // delivering 1.8 s of history.
+                                //
+                                // WG is loss-tolerant by construction, so this
+                                // costs a retransmit at worst; the alternative
+                                // costs seconds of latency (measured: a single
+                                // frame blocked 10.2 s inside the DC send).
+                                if let Some(max_age) = max_queue_age
+                                    && queued_at.elapsed() > max_age
+                                {
+                                    if let Some(m) = mux.upgrade() {
+                                        m.note_stale_drop();
+                                    }
+                                    continue;
+                                }
                                 if tx.send(Message::Binary(frame.into())).await.is_err() {
                                     break;
                                 }
