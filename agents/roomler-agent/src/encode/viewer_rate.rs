@@ -223,6 +223,147 @@ pub fn unpack_report(raw: u32) -> (u32, bool) {
     (raw & 0xFFFF, raw & STRUGGLE_BIT != 0)
 }
 
+// ── FR-15 — viewer paint-age feedback ───────────────────────────────────────
+// The FR-1 P7 age pill measures true end-to-end frame age at the viewer; the
+// viewer piggybacks each window's avg + min onto `rc:decodestat`. On a
+// CONSTRAINED transport that age is the only sensor that sees the whole path:
+// the 2026-08-27 field session showed a 1000 ms age against a 26 KB agent
+// queue — the backlog lives in the WG-over-DERP/TCP legs, below every agent
+// counter. The loop here turns sustained age growth into the same responses
+// the rest of the stack already knows: an fps cap (instant, no re-open) and a
+// multiplicative decrease (applied under the FR-10 quiet/spacing rules).
+
+/// Pack a viewer age report (window avg + window min, ms) into the shared
+/// `viewer_age` atomic. `0` is the swap-reset / no-report sentinel, so a
+/// genuine measurement is floored at 1 ms — sub-ms end-to-end age is not
+/// physically possible, so nothing real is lost.
+pub fn pack_age(age_ms: u16, age_min_ms: u16) -> u32 {
+    (age_ms.max(1) as u32) | ((age_min_ms.max(1) as u32) << 16)
+}
+
+/// Inverse of [`pack_age`]; `0` (no report this window) → `None`.
+pub fn unpack_age(raw: u32) -> Option<(u16, u16)> {
+    if raw == 0 {
+        return None;
+    }
+    Some(((raw & 0xFFFF) as u16, (raw >> 16) as u16))
+}
+
+/// Everything one viewer tells the agent about how the stream is actually
+/// landing: the rc.188 decode report (fps + struggling) and the FR-15 paint
+/// age. ONE shared cell per session — the control handler writes, the DC
+/// pump swaps once a viewer window, and a follower's is read by the shared
+/// pipeline's fold. Both slots use `0` as "nothing reported this window",
+/// so a viewer that goes quiet decays to no-signal instead of pinning a
+/// stale value.
+#[derive(Debug, Default)]
+pub struct ViewerFeedback {
+    report: std::sync::atomic::AtomicU32,
+    age: std::sync::atomic::AtomicU32,
+}
+
+impl ViewerFeedback {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Overwrite the decode report (see [`pack_report`]).
+    pub fn store_report(&self, packed: u32) {
+        self.report
+            .store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consume the decode report, leaving "no signal" behind.
+    pub fn take_report(&self) -> u32 {
+        self.report.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The reported fps WITHOUT consuming the report — session telemetry
+    /// reads what the user saw; the rate loop is the only consumer that
+    /// may take it.
+    pub fn peek_fps(&self) -> u32 {
+        self.report.load(std::sync::atomic::Ordering::Relaxed) & 0xFFFF
+    }
+
+    /// FR-15 — overwrite the paint-age report (see [`pack_age`]).
+    pub fn store_age(&self, packed: u32) {
+        self.age.store(packed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// FR-15 — consume the paint-age report.
+    pub fn take_age(&self) -> u32 {
+        self.age.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Age excess over the learned floor that counts a window as over-rate.
+/// Below this the climb is within jitter noise; the field baseline that
+/// motivated the loop was +60 ms felt as sluggish on an 85 ms-RTT relay.
+pub const AGE_SLACK_MS: u16 = 70;
+/// Consecutive over-rate windows before the loop reacts (mirrors the
+/// viewer-side struggle fold: one bad window is a blip, not a trend).
+const AGE_OVER_WINDOWS: u8 = 2;
+/// Windows of floor memory (~30 s at the 1 s viewer window): long enough to
+/// hold the floor through a sustained drag, short enough that a genuine
+/// path change (VPN re-route raising the floor) re-baselines in half a
+/// minute instead of over-triggering forever.
+const AGE_FLOOR_RING: usize = 30;
+
+/// FR-15 — the constrained-transport age loop. Feed one `observe` per
+/// viewer window; it learns the session's age floor (min over the ring —
+/// the floor is propagation+decode, not queue) and reports `true` once the
+/// excess has persisted [`AGE_OVER_WINDOWS`] consecutive windows, staying
+/// `true` each window while the overload lasts (the caller's MD is
+/// rate-limited internally, so "true every window" is exactly the intended
+/// ×0.85-per-window pressure).
+pub struct AgeLoop {
+    ring: [u16; AGE_FLOOR_RING],
+    len: usize,
+    idx: usize,
+    over_streak: u8,
+}
+
+impl Default for AgeLoop {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgeLoop {
+    pub fn new() -> Self {
+        Self {
+            ring: [0; AGE_FLOOR_RING],
+            len: 0,
+            idx: 0,
+            over_streak: 0,
+        }
+    }
+
+    /// Fold one viewer window. `age_ms` = window average, `age_min_ms` =
+    /// window minimum (the floor sample — even a queued window usually
+    /// contains one frame that rode a momentarily drained pipe).
+    pub fn observe(&mut self, age_ms: u16, age_min_ms: u16) -> bool {
+        self.ring[self.idx] = age_min_ms.max(1);
+        self.idx = (self.idx + 1) % AGE_FLOOR_RING;
+        if self.len < AGE_FLOOR_RING {
+            self.len += 1;
+        }
+        let floor = self.floor_ms().unwrap_or(age_min_ms.max(1));
+        let over = age_ms.saturating_sub(floor) >= AGE_SLACK_MS;
+        self.over_streak = if over {
+            self.over_streak.saturating_add(1)
+        } else {
+            0
+        };
+        self.over_streak >= AGE_OVER_WINDOWS
+    }
+
+    /// The learned path floor (min of the ring), None before any report.
+    pub fn floor_ms(&self) -> Option<u16> {
+        self.ring[..self.len].iter().copied().min()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +557,64 @@ mod tests {
         assert_eq!(c.divisor(), 2);
         assert_eq!(div, 2);
         assert!(c.cap_fps() <= 30);
+    }
+
+    // ── FR-15 — age packing + loop ──────────────────────────────────────
+
+    #[test]
+    fn age_pack_roundtrips_and_zero_is_no_report() {
+        assert_eq!(unpack_age(pack_age(120, 62)), Some((120, 62)));
+        assert_eq!(unpack_age(0), None);
+        // A genuine 0 ms input is floored to 1 so it cannot collide with
+        // the swap-reset sentinel.
+        assert_eq!(unpack_age(pack_age(0, 0)), Some((1, 1)));
+        assert_eq!(
+            unpack_age(pack_age(u16::MAX, u16::MAX)),
+            Some((u16::MAX, u16::MAX))
+        );
+    }
+
+    #[test]
+    fn age_loop_needs_two_consecutive_over_windows() {
+        let mut l = AgeLoop::new();
+        // Establish a ~60 ms floor.
+        assert!(!l.observe(62, 60));
+        assert!(!l.observe(64, 61));
+        assert_eq!(l.floor_ms(), Some(60));
+        // One over-window (140 vs floor 60 = +80 ≥ slack 70) is a blip…
+        assert!(!l.observe(140, 62));
+        // …a clean window resets the streak…
+        assert!(!l.observe(65, 61));
+        assert!(!l.observe(150, 63));
+        // …and only the SECOND consecutive over-window triggers.
+        assert!(l.observe(155, 64));
+        // Staying over keeps triggering (one MD per window by design).
+        assert!(l.observe(160, 64));
+        // Recovery clears it immediately.
+        assert!(!l.observe(70, 61));
+    }
+
+    #[test]
+    fn age_loop_floor_rebaselines_after_a_path_change() {
+        let mut l = AgeLoop::new();
+        l.observe(60, 55);
+        // A path change raises the true floor to ~200 ms. The stale 55 ms
+        // sample ages out of the 30-window ring, after which 205 vs the new
+        // floor is within slack and the loop stops treating it as overload.
+        for _ in 0..30 {
+            l.observe(205, 200);
+        }
+        assert_eq!(l.floor_ms(), Some(200));
+        assert!(!l.observe(205, 200));
+    }
+
+    #[test]
+    fn age_loop_within_slack_never_triggers() {
+        let mut l = AgeLoop::new();
+        l.observe(60, 58);
+        for _ in 0..50 {
+            // +65 ms of climb stays under the 70 ms slack.
+            assert!(!l.observe(123, 58));
+        }
     }
 }

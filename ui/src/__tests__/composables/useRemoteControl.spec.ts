@@ -2590,6 +2590,33 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
     })
   })
 
+  it('FR-15: carries the paint-age window when the clock probe has locked', () => {
+    expect(decodeStatWireMessage(30, false, { avgMs: 123.4, minMs: 61.8 })).toEqual({
+      t: 'rc:decodestat',
+      fps: 30,
+      struggling: false,
+      age_ms: 123,
+      age_min_ms: 62,
+    })
+  })
+
+  it('FR-15: omits the age entirely when absent — "no signal", not 0 ms', () => {
+    // Pre-P7 agents / a window that painted nothing: the agent's age loop
+    // must see NO report rather than a fabricated zero (which would read
+    // as a perfect path and suppress the loop forever).
+    for (const age of [undefined, null, { avgMs: NaN, minMs: 4 }, { avgMs: 4, minMs: Infinity }]) {
+      const m = decodeStatWireMessage(30, false, age as never)
+      expect(m.age_ms).toBeUndefined()
+      expect(m.age_min_ms).toBeUndefined()
+    }
+  })
+
+  it('FR-15: clamps the age into the u16 the agent packs it into', () => {
+    const m = decodeStatWireMessage(30, false, { avgMs: 999_999, minMs: -5 })
+    expect(m.age_ms).toBe(65535)
+    expect(m.age_min_ms).toBe(0)
+  })
+
   it('coerces non-finite / negative fps to 0 (a clean "no useful number")', () => {
     expect(decodeStatWireMessage(NaN, false).fps).toBe(0)
     expect(decodeStatWireMessage(-5, true).fps).toBe(0)
@@ -3031,9 +3058,26 @@ describe('P1 — hop-stats helpers (rc-hop-stats)', () => {
     s.add(2)
     s.add(6)
     const w = s.snapshotAndReset()
-    expect(w).toEqual({ avgMs: 3, maxMs: 6, n: 3 })
+    expect(w).toEqual({ avgMs: 3, maxMs: 6, minMs: 1, n: 3 })
     // Window reset — an empty follow-up window reads zeros.
-    expect(s.snapshotAndReset()).toEqual({ avgMs: 0, maxMs: 0, n: 0 })
+    expect(s.snapshotAndReset()).toEqual({ avgMs: 0, maxMs: 0, minMs: 0, n: 0 })
+  })
+
+  it('FR-15: HopStats tracks the window MINIMUM (the path-floor sample)', () => {
+    const s = new HopStats()
+    // A queued window still contains one frame that rode a drained pipe —
+    // that minimum is what the agent uses as the path floor, and the gap
+    // to the average is the queue it reacts to.
+    s.add(210)
+    s.add(64)
+    s.add(190)
+    const w = s.snapshotAndReset()
+    expect(w.minMs).toBe(64)
+    expect(w.avgMs).toBeGreaterThan(w.minMs)
+    // Reset clears the min too — a following clean window must not
+    // inherit the previous one's floor.
+    s.add(80)
+    expect(s.snapshotAndReset().minMs).toBe(80)
   })
 
   it('HopStats rounds to 0.1 ms', () => {
@@ -3051,7 +3095,7 @@ describe('P1 — hop-stats helpers (rc-hop-stats)', () => {
     s.add(-5)
     s.add(Number.POSITIVE_INFINITY)
     s.add(2)
-    expect(s.snapshotAndReset()).toEqual({ avgMs: 2, maxMs: 2, n: 1 })
+    expect(s.snapshotAndReset()).toEqual({ avgMs: 2, maxMs: 2, minMs: 2, n: 1 })
   })
 
   it('ctxOptionsFor maps the A/B modes (legacy = no options object)', () => {
