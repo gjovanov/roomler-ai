@@ -346,13 +346,26 @@ Every substantial feature or multi-step program (a new capability, a performance
 protocol/scheme change — anything bigger than a one-PR fix) gets a **Functional
 Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`:
 
-1. **Spec doc first**: `docs/fr/FR-NN-<slug>.md` on master (next free NN across `docs/fr/`)
-   — Goal, root-cause/field evidence, key design with `file:line` anchors verified against
-   master, a phase/status table with each phase's kill switch, acceptance criteria as
-   checkboxes, open decisions, out-of-scope, and a field-verification log.
-2. **GitHub issue** `FR-NN: <title>` in `gjovanov/roomler-ai/issues` (labels:
+0. **Claim the number against the ISSUE LIST, not `docs/fr/`.** A spec can still be
+   sitting on an unmerged branch, so `ls docs/fr/` under-counts and two parallel sessions
+   will mint the same NN. The registry is
+   `gh issue list --state all --search "FR-" --limit 50`; take the next free integer above
+   the highest title seen there. **Format is `FR-<N>`, never zero-padded** — `FR-01` and
+   `FR-1` are the same requirement spelled two ways, and on day one of this rule both
+   existed (#767 `FR-1` and #768 `FR-01`, minted in parallel). Renumber a stray padded one
+   rather than leaving the ambiguity.
+1. **Spec doc**: `docs/fr/FR-N-<slug>.md` — Goal, root-cause/field evidence, key design
+   with `file:line` anchors verified against master, a phase/status table with each phase's
+   kill switch, acceptance criteria as checkboxes, open decisions, out-of-scope, and a
+   field-verification log. Prefer landing it on master *before* the implementation PR; when
+   it rides along with that PR instead, the issue must link it at the **branch/PR** URL and
+   be switched to the master blob once merged — a `blob/master/…` link minted early is a
+   404 for everyone who opens the issue in the meantime (#768 shipped that way).
+2. **GitHub issue** `FR-N: <title>` in `gjovanov/roomler-ai/issues` (labels:
    `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
    Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
+   Open it at PLAN time, not at merge time — the point is that the plan is discoverable
+   while it is still a plan.
 3. **Comment as you ship**: every merged PR and release gets a comment on the issue with
    what landed, the knobs, and the FIELD RESULT once measured (CI green ≠ done — quote the
    operator's read or the heartbeat numbers). Update the spec's status table + check off
@@ -362,6 +375,15 @@ Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`:
 
 The first instance is `docs/fr/FR-1-remote-desktop-drag-smoothness.md`. Retroactive FRs
 for already-shipped arcs are welcome when a program resurfaces.
+
+⚠️ **Every plan for substantial work must carry the FR as an explicit step** — creating
+the issue and the spec is part of the plan, not paperwork after it. A program tracked only
+in session memory or a handover file is invisible to the operator and to the next session;
+that is precisely how a completed 5-phase plan sat in a memory file reading "NOT started"
+for a week while parallel sessions shipped all of it.
+
+⚠️ `gh auth` can flip to the `gjovanov-orf` account. Pair every `gh` write with
+`gh auth switch --user gjovanov` in the SAME invocation.
 
 ## Post-Implementation Testing
 
