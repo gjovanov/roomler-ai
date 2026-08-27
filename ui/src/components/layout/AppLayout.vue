@@ -441,6 +441,15 @@
           {{ roomStore.totalUnread }}
         </v-btn>
         <v-btn icon="mdi-magnify" size="small" @click="showSearch = true" />
+        <!-- FR-12 — the tour, reachable forever (not only at first login). -->
+        <v-btn
+          v-if="tenantId"
+          icon="mdi-help-circle-outline"
+          size="small"
+          :title="$t('nav.tutorial')"
+          :aria-label="$t('nav.tutorial')"
+          :to="{ name: 'tutorial', params: { tenantId } }"
+        />
         <v-btn
           :icon="isDark ? 'mdi-weather-sunny' : 'mdi-weather-night'"
           size="small"
@@ -471,6 +480,12 @@
           </template>
           <v-list density="compact">
             <v-list-item prepend-icon="mdi-account" title="Profile" @click="goToProfile" />
+            <v-list-item
+              v-if="tenantId"
+              prepend-icon="mdi-school-outline"
+              :title="$t('nav.tutorial')"
+              :to="{ name: 'tutorial', params: { tenantId } }"
+            />
             <v-list-item prepend-icon="mdi-logout" title="Logout" @click="handleLogout" />
           </v-list>
         </v-menu>
@@ -573,6 +588,7 @@ import MiniConference from '@/components/conference/MiniConference.vue'
 import SearchDialog from '@/components/layout/SearchDialog.vue'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'
+import { hasSeenTour, markTourSeen, shouldAutoOpenTour } from '@/composables/useTutorialProgress'
 
 const { mobile } = useDisplay()
 const { showError: showCreateOrgError } = useSnackbar()
@@ -854,6 +870,50 @@ watch(
   },
   { immediate: true },
 )
+
+// FR-12 — the welcome tour opens ONCE, for a user who has never seen it, in
+// an org that is still empty (no devices, at most one room). Everyone else is
+// never interrupted: the `?` in the app bar is the way back in.
+//
+// The seen-flag read comes FIRST and costs a localStorage hit, so the common
+// case (already seen) bails before issuing a single request; the counts are
+// only fetched for a user this can still fire for, once per app load.
+let tourChecked = false
+async function maybeAutoOpenTour() {
+  if (tourChecked) return
+  const tid = tenantId.value
+  const uid = auth.user?.id
+  if (!tid || !uid) return
+  if (route.name === 'tutorial') return
+  if (hasSeenTour(uid)) {
+    tourChecked = true
+    return
+  }
+  // The device count needs the fleet surfaces; without it there is no
+  // evidence the org is fresh, and we never navigate on a guess.
+  if (!showFleetNav.value) return
+  tourChecked = true
+  try {
+    await Promise.all([
+      agentStore.fetchAgents(tid),
+      roomStore.rooms.length ? Promise.resolve() : roomStore.fetchRooms(tid),
+    ])
+  } catch {
+    return
+  }
+  if (
+    !shouldAutoOpenTour({
+      userId: uid,
+      devices: agentStore.total,
+      rooms: roomStore.rooms.length,
+    })
+  ) {
+    return
+  }
+  markTourSeen(uid)
+  router.replace({ name: 'tutorial', params: { tenantId: tid } })
+}
+watch([tenantId, showFleetNav] as const, () => void maybeAutoOpenTour(), { immediate: true })
 
 const settingsRoute = computed(() =>
   tenantId.value ? `/tenant/${tenantId.value}/admin` : '/',
