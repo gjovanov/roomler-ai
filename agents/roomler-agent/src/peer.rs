@@ -4248,6 +4248,10 @@ async fn media_pump_ffmpeg_dc(
     // "gate bounded the queue" from "gate never engaged".
     let mut last_ceiling_bps: u32 = 0;
     let mut direct_gate_logged = false;
+    // P5 (FR-1) — cadence-pacing state: the next consumption slot, and the
+    // last paced value logged (changes only — engage / move / release).
+    let mut pace_due: Option<std::time::Instant> = None;
+    let mut last_paced_logged: Option<Option<u32>> = None;
 
     // P8c — the rate governor owns the four rate controllers this pump
     // previously threaded by hand (see `encode::governor` module docs):
@@ -4680,6 +4684,27 @@ async fn media_pump_ffmpeg_dc(
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
             continue;
+        }
+
+        // P5 (FR-1) — cadence pacing: when the HW encoder can't hold
+        // target_fps, consume frames on an even grid at the sustainable
+        // rate instead of letting the capture layer drop ~33 % at random
+        // phases (the alternating 16/33 ms motion deltas = the residual
+        // "steps" judder). Latest-wins capture keeps freshness; slots are
+        // scheduled from consumption start, so an encode longer than the
+        // interval degrades to natural (still even) cadence, never a
+        // burst.
+        if let Some(paced) = governor.paced_fps() {
+            let interval = Duration::from_micros(1_000_000 / paced.max(1) as u64);
+            let now = std::time::Instant::now();
+            if let Some(due) = pace_due
+                && due > now
+            {
+                tokio::time::sleep(due - now).await;
+            }
+            pace_due = Some(std::time::Instant::now() + interval);
+        } else {
+            pace_due = None;
         }
 
         // Capture one frame; on transient failure, reuse the last
@@ -5241,7 +5266,14 @@ async fn media_pump_ffmpeg_dc(
         }
 
         let encode_start = std::time::Instant::now();
-        let packets = match enc.encode(frame.clone()).await {
+        // P5 (FR-1) — the 20-30 ms HW encode (including the BGRA→NV12
+        // convert inside `encode_sync`) ran inline on an async worker,
+        // stalling every task sharing the runtime — the DC send task's
+        // chunk pumping among them. `block_in_place` keeps the call
+        // synchronous-in-place but shifts other work off this worker for
+        // the duration (multi-thread runtime only, which the agent always
+        // runs; unit tests never drive this pump).
+        let packets = match tokio::task::block_in_place(|| enc.encode_sync(&frame)) {
             Ok(p) => {
                 err_ladder.on_success();
                 p
@@ -5528,8 +5560,15 @@ async fn media_pump_ffmpeg_dc(
             // saturated-at-floor down / ≥60 s deep-headroom up, 60 s
             // cooldown); the dims change lands via the per-frame dims plan →
             // dim-change encoder rebuild.
-            if let Some(tier) = governor.heartbeat(avg_encode_ms as f32, std::time::Instant::now())
-            {
+            // P5 (FR-1) — this pump is definitionally the HW pump
+            // (FfmpegEncoder is always a hardware backend), so the
+            // fps-first cadence relief applies: is_hw = true.
+            if let Some(tier) = governor.heartbeat(
+                avg_encode_ms as f32,
+                true,
+                target_fps,
+                std::time::Instant::now(),
+            ) {
                 tracing::info!(
                     %session_id,
                     codec_label,
@@ -5537,6 +5576,20 @@ async fn media_pump_ffmpeg_dc(
                     ewma_encode_ms = tier.ewma_encode_ms,
                     encode_factor = governor.encode_factor(),
                     "encode-bound auto-downscale tier change"
+                );
+            }
+            // P5 — change-gated pace log (engage / move / release), so the
+            // field can attribute a cadence shift to this mechanism.
+            let paced_now = governor.paced_fps();
+            if last_paced_logged != Some(paced_now) {
+                last_paced_logged = Some(paced_now);
+                tracing::info!(
+                    %session_id,
+                    codec_label,
+                    paced_fps = ?paced_now,
+                    target_fps,
+                    avg_encode_ms,
+                    "FFmpeg DC pump: cadence pace changed (fps-first HW relief)"
                 );
             }
             // P8 Phase 4 — count shared / mixed-dial pipeline seconds
@@ -5571,6 +5624,7 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_backpressure, frames_empty,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 send_wait_avg_ms, send_wait_max_ms,
+                paced_fps = ?governor.paced_fps(),
                 encode_factor = governor.encode_factor(),
                 avg_qp = ?avg_qp,
                 max_qp = ?max_qp,

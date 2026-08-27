@@ -132,6 +132,75 @@ pub enum TierSignal {
     Hold,
 }
 
+/// Floor for the paced rate — below ~15 fps the cure is a resolution tier,
+/// not more pacing (and the viewer-rate floor uses the same figure).
+pub const FPS_PACE_MIN: u32 = 15;
+
+/// P5 (FR-1, 2026-08-27) — fps-FIRST relief for HW encoders.
+///
+/// On QSV/NVENC the encode time is pixels-bound and nearly
+/// bitrate-independent, so the bitrate factor above cannot buy frame time
+/// there — it only degrades quality (field: Rozalina rode factor 0.4 with
+/// encode still ~25 ms). The correct first lever on HW is CADENCE: pace the
+/// pump at the encoder's sustainable rate so consumed frames are EVENLY
+/// spaced. Unpaced, a 60 Hz WGC feed consumed at ~40 fps drops ~33 % of
+/// frames at random phases — alternating 16/33 ms motion deltas, which is
+/// the residual "steps" judder even when latency is good.
+///
+/// Pure and hysteretic: quantized to 5 fps steps, engages only when the
+/// sustainable rate sits ≥5 under target, moves only by ≥5, floors at
+/// [`FPS_PACE_MIN`] (beyond that the tier layer shrinks pixels). Kill
+/// switch `ROOMLER_AGENT_FPS_PACE=0` / config `fps_pace`.
+pub struct FpsPace {
+    paced: Option<u32>,
+    enabled: bool,
+}
+
+impl FpsPace {
+    pub fn new() -> Self {
+        Self {
+            paced: None,
+            enabled: !matches!(node_env("FPS_PACE").as_deref(), Some("0") | Some("false")),
+        }
+    }
+
+    /// Step once per heartbeat window with the pressure EWMA. Returns the
+    /// CURRENT paced fps (`None` = run at target).
+    pub fn observe(&mut self, ewma_ms: f32, target_fps: u32) -> Option<u32> {
+        if !self.enabled || ewma_ms <= 0.0 || !ewma_ms.is_finite() {
+            return self.paced;
+        }
+        let sustainable = (1000.0 / ewma_ms).floor().clamp(0.0, 240.0) as u32;
+        let quantized = (sustainable / 5) * 5;
+        let next = if quantized + 5 <= target_fps {
+            Some(quantized.clamp(FPS_PACE_MIN, target_fps))
+        } else {
+            None
+        };
+        let changed = match (self.paced, next) {
+            // Hysteresis: an engaged pace holds until the estimate moves a
+            // full quantum, so a session hovering on a boundary doesn't
+            // flap its cadence.
+            (Some(cur), Some(n)) => cur.abs_diff(n) >= 5,
+            (a, b) => a != b,
+        };
+        if changed {
+            self.paced = next;
+        }
+        self.paced
+    }
+
+    pub fn paced(&self) -> Option<u32> {
+        self.paced
+    }
+}
+
+impl Default for FpsPace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Long-edge caps per tier: native → ~1440p-class → ~1080p-class floor.
 /// Fed to `effective_target_resolution`'s SOFT slot, so an explicit
 /// controller-side Fixed pick always wins (the auto tier only shapes
@@ -408,6 +477,51 @@ mod tests {
         }
         assert_eq!(t.observe(TierSignal::Up, later), Some(None));
         assert_eq!(t.cap(), None);
+    }
+
+    fn pace() -> FpsPace {
+        FpsPace {
+            paced: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn pace_engages_quantized_and_holds_with_hysteresis() {
+        let mut p = pace();
+        // Fast encoder (10 ms → 100 fps sustainable) → no pacing at 60.
+        assert_eq!(p.observe(10.0, 60), None);
+        // 25 ms → 40 sustainable → paced 40 (quantized, ≥5 under 60).
+        assert_eq!(p.observe(25.0, 60), Some(40));
+        // 24 ms → 41 → quantizes to 40 — hysteresis holds.
+        assert_eq!(p.observe(24.0, 60), Some(40));
+        // 29 ms → 34 → quantizes to 30 — a full quantum away, moves.
+        assert_eq!(p.observe(29.0, 60), Some(30));
+        // Recovery (12 ms → 83 sustainable ≥ target) → releases.
+        assert_eq!(p.observe(12.0, 60), None);
+    }
+
+    #[test]
+    fn pace_floors_at_min_and_respects_target() {
+        let mut p = pace();
+        // 200 ms → 5 sustainable → floored at FPS_PACE_MIN (the tier layer
+        // owns anything below).
+        assert_eq!(p.observe(200.0, 60), Some(FPS_PACE_MIN));
+        // Near-target sustainable (17 ms → 58 → q 55 = target-5) engages at 55.
+        let mut q = pace();
+        assert_eq!(q.observe(17.0, 60), Some(55));
+        // 16 ms → 62 → q 60: not ≥5 under target → releases.
+        assert_eq!(q.observe(16.0, 60), None);
+    }
+
+    #[test]
+    fn disabled_pace_never_engages() {
+        let mut p = FpsPace {
+            paced: None,
+            enabled: false,
+        };
+        assert_eq!(p.observe(200.0, 60), None);
+        assert_eq!(p.paced(), None);
     }
 
     #[test]

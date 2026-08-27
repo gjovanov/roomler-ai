@@ -101,6 +101,9 @@ pub struct RateGovernor {
     encode_factor: f32,
     tier: DownscaleTier,
     auto_res_cap: Option<u32>,
+    // P5 (FR-1) — fps-first cadence pacing for HW encoders; sits between
+    // the factor (masked while engaged) and the tier (unchanged).
+    pace: super::encode_pressure::FpsPace,
 
     // Measured-rate v2 (2026-08-27) — CONSUMED at stage 1: the send
     // task reports per-frame blocked sends, the viewer-window tick
@@ -138,6 +141,7 @@ impl RateGovernor {
             auto_res_cap: None,
             goodput: GoodputEstimator::new(),
             goodput_sink: GoodputSink::new(),
+            pace: super::encode_pressure::FpsPace::new(),
             measured_ceiling,
         }
     }
@@ -336,14 +340,44 @@ impl RateGovernor {
     /// the next frame on), then the factor's saturation signal into
     /// the auto-downscale tier. Returns the tier change, if any, for
     /// the pump's log line.
-    pub fn heartbeat(&mut self, avg_encode_ms: f32, now: Instant) -> Option<TierChange> {
+    ///
+    /// P5 (FR-1) — on a HW encoder (`is_hw`) the FIRST relief lever is
+    /// CADENCE, not bitrate: encode time there is pixels-bound and
+    /// nearly bitrate-independent, so the factor was pure quality loss
+    /// (field: factor 0.4 with encode still ~25 ms). While the fps pace
+    /// is engaged the exposed factor is masked at 1.0; the pressure's
+    /// INTERNAL factor keeps marching so `tier_signal`'s
+    /// exhausted-lever condition still fires when even the paced floor
+    /// can't hold — resolution stays the second lever, exactly as
+    /// before.
+    pub fn heartbeat(
+        &mut self,
+        avg_encode_ms: f32,
+        is_hw: bool,
+        target_fps: u32,
+        now: Instant,
+    ) -> Option<TierChange> {
         self.encode_factor = self.pressure.observe(avg_encode_ms);
+        let paced = if is_hw {
+            self.pace.observe(self.pressure.ewma_ms(), target_fps)
+        } else {
+            None
+        };
+        if paced.is_some() {
+            self.encode_factor = 1.0;
+        }
         let new_cap = self.tier.observe(self.pressure.tier_signal(), now)?;
         self.auto_res_cap = new_cap;
         Some(TierChange {
             cap_long_edge: new_cap,
             ewma_encode_ms: self.pressure.ewma_ms(),
         })
+    }
+
+    /// The paced consumption rate for HW encoders (`None` = run at
+    /// target). Consumed by the pump's cadence gate each loop.
+    pub fn paced_fps(&self) -> Option<u32> {
+        self.pace.paced()
     }
 
     /// The encode-pressure maxrate scale (1.0 = full quality) —
@@ -663,6 +697,24 @@ mod tests {
         }
     }
 
+    /// P5 — on a HW encoder, sustained saturation engages the fps pace
+    /// and MASKS the bitrate factor (pixels-bound encode time doesn't
+    /// respond to bitrate); recovery releases both.
+    #[test]
+    fn hw_saturation_paces_fps_and_masks_the_factor() {
+        let start = Instant::now();
+        let mut g = gov(start);
+        for i in 1..=10u64 {
+            let _ = g.heartbeat(25.0, true, 60, start + Duration::from_secs(2 * i));
+        }
+        assert_eq!(g.paced_fps(), Some(40), "25 ms EWMA ⇒ ~40 fps pace");
+        assert_eq!(g.encode_factor(), 1.0, "factor masked while paced");
+        for i in 11..=30u64 {
+            let _ = g.heartbeat(8.0, true, 60, start + Duration::from_secs(2 * i));
+        }
+        assert_eq!(g.paced_fps(), None, "recovered encoder releases the pace");
+    }
+
     #[test]
     fn heartbeat_saturation_lowers_the_factor() {
         let start = Instant::now();
@@ -673,7 +725,7 @@ mod tests {
         // step within this horizon (its own windows + cooldown) — the
         // factor is the invariant here.
         for i in 1..=20u64 {
-            let _ = g.heartbeat(100.0, start + Duration::from_secs(2 * i));
+            let _ = g.heartbeat(100.0, false, 30, start + Duration::from_secs(2 * i));
         }
         assert!(
             g.encode_factor() < 1.0,

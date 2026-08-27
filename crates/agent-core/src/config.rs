@@ -680,6 +680,26 @@ pub struct AgentConfig {
     /// (applies held until 1.2 s of quiet, then a blocking re-open).
     #[serde(default)]
     pub bg_rebuild: Option<bool>,
+    /// 2026-08-27 drag-latency P5 — parallel colour conversion
+    /// (`ROOMLER_NODE_PAR_CONVERT`). Default ON: big frames run the
+    /// BGRA→NV12/I444 convert in row bands across threads
+    /// (byte-identical output, roughly halves the convert share of the
+    /// encode time at 2880×1800+). `false` restores the single-threaded
+    /// call.
+    #[serde(default)]
+    pub par_convert: Option<bool>,
+    /// 2026-08-27 drag-latency P5 — fps-first cadence pacing on HW
+    /// encoders (`ROOMLER_NODE_FPS_PACE`). Default ON: when the encoder
+    /// can't hold target fps, the pump consumes frames on an even grid
+    /// at the sustainable rate (quantized to 5 fps, floor 15) instead of
+    /// letting the capture layer drop ~33 % at random phases — even
+    /// cadence beats a higher-but-jittery rate. While engaged the
+    /// encode-pressure bitrate factor is masked at 1.0 (pixels-bound HW
+    /// encode time doesn't respond to bitrate); the resolution tier
+    /// stays the second lever. `false` restores the unpaced pre-P5
+    /// behaviour.
+    #[serde(default)]
+    pub fps_pace: Option<bool>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
     /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
@@ -1631,6 +1651,8 @@ pub fn test_fixture() -> AgentConfig {
         area_min_bitrate: None,
         measured_ceiling: None,
         bg_rebuild: None,
+        par_convert: None,
+        fps_pace: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -1746,12 +1768,14 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 50] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 52] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
         ("MEASURED_CEILING", cfg.measured_ceiling),
         ("BG_REBUILD", cfg.bg_rebuild),
+        ("PAR_CONVERT", cfg.par_convert),
+        ("FPS_PACE", cfg.fps_pace),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
         ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
         ("IDLE_REFINE", cfg.idle_refine),
