@@ -352,7 +352,12 @@ Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`:
    out-of-scope, and a field-verification log. **Numbering: unpadded `FR-N`; next N = max
    across BOTH `docs/fr/` AND `gh issue list --state all --search "FR-"` — sessions run in
    parallel, and day one produced an FR-1/FR-01 collision (#767 vs #768) because the issue
-   list wasn't checked. Search immediately before creating, same discipline as the tag race.**
+   list wasn't checked. Search immediately before creating — AND RE-VERIFY right after:
+   two sessions searched, both saw 2 as the max, and both filed FR-3 in the same window
+   (#773 vs the renumbered #774). The pre-check narrows the race; only the post-create
+   re-check (`gh issue list --state all --search "FR-<N>"` expecting exactly your own)
+   closes it — the tag-race push-then-verify discipline. The LOSER renumbers: whichever
+   issue is younger, or if that's ambiguous, the closed/retrospective one.**
 2. **GitHub issue** `FR-NN: <title>` in `gjovanov/roomler-ai/issues` (labels:
    `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
    Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
