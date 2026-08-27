@@ -490,6 +490,17 @@
                   Click "Enroll" for a one-line installer per platform — the
                   machine appears here as soon as it enrolls.
                 </p>
+                <!-- FR-12 — the empty state is exactly where the tour helps. -->
+                <v-btn
+                  size="small"
+                  variant="text"
+                  color="primary"
+                  prepend-icon="mdi-school-outline"
+                  :to="{ name: 'tutorial', params: { tenantId }, hash: '#devices' }"
+                  class="mt-2"
+                >
+                  Walk me through it
+                </v-btn>
               </template>
             </div>
           </template>
@@ -1945,6 +1956,21 @@ function fmtRelative(iso: string): string {
   if (months < 12) return `${months}mo ago`
   return `${Math.floor(months / 12)}y ago`
 }
+
+// FR-12 — `/devices?enroll=1` opens this dialog, so a tutorial step can land
+// on the real thing instead of describing a button. The param is stripped
+// immediately: opening MINTS a single-use enrollment token, and a bookmarked
+// or refreshed URL must not keep minting them.
+watch(
+  () => route.query.enroll,
+  (v) => {
+    if (!v) return
+    const { enroll: _dropped, ...rest } = route.query
+    void router.replace({ query: rest })
+    void openEnrollDialog()
+  },
+  { immediate: true },
+)
 
 async function openEnrollDialog() {
   enrollDialogOpen.value = true
