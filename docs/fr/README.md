@@ -22,7 +22,7 @@ and the last two happened *after* a scan-and-re-verify rule was already in force
 | `FR-1` (#767, 09:55:42) vs `FR-01` (#768, 09:57:20) | #768 → FR-9 |
 | `FR-3` (#773, 10:04:58) vs `FR-3` (#774, 10:05:05) | → FR-6 / FR-5 |
 | `FR-5` — three sessions within minutes | → FR-4 / FR-5 / FR-6 |
-| `FR-7` (#778, 10:07:14) vs `FR-7` (session-restore spec, 10:09:01) | spec → FR-8 |
+| `FR-7` (#778, 10:07:14) vs `FR-7` (#780, 10:09:41) | #780 → FR-8 |
 
 The tie-break when one slips through anyway: **the younger claim renumbers** (ambiguous ⇒
 the closed/retrospective one). That is repair, though — not allocation.
@@ -49,6 +49,6 @@ instead: a reader who meets `FR-4` in an old commit message must land on the rig
 | [FR-5](FR-5-macos-unattended-update-chain.md) | [#774](https://github.com/gjovanov/roomler-ai/issues/774) | macOS unattended update chain | closed — field-closed at agent rc.482 (retrospective) |
 | [FR-6](FR-6-ci-release-build-speed-slo.md) | [#773](https://github.com/gjovanov/roomler-ai/issues/773) | CI + release build-speed SLO — every lane ≤10 min warm | shipped + field-verified (retrospective) |
 | FR-7 | [#778](https://github.com/gjovanov/roomler-ai/issues/778) | Signed releases — Windows Authenticode, Linux GPG + provenance, macOS identity | closed — retrospective; spec pending |
-| [FR-8](FR-8-claude-session-restore.md) | — | Claude session restore after reboot (`crestore`) | shipped (retrospective); **needs an issue** — renumbered from FR-7, which #778 claimed 106 s earlier |
-| FR-9 | [#768](https://github.com/gjovanov/roomler-ai/issues/768) | Two nodes sharing a LAN converge to a direct carrier | acceptance criteria met; **filed as `FR-01`** — issue + PR #769 spec still to be renamed |
+| [FR-8](FR-8-claude-session-restore.md) | [#780](https://github.com/gjovanov/roomler-ai/issues/780) | Claude session restore after reboot (`crestore`) | closed — shipped (retrospective); renumbered from FR-7, which #778 claimed 147 s earlier |
+| FR-9 | [#768](https://github.com/gjovanov/roomler-ai/issues/768) | Two nodes sharing a LAN converge to a direct carrier | acceptance criteria met; renumbered from `FR-01`; **spec lands with PR #769** |
 
