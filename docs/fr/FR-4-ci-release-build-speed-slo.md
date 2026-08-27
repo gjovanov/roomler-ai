@@ -1,8 +1,8 @@
-# FR-3: CI + release build-speed SLO — every lane ≤10 min warm, self-healing
+# FR-4: CI + release build-speed SLO — every lane ≤10 min warm, self-healing
 
 **Status:** shipped + field-verified through 2026-08-26 (retroactive FR per the CLAUDE.md
 standing rule — the program ran 2026-07-13 → 2026-08-26 across ~20 PRs). Tracking issue:
-`FR-3` in gjovanov/roomler-ai/issues.
+`FR-4` (#773) in gjovanov/roomler-ai/issues.
 
 ## Goal
 
