@@ -1646,7 +1646,7 @@ fn epoch_ms_now() -> u64 {
 
 /// #33 — answer a peer's direct handshake initiation even while that tier is
 /// suppressed, when accepting cannot cost us the relay
-/// (`ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED`; default **OFF**).
+/// (`ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED`; default **ON** since 0.4.2).
 ///
 /// The #30 demote-follow hold-down exists to stop us PROMOTING into a flap. It
 /// also made `PathMonitor::inbound_init` refuse — and that verdict is
@@ -1662,14 +1662,23 @@ fn epoch_ms_now() -> u64 {
 ///
 /// ⚠️ Not entirely free: the accept occupies the peer's single probe slot for
 /// up to the handshake deadline, so a peer initiating on a genuinely bad tier
-/// can delay probing a better one. The alternative measured in the field is
-/// indefinite mutual deafness, which is strictly worse — but the slot cost is
-/// real, and is why this is default-OFF pending a soak.
+/// can delay probing a better one. Indefinite mutual deafness is strictly
+/// worse, and the field measurements below bear that out, but the slot cost is
+/// real — set the key to `false` on a host where it ever looks like the
+/// problem.
 ///
-/// Default OFF because this is carrier selection, where this codebase's
-/// regressions have been expensive: flag, two-host soak, field gate, then flip.
+/// Default flipped **ON** 2026-08-27 after the soak and field gate. Measured
+/// on hosts that ran it against hosts that did not, same LAN, same hour:
+///
+/// | pair | before | after |
+/// |---|---|---|
+/// | neo16 ↔ pc50045 | 80 probe failures, all `saw_inbound=false`; relay 108 ms | direct, **6.7 ms** |
+/// | neo16 ↔ MacBook | relay, 113 ms avg | direct, **4 ms** floor |
+///
+/// The `false` value remains the kill switch, per this crate's convention for
+/// default-ON overlay keys.
 pub fn answer_while_followed() -> bool {
-    crate::env::flag("OVERLAY_ANSWER_WHILE_FOLLOWED", false)
+    crate::env::flag("OVERLAY_ANSWER_WHILE_FOLLOWED", true)
 }
 
 #[cfg(test)]
