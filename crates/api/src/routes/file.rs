@@ -5,12 +5,52 @@ use axum::{
     response::Response,
 };
 use bson::oid::ObjectId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{error::ApiError, extractors::auth::AuthUser, state::AppState};
 use roomler_ai_db::models::{FileContext, FileContextType};
 use roomler_ai_services::dao::base::PaginationParams;
+
+/// FR-11 file-grid params. Flat (never `#[serde(flatten)]` behind axum
+/// `Query` — the AuditQuery postmortem); every field optional/defaulted so a
+/// parameterless request behaves exactly as before.
+#[derive(Debug, Deserialize)]
+pub struct FileListQuery {
+    #[serde(default = "file_default_page")]
+    pub page: u64,
+    #[serde(default = "file_default_per_page")]
+    pub per_page: u64,
+    /// Case-insensitive substring over filename/display_name.
+    pub q: Option<String>,
+    /// `filename` | `size` | `created_at` (default, desc). Unknown → 400.
+    pub sort: Option<String>,
+    /// `asc` (default for explicit sorts) | `desc`.
+    pub dir: Option<String>,
+}
+fn file_default_page() -> u64 {
+    1
+}
+fn file_default_per_page() -> u64 {
+    25
+}
+
+fn file_sort_args(params: &FileListQuery) -> Result<(Option<&str>, bool), ApiError> {
+    let sort = params.sort.as_deref();
+    if let Some(k) = sort
+        && !matches!(k, "filename" | "size" | "created_at")
+    {
+        return Err(ApiError::BadRequest(format!("Unknown sort key: {k}")));
+    }
+    let desc = match params.dir.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!("Unknown dir: {other}")));
+        }
+    };
+    Ok((sort, desc))
+}
 
 #[derive(Debug, Serialize)]
 pub struct FileResponse {
@@ -47,7 +87,7 @@ pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
     Path((tenant_id, room_id)): Path<(String, String)>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<FileListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -58,7 +98,16 @@ pub async fn list(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let result = state.files.find_by_room(tid, rid, &params).await?;
+    let (sort, desc) = file_sort_args(&params)?;
+    let page_params = PaginationParams {
+        page: params.page.max(1),
+        per_page: params.per_page.clamp(1, 100),
+        before: None,
+    };
+    let result = state
+        .files
+        .find_by_room(tid, rid, &page_params, params.q.as_deref(), sort, desc)
+        .await?;
 
     let items: Vec<FileResponse> = result.items.into_iter().map(to_response).collect();
 
@@ -76,7 +125,7 @@ pub async fn list_tenant_files(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
-    Query(params): Query<PaginationParams>,
+    Query(params): Query<FileListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
@@ -85,7 +134,16 @@ pub async fn list_tenant_files(
         return Err(ApiError::Forbidden("Not a member".to_string()));
     }
 
-    let result = state.files.find_by_tenant(tid, &params).await?;
+    let (sort, desc) = file_sort_args(&params)?;
+    let page_params = PaginationParams {
+        page: params.page.max(1),
+        per_page: params.per_page.clamp(1, 100),
+        before: None,
+    };
+    let result = state
+        .files
+        .find_by_tenant(tid, &page_params, params.q.as_deref(), sort, desc)
+        .await?;
 
     // Collect unique room IDs and look up room names
     let room_ids: Vec<ObjectId> = result
