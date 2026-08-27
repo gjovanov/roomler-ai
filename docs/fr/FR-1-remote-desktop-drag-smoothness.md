@@ -38,9 +38,19 @@ rate control:
 | P2 | Measured-rate v2 (per-frame blocked-send ≥10 ms samples, window-aggregated ≥60 ms) + stage-1 `ceiling := min(nominal, 0.85×G)` | `measured_ceiling` | ✅ rc.484 · **direct-only since 0.4.3** |
 | P3 | Background encoder rebuild: replacement opens on a blocking thread while the current encoder keeps producing; swap between frames + `send_epoch` bump | `bg_rebuild` | ✅ rc.484 · **direct-only since 0.4.3** |
 | P4 | Direct HRD window 2×→1× (`av1_*` floored at 2× — rc.443 VDENC kill) + area-scaled AIMD floor (~3.1 M @ 2880×1800, cap 4 M, unconstrained only) | `direct_hrd_pct`, `area_min_bitrate` | ✅ rc.483 |
-| P5 | Encode cost & cadence: parallel `convert_bgra` (row bands); `block_in_place` the encode; encode-pressure sheds **fps first** on HW (paced, even cadence) instead of the bitrate factor | `par_convert`, `fps_pace` | ✅ 0.4.4 (#781) — field gate pending |
-| P6 | Pointer decoupling: `pointerrawupdate` / timer-coalesced `mouse_move` instead of rAF | web deploy | ⏳ |
-| P7 | Latency telemetry: agent `send_wait_avg/max_ms` (✅ rc.483) + HUD end-to-end age (frame-header capture→send µs + control-DC RTT probe) | — | agent half ✅ · HUD half ⏳ |
+| P5 | Encode cost & cadence: parallel `convert_bgra` (row bands); `block_in_place` the encode; encode-pressure sheds **fps first** on HW (paced, even cadence) instead of the bitrate factor | `par_convert`, `fps_pace` | ✅ 0.4.4 (#781) — **field PASS** ("Rozalina works nicely", 2026-08-27) |
+| P6 | Pointer cadence decoupled from rAF: immediate-send + 8 ms min-gap timer (latest-wins), `pointerrawupdate` sampling where supported | web deploy | ✅ #793 — field gate pending |
+| P7 | Latency telemetry: agent `send_wait_avg/max_ms` (✅ rc.483) + HUD end-to-end age | — | ✅ #793 (agent 0.4.6 + web deploy) — field gate pending |
+
+P7 design note (differs from the original sketch, deliberately): no frame-header change.
+The 13-byte header already carries a µs timestamp; #793 makes BOTH pumps stamp it from one
+process-wide epoch (`agent_epoch_us`) and adds an `rc:clock` control verb echoing that same
+clock. The viewer keeps the lowest-RTT probe of 8 (fixed-origin clocks ⇒ the offset is a
+constant; min-RTT bounds the asymmetry error to RTT/2 of the BEST probe) and the decode
+workers measure age at paint: `age = epochNow + offset − wireTs`, covering encode-output →
+send queue → network → decode → paint. Agent-side capture+encode (~10–15 ms) sits before
+the stamp and is excluded — the pill's `~NN ms` reads ~15 ms low against a photographed
+input-to-photon. Old agents never echo ⇒ the pill simply doesn't show an age.
 
 Relay note (field 2026-08-27): P2 and P3 are **relay-hostile** — per-frame samples through
 a lumpy TURN-TCP pipe read near-zero during stalls (down-fast EWMA crashes the derived
@@ -90,4 +100,5 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 | rc.483 (P1+P4) | "definitively feels faster movement, but still bulky in several ms chunks/steps" — the byte gate converting queue-lag into skips against the still-unmeasured overrun |
 | rc.484 (P2+P3) | ROZALINA direct = better; CLK + PC55331 over corp relay = WORSE than rc.483 (both mechanisms relay-hostile — see relay note) |
 | 0.4.3 (relay gating) | Rozalina "much better now", verified from neo16, pc50045 and MacBook; relay reverted to rc.483 posture (re-test pending) |
-| 0.4.4 (P5) | parallel convert + block_in_place + fps-first cadence pacing — field gate pending (`paced_fps` engaging in heartbeats, `avg_encode_ms` ≤ ~17 native, even cadence, WGC drops no longer ~33 % random) |
+| 0.4.4 (P5) | **field PASS 2026-08-27**: "Rozalina's screen works nicely now" (direct); relay pairs handled by FR-10 (0.4.5, its own field PASS) |
+| 0.4.6 + web deploy (P6+P7, #793) | pending — expect: `~NN ms` age pill on the DC canvas paths (ROZALINA ≈ 40–70 ms direct; CLK-from-neo16 ≈ 120–180 ms relay; pc50045 pairs ≈ 200–300 ms — making FR-14's physics visible), drag cadence unchanged-or-better under heavy video |
