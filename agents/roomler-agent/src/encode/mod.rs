@@ -242,6 +242,16 @@ pub fn bg_rebuild_enabled() -> bool {
     tunnel_core::env::node_env("BG_REBUILD").as_deref() != Some("0")
 }
 
+/// Drag-latency P5 kill switch (FR-1, 2026-08-27): when on (default), big
+/// frames run the BGRA→NV12/I444 conversion in row bands across scoped
+/// threads (byte-identical output; ~25→~15 ms of "encode" time at
+/// 2880×1800). `0` restores the single-threaded dcv call. Hatch:
+/// `ROOMLER_AGENT_PAR_CONVERT=0` / config `par_convert`.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub fn par_convert_enabled() -> bool {
+    tunnel_core::env::node_env("PAR_CONVERT").as_deref() != Some("0")
+}
+
 /// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (the field-test host) that
 /// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
 /// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
