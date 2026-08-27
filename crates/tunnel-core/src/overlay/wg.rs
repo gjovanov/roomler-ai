@@ -3570,7 +3570,7 @@ mod tests {
         {
             let mux_b = Arc::clone(&mux_b);
             tokio::spawn(async move {
-                while let Some(frame) = a_out.recv().await {
+                while let Some((_queued_at, frame)) = a_out.recv().await {
                     let mut out = a_pk.to_vec();
                     out.extend_from_slice(&frame[32..]);
                     mux_b.deliver(&out);
@@ -3581,7 +3581,7 @@ mod tests {
         {
             let mux_a = Arc::clone(&mux_a);
             tokio::spawn(async move {
-                while let Some(frame) = b_out.recv().await {
+                while let Some((_queued_at, frame)) = b_out.recv().await {
                     let mut out = b_pk.to_vec();
                     out.extend_from_slice(&frame[32..]);
                     mux_a.deliver(&out);
