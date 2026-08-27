@@ -63,6 +63,45 @@ mostly adds skips without moving the age; revisit only if post-loop residuals po
 at the agent again. Also not in scope: intra-refresh (spread-I) encoding — the right
 long-term answer to residual IDR cost on thin pipes, but a separate arc.
 
+## P2 — the learned floor is wrong in BOTH directions (field 2026-08-27, 0.4.9)
+
+First field data with the loop live shows `viewer_age_floor_ms` taking values that are
+physically impossible for the path, and the loop misbehaving accordingly:
+
+- **Poisoned LOW** — floors of `1`, `2`, `8`, `9`, `10`, `11`, `13`, `15` ms on relays
+  whose own carrier RTT is 86–210 ms. A floor of 1 ms cannot exist there. With the
+  floor at 1, a perfectly healthy 100 ms window reads as +99 ms of excess and the loop
+  fires: `target_bps` is visibly parked at the 1.5 M area floor in windows where
+  `send_wait` and `bytes_inflight` say the path was fine. **The loop cuts quality on a
+  healthy session.**
+- **Poisoned HIGH** — MacBook → CORPLAP-1 learned `viewer_age_floor_ms 1111` while the
+  window average was 1 134–13 485 ms. A session that starts congested teaches the loop
+  that congestion IS the floor; `min(ring)` can only ever be as good as the best window
+  observed, so a uniformly-bad session can never trigger on excess alone.
+
+Mechanism for the low side: the `rc:clock` probe rides the SAME congested DataChannel
+as the video it measures, so the midpoint assumption `agent ≈ (t0+t1)/2` is biased
+exactly when it matters (request queued behind video, echo prompt). Bias makes computed
+ages too small — and `HopStats.add()` silently **drops negative samples**, so the
+impossible negatives disappear and the surviving near-zero positives become the floor.
+
+Fixes to design together (none is sufficient alone):
+1. **Key the loop on queueing delay, not absolute age** — `age − session_min_age` is
+   robust to any constant clock-offset error. Keep absolute age for the HUD.
+2. **Sanity-bound the floor against physics the agent already knows** — it logs the
+   pair's carrier `rtt_ms` every 5 s. A floor below ~RTT/2, or an absolute age far above
+   RTT, is evidence about the clock or the queue, not a valid floor.
+3. **Treat a negative age as offset-correction evidence**, not as a dropped sample —
+   a frame cannot arrive before it was stamped, so a negative is a direct measurement of
+   how wrong the offset is (standard one-way-delay minimum tracking).
+4. **Add an absolute over-queue trigger** so a uniformly-bad session still fires.
+
+⚠️ Also unused: `send_wait_avg/max_ms` measures the pipe's refusal to drain directly,
+needs no clock and no viewer, and works on both transports — a 907 ms blocked send is
+unambiguous congestion. Today it is telemetry only (the goodput stage-1 clamp is
+direct-only after the FR-1 P2 relay regression). A long blocked send should be an MD
+trigger on constrained. See FR-17 (#799) for why those numbers get so large.
+
 ## Acceptance criteria
 
 - [ ] neo16 → CORPLAP-3: age plateaus ≤ ~90 ms during sustained drag (was: climbs to 120);
