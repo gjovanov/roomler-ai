@@ -340,6 +340,46 @@ Registry retention: `registry-retention.sh 1` (weekly cron at Sun 04:00) keeps a
 
 **Periodic build-host maintenance (NOT per-deploy):** the fattest reclaimables are the local Rust `target/` dirs of the *other* projects cloned on the build host (`~/{harvex,oxmux,purestat,parakeet-rs}/target` were ~44 GB combined on 2026-07-12) — `cargo clean` or `rm -rf <proj>/target` when idle; they just recompile on next build. **Never touch `/var/lib/libvirt`** (the running k8s master+worker VM disks, ~87 GB) or the active container data volumes.
 
+## Functional Requirements (FR) — REQUIRED for every feature or substantive fix
+
+Every non-trivial change gets a **Functional Requirement**: a spec in the repo and a
+tracking issue that carries the work from proposal to measured result. This is the
+project's unit of record — `git log` says what changed, an FR says *what we required, how
+we verified it, and what it actually did in the field*.
+
+**Model to copy:** [gjovanov/lgr#21](https://github.com/gjovanov/lgr/issues/21).
+
+### The steps — do all four
+
+1. **Write the spec** at `docs/fr/FR-<NN>-<slug>.md`. Number sequentially from the highest
+   existing `docs/fr/` file. It carries: Goal · Key design with **`file:line` anchors**
+   (so a reader lands on the code, not a description of it) · Edge cases · **Acceptance
+   criteria as checkboxes** · Field test · Out of scope.
+2. **Open the issue** in <https://github.com/gjovanov/roomler-ai/issues>, titled
+   `FR-<NN>: <one-line requirement>`, label `enhancement`. The body links the spec file at
+   its commit and repeats Goal / Key design / Acceptance criteria / Open decisions /
+   Out of scope inline, so the issue is readable without opening the repo. Cross-link
+   related FRs and PRs.
+3. **Document each step as a comment** as the work lands — what was implemented, which PR,
+   what the gates said. One comment per meaningful step, not a single dump at the end.
+4. **Comment the RESULT**, with measurements. Tick the acceptance boxes that passed and say
+   plainly which did not. A field number ("108 ms relay → 6.7 ms direct, n=38") is worth
+   more than a paragraph, and an FR closed without one is not closed.
+
+### Rules
+
+- ⚠️ The FR is written **BEFORE** the implementation PR, and the PR references it
+  (`Implements FR-<NN>` / `Refs #<issue>`). An FR reverse-engineered afterwards records
+  what was built, which is exactly the thing it exists not to be.
+- ⚠️ **Acceptance criteria must be falsifiable.** "Improves convergence" is not a criterion;
+  "a pair sharing a LAN reaches `tier=lan` within 30 s, verified by `roomler why`" is.
+- ⚠️ **Report failures in the same comment as successes.** A criterion that did not pass,
+  or passed only under a flag, is the most valuable line in the thread.
+- ⚠️ A hypothesis that died on evidence belongs in the FR thread too — it stops the next
+  session re-running it. This repo has paid for that lesson repeatedly.
+- Small mechanical fixes (a typo, a lint, a version bump) do **not** need an FR; anything
+  that changes behaviour, adds a surface, or takes more than one PR does.
+
 ## Post-Implementation Testing
 
 After every feature or fix, verify your changes:
