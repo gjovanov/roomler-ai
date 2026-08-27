@@ -332,7 +332,7 @@ const KEYS: &[(&str, &str, &str)] = &[
     (
         "overlay_answer_while_followed",
         "tribool",
-        "Answer a peer's direct handshake even while that tier is suppressed, when accepting cannot cost the relay (it becomes a shadow probe). The demote-follow hold-down otherwise stops this node ANSWERING for up to 15 min, so two followed ends go mutually deaf and a good LAN pair sits on relay. Built-in default: off, pending a soak.",
+        "Answer a peer's direct handshake even while that tier is suppressed, when accepting cannot cost the relay (it becomes a shadow probe). The demote-follow hold-down otherwise stops this node ANSWERING for up to 15 min, so two followed ends go mutually deaf and a good LAN pair sits on relay. Built-in default: ON since 0.4.2 (set false as the kill switch).",
     ),
     (
         "overlay_tun_stable_guid",
