@@ -1011,6 +1011,21 @@
           >
             Clipboard auto-sync — {{ clipboardAutoSyncOn ? 'ON' : 'OFF' }}
           </v-btn>
+          <!-- FR-13 (#789): mac hosts only — Ctrl chords translate to Cmd
+               (copy/paste work); switch OFF to send literal Ctrl for
+               terminal work (SIGINT etc). -->
+          <v-btn
+            v-if="rc.hostIsMac.value"
+            block
+            variant="tonal"
+            :color="rc.ctrlAsCmd.value ? 'primary' : undefined"
+            prepend-icon="mdi-apple-keyboard-command"
+            title="ON: your Ctrl acts as the Mac's Cmd (Ctrl+C copies). OFF: literal Ctrl reaches the host (Ctrl+C is SIGINT in a terminal)."
+            class="mb-2"
+            @click="rc.ctrlAsCmd.value = !rc.ctrlAsCmd.value"
+          >
+            Ctrl acts as Cmd — {{ rc.ctrlAsCmd.value ? 'ON' : 'OFF' }}
+          </v-btn>
           <!-- rc.227 — manual remote-layout picker. Caps-gated ('set') AND
                self-gated on a received rc:layout (needs the installed
                list). Bound to REPORTED state: a lost/refused switch snaps
