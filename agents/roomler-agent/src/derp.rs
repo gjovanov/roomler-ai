@@ -36,6 +36,27 @@ const DERP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// megabytes autotuning would otherwise allow to accumulate as latency.
 const DERP_SNDBUF_BYTES: usize = 256 * 1024;
 
+/// Reconnect backoff ceiling. Deliberately LOW: the `/derp` WS is the relay
+/// FLOOR — with a force-DERP pin active the pinned pair has no other tier, and
+/// (post-#497) its build is withheld for exactly as long as this mux is down.
+/// At the old 60 s ceiling a VPN capture pushed attempts to ~90 s spacing
+/// (30 s connect timeout + 60 s backoff), so the floor could lag the network's
+/// recovery by minutes (field 2026-08-16: multi-minute dark windows on pinned
+/// pairs through a Check Point cycle). One TLS dial per 10 s while the path is
+/// actually broken is noise; a fast floor restoration is the whole point.
+const DERP_BACKOFF_MAX: Duration = Duration::from_secs(10);
+/// Keepalive Ping cadence on the established `/derp` WS. An idle DERP socket
+/// is legitimately silent (frames only flow while a both-UDP-blocked pair is
+/// relaying), so WITHOUT our own pings the RX deadline below would false-fire
+/// on healthy idle links. The server auto-pongs, giving a healthy link an
+/// inbound frame at least this often.
+const DERP_KEEPALIVE: Duration = Duration::from_secs(25);
+/// Receive-liveness deadline (3 keepalive periods + margin). Same rationale
+/// as `signaling::WS_RX_DEADLINE`: a TLS-inspecting corp middlebox keeps
+/// ACKing our pings after its upstream leg died, so send-success proves
+/// nothing — reconnect must key on frames RECEIVED.
+const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
+
 /// FR-18 — request the [`DERP_SNDBUF_BYTES`] ceiling on the socket under the
 /// (possibly TLS-wrapped) WebSocket. Best-effort by design: an OS may clamp or
 /// ignore the request, and a carrier that works with a big buffer must not fail
@@ -62,26 +83,6 @@ fn cap_send_buffer(
         debug!(%relay, %e, "overlay derp: set_send_buffer_size failed — OS default retained");
     }
 }
-/// Reconnect backoff ceiling. Deliberately LOW: the `/derp` WS is the relay
-/// FLOOR — with a force-DERP pin active the pinned pair has no other tier, and
-/// (post-#497) its build is withheld for exactly as long as this mux is down.
-/// At the old 60 s ceiling a VPN capture pushed attempts to ~90 s spacing
-/// (30 s connect timeout + 60 s backoff), so the floor could lag the network's
-/// recovery by minutes (field 2026-08-16: multi-minute dark windows on pinned
-/// pairs through a Check Point cycle). One TLS dial per 10 s while the path is
-/// actually broken is noise; a fast floor restoration is the whole point.
-const DERP_BACKOFF_MAX: Duration = Duration::from_secs(10);
-/// Keepalive Ping cadence on the established `/derp` WS. An idle DERP socket
-/// is legitimately silent (frames only flow while a both-UDP-blocked pair is
-/// relaying), so WITHOUT our own pings the RX deadline below would false-fire
-/// on healthy idle links. The server auto-pongs, giving a healthy link an
-/// inbound frame at least this often.
-const DERP_KEEPALIVE: Duration = Duration::from_secs(25);
-/// Receive-liveness deadline (3 keepalive periods + margin). Same rationale
-/// as `signaling::WS_RX_DEADLINE`: a TLS-inspecting corp middlebox keeps
-/// ACKing our pings after its upstream leg died, so send-success proves
-/// nothing — reconnect must key on frames RECEIVED.
-const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
 
 /// Derive the `/derp` WSS URL from the control `ws_url` (`wss://host/ws`).
 fn derp_url_from_ws(ws_url: &str) -> String {
@@ -104,7 +105,7 @@ pub fn spawn(
     agent_token: &str,
     tenant_id: &str,
     mux: &Arc<DerpMux>,
-    outbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
     // S6 — `tid` = tenant-affinity key for the front LB. DERP relays are
     // pod-local, so both mesh peers must land on the SAME pod; hashing
@@ -136,7 +137,7 @@ pub fn spawn_regional(
     ticket_slot: DerpTicketSlot,
     tenant_id: &str,
     mux: &Arc<DerpMux>,
-    outbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
     let base = derp_url.to_string();
     // Host part only — the ticket query string must never reach a log line.
