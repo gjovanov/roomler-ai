@@ -252,6 +252,43 @@ pub fn par_convert_enabled() -> bool {
     tunnel_core::env::node_env("PAR_CONVERT").as_deref() != Some("0")
 }
 
+/// FR-10 kill switch (2026-08-27): when on (default), CONSTRAINED sessions
+/// run IDR-thrifty — the idle-settle keyframe is suppressed (on a reliable
+/// ordered DC it is a quality refresh, not a correctness need; the
+/// request-driven resync stays) and deferred bitrate applies are spaced
+/// (see [`relay_deferred_apply_allowed`]). Field (CLK, 2026-08-27): each
+/// such IDR was a single ~300 KB frame ≈ 1.2–1.5 s of a ~2 Mbps relay —
+/// the "bulky" lumps. `0` restores the previous relay behaviour. Hatch:
+/// `ROOMLER_AGENT_RELAY_IDR_THRIFT=0` / config `relay_idr_thrift`.
+#[cfg_attr(
+    not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
+    allow(dead_code)
+)]
+pub fn relay_idr_thrift_enabled() -> bool {
+    tunnel_core::env::node_env("RELAY_IDR_THRIFT").as_deref() != Some("0")
+}
+
+/// FR-10 — whether a deferred (quiet-flushed) bitrate apply may land on a
+/// thrifty CONSTRAINED session. Each apply is a QSV/AMF re-open whose first
+/// frame is an IDR — a lump on a thin pipe — so small moves wait out a
+/// 15 s interval while a LARGE move (≥40 % relative — a genuine collapse
+/// or recovery) applies promptly.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub fn relay_deferred_apply_allowed(
+    since_last_apply: Option<std::time::Duration>,
+    current_bps: u32,
+    target_bps: u32,
+) -> bool {
+    const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+    let (lo, hi) = if current_bps < target_bps {
+        (current_bps, target_bps)
+    } else {
+        (target_bps, current_bps)
+    };
+    let big_move = lo == 0 || (hi as u64) * 10 >= (lo as u64) * 14;
+    big_move || since_last_apply.is_none_or(|d| d >= MIN_INTERVAL)
+}
+
 /// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (the field-test host) that
 /// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
 /// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
@@ -1001,6 +1038,40 @@ mod tests {
         assert_eq!(area_min_bitrate_bps(3840, 2160, false), 4_000_000);
         // Constrained sessions are exempt regardless of area.
         assert_eq!(area_min_bitrate_bps(3840, 2160, true), MIN_BITRATE_BPS);
+    }
+
+    /// FR-10 — deferred-apply spacing on thrifty relays: small moves wait
+    /// out 15 s, a ≥40 % move (genuine collapse/recovery) lands promptly,
+    /// and the first-ever apply is always allowed.
+    #[test]
+    fn relay_deferred_apply_spacing() {
+        use std::time::Duration;
+        // First apply of the session — allowed.
+        assert!(relay_deferred_apply_allowed(None, 2_000_000, 1_500_000));
+        // Small rung-hop 3 s after the last apply — held.
+        assert!(!relay_deferred_apply_allowed(
+            Some(Duration::from_secs(3)),
+            2_000_000,
+            1_500_000
+        ));
+        // Same hop after the interval — allowed.
+        assert!(relay_deferred_apply_allowed(
+            Some(Duration::from_secs(16)),
+            2_000_000,
+            1_500_000
+        ));
+        // A collapse (3 M → 1.5 M = 2×) applies promptly regardless.
+        assert!(relay_deferred_apply_allowed(
+            Some(Duration::from_secs(1)),
+            3_000_000,
+            1_500_000
+        ));
+        // ...and so does a big recovery (1.5 M → 3 M).
+        assert!(relay_deferred_apply_allowed(
+            Some(Duration::from_secs(1)),
+            1_500_000,
+            3_000_000
+        ));
     }
 
     /// rc.443 — the encode-error ladder: retry twice, rebuild at 3 and 6,
