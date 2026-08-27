@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 380 150" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-labelledby="sa-t">
+  <title id="sa-t">Default-deny policy between machines: one path allowed, one refused</title>
+  <!-- Two callers -->
+  <g fill="#ffffff" stroke="rgba(0,150,136,0.45)" stroke-width="1.5">
+    <rect x="8" y="26" width="80" height="36" rx="6"/>
+    <rect x="8" y="88" width="80" height="36" rx="6"/>
+  </g>
+  <text x="48" y="48" text-anchor="middle" font-size="8.5" font-weight="600" fill="#1a1a2e">ops laptop</text>
+  <text x="48" y="110" text-anchor="middle" font-size="8.5" font-weight="600" fill="#1a1a2e">contractor</text>
+
+  <!-- The gate -->
+  <g transform="translate(190 75)">
+    <path d="M0 -42 l34 14 v22 c0 20 -14 34 -34 42 c-20 -8 -34 -22 -34 -42 v-22 z"
+          fill="rgba(0,150,136,0.12)" stroke="#00796B" stroke-width="1.6"/>
+    <path d="M-8 -4 l6 7 l12 -14" fill="none" stroke="#00796B" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="0" y="18" text-anchor="middle" font-size="8" font-weight="700" fill="#00796B">policy</text>
+  </g>
+  <text x="190" y="134" text-anchor="middle" font-size="7.5" font-weight="600" fill="rgba(26,26,46,0.65)">default deny</text>
+
+  <!-- Allowed path -->
+  <path d="M88 44 Q140 44 158 62" stroke="#4caf50" stroke-width="1.8" fill="none" marker-end="url(#saOk)"/>
+  <path d="M222 62 Q252 44 292 44" stroke="#4caf50" stroke-width="1.8" fill="none" marker-end="url(#saOk)"/>
+  <text x="132" y="36" font-size="7.5" font-weight="600" fill="#4caf50">allowed</text>
+
+  <!-- Refused path -->
+  <path d="M88 106 Q122 106 136 100" stroke="#ef5350" stroke-width="1.8" fill="none" stroke-dasharray="5 3"/>
+  <g stroke="#ef5350" stroke-width="2.4" stroke-linecap="round">
+    <path d="M142 92 l12 12"/><path d="M154 92 l-12 12"/>
+  </g>
+  <text x="48" y="140" text-anchor="middle" font-size="7.5" font-weight="600" fill="#ef5350">refused + logged</text>
+
+  <defs>
+    <marker id="saOk" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 1 L6 4 L0 7 z" fill="#4caf50"/>
+    </marker>
+  </defs>
+
+  <!-- Destination -->
+  <rect x="292" y="26" width="80" height="36" rx="6" fill="#ffffff" stroke="rgba(0,150,136,0.45)" stroke-width="1.5"/>
+  <text x="332" y="48" text-anchor="middle" font-size="8.5" font-weight="600" fill="#1a1a2e">prod server</text>
+
+  <!-- Audit trail -->
+  <g fill="rgba(26,26,46,0.06)" stroke="rgba(26,26,46,0.22)" stroke-width="1">
+    <rect x="292" y="82" width="80" height="42" rx="5"/>
+  </g>
+  <g stroke="rgba(26,26,46,0.35)" stroke-width="1.6" stroke-linecap="round">
+    <path d="M302 94 h60"/><path d="M302 103 h48"/><path d="M302 112 h56"/>
+  </g>
+  <text x="332" y="76" text-anchor="middle" font-size="7.5" font-weight="600" fill="rgba(26,26,46,0.6)">audit</text>
+</svg>
