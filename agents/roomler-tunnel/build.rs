@@ -26,18 +26,30 @@ mod windows_version_info {
     use std::fs;
     use std::path::PathBuf;
 
-    /// `0.3.0-rc.238` -> `(0, 3, 238)`; a final release -> `(major, minor,
-    /// 65535)`. Mirrors the MSI ProductVersion remap in `release-agent.yml`
-    /// so the EXE file version and the MSI product version agree.
+    /// `0.3.0-rc.238` -> `(0, 3, 238)`; a 0.4+ final carries its PATCH
+    /// (`0.4.1` -> `(0, 4, 1)`), a pre-0.4 final keeps the legacy 65535 —
+    /// the #760 era split. Mirrors the MSI ProductVersion remap in
+    /// `release-agent.yml` so the EXE file version and the MSI product
+    /// version agree.
     fn file_version(pkg_version: &str) -> (u16, u16, u16) {
         let (core, rc) = match pkg_version.split_once("-rc.") {
-            Some((core, rc)) => (core, rc.parse::<u32>().unwrap_or(0).min(65535) as u16),
-            None => (pkg_version, 65535u16),
+            Some((core, rc)) => (core, Some(rc.parse::<u32>().unwrap_or(0).min(65535) as u16)),
+            None => (pkg_version, None),
         };
         let mut parts = core.split('.');
-        let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major, minor, rc)
+        let major: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let minor: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch: u16 = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(65535) as u16;
+        let build = match rc {
+            Some(rc) => rc,
+            None if (major, minor) >= (0, 4) => patch,
+            None => 65535,
+        };
+        (major, minor, build)
     }
 
     pub fn embed() {
