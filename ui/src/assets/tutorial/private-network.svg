@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" aria-labelledby="pn-title pn-desc">
+  <!-- Sibling of hero-mesh.svg — same visual system as the landing page. -->
+  <title id="pn-title">Your own secure private network</title>
+  <desc id="pn-desc">
+    A laptop, a GPU box, a home server sharing its LAN, and a cloud cluster are
+    joined in a private WireGuard-style mesh. Every device keeps a stable name
+    and address wherever it is; traffic flows directly between devices,
+    end-to-end encrypted, through NATs and firewalls, with no open ports. The
+    home server can also route all your internet traffic when you travel.
+  </desc>
+  <style>
+    .ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .mesh-line { stroke: rgba(0,150,136,.55); stroke-width: 1.75; stroke-linecap: round;
+      stroke-dasharray: 7 9; animation: pn-march-16 1.8s linear infinite; }
+    .exit-line { stroke: rgba(0,121,107,.55); stroke-width: 1.5; stroke-linecap: round; fill: none;
+      stroke-dasharray: 2 6; animation: pn-march-8 2.2s linear infinite; }
+    @keyframes pn-march-16 { to { stroke-dashoffset: -16; } }
+    @keyframes pn-march-8 { to { stroke-dashoffset: -8; } }
+    .pkt { fill: #009688; will-change: transform; animation: pn-packet 2.6s ease-in-out infinite; }
+    @keyframes pn-packet {
+      0% { transform: translate(0,0); opacity: 0; }
+      8% { opacity: 1; } 92% { opacity: 1; }
+      100% { transform: translate(var(--dx), var(--dy)); opacity: 0; }
+    }
+    .ring { transform-box: fill-box; transform-origin: center; animation: pn-ring 2.2s ease-out infinite; }
+    @keyframes pn-ring { 0% { transform: scale(1); opacity: .55; } 100% { transform: scale(2.4); opacity: 0; } }
+    .fan { transform-box: fill-box; transform-origin: center; animation: pn-spin 3.5s linear infinite; }
+    @keyframes pn-spin { to { transform: rotate(360deg); } }
+    .globe-spin { transform-box: fill-box; transform-origin: center; animation: pn-globe 6s linear infinite; }
+    @keyframes pn-globe { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      * { animation: none !important; }
+      .pkt, .ring { display: none; }
+    }
+  </style>
+  <defs>
+    <linearGradient id="pn-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e0f2f1" />
+      <stop offset=".5" stop-color="#e8f5e9" />
+      <stop offset="1" stop-color="#e0f7fa" />
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="400" rx="18" fill="url(#pn-bg)" />
+
+  <!-- ══ Mesh lines (behind everything) ══ -->
+  <g>
+    <line class="mesh-line" x1="164" y1="120" x2="545" y2="110" />
+    <line class="mesh-line" x1="150" y1="145" x2="160" y2="250" style="animation-delay: -0.3s" />
+    <line class="mesh-line" x1="168" y1="138" x2="562" y2="260" style="animation-delay: -0.6s" />
+    <line class="mesh-line" x1="558" y1="130" x2="200" y2="258" style="animation-delay: -0.9s" />
+    <line class="mesh-line" x1="590" y1="182" x2="590" y2="250" style="animation-delay: -1.2s" />
+    <line class="mesh-line" x1="220" y1="292" x2="558" y2="286" style="animation-delay: -1.5s" />
+    <circle class="pkt" cx="164" cy="120" r="3" style="--dx: 381px; --dy: -10px; animation-duration: 2.8s" />
+    <circle class="pkt" cx="558" cy="130" r="3" style="--dx: -358px; --dy: 128px; animation-duration: 3.2s; animation-delay: 0.9s" />
+    <circle class="pkt" cx="220" cy="292" r="3" style="--dx: 338px; --dy: -6px; animation-duration: 2.4s; animation-delay: 1.5s" />
+    <circle class="pkt" cx="150" cy="145" r="3" style="--dx: 10px; --dy: 105px; animation-duration: 2.2s; animation-delay: 2s" />
+  </g>
+
+  <!-- ══ Firewall on the right-hand path ══ -->
+  <g>
+    <rect x="579" y="190" width="22" height="44" rx="1" fill="rgba(26,26,46,.1)" stroke="rgba(26,26,46,.5)" />
+    <path d="M579 201 h22 M579 212 h22 M579 223 h22 M590 190 v11 M584 201 v11 M596 212 v11 M587 223 v11"
+      stroke="rgba(26,26,46,.4)" stroke-width="1" fill="none" />
+    <text x="612" y="205" font-size="8.5" fill="rgba(26,26,46,.55)">through NAT</text>
+    <text x="612" y="217" font-size="8.5" fill="rgba(26,26,46,.55)">&amp; firewalls</text>
+  </g>
+
+  <!-- ══ Devices ══ -->
+  <!-- laptop — you -->
+  <g>
+    <rect x="100" y="88" width="64" height="42" rx="3" fill="#1a1a2e" stroke="rgba(0,150,136,.5)" />
+    <rect x="106" y="94" width="52" height="30" rx="2" fill="rgba(0,150,136,.18)" />
+    <path d="M92 130 h80 l7 9 h-94 z" fill="#cfd8dc" />
+    <circle cx="167" cy="85" r="3.5" fill="#4caf50" />
+    <circle class="ring" cx="167" cy="85" r="3.5" fill="none" stroke="rgba(76,175,80,.5)" />
+    <rect x="62" y="149" width="140" height="30" rx="8" fill="rgba(255,255,255,.75)" />
+    <text x="132" y="160" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a1a2e">laptop — you</text>
+    <text class="ip" x="132" y="174" text-anchor="middle" font-size="10" fill="#00796B">laptop · 100.64.0.12</text>
+  </g>
+
+  <!-- gpu box -->
+  <g>
+    <rect x="545" y="86" width="58" height="38" rx="3" fill="#1a1a2e" stroke="rgba(0,150,136,.5)" />
+    <rect x="551" y="94" width="28" height="3" rx="1.5" fill="#009688" opacity=".8" />
+    <rect x="551" y="101" width="40" height="3" rx="1.5" fill="#009688" opacity=".5" />
+    <rect x="551" y="108" width="22" height="3" rx="1.5" fill="#009688" opacity=".65" />
+    <rect x="609" y="84" width="28" height="46" rx="3" fill="#1a1a2e" stroke="rgba(0,150,136,.5)" />
+    <circle cx="623" cy="104" r="8" fill="none" stroke="#009688" stroke-width="1.2" />
+    <g class="fan" stroke="#4DB6AC" stroke-width="1.4">
+      <line x1="623" y1="98.5" x2="623" y2="109.5" />
+      <line x1="618.2" y1="101.2" x2="627.8" y2="106.8" />
+      <line x1="627.8" y1="101.2" x2="618.2" y2="106.8" />
+    </g>
+    <circle cx="623" cy="104" r="1.6" fill="#009688" />
+    <circle cx="631" cy="81" r="3.5" fill="#4caf50" />
+    <circle class="ring" cx="631" cy="81" r="3.5" fill="none" stroke="rgba(76,175,80,.5)" style="animation-delay: 0.5s" />
+    <text x="590" y="160" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a1a2e">GPU box — office</text>
+    <text class="ip" x="590" y="174" text-anchor="middle" font-size="10" fill="#00796B">gpu-box · 100.64.0.23</text>
+  </g>
+
+  <!-- home server + its LAN -->
+  <g>
+    <ellipse cx="165" cy="288" rx="102" ry="60" fill="rgba(0,150,136,.04)" stroke="rgba(26,26,46,.25)" stroke-dasharray="4 5" />
+    <rect x="142" y="252" width="40" height="50" rx="4" fill="#ffffff" stroke="rgba(26,26,46,.4)" />
+    <rect x="148" y="260" width="28" height="3" rx="1.5" fill="rgba(26,26,46,.25)" />
+    <rect x="148" y="267" width="28" height="3" rx="1.5" fill="rgba(26,26,46,.25)" />
+    <circle cx="150" cy="292" r="2" fill="#4caf50" />
+    <circle class="ring" cx="150" cy="292" r="2" fill="none" stroke="rgba(76,175,80,.5)" style="animation-delay: 1s" />
+    <circle cx="157" cy="292" r="2" fill="#009688" />
+    <!-- little LAN neighbours it shares -->
+    <rect x="98" y="300" width="18" height="12" rx="2" fill="rgba(26,26,46,.15)" />
+    <rect x="200" y="304" width="14" height="18" rx="2" fill="rgba(26,26,46,.15)" />
+    <text x="163" y="330" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a1a2e">home server</text>
+    <text class="ip" x="163" y="344" text-anchor="middle" font-size="10" fill="#00796B">home · 100.64.0.31</text>
+    <text x="163" y="358" text-anchor="middle" font-size="9" fill="rgba(26,26,46,.55)">shares its whole LAN · 192.168.1.0/24</text>
+  </g>
+
+  <!-- cloud cluster -->
+  <g>
+    <path d="M590 252 L613 265.5 V292.5 L590 306 L567 292.5 V265.5 Z" fill="#ffffff" stroke="rgba(0,150,136,.5)" stroke-width="1.5" />
+    <rect x="579" y="265" width="22" height="7" rx="1.5" fill="rgba(26,26,46,.07)" stroke="rgba(26,26,46,.3)" stroke-width=".8" />
+    <rect x="579" y="275.5" width="22" height="7" rx="1.5" fill="rgba(26,26,46,.07)" stroke="rgba(26,26,46,.3)" stroke-width=".8" />
+    <rect x="579" y="286" width="22" height="7" rx="1.5" fill="rgba(26,26,46,.07)" stroke="rgba(26,26,46,.3)" stroke-width=".8" />
+    <circle cx="583.5" cy="268.5" r="1.4" fill="#4caf50" />
+    <circle cx="583.5" cy="279" r="1.4" fill="#4caf50" />
+    <circle cx="583.5" cy="289.5" r="1.4" fill="#009688" />
+    <circle cx="615" cy="257" r="3.5" fill="#4caf50" />
+    <circle class="ring" cx="615" cy="257" r="3.5" fill="none" stroke="rgba(76,175,80,.5)" style="animation-delay: 1.5s" />
+    <text x="590" y="330" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1a1a2e">cloud VM / cluster</text>
+    <text class="ip" x="590" y="344" text-anchor="middle" font-size="10" fill="#00796B">cluster · 100.64.0.44</text>
+  </g>
+
+  <!-- ══ Story pills ══ -->
+  <g>
+    <rect x="290" y="186" width="180" height="22" rx="11" fill="#ffffff" stroke="rgba(0,150,136,.35)" />
+    <path d="M300 196.5 v-2.5 a3.5 3.5 0 0 1 7 0 v2.5" fill="none" stroke="#00796B" stroke-width="1.4" />
+    <rect x="299" y="196.5" width="9" height="7" rx="1" fill="#00796B" />
+    <text x="386" y="200.5" text-anchor="middle" font-size="9.5" fill="#00796B">end-to-end encrypted · WireGuard</text>
+    <rect x="212" y="211" width="336" height="17" rx="8.5" fill="rgba(255,255,255,.85)" />
+    <text x="380" y="222.5" text-anchor="middle" font-size="8.5" fill="rgba(26,26,46,.6)">device-to-device · no open ports · stable names wherever they roam</text>
+
+    <rect x="290" y="128" width="176" height="17" rx="8.5" fill="#ffffff" stroke="rgba(0,150,136,.35)" />
+    <text x="378" y="139.5" text-anchor="middle" font-size="8.5" fill="#00796B">ssh gpu-box · psql db.home — by name</text>
+  </g>
+
+  <!-- ══ Exit node: your internet via home, when you travel ══ -->
+  <g>
+    <path class="exit-line" d="M228 322 Q280 356 332 344" />
+    <g>
+      <circle cx="352" cy="344" r="16" fill="#ffffff" stroke="rgba(0,121,107,.55)" stroke-width="1.4" />
+      <g class="globe-spin" stroke="rgba(0,121,107,.5)" stroke-width="1" fill="none">
+        <ellipse cx="352" cy="344" rx="7" ry="15" />
+        <ellipse cx="352" cy="344" rx="13" ry="15" />
+      </g>
+      <path d="M337.5 338 h29 M336 344 h32 M337.5 350 h29" stroke="rgba(0,121,107,.5)" stroke-width="1" fill="none" />
+    </g>
+    <text x="447" y="341" text-anchor="middle" font-size="9" fill="rgba(26,26,46,.6)">travelling? route all your internet</text>
+    <text x="447" y="353" text-anchor="middle" font-size="9" fill="rgba(26,26,46,.6)">through home (exit node)</text>
+  </g>
+</svg>
