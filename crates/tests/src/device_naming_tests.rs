@@ -401,3 +401,121 @@ async fn tunnel_client_update_renames_and_labels() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 403);
 }
+
+// ─── FR-2: pin-update downgrade guard (2026-08-27) ─────────────
+
+/// The incident this guards: a stale operator script pinned rc.484 at a
+/// fleet already on 0.4.1 and five hosts downgraded. The server knows both
+/// versions at push time — it refuses a strictly-older pin unless forced.
+#[tokio::test]
+async fn stale_pin_is_refused_unless_forced() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr2a").await;
+
+    let aid = enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-fr2-a",
+        "Guarded Box",
+        "0.4.1",
+    )
+    .await;
+
+    // Strictly older pin → 409 naming both versions.
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/{aid}/update", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "pin": "agent-v0.3.0-rc.484" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("0.3.0-rc.484") && body.contains("0.4.1"),
+        "{body}"
+    );
+
+    // force=true is the deliberate-downgrade escape hatch (agent offline in
+    // tests ⇒ delivered=false, but the push is ACCEPTED).
+    let resp: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/{aid}/update", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "pin": "agent-v0.3.0-rc.484", "force": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["delivered"].as_bool(), Some(false));
+    assert!(resp["refused"].is_null());
+
+    // Equal pin = re-install; newer pin = upgrade — both pass.
+    for pin in ["agent-v0.4.1", "agent-v0.4.2"] {
+        let resp = app
+            .auth_post(
+                &format!("/api/tenant/{}/agent/{aid}/update", t.tenant_id),
+                &t.admin.access_token,
+            )
+            .json(&json!({ "pin": pin }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "pin {pin} must pass");
+    }
+}
+
+/// Bulk pushes skip (per-agent `refused`) rather than failing the batch —
+/// one already-updated device must not veto a fleet push.
+#[tokio::test]
+async fn bulk_stale_pin_skips_per_agent() {
+    let app = TestApp::spawn().await;
+    let t = app.seed_tenant("fr2b").await;
+
+    let old = enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-fr2-old",
+        "Old Box",
+        "0.3.0-rc.400",
+    )
+    .await;
+    let new = enroll(
+        &app,
+        &t.tenant_id,
+        &t.admin.access_token,
+        "mach-fr2-new",
+        "New Box",
+        "0.4.2",
+    )
+    .await;
+
+    let resp: Value = app
+        .auth_post(
+            &format!("/api/tenant/{}/agent/update", t.tenant_id),
+            &t.admin.access_token,
+        )
+        .json(&json!({ "agent_ids": [old, new], "pin": "agent-v0.4.1" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["requested"].as_u64(), Some(2));
+    assert_eq!(resp["refused"].as_u64(), Some(1));
+    let results = resp["results"].as_array().unwrap();
+    let refused_row = results
+        .iter()
+        .find(|r| r["refused"].is_string())
+        .expect("one refused row");
+    // The 0.4.2 box is the one protected; the rc.400 box gets the push.
+    assert!(refused_row["refused"].as_str().unwrap().contains("0.4.2"));
+}
