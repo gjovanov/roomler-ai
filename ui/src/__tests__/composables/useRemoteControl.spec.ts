@@ -99,6 +99,7 @@ import {
   storedSharpenMode,
   storedSharpness,
   HEVC_REXT_CODEC_STRING,
+  translateModifierForHost,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -3569,5 +3570,48 @@ describe('P7 — FSR localStorage knobs', () => {
     expect(storedSharpness()).toBe(2)
     localStorage.setItem('roomler-rc-fsr-sharpness', 'banana')
     expect(storedSharpness()).toBe(DEFAULT_RCAS_SHARPNESS)
+  })
+})
+
+// ─── FR-13 (#789): mac-host Ctrl→Cmd translation ─────────────────────────
+
+describe('translateModifierForHost (FR-13 mac Ctrl→Cmd)', () => {
+  it('rewrites left/right Control to LeftGui when enabled', () => {
+    const state = { ctrlHeldAsCmd: false }
+    expect(translateModifierForHost(0xe0, true, true, state)).toBe(0xe3)
+    expect(state.ctrlHeldAsCmd).toBe(true)
+    expect(translateModifierForHost(0xe0, false, true, state)).toBe(0xe3)
+    expect(state.ctrlHeldAsCmd).toBe(false)
+
+    expect(translateModifierForHost(0xe4, true, true, state)).toBe(0xe3)
+    expect(translateModifierForHost(0xe4, false, true, state)).toBe(0xe3)
+  })
+
+  it('passes Control through untouched when disabled (literal-Ctrl toggle)', () => {
+    const state = { ctrlHeldAsCmd: false }
+    expect(translateModifierForHost(0xe0, true, false, state)).toBe(0xe0)
+    expect(translateModifierForHost(0xe0, false, false, state)).toBe(0xe0)
+  })
+
+  it('release matches what was SENT, not the toggle at release time', () => {
+    // Toggle flipped OFF while Ctrl held-as-Cmd: the up must still release
+    // Cmd (0xe3) or the host is left with Cmd stuck down.
+    const state = { ctrlHeldAsCmd: false }
+    expect(translateModifierForHost(0xe0, true, true, state)).toBe(0xe3)
+    expect(translateModifierForHost(0xe0, false, false, state)).toBe(0xe3)
+    expect(state.ctrlHeldAsCmd).toBe(false)
+
+    // And the mirror: pressed literal (disabled), toggle flipped ON before
+    // release — the up stays literal Ctrl.
+    expect(translateModifierForHost(0xe0, true, false, state)).toBe(0xe0)
+    expect(translateModifierForHost(0xe0, false, true, state)).toBe(0xe0)
+  })
+
+  it('never touches non-Control usages (letters, Shift, Alt, Meta)', () => {
+    const state = { ctrlHeldAsCmd: false }
+    for (const code of [0x06 /* c */, 0x19 /* v */, 0xe1 /* shift */, 0xe2 /* alt */, 0xe3 /* meta */]) {
+      expect(translateModifierForHost(code, true, true, state)).toBe(code)
+      expect(translateModifierForHost(code, false, true, state)).toBe(code)
+    }
   })
 })
