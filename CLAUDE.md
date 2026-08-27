@@ -369,8 +369,18 @@ write-up produced afterwards. Plan it, open it, then build against it:
    force*. Editing one shared table makes git the arbiter instead: the loser's push is
    rejected as non-fast-forward and the rebase shows the number is taken before anything
    is published — the overlay block allocator's shape, where a unique index arbitrates
-   concurrent claims rather than a lock. If one still slips through, the younger issue
-   renumbers (ambiguous ⇒ the closed/retrospective one).
+   concurrent claims rather than a lock.
+   ⚠️ **If one still slips through, repair it deterministically: the LOWER issue number
+   keeps `FR-N`, the HIGHER renumbers** — title, spec filename, ledger row and in-body
+   references together. Not "the younger one, ambiguous ⇒ the retrospective one": both
+   sessions in the FR-3 collision applied exactly that and renumbered PAST each other,
+   leaving #773 and #774 both titled `FR-5` with two `docs/fr/FR-5-*.md` specs on master,
+   and it took a third commit (`7ad2ca0b`) to settle. `FR-7` then repeated it (#778 vs
+   #780). Creation timestamps seconds apart are not a usable ordering and "the
+   retrospective one" was true of both at different moments; issue ids are server-assigned
+   and monotonic, so two sessions that never talk compute the same winner. Renumber to the
+   next free N — never into a vacated one — and **numbers already settled STAY settled**;
+   this decides the next collision, not the ones behind us.
 2. **GitHub issue** `FR-N: <title>` in `gjovanov/roomler-ai/issues` (labels:
    `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
    Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
