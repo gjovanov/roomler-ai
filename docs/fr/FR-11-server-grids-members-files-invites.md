@@ -131,4 +131,14 @@ its chat-panel UI stays); member ban/mute (BAN_MEMBERS stays unconsumed).
 
 ## Field-verification log
 
-- (pending)
+- **2026-08-27, prod (`v20260827-e175b50dd9a8`) — ALL PASS, #784 closed.**
+  Devices default sort: 32 rows, 15 online first, presence buckets strictly
+  ordered, names ascending within buckets, head = `corp-laptop-1` (a
+  display_name — effective-name sorting proven). Members: 9 rows all with
+  email, `sort=email` ordered, `q=goran` → 5. Add-by-email: unknown → 404,
+  both-fields → 400; full net-zero cycle on the throwaway verified test
+  account (201 → visible in grid → DELETE 200 → second DELETE 404).
+  Files: 16 rows, `sort=size desc` ordered, unknown sort → 400. Invites:
+  `status=active` (9) + `sort=target_email`, unknown status → 400. Mesh:
+  4 agents carry `display_name`, `CORP-LAPTOP-1` present. UI halves
+  vitest-locked (796) on the field-proven devices-grid kit.

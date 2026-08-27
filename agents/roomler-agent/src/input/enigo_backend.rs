@@ -174,11 +174,13 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             if let Some(k) = hid_to_key(code) {
                 enigo.key(k, direction).map_err(|e| anyhow!("key: {e}"))?;
             } else {
-                // Unknown HID code: try raw scancode. enigo exposes
-                // `Key::Other(u32)` that some platforms can map.
-                enigo
-                    .key(Key::Other(code), direction)
-                    .map_err(|e| anyhow!("key Other({code}): {e}"))?;
+                // FR-13: an unmapped HID usage is DROPPED, never forwarded.
+                // `Key::Other` is a platform-native virtual keycode (VK /
+                // CGKeyCode / keysym), NOT a scancode escape hatch — handing
+                // it the raw HID byte reinterprets it in a foreign namespace.
+                // Field: HID 0x39 (CapsLock) == VK_9 typed the digit 9;
+                // HID 0x5f (Numpad7) == VK_SLEEP would sleep the host.
+                tracing::debug!(code, "dropping key event with unmapped HID usage");
             }
         }
         InputMsg::KeyText { text } => {
@@ -453,7 +455,11 @@ fn wheel_to_steps(dx: f32, dy: f32, mode: WheelMode) -> (i32, i32) {
 /// with the letter exactly as if typed on a physical keyboard,
 /// regardless of layout.
 ///
-/// Unknown codes fall back to `Key::Other(code)` in the caller.
+/// Unknown codes are DROPPED by the caller (FR-13) — `Key::Other` takes a
+/// platform-native virtual keycode, so feeding it a HID usage types garbage
+/// (0x39 CapsLock == VK_9 → `9`). Every usage the browser's `kbdCodeToHid`
+/// can emit must therefore have an arm here or be a documented per-platform
+/// drop — locked by `browser_emitted_hid_usages_map_or_are_documented_drops`.
 fn hid_to_key(code: u32) -> Option<Key> {
     // HID usage codes from "Keyboard/Keypad" Page (0x07).
     match code {
@@ -525,6 +531,50 @@ fn hid_to_key(code: u32) -> Option<Key> {
         0x43 => Some(Key::F10),
         0x44 => Some(Key::F11),
         0x45 => Some(Key::F12),
+        // FR-13: CapsLock. HID 0x39 previously fell through to the
+        // `Key::Other` fallback, where the same byte is VK_9 on Windows —
+        // pressing CapsLock TYPED the digit 9 (field report 2026-08-26).
+        // `Key::CapsLock` is un-cfg'd in enigo 0.6.1 and resolves to
+        // VK_CAPITAL / Caps_Lock / kVK_CapsLock (with the AlphaShift toggle).
+        0x39 => Some(Key::CapsLock),
+        // FR-13: numeric keypad (HID 0x54..=0x63). All of these previously
+        // hit the fallback and typed garbage — worst cases: Numpad3/5 ==
+        // VK_LWIN/VK_RWIN opened the Start menu, Numpad7 == VK_SLEEP slept
+        // a Windows host, Numpad4 == kVK_ANSI_KEYPAD_9 typed 9 on a Mac.
+        // Every variant here is un-cfg'd in enigo 0.6.1.
+        0x54 => Some(Key::Divide),
+        0x55 => Some(Key::Multiply),
+        0x56 => Some(Key::Subtract),
+        0x57 => Some(Key::Add),
+        0x58 => Some(Key::Return), // NumpadEnter
+        0x59 => Some(Key::Numpad1),
+        0x5a => Some(Key::Numpad2),
+        0x5b => Some(Key::Numpad3),
+        0x5c => Some(Key::Numpad4),
+        0x5d => Some(Key::Numpad5),
+        0x5e => Some(Key::Numpad6),
+        0x5f => Some(Key::Numpad7),
+        0x60 => Some(Key::Numpad8),
+        0x61 => Some(Key::Numpad9),
+        0x62 => Some(Key::Numpad0),
+        0x63 => Some(Key::Decimal),
+        // FR-13: lock/system keys enigo models only on some platforms (the
+        // same shape as the 0x49 Insert arm above). Where a variant doesn't
+        // exist — Apple keyboards have none of these — the usage DROPS,
+        // which since FR-13 is the contract for anything unmappable.
+        #[cfg(not(target_os = "macos"))]
+        0x46 => Some(Key::PrintScr),
+        #[cfg(target_os = "windows")]
+        0x47 => Some(Key::Scroll),
+        #[cfg(all(unix, not(target_os = "macos")))]
+        0x47 => Some(Key::ScrollLock),
+        #[cfg(not(target_os = "macos"))]
+        0x48 => Some(Key::Pause),
+        #[cfg(not(target_os = "macos"))]
+        0x53 => Some(Key::Numlock),
+        // ContextMenu: only Windows models it (VK_APPS).
+        #[cfg(target_os = "windows")]
+        0x65 => Some(Key::Apps),
         0xe0 => Some(Key::Control),
         0xe1 => Some(Key::Shift),
         0xe2 => Some(Key::Alt),
@@ -533,6 +583,9 @@ fn hid_to_key(code: u32) -> Option<Key> {
         0xe5 => Some(Key::Shift),   // right shift
         0xe6 => Some(Key::Alt),     // right alt
         0xe7 => Some(Key::Meta),    // right meta
+        // Deliberately unmapped (documented drops): 0x64 IntlBackslash — no
+        // enigo variant and the glyph is layout-dependent; the printable
+        // path reaches it via KeyText.
         _ => None,
     }
 }
@@ -709,5 +762,73 @@ mod tests {
     fn hid_letters_map_to_unicode_on_non_windows() {
         assert!(matches!(hid_to_key(0x04), Some(Key::Unicode('a'))));
         assert!(matches!(hid_to_key(0x06), Some(Key::Unicode('c'))));
+    }
+
+    /// FR-13 (#789): CapsLock is a real mapping on every platform — HID
+    /// 0x39 used to fall through to `Key::Other(0x39)` == VK_9 on Windows,
+    /// so pressing CapsLock TYPED the digit 9.
+    #[test]
+    fn hid_caps_lock_and_keypad_map_everywhere() {
+        assert!(matches!(hid_to_key(0x39), Some(Key::CapsLock)));
+        assert!(matches!(hid_to_key(0x58), Some(Key::Return))); // NumpadEnter
+        assert!(matches!(hid_to_key(0x59), Some(Key::Numpad1)));
+        assert!(matches!(hid_to_key(0x61), Some(Key::Numpad9)));
+        assert!(matches!(hid_to_key(0x62), Some(Key::Numpad0)));
+        assert!(matches!(hid_to_key(0x63), Some(Key::Decimal)));
+        assert!(matches!(hid_to_key(0x54), Some(Key::Divide)));
+        assert!(matches!(hid_to_key(0x57), Some(Key::Add)));
+    }
+
+    /// FR-13 (#789): the contract the CapsLock bug broke silently — every
+    /// HID usage the browser's `kbdCodeToHid`
+    /// (ui/src/composables/useRemoteControl.ts) can emit either maps to a
+    /// real `Key` or is a DOCUMENTED per-platform drop. The caller drops
+    /// unmapped usages now; it must never again hand them to `Key::Other`,
+    /// which reinterprets the byte as a platform virtual keycode (VK_9 /
+    /// kVK_ANSI_KEYPAD_9 / a keysym).
+    #[test]
+    fn browser_emitted_hid_usages_map_or_are_documented_drops() {
+        // Mirror of kbdCodeToHid's full emission set. Update BOTH sides
+        // together when the viewer learns a new key.
+        let browser_emitted: Vec<u32> = (0x04..=0x31)
+            .chain(0x33..=0x52) // (0x32 Europe-1 is never emitted)
+            .chain(0x53..=0x65)
+            .chain(0xe0..=0xe7)
+            .collect();
+
+        // Keys this platform's enigo genuinely cannot model (same rationale
+        // as the pre-existing 0x49 Insert exclusion on macOS). Moving one
+        // OUT of this list requires a real mapping arm — never `Key::Other`.
+        #[cfg(target_os = "windows")]
+        let documented_drops: &[u32] = &[0x64]; // IntlBackslash (layout-dependent)
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let documented_drops: &[u32] = &[0x64, 0x65]; // + ContextMenu (Apps is Windows-only)
+        #[cfg(target_os = "macos")]
+        let documented_drops: &[u32] = &[
+            0x46, // PrintScreen — no such key/variant on Apple keyboards
+            0x47, // ScrollLock
+            0x48, // Pause
+            0x49, // Insert (pre-existing exclusion)
+            0x53, // NumLock
+            0x64, // IntlBackslash
+            0x65, // ContextMenu
+        ];
+
+        for code in browser_emitted {
+            if documented_drops.contains(&code) {
+                assert!(
+                    hid_to_key(code).is_none(),
+                    "0x{code:02x} is listed as a documented drop but now maps — \
+                     remove it from documented_drops"
+                );
+            } else {
+                assert!(
+                    hid_to_key(code).is_some(),
+                    "browser-emitted HID usage 0x{code:02x} has no hid_to_key arm — \
+                     it would previously have hit the Key::Other fallback and typed \
+                     garbage (FR-13); add a real mapping or document the drop"
+                );
+            }
+        }
     }
 }
