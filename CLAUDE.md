@@ -340,6 +340,29 @@ Registry retention: `registry-retention.sh 1` (weekly cron at Sun 04:00) keeps a
 
 **Periodic build-host maintenance (NOT per-deploy):** the fattest reclaimables are the local Rust `target/` dirs of the *other* projects cloned on the build host (`~/{harvex,oxmux,purestat,parakeet-rs}/target` were ~44 GB combined on 2026-07-12) — `cargo clean` or `rm -rf <proj>/target` when idle; they just recompile on next build. **Never touch `/var/lib/libvirt`** (the running k8s master+worker VM disks, ~87 GB) or the active container data volumes.
 
+## Functional Requirements (FR) workflow — STANDING RULE (operator, 2026-08-27)
+
+Every substantial feature or multi-step program (a new capability, a performance arc, a
+protocol/scheme change — anything bigger than a one-PR fix) gets a **Functional
+Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`:
+
+1. **Spec doc first**: `docs/fr/FR-NN-<slug>.md` on master (next free NN across `docs/fr/`)
+   — Goal, root-cause/field evidence, key design with `file:line` anchors verified against
+   master, a phase/status table with each phase's kill switch, acceptance criteria as
+   checkboxes, open decisions, out-of-scope, and a field-verification log.
+2. **GitHub issue** `FR-NN: <title>` in `gjovanov/roomler-ai/issues` (labels:
+   `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
+   Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
+3. **Comment as you ship**: every merged PR and release gets a comment on the issue with
+   what landed, the knobs, and the FIELD RESULT once measured (CI green ≠ done — quote the
+   operator's read or the heartbeat numbers). Update the spec's status table + check off
+   acceptance criteria in the same breath.
+4. **Close** the issue only when the acceptance criteria are field-verified; a regression
+   reopens it with the evidence.
+
+The first instance is `docs/fr/FR-1-remote-desktop-drag-smoothness.md`. Retroactive FRs
+for already-shipped arcs are welcome when a program resurfaces.
+
 ## Post-Implementation Testing
 
 After every feature or fix, verify your changes:
