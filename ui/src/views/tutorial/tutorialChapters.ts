@@ -2,18 +2,27 @@ import heroMesh from '@/assets/tutorial/hero-mesh.svg'
 import heroRemoteDesktop from '@/assets/tutorial/remote-desktop.svg'
 import heroPrivateNetwork from '@/assets/tutorial/private-network.svg'
 import heroCollaboration from '@/assets/tutorial/collaboration.svg'
+import stepEnroll from '@/assets/tutorial/step-enroll.svg'
+import stepConnect from '@/assets/tutorial/step-connect.svg'
+import stepForward from '@/assets/tutorial/step-forward.svg'
+import stepAcl from '@/assets/tutorial/step-acl.svg'
+import stepMagicDns from '@/assets/tutorial/step-magicdns.svg'
+import stepCall from '@/assets/tutorial/step-call.svg'
+import stepRooms from '@/assets/tutorial/step-rooms.svg'
 
 /**
  * FR-12 (#788) — the tour's content, kept OUT of the view so it stays
  * readable, diffable and unit-testable (a chapter whose deep link names a
  * route that doesn't exist is a broken promise, and a test can catch it).
  *
- * Prose follows README.md's voice, and the four heroes are the README's own
- * illustrations — one visual language across the site, the repo and the app.
+ * Voice and substance come from the LANDING PAGE and README, deliberately:
+ * a user who arrived through roomler.ai should meet the same three
+ * promises, in the same words, once they are inside. `**bold**` marks
+ * emphasis — rendered as segments, never through v-html.
  */
 
 export interface TutorialStep {
-  /** What the reader should do. */
+  /** What the reader should do. Supports `**bold**`. */
   text: string
   /** A REAL in-app destination — never a screenshot of a button. */
   to?: { name: string; query?: Record<string, string> }
@@ -21,8 +30,19 @@ export interface TutorialStep {
   linkLabel?: string
   /** A copyable command (tunnels / ssh chapters). */
   code?: string
-  /** External docs. */
-  href?: string
+  /** Icon for the step's bullet, in place of its number. */
+  icon?: string
+  /** An illustration for this step alone. */
+  graphic?: string
+  graphicAlt?: string
+}
+
+/** A decorated bullet: icon badge + bold lead-in + the rest. */
+export interface TutorialBadge {
+  icon: string
+  color: string
+  title: string
+  text: string
 }
 
 export interface TutorialChapter {
@@ -32,12 +52,24 @@ export interface TutorialChapter {
   icon: string
   /** One-line rail subtitle. */
   blurb: string
+  /** Landing-page headline treatment (chapter 0 only). */
+  tagline?: { headline: string; accent: string; sub: string }
+  /** Capability chips, straight from the landing strip. */
+  chips?: string[]
   hero?: string
   heroAlt?: string
   lead: string
+  /** The decorated three-bullet promise. */
+  badges?: TutorialBadge[]
   steps: TutorialStep[]
+  /** Landing pillar features — the "gems", as cards. */
+  highlights?: TutorialBadge[]
   detail: Array<{ label: string; text: string }>
 }
+
+const TEAL = '#009688'
+const DEEP = '#00796B'
+const CORAL = '#ef5350'
 
 export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
   {
@@ -45,33 +77,87 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     title: 'Get started',
     icon: 'mdi-flag-outline',
     blurb: 'What Roomler is, in one screen',
+    tagline: {
+      headline: 'Every device you own,',
+      accent: 'one secure network',
+      sub: 'Remote desktop from any browser and a private WireGuard-style mesh between your machines — with team chat and video included.',
+    },
+    chips: [
+      'Remote desktop',
+      'Private mesh network',
+      'Tunnels & SOCKS5',
+      'Exit nodes',
+      'MagicDNS',
+      'Chat & video included',
+    ],
     hero: heroMesh,
     heroAlt:
       'Machines joined in a direct encrypted mesh with stable private addresses, crossing NATs and firewalls',
     lead:
-      'Roomler is three products on one small daemon: remote control of your machines, a private network that joins them wherever they are, and rooms for chat, files and calls. You install one agent per machine; everything else happens in this browser. Traffic between your machines is end-to-end encrypted and goes peer-to-peer whenever a path exists — the server coordinates, it never carries your pixels, keystrokes or files.',
+      'Three products on **one small daemon**: remote control of your machines, a private network that joins them wherever they are, and rooms for chat, files and calls. You install **one agent per machine** — everything else happens in this browser. Traffic between your machines is **end-to-end encrypted** and goes peer-to-peer whenever a path exists: the server coordinates, it never carries your pixels, keystrokes or files.',
+    badges: [
+      {
+        icon: 'mdi-monitor-eye',
+        color: TEAL,
+        title: 'Remote desktop and control',
+        text: 'from any browser — nothing to install on the viewing side.',
+      },
+      {
+        icon: 'mdi-lan',
+        color: CORAL,
+        title: 'Private, secure mesh network',
+        text: 'for your machines in different geographic locations, with stable addresses and names.',
+      },
+      {
+        icon: 'mdi-video-outline',
+        color: DEEP,
+        title: 'HD video conferencing and chat',
+        text: 'for remote team collaboration — included in every plan, not an add-on.',
+      },
+    ],
     steps: [
       {
-        text: 'Give this organization a name your team will recognize — it labels every device and invite.',
+        icon: 'mdi-office-building-outline',
+        text: 'Give this organization a name your team will recognize — it labels **every device and invite**.',
         to: { name: 'admin-settings' },
         linkLabel: 'Organization settings',
       },
       {
-        text: 'Add your first machine: mint an enrollment token and run the one-line installer on it.',
+        icon: 'mdi-download',
+        text: 'Add your first machine: mint an enrollment token and run the **one-line installer** on it.',
         to: { name: 'devices', query: { enroll: '1' } },
         linkLabel: 'Enroll a device',
+        graphic: stepEnroll,
+        graphicAlt: 'One command on Windows, Linux or macOS enrolls a machine into your organization',
       },
       {
-        text: 'Bring in the people you work with — they can join by invite link or email.',
+        icon: 'mdi-account-multiple-plus-outline',
+        text: 'Bring in the people you work with — by **invite link** or straight to their **email**.',
         to: { name: 'invites' },
         linkLabel: 'Invites',
       },
     ],
-    detail: [
+    highlights: [
       {
-        label: 'One daemon per machine',
+        icon: 'mdi-shield-lock-outline',
+        color: CORAL,
+        title: 'Works behind strict networks',
+        text: 'Direct peer-to-peer when possible; relays and WebSocket fallbacks punch through corporate firewalls and full-tunnel VPNs.',
+      },
+      {
+        icon: 'mdi-monitor-multiple',
+        color: TEAL,
+        title: 'Fleet management built in',
+        text: 'Enroll unattended machines, push updates from the web, transfer files and clipboard, and audit every session.',
+      },
+      {
+        icon: 'mdi-cellphone-link',
+        color: DEEP,
+        title: 'One daemon per machine',
         text: 'The same agent is the remote-desktop target, the network node, the tunnel exit and the SSH server — not four services to install.',
       },
+    ],
+    detail: [
       {
         label: 'Nothing to install to watch',
         text: 'The viewing side is a plain browser tab. Only the machine you reach runs the agent.',
@@ -79,6 +165,10 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
       {
         label: 'Works from anywhere',
         text: 'Hotel Wi-Fi, NAT, corporate firewall: the connection cascade finds the fastest path that works and keeps re-trying for a better one.',
+      },
+      {
+        label: 'Free to start',
+        text: 'Up to three devices on the free plan — remote desktop, private mesh, tunnels, chat and calls all included.',
       },
     ],
   },
@@ -90,20 +180,45 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     hero: heroMesh,
     heroAlt: 'A fleet of machines enrolled into one organization',
     lead:
-      'Devices is the home page of your fleet. Every enrolled machine shows up here with its live status, operating system, overlay address, MagicDNS name and agent version. Two kinds live in the same grid: full daemons (remote desktop + network + tunnels) and tunnel-only clients. Enrolling is one command on the target machine — there is no manual key exchange.',
-    steps: [
+      'Devices is the **home page of your fleet**. Every enrolled machine shows up with its live status, operating system, overlay address, MagicDNS name and agent version. Two kinds share the grid: **full daemons** (remote desktop + network + tunnels) and **tunnel-only clients**. Enrolling is one command on the target machine — there is no manual key exchange.',
+    badges: [
       {
-        text: 'Mint an enrollment token, then paste the one-liner on the machine (Linux/macOS shell, or PowerShell on Windows).',
-        to: { name: 'devices', query: { enroll: '1' } },
-        linkLabel: 'Enroll a device',
+        icon: 'mdi-rocket-launch-outline',
+        color: TEAL,
+        title: 'Set up in minutes',
+        text: 'Run the graphical installer or paste one command — the machine appears here as soon as it enrolls.',
       },
       {
-        text: 'Give a device a friendly display name and tags — the name follows it into the network and MagicDNS.',
+        icon: 'mdi-tag-outline',
+        color: DEEP,
+        title: 'Name it once',
+        text: 'A display name and tags follow the device into the network and MagicDNS.',
+      },
+      {
+        icon: 'mdi-update',
+        color: CORAL,
+        title: 'Updates from the web',
+        text: 'Push a release to a device from here — and the server refuses a pin that would downgrade it.',
+      },
+    ],
+    steps: [
+      {
+        icon: 'mdi-key-plus',
+        text: 'Mint an enrollment token, then paste the one-liner on the machine — **shell** on Linux/macOS, **PowerShell** on Windows.',
+        to: { name: 'devices', query: { enroll: '1' } },
+        linkLabel: 'Enroll a device',
+        graphic: stepEnroll,
+        graphicAlt: 'One command per platform enrolls a machine',
+      },
+      {
+        icon: 'mdi-rename-box',
+        text: 'Give a device a **friendly display name** and tags — renaming propagates to the overlay and MagicDNS.',
         to: { name: 'devices' },
         linkLabel: 'Open Devices',
       },
       {
-        text: 'Tailor the grid: search across every column, sort, and pick which columns you see (your choice is remembered per device page).',
+        icon: 'mdi-table-cog',
+        text: 'Tailor the grid: **search across every column**, sort, and pick which columns you see — your choice is remembered.',
         to: { name: 'devices' },
         linkLabel: 'Open Devices',
       },
@@ -119,7 +234,7 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
       },
       {
         label: 'Updates',
-        text: 'Push a specific release to a device, or let it pick up the latest on its own. The server refuses a pin that would downgrade a device unless you force it.',
+        text: 'Push a specific release to a device, or let it pick up the latest on its own. A stale pin that would downgrade a device is refused unless you force it.',
       },
     ],
   },
@@ -132,34 +247,75 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     heroAlt:
       'A laptop showing the live desktop of an office PC inside a browser tab, mouse and keyboard flowing back',
     lead:
-      'Open a machine and use it as if you were sitting in front of it. The picture is hardware-encoded where the GPU allows and fluid enough for real work; clipboard, file transfer and multi-monitor all work, and on Windows the session survives the lock screen, UAC prompts and logout. Every session is consent-gated and audit-logged, and the media never touches the server.',
-    steps: [
+      'Open a machine and use it **as if you were sitting in front of it**. The picture is hardware-encoded where the GPU allows and fluid enough for real work; clipboard, file transfer and multi-monitor all work, and on Windows the session survives the **lock screen, UAC prompts and logout**. Every session is consent-gated and audit-logged, and the media never touches the server.',
+    badges: [
       {
-        text: 'Click Connect on any online device to open its screen in this tab.',
-        to: { name: 'devices' },
-        linkLabel: 'Open Devices',
+        icon: 'mdi-google-chrome',
+        color: TEAL,
+        title: 'No viewer to install',
+        text: 'Any modern browser is the controller — hardware-encoded H.264/HEVC/VP9 with sub-100 ms input latency.',
       },
       {
-        text: 'Decide how each device answers: ask the person at the machine every time, or grant unattended access.',
+        icon: 'mdi-shield-check-outline',
+        color: CORAL,
+        title: 'Consent-gated and audited',
+        text: 'The person at the machine decides, or you grant unattended access deliberately — either way it is logged.',
+      },
+      {
+        icon: 'mdi-content-copy',
+        color: DEEP,
+        title: 'Clipboard and files',
+        text: 'Copy text or images both ways and drag files across, resumable if the link drops.',
+      },
+    ],
+    steps: [
+      {
+        icon: 'mdi-monitor-arrow-down',
+        text: 'Click **Connect** on any online device to open its screen in this tab.',
+        to: { name: 'devices' },
+        linkLabel: 'Open Devices',
+        graphic: stepConnect,
+        graphicAlt: 'A browser tab showing a remote desktop, with keyboard and mouse flowing back',
+      },
+      {
+        icon: 'mdi-account-check-outline',
+        text: 'Decide how each device answers: **ask the person at the machine** every time, or grant unattended access.',
         to: { name: 'devices' },
         linkLabel: 'Consent per device',
       },
       {
-        text: 'In a session, try the toolbar: multi-monitor, scaling, clipboard sync, file upload and Ctrl-Alt-Del.',
+        icon: 'mdi-gesture-tap-button',
+        text: 'In a session, try the toolbar: **multi-monitor**, scaling, clipboard sync, file upload and **Ctrl-Alt-Del**.',
+      },
+    ],
+    highlights: [
+      {
+        icon: 'mdi-speedometer',
+        color: TEAL,
+        title: 'Built for real work',
+        text: 'A low-latency WebCodecs canvas path (Chrome-first) bypasses the browser video jitter buffer for drag-and-type work.',
+      },
+      {
+        icon: 'mdi-lock-open-variant-outline',
+        color: CORAL,
+        title: 'Unattended access',
+        text: 'Runs as a service, survives logout, drives the Windows lock screen and pre-logon desktop; headless Linux gets a virtual desktop.',
+      },
+      {
+        icon: 'mdi-chip',
+        color: DEEP,
+        title: 'Hardware encoding',
+        text: 'NVENC, Quick Sync, AMF and Media Foundation with probe-and-rollback, falling back to software when no GPU path works.',
       },
     ],
     detail: [
       {
         label: 'Codecs',
-        text: 'H.264, HEVC, AV1 and VP9 4:4:4, hardware-encoded via NVENC / Quick Sync / AMF / Media Foundation with automatic fallback to software.',
+        text: 'H.264, HEVC, AV1 and VP9 4:4:4 — the last one for crisp text at full chroma.',
       },
       {
-        label: 'Latency',
-        text: 'A low-latency WebCodecs canvas path (Chrome-first) bypasses the browser video element’s jitter buffer for drag-and-type work.',
-      },
-      {
-        label: 'Unattended',
-        text: 'Runs as a service, survives logout, and can drive the Windows lock screen and pre-logon desktop. Headless Linux gets a virtual desktop.',
+        label: 'Input',
+        text: 'Full keyboard and mouse, keyboard lock, remote cursor, multi-monitor, scaling and 1:1 host-display matching.',
       },
       {
         label: 'Security',
@@ -176,33 +332,55 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     heroAlt:
       'Machines on different networks joined by a private overlay with stable addresses',
     lead:
-      'Every enrolled machine gets a stable private address and a name that resolves from any other machine in your organization — across NAT, on hotel Wi-Fi, behind a corporate firewall. Connections go straight peer-to-peer when a path exists and fall back to an encrypted relay when nothing else gets through, so "is it reachable?" stops being a question.',
-    steps: [
+      'Every enrolled machine gets a **stable private address** and a **name that resolves from any other machine** in your organization — across NAT, on hotel Wi-Fi, behind a corporate firewall. Connections go straight peer-to-peer when a path exists and fall back to an encrypted relay when nothing else gets through, so *"is it reachable?"* stops being a question.',
+    badges: [
       {
-        text: 'Read a device’s overlay address and MagicDNS name straight off the grid (the copy button next to it puts the name on your clipboard).',
-        to: { name: 'devices' },
-        linkLabel: 'Open Devices',
+        icon: 'mdi-ip-network-outline',
+        color: TEAL,
+        title: 'WireGuard-style mesh',
+        text: 'Every device gets a stable private address; traffic flows directly between machines, encrypted end to end.',
       },
       {
-        text: 'Set the DNS suffix your names live under, so `laptop.<your-org>` resolves fleet-wide.',
+        icon: 'mdi-dns-outline',
+        color: DEEP,
+        title: 'MagicDNS',
+        text: 'Reach machines by name instead of chasing addresses that change with every network.',
+      },
+      {
+        icon: 'mdi-router-network',
+        color: CORAL,
+        title: 'Subnet routers and exit nodes',
+        text: 'Expose a whole LAN through one machine, or route all your traffic through a trusted exit node when you travel.',
+      },
+    ],
+    steps: [
+      {
+        icon: 'mdi-content-copy',
+        text: 'Read a device’s **overlay address** and **MagicDNS name** straight off the grid — the copy button puts the name on your clipboard.',
+        to: { name: 'devices' },
+        linkLabel: 'Open Devices',
+        graphic: stepMagicDns,
+        graphicAlt: 'A machine name resolving to its stable private address from anywhere',
+      },
+      {
+        icon: 'mdi-web',
+        text: 'Set the DNS suffix your names live under, so `laptop.your-org` resolves **fleet-wide**.',
         to: { name: 'network-dns' },
         linkLabel: 'MagicDNS settings',
       },
       {
-        text: 'Shell into any machine by name — no sshd, no open port, no firewall rule.',
+        icon: 'mdi-console',
+        text: 'Shell into any machine by name — **no sshd, no open port, no firewall rule**.',
         code: 'roomler ssh <device-name>',
       },
       {
-        text: 'Let one machine advertise the subnet behind it, so its LAN becomes reachable from the mesh.',
+        icon: 'mdi-router-wireless',
+        text: 'Let one machine advertise the subnet behind it, so **its LAN becomes reachable** from the mesh.',
         to: { name: 'network-subnet-routes' },
         linkLabel: 'Subnet routes',
       },
     ],
     detail: [
-      {
-        label: 'Addressing',
-        text: 'A private address per device plus a MagicDNS name, both stable across reboots and network changes.',
-      },
       {
         label: 'Path selection',
         text: 'LAN, then direct over the internet, then a hole-punched path, then an encrypted relay — measured, never assumed, and continuously re-upgraded.',
@@ -225,23 +403,49 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     hero: heroPrivateNetwork,
     heroAlt: 'A local port tunnelled to a service reachable only by a remote machine',
     lead:
-      'A tunnel turns anything one of your machines can reach into a local port on yours — a database on a private subnet, an internal web app, a printer. Nothing is published to the internet, the payload stays encrypted end to end, and access is default-deny: a tunnel only works where you allowed it.',
-    steps: [
+      'A tunnel turns **anything one of your machines can reach** into a local port on yours — a database on a private subnet, an internal web app, a printer. **Nothing is published to the internet**, the payload stays encrypted end to end, and access is default-deny: a tunnel only works where you allowed it.',
+    badges: [
       {
-        text: 'Forward a remote service to a local port on your machine.',
-        code: 'roomler forward --agent <device-name> --local 127.0.0.1:5432 --remote db:5432',
+        icon: 'mdi-swap-horizontal-bold',
+        color: TEAL,
+        title: 'Port forwarding',
+        text: 'Any host:port an enrolled machine can reach becomes 127.0.0.1 on yours.',
       },
       {
-        text: 'Or route a whole browser through a device’s vantage point with a local SOCKS5 proxy.',
+        icon: 'mdi-earth',
+        color: DEEP,
+        title: 'SOCKS5 proxy',
+        text: 'Point a browser at one device — or the whole fleet — and carry TCP and UDP through it.',
+      },
+      {
+        icon: 'mdi-cog-sync-outline',
+        color: CORAL,
+        title: 'Supervised routes',
+        text: 'Declare a forward once and the daemon rebuilds it on every start, with backoff.',
+      },
+    ],
+    steps: [
+      {
+        icon: 'mdi-arrow-right-bold-box-outline',
+        text: 'Forward a remote service to a **local port** on your machine.',
+        code: 'roomler forward --agent <device-name> --local 127.0.0.1:5432 --remote db:5432',
+        graphic: stepForward,
+        graphicAlt: 'A local port tunnelled through an enrolled machine to a database on its private LAN',
+      },
+      {
+        icon: 'mdi-web-box',
+        text: 'Or route a whole browser through a device’s **vantage point** with a local SOCKS5 proxy.',
         code: 'roomler socks5 --agent <device-name> --listen 127.0.0.1:1080',
       },
       {
-        text: 'Make a forward permanent: declare it in the device’s config and the daemon supervises it across reboots.',
+        icon: 'mdi-pin-outline',
+        text: 'Make a forward **permanent**: declare it in the device’s config and the daemon supervises it across reboots.',
         to: { name: 'devices', query: { type: 'both' } },
         linkLabel: 'Devices & tunnel clients',
       },
       {
-        text: 'A machine that should only reach services (no remote desktop) can enroll as a tunnel-only client.',
+        icon: 'mdi-laptop',
+        text: 'A machine that should **only reach services** (no remote desktop) can enroll as a tunnel-only client.',
         to: { name: 'devices', query: { enroll: '1' } },
         linkLabel: 'Enroll a tunnel client',
       },
@@ -269,41 +473,67 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     hero: heroPrivateNetwork,
     heroAlt: 'Policy gates between machines on the private network',
     lead:
-      'Membership of your organization is not the same as permission to reach a machine. Tunnel and overlay policies say which people and devices may reach which destinations, and both start closed: nothing is permitted until you write a rule. Every decision is recorded, and the device itself keeps a local veto that survives even a compromised control plane.',
-    steps: [
+      'Membership of your organization is **not** the same as permission to reach a machine. Tunnel and overlay policies say which people and devices may reach which destinations, and both **start closed**: nothing is permitted until you write a rule. Every decision is recorded, and the device itself keeps a **local veto** that survives even a compromised control plane.',
+    badges: [
       {
-        text: 'Write your first rules — one page, Overlay and Tunnel tabs.',
-        to: { name: 'network-acl' },
-        linkLabel: 'Open ACL',
+        icon: 'mdi-lock-outline',
+        color: CORAL,
+        title: 'Default deny',
+        text: 'An empty policy set grants nothing — rules are additive and scoped to your organization.',
       },
       {
-        text: 'Approve the subnets a device is allowed to advertise before its LAN becomes reachable.',
+        icon: 'mdi-eye-outline',
+        color: TEAL,
+        title: 'Try before enforcing',
+        text: 'Warn mode shows what would be refused, in the logs, before anything is actually dropped.',
+      },
+      {
+        icon: 'mdi-clipboard-text-clock-outline',
+        color: DEEP,
+        title: 'Everything audited',
+        text: 'Command runs and SSH session decisions are logged — including the refusals, which are the interesting ones.',
+      },
+    ],
+    steps: [
+      {
+        icon: 'mdi-playlist-check',
+        text: 'Write your first rules — **one page**, Overlay and Tunnel tabs.',
+        to: { name: 'network-acl' },
+        linkLabel: 'Open ACL',
+        graphic: stepAcl,
+        graphicAlt: 'Default-deny policy between machines: one path allowed, one refused and logged',
+      },
+      {
+        icon: 'mdi-check-decagram-outline',
+        text: 'Approve the subnets a device may advertise **before** its LAN becomes reachable.',
         to: { name: 'network-subnet-routes' },
         linkLabel: 'Subnet routes',
       },
       {
-        text: 'Give people only the powers they need — roles carry device, remote-control, SSH and audit permissions separately.',
+        icon: 'mdi-shield-account-outline',
+        text: 'Give people **only the powers they need** — device, remote-control, SSH and audit permissions are separate bits.',
         to: { name: 'admin-roles' },
         linkLabel: 'Roles',
       },
       {
-        text: 'Review what actually happened: every command and SSH session decision is logged.',
+        icon: 'mdi-history',
+        text: 'Review what actually happened: every command and SSH decision is logged.',
         to: { name: 'audit-exec' },
         linkLabel: 'Command audit',
       },
     ],
     detail: [
       {
-        label: 'Default deny',
-        text: 'An empty policy set grants nothing. Rules are additive and tenant-scoped.',
-      },
-      {
-        label: 'Try before enforcing',
-        text: 'Overlay policy has a warn mode: see what would be refused, in the logs, before anything is dropped.',
-      },
-      {
         label: 'The device has the last word',
         text: 'Remote command execution and SSH are each gated four times over — org switch, your permission, device policy, and a local setting on the machine itself.',
+      },
+      {
+        label: 'Roles',
+        text: 'Reviewing who held a session and being able to open one are deliberately different permissions.',
+      },
+      {
+        label: 'Scope',
+        text: 'Every rule, device and log line is scoped to this organization — nothing leaks across orgs.',
       },
     ],
   },
@@ -315,25 +545,51 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     hero: heroCollaboration,
     heroAlt: 'A team chatting, sharing files and meeting in rooms',
     lead:
-      'Rooms are where the people side lives: threaded chat with mentions and reactions, files shared in context, and a call one click away. Rooms nest, so a team can keep a general room with focused children under it, and each room can be open to the org or private to its members.',
-    steps: [
+      'Rooms are where the people side lives: **threaded chat** with mentions and reactions, **files shared in context**, and a call one click away. Rooms nest, so a team can keep a general room with focused children under it, and each room can be **open to the org** or **private to its members**.',
+    badges: [
       {
-        text: 'Create your first room and post something.',
-        to: { name: 'rooms' },
-        linkLabel: 'Open Rooms',
+        icon: 'mdi-pound',
+        color: TEAL,
+        title: 'Rooms, chat and threads',
+        text: 'Organized rooms with threaded messaging, reactions, mentions and file attachments.',
       },
       {
-        text: 'Browse what already exists in the org and join what is relevant to you.',
+        icon: 'mdi-file-document-outline',
+        color: DEEP,
+        title: 'Files in context',
+        text: 'Drop a file where the conversation is, then find everything the org shared in one searchable place.',
+      },
+      {
+        icon: 'mdi-eye-off-outline',
+        color: CORAL,
+        title: 'Private when it matters',
+        text: 'Open rooms anyone can join; private rooms only their members can even see.',
+      },
+    ],
+    steps: [
+      {
+        icon: 'mdi-plus-box-outline',
+        text: 'Create your first room and **post something**.',
+        to: { name: 'rooms' },
+        linkLabel: 'Open Rooms',
+        graphic: stepRooms,
+        graphicAlt: 'Nested rooms with threaded chat, mentions, reactions and a shared file',
+      },
+      {
+        icon: 'mdi-compass-outline',
+        text: 'Browse what already exists in the org and **join what is relevant** to you.',
         to: { name: 'explore' },
         linkLabel: 'Explore rooms',
       },
       {
+        icon: 'mdi-email-fast-outline',
         text: 'Invite the people who belong in it — by link, or straight to their email.',
         to: { name: 'invites' },
         linkLabel: 'Invites',
       },
       {
-        text: 'Everything anyone shared in the org, searchable in one place.',
+        icon: 'mdi-folder-multiple-outline',
+        text: 'Everything anyone shared in the org, **searchable in one place**.',
         to: { name: 'files' },
         linkLabel: 'Files',
       },
@@ -361,18 +617,43 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
     hero: heroCollaboration,
     heroAlt: 'A video call with several participants and a shared screen',
     lead:
-      'Any room can become a call. Video and audio run through a media server built for group calls, so a dozen people in one room is routine, and you can share a screen while you talk. A call in progress is visible from the app bar, so nobody has to be told twice that it started.',
+      'Any room can become a call. Video and audio run through a **media server built for group calls**, so a dozen people in one room is routine, and you can **share a screen** while you talk. A call in progress is visible from the app bar, so nobody has to be told twice that it started.',
+    badges: [
+      {
+        icon: 'mdi-video-high-definition',
+        color: CORAL,
+        title: 'HD video conferencing',
+        text: 'A built-in SFU for crisp meetings — participants scale without every browser encoding for everyone.',
+      },
+      {
+        icon: 'mdi-monitor-share',
+        color: TEAL,
+        title: 'Screen sharing',
+        text: 'Share a screen or a window alongside camera and microphone, from the in-call toolbar.',
+      },
+      {
+        icon: 'mdi-record-circle-outline',
+        color: DEEP,
+        title: 'Recordings',
+        text: 'Calls can be recorded per room where your plan allows it.',
+      },
+    ],
     steps: [
       {
-        text: 'Open a room and start a call from its header — anyone in the room can join it.',
+        icon: 'mdi-video-plus-outline',
+        text: 'Open a room and **start a call** from its header — anyone in the room can join.',
         to: { name: 'rooms' },
         linkLabel: 'Open Rooms',
+        graphic: stepCall,
+        graphicAlt: 'A room call with several participants and a shared screen',
       },
       {
-        text: 'Share your screen from the in-call toolbar while you talk.',
+        icon: 'mdi-monitor-share',
+        text: 'Share your screen from the in-call toolbar **while you talk**.',
       },
       {
-        text: 'Watch how the fleet and its calls are actually behaving over time.',
+        icon: 'mdi-chart-line',
+        text: 'Watch how the fleet and its calls are **actually behaving** over time.',
         to: { name: 'analytics' },
         linkLabel: 'Analytics',
       },
@@ -383,8 +664,8 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
         text: 'A selective forwarding media server, not a mesh — participants scale without every browser encoding for everyone.',
       },
       {
-        label: 'Screen sharing',
-        text: 'Share a screen or window in the call, alongside camera and microphone.',
+        label: 'In the room',
+        text: 'A call belongs to its room: the members are the invite list, and the app bar shows one is running.',
       },
       {
         label: 'Recording',
@@ -397,4 +678,20 @@ export const TUTORIAL_CHAPTERS: TutorialChapter[] = [
 /** Chapters keyed by their URL hash — the view resolves `#devices` etc. */
 export function chapterById(id: string): TutorialChapter | undefined {
   return TUTORIAL_CHAPTERS.find((c) => c.id === id)
+}
+
+/**
+ * Split `**bold**` prose into renderable segments. Deliberately NOT
+ * `v-html`: the strings are ours and compile-time, but a template that
+ * takes raw HTML is a habit worth not forming.
+ */
+export function richSegments(text: string): Array<{ text: string; bold: boolean }> {
+  return text
+    .split(/(\*\*[^*]+\*\*)/g)
+    .filter((part) => part.length > 0)
+    .map((part) =>
+      part.startsWith('**') && part.endsWith('**')
+        ? { text: part.slice(2, -2), bold: true }
+        : { text: part, bold: false },
+    )
 }
