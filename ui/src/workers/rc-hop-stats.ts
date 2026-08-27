@@ -66,6 +66,72 @@ export function epochNowMs(): number {
   return performance.timeOrigin + performance.now()
 }
 
+// ── FR-1 P7 — end-to-end age clock sync ─────────────────────────────────────
+// The agent stamps every DC video frame with µs on its process-wide epoch
+// (see peer.rs `agent_epoch_us`) and echoes the same clock over the control
+// DC (`rc:clock` → `rc:clock.echo`). The browser probes it every couple of
+// seconds, keeps the lowest-RTT sample (NTP-style — asymmetry error is
+// bounded by RTT/2 of the BEST probe, not the average), and can then read
+// any frame's wire timestamp as a true capture-side age on its own clock.
+
+/** Epoch-absolute microseconds (same convention as `epochNowMs`, scaled).
+ *  Precision note: epoch-µs ≈ 1.7e15 sits well inside Number's 2^53 exact
+ *  range; sub-µs float dust is irrelevant at HUD resolution. */
+export function epochNowUs(): number {
+  return epochNowMs() * 1000
+}
+
+/** One clock probe: `offsetUs` maps browser epoch-µs onto the agent clock
+ *  (`agentNow ≈ epochNowUs() + offsetUs`); `rttMs` is the probe's own
+ *  round trip, doubling as the HUD's control-path RTT readout. */
+export type ClockSample = { offsetUs: number; rttMs: number }
+
+/** Build a sample from one probe round trip. `t0`/`t1` are the browser's
+ *  epoch-µs at send/receive, `agentUs` the agent's clock from the echo.
+ *  Returns null for garbage (non-finite, negative RTT) — a bad echo must
+ *  never poison the offset. */
+export function clockSample(
+  t0EpochUs: number,
+  t1EpochUs: number,
+  agentUs: number,
+): ClockSample | null {
+  if (
+    !Number.isFinite(t0EpochUs)
+    || !Number.isFinite(t1EpochUs)
+    || !Number.isFinite(agentUs)
+  ) {
+    return null
+  }
+  const rttUs = t1EpochUs - t0EpochUs
+  if (rttUs < 0) return null
+  return {
+    offsetUs: agentUs - (t0EpochUs + t1EpochUs) / 2,
+    rttMs: rttUs / 1000,
+  }
+}
+
+/** The sample to trust: minimum-RTT of the retained window. */
+export function bestClockSample(samples: ClockSample[]): ClockSample | null {
+  let best: ClockSample | null = null
+  for (const s of samples) {
+    if (best === null || s.rttMs < best.rttMs) best = s
+  }
+  return best
+}
+
+/** Age of a frame at `epochUs` on the browser clock, given the frame's
+ *  agent-clock wire timestamp and the probe offset. Covers everything from
+ *  the agent's framing point (encode output + send queue + network + decode
+ *  + paint queue); agent-side capture+encode (~10–15 ms) sits BEFORE the
+ *  stamp and is not included. */
+export function frameAgeMs(
+  wireTsUs: number,
+  offsetUs: number,
+  epochUs: number,
+): number {
+  return (epochUs + offsetUs - wireTsUs) / 1000
+}
+
 /** 2D-context A/B mode. `legacy` = today's optionless `getContext('2d')`. */
 export type CtxMode = 'legacy' | 'opaque' | 'opaque-desync'
 

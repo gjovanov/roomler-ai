@@ -3,12 +3,16 @@ import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 import type { Agent } from '@/stores/agents'
 import {
+  bestClockSample,
+  clockSample,
+  epochNowUs,
   normalizeCtxMode,
   normalizeIntKnob,
   StruggleWindow,
   DEFAULT_MAX_DECODE_QUEUE,
   DEFAULT_STRUGGLE_QUEUE,
   DEFAULT_STRUGGLE_WINDOWS,
+  type ClockSample,
   type CtxMode,
   type HopWindow,
 } from '@/workers/rc-hop-stats'
@@ -413,6 +417,7 @@ export interface RcAppsActionReply {
 
 export type RcControlInbound =
   | { kind: 'host_locked'; locked: boolean }
+  | { kind: 'clock_echo'; t0: number; agentUs: number }
   | { kind: 'desktop_changed'; name: string }
   | { kind: 'video_info'; info: RcVideoInfo }
   | { kind: 'control_state'; state: RcControlState }
@@ -443,6 +448,13 @@ export function parseControlInbound(data: unknown): RcControlInbound {
   const obj = parsed as Record<string, unknown>
   if (obj.t === 'rc:host_locked' && typeof obj.locked === 'boolean') {
     return { kind: 'host_locked', locked: obj.locked }
+  }
+  if (
+    obj.t === 'rc:clock.echo'
+    && typeof obj.t0 === 'number'
+    && typeof obj.agent_us === 'number'
+  ) {
+    return { kind: 'clock_echo', t0: obj.t0, agentUs: obj.agent_us }
   }
   if (
     obj.t === 'rc:desktop_changed' &&
@@ -1240,6 +1252,12 @@ export type RcDecodeDiag = {
   paint: HopWindow | null
   fwd: HopWindow | null
   decode: HopWindow | null
+  /** FR-1 P7 — end-to-end frame age at paint (agent framing → canvas),
+   *  on the agent's clock mapped via the rc:clock probe. Null until the
+   *  probe lands (old agents never echo — the field just stays null). */
+  age: HopWindow | null
+  /** FR-1 P7 — control-DC round trip of the best retained clock probe. */
+  probeRttMs: number | null
   outGapMaxMs: number
   queue: number
   droppedTotal: number
@@ -4104,16 +4122,85 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   let statsPrevBytes = 0
   let statsPrevTsMs = 0
 
+  // FR-1 P7 — agent clock sync for the HUD's end-to-end frame age. A probe
+  // rides every stats tick (`rc:clock` on the control DC, ~60 B); the agent
+  // echoes t0 + its process-epoch µs, we keep the lowest-RTT sample of the
+  // last CLOCK_RING (both clocks are fixed-origin, so the offset is a
+  // constant — min-RTT is purely about asymmetry error), and push the offset
+  // to whichever decode worker is painting. Old agents never echo: the ring
+  // stays empty and the HUD simply shows no age.
+  const CLOCK_RING = 8
+  let clockSamples: ClockSample[] = []
+  let clockBest: ClockSample | null = null
+
+  function sendClockProbe() {
+    const ch = channels.control
+    if (!ch || ch.readyState !== 'open') return
+    try {
+      ch.send(JSON.stringify({ t: 'rc:clock', t0: epochNowUs() }))
+    } catch {
+      /* channel closed between check and send — next tick retries */
+    }
+  }
+
+  /** Post the current best offset to the active decode worker(s). Called
+   *  on every new best sample AND from each worker's start path (the
+   *  worker may be created after the offset is already known). */
+  function pushClockOffset() {
+    const msg = { type: 'clock-offset', offsetUs: clockBest?.offsetUs ?? null }
+    try { hevcWorker?.postMessage(msg) } catch { /* worker torn down */ }
+    try { vp9_444Worker?.postMessage(msg) } catch { /* worker torn down */ }
+  }
+
+  function handleClockEcho(t0: number, agentUs: number) {
+    const s = clockSample(t0, epochNowUs(), agentUs)
+    if (!s) return
+    clockSamples.push(s)
+    if (clockSamples.length > CLOCK_RING) clockSamples.shift()
+    const best = bestClockSample(clockSamples)
+    const changed = best !== null
+      && (clockBest === null || best.offsetUs !== clockBest.offsetUs)
+    clockBest = best
+    if (changed) pushClockOffset()
+  }
+
+  function resetClockSync() {
+    clockSamples = []
+    clockBest = null
+  }
+
   // Coalesce rapid mouse moves to one per animation frame (~60 Hz). Keys
   // and clicks are NOT coalesced Ã¢ÂÂ they're too meaningful to drop.
   let pendingMove: { x: number; y: number; mon: number } | null = null
-  let rafHandle: number | null = null
+  // FR-1 P6 — pointer cadence decoupled from rAF. The old
+  // requestAnimationFrame coalescer tied mouse_move sends to the viewer's
+  // compositor: a busy tab (heavy decode/FSR) slows rAF exactly when the
+  // user is dragging, thinning the input stream the remote end needs most —
+  // and even idle, rAF adds up to a frame (~16 ms) before the FIRST send.
+  // Now: send immediately when the min-gap has passed, else one timer for
+  // the remainder; latest-wins. 8 ms ≈ 125 Hz ceiling, ~60 B/msg — noise
+  // even on a constrained relay.
+  const INPUT_MOVE_GAP_MS = 8
+  let moveTimer: ReturnType<typeof setTimeout> | null = null
+  let lastMoveSentAt = 0
 
   function flushPendingMove() {
-    rafHandle = null
+    moveTimer = null
     if (!pendingMove || !channels.input || channels.input.readyState !== 'open') return
+    lastMoveSentAt = performance.now()
     sendInput({ t: 'mouse_move', ...pendingMove })
     pendingMove = null
+  }
+
+  /** Send now if the gap has passed, else arm one timer for the rest. */
+  function schedulePendingMove() {
+    if (moveTimer !== null) return
+    const since = performance.now() - lastMoveSentAt
+    if (since >= INPUT_MOVE_GAP_MS) {
+      flushPendingMove()
+    } else {
+      moveTimer = setTimeout(flushPendingMove, INPUT_MOVE_GAP_MS - since)
+    }
   }
 
   function sendInput(msg: Record<string, unknown>) {
@@ -4943,6 +5030,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     paint?: HopWindow
     fwd?: HopWindow
     decode?: HopWindow
+    age?: HopWindow | null
     outGapMaxMs?: number
     decodeQueueSize?: number
     framesDroppedBacklog?: number
@@ -4953,6 +5041,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       paint: m.paint ?? null,
       fwd: m.fwd ?? null,
       decode: m.decode ?? null,
+      age: m.age ?? null,
+      probeRttMs: clockBest?.rttMs ?? null,
       outGapMaxMs: typeof m.outGapMaxMs === 'number' ? m.outGapMaxMs : 0,
       queue: typeof m.decodeQueueSize === 'number' ? m.decodeQueueSize : 0,
       droppedTotal: typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0,
@@ -5170,6 +5260,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     channels.videoBytes = dc
     vp9_444Worker = worker
     vp9_444Active.value = true
+    // FR-1 P7 — the clock offset may already be locked (probe started with
+    // the control DC); hand it to the fresh worker.
+    pushClockOffset()
     return worker
   }
 
@@ -5400,6 +5493,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     channels.videoBytes = dc
     hevcWorker = worker
     hevcActive.value = true
+    // FR-1 P7 — the clock offset may already be locked (probe started with
+    // the control DC); hand it to the fresh worker.
+    pushClockOffset()
     return worker
   }
 
@@ -5444,6 +5540,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (statsTimer !== null) return
     statsTimer = setInterval(async () => {
       if (!pc) return
+      // FR-1 P7 — clock probe rides the stats cadence (no-op until the
+      // control DC opens; old agents ignore the verb).
+      sendClockProbe()
       try {
         const report = await pc.getStats()
         const snap = extractStatsSnapshot(report, statsPrevBytes, statsPrevTsMs)
@@ -5922,6 +6021,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     stopJankDetector()
     lastBacklogDrops = 0
     struggleWindow.reset()
+    // FR-1 P7 — clock sync is per-connection (a reconnect may land on a
+    // restarted agent process with a fresh epoch).
+    resetClockSync()
     stopWebCodecsPath()
     stopVp9_444Path()
     stopHevcPath()
@@ -6976,6 +7078,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const parsed = parseControlInbound(ev.data)
       if (parsed?.kind === 'host_locked') {
         hostLocked.value = parsed.locked
+      } else if (parsed?.kind === 'clock_echo') {
+        // FR-1 P7 — clock probe round trip complete; fold the sample.
+        handleClockEcho(parsed.t0, parsed.agentUs)
       } else if (parsed?.kind === 'desktop_changed') {
         currentDesktop.value = parsed.name
       } else if (parsed?.kind === 'layout') {
@@ -7558,7 +7663,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const { x, y, insideVideo } = normalisedXY(ev)
       if (!insideVideo) return
       pendingMove = { x, y, mon: 0 }
-      if (rafHandle === null) rafHandle = requestAnimationFrame(flushPendingMove)
+      schedulePendingMove()
     }
 
     // Cancel any RAF-queued mouse_move so it can't fire *after* a click
@@ -7566,9 +7671,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // fast click-then-drag can register a stale mouse_move at the click
     // coords between the button event and the subsequent moves.
     function cancelPendingMove() {
-      if (rafHandle !== null) {
-        cancelAnimationFrame(rafHandle)
-        rafHandle = null
+      if (moveTimer !== null) {
+        clearTimeout(moveTimer)
+        moveTimer = null
       }
       pendingMove = null
     }
@@ -8094,6 +8199,17 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     function onContextMenu(ev: MouseEvent) { ev.preventDefault() }
 
     surface.addEventListener('pointermove', onPointerMove)
+    // FR-1 P6 — where supported (Chromium), also sample at device rate:
+    // pointerrawupdate fires between rAF-aligned pointermoves, so the
+    // 8 ms coalescer always has the FRESHEST position even when the main
+    // thread is busy compositing. Duplicate events are harmless
+    // (latest-wins into pendingMove).
+    if ('onpointerrawupdate' in surface) {
+      surface.addEventListener(
+        'pointerrawupdate',
+        onPointerMove as EventListener,
+      )
+    }
     surface.addEventListener('pointerdown', onPointerDown)
     surface.addEventListener('pointerup', onPointerUp)
     surface.addEventListener('pointerenter', onPointerEnter)
@@ -8120,6 +8236,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
 
     return () => {
       surface.removeEventListener('pointermove', onPointerMove)
+      if ('onpointerrawupdate' in surface) {
+        surface.removeEventListener(
+          'pointerrawupdate',
+          onPointerMove as EventListener,
+        )
+      }
       surface.removeEventListener('pointerdown', onPointerDown)
       surface.removeEventListener('pointerup', onPointerUp)
       surface.removeEventListener('pointerenter', onPointerEnter)
@@ -8139,7 +8261,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // fire after teardown and call sendInput on a closed channel.
       if (pendingCtrlV?.timer) clearTimeout(pendingCtrlV.timer)
       pendingCtrlV = null
-      if (rafHandle !== null) cancelAnimationFrame(rafHandle)
+      if (moveTimer !== null) {
+        clearTimeout(moveTimer)
+        moveTimer = null
+      }
       // A disconnect while fullscreen must not leave the Keyboard
       // Lock dangling (the stage may stay fullscreen briefly).
       disableKeyboardLock()

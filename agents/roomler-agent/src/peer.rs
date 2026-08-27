@@ -2494,6 +2494,32 @@ async fn media_pump(
 /// ```
 ///
 /// Exported `pub(crate)` so the unit tests can lock the wire format.
+/// FR-1 P7 — the process-wide monotonic epoch behind both DC video wire
+/// timestamps and the `rc:clock` echo. One shared clock is the whole point:
+/// the browser probes it over the control DC, learns the offset to its own
+/// clock, and can then read any frame's wire timestamp as a true end-to-end
+/// age. (Before this the ffmpeg pump stamped from its own start and the
+/// vp9 pump forwarded the capture backend's epoch — three different zeros.)
+fn agent_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Microseconds since the process epoch. Stays under 2^53 (JS-exact) for
+/// ~285 years of uptime, and never runs backwards across pump rebuilds —
+/// which the old per-pump zero did, handing the decoder a timestamp jump
+/// on every encoder swap.
+pub(crate) fn agent_epoch_us() -> u64 {
+    agent_epoch().elapsed().as_micros() as u64
+}
+
+/// Pure reply builder for `rc:clock` (unit-locked). `t0` is echoed as the
+/// JSON value it arrived as — the browser subtracts it from its own clock,
+/// so any parse/normalise step here could only corrupt the RTT.
+pub(crate) fn clock_echo_json(t0: &serde_json::Value, agent_us: u64) -> String {
+    serde_json::json!({"t": "rc:clock.echo", "t0": t0, "agent_us": agent_us}).to_string()
+}
+
 /// `dead_code` allowance is for builds without the `vp9-444` feature
 /// where the function has no caller — the tests still exercise it
 /// under either feature flag setting.
@@ -2784,7 +2810,6 @@ async fn media_pump_vp9_444_dc(
     // pushes the last idle frame through the (now bounded, see the send task
     // below) DC path promptly. Fires only on capture-None.
     const IDLE_KEEPALIVE: Duration = Duration::from_millis(60);
-    let start = std::time::Instant::now();
 
     // rc.166 freeze fix — relay-aware bitrate clamp + tighter backpressure.
     // The WSL / corp path forces all media over a single TURN-TCP relay
@@ -3698,7 +3723,10 @@ async fn media_pump_vp9_444_dc(
         // the browser reassembler. (frames_sent / bytes_written / send_errors
         // are incremented by the send task via the shared atomics now.)
         for p in packets {
-            let ts_us = start.elapsed().as_micros() as u64;
+            // FR-1 P7 — process-epoch stamp (see `agent_epoch_us`): the
+            // browser maps this onto its own clock via the rc:clock probe.
+            // Stamped at framing, so send-queue wait is inside the age.
+            let ts_us = agent_epoch_us();
             let wire = bytes::Bytes::from(frame_video_bytes(&p.data, p.is_keyframe, ts_us));
             // P5 — fan out to the shared pipeline's followers first.
             pipeline.fan_out(
@@ -5495,10 +5523,13 @@ async fn media_pump_ffmpeg_dc(
         // the browser reassembler.
         let send_start = std::time::Instant::now();
         for pkt in packets {
+            // FR-1 P7 — process-epoch stamp, same clock as the ffmpeg pump
+            // and the rc:clock echo (was: the capture backend's own epoch,
+            // which the browser had no way to relate to anything).
             let wire = bytes::Bytes::from(frame_video_bytes(
                 &pkt.data,
                 pkt.is_keyframe,
-                frame.monotonic_us,
+                agent_epoch_us(),
             ));
             // P5 — fan the framed packet out to the shared pipeline's
             // followers first (their sync gates + queues are independent of
@@ -6259,6 +6290,19 @@ fn attach_control_handler(
                             ),
                         }
                     });
+                }
+                "rc:clock" => {
+                    // FR-1 P7 — viewer clock probe. Echo `t0` VERBATIM (the
+                    // browser computes RTT from its own value; parsing it here
+                    // would just add a way to corrupt it) plus our process-epoch
+                    // µs — the same clock the DC video wire timestamps are
+                    // stamped with, which is what lets the browser turn a frame
+                    // timestamp into a true end-to-end age in its HUD.
+                    let t0 = val.get("t0").cloned().unwrap_or(serde_json::Value::Null);
+                    let reply = clock_echo_json(&t0, agent_epoch_us());
+                    if let Err(e) = dc_for_reply.send_text(reply).await {
+                        debug!(%session_id, %e, "control: rc:clock echo send failed");
+                    }
                 }
                 "rc:keyframe" => {
                     // Browser's decode queue backed up → it dropped deltas and
@@ -9198,7 +9242,7 @@ mod tests {
 
 #[cfg(test)]
 mod video_bytes_wire_tests {
-    use super::frame_video_bytes;
+    use super::{agent_epoch_us, clock_echo_json, frame_video_bytes};
 
     /// Lock the exact byte layout that `rc-vp9-444-worker.ts`'s
     /// `parseFrameHeader` (lines 260-273 of that file) reads. A typo
@@ -9242,6 +9286,33 @@ mod video_bytes_wire_tests {
         let out = frame_video_bytes(&[], true, 1);
         assert_eq!(out.len(), 13);
         assert_eq!(&out[0..4], &[0, 0, 0, 0]);
+    }
+
+    /// FR-1 P7 — the rc:clock echo is a wire contract with the browser's
+    /// HUD-age math: `t0` must come back byte-for-byte (RTT correctness)
+    /// and `agent_us` must be the bare integer the wire timestamps use.
+    #[test]
+    fn clock_echo_echoes_t0_verbatim_and_carries_agent_us() {
+        let t0 = serde_json::json!(1_756_300_000_000_000.0_f64);
+        let v: serde_json::Value = serde_json::from_str(&clock_echo_json(&t0, 42)).unwrap();
+        assert_eq!(v["t"], "rc:clock.echo");
+        assert_eq!(v["agent_us"], 42);
+        assert_eq!(v["t0"], t0);
+        // A hostile/odd t0 (string, null) still round-trips rather than
+        // erroring — the browser just discards the unusable sample.
+        let v2: serde_json::Value =
+            serde_json::from_str(&clock_echo_json(&serde_json::json!("x"), 1)).unwrap();
+        assert_eq!(v2["t0"], "x");
+        let v3: serde_json::Value =
+            serde_json::from_str(&clock_echo_json(&serde_json::Value::Null, 1)).unwrap();
+        assert!(v3["t0"].is_null());
+    }
+
+    #[test]
+    fn agent_epoch_is_monotonic() {
+        let a = agent_epoch_us();
+        let b = agent_epoch_us();
+        assert!(b >= a, "process-epoch clock must never run backwards");
     }
 }
 
