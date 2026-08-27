@@ -169,7 +169,10 @@ pub fn build_router(state: AppState) -> Router {
             "/",
             get(routes::user::list_members).post(routes::invite::add_member),
         )
-        .route("/me", get(routes::user::my_membership));
+        .route("/me", get(routes::user::my_membership))
+        // FR-10 — matchit gives the static `/me` above precedence over this
+        // parameterised segment.
+        .route("/{user_id}", delete(routes::user::remove_member));
 
     // Room routes (under tenant) — replaces channel + conference
     let room_routes = Router::new()

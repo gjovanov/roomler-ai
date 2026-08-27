@@ -349,3 +349,146 @@ async fn upload_stores_the_sniffed_type_not_the_claimed_one() {
         "the sniffer recognises HTML by content, so that is the honest answer"
     );
 }
+
+// ─── FR-11 (#784): file grids — q search + whitelisted sort ──────────────
+
+/// Uploads three named files, then exercises the tenant-wide and room list
+/// endpoints' new `q`/`sort`/`dir` params (server-side grid feed).
+#[tokio::test]
+async fn file_lists_support_q_and_sort() {
+    let app = TestApp::spawn().await;
+    let tenant = app.seed_tenant("filegrid").await;
+    let room_id = tenant.rooms[0].id.clone();
+
+    app.auth_post(
+        &format!("/api/tenant/{}/room/{}/join", tenant.tenant_id, room_id),
+        &tenant.admin.access_token,
+    )
+    .send()
+    .await
+    .unwrap();
+
+    // (name, body) — sizes deliberately distinct for the size sort.
+    for (name, body) in [
+        ("alpha-report.txt", "a".repeat(10)),
+        ("beta-notes.txt", "b".repeat(30)),
+        ("gamma-summary.txt", "c".repeat(20)),
+    ] {
+        let file_part = multipart::Part::bytes(body.into_bytes())
+            .file_name(name.to_string())
+            .mime_str("text/plain")
+            .unwrap();
+        let form = multipart::Form::new()
+            .part("file", file_part)
+            .text("room_id", room_id.clone());
+        let resp = app
+            .client
+            .post(app.url(&format!("/api/tenant/{}/file/upload", tenant.tenant_id)))
+            .header(
+                "Authorization",
+                format!("Bearer {}", tenant.admin.access_token),
+            )
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "upload {name} failed");
+    }
+
+    // Tenant-wide list: q narrows by filename substring, case-insensitively.
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/file?q=BETA", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["total"].as_u64(), Some(1));
+    assert_eq!(json["items"][0]["filename"], "beta-notes.txt");
+
+    // sort=filename asc → alpha, beta, gamma.
+    let resp = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/file?sort=filename&dir=asc",
+                tenant.tenant_id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    let names: Vec<&str> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["filename"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha-report.txt", "beta-notes.txt", "gamma-summary.txt"]
+    );
+
+    // sort=size desc → 30, 20, 10.
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/file?sort=size&dir=desc", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    let sizes: Vec<u64> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["size"].as_u64().unwrap())
+        .collect();
+    assert_eq!(sizes, vec![30, 20, 10]);
+
+    // Room-scoped list takes the same params.
+    let resp = app
+        .auth_get(
+            &format!(
+                "/api/tenant/{}/room/{}/file?q=gamma&sort=filename",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["total"].as_u64(), Some(1));
+    assert_eq!(json["items"][0]["filename"], "gamma-summary.txt");
+
+    // No params → unchanged default (created_at desc), full envelope.
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/file", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    let json: Value = resp.json().await.unwrap();
+    assert_eq!(json["total"].as_u64(), Some(3));
+    assert_eq!(json["items"][0]["filename"], "gamma-summary.txt");
+
+    // Unknown sort key must 400.
+    let resp = app
+        .auth_get(
+            &format!("/api/tenant/{}/file?sort=evil", tenant.tenant_id),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}

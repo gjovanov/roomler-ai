@@ -13,6 +13,9 @@ interface Tenant {
   id: string
   name: string
   slug: string
+  /** FR-11: the members grid marks the owner row unremovable. The API has
+   *  always sent this; it just wasn't typed here. */
+  owner_id?: string
   description?: string
   icon?: string
   plan?: string

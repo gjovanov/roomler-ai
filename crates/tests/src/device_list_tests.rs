@@ -277,7 +277,9 @@ async fn device_list_sorts_and_paginates() {
     )
     .await;
 
-    // Default sort: effective name, case-insensitive ascending.
+    // Default sort (FR-11): presence bucket then effective name. All three
+    // fixture agents share one presence bucket (never connected), so the
+    // observable order here is the name half of the compound.
     let body = list_devices(&app, &t.tenant_id, &t.admin.access_token, "").await;
     let names: Vec<&str> = body["items"]
         .as_array()

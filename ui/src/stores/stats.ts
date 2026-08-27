@@ -83,6 +83,8 @@ export interface MeshPayload {
   agents?: Array<{
     id: string
     name?: string
+    /** FR-11: admin-set display label (mesh chart prefers it). */
+    display_name?: string
     last_presence?: string
     agent_version?: string
     relay_home?: string | null
