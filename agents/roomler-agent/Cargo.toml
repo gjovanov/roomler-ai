@@ -41,6 +41,9 @@ roomler-tunnel = { path = "../roomler-tunnel" }
 # Async + networking
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# FR-18 — capping SO_SNDBUF on the /derp socket. Pinned to the same version
+# tunnel-core already uses so the agent links one socket2, not two.
+socket2 = "0.5"
 reqwest = { workspace = true }
 futures = { workspace = true }
 
