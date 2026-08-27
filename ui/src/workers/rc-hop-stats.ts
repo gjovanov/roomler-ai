@@ -22,8 +22,12 @@
  * assumed win). localStorage `roomler-rc-ctx-mode` drives it.
  */
 
-/** One window's aggregate for a hop. */
-export type HopWindow = { avgMs: number; maxMs: number; n: number }
+/** One window's aggregate for a hop. `minMs` (FR-15) is what makes the
+ *  age window usable as a PATH-FLOOR sample: even a queued window usually
+ *  contains one frame that rode a momentarily drained pipe, and the
+ *  difference between that and the average is the queue the agent should
+ *  react to. 0 for an empty window (n = 0). */
+export type HopWindow = { avgMs: number; maxMs: number; minMs: number; n: number }
 
 /** Round to 0.1 ms — enough resolution for hop diagnosis, keeps the
  *  stats payload compact. */
@@ -37,12 +41,14 @@ export function round1(v: number): number {
 export class HopStats {
   private sum = 0
   private max = 0
+  private min = Number.POSITIVE_INFINITY
   private n = 0
 
   add(ms: number): void {
     if (!Number.isFinite(ms) || ms < 0) return
     this.sum += ms
     if (ms > this.max) this.max = ms
+    if (ms < this.min) this.min = ms
     this.n++
   }
 
@@ -50,10 +56,12 @@ export class HopStats {
     const w: HopWindow = {
       avgMs: this.n > 0 ? round1(this.sum / this.n) : 0,
       maxMs: round1(this.max),
+      minMs: this.n > 0 ? round1(this.min) : 0,
       n: this.n,
     }
     this.sum = 0
     this.max = 0
+    this.min = Number.POSITIVE_INFINITY
     this.n = 0
     return w
   }

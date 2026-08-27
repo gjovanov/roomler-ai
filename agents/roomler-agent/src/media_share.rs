@@ -44,7 +44,7 @@
 //! teardown aborts the media task — the guards run at the await point.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -114,7 +114,7 @@ pub struct FollowerSink {
     pub keyframe_requested: Arc<AtomicBool>,
     pub target_resolution: Arc<Mutex<TargetResolution>>,
     pub quality_state: Arc<AtomicU8>,
-    pub viewer_report: Arc<AtomicU32>,
+    pub viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     pub priority: Arc<AtomicU8>,
     pub capture_native_dims: Arc<AtomicU64>,
     pub encoded_dims: Arc<AtomicU64>,
@@ -386,7 +386,7 @@ impl Pipeline {
         let mut inner = self.inner.lock().unwrap();
         let mut max_div = 1u32;
         for f in inner.followers.iter_mut() {
-            let raw = f.sink.viewer_report.swap(0, Relaxed);
+            let raw = f.sink.viewer_report.take_report();
             let (fps, struggling) = crate::encode::viewer_rate::unpack_report(raw);
             f.divisor = f.viewer_rate.observe(fps, struggling, capture_fps);
             max_div = max_div.max(f.divisor);
@@ -783,7 +783,7 @@ mod tests {
             keyframe_requested: Arc::new(AtomicBool::new(false)),
             target_resolution: Arc::new(Mutex::new(TargetResolution::Native)),
             quality_state: Arc::new(AtomicU8::new(2)),
-            viewer_report: Arc::new(AtomicU32::new(0)),
+            viewer_report: Arc::new(crate::encode::viewer_rate::ViewerFeedback::new()),
             priority: Arc::new(AtomicU8::new(1)),
             capture_native_dims: Arc::new(AtomicU64::new(0)),
             encoded_dims: Arc::new(AtomicU64::new(0)),
@@ -1036,7 +1036,7 @@ mod tests {
 
         // The follower reports a struggling 20 fps decode → its controller
         // caps below 20 → divisor > 1. Owner's divisor 1 → max wins.
-        report.store(crate::encode::viewer_rate::pack_report(20, true), Relaxed);
+        report.store_report(crate::encode::viewer_rate::pack_report(20, true));
         let div = owner.step_viewer_windows(1, 60);
         assert!(
             div > 1,
@@ -1056,7 +1056,7 @@ mod tests {
         // Drive the follower to the floor divisor (cap 12 → divisor 5 at 60)
         // while the owner stays at divisor 1 → ratio 5 ≥ SPILL_RATIO.
         for _ in 0..SPILL_AFTER_WINDOWS + 6 {
-            report.store(crate::encode::viewer_rate::pack_report(5, true), Relaxed);
+            report.store_report(crate::encode::viewer_rate::pack_report(5, true));
             owner.step_viewer_windows(1, 60);
         }
         assert_eq!(owner.follower_count(), 0, "deviant follower spilled");
@@ -1076,7 +1076,7 @@ mod tests {
         let _g = try_join(key, s, 60).expect("join");
 
         for _ in 0..SPILL_AFTER_WINDOWS * 2 {
-            report.store(crate::encode::viewer_rate::pack_report(5, true), Relaxed);
+            report.store_report(crate::encode::viewer_rate::pack_report(5, true));
             owner.step_viewer_windows(1, 60);
         }
         assert_eq!(
