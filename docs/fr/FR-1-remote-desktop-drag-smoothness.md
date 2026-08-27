@@ -1,7 +1,7 @@
 # FR-1: RustDesk-parity remote-desktop drag smoothness
 
 **Status:** phases P1–P4 shipped + field-verified; P2/P3 shipped, relay-gated after field
-read; P5–P7 in progress. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
+read; P5 shipped in 0.4.4 (field gate pending); P6 + P7-HUD remaining. Tracking issue: `FR-1` in gjovanov/roomler-ai/issues.
 
 ## Goal
 
@@ -90,3 +90,4 @@ lumpiness-robust estimator (its own follow-up FR when picked up).
 | rc.483 (P1+P4) | "definitively feels faster movement, but still bulky in several ms chunks/steps" — the byte gate converting queue-lag into skips against the still-unmeasured overrun |
 | rc.484 (P2+P3) | ROZALINA direct = better; CORPLAP-3 + CORPLAP-2 over corp relay = WORSE than rc.483 (both mechanisms relay-hostile — see relay note) |
 | 0.4.3 (relay gating) | Rozalina "much better now", verified from neo16, CORPLAP-1 and MacBook; relay reverted to rc.483 posture (re-test pending) |
+| 0.4.4 (P5) | parallel convert + block_in_place + fps-first cadence pacing — field gate pending (`paced_fps` engaging in heartbeats, `avg_encode_ms` ≤ ~17 native, even cadence, WGC drops no longer ~33 % random) |
