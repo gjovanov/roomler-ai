@@ -57,12 +57,12 @@ direct path entirely, and every FR-1 mechanism.
 
 ## Acceptance criteria
 
-- [ ] Relay drag session heartbeats: `bytes_inflight` spikes >150 KB only for
+- [x] Relay drag session heartbeats: `bytes_inflight` spikes >150 KB only for
       requested resyncs; zero `idle-settle keyframe` lines while constrained
       (counter climbing instead); ≤1 `deferred bitrate applied` per 15 s
-- [ ] Field: CORPLAP-3-from-neo16 drag no longer "bulky" (or clearly reduced); post-motion
+- [x] Field: CORPLAP-3-from-neo16 drag no longer "bulky" (or clearly reduced); post-motion
       text still crystallises within ~1–2 s via deltas
-- [ ] Direct sessions byte-identical in behaviour (settle IDRs still fire there)
+- [x] Direct sessions byte-identical in behaviour (settle IDRs still fire there)
 - [ ] `relay_idr_thrift=0` restores the previous relay behaviour
 
 ## Open decisions
@@ -81,4 +81,4 @@ direct path entirely, and every FR-1 mechanism.
 
 | Release | Result |
 |---|---|
-| 0.4.5 (relay_idr_thrift) | shipped — field gate pending: CORPLAP-3 drag from neo16 (settle_kf_suppressed climbing, bytes_inflight lumps gone, bulky feel reduced) |
+| 0.4.5 (relay_idr_thrift) | ✅ FIELD PASS: CORPLAP-3-from-neo16 "very smooth now". CORPLAP-1→CORPLAP-3 session measured post-fix: agent EXONERATED (max inflight 36 KB vs 334 KB pre-fix, send_wait ≤0.38 ms, zero skips, thrift active, no viewer-rate struggle) — the residual "a bit sluggish" there is 98–164 ms DERP RTT with BOTH endpoints corp-VPN d (pair cannot go direct; input-to-photon ≈ 250–350 ms is path physics, out of scope per spec) |
