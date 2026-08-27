@@ -60,7 +60,7 @@ exactly the hole the row closes.
 
 | FR | Issue | Title | Status |
 |---|---|---|---|
-| [FR-1](FR-1-remote-desktop-drag-smoothness.md) | [#767](https://github.com/gjovanov/roomler-ai/issues/767) | RustDesk-parity remote-desktop drag smoothness | in progress — P1–P4 shipped + field-verified, P5–P7 open |
+| [FR-1](FR-1-remote-desktop-drag-smoothness.md) | [#767](https://github.com/gjovanov/roomler-ai/issues/767) | RustDesk-parity remote-desktop drag smoothness | in progress — P1–P5 shipped + field-verified (0.4.4 "Rozalina works nicely"), P6 + P7-HUD open |
 | [FR-2](FR-2-pin-update-downgrade-guard.md) | [#770](https://github.com/gjovanov/roomler-ai/issues/770) | Pin-update downgrade guard | closed — shipped (#771) + field-verified on prod 2026-08-27 |
 | ~~FR-3~~ | — | *vacated* — the #773/#774 collision; both claimants renumbered | never reuse |
 | [FR-4](FR-4-conference-media-path-integrity.md) | [#776](https://github.com/gjovanov/roomler-ai/issues/776) | Conference media-path integrity | closed — shipped + field-verified (retrospective) |
@@ -69,7 +69,8 @@ exactly the hole the row closes.
 | [FR-7](FR-7-signed-releases.md) | [#778](https://github.com/gjovanov/roomler-ai/issues/778) | Signed releases — Windows Authenticode, Linux GPG + provenance, macOS identity | in progress — retrospective; all criteria field-verified except Apple Developer ID (enrolment 5XS5WN8R99 under review); closes on `spctl … Notarized Developer ID` |
 | [FR-8](FR-8-claude-session-restore.md) | [#780](https://github.com/gjovanov/roomler-ai/issues/780) | Claude session restore after reboot (`crestore`) | closed — shipped (retrospective); renumbered from FR-7, which #778 claimed 147 s earlier |
 | FR-9 | [#768](https://github.com/gjovanov/roomler-ai/issues/768) | Two nodes sharing a LAN converge to a direct carrier | acceptance criteria met; renumbered from `FR-01`; **spec lands with PR #769** |
-| [FR-10](FR-10-relay-drag-quality.md) | [#783](https://github.com/gjovanov/roomler-ai/issues/783) | Relay drag quality — IDR thrift on constrained transports | in progress — child of FR-1; implementation in PR #785; kept FR-10 by the lower-issue-id rule vs #784 |
+| [FR-10](FR-10-relay-drag-quality.md) | [#783](https://github.com/gjovanov/roomler-ai/issues/783) | Relay drag quality — IDR thrift on constrained transports | closed — shipped in 0.4.5, field PASS 2026-08-27 ("CORPLAP-3 from neo16 very smooth"); CORPLAP-1 residual attributed to DERP RTT; kept FR-10 by the lower-issue-id rule vs #784 |
 | [FR-11](FR-11-server-grids-members-files-invites.md) | [#784](https://github.com/gjovanov/roomler-ai/issues/784) | Server-side grids — members/files/invites, devices online-first default sort, mesh display names | closed — shipped (#790) + field-verified on prod 2026-08-27; renumbered from `FR-10`, which #783 claimed 104 s earlier |
 | [FR-12](FR-12-onboarding-tutorial.md) | [#788](https://github.com/gjovanov/roomler-ai/issues/788) | Onboarding tutorial — guided welcome tour, callable anytime | design+plan — spec lands with the FR-11 P1 PR |
 | [FR-13](FR-13-rc-keyboard-hid-mapping-mac-chords.md) | [#789](https://github.com/gjovanov/roomler-ai/issues/789) | RC keyboard: unmapped HID usages type garbage (CapsLock→`9`); mac Ctrl→Cmd chords | implemented — viewer half ships with the next web deploy, agent half with the next agent release; field pending |
+| [FR-14](FR-14-direct-link-jitter-episodes.md) | [#792](https://github.com/gjovanov/roomler-ai/issues/792) | Direct-link jitter episodes — AIMD sawtooth on VPN-churning links | design — evidence collected (CORPLAP-1 2026-08-27); child of FR-1 |
