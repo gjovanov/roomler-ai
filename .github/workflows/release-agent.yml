@@ -195,12 +195,17 @@ jobs:
           # for rc builds) — fails loudly otherwise so the mapping can't
           # silently collide.
           #
-          # ⚠️ THIS MAPPING HAS TWO MORE COPIES:
+          # ⚠️ THIS MAPPING HAS FIVE MORE COPIES:
           # agents/roomler-agent/src/artifact_version.rs::msi_product_version_for
-          # (download verification) and
+          # (download verification),
           # agents/roomler-agent/src/version_sweep.rs::own_msi_version
           # (coexisting-MSI sweep — a divergence there makes an agent rank
-          # its OWN install as older and uninstall itself).
+          # its OWN install as older and uninstall itself), and the three
+          # build.rs VERSIONINFO embeds (roomler-agent, roomler-cli-shim,
+          # roomler-tunnel — `file_version`): those stamp the EXE
+          # FILEVERSION shown by Explorer/EDR inventory; a divergence there
+          # is cosmetic-but-confusing (EXE claims a different version than
+          # the MSI), nothing asserts it at build time.
           # The self-updater reads the ProductVersion back out of the
           # downloaded MSI and refuses to install one that does not carry
           # the version the release manifest claimed — that is what stops a
