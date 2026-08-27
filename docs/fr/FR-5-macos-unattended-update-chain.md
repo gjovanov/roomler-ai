@@ -1,6 +1,6 @@
-# FR-3: macOS unattended update chain — the update half, pinned-GPG artifact trust, and a stable code-signing identity (retrospective)
+# FR-5: macOS unattended update chain — the update half, pinned-GPG artifact trust, and a stable code-signing identity (retrospective)
 
-**Status:** SHIPPED and field-closed 2026-08-26 at agent rc.482. Tracking issue: `FR-3`
+**Status:** SHIPPED and field-closed 2026-08-26 at agent rc.482. Tracking issue: `FR-5` (#774)
 in gjovanov/roomler-ai/issues. Retrospective FR — the arc completed before this document;
 every claim below carries its field receipt.
 
