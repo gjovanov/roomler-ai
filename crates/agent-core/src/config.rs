@@ -700,6 +700,16 @@ pub struct AgentConfig {
     /// behaviour.
     #[serde(default)]
     pub fps_pace: Option<bool>,
+    /// 2026-08-27 FR-10 — relay IDR thrift
+    /// (`ROOMLER_NODE_RELAY_IDR_THRIFT`). Default ON: constrained (relay)
+    /// sessions suppress the idle-settle keyframe (a quality refresh, not
+    /// a correctness need on a reliable DC — the request-driven resync
+    /// stays) and space deferred bitrate re-opens to ≥15 s unless the
+    /// move is ≥40 % — each such IDR was a single ~300 KB frame ≈
+    /// 1.2–1.5 s of a ~2 Mbps relay (the CORPLAP-3 "bulky" lumps). `false`
+    /// restores the previous relay behaviour. Direct sessions unaffected.
+    #[serde(default)]
+    pub relay_idr_thrift: Option<bool>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
     /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
@@ -1653,6 +1663,7 @@ pub fn test_fixture() -> AgentConfig {
         bg_rebuild: None,
         par_convert: None,
         fps_pace: None,
+        relay_idr_thrift: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -1768,7 +1779,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 52] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 53] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1776,6 +1787,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 52]
         ("BG_REBUILD", cfg.bg_rebuild),
         ("PAR_CONVERT", cfg.par_convert),
         ("FPS_PACE", cfg.fps_pace),
+        ("RELAY_IDR_THRIFT", cfg.relay_idr_thrift),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
         ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
         ("IDLE_REFINE", cfg.idle_refine),
