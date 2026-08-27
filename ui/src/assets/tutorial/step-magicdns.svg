@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 380 150" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" role="img" aria-labelledby="sd-t">
+  <title id="sd-t">A machine name resolving to its stable private address, reachable from anywhere</title>
+  <!-- Typed name -->
+  <rect x="8" y="52" width="132" height="46" rx="7" fill="#1a1a2e"/>
+  <text x="20" y="72" font-size="8.5" fill="#4caf50" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">$ ssh workstation</text>
+  <text x="20" y="88" font-size="8" fill="rgba(255,255,255,0.65)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">no port · no sshd</text>
+
+  <path d="M140 75 h34" stroke="rgba(0,150,136,0.55)" stroke-width="1.6" fill="none" marker-end="url(#sdA)"/>
+  <defs>
+    <marker id="sdA" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 1 L6 4 L0 7 z" fill="#009688"/>
+    </marker>
+  </defs>
+
+  <!-- Resolution -->
+  <g>
+    <rect x="178" y="46" width="94" height="58" rx="8" fill="rgba(0,150,136,0.10)" stroke="#00796B" stroke-width="1.5"/>
+    <text x="225" y="64" text-anchor="middle" font-size="8" font-weight="700" fill="#00796B">MagicDNS</text>
+    <text x="225" y="80" text-anchor="middle" font-size="8" fill="#1a1a2e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">workstation</text>
+    <text x="225" y="94" text-anchor="middle" font-size="8" fill="#ef5350" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">100.65.4.12</text>
+  </g>
+
+  <path d="M272 75 h30" stroke="rgba(0,150,136,0.55)" stroke-width="1.6" fill="none" marker-end="url(#sdA)"/>
+
+  <!-- Target machine, stable across networks -->
+  <rect x="304" y="40" width="68" height="70" rx="7" fill="#ffffff" stroke="rgba(0,150,136,0.45)" stroke-width="1.5"/>
+  <rect x="314" y="50" width="48" height="30" rx="3" fill="rgba(0,150,136,0.16)"/>
+  <text x="338" y="70" text-anchor="middle" font-size="7.5" font-weight="700" fill="#00796B">GPU box</text>
+  <text x="338" y="96" text-anchor="middle" font-size="7" fill="rgba(26,26,46,0.6)">café · office · home</text>
+  <circle cx="366" cy="48" r="3.2" fill="#4caf50"/>
+
+  <!-- The name follows the machine wherever it is -->
+  <g stroke="rgba(239,83,80,0.5)" stroke-width="1.2" stroke-dasharray="3 3" fill="none">
+    <path d="M338 116 q-60 26 -150 6"/>
+  </g>
+  <text x="238" y="138" text-anchor="middle" font-size="7.5" fill="#ef5350">same name on any network</text>
+</svg>

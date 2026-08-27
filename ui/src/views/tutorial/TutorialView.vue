@@ -2,7 +2,7 @@
   <v-container fluid class="pa-2 pa-md-4 pa-xl-6">
     <div class="d-flex align-center flex-wrap ga-2 mb-2 mb-md-4">
       <h1 class="text-h5 text-md-h4">{{ $t('nav.tutorial') }}</h1>
-      <v-chip size="small" variant="tonal" class="ml-1">
+      <v-chip size="small" variant="tonal" color="primary" class="ml-1 font-weight-medium">
         {{ doneCount }}/{{ chapters.length }} done
       </v-chip>
       <v-spacer />
@@ -18,10 +18,9 @@
     </div>
 
     <v-row>
-      <!-- Chapter rail. On phones it becomes a horizontal chip row so the
-           body still gets the full width. -->
+      <!-- Chapter rail -->
       <v-col cols="12" md="3" lg="3">
-        <v-card variant="outlined" class="tutorial-rail">
+        <v-card variant="outlined" class="tutorial-rail" rounded="lg">
           <!-- Plain click + :active rather than v-list selection: the rail
                must track the URL hash (which back/forward and deep links
                also drive), not v-list's own selection state. -->
@@ -47,64 +46,138 @@
       </v-col>
 
       <v-col cols="12" md="9" lg="9">
-        <v-card variant="outlined" class="pa-4 pa-md-6">
-          <div class="d-flex align-center ga-2 mb-2">
-            <v-icon :icon="active.icon" color="primary" />
-            <h2 class="text-h6 text-md-h5">{{ active.title }}</h2>
+        <v-card variant="outlined" class="pa-4 pa-md-6" rounded="lg">
+          <div class="d-flex align-center ga-2 mb-3">
+            <v-avatar size="36" color="primary" variant="tonal">
+              <v-icon :icon="active.icon" />
+            </v-avatar>
+            <h2 class="text-h6 text-md-h5 font-weight-bold">{{ active.title }}</h2>
+          </div>
+
+          <!-- Landing-page headline treatment (chapter 0). -->
+          <template v-if="active.tagline">
+            <h3 class="text-h5 text-md-h4 font-weight-bold mb-2 tutorial-headline">
+              {{ active.tagline.headline }}<br />
+              <span class="text-primary">{{ active.tagline.accent }}</span>
+            </h3>
+            <p class="text-body-1 text-md-h6 text-medium-emphasis font-weight-regular mb-4">
+              {{ active.tagline.sub }}
+            </p>
+          </template>
+
+          <!-- Capability strip, straight off the landing page. -->
+          <div v-if="active.chips" class="d-flex flex-wrap ga-2 mb-4">
+            <v-chip
+              v-for="chip in active.chips"
+              :key="chip"
+              size="small"
+              variant="tonal"
+              color="primary"
+            >
+              {{ chip }}
+            </v-chip>
           </div>
 
           <!-- The heroes are the README's own illustrations: a light
                palette on transparent. They are painted on a fixed light
                panel in BOTH themes — recolouring them per theme would mean
-               forking four artworks. -->
-          <div v-if="active.hero" class="tutorial-hero mb-4">
+               forking every artwork. -->
+          <div v-if="active.hero" class="tutorial-hero mb-5">
             <img :src="active.hero" :alt="active.heroAlt || active.title" />
           </div>
 
-          <p class="text-body-1 mb-4">{{ active.lead }}</p>
-
-          <h3 class="text-subtitle-1 font-weight-medium mb-2">Try it now</h3>
-          <v-list class="tutorial-steps mb-4" density="comfortable">
-            <v-list-item
-              v-for="(s, i) in active.steps"
-              :key="i"
-              class="px-0"
-            >
-              <template #prepend>
-                <v-avatar size="24" color="primary" variant="tonal" class="mr-3">
-                  <span class="text-caption">{{ i + 1 }}</span>
+          <!-- Decorated promise bullets. -->
+          <v-row v-if="active.badges" class="mb-2">
+            <v-col v-for="b in active.badges" :key="b.title" cols="12" sm="6" md="4">
+              <div class="tutorial-badge h-100">
+                <v-avatar size="34" :color="b.color" variant="tonal" class="mb-2">
+                  <v-icon :icon="b.icon" :color="b.color" size="20" />
                 </v-avatar>
-              </template>
-              <div class="text-body-2">{{ s.text }}</div>
-              <div v-if="s.code" class="tutorial-code mt-2">
-                <code>{{ s.code }}</code>
-                <v-btn
-                  icon="mdi-content-copy"
-                  size="x-small"
-                  variant="text"
-                  :aria-label="`Copy: ${s.code}`"
-                  @click="copy(s.code)"
-                />
+                <div class="text-subtitle-2 font-weight-bold mb-1">{{ b.title }}</div>
+                <div class="text-body-2 text-medium-emphasis">{{ b.text }}</div>
               </div>
-              <div v-if="s.to" class="mt-2">
-                <v-btn
-                  size="small"
-                  variant="tonal"
-                  color="primary"
-                  append-icon="mdi-arrow-right"
-                  :to="linkFor(s)"
-                >
-                  {{ s.linkLabel || 'Open' }}
-                </v-btn>
-              </div>
-            </v-list-item>
-          </v-list>
+            </v-col>
+          </v-row>
 
-          <h3 class="text-subtitle-1 font-weight-medium mb-2">In detail</h3>
-          <v-table density="compact" class="tutorial-detail mb-4">
+          <p class="text-body-1 mb-5">
+            <template v-for="(seg, i) in richSegments(active.lead)" :key="i">
+              <strong v-if="seg.bold">{{ seg.text }}</strong>
+              <template v-else>{{ seg.text }}</template>
+            </template>
+          </p>
+
+          <div class="d-flex align-center ga-2 mb-3">
+            <v-icon icon="mdi-play-circle-outline" color="primary" size="20" />
+            <h3 class="text-subtitle-1 font-weight-bold">Try it now</h3>
+          </div>
+          <div class="tutorial-steps mb-5">
+            <div v-for="(s, i) in active.steps" :key="i" class="tutorial-step">
+              <div class="d-flex align-start ga-3">
+                <v-avatar size="30" color="primary" variant="tonal" class="flex-shrink-0">
+                  <v-icon v-if="s.icon" :icon="s.icon" size="17" />
+                  <span v-else class="text-caption font-weight-bold">{{ i + 1 }}</span>
+                </v-avatar>
+                <div class="flex-grow-1">
+                  <div class="text-body-2">
+                    <template v-for="(seg, j) in richSegments(s.text)" :key="j">
+                      <strong v-if="seg.bold">{{ seg.text }}</strong>
+                      <template v-else>{{ seg.text }}</template>
+                    </template>
+                  </div>
+                  <div v-if="s.code" class="tutorial-code mt-2">
+                    <code>{{ s.code }}</code>
+                    <v-btn
+                      icon="mdi-content-copy"
+                      size="x-small"
+                      variant="text"
+                      :aria-label="`Copy: ${s.code}`"
+                      @click="copy(s.code)"
+                    />
+                  </div>
+                  <div v-if="s.to" class="mt-2">
+                    <v-btn
+                      size="small"
+                      variant="tonal"
+                      color="primary"
+                      append-icon="mdi-arrow-right"
+                      :to="linkFor(s)"
+                    >
+                      {{ s.linkLabel || 'Open' }}
+                    </v-btn>
+                  </div>
+                  <div v-if="s.graphic" class="tutorial-step-graphic mt-3">
+                    <img :src="s.graphic" :alt="s.graphicAlt || ''" />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Landing pillar "gems" as cards. -->
+          <template v-if="active.highlights">
+            <div class="d-flex align-center ga-2 mb-3">
+              <v-icon icon="mdi-star-four-points-outline" color="primary" size="20" />
+              <h3 class="text-subtitle-1 font-weight-bold">Why it holds up</h3>
+            </div>
+            <v-row class="mb-3">
+              <v-col v-for="h in active.highlights" :key="h.title" cols="12" sm="6" md="4">
+                <v-card variant="outlined" rounded="lg" class="pa-4 h-100">
+                  <v-icon :icon="h.icon" :color="h.color" size="30" class="mb-2" />
+                  <div class="text-subtitle-2 font-weight-bold mb-1">{{ h.title }}</div>
+                  <div class="text-body-2 text-medium-emphasis">{{ h.text }}</div>
+                </v-card>
+              </v-col>
+            </v-row>
+          </template>
+
+          <div class="d-flex align-center ga-2 mb-2">
+            <v-icon icon="mdi-information-outline" color="primary" size="20" />
+            <h3 class="text-subtitle-1 font-weight-bold">In detail</h3>
+          </div>
+          <v-table density="compact" class="tutorial-detail mb-5">
             <tbody>
               <tr v-for="(d, i) in active.detail" :key="i">
-                <th class="font-weight-medium">{{ d.label }}</th>
+                <th class="font-weight-bold">{{ d.label }}</th>
                 <td>{{ d.text }}</td>
               </tr>
             </tbody>
@@ -135,7 +208,8 @@
             <v-btn
               v-if="nextChapter"
               size="small"
-              variant="text"
+              variant="tonal"
+              color="primary"
               append-icon="mdi-chevron-right"
               @click="go(nextChapter.id)"
             >
@@ -154,7 +228,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useTutorialProgress } from '@/composables/useTutorialProgress'
-import { TUTORIAL_CHAPTERS, chapterById, type TutorialStep } from './tutorialChapters'
+import {
+  TUTORIAL_CHAPTERS,
+  chapterById,
+  richSegments,
+  type TutorialStep,
+} from './tutorialChapters'
 
 const route = useRoute()
 const router = useRouter()
@@ -211,33 +290,61 @@ async function copy(text: string) {
   top: 76px;
 }
 
-/* The four heroes are light-palette artwork (README parity). Give them a
-   fixed pale panel so the dark theme doesn't put dark ink on a dark
-   surface — one artwork, legible in both themes. */
+.tutorial-headline {
+  line-height: 1.2;
+}
+
+/* The heroes are light-palette artwork (README parity). Give them a fixed
+   pale panel so the dark theme doesn't put dark ink on a dark surface —
+   one artwork, legible in both themes. Height is deliberately generous:
+   at half this size the labels inside the diagrams are unreadable. */
 .tutorial-hero {
   background: #f5f7fa;
-  border-radius: 8px;
-  padding: 12px;
+  border: 1px solid rgba(0, 150, 136, 0.18);
+  border-radius: 10px;
+  padding: 16px;
   text-align: center;
 }
 .tutorial-hero img {
   max-width: 100%;
   height: auto;
-  max-height: 340px;
+  max-height: 680px;
 }
 
-.tutorial-steps :deep(.v-list-item__content) {
-  overflow: visible;
-  white-space: normal;
+.tutorial-badge {
+  border-left: 3px solid rgb(var(--v-theme-primary));
+  padding: 2px 0 2px 12px;
+}
+
+.tutorial-step + .tutorial-step {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid rgba(var(--v-theme-on-surface), 0.08);
+}
+
+/* Per-step diagrams: same pale panel, and wide enough to read their own
+   labels (they carry text). */
+.tutorial-step-graphic {
+  background: #f5f7fa;
+  border: 1px solid rgba(0, 150, 136, 0.18);
+  border-radius: 8px;
+  padding: 10px;
+  max-width: 560px;
+}
+.tutorial-step-graphic img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .tutorial-code {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 4px;
   background: rgba(var(--v-theme-on-surface), 0.06);
   border-radius: 6px;
   padding: 4px 4px 4px 10px;
+  max-width: 100%;
   overflow-x: auto;
 }
 .tutorial-code code {
@@ -253,7 +360,7 @@ async function copy(text: string) {
 }
 .tutorial-detail td {
   white-space: normal;
-  padding-top: 6px;
-  padding-bottom: 6px;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }
 </style>
