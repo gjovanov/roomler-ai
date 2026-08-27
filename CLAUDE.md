@@ -344,21 +344,27 @@ Registry retention: `registry-retention.sh 1` (weekly cron at Sun 04:00) keeps a
 
 Every substantial feature or multi-step program (a new capability, a performance arc, a
 protocol/scheme change — anything bigger than a one-PR fix) gets a **Functional
-Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`:
+Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`.
+
+**Creating the FR is a step of the PLAN**, alongside the implementation steps — not a
+write-up produced afterwards. Plan it, open it, then build against it:
 
 1. **Spec doc first**: `docs/fr/FR-N-<slug>.md` on master — Goal, root-cause/field
    evidence, key design with `file:line` anchors verified against master, a phase/status
    table with each phase's kill switch, acceptance criteria as checkboxes, open decisions,
-   out-of-scope, and a field-verification log. **Numbering: unpadded `FR-N`; next N = max
-   across BOTH `docs/fr/` AND `gh issue list --state all --search "FR-"` — sessions run in
-   parallel, and day one produced an FR-1/FR-01 collision (#767 vs #768) because the issue
-   list wasn't checked. Search immediately before creating — AND RE-VERIFY right after:
-   two sessions searched, both saw 2 as the max, and both filed FR-3 in the same window
-   (#773 vs the renumbered #774). The pre-check narrows the race; only the post-create
-   re-check (`gh issue list --state all --search "FR-<N>"` expecting exactly your own)
-   closes it — the tag-race push-then-verify discipline. The LOSER renumbers: whichever
-   issue is younger, or if that's ambiguous, the closed/retrospective one.**
-2. **GitHub issue** `FR-NN: <title>` in `gjovanov/roomler-ai/issues` (labels:
+   out-of-scope, and a field-verification log. **Claim the number by adding your row to
+   `docs/fr/README.md` in the same commit as the spec** — unpadded `FR-N`, never reused.
+   ⚠️ Do NOT allocate by scanning `docs/fr/` or the issue list, with or without a
+   post-create re-check: two sessions both read `max = N`, both write `FR-N+1`, and git
+   merges them without a murmur because they touched *different* files. Measured three
+   times on day one — #767/#768, then #773/#774 seven seconds apart, then **three**
+   sessions on FR-5 within minutes *while the scan-and-re-verify rule was already in
+   force*. Editing one shared table makes git the arbiter instead: the loser's push is
+   rejected as non-fast-forward and the rebase shows the number is taken before anything
+   is published — the overlay block allocator's shape, where a unique index arbitrates
+   concurrent claims rather than a lock. If one still slips through, the younger issue
+   renumbers (ambiguous ⇒ the closed/retrospective one).
+2. **GitHub issue** `FR-N: <title>` in `gjovanov/roomler-ai/issues` (labels:
    `enhancement` + whatever fits, e.g. `performance`): body links the spec doc and carries
    Goal / Key design / Acceptance criteria / Open decisions / Out of scope / Related.
 3. **Comment as you ship**: every merged PR and release gets a comment on the issue with
@@ -368,8 +374,8 @@ Requirement** tracked in GitHub, modeled on `gjovanov/lgr#21`:
 4. **Close** the issue only when the acceptance criteria are field-verified; a regression
    reopens it with the evidence.
 
-The first instance is `docs/fr/FR-1-remote-desktop-drag-smoothness.md`. Retroactive FRs
-for already-shipped arcs are welcome when a program resurfaces.
+`docs/fr/README.md` is the registry — every FR, its issue and its status, plus the claim
+protocol. Retroactive FRs for already-shipped arcs are welcome when a program resurfaces.
 
 ## Post-Implementation Testing
 
