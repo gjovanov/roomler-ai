@@ -2669,9 +2669,18 @@ mod tests {
         );
         assert!(m.eligible(&a, DirectTier::Srflx, t), "and clears it");
 
-        // LAN: suppressed → refused; lapsed → accepted; re-point shape when
-        // not on relay/MBB.
+        // LAN: #33 generalised D9 above — an authenticated inbound init is
+        // live evidence the tier carries peer→us, and answering it under MBB
+        // with a relay to protect costs nothing (shadow probe; the latch is
+        // the gate). So a suppressed LAN init is now ANSWERED rather than
+        // refused. The anti-thrash it used to provide lives where it belongs:
+        // `eligible` still governs everything OUTBOUND, so we still do not
+        // promote into a flap.
         m.on_death(&a, DirectTier::Lan, DeathReason::HandshakeDeadline, true, t);
+        assert!(
+            !m.eligible(&a, DirectTier::Lan, t + Duration::from_secs(30)),
+            "the tier is genuinely suppressed — outbound stays refused"
+        );
         assert_eq!(
             m.inbound_init(
                 &a,
@@ -2680,8 +2689,9 @@ mod tests {
                 true,
                 t + Duration::from_secs(30)
             ),
-            None,
-            "a cooling LAN init is refused (anti-thrash)"
+            Some(PathAction::Probe(DirectTier::Lan)),
+            "#33 — a suppressed tier is still ANSWERED when there is a relay to \
+             protect; going deaf here is what deadlocked pairs on one LAN"
         );
         let late = t + Duration::from_secs(61);
         assert_eq!(
