@@ -20,6 +20,17 @@
       <p class="text-body-2 text-medium-emphasis mb-4">
         Create your first room to start chatting, sharing files, or hosting calls with your team.
       </p>
+      <!-- FR-12 — the empty state is exactly where the tour helps. -->
+      <v-btn
+        size="small"
+        variant="text"
+        color="primary"
+        prepend-icon="mdi-school-outline"
+        :to="{ name: 'tutorial', params: { tenantId }, hash: '#rooms' }"
+        class="mb-2"
+      >
+        Walk me through it
+      </v-btn>
     </v-card>
 
     <v-list v-else>
