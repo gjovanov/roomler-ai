@@ -710,6 +710,17 @@ pub struct AgentConfig {
     /// restores the previous relay behaviour. Direct sessions unaffected.
     #[serde(default)]
     pub relay_idr_thrift: Option<bool>,
+    /// FR-15 — constrained-transport age feedback (2026-08-27). Default
+    /// ON: the viewer reports the paint age of the frames it actually
+    /// showed, the agent learns the session floor, and sustained excess
+    /// over it caps send-fps AND feeds the AIMD a congestion sample. It
+    /// exists because a relay backlog lives BELOW every agent counter:
+    /// field 2026-08-27 measured 1000 ms of viewer age against a 26 KB
+    /// agent queue.  = the open-loop 0.4.7 relay posture. Direct
+    /// sessions are unaffected (they have the measured ceiling + byte
+    /// gate). Env: ROOMLER_NODE_RELAY_AGE_FEEDBACK. Restart required.
+    #[serde(default)]
+    pub relay_age_feedback: Option<bool>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
     /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
@@ -1664,6 +1675,7 @@ pub fn test_fixture() -> AgentConfig {
         par_convert: None,
         fps_pace: None,
         relay_idr_thrift: None,
+        relay_age_feedback: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -1779,7 +1791,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 53] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1788,6 +1800,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 53]
         ("PAR_CONVERT", cfg.par_convert),
         ("FPS_PACE", cfg.fps_pace),
         ("RELAY_IDR_THRIFT", cfg.relay_idr_thrift),
+        ("RELAY_AGE_FEEDBACK", cfg.relay_age_feedback),
         ("PRIORITY_RES_CAP", cfg.priority_res_cap),
         ("NVENC_SPATIAL_AQ", cfg.nvenc_spatial_aq),
         ("IDLE_REFINE", cfg.idle_refine),

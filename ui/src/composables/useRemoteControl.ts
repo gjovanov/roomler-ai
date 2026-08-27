@@ -1040,9 +1040,22 @@ export function resolutionWireMessage(
 export function decodeStatWireMessage(
   fps: number,
   struggling: boolean,
+  age?: { avgMs: number; minMs: number } | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
-  return { t: 'rc:decodestat', fps: f, struggling: !!struggling }
+  const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
+  // FR-15 — the window's paint age (average) and its minimum, which the
+  // agent uses as the path-floor sample. Sent only when the FR-1 P7 clock
+  // probe has locked AND frames actually painted this window: an absent
+  // pair means "no signal" to the agent's age loop, which is different
+  // from (and must not be reported as) a 0 ms age. Both are clamped to
+  // the u16 the agent packs them into.
+  if (age && Number.isFinite(age.avgMs) && Number.isFinite(age.minMs)) {
+    const clamp = (v: number) => Math.min(Math.max(Math.round(v), 0), 65535)
+    msg.age_ms = clamp(age.avgMs)
+    msg.age_min_ms = clamp(age.minMs)
+  }
+  return msg
 }
 
 /** Which render path the viewer uses for the inbound video track.
@@ -4449,11 +4462,15 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** rc.188 Ã¢ÂÂ push the viewer's measured decode rate + a struggling bit to the
    *  agent over the control DC. Sent once per stats window from the active
    *  decode worker's `stats` message. No-op while the channel is closed. */
-  function sendDecodeStat(fps: number, struggling: boolean) {
+  function sendDecodeStat(
+    fps: number,
+    struggling: boolean,
+    age?: { avgMs: number; minMs: number } | null,
+  ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
-      ch.send(JSON.stringify(decodeStatWireMessage(fps, struggling)))
+      ch.send(JSON.stringify(decodeStatWireMessage(fps, struggling, age)))
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
     }
@@ -4468,6 +4485,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     fps?: number
     framesDroppedBacklog?: number
     decodeQueueSize?: number
+    age?: HopWindow | null
   }) {
     const drops = typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0
     const delta = Math.max(0, drops - lastBacklogDrops)
@@ -4481,7 +4499,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // queue 0, so a single-window blip (a big IDR landing, a GPU hiccup) was
     // a false positive that cost ~20 s of lazily-recovered reduced fps.
     const bad = delta > 0 || queue > flowParams.struggleQueue
-    sendDecodeStat(typeof m.fps === 'number' ? m.fps : 0, struggleWindow.observe(bad))
+    // FR-15 — ride the window's paint age along. Present only once the
+    // clock probe has locked and frames actually painted (n > 0); the
+    // agent treats its absence as "no signal", not as a 0 ms age.
+    const age = m.age && m.age.n > 0 ? { avgMs: m.age.avgMs, minMs: m.age.minMs } : null
+    sendDecodeStat(typeof m.fps === 'number' ? m.fps : 0, struggleWindow.observe(bad), age)
   }
 
   /** Update the controller's quality preference, persist it, and push
@@ -5155,6 +5177,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           paint?: HopWindow
           fwd?: HopWindow
           decode?: HopWindow
+          // FR-15 — end-to-end paint age window (null until the
+          // rc:clock probe locks); rides the decodestat to the agent.
+          age?: HopWindow | null
           outGapMaxMs?: number
           ctxMode?: string
           render?: string
@@ -5406,6 +5431,9 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           paint?: HopWindow
           fwd?: HopWindow
           decode?: HopWindow
+          // FR-15 — end-to-end paint age window (null until the
+          // rc:clock probe locks); rides the decodestat to the agent.
+          age?: HopWindow | null
           outGapMaxMs?: number
           ctxMode?: string
           render?: string

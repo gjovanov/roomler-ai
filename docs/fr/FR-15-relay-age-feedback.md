@@ -35,15 +35,23 @@ window's average paint-age) and `age_min_ms` (the window's minimum — the path-
 tracker). Old web sends no age → agent sees absent → loop stays off (back-compat).
 
 **B. Constrained age-loop in the governor.** The agent learns the session's age FLOOR
-(min over recent windows — same min-filter logic as the clock probe: the floor is the
-path's propagation+decode cost, not queue). When `age_avg − floor` exceeds a slack
-(~60–75 ms) for ≥2 consecutive windows, treat it as over-rate: **step the constrained
-ceiling down ×0.85 per window** while the excess persists, floor at the relay area
-floor (1.5 M). Recovery rides the existing AI climb (+ceiling/16 per 5 s) back to the
-nominal clamp. Mirrors AIMD, but keyed on the only end-to-end signal the relay path
-cannot hide. Kill switch `relay_age_feedback` (default ON), constrained-only —
-direct already has the measured ceiling + byte gate (and FR-14 will own its episodic
-holes).
+(min over a 30-window ring — the floor is the path's propagation+decode cost, not
+queue; a genuine path change re-baselines in ~30 s). When `age_avg − floor` exceeds
+`AGE_SLACK_MS` (70) for ≥2 consecutive windows, treat it as over-rate. Kill switch
+`relay_age_feedback` (default ON), constrained-only — direct already has the measured
+ceiling + byte gate (and FR-14 will own its episodic holes).
+
+**As implemented (#796), the over-rate response reuses machinery rather than adding a
+third rate rule**: the window folds `age_over` into the viewer-rate controller's
+`struggling` input (an instant fps-cap cut with no encoder re-open) *and* feeds the
+AIMD one congestion sample, so the multiplicative decrease reaches the encoder through
+the pump's NORMAL apply arms one frame later — including the FR-10 deferral that keeps
+a re-open lump out of the middle of a drag. Recovery is then the AIMD's existing AI
+climb plus the viewer-rate controller's slow-start, unchanged.
+
+⚠️ The window tick deliberately does **not** call `take_pending()`: consuming the move
+there would mark it applied while the encoder was never told, and the target would
+silently diverge from the stream. The AIMD holds the decrease; the pump takes it.
 
 **C. Heartbeat exposure.** `viewer_age_ms` + `viewer_age_floor_ms` in the pump
 heartbeat, so field verification reads the loop server-side (`agent_logs`), not just
@@ -71,3 +79,4 @@ long-term answer to residual IDR cost on thin pipes, but a separate arc.
 | date | build | result |
 |---|---|---|
 | 2026-08-27 | 0.4.7 | Baseline: the two readings above; FR filed. |
+| 2026-08-27 | 0.4.8 (#796) | Implemented. Field gate pending: read `viewer_age_ms` / `viewer_age_floor_ms` in the pump heartbeats, and expect `target_bps` to step DOWN while the viewer's age is spiking — that pairing IS the loop working. Agent half needs 0.4.8 on the TARGET (CORPLAP-3), viewer half needs the web deploy. |
