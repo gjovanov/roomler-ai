@@ -182,6 +182,10 @@
         <span class="stats-pill">{{ statsBitrateLabel }}</span>
         <span class="stats-pill">{{ statsFpsLabel }}</span>
         <span v-if="statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
+        <!-- FR-1 P7 — end-to-end frame age (agent framing → canvas paint),
+             the RustDesk-"Delay" analogue. Appears once the rc:clock probe
+             locks; absent on old agents and the classic video-tag path. -->
+        <span v-if="statsAgeLabel" class="stats-pill">{{ statsAgeLabel }}</span>
         <!-- P1 — per-hop pipeline diagnostics (paint / fwd / decode ms,
              output gap, queue, drops, main-thread long tasks). Opt-in via
              localStorage roomler-rc-diag-hud=1; the numbers that decide
@@ -2453,8 +2457,12 @@ const diagLabel = computed(() => {
   // for field-verifying the FSR sizing policy.
   const r = rc.renderInfo.value
   const render = r ? ` · ${r.mode}@${r.w}x${r.h}` : ''
+  // FR-1 P7 — age avg/max + the probe's own RTT, for splitting "old
+  // frames" into network-vs-pipeline at a glance.
+  const age = d.age ? ` · age ${hop(d.age)}` : ''
+  const rtt = d.probeRttMs !== null ? ` · rtt ${Math.round(d.probeRttMs)}` : ''
   return (
-    `paint ${hop(d.paint)} · fwd ${hop(d.fwd)} · dec ${hop(d.decode)}`
+    `paint ${hop(d.paint)} · fwd ${hop(d.fwd)} · dec ${hop(d.decode)}${age}${rtt}`
     + ` · gap ${d.outGapMaxMs} · q ${d.queue} · drop ${d.droppedTotal}`
     + ` · long ${d.longTasksPerSec}/${d.longTaskMsPerSec}ms · ${d.ctxMode}${render}`
   )
@@ -2911,6 +2919,15 @@ const statsBitrateLabel = computed(() => {
   if (bps <= 0) return '— bps'
   if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
   return `${Math.round(bps / 1_000)} kbps`
+})
+/** FR-1 P7 — end-to-end frame age at paint (avg over the last stats
+ *  window), measured against the agent's clock via the rc:clock probe.
+ *  Covers encode-output → send queue → network → decode → paint; the
+ *  agent-side capture+encode (~10–15 ms) sits before the stamp. */
+const statsAgeLabel = computed(() => {
+  const age = rc.decodeDiag.value?.age
+  if (!age || age.n <= 0) return ''
+  return `~${Math.round(age.avgMs)} ms`
 })
 const statsFpsLabel = computed(() => {
   const fps = rc.hevcActive.value
