@@ -3,6 +3,26 @@
     <div class="d-flex align-center flex-wrap ga-2 mb-2 mb-md-4">
       <h1 class="text-h5 text-md-h4">{{ $t('nav.files') }}</h1>
       <v-spacer />
+      <!-- FR-11: server-side search over filename / display name. -->
+      <v-text-field
+        v-model="gridSearch"
+        density="compact"
+        hide-details
+        clearable
+        prepend-inner-icon="mdi-magnify"
+        placeholder="Search files"
+        style="max-width: 240px"
+        class="flex-grow-0"
+      />
+      <v-btn
+        icon="mdi-table-cog"
+        size="small"
+        variant="text"
+        :color="colsCustomized ? 'primary' : undefined"
+        title="Configure columns"
+        aria-label="Configure columns"
+        @click="colDialogOpen = true"
+      />
       <v-btn-toggle v-model="viewMode" mandatory density="compact">
         <v-btn value="all" size="small">All Files</v-btn>
         <v-btn value="room" size="small" :disabled="!currentRoomId">Room Files</v-btn>
@@ -19,64 +39,75 @@
       />
     </div>
 
-    <div v-if="fileStore.loading" class="text-center pa-4 pa-md-6">
-      <v-progress-circular indeterminate />
-    </div>
+    <v-card>
+      <v-data-table-server
+        v-model:page="gridPage"
+        v-model:items-per-page="gridPerPage"
+        :headers="effectiveHeaders"
+        :items="fileStore.files"
+        :items-length="fileStore.total"
+        :loading="fileStore.loading"
+        :items-per-page-options="[10, 25, 50, 100]"
+        density="compact"
+        class="files-table"
+        item-value="id"
+        @update:options="onGridOptions"
+      >
+        <template #item.filename="{ item }">
+          <v-icon size="small" class="mr-2">{{ fileIcon(item.content_type) }}</v-icon>
+          {{ item.filename }}
+        </template>
+        <template #item.room="{ item }">
+          <router-link
+            v-if="item.room_id"
+            :to="{ name: 'room-chat', params: { tenantId: tenantId, roomId: item.room_id } }"
+            class="text-decoration-none"
+          >
+            {{ item.room_name || item.room_id }}
+          </router-link>
+          <span v-else class="text-medium-emphasis">—</span>
+        </template>
+        <template #item.content_type="{ item }">
+          {{ item.content_type }}
+        </template>
+        <template #item.size="{ item }">
+          {{ formatSize(item.size) }}
+        </template>
+        <template #item.created_at="{ item }">
+          {{ new Date(item.created_at).toLocaleDateString() }}
+        </template>
+        <template #item.actions="{ item }">
+          <div class="text-no-wrap">
+            <v-btn
+              icon="mdi-download"
+              size="small"
+              variant="text"
+              :href="fileStore.downloadUrl(tenantId, item.id)"
+            />
+            <v-btn
+              icon="mdi-delete"
+              size="small"
+              variant="text"
+              color="error"
+              @click="handleDelete(item.id)"
+            />
+          </div>
+        </template>
+        <template #no-data>
+          <div class="text-center pa-4 pa-md-6 text-medium-emphasis">
+            {{ $t('files.noFiles') }}
+          </div>
+        </template>
+      </v-data-table-server>
+    </v-card>
 
-    <div v-else-if="fileStore.files.length === 0" class="text-center pa-4 pa-md-6 pa-lg-8 text-medium-emphasis">
-      {{ $t('files.noFiles') }}
-    </div>
-
-    <div v-else class="files-table-wrap">
-      <v-table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th v-if="viewMode === 'all'">Room</th>
-              <th>Type</th>
-              <th>Size</th>
-              <th>Uploaded</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="f in fileStore.files" :key="f.id">
-              <td>
-                <v-icon size="small" class="mr-2">{{ fileIcon(f.content_type) }}</v-icon>
-                {{ f.filename }}
-              </td>
-              <td v-if="viewMode === 'all'">
-                <router-link
-                  v-if="f.room_id"
-                  :to="{ name: 'room-chat', params: { tenantId: tenantId, roomId: f.room_id } }"
-                  class="text-decoration-none"
-                >
-                  {{ f.room_name || f.room_id }}
-                </router-link>
-                <span v-else class="text-medium-emphasis">--</span>
-              </td>
-              <td>{{ f.content_type }}</td>
-              <td>{{ formatSize(f.size) }}</td>
-              <td>{{ new Date(f.created_at).toLocaleDateString() }}</td>
-              <td>
-                <v-btn
-                  icon="mdi-download"
-                  size="small"
-                  variant="text"
-                  :href="fileStore.downloadUrl(tenantId, f.id)"
-                />
-                <v-btn
-                  icon="mdi-delete"
-                  size="small"
-                  variant="text"
-                  color="error"
-                  @click="handleDelete(f.id)"
-                />
-              </td>
-            </tr>
-          </tbody>
-        </v-table>
-    </div>
+    <GridColumnPickerDialog
+      v-model="colDialogOpen"
+      :entries="colEntries"
+      @toggle="colToggle"
+      @reorder="colReorder"
+      @reset="colReset"
+    />
 
     <!-- Upload progress -->
     <v-snackbar v-model="uploading" timeout="-1">
@@ -87,20 +118,102 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useFileStore } from '@/stores/files'
 import { useRoomStore } from '@/stores/rooms'
+import { useAuthStore } from '@/stores/auth'
+import { useGridColumns } from '@/composables/useGridColumns'
+import GridColumnPickerDialog from '@/components/common/GridColumnPickerDialog.vue'
 
 const route = useRoute()
 const fileStore = useFileStore()
 const roomStore = useRoomStore()
+const auth = useAuthStore()
 
 const tenantId = computed(() => route.params.tenantId as string)
 const currentRoomId = computed(() => roomStore.current?.id || roomStore.rooms[0]?.id || '')
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const uploading = ref(false)
 const viewMode = ref<'all' | 'room'>('all')
+
+// ── grid state (devices-grid kit, FR-11) ───────────────────────────
+
+const gridPage = ref(1)
+const gridPerPage = ref(25)
+const gridSearch = ref('')
+const gridSort = ref<string | undefined>(undefined)
+const gridDir = ref<'asc' | 'desc' | undefined>(undefined)
+
+const fileHeaders = computed(() => {
+  const cols = [
+    // Sortable keys double as the server whitelist (filename | size | created_at).
+    { title: 'Name', key: 'filename', sortable: true },
+    { title: 'Room', key: 'room', sortable: false },
+    { title: 'Type', key: 'content_type', sortable: false },
+    { title: 'Size', key: 'size', sortable: true },
+    { title: 'Uploaded', key: 'created_at', sortable: true },
+    { title: 'Actions', key: 'actions', sortable: false, align: 'end' as const },
+  ]
+  return viewMode.value === 'all' ? cols : cols.filter((c) => c.key !== 'room')
+})
+const colDialogOpen = ref(false)
+const {
+  effectiveHeaders,
+  entries: colEntries,
+  toggle: colToggle,
+  reorder: colReorder,
+  reset: colReset,
+  customized: colsCustomized,
+} = useGridColumns({
+  headers: fileHeaders,
+  gridId: 'files',
+  scope: () => `${auth.user?.id ?? 'anon'}:${tenantId.value}`,
+})
+
+function fetchGrid() {
+  const opts = {
+    page: gridPage.value,
+    perPage: gridPerPage.value,
+    q: gridSearch.value || undefined,
+    sort: gridSort.value,
+    dir: gridDir.value,
+  }
+  if (viewMode.value === 'all') {
+    void fileStore.fetchTenantFiles(tenantId.value, opts)
+  } else if (currentRoomId.value) {
+    void fileStore.fetchFiles(tenantId.value, currentRoomId.value, opts)
+  }
+}
+
+/** v-data-table-server fires this once on mount too — it is the grid's ONLY
+ *  fetch trigger for page/sort changes (a separate onMounted fetch would
+ *  double-load). */
+function onGridOptions(opts: {
+  page: number
+  itemsPerPage: number
+  sortBy: Array<{ key: string; order: 'asc' | 'desc' }>
+}) {
+  gridPage.value = opts.page
+  gridPerPage.value = opts.itemsPerPage
+  gridSort.value = opts.sortBy[0]?.key
+  gridDir.value = opts.sortBy[0]?.order
+  fetchGrid()
+}
+
+let gridSearchTimer: ReturnType<typeof setTimeout> | undefined
+watch(gridSearch, () => {
+  if (gridSearchTimer) clearTimeout(gridSearchTimer)
+  gridSearchTimer = setTimeout(() => {
+    if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+    else fetchGrid()
+  }, 300)
+})
+
+watch(viewMode, () => {
+  if (gridPage.value !== 1) gridPage.value = 1 // options handler fetches
+  else fetchGrid()
+})
 
 function triggerUpload() {
   fileInputRef.value?.click()
@@ -120,10 +233,12 @@ async function handleFileSelect(event: Event) {
   }
   uploading.value = false
   input.value = ''
+  fetchGrid()
 }
 
 async function handleDelete(fileId: string) {
   await fileStore.deleteFile(tenantId.value, fileId)
+  fetchGrid()
 }
 
 function fileIcon(contentType: string): string {
@@ -141,23 +256,21 @@ function formatSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
-
-function loadFiles() {
-  if (viewMode.value === 'all') {
-    fileStore.fetchTenantFiles(tenantId.value)
-  } else {
-    const roomId = currentRoomId.value
-    if (roomId) {
-      fileStore.fetchFiles(tenantId.value, roomId)
-    }
-  }
-}
-
-watch(viewMode, () => {
-  loadFiles()
-})
-
-onMounted(() => {
-  loadFiles()
-})
 </script>
+
+<style scoped>
+/* Never squeeze the columns into the viewport — cells keep their natural
+   width and the WRAPPER scrolls horizontally (house rule: wide tables
+   scroll in their own container). */
+.files-table :deep(.v-table__wrapper) {
+  overflow-x: auto;
+}
+.files-table :deep(table) {
+  width: max-content;
+  min-width: 100%;
+}
+.files-table :deep(th),
+.files-table :deep(td) {
+  white-space: nowrap;
+}
+</style>
