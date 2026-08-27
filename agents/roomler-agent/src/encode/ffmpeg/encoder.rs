@@ -1144,16 +1144,31 @@ impl FfmpegEncoder {
         // already a dep for the libvpx VP9 4:4:4 path; both conversions use
         // the same SIMD primitives (and the same BT.601 matrix, so the P7
         // Rext path renders identically to the libvpx 4:4:4 path).
+        //
+        // P5 (FR-1, 2026-08-27) — big frames convert in ROW BANDS across
+        // scoped threads. dcv's convert_image is single-threaded SIMD; at
+        // 2880×1800 it was a large share of the 20-30 ms "encode" time
+        // that capped the pump at ~40 fps. Bands split on EVEN row starts
+        // (NV12's vertically-subsampled chroma pairs never straddle a cut;
+        // BT.601 is pointwise per 2×2 block), so the banded output is
+        // byte-identical to the full-frame call. Source slices read the
+        // tail from the band start (immutable borrows may overlap);
+        // destination slices are disjoint via split_at_mut. Sub-2 MPix
+        // frames and the `par_convert` hatch keep the single-call path.
         use dcv_color_primitives::{
             ColorSpace, ImageFormat, PixelFormat as DcvPixelFormat, convert_image,
         };
 
-        let plane_pixels = (self.width as usize) * (self.height as usize);
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let stride = frame.stride as usize;
+        let plane_pixels = w * h;
         let src_format = ImageFormat {
             pixel_format: DcvPixelFormat::Bgra,
             color_space: ColorSpace::Rgb,
             num_planes: 1,
         };
+        let bands = Self::convert_bands(plane_pixels);
 
         if self.chroma444 {
             if self.plane_y.len() != plane_pixels {
@@ -1166,26 +1181,66 @@ impl FfmpegEncoder {
                 color_space: ColorSpace::Bt601,
                 num_planes: 3,
             };
-            let mut dst_planes: [&mut [u8]; 3] = {
-                let (y, rest) = (
-                    &mut self.plane_y[..],
-                    (&mut self.plane_u[..], &mut self.plane_v[..]),
-                );
-                [y, rest.0, rest.1]
-            };
-            let w = self.width as usize;
             let dst_strides = [w, w, w];
-            convert_image(
-                self.width,
-                self.height,
-                &src_format,
-                Some(&[frame.stride as usize]),
-                &[&frame.data],
-                &dst_format,
-                Some(&dst_strides),
-                &mut dst_planes,
-            )
-            .map_err(|e| anyhow!("dcv BGRA→I444 convert failed: {:?}", e))?;
+            if bands <= 1 {
+                let mut dst_planes: [&mut [u8]; 3] = {
+                    let (y, rest) = (
+                        &mut self.plane_y[..],
+                        (&mut self.plane_u[..], &mut self.plane_v[..]),
+                    );
+                    [y, rest.0, rest.1]
+                };
+                convert_image(
+                    self.width,
+                    self.height,
+                    &src_format,
+                    Some(&[stride]),
+                    &[&frame.data],
+                    &dst_format,
+                    Some(&dst_strides),
+                    &mut dst_planes,
+                )
+                .map_err(|e| anyhow!("dcv BGRA→I444 convert failed: {:?}", e))?;
+                return Ok(());
+            }
+            let cuts = Self::band_cuts(h, bands);
+            let mut y_rest: &mut [u8] = &mut self.plane_y[..];
+            let mut u_rest: &mut [u8] = &mut self.plane_u[..];
+            let mut v_rest: &mut [u8] = &mut self.plane_v[..];
+            std::thread::scope(|s| -> Result<()> {
+                let mut handles = Vec::with_capacity(cuts.len());
+                for &(r0, bh) in &cuts {
+                    let (y_band, yr) = std::mem::take(&mut y_rest).split_at_mut(bh * w);
+                    let (u_band, ur) = std::mem::take(&mut u_rest).split_at_mut(bh * w);
+                    let (v_band, vr) = std::mem::take(&mut v_rest).split_at_mut(bh * w);
+                    y_rest = yr;
+                    u_rest = ur;
+                    v_rest = vr;
+                    let src = &frame.data[r0 * stride..];
+                    let sf = &src_format;
+                    let df = &dst_format;
+                    let ds = &dst_strides;
+                    handles.push(s.spawn(move || {
+                        let mut dst: [&mut [u8]; 3] = [y_band, u_band, v_band];
+                        convert_image(
+                            w as u32,
+                            bh as u32,
+                            sf,
+                            Some(&[stride]),
+                            &[src],
+                            df,
+                            Some(ds),
+                            &mut dst,
+                        )
+                    }));
+                }
+                for hnd in handles {
+                    hnd.join()
+                        .map_err(|_| anyhow!("convert band thread panicked"))?
+                        .map_err(|e| anyhow!("dcv BGRA→I444 band convert failed: {:?}", e))?;
+                }
+                Ok(())
+            })?;
             return Ok(());
         }
 
@@ -1198,28 +1253,94 @@ impl FfmpegEncoder {
             color_space: ColorSpace::Bt601,
             num_planes: 2,
         };
-
         // Two-plane NV12: Y is width × height; UV is interleaved
         // width × (height / 2) bytes (== plane_pixels / 2 in interleaved form).
-        let mut dst_planes: [&mut [u8]; 2] = {
-            let (y, uv) = (&mut self.plane_y[..], &mut self.plane_u[..]);
-            [y, uv]
-        };
-        let dst_strides = [self.width as usize, self.width as usize];
+        let dst_strides = [w, w];
 
-        convert_image(
-            self.width,
-            self.height,
-            &src_format,
-            Some(&[frame.stride as usize]),
-            &[&frame.data],
-            &dst_format,
-            Some(&dst_strides),
-            &mut dst_planes,
-        )
-        .map_err(|e| anyhow!("dcv BGRA→NV12 convert failed: {:?}", e))?;
+        if bands <= 1 {
+            let mut dst_planes: [&mut [u8]; 2] = {
+                let (y, uv) = (&mut self.plane_y[..], &mut self.plane_u[..]);
+                [y, uv]
+            };
+            convert_image(
+                self.width,
+                self.height,
+                &src_format,
+                Some(&[stride]),
+                &[&frame.data],
+                &dst_format,
+                Some(&dst_strides),
+                &mut dst_planes,
+            )
+            .map_err(|e| anyhow!("dcv BGRA→NV12 convert failed: {:?}", e))?;
+            return Ok(());
+        }
 
+        let cuts = Self::band_cuts(h, bands);
+        let mut y_rest: &mut [u8] = &mut self.plane_y[..];
+        let mut uv_rest: &mut [u8] = &mut self.plane_u[..];
+        std::thread::scope(|s| -> Result<()> {
+            let mut handles = Vec::with_capacity(cuts.len());
+            for &(r0, bh) in &cuts {
+                let (y_band, yr) = std::mem::take(&mut y_rest).split_at_mut(bh * w);
+                let (uv_band, uvr) = std::mem::take(&mut uv_rest).split_at_mut((bh / 2) * w);
+                y_rest = yr;
+                uv_rest = uvr;
+                let src = &frame.data[r0 * stride..];
+                let sf = &src_format;
+                let df = &dst_format;
+                let ds = &dst_strides;
+                handles.push(s.spawn(move || {
+                    let mut dst: [&mut [u8]; 2] = [y_band, uv_band];
+                    convert_image(
+                        w as u32,
+                        bh as u32,
+                        sf,
+                        Some(&[stride]),
+                        &[src],
+                        df,
+                        Some(ds),
+                        &mut dst,
+                    )
+                }));
+            }
+            for hnd in handles {
+                hnd.join()
+                    .map_err(|_| anyhow!("convert band thread panicked"))?
+                    .map_err(|e| anyhow!("dcv BGRA→NV12 band convert failed: {:?}", e))?;
+            }
+            Ok(())
+        })?;
         Ok(())
+    }
+
+    /// P5 — band count for the threaded convert: single-call under 2 MPix
+    /// (thread spawn overhead beats the win there) or when hatched off
+    /// (`ROOMLER_AGENT_PAR_CONVERT=0` / config `par_convert`); else
+    /// min(4, cores).
+    fn convert_bands(plane_pixels: usize) -> usize {
+        if plane_pixels < 2_000_000 || !crate::encode::par_convert_enabled() {
+            return 1;
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 4)
+    }
+
+    /// P5 — split `h` rows into up to `bands` cuts with EVEN row starts and
+    /// even heights except possibly the last (the pump masks dims `& !1`,
+    /// so `h` itself is even and every band height comes out even too).
+    fn band_cuts(h: usize, bands: usize) -> Vec<(usize, usize)> {
+        let rows_per = ((h / bands.max(1)).max(2) + 1) & !1;
+        let mut cuts = Vec::with_capacity(bands);
+        let mut r0 = 0;
+        while r0 < h {
+            let bh = rows_per.min(h - r0);
+            cuts.push((r0, bh));
+            r0 += bh;
+        }
+        cuts
     }
 
     fn build_av_frame(&self, monotonic_us: u64) -> Result<frame::Video> {
@@ -1611,6 +1732,36 @@ mod tests {
         assert!(
             msg.contains("not registered") || msg.contains("encoder names tried"),
             "expected dispatch error, got: {msg}"
+        );
+    }
+
+    /// P5 — the banded convert's row math: every band starts on an EVEN
+    /// row (NV12 chroma pairs must not straddle a cut), heights cover `h`
+    /// exactly, and small/degenerate inputs behave.
+    #[test]
+    fn band_cuts_are_even_and_cover_exactly() {
+        for (h, bands) in [
+            (1800usize, 4usize),
+            (1798, 4),
+            (1200, 3),
+            (16, 4),
+            (1080, 2),
+        ] {
+            let cuts = FfmpegEncoder::band_cuts(h, bands);
+            let mut expect_r0 = 0;
+            for &(r0, bh) in &cuts {
+                assert_eq!(r0, expect_r0, "bands must be contiguous");
+                assert_eq!(r0 % 2, 0, "band start must be even (h={h})");
+                assert!(bh > 0);
+                expect_r0 += bh;
+            }
+            assert_eq!(expect_r0, h, "bands must cover h exactly (h={h})");
+            assert!(cuts.len() <= bands + 1);
+        }
+        // Even 2880×1800 in 4 bands: four equal 450-row cuts.
+        assert_eq!(
+            FfmpegEncoder::band_cuts(1800, 4),
+            vec![(0, 450), (450, 450), (900, 450), (1350, 450)]
         );
     }
 
