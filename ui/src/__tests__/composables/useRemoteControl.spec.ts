@@ -124,6 +124,9 @@ import {
   normalizeCtxMode,
   normalizeIntKnob,
   round1,
+  bestClockSample,
+  clockSample,
+  frameAgeMs,
   DEFAULT_MAX_DECODE_QUEUE,
   DEFAULT_STRUGGLE_QUEUE,
   DEFAULT_STRUGGLE_WINDOWS,
@@ -1887,6 +1890,15 @@ describe('RC_RECONNECT_LADDER_MS', () => {
 })
 
 describe('parseControlInbound', () => {
+  it('parses rc:clock.echo (FR-1 P7) and rejects non-numeric fields', () => {
+    const r = parseControlInbound('{"t":"rc:clock.echo","t0":1500,"agent_us":5000}')
+    expect(r).toEqual({ kind: 'clock_echo', t0: 1500, agentUs: 5000 })
+    // A t0 the agent echoed from a hostile/odd probe must not parse.
+    expect(parseControlInbound('{"t":"rc:clock.echo","t0":"x","agent_us":5}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:clock.echo","t0":null,"agent_us":5}')).toBeNull()
+    expect(parseControlInbound('{"t":"rc:clock.echo","t0":1500}')).toBeNull()
+  })
+
   it('parses a well-formed rc:host_locked locked=true', () => {
     const r = parseControlInbound('{"t":"rc:host_locked","locked":true}')
     expect(r).toEqual({ kind: 'host_locked', locked: true })
@@ -2969,6 +2981,46 @@ describe('storedDecodePref (2026-07-24 decode-stall A/B)', () => {
     expect(storedDecodePref()).toBe('no-preference')
     localStorage.setItem('roomler-rc-decode-pref', 'banana')
     expect(storedDecodePref()).toBe('no-preference')
+  })
+})
+
+describe('FR-1 P7 — clock-sync helpers (rc-hop-stats)', () => {
+  it('clockSample maps the agent clock onto the browser epoch at the probe midpoint', () => {
+    // Probe: sent at 1000µs, echoed back at 1400µs (400µs RTT); the agent
+    // read its clock at 5000µs. Midpoint = 1200 → offset 3800, and
+    // agentNow ≈ epochNow + offset thereafter.
+    const s = clockSample(1000, 1400, 5000)
+    expect(s).toEqual({ offsetUs: 3800, rttMs: 0.4 })
+  })
+
+  it('clockSample rejects garbage (negative RTT, non-finite inputs)', () => {
+    expect(clockSample(2000, 1000, 5000)).toBeNull()
+    expect(clockSample(Number.NaN, 1400, 5000)).toBeNull()
+    expect(clockSample(1000, Number.POSITIVE_INFINITY, 5000)).toBeNull()
+    expect(clockSample(1000, 1400, Number.NaN)).toBeNull()
+  })
+
+  it('bestClockSample picks the minimum-RTT sample (NTP-style)', () => {
+    const a = { offsetUs: 100, rttMs: 5 }
+    const b = { offsetUs: 90, rttMs: 1.2 }
+    const c = { offsetUs: 130, rttMs: 8 }
+    expect(bestClockSample([a, b, c])).toBe(b)
+    expect(bestClockSample([])).toBeNull()
+  })
+
+  it('frameAgeMs reads a wire timestamp as age on the browser clock', () => {
+    // offset 3800 (from the sample above): a frame stamped at agent-µs
+    // 4000 observed at browser epoch-µs 1500 is (1500+3800-4000)/1000 ms old.
+    expect(frameAgeMs(4000, 3800, 1500)).toBeCloseTo(1.3)
+    // Same instant → age 0.
+    expect(frameAgeMs(5300, 3800, 1500)).toBeCloseTo(0)
+  })
+
+  it('round-trip: a sample built from a probe makes the probed instant age≈RTT/2', () => {
+    // The echo left the agent mid-flight: by receive time (t1) it should
+    // read as ~half an RTT old — the asymmetry bound of the method.
+    const s = clockSample(1000, 1400, 5000)!
+    expect(frameAgeMs(5000, s.offsetUs, 1400)).toBeCloseTo(0.2)
   })
 })
 
