@@ -1,7 +1,7 @@
 # FR-13 — Remote-desktop keyboard: unmapped HID usages type garbage (CapsLock → `9`); Ctrl chords don't operate a macOS host
 
 **Issue:** [#789](https://github.com/gjovanov/roomler-ai/issues/789)
-**Status:** investigated (root causes pinned, static); fix planned — agent + viewer halves
+**Status:** implemented — agent half (hid_to_key arms + fallback removed) and viewer half (Ctrl→Cmd translate + toggle) both landed; agent half awaits the next agent release, viewer half the next web deploy; field verification pending
 
 ## Field report (2026-08-26)
 
