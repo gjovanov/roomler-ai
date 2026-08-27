@@ -321,7 +321,7 @@ impl RateGovernor {
         now: Instant,
         target_fps: u32,
         take_report: impl FnOnce() -> u32,
-        take_age: impl FnOnce() -> u32,
+        take_age: impl FnOnce() -> u64,
         constrained: bool,
         fold_followers: impl FnOnce(u32) -> u32,
     ) -> Option<ViewerWindow> {
@@ -345,13 +345,19 @@ impl RateGovernor {
         // relay, FR-10-deferred — rules). Direct transports keep their own
         // machinery; the loop still LEARNS there so the heartbeat can show
         // ages on every transport.
-        let age_ms = viewer_rate::unpack_age(take_age());
+        let report = viewer_rate::unpack_age(take_age());
         let mut age_over = false;
-        if let Some((avg, min)) = age_ms {
-            let triggered = self.age_loop.observe(avg, min);
+        if let Some((avg, min, rtt)) = report {
+            // P2 — half the viewer's own measured round trip is the smallest
+            // age this path can physically produce; the loop uses it both to
+            // reject impossible floor samples and to catch a session that was
+            // congested from its first window.
+            let triggered = self.age_loop.observe(avg, min, rtt / 2);
             age_over = triggered && constrained && self.age_feedback;
         }
-        self.last_viewer_age = age_ms.map(|(avg, _)| (avg, self.age_loop.floor_ms().unwrap_or(0)));
+        let age_ms = report.map(|(avg, min, _)| (avg, min));
+        self.last_viewer_age =
+            report.map(|(avg, _, _)| (avg, self.age_loop.floor_ms().unwrap_or(0)));
         let own_div = self
             .viewer_rate
             .observe(reported_fps, struggling || age_over, target_fps);
@@ -382,6 +388,14 @@ impl RateGovernor {
     /// `agent_logs` instead of the viewer's screen.
     pub fn viewer_age(&self) -> Option<(u16, u16)> {
         self.last_viewer_age
+    }
+
+    /// FR-15 P2 — count of floor samples rejected as below the path's
+    /// physical minimum. A climbing count means the clock probe is being
+    /// skewed by the congestion it rides through; that is a different fault
+    /// from a slow path and the heartbeat must not conflate them.
+    pub fn viewer_age_implausible(&self) -> u32 {
+        self.age_loop.implausible_samples()
     }
 
     /// The decode-pressure frame-skip gate: keep 1 of every
@@ -820,7 +834,7 @@ mod tests {
                     t,
                     30,
                     || viewer_rate::pack_report(30, false),
-                    || viewer_rate::pack_age(avg, min),
+                    || viewer_rate::pack_age(avg, min, 100),
                     true,
                     |o| o,
                 )
@@ -868,7 +882,7 @@ mod tests {
                         t,
                         30,
                         || viewer_rate::pack_report(30, false),
-                        || viewer_rate::pack_age(avg, min),
+                        || viewer_rate::pack_age(avg, min, 100),
                         constrained,
                         |o| o,
                     )

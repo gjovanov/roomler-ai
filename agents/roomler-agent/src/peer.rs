@@ -3812,6 +3812,7 @@ async fn media_pump_vp9_444_dc(
                 // floor. None = pre-FR-15 viewer (the loop stays off).
                 viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
+                viewer_age_implausible = governor.viewer_age_implausible(),
                 "VP9-444 DC pump heartbeat (≈1s window)"
             );
             qp_sum = 0;
@@ -5738,6 +5739,7 @@ async fn media_pump_ffmpeg_dc(
                 // constrained age loop acts on; None = pre-FR-15 viewer.
                 viewer_age_ms = ?governor.viewer_age().map(|(a, _)| a),
                 viewer_age_floor_ms = ?governor.viewer_age().map(|(_, f)| f),
+                viewer_age_implausible = governor.viewer_age_implausible(),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             heartbeat_frames_base = frames_encoded;
@@ -6274,10 +6276,21 @@ fn attach_control_handler(
                     // loop reads "no report" rather than a fabricated 0 ms.
                     let age = val.get("age_ms").and_then(|v| v.as_u64());
                     let age_min = val.get("age_min_ms").and_then(|v| v.as_u64());
+                    // FR-15 P2 — the viewer's own probe round trip. Without it
+                    // the agent has no way to tell a real path floor from a
+                    // clock-biased one, which is exactly how the loop ended up
+                    // learning 1 ms floors on 86-210 ms relays. Absent (an
+                    // older viewer) ⇒ 0 ⇒ the bound is inert and the loop
+                    // behaves as it did in 0.4.9.
+                    let rtt = val
+                        .get("probe_rtt_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     if let (Some(a), Some(m)) = (age, age_min) {
                         viewer_report.store_age(crate::encode::viewer_rate::pack_age(
                             a.min(u16::MAX as u64) as u16,
                             m.min(u16::MAX as u64) as u16,
+                            rtt.min(u16::MAX as u64) as u16,
                         ));
                     }
                 }
