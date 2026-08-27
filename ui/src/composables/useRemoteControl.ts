@@ -1041,6 +1041,7 @@ export function decodeStatWireMessage(
   fps: number,
   struggling: boolean,
   age?: { avgMs: number; minMs: number } | null,
+  probeRttMs?: number | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -1050,10 +1051,18 @@ export function decodeStatWireMessage(
   // pair means "no signal" to the agent's age loop, which is different
   // from (and must not be reported as) a 0 ms age. Both are clamped to
   // the u16 the agent packs them into.
+  const clamp = (v: number) => Math.min(Math.max(Math.round(v), 0), 65535)
   if (age && Number.isFinite(age.avgMs) && Number.isFinite(age.minMs)) {
-    const clamp = (v: number) => Math.min(Math.max(Math.round(v), 0), 65535)
     msg.age_ms = clamp(age.avgMs)
     msg.age_min_ms = clamp(age.minMs)
+    // FR-15 P2 — the probe's own round trip travels WITH the age, because
+    // the agent cannot otherwise tell a real path floor from a clock-biased
+    // one: half of this is the smallest age the path can physically produce.
+    // Sent only alongside an age (it is meaningless on its own) and only
+    // when a probe has actually landed.
+    if (typeof probeRttMs === 'number' && Number.isFinite(probeRttMs) && probeRttMs >= 0) {
+      msg.probe_rtt_ms = clamp(probeRttMs)
+    }
   }
   return msg
 }
@@ -4466,11 +4475,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     fps: number,
     struggling: boolean,
     age?: { avgMs: number; minMs: number } | null,
+    probeRttMs?: number | null,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
-      ch.send(JSON.stringify(decodeStatWireMessage(fps, struggling, age)))
+      ch.send(JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs)))
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
     }
@@ -4503,7 +4513,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // clock probe has locked and frames actually painted (n > 0); the
     // agent treats its absence as "no signal", not as a 0 ms age.
     const age = m.age && m.age.n > 0 ? { avgMs: m.age.avgMs, minMs: m.age.minMs } : null
-    sendDecodeStat(typeof m.fps === 'number' ? m.fps : 0, struggleWindow.observe(bad), age)
+    sendDecodeStat(
+      typeof m.fps === 'number' ? m.fps : 0,
+      struggleWindow.observe(bad),
+      age,
+      clockBest?.rttMs ?? null,
+    )
   }
 
   /** Update the controller's quality preference, persist it, and push
