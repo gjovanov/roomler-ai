@@ -1470,6 +1470,13 @@ impl FfmpegEncoder {
         self.supports_dynamic_bitrate
     }
 
+    /// FR-10 — the maxrate the encoder is CURRENTLY running with, for the
+    /// thrifty relay's "is this deferred move big enough to pay an IDR
+    /// for" ratio (`encode::relay_deferred_apply_allowed`).
+    pub fn current_maxrate_bps(&self) -> u32 {
+        self.maxrate_bps.min(u32::MAX as usize) as u32
+    }
+
     /// P3 — capture the parameters a background maxrate rebuild needs.
     /// Mirrors `set_bitrate`'s coarsen + change gate: `None` = the
     /// target coarsens to the CURRENT rung, nothing to do.

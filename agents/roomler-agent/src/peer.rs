@@ -2844,6 +2844,9 @@ async fn media_pump_vp9_444_dc(
     let mut dc_unopen_drops: u64 = 0;
     let mut frames_skipped_backpressure: u64 = 0;
     let mut scene_change_keyframes: u64 = 0;
+    // FR-10 — settle-IDRs suppressed by relay IDR thrift (heartbeat truth).
+    let relay_idr_thrift = crate::encode::relay_idr_thrift_enabled();
+    let mut settle_kf_suppressed: u64 = 0;
     // rc.190 — one-shot (per value) log marker for the agent-side resolution
     // caps, so the field log explains WHY the stream is smaller than asked.
     let mut res_cap_logged: Option<TargetResolution> = None;
@@ -3174,16 +3177,24 @@ async fn media_pump_vp9_444_dc(
                         // motion burst settles = keyframe, so a viewer that
                         // dropped frames mid-motion resyncs to the settled
                         // state instead of freezing on the old position.
+                        // FR-10 — suppressed on thrifty constrained sessions
+                        // (quality refresh, not correctness; the lump costs
+                        // more than the crispness buys on a thin relay).
                         if let Some(burst) =
                             settle_kf.should_fire_on_settle(std::time::Instant::now())
                         {
-                            keyframe_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-                            crate::session_telemetry::counters(session_id).note_keyframe();
-                            tracing::info!(
-                                %session_id,
-                                burst,
-                                "idle-settle keyframe (motion burst ended)"
-                            );
+                            if constrained_transport && relay_idr_thrift {
+                                settle_kf_suppressed += 1;
+                            } else {
+                                keyframe_requested
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                crate::session_telemetry::counters(session_id).note_keyframe();
+                                tracing::info!(
+                                    %session_id,
+                                    burst,
+                                    "idle-settle keyframe (motion burst ended)"
+                                );
+                            }
                         }
                         f.clone()
                     } else {
@@ -3754,6 +3765,7 @@ async fn media_pump_vp9_444_dc(
                 send_errors, dc_unopen_drops,
                 frames_skipped_backpressure,
                 scene_change_keyframes,
+                settle_kf_suppressed,
                 avg_scale_ms,
                 target_bps = governor.applied_bps(),
                 avg_qp = ?avg_qp,
@@ -4252,6 +4264,12 @@ async fn media_pump_ffmpeg_dc(
     // last paced value logged (changes only — engage / move / release).
     let mut pace_due: Option<std::time::Instant> = None;
     let mut last_paced_logged: Option<Option<u32>> = None;
+    // FR-10 — relay IDR thrift: suppress settle-IDRs and space deferred
+    // applies on constrained sessions (each such IDR was a 1.2-1.5 s lump
+    // on CORPLAP-3's ~2 Mbps relay).
+    let relay_idr_thrift = crate::encode::relay_idr_thrift_enabled();
+    let mut last_deferred_apply_at: Option<std::time::Instant> = None;
+    let mut settle_kf_suppressed: u64 = 0;
 
     // P8c — the rate governor owns the four rate controllers this pump
     // previously threaded by hand (see `encode::governor` module docs):
@@ -4785,15 +4803,26 @@ async fn media_pump_ffmpeg_dc(
                     // lands as a fresh IDR any viewer can decode standalone —
                     // fixing the "window shows the old position after a drag"
                     // freeze without paying an IDR for every caret blink.
+                    //
+                    // FR-10 — SUPPRESSED on thrifty constrained sessions: on a
+                    // reliable ordered DC the settle-IDR is a quality refresh,
+                    // not a correctness need (the request-driven resync path
+                    // stays), and on a ~2 Mbps relay it was a single ~300 KB
+                    // frame ≈ 1.2-1.5 s lump per drag-pause. The gate is
+                    // still consumed so episode accounting stays identical.
                     if let Some(burst) = settle_kf.should_fire_on_settle(std::time::Instant::now())
                     {
-                        keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
-                        tracing::info!(
-                            %session_id,
-                            codec_label,
-                            burst,
-                            "idle-settle keyframe (motion burst ended)"
-                        );
+                        if constrained && relay_idr_thrift {
+                            settle_kf_suppressed += 1;
+                        } else {
+                            keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                            tracing::info!(
+                                %session_id,
+                                codec_label,
+                                burst,
+                                "idle-settle keyframe (motion burst ended)"
+                            );
+                        }
                     }
                     // P7 — idle-refine tick. Eligible = a cap below native is
                     // actually clamping, the controller left resolution at
@@ -5250,19 +5279,34 @@ async fn media_pump_ffmpeg_dc(
         } else if let Some(bps) = deferred_bps
             && last_motion_at.elapsed() >= DEFER_QUIET
         {
-            // Quiet flush: the held QSV/AMF target applies now, while the
-            // scene is static — the rebuild stalls a frozen image nobody
-            // can see, and its first-frame IDR doubles as the post-motion
-            // refresh. Jump the (stale) queue for it.
-            deferred_bps = None;
-            send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            enc.set_bitrate(bps);
-            info!(
-                %session_id,
-                codec_label,
-                target_bps = bps,
-                "FFmpeg DC pump: deferred bitrate applied at quiet"
-            );
+            // FR-10 — relay IDR thrift: each flush is a re-open whose first
+            // frame is an IDR — a single ~300 KB frame ≈ 1.2-1.5 s of a
+            // ~2 Mbps relay (field CORPLAP-3 2026-08-27). Thrifty constrained
+            // sessions space small moves to ≥15 s; a ≥40 % move (genuine
+            // collapse/recovery) still lands promptly. Held targets stay in
+            // `deferred_bps` and re-evaluate every loop.
+            let allow = !(constrained && relay_idr_thrift)
+                || crate::encode::relay_deferred_apply_allowed(
+                    last_deferred_apply_at.map(|t| t.elapsed()),
+                    enc.current_maxrate_bps(),
+                    bps,
+                );
+            if allow {
+                // Quiet flush: the held QSV/AMF target applies now, while the
+                // scene is static — the rebuild stalls a frozen image nobody
+                // can see, and its first-frame IDR doubles as the post-motion
+                // refresh. Jump the (stale) queue for it.
+                deferred_bps = None;
+                last_deferred_apply_at = Some(std::time::Instant::now());
+                send_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                enc.set_bitrate(bps);
+                info!(
+                    %session_id,
+                    codec_label,
+                    target_bps = bps,
+                    "FFmpeg DC pump: deferred bitrate applied at quiet"
+                );
+            }
         }
 
         let encode_start = std::time::Instant::now();
@@ -5621,7 +5665,7 @@ async fn media_pump_ffmpeg_dc(
                 encoder = enc.name(),
                 frames_captured, frames_encoded, frames_sent, bytes_written,
                 send_errors, dc_unopen_drops, frames_dropped_backpressure,
-                frames_skipped_backpressure, frames_empty,
+                frames_skipped_backpressure, frames_empty, settle_kf_suppressed,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 send_wait_avg_ms, send_wait_max_ms,
                 paced_fps = ?governor.paced_fps(),
