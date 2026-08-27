@@ -23,9 +23,23 @@ and the last two happened *after* a scan-and-re-verify rule was already in force
 | `FR-3` (#773, 10:04:58) vs `FR-3` (#774, 10:05:05) | → FR-6 / FR-5 |
 | `FR-5` — three sessions within minutes | → FR-4 / FR-5 / FR-6 |
 | `FR-7` (#778, 10:07:14) vs `FR-7` (#780, 10:09:41) | #780 → FR-8 |
+| `FR-10` (#783) vs `FR-10` (#784) | #784 → FR-11 — **neither claimed a ledger row** |
 
-The tie-break when one slips through anyway: **the younger claim renumbers** (ambiguous ⇒
-the closed/retrospective one). That is repair, though — not allocation.
+The tie-break when one slips through anyway, matching `CLAUDE.md`: **the LOWER issue number
+keeps `FR-N`; the HIGHER renumbers to the next free N** — title, spec filename, this row and
+in-body references together. That is repair, though — not allocation.
+
+⚠️ Not "the younger claim renumbers (ambiguous ⇒ the closed/retrospective one)", which this
+file said until `3af6761d` corrected `CLAUDE.md`. It reads decidable and is not: both
+sessions in the `FR-3` collision applied it and renumbered **past each other**, landing on
+`FR-5` together and needing a third commit to settle. Creation times seconds apart are not
+an ordering; issue ids are server-assigned and monotonic, so two sessions that never talk
+compute the same winner.
+
+⚠️ **The registry only arbitrates if the row is in the same commit as the spec.** `FR-10`
+proves it: `2366859d` added `FR-10-relay-drag-quality.md` with **no row here**, so the table
+still ended at `FR-9` and #784 claimed `FR-10` as free. A spec that skips the ledger reopens
+exactly the race the ledger exists to close.
 
 Editing **one** file makes git the arbiter instead: the second push is rejected as
 non-fast-forward, and the rebase shows the number is already taken *before* anything is
@@ -51,4 +65,6 @@ instead: a reader who meets `FR-4` in an old commit message must land on the rig
 | [FR-7](FR-7-signed-releases.md) | [#778](https://github.com/gjovanov/roomler-ai/issues/778) | Signed releases — Windows Authenticode, Linux GPG + provenance, macOS identity | in progress — retrospective; all criteria field-verified except Apple Developer ID (enrolment 5XS5WN8R99 under review); closes on `spctl … Notarized Developer ID` |
 | [FR-8](FR-8-claude-session-restore.md) | [#780](https://github.com/gjovanov/roomler-ai/issues/780) | Claude session restore after reboot (`crestore`) | closed — shipped (retrospective); renumbered from FR-7, which #778 claimed 147 s earlier |
 | FR-9 | [#768](https://github.com/gjovanov/roomler-ai/issues/768) | Two nodes sharing a LAN converge to a direct carrier | acceptance criteria met; renumbered from `FR-01`; **spec lands with PR #769** |
+| [FR-10](FR-10-relay-drag-quality.md) | [#783](https://github.com/gjovanov/roomler-ai/issues/783) | Relay drag quality — IDR thrift on constrained transports | in progress — spec landed `2366859d` **without this row**; impl PR #785 |
+| FR-11 | [#784](https://github.com/gjovanov/roomler-ai/issues/784) | Server-side grids — members/files/invites, devices online-first, mesh display names | ⚠️ **issue still titled `FR-10`** — renumber per the tie-break above; spec not yet on master |
 
