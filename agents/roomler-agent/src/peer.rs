@@ -3472,7 +3472,7 @@ async fn media_pump_vp9_444_dc(
             // ceiling + byte gate), learned always so the heartbeat can
             // report it on every transport.
             || viewer_report.take_age(),
-            constrained,
+            constrained_transport,
             |own_div| pipeline.step_viewer_windows(own_div, target_fps),
         ) && (vw.changed || vw.struggling || vw.age_over)
         {
