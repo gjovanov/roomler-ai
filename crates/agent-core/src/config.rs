@@ -458,7 +458,7 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_ANSWER_WHILE_FOLLOWED`). The demote-follow
     /// hold-down otherwise makes this node stop ANSWERING for up to 15 min, so
     /// two followed ends go mutually deaf and a perfectly good LAN pair sits on
-    /// relay. Built-in default: off, pending a two-host soak.
+    /// relay. Built-in default: ON since 0.4.2 — set `false` as the kill switch.
     #[serde(default)]
     pub overlay_answer_while_followed: Option<bool>,
     /// Stable Wintun adapter identity — constant requested GUID + boot
