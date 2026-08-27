@@ -123,6 +123,15 @@ const routes: RouteRecordRaw[] = [
             component: () => import('@/views/invite/InviteManageView.vue'),
           },
           {
+            // FR-12 — the welcome tour. Every member can reach it forever
+            // (app-bar `?` / user menu); a fresh org auto-opens it once.
+            // The chapter lives in the URL hash, so `#devices` deep-links
+            // from the devices empty state and back/forward work.
+            path: 'tutorial',
+            name: 'tutorial',
+            component: () => import('@/views/tutorial/TutorialView.vue'),
+          },
+          {
             // Stats PR-4 — org analytics (machines/calls/tunnels over
             // time). The component fail-closes on membership permissions
             // before firing any query.
