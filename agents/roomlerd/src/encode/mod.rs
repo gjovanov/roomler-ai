@@ -192,7 +192,7 @@ pub const MIN_BITRATE_BPS: u32 = 1_500_000;
 /// disabling the multiplicative decrease entirely (the rc.171
 /// starvation class). The AIMD additionally caps the floor at its live
 /// ceiling, so a mid-session flip to relay can never invert the two.
-/// Hatch: `ROOMLER_AGENT_AREA_MIN_BITRATE=0` / config
+/// Hatch: `ROOMLERD_AREA_MIN_BITRATE=0` / config
 /// `area_min_bitrate` restores the flat 1.5 M floor.
 #[cfg_attr(
     not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
@@ -220,7 +220,7 @@ fn area_min_bitrate_enabled() -> bool {
 /// tops out just under the pipe instead of rediscovering it by
 /// congesting the send queue on every drag burst. See
 /// `encode::goodput` for the sampling rules. Hatch:
-/// `ROOMLER_AGENT_MEASURED_CEILING=0` / config `measured_ceiling`.
+/// `ROOMLERD_MEASURED_CEILING=0` / config `measured_ceiling`.
 #[cfg_attr(
     not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
     allow(dead_code)
@@ -236,7 +236,7 @@ pub fn measured_ceiling_enabled() -> bool {
 /// stall, no dead air, and rate DROPS finally land DURING motion as
 /// smaller frames instead of production skips. `0` restores the rc.445
 /// motion-defer (applies held until 1.2 s of quiet, then a blocking
-/// re-open). Hatch: `ROOMLER_AGENT_BG_REBUILD=0` / config `bg_rebuild`.
+/// re-open). Hatch: `ROOMLERD_BG_REBUILD=0` / config `bg_rebuild`.
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub fn bg_rebuild_enabled() -> bool {
     tunnel_core::env::node_env("BG_REBUILD").as_deref() != Some("0")
@@ -246,7 +246,7 @@ pub fn bg_rebuild_enabled() -> bool {
 /// frames run the BGRA→NV12/I444 conversion in row bands across scoped
 /// threads (byte-identical output; ~25→~15 ms of "encode" time at
 /// 2880×1800). `0` restores the single-threaded dcv call. Hatch:
-/// `ROOMLER_AGENT_PAR_CONVERT=0` / config `par_convert`.
+/// `ROOMLERD_PAR_CONVERT=0` / config `par_convert`.
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub fn par_convert_enabled() -> bool {
     tunnel_core::env::node_env("PAR_CONVERT").as_deref() != Some("0")
@@ -259,7 +259,7 @@ pub fn par_convert_enabled() -> bool {
 /// (see [`relay_deferred_apply_allowed`]). Field (CORPLAP-3, 2026-08-27): each
 /// such IDR was a single ~300 KB frame ≈ 1.2–1.5 s of a ~2 Mbps relay —
 /// the "bulky" lumps. `0` restores the previous relay behaviour. Hatch:
-/// `ROOMLER_AGENT_RELAY_IDR_THRIFT=0` / config `relay_idr_thrift`.
+/// `ROOMLERD_RELAY_IDR_THRIFT=0` / config `relay_idr_thrift`.
 #[cfg_attr(
     not(any(feature = "ffmpeg-encoder", feature = "vp9-444")),
     allow(dead_code)
@@ -270,7 +270,7 @@ pub fn relay_idr_thrift_enabled() -> bool {
 
 /// FR-15 — whether the constrained-transport age loop (viewer paint-age →
 /// fps cap + multiplicative decrease) is active. Default ON; kill switch
-/// `relay_age_feedback=false` / `ROOMLER_AGENT_RELAY_AGE_FEEDBACK=0`
+/// `relay_age_feedback=false` / `ROOMLERD_RELAY_AGE_FEEDBACK=0`
 /// reverts relay rate control to the open-loop 0.4.7 posture.
 pub fn relay_age_feedback_enabled() -> bool {
     tunnel_core::env::node_env("RELAY_AGE_FEEDBACK").as_deref() != Some("0")
@@ -416,7 +416,7 @@ pub(crate) fn initial_bitrate_for_fps(width: u32, height: u32, fps: u32) -> u32 
 
 /// True when the ICE transport is forced to a TURN relay — on TCP (WSL,
 /// corp-UDP-blocked nets) that path is bandwidth- + head-of-line-constrained.
-/// Set by virtual-desktop mode and the corp path via ROOMLER_AGENT_ICE_RELAY_TCP.
+/// Set by virtual-desktop mode and the corp path via ROOMLERD_ICE_RELAY_TCP.
 ///
 /// Only the VP9-444 DC pump (`vp9-444`) and the FFmpeg DC pump
 /// (`ffmpeg-encoder`) consume this; the default-feature build has neither, so
@@ -433,7 +433,7 @@ pub(crate) fn transport_is_constrained() -> bool {
 }
 
 /// Bitrate ceiling (bps) for a constrained relay-TCP transport. Default 3 Mbps;
-/// override with ROOMLER_AGENT_RELAY_MAX_KBPS. A single TURN-TCP relay carries
+/// override with ROOMLERD_RELAY_MAX_KBPS. A single TURN-TCP relay carries
 /// ~1-4 Mbps; the VP9-444 0.20-bpp ~12 Mbps target collapses it (27s freeze).
 ///
 /// See `transport_is_constrained` for why the `dead_code` allow is keyed on the
@@ -455,15 +455,14 @@ pub(crate) fn relay_max_bps() -> u32 {
 /// stream at 3 Mbps starves into the blur↔crystallize AIMD sawtooth (field
 /// DEVBOX→WINHOST-A 2026-07-16) — fewer pixels per bit is the actual fix, so the
 /// DC pumps also cap the encode resolution. Default 1280 long edge (≈1280×800
-/// at 3 Mbps is smooth); env `ROOMLER_AGENT_RELAY_MAX_EDGE`, `0` disables.
+/// at 3 Mbps is smooth); env `ROOMLERD_RELAY_MAX_EDGE`, `0` disables.
 /// Hard cap: clamps even an explicit controller pick (it's link physics).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
 pub(crate) fn relay_res_cap_long_edge() -> Option<u32> {
-    let v = std::env::var("ROOMLER_AGENT_RELAY_MAX_EDGE")
-        .ok()
+    let v = tunnel_core::env::node_env("RELAY_MAX_EDGE")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(1280);
     (v > 0).then_some(v)
@@ -495,14 +494,13 @@ pub(crate) fn relay_addr_is_fast_local(addr: &str) -> bool {
 /// rc.190 (B2) — long-edge RESOLUTION cap for the SOFTWARE-encoded DC pump
 /// (libvpx). Mirrors the RTP pump's SW auto-downscale: a 4K panel through
 /// libvpx crawls (~25 fps at cpu-used 6, host CPU pinned — field WINHOST-H
-/// 2026-07-16). Default 1920 long edge; env `ROOMLER_AGENT_SW_MAX_EDGE`,
+/// 2026-07-16). Default 1920 long edge; env `ROOMLERD_SW_MAX_EDGE`,
 /// `0` disables. Soft cap: fills in only when the controller left resolution
 /// at Native — an explicit rc:resolution pick wins ("operator can override",
 /// same contract as the RTP pump's auto-downscale).
 #[cfg_attr(not(feature = "vp9-444"), allow(dead_code))]
 pub(crate) fn sw_res_cap_long_edge() -> Option<u32> {
-    let v = std::env::var("ROOMLER_AGENT_SW_MAX_EDGE")
-        .ok()
+    let v = tunnel_core::env::node_env("SW_MAX_EDGE")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(1920);
     (v > 0).then_some(v)
@@ -511,15 +509,14 @@ pub(crate) fn sw_res_cap_long_edge() -> Option<u32> {
 /// rc.199 — the "Smoother" priority resolution cap (long-edge px). Chosen
 /// BELOW the relay hard cap (1280) so that even a direct-but-weak path sheds
 /// pixels in exchange for frame-rate + latency when the operator explicitly
-/// picks Smoother. Default 1024 long edge; env `ROOMLER_AGENT_SMOOTH_MAX_EDGE`,
+/// picks Smoother. Default 1024 long edge; env `ROOMLERD_SMOOTH_MAX_EDGE`,
 /// `0` disables (falls back to native, subject to any independent SW soft cap).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
 pub(crate) fn smooth_res_cap_long_edge() -> Option<u32> {
-    let v = std::env::var("ROOMLER_AGENT_SMOOTH_MAX_EDGE")
-        .ok()
+    let v = tunnel_core::env::node_env("SMOOTH_MAX_EDGE")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(1024);
     (v > 0).then_some(v)
@@ -584,7 +581,7 @@ pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32>
     // on every host — i.e. never flipping beats the rung's steady-state
     // benefit. The rung's bit-shedding job moved to the continuous,
     // rebuild-free dial CEILING factor (`dial_rate_factor_pct` — the HRD
-    // raises QP during motion by itself). `ROOMLER_AGENT_PRIORITY_RES_CAP=1`
+    // raises QP during motion by itself). `ROOMLERD_PRIORITY_RES_CAP=1`
     // / config `priority_res_cap` restores the rc.443 caps for A/B.
     if !matches!(
         node_env("PRIORITY_RES_CAP").as_deref().map(str::trim),
@@ -616,7 +613,7 @@ pub(crate) fn priority_relay_cap(priority: u8, constrained: bool) -> Option<u32>
 /// and an untouched at-rest polish (a settled desktop never reaches the
 /// ceiling, so CQ-quality stills are unaffected). Smoother trades the
 /// most bits for fluidity; Sharper none. Env overrides
-/// `ROOMLER_AGENT_SMOOTHER_RATE_PCT` / `ROOMLER_AGENT_BALANCED_RATE_PCT`
+/// `ROOMLERD_SMOOTHER_RATE_PCT` / `ROOMLERD_BALANCED_RATE_PCT`
 /// (clamped [30, 100]).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
@@ -647,7 +644,7 @@ pub(crate) fn dial_rate_factor_pct(priority: u8) -> usize {
 /// opt-in at v1, default ON since P7c: a full field day on the winhost-b
 /// relay (2026-08-20) showed clean refine cycles at exactly this IDR
 /// cost, and the un-refined Balanced rung was the user-visible "still
-/// blurred" report. `ROOMLER_AGENT_IDLE_REFINE_BALANCED=0` restores the
+/// blurred" report. `ROOMLERD_IDLE_REFINE_BALANCED=0` restores the
 /// old behaviour. Sharper has no cap to lift. The vp9-444 SW pump is
 /// excluded entirely (refined-native keepalives would cost ~16 fps of
 /// native libvpx SW encode while "idle" — a real CPU tax with none of
@@ -670,7 +667,7 @@ pub(crate) fn idle_refine_applies(priority: u8, constrained: bool) -> bool {
 /// P7 — long-edge cap for the REFINED rung. Default 0 = full native (rc.191
 /// field data: even a 0.85× resample mushes ClearType, so a half-rung pays
 /// the same rebuild + IDR without delivering 1:1 crispness). Safety valve
-/// `ROOMLER_AGENT_IDLE_REFINE_MAX_EDGE` (e.g. 1600) bounds the refined IDR
+/// `ROOMLERD_IDLE_REFINE_MAX_EDGE` (e.g. 1600) bounds the refined IDR
 /// size if the field disagrees.
 #[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
 pub(crate) fn idle_refine_cap_long_edge() -> Option<u32> {
@@ -839,7 +836,7 @@ impl std::str::FromStr for EncoderPreference {
 /// inside the cascade is still the default-adapter SW MFT, so any
 /// box with a working CLSID_MSH264EncoderMFT produces output.
 ///
-/// Escape hatch: setting `ROOMLER_AGENT_HW_AUTO=0` reverts Auto to
+/// Escape hatch: setting `ROOMLERD_HW_AUTO=0` reverts Auto to
 /// openh264-first (for diagnosing regressions in the field without
 /// a rebuild). `--encoder software` and `encoder_preference=software`
 /// still force openh264 unconditionally.
@@ -895,9 +892,7 @@ pub fn open_default(
             // Windows builds that didn't opt into MF.
         }
     } else if preference == EncoderPreference::Auto {
-        tracing::info!(
-            "ROOMLER_AGENT_HW_AUTO=0 — skipping MF-HW on Auto, going straight to openh264"
-        );
+        tracing::info!("ROOMLERD_HW_AUTO=0 — skipping MF-HW on Auto, going straight to openh264");
     }
 
     #[cfg(feature = "openh264-encoder")]
@@ -994,7 +989,7 @@ fn open_for_codec_av1(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'stat
 
 /// HEVC opener — same fail-closed semantics as `open_for_codec_av1`.
 ///
-/// rc.72: when `ROOMLER_AGENT_USE_FFMPEG=1` is set AND the
+/// rc.72: when `ROOMLERD_USE_FFMPEG=1` is set AND the
 /// `ffmpeg-encoder` feature is compiled in, try the FFmpeg backend first
 /// (`hevc_nvenc` → `hevc_qsv` → `hevc_amf`). Falls through to MF on
 /// FFmpeg construction failure so a misconfigured opt-in doesn't break
@@ -1016,7 +1011,7 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
                 Err(err) => {
                     tracing::warn!(
                         %err,
-                        "ROOMLER_AGENT_USE_FFMPEG=1 but ffmpeg HEVC construction failed; falling back to MF cascade"
+                        "ROOMLERD_USE_FFMPEG=1 but ffmpeg HEVC construction failed; falling back to MF cascade"
                     );
                 }
             }
@@ -1048,7 +1043,7 @@ fn open_for_codec_hevc(width: u32, height: u32) -> (Box<dyn VideoEncoder>, &'sta
     }
 }
 
-/// Check the `ROOMLER_AGENT_HW_AUTO` escape hatch. Any value equal to
+/// Check the `ROOMLERD_HW_AUTO` escape hatch. Any value equal to
 /// `"0"`, `"false"`, `"no"`, or `"off"` (case-insensitive) disables the
 /// MF-HW-first branch of the Auto cascade. Unset or any other value
 /// leaves the default (MF-HW first) in place.
@@ -1230,7 +1225,7 @@ mod tests {
         // concurrent reads from other threads can race. Our test suite
         // is single-threaded in practice (cargo test default is
         // parallel but this module has one test) and no other code in
-        // this crate touches ROOMLER_AGENT_HW_AUTO at test time.
+        // this crate touches ROOMLERD_HW_AUTO at test time.
         unsafe { std::env::remove_var("ROOMLER_AGENT_HW_AUTO") };
         assert!(!hw_auto_disabled(), "unset defaults to MF-first");
         for truthy in ["0", "false", "FALSE", "No", "off"] {
@@ -1350,7 +1345,7 @@ mod tests {
         }
     }
 
-    // rc.191 — BOTH tests below read/write ROOMLER_AGENT_RELAY_MAX_KBPS;
+    // rc.191 — BOTH tests below read/write ROOMLERD_RELAY_MAX_KBPS;
     // cargo's parallel runner interleaved them once the peer::tests grew
     // (field flake 2026-07-16: the clamp test observed the reader test's
     // mid-flight "4200" write). Serialise them on one lock — module-scoped
@@ -1362,7 +1357,7 @@ mod tests {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Hermetic: save the prior value, exercise set/unset, then restore.
         // SAFETY: same reasoning as `hw_auto_disabled_reads_env` — no other
-        // code in this crate touches ROOMLER_AGENT_RELAY_MAX_KBPS at test
+        // code in this crate touches ROOMLERD_RELAY_MAX_KBPS at test
         // time, and the tests that do share RELAY_ENV_LOCK.
         let prior = std::env::var("ROOMLER_AGENT_RELAY_MAX_KBPS").ok();
 
