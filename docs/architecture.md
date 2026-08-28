@@ -114,7 +114,7 @@ flowchart BT
     setupcore["crates/roomler-setup-core<br/>installer mechanics"]
 
     roomlerd["agents/roomlerd → roomlerd<br/>the daemon"]
-    tunnel["agents/roomler-tunnel → roomler<br/>tunnel CLI (surface lives in its lib)"]
+    tunnel["agents/roomler-cli → roomler<br/>tunnel CLI (surface lives in its lib)"]
     shim["agents/roomler-cli-shim<br/>roomler.exe on daemon hosts → re-execs roomlerd cli"]
     tray["agents/roomler-desktop → roomler-desktop"]
     setup["agents/roomler-setup<br/>install wizard (Tauri)"]
