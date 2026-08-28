@@ -5,9 +5,9 @@ edition.workspace = true
 description = "Roomler desktop — tray-resident control surface: overview, devices, tunnels, settings, onboarding, consent."
 
 [[bin]]
-# P3d Slice B: OUTPUT binary is `roomler-desktop` (the tray/desktop companion).
-# Package name (`roomler-agent-tray`) UNCHANGED. CI renames the release
-# artifact to `roomler-desktop-{VERSION}-{TRIPLE}.exe` accordingly.
+# The tray/desktop companion. P3d Slice B moved the OUTPUT binary to
+# `roomler-desktop`; FR-21 P2a brought the package name into line. CI renames
+# the release artifact to `roomler-desktop-{VERSION}-{TRIPLE}.exe` accordingly.
 name = "roomler-desktop"
 path = "src/main.rs"
 
