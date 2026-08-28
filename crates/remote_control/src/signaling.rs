@@ -519,6 +519,16 @@ pub enum ClientMsg {
         /// matching server-side [`ServerMsg::SessionRequest`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// FR-17 — the controller can parse the framed DataChannel wire
+        /// format (every message prefixed with
+        /// `[frame_seq | chunk_idx | chunk_count]`). Sent only when the
+        /// agent advertised `chunk-framing` in `AgentCaps.video`, so the
+        /// two ends can never disagree about bytes already in flight.
+        /// `None` / unset (older controllers) means the legacy unframed
+        /// format, which is reassemblable only because the channel is
+        /// reliable + ordered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_framing: Option<bool>,
         /// Opt-in system/desktop audio. When `true` the controller wants
         /// the agent to add a WebRTC Opus audio track (the agent must
         /// also advertise `"opus"` in `AgentCaps.audio` and be built with
@@ -1095,6 +1105,12 @@ pub enum ServerMsg {
         /// `ROOMLERD_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// FR-17 — forwarded verbatim from the controller's
+        /// [`ClientMsg::SessionRequest::chunk_framing`]. `Some(true)` means
+        /// the controller can parse the framed wire format; anything else
+        /// keeps the legacy unframed one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_framing: Option<bool>,
         /// Opt-in system/desktop audio, forwarded verbatim from the
         /// controller's [`ClientMsg::SessionRequest::audio_enabled`]. When
         /// `true` the agent adds a WebRTC Opus audio track (if built with
@@ -1977,6 +1993,11 @@ pub struct LocalRelayDescriptor {
 /// back to its local computation, so adding a variant later is
 /// forward-compatible.
 ///
+/// ⚠️ That last sentence is only true because [`NetmapPeer::relay_strategy`]
+/// decodes through [`relay_strategy_lenient`]. The derive alone does **not**
+/// deliver it — see that function for what happens without it. Any *new*
+/// field or message carrying this type must use the same shim.
+///
 /// Anchor/dialer symmetry is the whole reason this is server-computed: the
 /// server holds BOTH ends' pubkeys, so it stamps exactly one end
 /// `SingleRelayAnchor` and the other `SingleRelayDialer` — the client's own
@@ -1993,6 +2014,44 @@ pub enum RelayStrategyWire {
     Derp,
     /// Two coturn allocations (the fall-through).
     BothAllocate,
+}
+
+/// Lenient decoder for [`NetmapPeer::relay_strategy`]: an **unrecognised**
+/// tag becomes `None` instead of failing the parse.
+///
+/// ⚠️ Without this, [`RelayStrategyWire`]'s own doc comment is a lie with
+/// fleet-wide consequences, and the failure is invisible. The enum is
+/// externally tagged with only unit variants, so it decodes from a bare
+/// string; `#[serde(default)]` on the field covers an **absent** value and
+/// does nothing for an **unknown** one. An unknown tag is therefore a hard
+/// serde error that fails the *whole enclosing `ServerMsg`* — not just this
+/// field, not just this peer — and the agent's parse arm swallows that at
+/// `debug!`. So the first server to add a variant would make every older
+/// agent drop entire netmap frames and stop installing peers, silently.
+///
+/// `#[serde(other)]` cannot express this: serde permits it only on
+/// internally or adjacently tagged enums, and this one is neither.
+///
+/// Unknown ⇒ `None` ⇒ the client computes the tier locally — precisely what
+/// an absent field already means, so every existing consumer handles it with
+/// no new arm. A non-string value degrades the same way rather than
+/// exploding, so a future variant that grows a payload is survivable too.
+fn relay_strategy_lenient<'de, D>(de: D) -> Result<Option<RelayStrategyWire>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::String(tag) = raw else {
+        return Ok(None);
+    };
+    // Re-parse through the derive so the kebab-case spellings live in exactly
+    // one place; a rename cannot drift away from this shim.
+    Ok(RelayStrategyWire::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(tag.as_str()),
+    )
+    .ok())
 }
 
 /// One peer in a netmap. `node_id` is the peer's `overlay_nodes._id`
@@ -2113,7 +2172,15 @@ pub struct NetmapPeer {
     /// `supports_server_relay_strategy`; `None` otherwise (and for every
     /// pre-U2 server), in which case the client computes the tier locally as
     /// before. Skipped-when-None so a pre-U2 node's wire shape is unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// ⚠️ Decodes through [`relay_strategy_lenient`], NOT the bare derive:
+    /// an unknown tag from a newer server must degrade to `None`, not fail
+    /// the whole `ServerMsg`. Do not "simplify" this back to `#[serde(default)]`.
+    #[serde(
+        default,
+        deserialize_with = "relay_strategy_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub relay_strategy: Option<RelayStrategyWire>,
     /// Data-probe — this peer's overlay engine answers the overlay-native
     /// echo probe inline. The prober uses the engine echo toward such peers
@@ -2551,6 +2618,7 @@ mod tests {
             browser_caps: vec!["h264".into(), "h265".into()],
             preferred_transport: None,
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: false,
             override_reason: None,
             local_relay: None,
@@ -2573,6 +2641,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: Some("data-channel-vp9-444".into()),
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: true,
             override_reason: None,
             local_relay: None,
@@ -2593,6 +2662,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: None,
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: false,
             override_reason: None,
             local_relay: Some(LocalRelayDescriptor {
@@ -4290,6 +4360,93 @@ mod tests {
         }"#;
         let p: NetmapPeer = serde_json::from_str(json).unwrap();
         assert!(p.agent_id.is_none());
+    }
+
+    /// The regression this shim exists for, at the level where it actually
+    /// bites: a NEWER server stamps a `relay_strategy` tag this build has
+    /// never heard of, and an OLDER agent must still parse the **whole
+    /// netmap** and install its peers.
+    ///
+    /// Without `relay_strategy_lenient` the unknown tag is a hard serde error
+    /// on the enclosing `ServerMsg` — the frame is lost, not the field — and
+    /// the agent's parse arm swallows it at `debug!`. That is a fleet-wide,
+    /// silent peer-install outage triggered by a server-side deploy, which is
+    /// why this asserts the surviving peer's other fields too: "it parsed" is
+    /// the claim, not merely "the enum was None".
+    #[test]
+    fn unknown_relay_strategy_tag_keeps_the_whole_netmap_parseable() {
+        let json = r#"{
+            "t":"rc:overlay.netmap",
+            "self_ip":"100.64.0.2",
+            "network":{"cidr":"100.64.0.0/10","mtu":1280},
+            "epoch":7,
+            "peers":[{
+                "node_id":"507f1f77bcf86cd799439011",
+                "overlay_ip":"100.64.0.4",
+                "name":"devbox",
+                "wg_public_key":"cGVlcg==",
+                "reachable":true,
+                "relay_strategy":"org-relay"
+            }]
+        }"#;
+        let msg: ServerMsg =
+            serde_json::from_str(json).expect("unknown tag must not fail the frame");
+        let ServerMsg::OverlayNetmap { peers, epoch, .. } = msg else {
+            panic!("expected an OverlayNetmap");
+        };
+        assert_eq!(epoch, 7);
+        assert_eq!(peers.len(), 1, "the peer must survive, not be dropped");
+        assert_eq!(peers[0].name, "devbox");
+        assert_eq!(peers[0].overlay_ip, "100.64.0.4");
+        assert!(
+            peers[0].relay_strategy.is_none(),
+            "unknown ⇒ None ⇒ the client derives the tier locally, exactly as for an absent field"
+        );
+    }
+
+    /// Leniency must not swallow the values that DO exist — a shim that
+    /// mapped everything to `None` would pass the test above while silently
+    /// disabling the server verdict fleet-wide.
+    #[test]
+    fn every_known_relay_strategy_tag_still_decodes() {
+        for (tag, want) in [
+            ("single-relay-anchor", RelayStrategyWire::SingleRelayAnchor),
+            ("single-relay-dialer", RelayStrategyWire::SingleRelayDialer),
+            ("derp", RelayStrategyWire::Derp),
+            ("both-allocate", RelayStrategyWire::BothAllocate),
+        ] {
+            let json = format!(
+                r#"{{"node_id":"507f1f77bcf86cd799439011","overlay_ip":"100.64.0.4",
+                     "name":"d","wg_public_key":"cGVlcg==","reachable":true,
+                     "relay_strategy":"{tag}"}}"#
+            );
+            let p: NetmapPeer = serde_json::from_str(&json).unwrap();
+            assert_eq!(p.relay_strategy, Some(want), "tag {tag} must still decode");
+            // …and still serialise back to the same tag.
+            let s = serde_json::to_string(&p).unwrap();
+            assert!(s.contains(&format!(r#""relay_strategy":"{tag}""#)), "{s}");
+        }
+    }
+
+    /// Absent, `null`, and a non-string shape all mean "no verdict". The last
+    /// case matters because a future variant that grows a payload would arrive
+    /// as a map, and an older agent must degrade rather than lose the frame.
+    #[test]
+    fn relay_strategy_absent_null_and_non_string_all_decode_to_none() {
+        let base = r#""node_id":"507f1f77bcf86cd799439011","overlay_ip":"100.64.0.4",
+                      "name":"d","wg_public_key":"cGVlcg==","reachable":true"#;
+        for tail in [
+            String::new(),
+            r#","relay_strategy":null"#.to_string(),
+            r#","relay_strategy":{"org-relay":{"vni":7}}"#.to_string(),
+            r#","relay_strategy":42"#.to_string(),
+        ] {
+            let p: NetmapPeer = serde_json::from_str(&format!("{{{base}{tail}}}")).unwrap();
+            assert!(
+                p.relay_strategy.is_none(),
+                "tail {tail} must decode to None"
+            );
+        }
     }
 
     /// Back-compat both directions for the Phase-A `lan_endpoints` field: a

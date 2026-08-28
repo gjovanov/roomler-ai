@@ -77,6 +77,39 @@ direct path entirely, and every FR-1 mechanism.
 - The 88–105 ms base RTT (DERP/TURN path selection is the overlay's domain).
 - AV1 HRD shrinking (blocked by the rc.443 VDENC error class).
 
+## Follow-up — the spacing guarded only one of two apply paths (field 2026-08-28)
+
+Operator: *"right after the connection it starts very slow (sometimes with a bit
+freezes and blurs), but then it stabilizes"*, and one session froze 3-5 s holding the
+stale window position mid-drag.
+
+The spacing this FR shipped went into the DEFERRED flush arm only. Its sibling — *"the
+scene is quiet, apply now"* — called `set_bitrate` with no gate. **At session start
+nothing has moved yet, so that arm is always the one taken**, and every rung the AIMD
+crossed climbing to the relay ceiling became a blocking QSV re-open plus a fresh IDR.
+Measured on CORPLAP-3, identically at the start of every session:
+
+```
+08:27:31  encoder opened  maxrate=2550000
+08:27:39  encoder opened  maxrate=2000000
+08:27:44  encoder opened  maxrate=3000000
+```
+
+with `target_bps` ramping 2.55M → 2.17M → … → 3.0M over ~26 s and a **2 658 ms** viewer
+age spike at 07:29:02Z. Steady state either side was 46–60 ms — which is why it
+"settles", and why the steady-state field PASS below never caught it.
+
+⚠️ The lesson is structural, not numeric: **the rule was written into one call site
+instead of one function.** It is now `encode::rebuild_apply_allowed(constrained,
+thrift, since_last, current, target)`, which both paths call — a property of the
+ENCODER and the TRANSPORT (this one rebuilds on `set_bitrate`, and the pipe is thin),
+not of the arm we happened to arrive through. A third apply path added later inherits
+the spacing by calling it rather than by remembering. Same class as the FR-18
+`dropped_stale` counter that was incremented and never read.
+
+Shipped in **agent-v0.4.12** (#817). Field gate: at most ONE `ffmpeg encoder opened`
+line in the first 15 s of a relay session, and no multi-second age spike at the open.
+
 ## Field-verification log
 
 | Release | Result |
