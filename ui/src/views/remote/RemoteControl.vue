@@ -21,7 +21,7 @@
         <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0">
           mdi-circle
         </v-icon>
-        <!-- FR-24 — the admin-set display name wins, as it does on /devices
+        <!-- FR-26 — the admin-set display name wins, as it does on /devices
              and the dashboard mesh; the machine name rides the subtitle so
              the mapping stays visible. -->
         <span class="text-truncate">{{ agent?.display_name || agent?.name || 'Agent' }}</span>
@@ -862,7 +862,7 @@
             <v-icon>mdi-close</v-icon>
           </v-btn>
         </v-toolbar>
-        <!-- FR-24 — four tabs instead of one long scroll. The dialog is
+        <!-- FR-26 — four tabs instead of one long scroll. The dialog is
              fullscreen on a phone, where ~8 stacked buttons plus three
              sections meant the Session tools were below two screenfuls. -->
         <v-tabs v-model="settingsTab" density="comfortable" color="primary" grow>
@@ -984,7 +984,7 @@
           </v-tabs-window-item>
 
           <v-tabs-window-item value="metrics">
-          <!-- FR-24 — one checkbox per pill in the toolbar readout. All on
+          <!-- FR-26 — one checkbox per pill in the toolbar readout. All on
                except `paint`: the per-hop numbers answer a question you only
                ask while chasing an fps ceiling. -->
           <div class="d-flex align-center ga-2 mb-1">
@@ -2526,7 +2526,7 @@ const isHevcRender = computed<boolean>(() => rc.hevcActive.value)
 // P1 — per-hop diagnostics pill (opt-in localStorage roomler-rc-diag-hud=1).
 // Read once at mount: flipping the flag is a reload-scoped A/B, matching the
 // other roomler-rc-* diagnosis knobs.
-// FR-24 - per-pill visibility, persisted per user. `paint` inherits the
+// FR-26 - per-pill visibility, persisted per user. `paint` inherits the
 // legacy roomler-rc-diag-hud flag on first read (see storedMetricToggles).
 const settingsTab = ref<'video' | 'display' | 'metrics' | 'session'>('video')
 const metrics = ref(storedMetricToggles())
