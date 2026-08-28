@@ -874,7 +874,15 @@ mod sshd {
             let broker = self.ctx.services.consent.clone();
 
             if let Some(sentinel) = consent
-                && let Err(why) = await_consent(&broker, &handle, channel, &caller, &sentinel).await
+                && let Err(why) = await_consent(
+                    &broker,
+                    &handle,
+                    channel,
+                    &caller,
+                    &sentinel,
+                    "transfer files over SFTP",
+                )
+                .await
             {
                 let _ = handle
                     .extended_data(channel, 1, format!("roomler: {why}\r\n").into_bytes())
@@ -1026,7 +1034,15 @@ mod sshd {
             let broker = self.ctx.services.consent.clone();
 
             if let Some(sentinel) = consent
-                && let Err(why) = await_consent(&broker, &handle, channel, &caller, &sentinel).await
+                && let Err(why) = await_consent(
+                    &broker,
+                    &handle,
+                    channel,
+                    &caller,
+                    &sentinel,
+                    "open an interactive shell",
+                )
+                .await
             {
                 let _ = handle
                     .extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes())
@@ -1609,12 +1625,18 @@ mod sshd {
     /// be asked" is no longer a reachable state — a server that exists was
     /// handed one at construction. (It used to be a process global whose
     /// absence this function had to treat as a denial.)
+    ///
+    /// `what` names the activity being approved ("open an interactive shell",
+    /// "run a command", "transfer files"). FR-27 puts it in front of the person
+    /// deciding, not just in the daemon log: "grant SSH" and "give this account
+    /// a root shell on my machine right now" are not the same question.
     async fn await_consent(
         broker: &crate::consent::ConsentBroker,
         handle: &russh::server::Handle,
         channel: ChannelId,
         caller: &str,
         sentinel: &str,
+        what: &str,
     ) -> Result<(), String> {
         let timeout = crate::consent::DEFAULT_PROMPT_TIMEOUT;
         let _ = handle
@@ -1628,6 +1650,22 @@ mod sshd {
                 .into_bytes(),
             )
             .await;
+
+        // FR-27 — SSH has prompted through this broker since P5d and never
+        // written a marker, so the prompt reached no UI at all: the only way to
+        // answer was to find the sentinel id in the daemon log and run the CLI
+        // inside 30 s. Best-effort — the CLI path is unchanged if this fails.
+        let prompt = crate::consent::PendingPrompt {
+            kind: crate::consent::PromptKind::Ssh,
+            asked_by: caller,
+            permissions: String::new(),
+            detail: what.to_string(),
+            org: String::new(),
+            timeout,
+        };
+        if let Err(e) = broker.write_prompt(sentinel, &prompt) {
+            warn!(%caller, %sentinel, %e, "ssh: could not write the .pending consent marker — no on-screen prompt is possible for this session");
+        }
 
         let decision = broker
             .request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout })
@@ -1681,7 +1719,15 @@ mod sshd {
         // has already told the caller where to dial by then, so a refusal there
         // would surface as a connection that rejects them for no stated reason.
         if let Some(sentinel) = consent
-            && let Err(why) = await_consent(&broker, &handle, channel, &caller, &sentinel).await
+            && let Err(why) = await_consent(
+                &broker,
+                &handle,
+                channel,
+                &caller,
+                &sentinel,
+                "run a command",
+            )
+            .await
         {
             let _ = handle
                 .extended_data(channel, 1, format!("roomler-ssh: {why}\r\n").into_bytes())

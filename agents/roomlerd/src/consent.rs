@@ -104,6 +104,116 @@ impl Mode {
     }
 }
 
+/// FR-27 — resolve the server's directive against this device's own setting,
+/// taking the STRICTER of the two.
+///
+/// The server's directive is a ceiling, not a floor. Before this, the directive
+/// simply won (`directive.unwrap_or(local)`), so a device that had set
+/// `auto_grant_session = false` — "never start a session without asking someone
+/// here" — was silently overridden by a server `Auto`, which is the exact
+/// inversion of the gate-4 property the exec and SSH designs are built on: the
+/// device's own refusal has to survive a server that has been talked into
+/// something. A remote-control session is a strictly more invasive grant than
+/// an `exec`, so it cannot be the one subsystem where the local switch is
+/// advisory.
+///
+/// `None` = an older server that sends no directive; the local mode is then the
+/// whole answer, exactly as before.
+///
+/// `host_window` is how long a downgraded prompt should stand — the window the
+/// SERVER is waiting on, passed in rather than taken from `local` so the two
+/// sides cannot silently disagree. (They happen to coincide today at 30 s, and
+/// a coincidence is not a contract.)
+///
+/// ⚠️ The floor defeats `Auto` and nothing else. `Email`/`Push` do not
+/// auto-grant — they ask the device OWNER — so a device that merely refuses to
+/// auto-grant has no standing to force a second prompt onto the host. Those
+/// modes never reach here as `AutoGrant`; the call site, which knows the mode,
+/// keeps them on their own path.
+pub fn strictest_of(directive: Option<Mode>, local: Mode, host_window: Duration) -> Mode {
+    match (directive, local) {
+        // No directive: the device's own setting is the whole answer.
+        (None, local) => local,
+        // The device refuses to auto-grant. A directive to do so anyway is
+        // downgraded to a prompt over the server's own window.
+        (Some(Mode::AutoGrant), Mode::Prompt { .. }) => Mode::Prompt {
+            timeout: host_window,
+        },
+        // Otherwise the directive is at least as strict as the local setting.
+        (Some(directive), _) => directive,
+    }
+}
+
+/// FR-27 — which subsystem a pending prompt belongs to. The wire values match
+/// [`tunnel_core::localapi::ConsentRequest::kind`].
+///
+/// The three read very differently to whoever is being asked — a screen share,
+/// a single command, an interactive shell — and until FR-27 only the first one
+/// ever reached a UI at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    RemoteControl,
+    Exec,
+    Ssh,
+}
+
+impl PromptKind {
+    pub fn wire(self) -> &'static str {
+        match self {
+            PromptKind::RemoteControl => "rc",
+            PromptKind::Exec => "exec",
+            PromptKind::Ssh => "ssh",
+        }
+    }
+}
+
+/// Everything a prompt surface needs to render one decision.
+///
+/// Built here rather than at each call site so the three subsystems cannot
+/// drift into three subtly different JSON shapes — the marker file is parsed
+/// back as `localapi::ConsentRequest`, and a field spelled differently in one
+/// producer is simply absent for that kind, silently.
+pub struct PendingPrompt<'a> {
+    pub kind: PromptKind,
+    /// Who is asking (a display name, or the caller identity for exec/ssh).
+    pub asked_by: &'a str,
+    /// Pipe-separated permission names; empty for exec/ssh.
+    pub permissions: String,
+    /// The one line that makes the decision answerable — the redacted command,
+    /// the SSH principal. Empty for RC.
+    ///
+    /// ⚠️ Must ALREADY be redacted by the caller. A prompt is rendered by a GUI
+    /// and can be screenshotted; exec payloads routinely carry tokens.
+    pub detail: String,
+    /// Asking organization, for a multi-org device. Empty otherwise.
+    pub org: String,
+    pub timeout: Duration,
+}
+
+impl PendingPrompt<'_> {
+    /// Serialize to the marker body. Deliberately built from the SAME struct
+    /// the reader parses, so adding a field cannot leave one producer behind.
+    pub fn to_body(&self, session_hex: &str) -> String {
+        let expires_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64 + self.timeout.as_millis() as u64)
+            .unwrap_or(0);
+        let req = tunnel_core::localapi::ConsentRequest {
+            session_id: session_hex.to_string(),
+            controller_name: self.asked_by.to_string(),
+            permissions: self.permissions.clone(),
+            timeout_secs: self.timeout.as_secs(),
+            kind: self.kind.wire().to_string(),
+            detail: self.detail.clone(),
+            expires_at_ms,
+            org: self.org.clone(),
+        };
+        // Infallible for this shape; a `{}` body would still parse to a
+        // renderable (if bare) request rather than dropping the prompt.
+        serde_json::to_string(&req).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
 /// Cross-platform consent broker. One instance per agent process.
 /// Cheap to clone — internal state is `Arc<Mutex<...>>`. Thread-safe.
 #[derive(Clone)]
@@ -359,6 +469,12 @@ impl ConsentBroker {
     /// prompt begins. The tray watches for these files; the poll loop removes
     /// this one when the decision resolves. Best-effort — a write failure just
     /// means the tray falls back to its CLI-less state; the CLI path still works.
+    /// FR-27 — the typed form of [`Self::write_pending`]. Every subsystem
+    /// should use this; the raw string form stays for tests.
+    pub fn write_prompt(&self, session_hex: &str, prompt: &PendingPrompt<'_>) -> Result<PathBuf> {
+        self.write_pending(session_hex, &prompt.to_body(session_hex))
+    }
+
     pub fn write_pending(&self, session_hex: &str, body: &str) -> Result<PathBuf> {
         let path = self.pending_path(session_hex);
         std::fs::write(&path, body)
@@ -448,6 +564,69 @@ mod tests {
             Mode::Prompt { timeout } => assert_eq!(timeout, DEFAULT_PROMPT_TIMEOUT),
             other => panic!("expected Prompt, got {other:?}"),
         }
+    }
+
+    /// FR-27 — the local switch is a FLOOR. A device that set
+    /// `auto_grant_session = false` must keep prompting even when the server
+    /// directs `Auto`; before this, the directive simply won, which inverted
+    /// the gate-4 property every other subsystem here relies on.
+    #[test]
+    fn a_local_refusal_to_auto_grant_beats_a_server_auto() {
+        let local = Mode::from_config(false); // auto_grant_session = false
+        let host_window = Duration::from_secs(30);
+        assert_eq!(
+            strictest_of(Some(Mode::AutoGrant), local, host_window),
+            Mode::Prompt {
+                timeout: host_window
+            },
+            "a server Auto must not lift a local refusal"
+        );
+    }
+
+    /// …and the downgraded prompt runs for the window the SERVER is waiting on,
+    /// not the local default. A shorter local one would deny a session the
+    /// server would still have accepted an answer for.
+    #[test]
+    fn the_downgraded_prompt_uses_the_server_window() {
+        let local = Mode::from_config(false);
+        assert_eq!(
+            local,
+            Mode::Prompt {
+                timeout: DEFAULT_PROMPT_TIMEOUT
+            }
+        );
+        let long = Duration::from_secs(300);
+        assert_ne!(long, DEFAULT_PROMPT_TIMEOUT);
+        assert_eq!(
+            strictest_of(Some(Mode::AutoGrant), local, long),
+            Mode::Prompt { timeout: long }
+        );
+    }
+
+    /// The permissive direction is unchanged: a device happy to auto-grant
+    /// still obeys a server that asks for a prompt.
+    #[test]
+    fn a_permissive_device_still_obeys_a_prompt_directive() {
+        let local = Mode::from_config(true); // the default
+        let w = Duration::from_secs(30);
+        let directed = Mode::Prompt { timeout: w };
+        assert_eq!(strictest_of(Some(directed), local, w), directed);
+        assert_eq!(
+            strictest_of(Some(Mode::AutoGrant), local, w),
+            Mode::AutoGrant
+        );
+    }
+
+    /// An older server sends no directive at all — the device's own setting is
+    /// then the whole answer, in both directions.
+    #[test]
+    fn no_directive_falls_back_to_the_local_mode() {
+        let w = Duration::from_secs(30);
+        assert_eq!(strictest_of(None, Mode::AutoGrant, w), Mode::AutoGrant);
+        let p = Mode::Prompt {
+            timeout: Duration::from_secs(7),
+        };
+        assert_eq!(strictest_of(None, p, w), p);
     }
 
     #[test]
