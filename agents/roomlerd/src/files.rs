@@ -2061,10 +2061,18 @@ mod tests {
         {
             // No single staging root off Windows — saying so beats inventing a
             // path that would be wrong in a new way.
-            let err = listing.expect_err("non-Windows hosts have no staging root");
+            //
+            // Matched rather than `expect_err`: that would require
+            // `DirListing: Debug`, which it does not implement. The arm compiles
+            // only on Linux/macOS, so the mistake was invisible locally on
+            // Windows and CI is what caught it.
+            let msg = match listing {
+                Ok(l) => panic!("non-Windows hosts have no staging root, got {}", l.path),
+                Err(e) => e.to_string(),
+            };
             assert!(
-                err.to_string().contains("no single staging root"),
-                "unhelpful error: {err}"
+                msg.contains("no single staging root"),
+                "unhelpful error: {msg}"
             );
         }
     }
