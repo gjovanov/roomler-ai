@@ -545,7 +545,7 @@ impl LocalApiState for DaemonState {
                           instead (check `roomler status` / `roomler peers` for the IPs). If \
                           the overlay isn't up at all, set `overlay_enabled = true` in the \
                           node's config.toml and restart the daemon; for netstack mode, set \
-                          ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>."
+                          ROOMLERD_OVERLAY_NETSTACK_SOCKS=<port>."
                     .into(),
             };
         };

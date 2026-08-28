@@ -29,7 +29,7 @@ pub const RELEASES_REPO: &str = "gjovanov/roomler-ai";
 /// Default proxy endpoint that caches GitHub's releases response on
 /// the roomler-ai API server. Eliminates the per-IP GitHub rate
 /// limit (60 req/hr unauth) that bites fleets of agents behind one
-/// NAT. Override via `ROOMLER_AGENT_UPDATE_URL` env var for self-
+/// NAT. Override via `ROOMLERD_UPDATE_URL` env var for self-
 /// hosted deployments or to bypass the proxy in dev. When the proxy
 /// is unreachable we fall back to direct GitHub.
 pub const DEFAULT_PROXY_URL: &str = "https://roomler.ai/api/agent/latest-release";
@@ -47,7 +47,7 @@ pub const DEFAULT_PROXY_URL: &str = "https://roomler.ai/api/agent/latest-release
 /// (`DEFAULT_PROXY_URL`, server-side 1 h cache), so GitHub only sees
 /// fallback traffic. 4 h keeps even a large NAT'd office far under the
 /// quota on the fallback path. Operators tune via
-/// `update_check_interval_h` / `ROOMLER_AGENT_UPDATE_INTERVAL_H`.
+/// `update_check_interval_h` / `ROOMLERD_UPDATE_INTERVAL_H`.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(4 * 3600);
 
 /// Minimum download size before we trust an installer artifact. A
@@ -557,7 +557,7 @@ fn pick_linux_asset<'a>(
 /// default (caches GitHub's response for 1h on the API server, so a
 /// fleet of agents shares a single upstream call), falls back to
 /// direct GitHub when the proxy is unreachable. Override via
-/// `ROOMLER_AGENT_UPDATE_URL` env var for self-hosted deployments.
+/// `ROOMLERD_UPDATE_URL` env var for self-hosted deployments.
 ///
 /// We do NOT use GitHub's `/releases/latest` because that endpoint
 /// excludes prereleases unconditionally, and our v0.x policy briefly
@@ -1146,7 +1146,7 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
 /// CA is conditioned on `ENABLE_SYSTEM_CONTEXT="0" AND NOT
 /// (REMOVE="ALL")` (see `wix-perMachine/main.wxs:344-346`).
 /// The CA runs `roomlerd disable-system-context` which
-/// strips `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` from the SCM
+/// strips `ROOMLERD_ENABLE_SYSTEM_SWAP` from the SCM
 /// Environment block and restarts the service. After auto-update
 /// the supervisor sees env-var-off, doesn't perform the M3 A1
 /// winlogon-token swap, and the resulting LocalSystem worker
@@ -1178,7 +1178,7 @@ pub fn spawn_installer_as_flavour(
 }
 
 /// rc.56: read the current SCM Environment block. If the perMachine
-/// service has `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` set, return
+/// service has `ROOMLERD_ENABLE_SYSTEM_SWAP=1` set, return
 /// `vec![("ENABLE_SYSTEM_CONTEXT", "1")]` so the auto-update msiexec
 /// invocation re-asserts the env var via the WiX `EnableSystemContext`
 /// CA instead of stripping it via `DisableSystemContext`.
@@ -1189,11 +1189,11 @@ pub fn spawn_installer_as_flavour(
 #[cfg(target_os = "windows")]
 fn preserve_system_context_property(flavour: WindowsInstallFlavour) -> Vec<(String, String)> {
     let env_value =
-        crate::win_service::environment::read_service_env_var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")
+        crate::win_service::environment::read_service_env_var("ROOMLERD_ENABLE_SYSTEM_SWAP")
             .map_err(|e| {
                 tracing::warn!(
                     error = %e,
-                    "updater: failed to read SCM env var ROOMLER_AGENT_ENABLE_SYSTEM_SWAP; \
+                    "updater: failed to read SCM env var ROOMLERD_ENABLE_SYSTEM_SWAP; \
                      not passing ENABLE_SYSTEM_CONTEXT to msiexec (auto-update will proceed \
                      but may strip SystemContext if it was enabled)"
                 );
@@ -1202,7 +1202,7 @@ fn preserve_system_context_property(flavour: WindowsInstallFlavour) -> Vec<(Stri
     let result = preserve_system_context_property_for(flavour, env_value);
     if !result.is_empty() {
         tracing::info!(
-            "updater: detected ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1 in service env; \
+            "updater: detected ROOMLERD_ENABLE_SYSTEM_SWAP=1 in service env; \
              passing ENABLE_SYSTEM_CONTEXT=1 to msiexec to preserve SystemContext mode \
              across auto-update (rc.56 hotfix)"
         );
@@ -1390,7 +1390,7 @@ const TARBALL_REQUIRED: &[&str] = &["usr/bin/roomlerd", "usr/bin/roomler"];
 
 /// Units ship in the tarball but are only written when ABSENT. An upgrade
 /// must never revert a unit the operator edited — the field host carries a
-/// hand-written unit with `ROOMLER_AGENT_VIRTUAL_DESKTOP=1`, and silently
+/// hand-written unit with `ROOMLERD_VIRTUAL_DESKTOP=1`, and silently
 /// reverting that would be a data-loss-class bug. A package manager does not
 /// clobber modified conffiles either.
 #[cfg(target_os = "linux")]
@@ -1838,7 +1838,7 @@ fn stage_watcher_exe(
 
 /// Resolve the effective update-check cadence for this run. Order:
 ///
-/// 1. `ROOMLER_AGENT_UPDATE_INTERVAL_H` env var (parses an unsigned
+/// 1. `ROOMLERD_UPDATE_INTERVAL_H` env var (parses an unsigned
 ///    integer count of hours; non-positive or non-numeric is ignored
 ///    so a typo can't accidentally disable updates).
 /// 2. `update_check_interval_h` field on `AgentConfig`, if set.
