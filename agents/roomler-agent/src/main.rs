@@ -36,7 +36,7 @@ use tunnel_core::env::node_env;
 use tunnel_core::env::node_env_os;
 
 #[derive(Debug, Parser)]
-#[command(name = "roomler-agent", version, about, long_about = None)]
+#[command(name = "roomlerd", version, about, long_about = None)]
 struct Cli {
     /// Override config file location. Defaults to the platform config dir.
     #[arg(long, global = true)]
@@ -3512,7 +3512,7 @@ mod tests {
 
     #[test]
     fn parses_enable_system_context_default() {
-        let cli = Cli::try_parse_from(["roomler-agent", "enable-system-context"]).unwrap();
+        let cli = Cli::try_parse_from(["roomlerd", "enable-system-context"]).unwrap();
         match cli.command {
             Some(Command::EnableSystemContext { no_restart }) => assert!(!no_restart),
             other => panic!("expected EnableSystemContext, got {other:?}"),
@@ -3521,8 +3521,8 @@ mod tests {
 
     #[test]
     fn parses_enable_system_context_no_restart() {
-        let cli = Cli::try_parse_from(["roomler-agent", "enable-system-context", "--no-restart"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["roomlerd", "enable-system-context", "--no-restart"]).unwrap();
         match cli.command {
             Some(Command::EnableSystemContext { no_restart }) => assert!(no_restart),
             other => panic!("expected EnableSystemContext --no-restart, got {other:?}"),
@@ -3531,7 +3531,7 @@ mod tests {
 
     #[test]
     fn parses_disable_system_context_default() {
-        let cli = Cli::try_parse_from(["roomler-agent", "disable-system-context"]).unwrap();
+        let cli = Cli::try_parse_from(["roomlerd", "disable-system-context"]).unwrap();
         match cli.command {
             Some(Command::DisableSystemContext { no_restart }) => assert!(!no_restart),
             other => panic!("expected DisableSystemContext, got {other:?}"),
