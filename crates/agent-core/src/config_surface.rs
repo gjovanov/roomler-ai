@@ -163,6 +163,23 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session, advertise the capability, and floor fresh pairs at birth. Built-in default: on since rc.400.",
     ),
     (
+        "relay_server_enabled",
+        "tribool",
+        "FR-19 - offer this node as an ORG RELAY: bind relay_server_port and answer \
+         reachability probes (it forwards nothing until the relay data path ships). \
+         Device-local by design and never server-pushable: this is the refusal that \
+         survives a compromised server. Built-in default: OFF.",
+    ),
+    (
+        "relay_server_port",
+        "number",
+        "FR-19 - UDP port for the org-relay listener (1-65535). Built-in default: 3478, \
+         measured rather than guessed - the corp-managed target host reaches 3478 on an \
+         arbitrary public IP and no other port. A successful bind does NOT prove \
+         reachability: a coturn DNAT can consume the port in PREROUTING while ss shows it \
+         free.",
+    ),
+    (
         "overlay_netcheck",
         "tribool",
         "Overlay v3 Phase B — netcheck: measure egress capabilities (relay-band probe over the dialer path, STUN/NAT, /derp health) every ~20 min and publish the capability vector. Built-in default: on.",
@@ -651,6 +668,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_server_relay_strategy" => cfg.overlay_server_relay_strategy.map(fmt_bool),
         "overlay_derp_floor" => cfg.overlay_derp_floor.map(fmt_bool),
         "overlay_netcheck" => cfg.overlay_netcheck.map(fmt_bool),
+        "relay_server_enabled" => cfg.relay_server_enabled.map(fmt_bool),
+        "relay_server_port" => cfg.relay_server_port.map(|v| v.to_string()),
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback.map(fmt_bool),
         "tunnel_peers_survive_reattach" => cfg.tunnel_peers_survive_reattach.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
@@ -878,6 +897,25 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "overlay_derp_floor" => cfg.overlay_derp_floor = parse_tribool(value)?,
         "overlay_netcheck" => cfg.overlay_netcheck = parse_tribool(value)?,
+        "relay_server_enabled" => cfg.relay_server_enabled = parse_tribool(value)?,
+        "relay_server_port" => {
+            cfg.relay_server_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| format!("relay_server_port must be a number (got {v:?})"))?;
+                    // No 0-means-ephemeral escape hatch here, deliberately: a
+                    // relay peers must be able to FIND is useless on a port the
+                    // operator cannot state, and 3478 is the only port E2E-3
+                    // measured the target population reaching.
+                    if n == 0 || n > 65535 {
+                        return Err(format!("relay_server_port must be 1-65535 (got {n})"));
+                    }
+                    Some(n)
+                }
+            }
+        }
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback = parse_tribool(value)?,
         "tunnel_peers_survive_reattach" => {
             cfg.tunnel_peers_survive_reattach = parse_tribool(value)?
