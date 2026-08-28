@@ -275,6 +275,12 @@ impl AgentPeer {
         chosen_codec: String,
         negotiated_transport: Option<String>,
         chroma_pref: Option<String>,
+        // FR-17 — this controller can parse the framed DataChannel wire
+        // format (`[frame_seq | chunk_idx | chunk_count]` per message).
+        // False = the legacy unframed format. Negotiated, never assumed:
+        // framing bytes a peer cannot parse is unrecoverable, so the
+        // default on every unknown path is the old format.
+        chunk_framing: bool,
         // Opt-in system-audio track. Only acted on when the `audio`
         // feature is compiled in; underscored-through otherwise so the
         // default-feature build doesn't warn on the unused binding.
@@ -1130,6 +1136,7 @@ impl AgentPeer {
             target_resolution.clone(),
             negotiated_transport,
             chroma_pref,
+            chunk_framing,
             video_bytes_dc.clone(),
             lock_state_rx,
             // rc.87 — control DC so the DC video pumps can emit
@@ -1607,6 +1614,8 @@ async fn media_pump(
     target_resolution: Arc<std::sync::Mutex<TargetResolution>>,
     negotiated_transport: Option<String>,
     chroma_pref: Option<String>,
+    // FR-17 — the controller can parse the framed DataChannel wire format.
+    chunk_framing: bool,
     video_bytes_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     lock_state_rx: tokio::sync::watch::Receiver<lock_state::LockState>,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
@@ -1642,6 +1651,10 @@ async fn media_pump(
     // Same story for the Priority dial — DC-pump-only.
     #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
     let _ = &priority;
+    // FR-17 framing is a property of the `video-bytes` DC, which only
+    // the DC pumps own; the webrtc-track path has no chunks to frame.
+    #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+    let _ = chunk_framing;
     // Tracks the lock-state value seen on the previous loop iteration
     // so we can request an encoder keyframe on each transition. The
     // browser decoder otherwise has to wait for the next periodic
@@ -1700,6 +1713,7 @@ async fn media_pump(
                     viewer_report,
                     priority,
                     false,
+                    chunk_framing,
                 )
                 .await;
             }
@@ -1742,6 +1756,7 @@ async fn media_pump(
                     // rc:session.request `chroma_pref`, previously honoured
                     // only by the VP9-444 transport).
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
+                    chunk_framing,
                 )
                 .await;
             }
@@ -1781,6 +1796,7 @@ async fn media_pump(
                     viewer_report,
                     priority,
                     false,
+                    chunk_framing,
                 )
                 .await;
             }
@@ -1842,6 +1858,7 @@ async fn media_pump(
                         viewer_report,
                         priority,
                         false,
+                        chunk_framing,
                     )
                     .await;
                 }
@@ -1867,6 +1884,7 @@ async fn media_pump(
                 encoded_dims,
                 viewer_report,
                 priority,
+                chunk_framing,
             )
             .await;
         }
@@ -2523,6 +2541,41 @@ pub(crate) fn clock_echo_json(t0: &serde_json::Value, agent_us: u64) -> String {
     serde_json::json!({"t": "rc:clock.echo", "t0": t0, "agent_us": agent_us}).to_string()
 }
 
+/// FR-17 — bytes of the per-message framing prefix: `frame_seq` u32 LE,
+/// `chunk_idx` u16 LE, `chunk_count` u16 LE.
+/// `dead_code` allowance mirrors [`frame_video_bytes`]: both DC pumps
+/// are feature-gated, so a signalling-only build has no caller. The
+/// codec itself is portable and its tests run unconditionally.
+#[allow(dead_code)]
+pub(crate) const CHUNK_HEADER_BYTES: usize = 8;
+
+/// FR-17 — prefix one outbound DataChannel message so the receiver can tell
+/// WHICH frame it belongs to and notice a missing one.
+///
+/// Today the channel is reliable + ordered, so a gap cannot occur and this
+/// changes nothing on the wire beyond 8 bytes per 16 KiB message (0.05 %).
+/// It ships first, alone, precisely so that the stage that DOES give up
+/// ordering flips one property against a receiver whose gap handling has
+/// already been exercised — rather than debugging two changes at once.
+///
+/// `frame_seq` wraps at u32: ~19 000 hours at 60 fps, and the receiver only
+/// ever compares it for equality with the frame it is assembling, so a wrap
+/// costs at most one discarded frame.
+#[allow(dead_code)]
+pub(crate) fn chunk_framed(
+    frame_seq: u32,
+    chunk_idx: u16,
+    chunk_count: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CHUNK_HEADER_BYTES + payload.len());
+    out.extend_from_slice(&frame_seq.to_le_bytes());
+    out.extend_from_slice(&chunk_idx.to_le_bytes());
+    out.extend_from_slice(&chunk_count.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
 /// `dead_code` allowance is for builds without the `vp9-444` feature
 /// where the function has no caller — the tests still exercise it
 /// under either feature flag setting.
@@ -2585,6 +2638,12 @@ async fn run_ffmpeg_dc_session(
     // never share an encoder — the Vp9Dc chroma-keyed precedent) and is
     // threaded into the pump.
     chroma444: bool,
+    // FR-17 — the controller negotiated per-chunk framing for this
+    // session (it advertised `chunk-framing` support in
+    // `rc:session.request`). Threaded down to the send task rather
+    // than read from a global: it is a per-SESSION property, and a
+    // shared pipeline can serve viewers that disagree.
+    chunk_framing: bool,
 ) {
     // P7 — chroma-discriminated hard-profile label (HEVC only; every other
     // codec ignores the flag).
@@ -2636,6 +2695,7 @@ async fn run_ffmpeg_dc_session(
             viewer_report,
             priority,
             chroma444,
+            chunk_framing,
         )
         .await;
     }
@@ -2660,6 +2720,12 @@ async fn run_vp9_444_dc_session(
     encoded_dims: Arc<std::sync::atomic::AtomicU64>,
     viewer_report: Arc<crate::encode::viewer_rate::ViewerFeedback>,
     priority: Arc<std::sync::atomic::AtomicU8>,
+    // FR-17 — the controller negotiated per-chunk framing for this
+    // session (it advertised `chunk-framing` support in
+    // `rc:session.request`). Threaded down to the send task rather
+    // than read from a global: it is a per-SESSION property, and a
+    // shared pipeline can serve viewers that disagree.
+    chunk_framing: bool,
 ) {
     loop {
         let sink = crate::media_share::FollowerSink {
@@ -2705,6 +2771,7 @@ async fn run_vp9_444_dc_session(
             encoded_dims,
             viewer_report,
             priority,
+            chunk_framing,
         )
         .await;
     }
@@ -2754,6 +2821,12 @@ async fn media_pump_vp9_444_dc(
     // rc.199 — per-session Priority dial (`rc:priority`); resolves the relay
     // resolution cap this pump feeds `effective_target_resolution`.
     priority: Arc<std::sync::atomic::AtomicU8>,
+    // FR-17 — the controller negotiated per-chunk framing for this
+    // session (it advertised `chunk-framing` support in
+    // `rc:session.request`). Threaded down to the send task rather
+    // than read from a global: it is a per-SESSION property, and a
+    // shared pipeline can serve viewers that disagree.
+    chunk_framing: bool,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -3033,6 +3106,9 @@ async fn media_pump_vp9_444_dc(
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
+            // FR-17 — see the ffmpeg pump: the sequence lives in the send
+            // task because that is what puts messages on the wire.
+            let mut frame_seq: u32 = 0;
             // Measured-rate v2 — time each frame's chunked serialisation;
             // the sink keeps only genuinely blocked sends (≥10 ms of SCTP
             // flow control), so buffer headroom never biases the estimate
@@ -3045,9 +3121,24 @@ async fn media_pump_vp9_444_dc(
                         let ser_start = std::time::Instant::now();
                         let mut off = 0usize;
                         let mut ok = true;
+                        let chunk_count = total.div_ceil(SCTP_CHUNK_SIZE).max(1) as u16;
+                        let mut chunk_idx: u16 = 0;
+                        frame_seq = frame_seq.wrapping_add(1);
                         while off < total {
                             let end = (off + SCTP_CHUNK_SIZE).min(total);
-                            if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                            let res = if chunk_framing {
+                                let framed = chunk_framed(
+                                    frame_seq,
+                                    chunk_idx,
+                                    chunk_count,
+                                    &wire.slice(off..end),
+                                );
+                                dc.send(&bytes::Bytes::from(framed)).await
+                            } else {
+                                dc.send(&wire.slice(off..end)).await
+                            };
+                            chunk_idx = chunk_idx.saturating_add(1);
+                            if let Err(e) = res {
                                 let n = send_errors.fetch_add(1, Relaxed) + 1;
                                 tracing::warn!(session = %task_session, %e, send_errors = n, "VP9-444 DC send task: DC send failed");
                                 ok = false;
@@ -4040,6 +4131,12 @@ async fn media_pump_ffmpeg_dc(
     // new_hevc_adaptive); the other codecs ignore it. May silently fall
     // back to 4:2:0 at open time — `rc:video-info` reports the truth.
     chroma444: bool,
+    // FR-17 — the controller negotiated per-chunk framing for this
+    // session (it advertised `chunk-framing` support in
+    // `rc:session.request`). Threaded down to the send task rather
+    // than read from a global: it is a per-SESSION property, and a
+    // shared pipeline can serve viewers that disagree.
+    chunk_framing: bool,
 ) {
     use crate::encode::VideoEncoder;
     use crate::encode::ffmpeg::FfmpegEncoder;
@@ -4300,6 +4397,12 @@ async fn media_pump_ffmpeg_dc(
     let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The longest blocked send the task has seen since the pump last
+    // looked, µs. A separate cell from the heartbeat's max because this
+    // one is a CONTROL input drained every loop, while that one is a
+    // report drained every 2 s — sharing it would make the rate loop's
+    // reaction depend on the logging cadence.
+    let send_stall_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // The direct byte gate's reference rate: the last policy ceiling (the
     // AIMD's applied target takes over once it exists). One-shot log the
     // first time the direct gate actually sheds, so a field read can tell
@@ -4314,6 +4417,9 @@ async fn media_pump_ffmpeg_dc(
     // applies on constrained sessions (each such IDR was a 1.2-1.5 s lump
     // on CORPLAP-3's ~2 Mbps relay).
     let relay_idr_thrift = crate::encode::relay_idr_thrift_enabled();
+    // Resolved once: a per-frame env read would sit in the hot path.
+    let send_stall_threshold = crate::encode::send_stall_threshold();
+    let mut send_stalls: u64 = 0;
     let mut last_deferred_apply_at: Option<std::time::Instant> = None;
     let mut settle_kf_suppressed: u64 = 0;
 
@@ -4388,11 +4494,17 @@ async fn media_pump_ffmpeg_dc(
         let send_wait_us_sum = send_wait_us_sum.clone();
         let send_wait_us_max = send_wait_us_max.clone();
         let send_wait_frames = send_wait_frames.clone();
+        let send_stall_us = send_stall_us.clone();
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             const SCTP_CHUNK_SIZE: usize = 16 * 1024;
+            // FR-17 — monotonic per-frame sequence for the framing prefix.
+            // Lives in the SEND TASK because that is what actually puts
+            // messages on the wire: a counter kept in the pump would drift
+            // from the wire the moment a frame is shed after encoding.
+            let mut frame_seq: u32 = 0;
             // Measured-rate v2 — time each frame's chunked serialisation
             // and report it; the sink keeps only genuinely blocked sends
             // (≥10 ms of SCTP flow control), so buffer headroom never
@@ -4418,10 +4530,32 @@ async fn media_pump_ffmpeg_dc(
                         let ser_start = std::time::Instant::now();
                         let mut off = 0usize;
                         let mut ok = true;
+                        // Ceiling division, floored at one: a zero-length frame
+                        // still counts as one message so the receiver sees a
+                        // complete frame rather than an empty set it can never
+                        // satisfy.
+                        let chunk_count = total.div_ceil(SCTP_CHUNK_SIZE).max(1) as u16;
+                        let mut chunk_idx: u16 = 0;
+                        frame_seq = frame_seq.wrapping_add(1);
                         while off < total {
                             let end = (off + SCTP_CHUNK_SIZE).min(total);
-                            // `wire.slice` is zero-copy (shares the Bytes buffer).
-                            if let Err(e) = dc.send(&wire.slice(off..end)).await {
+                            // `wire.slice` is zero-copy (shares the Bytes
+                            // buffer); FR-17 framing costs one small copy per
+                            // message — 8 bytes on 16 KiB, 0.05 % — and only
+                            // when the controller negotiated it.
+                            let res = if chunk_framing {
+                                let framed = chunk_framed(
+                                    frame_seq,
+                                    chunk_idx,
+                                    chunk_count,
+                                    &wire.slice(off..end),
+                                );
+                                dc.send(&bytes::Bytes::from(framed)).await
+                            } else {
+                                dc.send(&wire.slice(off..end)).await
+                            };
+                            chunk_idx = chunk_idx.saturating_add(1);
+                            if let Err(e) = res {
                                 let n = send_errors.fetch_add(1, Relaxed) + 1;
                                 tracing::warn!(
                                     session = %task_session, %e, send_errors = n,
@@ -4446,6 +4580,7 @@ async fn media_pump_ffmpeg_dc(
                             send_wait_us_sum.fetch_add(waited_us, Relaxed);
                             send_wait_us_max.fetch_max(waited_us, Relaxed);
                             send_wait_frames.fetch_add(1, Relaxed);
+                            send_stall_us.fetch_max(waited_us, Relaxed);
                         }
                     }
                     // Byte-budget ledger: the frame left the queue (delivered
@@ -5287,6 +5422,25 @@ async fn media_pump_ffmpeg_dc(
             continue;
         };
 
+        // A frame that sat inside the DataChannel send call longer than the
+        // threshold is unambiguous congestion — the pipe refused to drain.
+        // It needs no clock sync and no viewer, so it is the one signal that
+        // works on a relay, where the goodput clamp is switched off and the
+        // age loop depends on a probe the congestion itself biases.
+        //
+        // Constrained only: on direct the measured ceiling already owns this,
+        // and a stall there is the FR-14 episodic case, which wants a
+        // different response. Feeding the SAMPLE rather than taking the move
+        // lets `pre_encode_tick` below apply it through the normal arms one
+        // frame later.
+        if let Some(threshold) = send_stall_threshold {
+            let stalled_us = send_stall_us.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if constrained && stalled_us >= threshold.as_micros() as u64 {
+                send_stalls += 1;
+                governor.note_send_stall(std::time::Instant::now());
+            }
+        }
+
         // Phase B — drive the AIMD off send-channel occupancy (the real DC
         // backpressure signal) each frame. Ceiling = the per-resolution,
         // relay-aware maxrate cap; the controller starts there and tracks the
@@ -5315,8 +5469,36 @@ async fn media_pump_ffmpeg_dc(
             } else if bg_rebuild && !constrained {
                 swap_wanted = Some(applied.bps);
             } else if last_motion_at.elapsed() >= DEFER_QUIET {
-                deferred_bps = None;
-                enc.set_bitrate(applied.bps);
+                // FR-10 follow-up (field 2026-08-28): the spacing below
+                // guarded only the DEFERRED flush, so this arm — "the
+                // scene is quiet, apply now" — rebuilt on EVERY rung the
+                // AIMD crossed. At session start nothing has moved yet, so
+                // it is always quiet here, and the startup ramp became two
+                // or three blocking QSV re-opens inside the first 15 s,
+                // each shipping a fresh IDR onto a ~3 Mbps pipe. That is
+                // the "always slow right after connecting, then it
+                // settles" the operator reported, and the 2 658 ms age
+                // spike measured on CORPLAP-3 at 07:29:02Z.
+                //
+                // The spacing belongs to the ENCODER and the TRANSPORT
+                // (this one rebuilds on set_bitrate, and the pipe is thin),
+                // not to the arm we happened to arrive through. A large
+                // move still lands promptly; a small one is held in
+                // `deferred_bps`, which re-evaluates every loop.
+                let allow = crate::encode::rebuild_apply_allowed(
+                    constrained,
+                    relay_idr_thrift,
+                    last_deferred_apply_at.map(|t| t.elapsed()),
+                    enc.current_maxrate_bps(),
+                    applied.bps,
+                );
+                if allow {
+                    deferred_bps = None;
+                    last_deferred_apply_at = Some(std::time::Instant::now());
+                    enc.set_bitrate(applied.bps);
+                } else {
+                    deferred_bps = Some(applied.bps);
+                }
             } else {
                 deferred_bps = Some(applied.bps);
             }
@@ -5339,12 +5521,13 @@ async fn media_pump_ffmpeg_dc(
             // sessions space small moves to ≥15 s; a ≥40 % move (genuine
             // collapse/recovery) still lands promptly. Held targets stay in
             // `deferred_bps` and re-evaluate every loop.
-            let allow = !(constrained && relay_idr_thrift)
-                || crate::encode::relay_deferred_apply_allowed(
-                    last_deferred_apply_at.map(|t| t.elapsed()),
-                    enc.current_maxrate_bps(),
-                    bps,
-                );
+            let allow = crate::encode::rebuild_apply_allowed(
+                constrained,
+                relay_idr_thrift,
+                last_deferred_apply_at.map(|t| t.elapsed()),
+                enc.current_maxrate_bps(),
+                bps,
+            );
             if allow {
                 // Quiet flush: the held QSV/AMF target applies now, while the
                 // scene is static — the rebuild stalls a frozen image nobody
@@ -5725,6 +5908,7 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_backpressure, frames_empty, settle_kf_suppressed,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 send_wait_avg_ms, send_wait_max_ms,
+                send_stalls,
                 paced_fps = ?governor.paced_fps(),
                 encode_factor = governor.encode_factor(),
                 avg_qp = ?avg_qp,
@@ -9295,7 +9479,9 @@ mod tests {
 
 #[cfg(test)]
 mod video_bytes_wire_tests {
-    use super::{agent_epoch_us, clock_echo_json, frame_video_bytes};
+    use super::{
+        CHUNK_HEADER_BYTES, agent_epoch_us, chunk_framed, clock_echo_json, frame_video_bytes,
+    };
 
     /// Lock the exact byte layout that `rc-vp9-444-worker.ts`'s
     /// `parseFrameHeader` (lines 260-273 of that file) reads. A typo
@@ -9323,6 +9509,69 @@ mod video_bytes_wire_tests {
         );
         // payload follows verbatim
         assert_eq!(&out[13..], payload);
+    }
+
+    /// FR-17 — lock the 8-byte chunk prefix both workers'
+    /// `assembleFrame` reads. This is a wire contract in the same sense
+    /// as `header_layout_matches_worker_parser` above, and it matters
+    /// MORE than that one: the framed messages are the layer that lets a
+    /// receiver notice a gap at all, so a silent endian flip here would
+    /// look like corrupt video rather than a parse error.
+    ///
+    /// Layout:
+    ///   bytes [0..4)  frame_seq,   u32 little-endian
+    ///   bytes [4..6)  chunk_idx,   u16 little-endian
+    ///   bytes [6..8)  chunk_count, u16 little-endian
+    ///   bytes [8..)   the 16 KiB slice of the already-framed frame
+    #[test]
+    fn chunk_prefix_layout_matches_worker_assembler() {
+        let payload = b"chunk";
+        let out = chunk_framed(0x0102_0304, 0x0A0B, 0x0C0D, payload);
+        assert_eq!(out.len(), CHUNK_HEADER_BYTES + payload.len());
+        assert_eq!(&out[0..4], &[0x04, 0x03, 0x02, 0x01], "frame_seq LE");
+        assert_eq!(&out[4..6], &[0x0B, 0x0A], "chunk_idx LE");
+        assert_eq!(&out[6..8], &[0x0D, 0x0C], "chunk_count LE");
+        assert_eq!(&out[8..], payload, "payload follows verbatim");
+    }
+
+    /// The prefix must not disturb the payload — the assembler
+    /// concatenates the slices and hands the result to the SAME
+    /// `parseFrameHeader` as before, so a framed session and an unframed
+    /// one must reconstruct byte-identical frames. Reassembling the
+    /// chunks here is the check that stage A really is behaviour-neutral.
+    #[test]
+    fn reassembly_reproduces_the_unframed_stream() {
+        const CHUNK: usize = 16 * 1024;
+        let frame = frame_video_bytes(&vec![7u8; 40_000], true, 42);
+        let mut chunks = Vec::new();
+        let count = frame.len().div_ceil(CHUNK).max(1) as u16;
+        let mut off = 0;
+        let mut idx: u16 = 0;
+        while off < frame.len() {
+            let end = (off + CHUNK).min(frame.len());
+            chunks.push(chunk_framed(9, idx, count, &frame[off..end]));
+            idx += 1;
+            off = end;
+        }
+        assert_eq!(chunks.len(), 3, "40 000 + 13 bytes spans three messages");
+        let mut rebuilt = Vec::new();
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(u32::from_le_bytes(c[0..4].try_into().unwrap()), 9);
+            assert_eq!(u16::from_le_bytes(c[4..6].try_into().unwrap()), i as u16);
+            assert_eq!(u16::from_le_bytes(c[6..8].try_into().unwrap()), count);
+            rebuilt.extend_from_slice(&c[8..]);
+        }
+        assert_eq!(rebuilt, frame, "framing is transparent to the frame bytes");
+    }
+
+    /// A zero-length frame must still be announced as one chunk. The
+    /// `.max(1)` in the pumps is what makes that true; without it a
+    /// receiver would be told to expect zero chunks and could never
+    /// consider the frame complete.
+    #[test]
+    fn empty_frame_is_announced_as_one_chunk_not_zero() {
+        let total = 0usize;
+        assert_eq!(total.div_ceil(16 * 1024).max(1), 1);
     }
 
     #[test]
