@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Admin CRUD for overlay subnet-route approval (Phase 1 subnet router).
 //!
 //! A node advertises subnet CIDRs on join (`OverlayNode.advertised_routes`);

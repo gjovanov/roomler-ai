@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Applying a pushed desired-config (`docs/remote-config.md` step 4).
 //!
 //! Rides into `signaling::run` as one value rather than three loose

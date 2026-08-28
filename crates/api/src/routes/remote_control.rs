@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! REST surface for the remote-control subsystem.
 //!
 //! Per `docs/remote-control.md` §9.1. Signaling (SDP/ICE) happens over the

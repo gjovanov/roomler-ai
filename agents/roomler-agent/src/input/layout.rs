@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows keyboard-layout awareness + auto-switch (rc.227).
 //!
 //! The field symptom this fixes: viewer keyboard = German, remote =

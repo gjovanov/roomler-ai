@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows real-virtual-key text injection (rc.122).
 //!
 //! The browser sends each typed printable character as a `KeyText` message.

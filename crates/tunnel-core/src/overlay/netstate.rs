@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! netstate — the process-wide network-state subsystem.
 //!
 //! ONE owner of the OS network-change signal, typed state, and non-blocking

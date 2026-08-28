@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `SetThreadDesktop` rebind primitives for the M3 A1 SYSTEM-context
 //! input thread.
 //!

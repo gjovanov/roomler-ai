@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! S2 config surface — the curated, secret-free slice of [`AgentConfig`]
 //! that the LocalAPI `ConfigGet` / `ConfigSet` verbs expose to the
 //! desktop app / CLI.

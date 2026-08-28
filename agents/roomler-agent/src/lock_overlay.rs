@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! "Host is locked" overlay frame producer (M3 phase 3b, Z-path).
 //!
 //! When the lock-state monitor (`lock_state.rs`) reports `Locked`,

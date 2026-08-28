@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Platform user analytics (wave 2): who is connected, for how long,
 //! from what browser, and from where.
 //!

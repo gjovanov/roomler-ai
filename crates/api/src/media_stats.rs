@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Stats PR-2 — the mediasoup conference sampler.
 //!
 //! Every 30 s, each pod samples the conferences IT owns (multi-pod media

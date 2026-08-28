@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Video encoder abstraction.
 //!
 //! Encoders consume `capture::Frame` values and produce NAL-unit-delimited

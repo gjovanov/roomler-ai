@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Post-install watcher subprocess.
 //!
 //! Spawned by the updater immediately before the agent exits to make

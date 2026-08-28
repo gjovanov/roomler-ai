@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Client-IP extraction that survives our reverse-proxy chain.
 //!
 //! `X-Forwarded-For` is append-only and anyone may seed it. A client that

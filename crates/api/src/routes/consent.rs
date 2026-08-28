@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! PUBLIC remote-control consent endpoints (Phase 4).
 //!
 //! A device owner who received an email link / web-push tap lands here to

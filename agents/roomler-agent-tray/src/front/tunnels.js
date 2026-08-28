@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 /*
  * Tunnels view: declared, daemon-supervised routes (P6) + the live-forwards
  * table (`cmd_flows` — per-forward transport, connection count and byte

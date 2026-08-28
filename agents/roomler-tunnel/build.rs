@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Embeds a Windows VERSIONINFO resource into `roomler.exe`.
 //!
 //! Same rationale as `agents/roomler-agent/build.rs` -- see that file for the

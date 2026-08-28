@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Loopback-TURN corp-relay (Phase 2b) — the agent side.
 //!
 //! When a corp host runs this agent AND its browser is the controller, the

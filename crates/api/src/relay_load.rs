@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Relay-PoP load poller — the server half of load-aware region routing.
 //!
 //! Every `relay.stats_poll_secs` (default 30 s) it fetches each enabled

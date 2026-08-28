@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Stats PR-1 — the rollup compactor: raw samples → `_1h` (90 d) → `_1d`
 //! (730 d), so year-scale queries survive the 7-day raw TTL.
 //!

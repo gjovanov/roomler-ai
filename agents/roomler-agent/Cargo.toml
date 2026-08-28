@@ -1,5 +1,6 @@
 [package]
 name = "roomler-agent"
+license = "MPL-2.0"
 version.workspace = true
 edition.workspace = true
 description = "Roomler AI remote-control agent — runs on the controlled host, connects to the Roomler API."

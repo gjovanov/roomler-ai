@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P6 (multi-org program) — the InputArbiter: ONE injection worker for all
 //! concurrent remote-control sessions.
 //!

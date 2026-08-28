@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent-side handler for one inbound `ServerMsg::TcpForwardForward`.
 //!
 //! Splits into two steps so the policy + dial logic stays unit-

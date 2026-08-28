@@ -1,3 +1,5 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 G ROX EOOD -->
 <template>
   <div ref="wrap" class="mesh-wrap">
     <div v-if="!nodes.length" class="mesh-empty text-medium-emphasis text-body-2">

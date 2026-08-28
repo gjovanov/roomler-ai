@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Phase 2 MagicDNS — a tiny split-DNS resolver.
 //!
 //! Overlay names (`<node>.<magic_domain>`, or a bare `<node>` label the OS sends

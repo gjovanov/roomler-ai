@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Wire-format integration tests for the file-DC v2 protocol.
 //!
 //! These tests stand up two `webrtc-rs` `RTCPeerConnection`s in

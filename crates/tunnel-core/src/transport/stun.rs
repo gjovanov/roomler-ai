@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Minimal STUN client (RFC 5389) — just enough to discover a
 //! **server-reflexive** candidate (our public `ip:port` mapping behind
 //! a NAT) for QUIC hole-punching. We send a Binding Request and parse
