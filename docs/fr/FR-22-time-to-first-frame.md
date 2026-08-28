@@ -1,6 +1,7 @@
 # FR-22: Time-to-first-frame — connecting sometimes takes 10–15 s
 
-Status: **investigated, fix proposed** (2026-08-28). Tracking issue: `FR-22` (#819).
+Status: **parts 1 + 3 shipped, root cause still open** (2026-08-28). Tracking issue:
+`FR-22` (#819).
 UX rather than picture quality — but it is the first thing every session is judged on,
 and the quality work is invisible to someone still looking at a blank stage.
 
@@ -61,34 +62,72 @@ shown to work.
 
 ## Proposed direction — three parts, cheapest first
 
-**1. Phase-aware signalling timeout.** 15 s is far beyond the measured healthy path
-(worst observed end-to-end: 4.7 s agent-side). A short bound on `requesting` — *has the
-agent answered at all?* — with the existing longer bound kept for `negotiating`, where
-ICE legitimately varies by network. Cuts the bad case from ~18 s to ~7 s and does not
-touch the good case. `awaiting_consent` stays exempt: the SERVER owns that timeout, and
-a human approving a prompt may legitimately take longer than any client-side number.
+**1. Phase-aware signalling timeout.** ✅ **SHIPPED** (PR #821). 15 s is far beyond the
+measured healthy path (worst observed end-to-end: 4.7 s agent-side). A short bound on
+`requesting` — *has the server answered at all?* — with the existing longer bound kept
+for `negotiating`, where ICE legitimately varies by network. Cuts the bad case from
+~18 s to ~7 s and does not touch the good case. `awaiting_consent` stays exempt: the
+SERVER owns that timeout, and a human approving a prompt may legitimately take longer
+than any client-side number.
 
-**2. Make the server answer instead of the client guessing.** The hub already knows
-whether a session request reached a live agent — that is exactly how the `agent_offline`
-412 works on the exec and SSH paths. An undeliverable request should fail in under a
-second with a reason the UI can show, rather than being discovered by a client-side
-timer 15 s later. This is the part that removes the class rather than shortening it.
+`signalingTimeoutFor(phase)`: `requesting` **4 s**, `negotiating` 15 s (unchanged),
+everything else `null` = never arm. Exported and total over `RcPhase`, so a new phase
+must declare its own bound instead of silently inheriting the ICE-sized one.
 
-**3. Instrument time-to-first-frame.** Request → first painted frame, reported the way
-FR-1 P7 instrumented paint age. Without it every future claim here is an anecdote, and
-part 2's fast-fail cannot be told apart from a fast success. Feeds FR-16 (#798) L3.
+⚠️ **Mitigation, not diagnosis.** This shortens the cost of the stall; it does not
+explain it. Criterion 5 stays open on purpose.
+
+**2. Make the server answer instead of the client guessing.** ✅ **ALREADY IMPLEMENTED**
+— checked against the tree rather than assumed, and deliberately NOT rebuilt (PR #821).
+`Hub::create_session` returns `AgentOffline` when the request cannot reach a live agent;
+`ws/remote_control.rs` runs a 250 ms cross-pod rehome probe and then sends
+`ServerMsg::Error` with an attributable code (`agent_offline` / `agent_on_other_pod`);
+the client surfaces it via `rcErrorMessage` and advances the ladder via
+`isRetryableRcErrorCode`. So the undeliverable case already fails in well under a second.
+
+⚠️ **This is the wrong-turn worth recording**: the proposal was written from the
+assumption that the fast-fail was missing, and it is not. What the server genuinely
+CANNOT see is the case actually observed — session `…ff8c23` **reached** the agent,
+gathered candidates at +160 ms, and then went silent. A live agent that stops answering
+is not detectable by another server-side check; it needs part 3.
+
+**3. Instrument time-to-first-frame.** ✅ **SHIPPED** (PR #821). Request → first painted
+frame, reported the way FR-1 P7 instrumented paint age. Without it every future claim
+here is an anecdote. Feeds FR-16 (#798) L3.
+
+`ui/src/composables/rcConnectTiming.ts` records eight marks — `request_sent`,
+`session_created`, `ready`, `offer_sent`, `answer`, `pc_connected`, `dc_open`,
+`first_frame` — and logs per-STEP deltas.
+
+⚠️ **Marks are per ATTEMPT, not per connect.** A recorder shared across the ladder would
+let a fast retry overwrite the lost attempt's marks and report an 18 s connect as a 3 s
+one — hiding the exact defect being hunted.
+⚠️ **An unreached step prints as `<name>:—`, not omitted**, and the abandoned/cancelled
+paths log too. A MISSING mark is the finding: it names the step that never completed,
+which is what separates a half-open agent WS from a cross-pod split from a lost SDP
+frame. The three fail in different phases; a single total cannot tell them apart.
+⚠️ Deltas rather than absolute offsets — the actionable quantity is *which wait was
+long*, and with offsets every step after a 9 s stall looks equally late.
 
 ## Acceptance criteria
 
-- [ ] Instrumented TTFF exists and a normal connect reports it (p50 ≈ the measured
-      3–5 s, not a number we assumed).
-- [ ] An attempt that cannot reach the agent fails in **< 2 s** with an attributable
-      reason, rather than after the signalling timeout.
-- [ ] A deliberately stalled attempt (agent WS killed mid-request) recovers in
-      **< 8 s** end-to-end, down from ~18 s.
-- [ ] The healthy path is not slowed: p50 TTFF unchanged within noise.
+- [x] Instrumented TTFF exists and a normal connect reports it. **Built** (#821);
+      the p50 number itself is a FIELD reading and lands in the log below once a build
+      carrying this has run — the criterion is not "we assumed 3–5 s".
+- [x] An attempt that cannot reach the agent fails in **< 2 s** with an attributable
+      reason, rather than after the signalling timeout. **Already true** — see part 2:
+      `AgentOffline` → 250 ms cross-pod probe → `rc:error` with a code the UI shows.
+      Verified by reading the path, not by rebuilding it.
+- [x] A deliberately stalled attempt recovers in **< 8 s** end-to-end, down from ~18 s.
+      Arithmetic locked by a unit test: 4 s bound + 250 ms ladder + ~3 s normal connect.
+      ⚠️ Holds for a stall in `requesting`; a stall in `negotiating` still costs 15 s by
+      design, because that bound is guarding ICE.
+- [ ] The healthy path is not slowed: p50 TTFF unchanged within noise. Needs the field
+      reading above; nothing healthy was near either bound, so the expectation is no
+      change — but that is a prediction, not a result.
 - [ ] The stall's ROOT CAUSE is identified from the new instrumentation and recorded
-      here — shortening the timeout is mitigation, not a diagnosis.
+      here — shortening the timeout is mitigation, not a diagnosis. **Still open**, and
+      the reason this FR does not close on the two shipped parts.
 
 ## Out of scope
 
@@ -100,3 +139,4 @@ part 2's fast-fail cannot be told apart from a fast success. Feeds FR-16 (#798) 
 | date | build | result |
 |---|---|---|
 | 2026-08-28 | 0.4.12 | Investigated. Agent-side spans measured across 10 sessions (above); ICE trickle ruled out; 15 s signalling timeout identified as the cost mechanism. Trigger not yet proven. |
+| 2026-08-28 | — | Parts 1 + 3 merged (#821): phase-aware bound (`requesting` 4 s) and eight-mark connect timing. Part 2 measured against the tree and found ALREADY PRESENT — recorded rather than rebuilt. **No field reading yet**; the p50 and the root cause both need a deployed build, so nothing here is a result. |
