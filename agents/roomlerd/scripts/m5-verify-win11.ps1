@@ -5,7 +5,7 @@ The agent has shipped two autostart strategies on Windows since 0.1.58:
   - Scheduled Task (default, perUser MSI's RegisterAutostart custom action).
     Logs to %LOCALAPPDATA%\roomler\roomler-agent\data\logs\.
   - SCM service `RoomlerAgentService` (M1 + M2, opt-in via
-    `roomler-agent service install --as-service` from elevated PS).
+    `roomlerd service install --as-service` from elevated PS).
     Logs to %PROGRAMDATA%\roomler\roomler-agent\service-logs\.
 
 Until M5, only the Scheduled Task path was field-tested. This script

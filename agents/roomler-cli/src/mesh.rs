@@ -1,4 +1,4 @@
-//! SOCKS5 **mesh** mode (`roomler-tunnel socks5` with no `--agent`).
+//! SOCKS5 **mesh** mode (`roomler socks5` with no `--agent`).
 //!
 //! One local SOCKS5 proxy that reaches the WHOLE tenant: each CONNECT names an
 //! agent, and the mesh routes the flow to that agent. It reuses the proven
