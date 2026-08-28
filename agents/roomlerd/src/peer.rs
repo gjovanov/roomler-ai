@@ -1042,13 +1042,24 @@ impl AgentPeer {
                         // negotiated this transport) consults this
                         // handle each iteration and routes encoded
                         // frames here instead of the WebRTC video
-                        // track. No-op today — full pump-side branch
-                        // lands in a follow-up. Logging the open
-                        // event so a future regression where the
-                        // channel arrives but the pump doesn't see it
-                        // is greppable.
+                        // track. Logging the open event so a future
+                        // regression where the channel arrives but the
+                        // pump doesn't see it is greppable.
+                        //
+                        // FR-17 — log the NEGOTIATED delivery mode. The
+                        // controller chooses ordering at
+                        // `createDataChannel`, so nothing server-side
+                        // otherwise records which mode a session ran in,
+                        // and an A/B between ordered and unordered was
+                        // only attributable by trusting the order the
+                        // runs happened in. `accept_data_channels`
+                        // derives these from the DCEP `ChannelType`, so
+                        // they are the negotiated truth rather than a
+                        // local default.
                         info!(
                             session = %session_id,
+                            ordered = dc.ordered(),
+                            max_retransmits = ?dc.max_retransmits(),
                             "video-bytes DC stashed for Y.3 media-pump branch"
                         );
                         *video_bytes_stash.lock().await = Some(dc.clone());
@@ -5836,6 +5847,10 @@ async fn media_pump_ffmpeg_dc(
                 .unwrap_or(0.0);
             let send_wait_max_ms =
                 send_wait_us_max.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+            // FR-17 - read the LIVE channel, not a cached flag: the
+            // handle can be replaced mid-session, and a stale copy
+            // would mislabel exactly the window someone is measuring.
+            let video_dc_ordered = video_bytes_dc.lock().await.as_ref().map(|d| d.ordered());
             // rc.186 — step the encode-pressure controller off this window's
             // avg encode time; the new factor applies to the ceiling from the
             // next frame on (throttles a saturating encoder, restores when it
@@ -5909,6 +5924,13 @@ async fn media_pump_ffmpeg_dc(
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 send_wait_avg_ms, send_wait_max_ms,
                 send_stalls,
+                // FR-17 - the NEGOTIATED delivery mode of this
+                // session's `video-bytes` channel, so a heartbeat is
+                // self-labelling. Without it an ordered-vs-unordered
+                // A/B is only attributable by trusting the order the
+                // runs happened in, which is an assumption wearing the
+                // costume of a measurement.
+                dc_ordered = ?video_dc_ordered,
                 paced_fps = ?governor.paced_fps(),
                 encode_factor = governor.encode_factor(),
                 avg_qp = ?avg_qp,
