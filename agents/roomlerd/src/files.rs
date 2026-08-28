@@ -60,7 +60,7 @@ const MAX_TRANSFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Process-global flag for the `files:dir` browse capability. Set
 /// once at startup from `AgentConfig::enable_remote_browse` (and the
-/// `ROOMLER_AGENT_DISABLE_BROWSE` env-var escape hatch). Readers in
+/// `ROOMLERD_DISABLE_BROWSE` env-var escape hatch). Readers in
 /// the DC hot path use [`is_remote_browse_enabled`] which compiles
 /// to a single relaxed atomic load.
 ///

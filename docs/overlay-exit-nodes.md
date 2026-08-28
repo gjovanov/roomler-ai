@@ -156,7 +156,7 @@ Four layers, each defending against a different way to cut yourself off:
   heartbeat while the subscription is live (`…_ROUTE_TICK_SECS` overrides;
   `2` = the pre-demotion cadence) and returns to 2 s automatically if the
   subscription is unavailable or dies. Kill-switch:
-  `ROOMLER_NODE_OVERLAY_ROUTE_EVENTS=0` reverts to the 2 s tick-only guard.
+  `ROOMLERD_OVERLAY_ROUTE_EVENTS=0` reverts to the 2 s tick-only guard.
 
 Teardown is symmetric: a clean exit reverts everything; an unclean exit
 self-heals because the OS default route is *never deleted* (the `/1`s just

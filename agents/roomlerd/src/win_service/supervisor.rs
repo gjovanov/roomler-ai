@@ -301,7 +301,7 @@ pub unsafe fn spawn_in_session(token: HANDLE, exe: &Path, args: &[&str]) -> Resu
     })
 }
 
-/// Parse the `ROOMLER_AGENT_ELEVATE_WORKER` value. **Default ON**
+/// Parse the `ROOMLERD_ELEVATE_WORKER` value. **Default ON**
 /// (field-proven on an interactive-admin box, 2026-07-23): the
 /// user-context worker is spawned with the interactive admin's ELEVATED
 /// linked token so the overlay's Wintun adapter (a privileged device
@@ -354,7 +354,7 @@ fn parse_elevate_flag(val: Option<&str>) -> bool {
 /// lets input injection reach elevated foreground apps (the UIPI gap).
 ///
 /// **Default ON** (field-proven 2026-07-23); disable per-host with
-/// `ROOMLER_AGENT_ELEVATE_WORKER=0`. The elevation is inert unless the
+/// `ROOMLERD_ELEVATE_WORKER=0`. The elevation is inert unless the
 /// interactive user is a UAC-split administrator, so the default only
 /// engages on the hosts that need it — see [`parse_elevate_flag`].
 fn worker_elevation_requested() -> bool {
@@ -734,7 +734,7 @@ pub enum ExitReaction {
 /// but this helper keeps the supervisor's call site free of
 /// `#[cfg]` arms.
 ///
-/// Also gated on the `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` env var. The
+/// Also gated on the `ROOMLERD_ENABLE_SYSTEM_SWAP` env var. The
 /// auto-swap from user-context → SystemContext on every controller
 /// connection is more aggressive than the original M3 A1 plan
 /// intended (the plan called for swap on lock screen, not on every
@@ -744,7 +744,7 @@ pub enum ExitReaction {
 /// user-context worker always, Z-path overlay covers the lock screen,
 /// no SystemContext spawn ever fires.
 ///
-/// Set `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` (or `true`/`yes`/`on`) in
+/// Set `ROOMLERD_ENABLE_SYSTEM_SWAP=1` (or `true`/`yes`/`on`) in
 /// the SCM service environment to re-enable.
 ///
 /// **0.3.0-rc.7 semantic change**: when the env var is on, this
@@ -782,7 +782,7 @@ fn peer_presence_is_signaled() -> bool {
     }
 }
 
-/// Read the `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` env var.
+/// Read the `ROOMLERD_ENABLE_SYSTEM_SWAP` env var.
 /// Truthy values: `1` / `true` / `yes` / `on` (case-insensitive).
 /// Anything else (including unset) → false.
 #[cfg(all(feature = "system-context", target_os = "windows"))]
@@ -941,7 +941,7 @@ struct ActiveWorker {
 // Track A stage 1 — the SECOND supervisor child: `roomlerd netd`.
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Truthiness for the `ROOMLER_AGENT_OVERLAY_NETD` env lever (pure; tested).
+/// Truthiness for the `ROOMLERD_OVERLAY_NETD` env lever (pure; tested).
 fn netd_flag_truthy(v: &str) -> bool {
     let t = v.trim();
     t.eq_ignore_ascii_case("1")
@@ -951,13 +951,13 @@ fn netd_flag_truthy(v: &str) -> bool {
 }
 
 /// Track A stage 1 — is the netd scaffold enabled? Env lever first
-/// (`ROOMLER_AGENT_OVERLAY_NETD`), else the MACHINE-GLOBAL config's
+/// (`ROOMLERD_OVERLAY_NETD`), else the MACHINE-GLOBAL config's
 /// `overlay_netd` (the supervisor is LocalSystem; per-user enrollments
 /// keep today's single-child topology until a later stage). Read ONCE at
 /// service start — changing it needs a service restart, by design: the
 /// two-child topology must never flip mid-run.
 fn netd_enabled() -> bool {
-    if let Ok(v) = std::env::var("ROOMLER_AGENT_OVERLAY_NETD") {
+    if let Some(v) = tunnel_core::env::node_env("OVERLAY_NETD") {
         return netd_flag_truthy(&v);
     }
     let p = crate::config::machine_global_config_path();
@@ -1083,7 +1083,7 @@ pub fn run(
         let enabled = system_swap_enabled();
         tracing::info!(
             enabled,
-            env_var = "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+            env_var = "ROOMLERD_ENABLE_SYSTEM_SWAP",
             "supervisor: M3 A1 auto-swap (user-context -> SystemContext) is {}",
             if enabled {
                 "ENABLED"
@@ -1391,7 +1391,7 @@ pub fn run(
                         // ELEVATED linked token so the overlay's Wintun
                         // adapter (a privileged device install) succeeds
                         // without the heavier SystemContext SYSTEM-swap.
-                        // Default-on; kill-switch ROOMLER_AGENT_ELEVATE_
+                        // Default-on; kill-switch ROOMLERD_ELEVATE_
                         // WORKER=0. Falls back to the filtered `token` for
                         // standard users / already-elevated / any failure
                         // (no regression). `elevated` (when Some) owns the
