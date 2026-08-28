@@ -496,7 +496,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          src=$(ls target/debian/roomler-agent_*_amd64.deb | head -n1)
+          # FR-21 P2a: cargo-deb emits `<package>_<version>_<arch>.deb`, and the
+          # package is `roomlerd` now. The DESTINATION asset name is deliberately
+          # left as `roomler-agent-…` — it is a published, immutable surface that
+          # every prior release already carries, and the updater's picker keys on
+          # the extension + arch token, never the prefix (updater.rs::pick_asset_for_unix).
+          # Renaming it is a separate decision with its own blast radius.
+          src=$(ls target/debian/roomlerd_*_amd64.deb | head -n1)
           dst="roomler-agent-${version}-x86_64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
@@ -657,7 +663,13 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          src=$(ls target/debian/roomler-agent_*_arm64.deb | head -n1)
+          # FR-21 P2a: cargo-deb emits `<package>_<version>_<arch>.deb`, and the
+          # package is `roomlerd` now. The DESTINATION asset name is deliberately
+          # left as `roomler-agent-…` — it is a published, immutable surface that
+          # every prior release already carries, and the updater's picker keys on
+          # the extension + arch token, never the prefix (updater.rs::pick_asset_for_unix).
+          # Renaming it is a separate decision with its own blast radius.
+          src=$(ls target/debian/roomlerd_*_arm64.deb | head -n1)
           dst="roomler-agent-${version}-aarch64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
