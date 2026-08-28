@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchDaemon for the UPDATE HALF — `roomler-agent update-helper`.
+  LaunchDaemon for the UPDATE HALF — `roomlerd update-helper`.
 
   Why this exists: `installer -pkg … -target /` requires root, and the
   DEFAULT macOS install is the per-user LaunchAgent alone (the privileged
