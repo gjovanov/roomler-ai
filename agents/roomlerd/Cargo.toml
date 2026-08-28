@@ -37,7 +37,7 @@ roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
 # CLI binary (rc.361: 22.1 MiB, ~92 % of it crates this daemon already links).
 # Cheap to add: this crate's lib is CLI glue over tunnel-core + remote-control,
 # both of which are already in the graph above.
-roomler-tunnel = { path = "../roomler-cli" }
+roomler-cli = { path = "../roomler-cli" }
 
 # Async + networking
 tokio = { workspace = true }
@@ -617,7 +617,7 @@ maintainer-scripts = "packaging/linux/debian"
 # safe exactly because `replaces` already transferred every file.
 name = "roomlerd"
 provides = "roomler-agent"
-replaces = "roomler-tunnel, roomler-agent"
+replaces = "roomler-tunnel, roomler-cli, roomler-agent"
 assets = [
     # P3d Slice B: installed binary is `roomlerd` (the [[bin]] output name).
     ["target/release/roomlerd", "usr/bin/", "755"],
