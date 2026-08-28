@@ -6,7 +6,7 @@
 //! CLI binary finds its config on first run.
 //!
 //! Moved here (P4a) from the legacy tunnel wizard's enroll.rs (crate
-//! retired in P4c-2). The `roomler_tunnel`-coupled `write_config`
+//! retired in P4c-2). The `roomler_cli`-coupled `write_config`
 //! half lives with the dep holders (the setup app's tunnel
 //! orchestrator) — this crate stays free of the tunnel dep.
 //! Original rationale for not calling
@@ -141,7 +141,7 @@ pub async fn enroll(
 
 /// Derive a stable opaque `machine_id` from `machine_name` + the host's
 /// `OS::HOSTNAME` env + OS/arch. Mirrors
-/// `agents/roomler-tunnel/src/main.rs::derive_machine_id` exactly so
+/// `agents/roomler-cli/src/main.rs::derive_machine_id` exactly so
 /// re-enrollments from the same wizard land on the same row in the
 /// server's `tunnel_clients` collection (unique index on
 /// `{tenant_id, machine_id}`).
