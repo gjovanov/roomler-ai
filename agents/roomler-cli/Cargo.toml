@@ -122,7 +122,7 @@ assets = [
 
 # cargo-wix (Windows .msi)
 #   cargo wix -p roomler-tunnel --nocapture
-# Source lives at agents/roomler-tunnel/wix/main.wxs (T4).
+# Source lives at agents/roomler-cli/wix/main.wxs (T4).
 [package.metadata.wix]
 upgrade-guid = "8A4D2E1B-5C9F-4D7E-A2B3-1F4E6A8B9C2D"
 path-guid    = "4D2C8F12-7E9A-4B6D-8C3F-5A1E9F2D8B47"

@@ -277,7 +277,7 @@ order and it is wrong, because in a rename the docs are only wrong *after* the c
 ```rust
 -#[command(name = "roomlerd", version, about, long_about = None)]   // agents/roomlerd/src/main.rs:39
 +#[command(name = "roomlerd",      version, about, long_about = None)]
--#[command(name = "roomler-tunnel", ...)]                                // agents/roomler-tunnel/src/cli.rs:60
+-#[command(name = "roomler-tunnel", ...)]                                // agents/roomler-cli/src/cli.rs:60
 +#[command(name = "roomler",        ...)]
 ```
 

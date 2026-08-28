@@ -141,7 +141,7 @@ pub async fn enroll(
 
 /// Derive a stable opaque `machine_id` from `machine_name` + the host's
 /// `OS::HOSTNAME` env + OS/arch. Mirrors
-/// `agents/roomler-tunnel/src/main.rs::derive_machine_id` exactly so
+/// `agents/roomler-cli/src/main.rs::derive_machine_id` exactly so
 /// re-enrollments from the same wizard land on the same row in the
 /// server's `tunnel_clients` collection (unique index on
 /// `{tenant_id, machine_id}`).
