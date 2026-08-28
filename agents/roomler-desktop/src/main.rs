@@ -23,7 +23,7 @@
 //!   and the consent watcher must outlive the window, since surfacing
 //!   consent prompts is this app's safety-relevant job.
 //!
-//! See `agents/roomler-agent-tray/Cargo.toml` for the dep wiring (the
+//! See `agents/roomler-desktop/Cargo.toml` for the dep wiring (the
 //! package keeps its historical name; the output binary is
 //! `roomler-desktop` since P3d).
 
