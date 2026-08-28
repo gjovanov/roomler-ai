@@ -364,6 +364,8 @@ pub const INSTALL_FOLDER_NAME: &str = "Roomler";
 /// rc.194. The `cleanup-legacy-install` vacated-dir sweep targets
 /// this after a rename-hop upgrade.
 #[cfg(target_os = "windows")]
+// RETIRED-NAME-ANCHOR: the cleanup sweep needs the OLD folder name to find the
+// vacated directory after a rename-hop upgrade. See docs/fr/FR-21.
 pub(crate) const LEGACY_INSTALL_FOLDER_NAME: &str = "roomler-agent";
 
 /// Resolve a flavour's MSI install directory for a given folder name:
