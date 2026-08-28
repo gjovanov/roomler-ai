@@ -7,9 +7,9 @@
 //! declines media until the screen-capture / encode / WebRTC pieces land.
 //!
 //! CLI:
-//!   roomler-agent enroll --server <url> --token <enrollment-jwt> \
+//!   roomlerd enroll --server <url> --token <enrollment-jwt> \
 //!                        --name "Goran's Laptop" [--config <path>]
-//!   roomler-agent run    [--config <path>]
+//!   roomlerd run    [--config <path>]
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -110,7 +110,7 @@ enum Command {
         #[arg(long)]
         token: String,
         /// Multi-org: which enrollment to refresh — `primary` (default) or
-        /// a `[[orgs]]` label (`roomler-agent org ls`). The token is posted
+        /// a `[[orgs]]` label (`roomlerd org ls`). The token is posted
         /// to THAT org's server; the response must resolve to the same
         /// org (a different-tenant token belongs in `enroll`).
         #[arg(long)]
@@ -148,7 +148,7 @@ enum Command {
     /// `installer -pkg … -target /` as root, waiting on it. Root-only and
     /// single-shot; the pkg's postinstall restarts the agent halves.
     /// Hidden: launchd is the caller — by hand it is
-    /// `sudo roomler-agent update-helper`, and running it non-root only
+    /// `sudo roomlerd update-helper`, and running it non-root only
     /// prints the refusal.
     #[command(hide = true, name = "update-helper")]
     UpdateHelper,
@@ -359,8 +359,8 @@ enum Command {
     /// any rc.28+ wizard EXE in the field. Requires admin (HKLM write).
     ///
     /// Typical use:
-    ///   roomler-agent set-service-env-var --name ROOMLER_AGENT_VP9_FPS --value 60
-    ///   roomler-agent restart-service
+    ///   roomlerd set-service-env-var --name ROOMLER_AGENT_VP9_FPS --value 60
+    ///   roomlerd restart-service
     #[command(name = "set-service-env-var")]
     SetServiceEnvVar {
         /// Env var name (e.g. `ROOMLER_AGENT_VP9_FPS`,
@@ -1299,18 +1299,18 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
             println!("Enrolled into an ADDITIONAL org as {label:?}. Agent id: {enrolled_agent_id}");
             println!(
                 "This machine now serves {} enrollment(s); manage them with \
-                 `roomler-agent org ls`.",
+                 `roomlerd org ls`.",
                 1 + cfg.orgs.len()
             );
         }
     }
     println!("Config written to: {}", target_path.display());
-    println!("Run `roomler-agent run` (or restart the service) to connect.");
+    println!("Run `roomlerd run` (or restart the service) to connect.");
 
     // rc.53 Phase 7: WINHOST-B's recurring pain — operator runs
     // `enroll --machine-global` from a user PowerShell, the config
     // lands in %PROGRAMDATA% (where the LocalSystem service reads
-    // it), but then `roomler-agent run` from THAT SAME user shell
+    // it), but then `roomlerd run` from THAT SAME user shell
     // reads %APPDATA% (a separate config, different machine_id) and
     // looks like a different host to the server. Surface the
     // asymmetry explicitly so the operator doesn't burn an hour
@@ -1326,7 +1326,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 /// rc.53 Phase 7 predicate: should the `--machine-global` enroll
 /// command print the user-vs-LocalSystem warning? True when the
 /// current process is NOT the LocalSystem worker — i.e. the operator
-/// is enrolling from a user shell where `roomler-agent run` would
+/// is enrolling from a user shell where `roomlerd run` would
 /// later read %APPDATA% instead of %PROGRAMDATA%.
 ///
 /// Gated on `system-context` feature + Windows; non-Windows / non-SC
@@ -1356,7 +1356,7 @@ fn enroll_user_context_warning_due() -> bool {
 #[cfg(target_os = "windows")]
 fn warning_message_for_user_context_enroll() -> String {
     "NOTE: --machine-global wrote config to %PROGRAMDATA%, which is read by\n\
-     the LocalSystem service worker. A `roomler-agent run` from THIS user\n\
+     the LocalSystem service worker. A `roomlerd run` from THIS user\n\
      shell will instead read %APPDATA% (a separate config, different\n\
      machine_id) and will look like a different host to the server.\n\
 \n\
@@ -1403,9 +1403,7 @@ async fn re_enroll_cmd(
         )
     } else {
         let entry = existing.find_org(org_label).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no org labelled {org_label:?} in this config — see `roomler-agent org ls`"
-            )
+            anyhow::anyhow!("no org labelled {org_label:?} in this config — see `roomlerd org ls`")
         })?;
         (
             entry.server_url.clone(),
@@ -1460,18 +1458,18 @@ async fn re_enroll_cmd(
         notify::clear_all_attention();
     }
     println!("Re-enrollment successful for {org_label:?}. Agent id: {refreshed_agent_id}");
-    println!("Run `roomler-agent run` (or wait for the supervisor to relaunch) to reconnect.");
+    println!("Run `roomlerd run` (or wait for the supervisor to relaunch) to reconnect.");
     Ok(())
 }
 
-/// Multi-org P1 — `roomler-agent org <ls|rm|enable|disable|set-primary>`.
+/// Multi-org P1 — `roomlerd org <ls|rm|enable|disable|set-primary>`.
 /// Direct config-file edits (same model as `enroll`): the daemon applies
 /// changes on its next start. Runtime org verbs over the LocalAPI land with
 /// the desktop org-management UI in a later phase.
 fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
     let mut cfg = config::load(config_path).with_context(|| {
         format!(
-            "loading config at {} (run `roomler-agent enroll` first)",
+            "loading config at {} (run `roomlerd enroll` first)",
             config_path.display()
         )
     })?;
@@ -1515,7 +1513,7 @@ fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
             let before = cfg.orgs.len();
             cfg.orgs.retain(|o| o.label != label);
             if cfg.orgs.len() == before {
-                bail!("no org labelled {label:?} — see `roomler-agent org ls`");
+                bail!("no org labelled {label:?} — see `roomlerd org ls`");
             }
             println!(
                 "Removed org {label:?} from this machine. NOTE: the device row in that \
@@ -1559,7 +1557,7 @@ fn set_org_enabled(cfg: &mut config::AgentConfig, label: &str, enable: bool) -> 
         );
     }
     let Some(entry) = cfg.orgs.iter_mut().find(|o| o.label == label) else {
-        bail!("no org labelled {label:?} — see `roomler-agent org ls`");
+        bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };
     entry.enabled = enable;
     println!(
@@ -1708,7 +1706,7 @@ fn macos_permission_preflight() {
 async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()> {
     if !config_path.exists() {
         bail!(
-            "no config found at {}. Run `roomler-agent enroll` first.",
+            "no config found at {}. Run `roomlerd enroll` first.",
             config_path.display()
         );
     }
@@ -1725,7 +1723,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             instance_lock::AcquireOutcome::AlreadyRunning => {
                 eprintln!(
                     "Another roomler-agent is already running for this config; exiting.\n\
-                 (use `roomler-agent service status` to check the auto-start hook,\n\
+                 (use `roomlerd service status` to check the auto-start hook,\n\
                  or stop the running instance before starting a new one.)"
                 );
                 tracing::warn!("single-instance lock held by another process; exiting");
@@ -3018,7 +3016,7 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
     if no_restart {
         let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
         println!(
-            "--no-restart: skipping service restart. Run `roomler-agent restart-service` to apply."
+            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply."
         );
         return Ok(());
     }
@@ -3028,7 +3026,7 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
     {
         let hint = "Env-var write succeeded; service restart failed. Common cause: a \
                     `services.msc` window holds a handle on RoomlerAgentService. Close \
-                    any open services consoles and run `roomler-agent restart-service` \
+                    any open services consoles and run `roomlerd restart-service` \
                     again.";
         let _ = attempt::record(&attempt::Attempt::failure(
             COMMAND,
@@ -3070,7 +3068,7 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
     if no_restart {
         let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
         println!(
-            "--no-restart: skipping service restart. Run `roomler-agent restart-service` to apply."
+            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply."
         );
         return Ok(());
     }
@@ -3078,7 +3076,7 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
     if let Err(e) = environment::restart_service(Duration::from_secs(DEFAULT_RESTART_TIMEOUT_SECS))
     {
         let hint = "Env-var unset succeeded; service restart failed. Close any open \
-                    `services.msc` consoles and run `roomler-agent restart-service` again.";
+                    `services.msc` consoles and run `roomlerd restart-service` again.";
         let _ = attempt::record(&attempt::Attempt::failure(
             COMMAND,
             attempt::Stage::ServiceRestart,
@@ -3105,14 +3103,14 @@ fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
             environment::set_service_env_var(name, v)
                 .with_context(|| format!("set-service-env-var: {name}={v}"))?;
             println!(
-                "{name}={v} written to SCM service env block. Run `roomler-agent restart-service` to apply."
+                "{name}={v} written to SCM service env block. Run `roomlerd restart-service` to apply."
             );
         }
         None => {
             environment::unset_service_env_var(name)
                 .with_context(|| format!("unset-service-env-var: {name}"))?;
             println!(
-                "{name} removed from SCM service env block. Run `roomler-agent restart-service` to apply."
+                "{name} removed from SCM service env block. Run `roomlerd restart-service` to apply."
             );
         }
     }
@@ -3497,7 +3495,7 @@ fn peer_presence_status_cmd() -> Result<()> {
 mod tests {
     //! Locks the CLI parses that wizard Done-page snippets rely on:
     //! the unified roomler-setup wizard surfaces
-    //! `roomler-agent disable-system-context`
+    //! `roomlerd disable-system-context`
     //! (`agents/roomler-setup/src/front/index.html`, SystemContext
     //! note), and the rc.30-era operator snippet still in field hands
     //! used `enable-system-context` / `set-service-env-var`. If any of

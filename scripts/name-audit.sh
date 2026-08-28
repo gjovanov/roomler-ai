@@ -116,8 +116,36 @@ scan() {
                 bare = line
                 sub(/^[ \t]*/, "", bare)
 
-                is_marker = (line ~ /RETIRED-NAME-ANCHOR/)
                 has_token = (line ~ ENVIRON["TOKENS"])
+
+                # A BEGIN/END pair covers a whole REGION. Line-counted spans are
+                # too brittle for prose — a historical appendix is edited far more
+                # often than it is renumbered — so a region that is frozen as a
+                # body (an appendix recording what operators actually typed, a
+                # legacy-cleanup module) says so explicitly at both ends.
+                if (line ~ /RETIRED-NAME-ANCHOR-BEGIN/) {
+                    in_region = 1
+                    region_line = NR
+                    region_used[NR] = 0
+                    next
+                }
+                if (line ~ /RETIRED-NAME-ANCHOR-END/) {
+                    if (!in_region)
+                        print "STALEMARKER\t" file "\t" NR "\tEND without a matching BEGIN"
+                    else if (!region_used[region_line])
+                        print "STALEMARKER\t" file "\t" region_line "\tBEGIN/END region holds no retired name"
+                    in_region = 0
+                    next
+                }
+                if (in_region) {
+                    if (has_token) {
+                        print "ANCHORED\t" file "\t" NR "\t" line
+                        region_used[region_line] = 1
+                    }
+                    next
+                }
+
+                is_marker = (line ~ /RETIRED-NAME-ANCHOR/)
                 # Comment syntaxes across the tree: Rust/TS //, shell/YAML/systemd #,
                 # block-comment continuation *, /*, XML <!--, ini ;.
                 is_comment = (bare ~ /^(\/\/|#|\*|\/\*|<!--|;)/)
