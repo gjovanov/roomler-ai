@@ -441,14 +441,30 @@ whole of it.
 |---|---|---|
 | 2026-08-28 | **Debian takeover, against real artifacts.** Built `.deb` from `release-agent.yml` run `33150602388`; published `agent-v0.4.11` `.deb` as the upgrade-from side. | **PASS.** `Package: roomlerd`, `Provides: roomler-agent`, `Replaces: roomler-tunnel, roomler-agent`. Upgrade via `dpkg -i` (the self-updater's *fallback*, the stricter path): **exit 0, zero overwrite conflicts**; `/usr/bin/roomlerd` + `/usr/bin/roomler` ownership transferred to `roomlerd`; unit present. Vestigial `ii roomler-agent` remains exactly as designed, and the one-time `--remove roomler-agent` sweep exits 0 with **all files surviving**. Asset filename unchanged (`roomler-agent-0.4.11-…deb`), so the "no artifact name moves" criterion holds. |
 | 2026-08-28 | Full release lane under the renamed packages (dispatch). | **PASS** — both `.deb`s, `.msi`, `.pkg`, companion EXE all build. |
-| — | P6 on a real host: `apt upgrade` with the old package genuinely installed and the daemon running; the Windows/macOS matrix in §9.4. | *not started* |
+| 2026-08-28 | **P6 Linux, on three REAL hosts** — mars, jupiter, zeus, each with `roomler-agent 0.4.11-1` genuinely installed and the daemon running. `.deb` from run `33150602388`, moved to each host over the roomler mesh itself (`100.65.4.2` → node). Primary path `apt-get install ./…deb`, not the fallback. | **PASS.** `Replacing files in old package roomler-agent`, exit 0, no conflict, on all three. `/usr/bin/roomlerd`, `/usr/bin/roomler` and the bundled FFmpeg `.so`s transferred owner; `ldd` 0 not-found; node id + overlay ip UNCHANGED; service active on the new binary; `roomlerd --version` now `roomlerd 0.4.11` (production printed `roomler-agent 0.4.11`). |
+| 2026-08-28 | **The RUST_LOG shim, forced onto the legacy spec** — a `.deb` upgrade replaces the packaged unit, so a plain upgrade tests the FILE, not the fallback. Drop-in pinned `RUST_LOG=roomler_agent=info,warn` on mars, then restart. | **PASS.** INFO 40 → 75: 35 new lines from the renamed lib under a spec naming ONLY the retired target. Without the shim it stays 40 and the daemon goes dark above `warn`. Drop-in removed; the operator's own `virtual-desktop.conf` untouched. |
+| — | P6 Windows + macOS: the install/upgrade matrix in §9.4. | *not started* |
 
-⚠️ What the Debian test above does **not** prove: it used an isolated dpkg root with
-`--force-depends` and `--force-script-chrootless`, so base deps were unresolved and maintainer
-scripts ran unchrooted (`postinst` is only `systemctl daemon-reload`); and it exercised only
-`dpkg -i`, not the `apt-get install` primary path. That is the conservative direction — the
-fallback is stricter about conflicts — but it is not the same as having run it, and **no real
-host has taken this upgrade**.
+⚠️ The isolated-dpkg-root row above used `--force-depends` + `--force-script-chrootless` and
+exercised only `dpkg -i`. Its caveat — *"no real host has taken this upgrade"* — **no longer
+holds**: the two rows beneath it are three real fleet hosts taking it through the `apt-get
+install` primary path, with the daemon running and the old package genuinely installed. The two
+tests are complementary rather than redundant — the isolated one covers the stricter `dpkg -i`
+fallback, the fleet one covers the path the self-updater actually tries first.
+
+⚠️ **The rename is a ONE-WAY DOOR, and this is the open risk.** The released `roomler-agent`
+package carries `Replaces: roomler-tunnel` only, so a `.deb` still packaged as `roomler-agent`
+**cannot install** over a converted host — it would overwrite `/usr/bin/roomlerd`, which
+`roomlerd` now owns. Three fleet hosts are converted. Land P2a before the next agent release, or
+add `Replaces: roomlerd` + `Provides: roomlerd` to master's package. The failure is visible and
+non-destructive (the update fails, the host keeps running), but it is a stuck fleet until fixed.
+
+⚠️ Not a regression, chased rather than assumed: jupiter/zeus sat on `relay:derp/tcp` from the
+dev box after their restarts. From mars both were `direct 0 ms` throughout — only the long-haul
+path to a home NAT degraded — and the `demote-follow` WARN (#746; its mitigation
+`overlay_answer_while_followed` is unset on these hosts) occurred 171/158/81 times on the three
+days BEFORE this change versus 39 today, restarts included. Take a second vantage before calling
+a relay state a regression.
 
 **To confirm before P4 lands** (§5): read the actual staging directory on a fresh perMachine
 Windows host and on a pre-rename perMachine host. The prediction is that they differ
