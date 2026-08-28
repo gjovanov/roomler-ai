@@ -58,6 +58,7 @@ import {
   RC_STALL_PROBE_TICKS,
   RC_STALL_FAIL_TICKS,
   isRetryableTerminateReason,
+  friendlyEndReason,
   isRetryableRcErrorCode,
   readyRecoveryAction,
   sessionGateAllows,
@@ -3338,6 +3339,10 @@ describe('S3 resilience: isRetryableTerminateReason', () => {
       'agent_hangup',
       'user_denied',
       'consent_timeout',
+      // FR-27 - a device with no prompt surface would answer the retry the
+      // same way, so retrying is pure noise. Terminal by the allowlist's
+      // fail-safe default; asserted here so it stays deliberate.
+      'no_prompt_surface',
       'admin_terminated',
       'idle_timeout',
     ]) {
@@ -3350,6 +3355,31 @@ describe('S3 resilience: isRetryableTerminateReason', () => {
     expect(isRetryableTerminateReason(null)).toBe(false)
     expect(isRetryableTerminateReason('')).toBe(false)
     expect(isRetryableTerminateReason('some_future_reason')).toBe(false)
+  })
+})
+
+describe('FR-27: friendlyEndReason', () => {
+  it('tells the three consent outcomes apart', () => {
+    const denied = friendlyEndReason('user_denied')!
+    const timedOut = friendlyEndReason('consent_timeout')!
+    const noSurface = friendlyEndReason('no_prompt_surface')!
+    expect(new Set([denied, timedOut, noSurface]).size).toBe(3)
+    // The whole point of the wire change: a timeout must not read as a
+    // refusal. It says so out loud, because that IS what it used to say.
+    expect(timedOut).toMatch(/nobody answered/i)
+    expect(timedOut).toMatch(/nothing was declined/i)
+    expect(denied).toMatch(/declined/i)
+    expect(denied).not.toMatch(/nobody answered/i)
+    // And "nobody could be asked" has to name a fix the operator can act on.
+    expect(noSurface).toMatch(/desktop app|email/i)
+  })
+
+  it('stays silent on a nominal ending', () => {
+    for (const r of ['controller_hangup', 'agent_hangup', 'idle_timeout', 'agent_disconnect']) {
+      expect(friendlyEndReason(r)).toBeNull()
+    }
+    expect(friendlyEndReason(undefined)).toBeNull()
+    expect(friendlyEndReason('some_future_reason')).toBeNull()
   })
 })
 
