@@ -9,7 +9,7 @@
 #
 # Usage:
 #   ./scripts/dev-xvfb.sh                # runs the capture smoke test
-#   ./scripts/dev-xvfb.sh run            # runs `roomler-agent run` (needs enrolled config)
+#   ./scripts/dev-xvfb.sh run            # runs `roomlerd run` (needs enrolled config)
 #   ./scripts/dev-xvfb.sh shell          # leaves Xvfb up and drops you into a shell
 #   ./scripts/dev-xvfb.sh <cmd> [args]   # runs <cmd> with DISPLAY set to the Xvfb
 #
