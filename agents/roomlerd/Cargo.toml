@@ -37,7 +37,7 @@ roomler-ai-tunnel-core = { path = "../../crates/tunnel-core" }
 # CLI binary (rc.361: 22.1 MiB, ~92 % of it crates this daemon already links).
 # Cheap to add: this crate's lib is CLI glue over tunnel-core + remote-control,
 # both of which are already in the graph above.
-roomler-tunnel = { path = "../roomler-tunnel" }
+roomler-tunnel = { path = "../roomler-cli" }
 
 # Async + networking
 tokio = { workspace = true }
