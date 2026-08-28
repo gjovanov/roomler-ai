@@ -2663,7 +2663,54 @@ export function isChromeWithBrokenScriptTransform(): boolean {
  *  worker to wait for the next IDR Ã¢ÂÂ far worse than a few ms of
  *  retransmit latency. */
 export const VP9_444_DC_LABEL = 'video-bytes'
-export const VP9_444_DC_OPTIONS: RTCDataChannelInit = { ordered: true }
+
+/**
+ * FR-17 stage B — how the `video-bytes` channel is opened.
+ *
+ * Historically `{ ordered: true }`, justified as "SCTP is doing the
+ * reassembly anyway, and dropping a P-frame is far worse than a few ms
+ * of retransmit latency". True on a LAN; falsified on a 90-210 ms relay,
+ * where one lost chunk head-of-line-blocks everything behind it and the
+ * backlog has no bound — measured `send_wait_max` 10,263 ms on an agent
+ * whose encoder was idle at 8-12 ms/frame.
+ *
+ * `maxRetransmits: 0` rather than a bounded retransmit is deliberate and
+ * is coupled to the RECEIVER. Stage A's assembler treats a chunk-index
+ * jump as an unrecoverable gap: it drops the frame and asks for an IDR.
+ * That is exactly right when a lost chunk never arrives, and WRONG the
+ * moment retransmits are allowed — a chunk that arrives one RTT late
+ * would be discarded as a gap, converting a recoverable frame into a
+ * lost one plus a keyframe request. Testing 1-2 retransmits (stage C)
+ * therefore requires a reorder buffer in the worker first; it is not a
+ * number that can be turned up on its own.
+ *
+ * ⚠️ Unordered is only legal WITH framing. An unframed stream is a bare
+ * byte sequence whose reassembly depends entirely on arrival order, so
+ * delivering it out of order does not degrade the picture — it produces
+ * garbage the decoder reports as corruption. This function is the single
+ * place that pairing is enforced, so the two can never be set
+ * independently by a caller who has not thought about it.
+ */
+export function videoDcOptions(
+  chunkFraming: boolean,
+  unordered: boolean,
+): RTCDataChannelInit {
+  if (!chunkFraming || !unordered) return { ordered: true }
+  return { ordered: false, maxRetransmits: 0 }
+}
+
+/** Field opt-in for stage B, mirroring `storedDecodePref`'s A/B knob.
+ *  Default OFF: this changes the delivery guarantee of the video path,
+ *  and the FR's own acceptance bar is a measured relay-pair improvement,
+ *  not a plausible argument. Pure + exported for tests. */
+export function storedUnorderedVideo(): boolean {
+  try {
+    return globalThis.localStorage?.getItem('roomler-rc-unordered-video') === '1'
+  } catch {
+    /* privacy mode - default off */
+    return false
+  }
+}
 
 /** Short codec name to pass into `new RTCRtpScriptTransform(worker,
  *  { codec })`. Reads the first negotiated codec off
@@ -5410,7 +5457,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // worker as ArrayBuffer chunks (transferred, not copied).
     let dc: RTCDataChannel
     try {
-      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+      // FR-17 stage B - unordered ONLY when this session negotiated
+      // framing; `videoDcOptions` enforces that pairing.
+      dc = pc.createDataChannel(
+        VP9_444_DC_LABEL,
+        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
+      )
     } catch (err) {
       console.warn('[rc] vp9-444 DC creation failed', err)
       try { worker.terminate() } catch { /* ignore */ }
@@ -5651,7 +5703,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // agent stays silent if it picked the WebRTC track instead.
     let dc: RTCDataChannel
     try {
-      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+      // FR-17 stage B - unordered ONLY when this session negotiated
+      // framing; `videoDcOptions` enforces that pairing.
+      dc = pc.createDataChannel(
+        VP9_444_DC_LABEL,
+        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
+      )
     } catch (err) {
       console.warn('[rc] hevc DC creation failed', err)
       try { worker.terminate() } catch { /* ignore */ }
