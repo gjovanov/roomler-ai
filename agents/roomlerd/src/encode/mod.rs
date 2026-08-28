@@ -297,6 +297,44 @@ pub fn relay_deferred_apply_allowed(
     big_move || since_last_apply.is_none_or(|d| d >= MIN_INTERVAL)
 }
 
+/// How long ONE frame may sit inside the DataChannel send call before the
+/// pump treats it as congestion, ms. `0` disables the signal.
+///
+/// Default 250: a healthy relay's send wait sits at ~0.2 ms p50 and, since
+/// FR-18 bounded the carrier queue, ~200 ms p99 — so this fires on the tail
+/// that FR-18 could not reach (SCTP's own window), not on ordinary jitter.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub fn send_stall_threshold() -> Option<std::time::Duration> {
+    let ms = tunnel_core::env::node_env("SEND_STALL_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(250);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// FR-10 follow-up — MAY a rebuild-bound bitrate apply land right now?
+///
+/// One named rule for both apply paths. It exists because the spacing was
+/// originally written into the DEFERRED flush only, and the sibling arm —
+/// "the scene is quiet, apply now" — silently skipped it. At session start
+/// nothing has moved yet, so that arm is always taken, and the AIMD's
+/// startup ramp turned into two or three blocking QSV re-opens inside the
+/// first 15 s, each shipping a fresh IDR onto a ~3 Mbps pipe (field
+/// 2026-08-28: the operator's "always slow right after connecting").
+///
+/// Keeping the rule in one function is the point: a third apply path added
+/// later gets the spacing by calling this, rather than by remembering.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub fn rebuild_apply_allowed(
+    constrained: bool,
+    thrift: bool,
+    since_last_apply: Option<std::time::Duration>,
+    current_bps: u32,
+    target_bps: u32,
+) -> bool {
+    !(constrained && thrift)
+        || relay_deferred_apply_allowed(since_last_apply, current_bps, target_bps)
+}
+
 /// MAX bumped 25→40 Mbps in rc.36. Field-confirmed (the field-test host) that
 /// rc.35 at 1920×1200 Quality=High was content-bound around 13 Mbps,
 /// well under the 25 Mbps cap — but `Quality=High × 1.5` math could
@@ -1075,6 +1113,69 @@ mod tests {
             1_500_000,
             3_000_000
         ));
+    }
+
+    /// The stall threshold is on by default and sits above the post-FR-18
+    /// p99, so it fires on the SCTP tail rather than on ordinary jitter.
+    #[test]
+    fn send_stall_threshold_defaults_above_the_healthy_tail() {
+        let d = send_stall_threshold().expect("on by default");
+        assert!(d >= std::time::Duration::from_millis(200));
+        assert!(d <= std::time::Duration::from_millis(1000));
+    }
+
+    /// FR-10 follow-up — the startup ramp must not become a rebuild storm.
+    ///
+    /// Replays the AIMD climb measured on CORPLAP-3 (2.55 M start, an early
+    /// dip, then a steady climb to the 3 M relay ceiling over ~26 s). Every
+    /// step is a small move, so after the first apply the spacing must hold
+    /// them: the whole ramp costs ONE further re-open, not six.
+    #[test]
+    fn startup_ramp_costs_one_rebuild_not_six() {
+        use std::time::Duration;
+        let ramp = [
+            (0u64, 2_550_000u32),
+            (2, 2_167_500),
+            (6, 2_355_000),
+            (12, 2_542_500),
+            (16, 2_730_000),
+            (22, 2_917_500),
+            (26, 3_000_000),
+        ];
+        let mut current = 2_550_000u32;
+        let mut last_apply_at: Option<u64> = None;
+        let mut applies = 0;
+        for (t, target) in ramp {
+            let since = last_apply_at.map(|a| Duration::from_secs(t - a));
+            if rebuild_apply_allowed(true, true, since, current, target) {
+                applies += 1;
+                current = target;
+                last_apply_at = Some(t);
+            }
+        }
+        assert_eq!(
+            applies, 2,
+            "the ramp should cost one apply plus one after the interval, got {applies}"
+        );
+    }
+
+    /// The same ramp on a DIRECT transport, or with the thrift hatch off,
+    /// keeps the old behaviour: every move applies.
+    #[test]
+    fn spacing_is_constrained_and_thrift_only() {
+        use std::time::Duration;
+        for (constrained, thrift) in [(false, true), (true, false), (false, false)] {
+            assert!(
+                rebuild_apply_allowed(
+                    constrained,
+                    thrift,
+                    Some(Duration::from_secs(1)),
+                    2_000_000,
+                    2_100_000
+                ),
+                "constrained={constrained} thrift={thrift} must not be spaced"
+            );
+        }
     }
 
     /// rc.443 — the encode-error ladder: retry twice, rebuild at 3 and 6,
