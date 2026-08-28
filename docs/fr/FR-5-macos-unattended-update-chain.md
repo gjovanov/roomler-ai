@@ -22,7 +22,7 @@ every update wiped Screen Recording + Accessibility.
 (spawn installer, exit, hope launchd restarts you) raced launchd job replacement.
 Fix: a third launchd unit, **`com.roomler.update`**, installed by the pkg BY DEFAULT
 (opt-out marker `/etc/roomler-agent/disable-auto-update`, absence-removes): a root,
-single-shot helper (`roomler-agent update-helper`, hidden subcommand) that owns
+single-shot helper (`roomlerd update-helper`, hidden subcommand) that owns
 check → download → verify → `installer -pkg … -target /`. Agents only touch the wake file
 `/private/var/tmp/roomler-update-check` — **whose content is deliberately ignored** (a pin
 honoured from a sticky world-writable path would hand any local user a
