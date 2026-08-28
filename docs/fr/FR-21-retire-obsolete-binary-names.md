@@ -437,9 +437,18 @@ whole of it.
 
 ## 12. Field-verification log
 
-| date | version | host / OS | result |
-|---|---|---|---|
-| — | — | — | *(P6 not started)* |
+| date | what | result |
+|---|---|---|
+| 2026-08-28 | **Debian takeover, against real artifacts.** Built `.deb` from `release-agent.yml` run `33150602388`; published `agent-v0.4.11` `.deb` as the upgrade-from side. | **PASS.** `Package: roomlerd`, `Provides: roomler-agent`, `Replaces: roomler-tunnel, roomler-agent`. Upgrade via `dpkg -i` (the self-updater's *fallback*, the stricter path): **exit 0, zero overwrite conflicts**; `/usr/bin/roomlerd` + `/usr/bin/roomler` ownership transferred to `roomlerd`; unit present. Vestigial `ii roomler-agent` remains exactly as designed, and the one-time `--remove roomler-agent` sweep exits 0 with **all files surviving**. Asset filename unchanged (`roomler-agent-0.4.11-…deb`), so the "no artifact name moves" criterion holds. |
+| 2026-08-28 | Full release lane under the renamed packages (dispatch). | **PASS** — both `.deb`s, `.msi`, `.pkg`, companion EXE all build. |
+| — | P6 on a real host: `apt upgrade` with the old package genuinely installed and the daemon running; the Windows/macOS matrix in §9.4. | *not started* |
+
+⚠️ What the Debian test above does **not** prove: it used an isolated dpkg root with
+`--force-depends` and `--force-script-chrootless`, so base deps were unresolved and maintainer
+scripts ran unchrooted (`postinst` is only `systemctl daemon-reload`); and it exercised only
+`dpkg -i`, not the `apt-get install` primary path. That is the conservative direction — the
+fallback is stricter about conflicts — but it is not the same as having run it, and **no real
+host has taken this upgrade**.
 
 **To confirm before P4 lands** (§5): read the actual staging directory on a fresh perMachine
 Windows host and on a pre-rename perMachine host. The prediction is that they differ
