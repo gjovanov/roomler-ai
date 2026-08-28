@@ -308,6 +308,15 @@ function maybeEmitStats(): void {
     bytesReceivedTotal: statsBytesTotal,
     decodeQueueSize: decoder?.decodeQueueSize ?? 0,
     framesDroppedBacklog,
+    // FR-17 - the framing counters, surfaced rather than left
+    // internal: a rising `chunkStragglers` with steady fps is the
+    // unordered transport WORKING (late chunks discarded without
+    // harming the frames after them), while a rising `chunkGaps`
+    // is real loss costing an IDR each. Told apart only if both
+    // are readable - FR-18 shipped a counter nothing read and its
+    // acceptance criterion became unmeasurable.
+    chunkGaps: framingState.gaps,
+    chunkStragglers: framingState.stragglers,
     paint: paintStats.snapshotAndReset(),
     fwd: fwdStats.snapshotAndReset(),
     decode: decodeStats.snapshotAndReset(),
