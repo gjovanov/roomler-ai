@@ -69,10 +69,12 @@ export const RCAS_ONLY_MAX_SCALE = 1.05
  *  near-max crispness without ringing on hard text edges. */
 export const DEFAULT_RCAS_SHARPNESS = 0.25
 
-/** localStorage `roomler-rc-sharpen` → mode, default 'auto' (sharpen only
- *  when the stream is smaller than the window needs). */
+/** localStorage `roomler-rc-sharpen` → mode. FR-24 moved the default from
+ *  'auto' (sharpen only when upscaling) to **'on'** — operators run the
+ *  viewer for text far more often than for video, and always-on RCAS is
+ *  what makes remote text crisp at 1:1 too. 'auto'/'off' stay selectable. */
 export function normalizeSharpenMode(v: unknown): SharpenMode {
-  return v === 'on' || v === 'off' || v === 'auto' ? v : 'auto'
+  return v === 'on' || v === 'off' || v === 'auto' ? v : 'on'
 }
 
 /** localStorage `roomler-rc-fsr-sharpness` → RCAS stops, clamped 0..2. */
