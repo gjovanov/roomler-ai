@@ -205,7 +205,7 @@ shows in `roomler status` (`… DNS steered` / `DNS NOT steered`).
 stall, self-update, agent-deleted) never run RAII teardown. Two sync,
 context-free purges — `overlay::tun::purge_split_default()` and
 `overlay::dns::purge_exit_dns()` — are folded into
-`roomler_agent::purge_exit_routes()` and called:
+`roomlerd::purge_exit_routes()` and called:
 
 - at **startup** (a boot-reconciler that heals a stale `/1` *before* the runtime
   reinstalls anything, regardless of `overlay_enabled`), and

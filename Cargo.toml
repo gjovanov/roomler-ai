@@ -20,8 +20,8 @@ members = [
     "crates/api",
     "crates/tests",
 
-    "agents/roomler-agent",
-    "agents/roomler-agent-tray",
+    "agents/roomlerd",
+    "agents/roomler-desktop",
     "agents/roomler-cli-shim",
     "agents/roomler-setup",
     "agents/roomler-tunnel",

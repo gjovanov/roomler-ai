@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2117`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomler-agent/src/signaling.rs:1502`).
+(`agents/roomlerd/src/signaling.rs:1502`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -782,7 +782,7 @@ kill switch. That is what makes E2E-3 executable before P2.
 - [ ] Same pair, same day, before/after: RTT, overlay throughput, RC `send_wait_max_ms`.
       Target **≥3× throughput**, **≥50 % lower `send_wait_max_ms`**. ⚠️ `send_wait_max_ms`
       exists only as a tracing field on the agent's video-pump heartbeat
-      (`agents/roomler-agent/src/peer.rs:5650`, emitted `:5723`) — **not** on `NodeStatus` or
+      (`agents/roomlerd/src/peer.rs:5650`, emitted `:5723`) — **not** on `NodeStatus` or
       in `peers --json` — so this needs a **live remote-desktop session** in both runs plus
       log scraping, and `roomler logs --grep` reads a ≤64 KiB tail with literal substring
       matching, so a miss is not an absence.
@@ -805,7 +805,7 @@ kill switch. That is what makes E2E-3 executable before P2.
 
 ### 10a. Unit (no MongoDB)
 
-⚠️ `cargo test -p roomler-agent --lib` **skips** the overlay tests; the lane needs
+⚠️ `cargo test -p roomlerd --lib` **skips** the overlay tests; the lane needs
 `--features overlay-l3`.
 
 | test | asserts |
@@ -842,7 +842,7 @@ content nor existence), `mint_refused_for_secondary_org`, `mint_requires_relay_s
 
 ⚠️ **The data-plane round trip does NOT go here.** The first draft proposed
 `three_node_relay_roundtrip` in this crate with "A and B forced off direct". That is not
-implementable: `crates/tests/Cargo.toml:17` depends on `roomler-agent` with **default
+implementable: `crates/tests/Cargo.toml:17` depends on `roomlerd` with **default
 features**, and `overlay-l3`/`overlay-netstack` are opt-in — **the overlay data plane,
 WireGuard, carriers and `CarrierPlane` are not compiled into the test binary at all**
 (`grep -l 'tunnel_core|overlay::' crates/tests/src/` returns nothing). `connect_agent`
@@ -1038,7 +1038,7 @@ property to test (E2E-2, E2E-4), not to assert.
   survive; one attempted after will not. Interacts with the C4 warm-relay design — **do not
   solve both here.**
 - **MTU — not a risk, and the first draft overstated it.** The overlay MTU is a fixed 1280
-  (`agents/roomler-agent/src/overlay.rs:41`), so worst case on the wire is
+  (`agents/roomlerd/src/overlay.rs:41`), so worst case on the wire is
   1280 + 32 (WG) + 8 (Geneve) + 8 (UDP) + 20 (IPv4) = **1348**, comfortably under 1500.
   Geneve's 8 bytes is +4 over TURN's ChannelData and costs nothing against DERP (WS over
   TCP). Re-check only if the overlay MTU is ever raised. ⚠️ And do **not** cite

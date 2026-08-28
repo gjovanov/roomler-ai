@@ -58,7 +58,7 @@ jobs:
         # The `roomler` CLI comes too — it is how a user session reaches the
         # ROOT daemon, which is the thing the system socket exists for.
         run: |
-          cargo build -p roomler-agent --release --features overlay-l3
+          cargo build -p roomlerd --release --features overlay-l3
           cargo build -p roomler-tunnel --release
 
       - name: Enroll
