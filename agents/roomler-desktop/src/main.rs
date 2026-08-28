@@ -33,6 +33,7 @@
 )]
 
 mod commands;
+mod panels;
 mod tray;
 
 use tauri::Manager;
@@ -92,6 +93,8 @@ fn main() {
             commands::cmd_consent_approve,
             commands::cmd_consent_deny,
             commands::cmd_get_pending_consents,
+            commands::cmd_rc_sessions,
+            commands::cmd_rc_disconnect,
             commands::cmd_route_list,
             commands::cmd_route_add,
             commands::cmd_route_remove,
@@ -151,26 +154,46 @@ async fn consent_watch_loop(app: tauri::AppHandle) {
     use std::collections::HashSet;
 
     let mut seen: HashSet<String> = HashSet::new();
+    let mut banner_up = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        let current: HashSet<String> = match roomler_localapi::connect().await {
-            Ok(mut c) => c
-                .consent_pending()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|p| p.session_id)
-                .collect(),
-            // Daemon down / pipe absent ⇒ nothing pending (stay quiet).
-            Err(_) => HashSet::new(),
+        let (pending, live) = match roomler_localapi::connect().await {
+            Ok(mut c) => {
+                let pending: HashSet<String> = c
+                    .consent_pending()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| p.session_id)
+                    .collect();
+                let live = c.rc_sessions().await.unwrap_or_default();
+                (pending, live)
+            }
+            // Daemon down / pipe absent ⇒ nothing pending, nothing live.
+            Err(_) => (HashSet::new(), Vec::new()),
         };
-        // A newly-appeared pending (not in `seen`) → bring the window forward.
-        if current.difference(&seen).next().is_some()
-            && let Some(win) = app.get_webview_window("main")
-        {
-            let _ = win.show();
-            let _ = win.set_focus();
+
+        // FR-27 — a newly-appeared prompt opens the small always-on-top CONSENT
+        // window, not the whole 1100×740 app. The old behaviour showed the
+        // entire SPA over whatever the person was doing, to ask one yes/no.
+        if pending.difference(&seen).next().is_some() {
+            panels::show_consent(&app);
+        } else if pending.is_empty() {
+            panels::hide(&app, panels::CONSENT);
         }
-        seen = current;
+        seen = pending;
+
+        // FR-27 — the "Being viewed by …" banner. Windows has a native,
+        // capture-excluded overlay for this and keeps it; everywhere else this
+        // is the only such indicator there has ever been.
+        let want_banner = !live.is_empty() && panels::banner_enabled();
+        if want_banner != banner_up {
+            if want_banner {
+                panels::show_banner(&app);
+            } else {
+                panels::hide(&app, panels::VIEWING);
+            }
+            banner_up = want_banner;
+        }
     }
 }
