@@ -38,6 +38,11 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/legal/TermsView.vue'),
   },
   {
+    path: '/imprint',
+    name: 'imprint',
+    component: () => import('@/views/legal/ImprintView.vue'),
+  },
+  {
     path: '/oauth/callback',
     name: 'oauth-callback',
     component: () => import('@/views/auth/OAuthCallbackView.vue'),
