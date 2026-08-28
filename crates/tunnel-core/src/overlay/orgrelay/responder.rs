@@ -215,6 +215,70 @@ impl ProbeResponder {
     pub fn tracked_sources(&self) -> usize {
         self.gate.tracked_sources()
     }
+
+    /// Own `sock` and answer probes until the socket dies.
+    ///
+    /// ⚠️ **A successful bind does not prove reachability, and the log line
+    /// says so on purpose.** On a host with a coturn DNAT the port can be
+    /// consumed in `PREROUTING` while `ss -ulnp` shows it free and this loop
+    /// receives nothing — measured on mars during E2E-3, where exactly that
+    /// confound nearly inverted the result. The probe exists because binding
+    /// is not evidence.
+    pub async fn serve(mut self, sock: Arc<tokio::net::UdpSocket>) {
+        let local = sock.local_addr().ok();
+        tracing::info!(
+            ?local,
+            "org-relay probe responder listening (answers probes, forwards nothing; \
+             a successful bind does NOT prove reachability -- a DNAT can eat this port \
+             upstream of the socket)"
+        );
+        // ⚠️ Sized well above a probe frame ON PURPOSE, and a recv error is
+        // NOT fatal. Both halves were bugs, caught by
+        // `serve_answers_a_real_probe_and_stays_silent_otherwise`:
+        //
+        // A datagram larger than the buffer does not truncate everywhere. On
+        // Windows `recvfrom` fails with `WSAEMSGSIZE` instead, so a one-frame
+        // buffer plus "any error ends the loop" meant **one oversized packet
+        // from anyone on the internet permanently killed the responder** — a
+        // remote DoS on an unauthenticated port, which is precisely what this
+        // module claims to be hardened against.
+        //
+        // So: read generously and refuse on length in `classify` (portable, no
+        // error path for the common case), and treat errors as transient up to
+        // a bound — a genuinely dead socket still terminates instead of
+        // spinning, but no single datagram can end the service.
+        const READ_BUF: usize = 2048;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 64;
+        let mut buf = [0u8; READ_BUF];
+        let mut consecutive_errors: u32 = 0;
+        loop {
+            let (n, src) = match sock.recv_from(&mut buf).await {
+                Ok(v) => {
+                    consecutive_errors = 0;
+                    v
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        tracing::warn!(
+                            ?local,
+                            error = %e,
+                            consecutive_errors,
+                            "org-relay responder giving up: the socket keeps failing"
+                        );
+                        return;
+                    }
+                    tracing::debug!(?local, error = %e, "org-relay responder recv error (transient)");
+                    continue;
+                }
+            };
+            if let Some(reply) = self.handle(src, &buf[..n], Instant::now())
+                && let Err(e) = sock.send_to(&reply, src).await
+            {
+                tracing::debug!(%src, error = %e, "org-relay probe reply failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +452,110 @@ mod tests {
         assert_eq!(c.refused_rate_limited, 1);
         // The snapshot is the reader; the Arc sees the same numbers.
         assert_eq!(stats.snapshot(), c);
+    }
+
+    /// The socket loop itself, over a real loopback UDP socket. `classify` is
+    /// covered exhaustively above, but that leaves the parts only `serve` has:
+    /// the one-frame read buffer, the reply going back to the right peer, and
+    /// the fact that a refused datagram produces **no** datagram at all rather
+    /// than an error reply.
+    #[tokio::test]
+    async fn serve_answers_a_real_probe_and_stays_silent_otherwise() {
+        use tokio::net::UdpSocket;
+        use tokio::time::{Duration as TDuration, timeout};
+
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let stats = Arc::new(ResponderStats::default());
+        tokio::spawn(ProbeResponder::new(stats.clone()).serve(server.clone()));
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sent = probe();
+        client.send_to(&sent, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 256];
+        let n = timeout(TDuration::from_secs(5), client.recv(&mut buf))
+            .await
+            .expect("responder did not reply within 5s")
+            .unwrap();
+        assert_eq!(
+            &buf[..n],
+            &sent[..],
+            "the reply must be the request, byte for byte"
+        );
+        assert_eq!(
+            n,
+            sent.len(),
+            "reply bytes must equal request bytes over a real socket too"
+        );
+
+        // A datagram that is not a probe must produce NO reply at all --
+        // silence, not an error frame, which would be a second reflection
+        // surface and a way to probe for our presence.
+        client.send_to(&[0xFFu8; 40], server_addr).await.unwrap();
+        assert!(
+            timeout(TDuration::from_millis(400), client.recv(&mut buf))
+                .await
+                .is_err(),
+            "a refused datagram must draw no response"
+        );
+
+        // An OVERSIZED datagram whose first 64 bytes ARE a valid probe. It is
+        // org-relay *shaped* (the header is in bytes 0..8) but it is not a
+        // probe, because a probe is exactly 64 bytes -- so it draws no reply.
+        //
+        // ⚠️ This case found two real bugs, and the second only because the
+        // first was fixed:
+        //
+        // 1. With a one-frame read buffer, Windows `recvfrom` returns
+        //    WSAEMSGSIZE rather than truncating, and the loop treated every
+        //    error as fatal -- so ONE oversized datagram from anyone on the
+        //    internet permanently killed the responder.
+        // 2. Once the buffer was sized up, the honest behaviour appeared:
+        //    refuse on length. The tempting alternative -- truncate to 64 and
+        //    answer -- would mean a 512-byte request drew a 64-byte reply,
+        //    which is de-amplifying and therefore *looks* safe, but it also
+        //    means the frame we answer is not the frame that was sent. Exact
+        //    match or nothing.
+        // (a) Oversized but still UNDER the read buffer: read in full on every
+        // platform, then refused on length. Deterministic, so the counter is
+        // safe to assert.
+        let mut big = vec![0u8; 512];
+        big[..PROBE_FRAME_LEN].copy_from_slice(&sent);
+        client.send_to(&big, server_addr).await.unwrap();
+        assert!(
+            timeout(TDuration::from_millis(400), client.recv(&mut buf))
+                .await
+                .is_err(),
+            "an oversized datagram must draw no reply -- not a truncated one"
+        );
+
+        // (b) LARGER than the read buffer: this is where the platforms differ.
+        // Linux truncates and classifies; Windows fails the recv outright with
+        // WSAEMSGSIZE. So assert only the property that must hold on BOTH --
+        // the responder is still alive -- and deliberately assert nothing
+        // about the counters here, because a portable-looking counter
+        // assertion would be a lie on one of the two.
+        let mut huge = vec![0u8; 4096];
+        huge[..PROBE_FRAME_LEN].copy_from_slice(&sent);
+        client.send_to(&huge, server_addr).await.unwrap();
+        let _ = timeout(TDuration::from_millis(400), client.recv(&mut buf)).await;
+
+        client.send_to(&sent, server_addr).await.unwrap();
+        let n3 = timeout(TDuration::from_secs(5), client.recv(&mut buf))
+            .await
+            .expect("responder died after an oversized datagram -- remote DoS")
+            .unwrap();
+        assert_eq!(&buf[..n3], &sent[..]);
+
+        let c = stats.snapshot();
+        assert_eq!(c.answered, 2, "two well-formed probes were answered");
+        assert_eq!(c.refused_not_shaped, 1, "the junk datagram");
+        assert!(
+            c.refused_not_probe >= 1,
+            "case (a) must have been classified and refused on length; \
+             case (b) may or may not reach the classifier depending on platform"
+        );
     }
 
     /// Runs on an unauthenticated public UDP port inside a SYSTEM/root daemon:
