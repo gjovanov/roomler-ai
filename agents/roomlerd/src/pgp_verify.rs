@@ -468,7 +468,7 @@ hV/0cAHGFizJ3Gl+qz5YZ4IEbnnXtgs=\n\
     /// gh release download agent-v0.3.0-rc.475 --repo gjovanov/roomler-ai \
     ///   --pattern 'roomler-agent-*aarch64-apple-darwin.pkg*' --dir /tmp/rel
     /// ROOMLER_TEST_ARTIFACT=/tmp/rel/roomler-agent-0.3.0-rc.475-aarch64-apple-darwin.pkg \
-    ///   cargo test -p roomler-agent --lib -- --ignored real_published_asc
+    ///   cargo test -p roomlerd --lib -- --ignored real_published_asc
     /// ```
     #[test]
     #[ignore = "needs a published release artifact; see the doc comment"]

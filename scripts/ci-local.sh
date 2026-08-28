@@ -93,7 +93,7 @@ if [ "$QUICK" = "0" ]; then
   # `telemetry.rs`'s tests sailed past a green local gate and failed all three
   # (2026-08-25). "Compiled somewhere" is not "compiled everywhere CI does".
   run "clippy-agent-overlay" \
-    cargo clippy -p roomler-agent --features overlay-l3 --all-targets -- -D warnings
+    cargo clippy -p roomlerd --features overlay-l3 --all-targets -- -D warnings
 fi
 
 echo

@@ -664,7 +664,7 @@ keyframe comes out or the cascade bottoms at `NoopEncoder`.
 
 To reproduce locally:
 
-    cargo build -p roomler-agent --release --features full-hw
+    cargo build -p roomlerd --release --features full-hw
     target\release\roomler-agent.exe encoder-smoke --encoder hardware
 
 With the `full-hw` build, the MF backend code is present but only
