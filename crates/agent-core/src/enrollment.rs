@@ -1,7 +1,7 @@
 //! One-shot enrollment exchange.
 //!
 //! Flow: admin issues an enrollment token in the Roomler UI and hands it to
-//! the machine operator. `roomler-agent enroll --token <t>` posts it to
+//! the machine operator. `roomlerd enroll --token <t>` posts it to
 //! `POST /api/agent/enroll` with machine metadata, gets back a long-lived
 //! agent token, and persists everything to the config file.
 
@@ -345,7 +345,7 @@ fn unique_org_label(
             )
         })?;
         if cfg.find_org(&label).is_some() {
-            bail!("--label {label:?} is already in use (see `roomler-agent org ls`)");
+            bail!("--label {label:?} is already in use (see `roomlerd org ls`)");
         }
         return Ok(label);
     }

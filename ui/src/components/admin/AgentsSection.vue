@@ -1239,7 +1239,7 @@
       <v-card-text>
         <p class="text-body-2 mb-3">
           CIDRs that <strong>{{ routesTarget?.name }}</strong> advertises for the
-          mesh (<code>roomler-tunnel socks5</code>). A LAN target IP matching one of
+          mesh (<code>roomler socks5</code>). A LAN target IP matching one of
           these routes is dialed by this agent, so the mesh can reach non-agent
           devices behind it (a NAS, a printer, a database host). Access is still
           gated by your <strong>Tunnel ACL</strong> — a route steers the dial, it
@@ -1993,7 +1993,7 @@ function closeEnrollDialog() {
 
 /**
  * Copy an agent's hex ObjectId to the clipboard so the operator can
- * paste it into `roomler-tunnel forward --agent <hex>` (or any other
+ * paste it into `roomler forward --agent <hex>` (or any other
  * CLI / API call that needs the agent identifier).
  *
  * Surfaces transient success state via [`copiedAgentId`] for 2 s —

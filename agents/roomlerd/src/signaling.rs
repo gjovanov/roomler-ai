@@ -608,7 +608,7 @@ pub async fn run(
                     );
                     return Err(anyhow::anyhow!(
                         "server goodbye ({reason:?}): {message} — re-enroll this org \
-                         with `roomler-agent enroll --server <url> --token <new-jwt>`"
+                         with `roomlerd enroll --server <url> --token <new-jwt>`"
                     ));
                 }
                 // rc.53: server told us to stop reconnecting. The
