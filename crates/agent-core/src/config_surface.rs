@@ -163,6 +163,23 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Overlay v3 Phase A — DERP always-on floor: keep the central /derp mux open + registered for the whole session, advertise the capability, and floor fresh pairs at birth. Built-in default: on since rc.400.",
     ),
     (
+        "relay_server_enabled",
+        "tribool",
+        "FR-19 - offer this node as an ORG RELAY: bind relay_server_port and answer \
+         reachability probes (it forwards nothing until the relay data path ships). \
+         Device-local by design and never server-pushable: this is the refusal that \
+         survives a compromised server. Built-in default: OFF.",
+    ),
+    (
+        "relay_server_port",
+        "number",
+        "FR-19 - UDP port for the org-relay listener (1-65535). Built-in default: 3478, \
+         measured rather than guessed - the corp-managed target host reaches 3478 on an \
+         arbitrary public IP and no other port. A successful bind does NOT prove \
+         reachability: a coturn DNAT can consume the port in PREROUTING while ss shows it \
+         free.",
+    ),
+    (
         "overlay_netcheck",
         "tribool",
         "Overlay v3 Phase B — netcheck: measure egress capabilities (relay-band probe over the dialer path, STUN/NAT, /derp health) every ~20 min and publish the capability vector. Built-in default: on.",
@@ -500,6 +517,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CORPLAP-3 bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_IDR_THRIFT. Restart required.",
     ),
     (
+        "send_stall_ms",
+        "number",
+        "Blocked-send congestion threshold in ms (2026-08-28, FR-15 P2 follow-up). Default 250; 0 disables. A frame that sat longer than this inside the DataChannel send call is unambiguous congestion - the pipe refused to drain - and the pump feeds the AIMD a congestion sample. This is the one congestion signal that needs NO clock sync and NO viewer and works on both transports, which matters on a relay where the measured-rate clamp is direct-only and the age loop rides a probe the congestion itself biases. Acted on for CONSTRAINED sessions only; direct keeps the measured ceiling. Env: ROOMLER_NODE_SEND_STALL_MS. Restart required.",
+    ),
+    (
         "relay_age_feedback",
         "tribool",
         "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the agent learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every agent counter: the field measured 1000ms of viewer age against a 26KB agent queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_AGE_FEEDBACK. Restart required.",
@@ -646,6 +668,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_server_relay_strategy" => cfg.overlay_server_relay_strategy.map(fmt_bool),
         "overlay_derp_floor" => cfg.overlay_derp_floor.map(fmt_bool),
         "overlay_netcheck" => cfg.overlay_netcheck.map(fmt_bool),
+        "relay_server_enabled" => cfg.relay_server_enabled.map(fmt_bool),
+        "relay_server_port" => cfg.relay_server_port.map(|v| v.to_string()),
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback.map(fmt_bool),
         "tunnel_peers_survive_reattach" => cfg.tunnel_peers_survive_reattach.map(fmt_bool),
         "overlay_mbb" => cfg.overlay_mbb.map(fmt_bool),
@@ -718,6 +742,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "fps_pace" => cfg.fps_pace.map(fmt_bool),
         "relay_idr_thrift" => cfg.relay_idr_thrift.map(fmt_bool),
         "relay_age_feedback" => cfg.relay_age_feedback.map(fmt_bool),
+        "send_stall_ms" => cfg.send_stall_ms.map(|v| v.to_string()),
         "priority_res_cap" => cfg.priority_res_cap.map(fmt_bool),
         "smoother_rate_pct" => cfg.smoother_rate_pct.map(|p| p.to_string()),
         "balanced_rate_pct" => cfg.balanced_rate_pct.map(|p| p.to_string()),
@@ -872,6 +897,25 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         }
         "overlay_derp_floor" => cfg.overlay_derp_floor = parse_tribool(value)?,
         "overlay_netcheck" => cfg.overlay_netcheck = parse_tribool(value)?,
+        "relay_server_enabled" => cfg.relay_server_enabled = parse_tribool(value)?,
+        "relay_server_port" => {
+            cfg.relay_server_port = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| format!("relay_server_port must be a number (got {v:?})"))?;
+                    // No 0-means-ephemeral escape hatch here, deliberately: a
+                    // relay peers must be able to FIND is useless on a port the
+                    // operator cannot state, and 3478 is the only port E2E-3
+                    // measured the target population reaching.
+                    if n == 0 || n > 65535 {
+                        return Err(format!("relay_server_port must be 1-65535 (got {n})"));
+                    }
+                    Some(n)
+                }
+            }
+        }
         "tunnel_derp_fallback" => cfg.tunnel_derp_fallback = parse_tribool(value)?,
         "tunnel_peers_survive_reattach" => {
             cfg.tunnel_peers_survive_reattach = parse_tribool(value)?
@@ -1074,6 +1118,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "fps_pace" => cfg.fps_pace = parse_tribool(value)?,
         "relay_idr_thrift" => cfg.relay_idr_thrift = parse_tribool(value)?,
         "relay_age_feedback" => cfg.relay_age_feedback = parse_tribool(value)?,
+        "send_stall_ms" => cfg.send_stall_ms = parse_u32_range(key, value, 0, 10_000)?,
         "priority_res_cap" => cfg.priority_res_cap = parse_tribool(value)?,
         "smoother_rate_pct" => cfg.smoother_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,
