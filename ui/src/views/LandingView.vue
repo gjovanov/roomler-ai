@@ -169,10 +169,11 @@
             <div class="text-subtitle-2 font-weight-bold mb-2">Legal</div>
             <router-link to="/privacy" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Privacy Policy</router-link>
             <router-link to="/terms" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Terms of Service</router-link>
+            <router-link to="/imprint" class="text-body-2 landing-muted mb-1 d-block text-decoration-none">Imprint</router-link>
           </v-col>
         </v-row>
         <v-divider class="my-4" />
-        <div class="text-body-2 landing-muted text-center">&copy; {{ new Date().getFullYear() }} Roomler. All rights reserved.</div>
+        <div class="text-body-2 landing-muted text-center">&copy; {{ new Date().getFullYear() }} G ROX EOOD &mdash; Roomler. All rights reserved.</div>
       </v-container>
     </v-footer>
   </div>
