@@ -513,6 +513,29 @@ fn host_has_debian_tooling() -> bool {
 /// a dead end. See `docs/linux-self-update.md`.
 #[cfg(any(not(target_os = "windows"), test))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
+/// Is this release asset the DAEMON's own package, as opposed to something
+/// else in the same release that happens to be a `.deb` for the same arch?
+///
+/// FR-27 made this necessary: the Linux desktop companion now ships as its own
+/// `roomler-desktop-…-x86_64-unknown-linux-gnu.deb`, so a release carries two
+/// arch-matching `.deb`s and asset order is GitHub's, not ours. Without this
+/// the daemon could download the COMPANION, `dpkg -i` it — which succeeds —
+/// and never update itself: a silent, permanent freeze that looks like a
+/// working update. Exactly the shape the arch guard above was added for, one
+/// axis over.
+///
+/// Positive match, not a denylist of names we happen to know today. The
+/// daemon's published asset names are a deliberately immutable surface
+/// (`roomler-agent-…`, plus cargo-deb's `roomlerd_…` spelling on old
+/// releases), so naming them is safe and a new sibling asset cannot creep
+/// through by being unlisted. Locked by
+/// `pick_linux_asset_never_takes_the_desktop_companion`.
+#[cfg(any(not(target_os = "windows"), test))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn is_daemon_asset(lower_name: &str) -> bool {
+    lower_name.starts_with("roomler-agent") || lower_name.starts_with("roomlerd")
+}
+
 fn pick_linux_asset<'a>(
     assets: &'a [GithubAsset],
     arch_tokens: &[&str],
@@ -521,7 +544,9 @@ fn pick_linux_asset<'a>(
     let for_arch = |suffix: &str| {
         assets.iter().find(|a| {
             let lower = a.name.to_lowercase();
-            lower.ends_with(suffix) && arch_tokens.iter().any(|t| lower.contains(t))
+            lower.ends_with(suffix)
+                && arch_tokens.iter().any(|t| lower.contains(t))
+                && is_daemon_asset(&lower)
         })
     };
     let deb = for_arch(".deb");
@@ -2835,6 +2860,49 @@ mod tests {
         // download something it cannot install.
         let deb_only = vec![mk("roomler-agent-0.3.0-x86_64-unknown-linux-gnu.deb")];
         assert!(pick_linux_asset(&deb_only, x86, false).is_none());
+    }
+
+    /// FR-27 — a release now carries TWO arch-matching Linux `.deb`s: the
+    /// daemon's and the desktop companion's. Installing the companion as a
+    /// daemon update would succeed at the dpkg level and freeze the daemon on
+    /// its old version forever, which is worse than a failed update because
+    /// nothing reports it.
+    #[test]
+    fn pick_linux_asset_never_takes_the_desktop_companion() {
+        let mk = |name: &str| GithubAsset {
+            name: name.into(),
+            browser_download_url: "https://example.invalid/x".into(),
+            size: 1,
+            digest: None,
+        };
+        let x86 = &["x86_64", "amd64"][..];
+
+        // The companion listed FIRST — asset order is GitHub's, not ours, so
+        // "the daemon's happens to come first" is not a property we may rely on.
+        let release = vec![
+            mk("roomler-desktop-0.4.15-x86_64-unknown-linux-gnu.deb"),
+            mk("roomler-agent-0.4.15-x86_64-unknown-linux-gnu.deb"),
+            mk("roomler-agent-0.4.15-x86_64-unknown-linux-gnu.tar.gz"),
+        ];
+        let picked = pick_linux_asset(&release, x86, true).expect("must still find the daemon deb");
+        assert_eq!(
+            picked.name,
+            "roomler-agent-0.4.15-x86_64-unknown-linux-gnu.deb"
+        );
+
+        // With ONLY the companion published, there is nothing installable —
+        // skipping is right; taking it is the freeze.
+        let companion_only = vec![mk("roomler-desktop-0.4.15-x86_64-unknown-linux-gnu.deb")];
+        assert!(pick_linux_asset(&companion_only, x86, true).is_none());
+
+        // cargo-deb's own spelling, as old releases carry it, still counts.
+        assert!(is_daemon_asset("roomlerd_0.4.15-1_amd64.deb"));
+        assert!(is_daemon_asset(
+            "roomler-agent-0.4.15-x86_64-unknown-linux-gnu.tar.gz"
+        ));
+        assert!(!is_daemon_asset(
+            "roomler-desktop-0.4.15-x86_64-unknown-linux-gnu.deb"
+        ));
     }
 
     /// Format preference must never override architecture: a tarball for the
