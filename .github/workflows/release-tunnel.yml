@@ -165,7 +165,7 @@ jobs:
           mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
           echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
       - name: Build .deb
-        working-directory: agents/roomler-tunnel
+        working-directory: agents/roomler-cli
         run: cargo deb --no-build --no-strip
       - name: Rename .deb + checksum
         id: deb
