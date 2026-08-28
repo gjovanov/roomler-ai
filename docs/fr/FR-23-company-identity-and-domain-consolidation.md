@@ -122,10 +122,68 @@ and the `/ws` cookie handshake (`crates/api/src/ws/handler.rs:109`, via
 `origin_is_ours` at `:146-154`). A WebSocket handshake is not subject to CORS, so
 this is the check standing between an attacker's page and an authenticated socket.
 
-⇒ the prod configmap must list **both** origins. Listing only `roomler.live`
-breaks `roomler.ai` — for browsers *and* for every WS client. `cors_origins` is
-`Vec<String>` (`crates/config/src/settings.rs:291`); a scalar env var fails to
-deserialize.
+⇒ both origins must be trusted. Trusting only `roomler.live` breaks `roomler.ai`.
+The `/ws` check applies **only to the cookie path** (`handler.rs:88-113`) — a
+`?token=` client sends a credential it had to obtain, and native clients send no
+`Origin` at all — so agents and tunnel clients are unaffected, while every
+**browser session** on an untrusted origin loses its socket: chat, notifications,
+presence and RC signalling all die.
+
+⚠️ **Measured 2026-08-28: "list both in the configmap" is IMPOSSIBLE today.**
+`settings.rs:543` is `Environment::default().separator("__").prefix("ROOMLER")`
+with **no `list_separator`**, and `app.cors_origins` is `Vec<String>` — so a
+scalar env var deserialising into a sequence *fails outright*
+(`invalid type: string, expected a sequence`) and the API would **refuse to
+boot**. The repo already knows this: `jwt.previous_secrets` is deliberately a
+`String` for exactly this reason (`settings.rs:400-406`), and the e2e overlay's
+configmap carries the same warning.
+
+Two real paths, neither of them "just set the configmap":
+
+- **A — mount a file.** `Settings::load` also reads
+  `File::with_name("config/local")` (`settings.rs:541`) and the Dockerfile's
+  runtime stage sets **no `WORKDIR`**, so CWD is `/` and a ConfigMap at
+  `/config/local.toml` is read. No code change. ⚠️ But the source is
+  `required(false)`, so **a wrong path is a silent no-op** — the API boots, the
+  trust set stays `roomler.ai`-only, and the sole symptom is that browser
+  WebSockets on `roomler.live` fail. Silent-on-misconfiguration is a bad property
+  for the control gating ambient-credential auth.
+- **B — two lines, recommended.** Scope list parsing to just this key:
+  `.list_separator(",").with_list_parse_key("app.cors_origins")` (config 0.14.1
+  supports both). Then `ROOMLER__APP__CORS_ORIGINS` works in the existing
+  configmap and a malformed value fails **loudly at boot**. Scoped, so no other
+  field's parsing changes — a global `list_separator` would silently split any
+  string containing a comma.
+
+⚠️ Order matters if B is taken: deploy the code first (a no-op while the env var
+is unset), **then** add the configmap key in a separate gitops commit. Doing both
+at once means an old pod that restarts mid-roll reads a key its binary cannot
+parse and crash-loops.
+
+### ⚠️ Sequencing correction (found during phase 4's inventory)
+
+Phases 4 and 5 as written are **ordered wrong**. `roomler.live.conf` currently
+proxies the *old* app (`proxy_pass http://10.10.10.11:30030`), so tearing that
+down first makes the apex **502** — on the very domain whose credibility the
+Apple review turns on. **Cut `.live` over first, verify, then tear down.**
+
+### Phase 4 — what is actually there
+
+| | |
+|---|---|
+| ArgoCD app | `roomler-old` → `github.com/gjovanov/roomler-deploy.git`, `k8s/overlays/prod`, `main` |
+| Registered in | app-of-apps `github.com/gjovanov/argocd-apps.git`, path `apps`, `recurse: true` |
+| Namespace | `roomler` (179 d) |
+| Workloads | deployments `janus`, `redis`, `roomler`; statefulset `mongodb`; 4 running pods |
+| PVCs / PVs | `mongodb-data` + `roomler-uploads`, 5Gi each → **hostPath**, **reclaim=Retain**, nodeAffinity **`k8s-worker-2`** |
+| On disk | `/data/roomler/mongodb`, `/data/roomler/uploads` |
+
+⚠️ The namespace is **not** owned by the Application, so pruning leaves
+`ns/roomler` behind. ⚠️ Both PVs are `Retain`, so they outlive the prune and the
+hostPath dirs outlive the PVs — `/data/roomler/*` must be removed explicitly on
+that node, and must not be confused with the **current** product's
+`/data/roomler-ai/*` on the same node. ⚠️ The parent app runs `prune: false`
+deliberately, so deleting `apps/roomler-old.yaml` does not cascade.
 
 ## Phases
 
@@ -134,9 +192,10 @@ deserialize.
 | 0 | Phone rectification | revert one commit | ✅ shipped |
 | 1 | Imprint page + company blocks + footer | revert; route is additive | ✅ shipped |
 | 2 | FR + PR | — | ✅ shipped |
-| 3 | Deploy, then send Apple the correction | previous image tag | ⬜ |
-| 4 | Delete the obsolete `roomler-old` app | git revert in the deploy repo | ⬜ blocked — no cluster access |
-| 5 | `roomler.live` serves the current app | drop the `server_name`; revert the configmap | ⬜ |
+| 3 | Deploy | previous image tag | ✅ shipped + field-verified (`v20260828-de59383da2fe`) |
+| 3b | Send Apple the correction | — | ⬜ operator action; letter + PDF prepared |
+| 4 | Delete the obsolete `roomler-old` app | git revert in the deploy repo | ⬜ inventoried, **awaiting go-ahead** |
+| 5 | `roomler.live` — serve the app, or 301 | drop the `server_name`; revert the configmap | ⬜ **blocked on a decision** (see below) |
 
 ## Acceptance criteria
 
@@ -146,7 +205,7 @@ deserialize.
 - [x] Terms and Privacy name the entity; Privacy names the **data controller**
 - [x] The landing footer links the imprint and names the operating company
 - [x] `bun run build` (incl. `vue-tsc --noEmit`) and `bun run test:unit` pass
-- [ ] `https://roomler.ai/imprint` is live and renders in a browser
+- [x] `https://roomler.ai/imprint` is live — verified against the **shipped bundle**, not the source
 - [ ] Apple has the corrected number and the imprint URL
 - [ ] The `roomler-old` namespace, its PVCs, PVs and node-local backing directory are gone
 - [ ] `https://roomler.live` serves the current app; **`roomler.ai` is unaffected**
@@ -161,11 +220,25 @@ deserialize.
   mitigation is an edge redirect of `/oauth/*` on `.live` to `.ai`.
 - **Analytics mis-attribute on `.live`** — `ui/index.html:8` hardcodes
   `data-domain="roomler.ai"`.
-- Whether `roomler.live` should serve the app at all, or simply **301 to
-  `roomler.ai`**. A redirect would satisfy Apple equally (the imprint names both
-  domains), costs nothing, and dodges both issues above. Serving the app was the
-  operator's stated preference; this is recorded so the cheaper option stays
-  visible.
+- **Whether `roomler.live` should serve the app at all, or simply 301 to
+  `roomler.ai`.** This was written as a footnote and implementation has promoted
+  it to the live decision, on three facts that were not known when the phase was
+  planned:
+  1. **It is not config-only** — either a code change or a silently-failing file
+     mount (above).
+  2. **OAuth on `.live` stays broken either way.**
+  3. **`roomler.live` is not a spare domain.** It hosts live, unrelated services
+     as subdomains — `bauleiter`, `regal`, `janus`, `coturn`, `neko`, `ping`,
+     `asterisk`, `audio-waveform`, `scws`. Only the **apex** is the obsolete
+     product, and only the apex may be touched.
+
+  And the phase's original Apple rationale has already been delivered by phase 1:
+  the imprint names `roomler.live` as company-operated, so a reviewer can close
+  the loop today. What actually remains is *"don't serve an obsolete product on
+  our own domain"* — for which a **301 is the cleanest answer**, needs one nginx
+  file, no code, no configmap, and composes naturally with phase 4 (once the old
+  app is gone there is nothing left to proxy). Serving the app remains entirely
+  doable via B; the trade is recorded rather than quietly decided.
 
 ## Out of scope
 
@@ -187,3 +260,11 @@ deserialize.
 | 2026-08-28 | `diff` repo-root letter vs the Dropbox copy | identical — safe to delete |
 | 2026-08-28 | `rg 'G ROX\|EOOD\|205174895' ui/` | **zero hits** — the gap Apple cannot close |
 | 2026-08-28 | Ledger vs GitHub issues | FR-1…FR-22 taken (FR-3 vacated); FR-20/#807 and FR-21/#809 have issues but no rows on master ⇒ claimed FR-23 |
+| 2026-08-28 | Deployed `v20260828-de59383da2fe`; `grep -c imprint` on the **live main bundle** | **0 → 1** (`index-CaaVw1X0.js` → `index-CkmwLR-m.js`). The route did not exist in the shipped artifact before and does now |
+| 2026-08-28 | Live lazy chunk `ImprintView-CuuvccrS.js` | all present: `G ROX EOOD`, `205174895`, `BG205174895`, `Plovdivska 110`, `Pazardzhik`, `Goran Jovanov`, `711 8883`, `roomler.live`, `РОКС` (UTF-8 survived the whole pipeline) |
+| 2026-08-28 | Live `TermsView` / `PrivacyPolicyView` / `LandingView` chunks | each names the entity and links `/imprint`; Privacy carries `data controller` |
+| 2026-08-28 | **Defect in my own imprint** | it cited the EU ODR platform, **repealed by Reg. (EU) 2024/3228, offline since 2025-07-20**. Confirmed live (`grep -c consumers/odr` → 1), removed in #830 |
+| 2026-08-28 | `roomler.live` vs `roomler.ai` titles | `roomler.ui - roomler.ui` vs `Roomler` — the apex really is still the obsolete product |
+| 2026-08-28 | `settings.rs:543` env source | no `list_separator` ⇒ `ROOMLER__APP__CORS_ORIGINS` would **crash the API at boot**, not merely be ignored. Phase 5 is not config-only |
+| 2026-08-28 | `ws/handler.rs:88-113` | the origin check gates the **cookie path only** ⇒ agents unaffected, browser sessions on an untrusted origin lose every socket |
+| 2026-08-28 | Cluster access | `kubectl`+`argocd` on the build host, kubeconfig at `/home/gjovanov/.kube/config`. The earlier "no kubeconfig" was wrong — it checked `/root` only |
