@@ -68,6 +68,7 @@ describe('FR-22 connect timing recorder', () => {
   it('formats a complete attempt as per-step deltas, not absolute offsets', () => {
     const t: RcConnectTiming = {
       attempt: 1,
+      afterDrop: false,
       marks: {
         request_sent: 0,
         session_created: 40,
@@ -92,6 +93,7 @@ describe('FR-22 connect timing recorder', () => {
     // distinguishes a half-open agent WS from a cross-pod split.
     const t: RcConnectTiming = {
       attempt: 2,
+      afterDrop: false,
       marks: {
         ws_ready: 0, turn_ready: 0, probes_ready: 0,
         request_sent: 0, session_created: 35, ready: 50, offer_sent: 55,
@@ -119,7 +121,7 @@ describe('FR-22 connect timing recorder', () => {
 
 describe('FR-22 operator-facing connect verdict', () => {
   const marks = (o: Partial<Record<string, number>>) =>
-    ({ attempt: 1, marks: o } as RcConnectTiming)
+    ({ attempt: 1, afterDrop: false, marks: o } as RcConnectTiming)
 
   it('says nothing about a normal connect', () => {
     // A notification on every successful connect is noise, and noise is
@@ -167,6 +169,7 @@ describe('FR-22 operator-facing connect verdict', () => {
     // devtools — and telling them apart is the whole point.
     const v = describeConnectTiming({
       attempt: 2,
+      afterDrop: false,
       marks: {
         request_sent: 0, session_created: 30, ready: 45, offer_sent: 50,
         answer: 200, pc_connected: 900, dc_open: 1100, first_frame: 2600,
@@ -177,9 +180,47 @@ describe('FR-22 operator-facing connect verdict', () => {
     expect(v.text).not.toContain('attempts')
   })
 
+  it('does not name a cause the marks cannot establish', () => {
+    // ⚠️ Field-found on the first real session this shipped into: attempt 1
+    // painted at 1734 ms, the agent's DERP control WS then dropped, and the
+    // ladder reconnected on attempt 6 — but the message said "the first
+    // request went unanswered", which was simply false. A retry has at
+    // least two causes that look identical in the attempt counter.
+    const t: RcConnectTiming = {
+      attempt: 6,
+      afterDrop: false,
+      marks: { request_sent: 0, first_frame: 2164 },
+    }
+    const v = describeConnectTiming(t)
+    expect(v.text).toContain('after 5 failed attempts')
+    expect(v.text).not.toContain('went unanswered')
+    expect(v.text).not.toContain('first request')
+  })
+
+  it('says the session dropped when an earlier attempt had already painted', () => {
+    const t: RcConnectTiming = {
+      attempt: 6,
+      afterDrop: true,
+      marks: { request_sent: 0, first_frame: 2164 },
+    }
+    const v = describeConnectTiming(t)
+    expect(v.text).toContain('Reconnected')
+    expect(v.text).toContain('dropped and was restored')
+  })
+
+  it('singularises a single failed attempt', () => {
+    const t: RcConnectTiming = {
+      attempt: 2,
+      afterDrop: false,
+      marks: { request_sent: 0, first_frame: 2600 },
+    }
+    expect(describeConnectTiming(t).text).toContain('1 failed attempt.')
+  })
+
   it('pluralises multiple failed attempts', () => {
     const v = describeConnectTiming({
       attempt: 3,
+      afterDrop: false,
       marks: { request_sent: 0, first_frame: 2600 },
     })
     expect(v.text).toContain('after 2 failed attempts')
@@ -225,6 +266,7 @@ describe('FR-22 pre-flight is inside the measured window', () => {
     // said "normal", and no snackbar appeared while the operator waited.
     const v = describeConnectTiming({
       attempt: 1,
+      afterDrop: false,
       marks: {
         ws_ready: 8000, turn_ready: 8100, probes_ready: 8150,
         request_sent: 8160, session_created: 8200, ready: 8220,
@@ -242,6 +284,7 @@ describe('FR-22 pre-flight is inside the measured window', () => {
     // if the operator waited 9 s to get there.
     const v = describeConnectTiming({
       attempt: 1,
+      afterDrop: false,
       marks: {
         ws_ready: 200, turn_ready: 9000, probes_ready: 9100,
         request_sent: 9110, first_frame: 11000,
@@ -256,7 +299,7 @@ describe('FR-22 pre-flight is inside the measured window', () => {
     // Before this, an attempt abandoned during the pre-flight had NO
     // marks at all, so the first missing one was `request_sent` and the
     // message pointed at the wrong half of the system.
-    const v = describeConnectTiming({ attempt: 1, marks: {} })
+    const v = describeConnectTiming({ attempt: 1, afterDrop: false, marks: {} })
     expect(v.text).toContain('connecting to the signalling server')
     expect(v.text).toContain('stalled at ws_ready')
   })
