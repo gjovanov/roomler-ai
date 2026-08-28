@@ -129,7 +129,7 @@ can be pinned out of band.
 
 `ssh <node>` allocates a terminal, runs a login shell on it, streams both ways,
 and reflows when the client window changes — on **both platforms**, through one
-surface: `agents/roomler-agent/src/pty/{mod,unix,windows}.rs`. `ssh.rs` has a
+surface: `agents/roomlerd/src/pty/{mod,unix,windows}.rs`. `ssh.rs` has a
 single code path, which is deliberate: an interactive session is where a
 per-platform divergence would be least visible and most annoying, and two
 handlers would have grown two subtly different privilege and teardown stories.

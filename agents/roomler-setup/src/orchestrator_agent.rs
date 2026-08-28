@@ -17,7 +17,7 @@
 //!   2. Resolve installer metadata via the roomler.ai proxy (rc.27)
 //!   3. Stream MSI bytes to `%TEMP%` with progress emits
 //!   4. Verify SHA256
-//!   5. Spawn msiexec via `roomler_agent::updater::
+//!   5. Spawn msiexec via `roomlerd::updater::
 //!      spawn_installer_for_flavour_with_properties` (perMachine gets
 //!      UAC via ShellExecuteExW + verb=runas)
 //!   6. Attach `MsiRunner` to the spawned PID + wait for exit (caller's
@@ -43,8 +43,8 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use roomler_agent::install_detect::{ExistingInstall, detect_existing_install};
-use roomler_agent::updater::{WindowsInstallFlavour, spawn_installer_for_flavour_with_properties};
+use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
+use roomlerd::updater::{WindowsInstallFlavour, spawn_installer_for_flavour_with_properties};
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
 use wizard_shared::msi_runner::{MsiExitDecoded, MsiRunner};
@@ -91,7 +91,7 @@ impl AdvancedOptions {
     fn validate(&self) -> Result<(), String> {
         for (key, val) in self.route_fields() {
             if let Some(v) = val {
-                roomler_agent::config_surface::validate_cidr_list(v)
+                roomlerd::config_surface::validate_cidr_list(v)
                     .map_err(|e| format!("advanced option {key}: {e}"))?;
             }
         }
@@ -100,8 +100,8 @@ impl AdvancedOptions {
 
     /// Write the selected options into the freshly-enrolled config via
     /// the same per-key registry the desktop editor uses.
-    fn apply_to(&self, cfg: &mut roomler_agent::config::AgentConfig) -> Result<(), String> {
-        use roomler_agent::config_surface::apply;
+    fn apply_to(&self, cfg: &mut roomlerd::config::AgentConfig) -> Result<(), String> {
+        use roomlerd::config_surface::apply;
         let bools = [
             ("overlay_enabled", self.overlay_enabled),
             ("advertise_local_subnets", self.advertise_local_subnets),
@@ -442,15 +442,14 @@ async fn run_install_inner(
     let config_path = if is_system_context {
         #[cfg(target_os = "windows")]
         {
-            roomler_agent::config::machine_global_config_path()
+            roomlerd::config::machine_global_config_path()
         }
         #[cfg(not(target_os = "windows"))]
         {
             return Err("SystemContext flavour is Windows-only".to_string());
         }
     } else {
-        roomler_agent::config::default_config_path()
-            .map_err(|e| format!("resolve config path: {e}"))?
+        roomlerd::config::default_config_path().map_err(|e| format!("resolve config path: {e}"))?
     };
     // rc.52: for the SystemContext flavour, lock down
     // %PROGRAMDATA%\roomler\ with an inheritable SYSTEM+Administrators
@@ -472,14 +471,14 @@ async fn run_install_inner(
             },
         );
     }
-    let machine_id = roomler_agent::machine::derive_machine_id(&config_path);
-    let inputs = roomler_agent::enrollment::EnrollInputs {
+    let machine_id = roomlerd::machine::derive_machine_id(&config_path);
+    let inputs = roomlerd::enrollment::EnrollInputs {
         server_url: &server,
         enrollment_token: &token,
         machine_id: &machine_id,
         machine_name: &device_name,
     };
-    let mut cfg = roomler_agent::enrollment::enroll(inputs)
+    let mut cfg = roomlerd::enrollment::enroll(inputs)
         .await
         .map_err(|e| format!("enrollment: {e}"))?;
     // S2 — fold the wizard's advanced options into the enrolled config
@@ -487,8 +486,7 @@ async fn run_install_inner(
     advanced.apply_to(&mut cfg)?;
     let agent_id = cfg.agent_id.clone();
     let tenant_id = cfg.tenant_id.clone();
-    roomler_agent::config::save(&config_path, &cfg)
-        .map_err(|e| format!("write config.toml: {e}"))?;
+    roomlerd::config::save(&config_path, &cfg).map_err(|e| format!("write config.toml: {e}"))?;
     emit(
         on_event,
         ProgressEvent::EnrollOk {
@@ -545,10 +543,8 @@ async fn place_desktop_companion(
     flavour: WindowsInstallFlavour,
     on_event: &Channel<ProgressEvent>,
 ) -> Option<bool> {
-    let dir = roomler_agent::updater::install_dir_with_name(
-        flavour,
-        roomler_agent::updater::INSTALL_FOLDER_NAME,
-    )?;
+    let dir =
+        roomlerd::updater::install_dir_with_name(flavour, roomlerd::updater::INSTALL_FOLDER_NAME)?;
     emit(
         on_event,
         ProgressEvent::AssetResolving {
@@ -631,10 +627,9 @@ async fn place_desktop_companion(
 fn cli_done_surface(
     flavour: WindowsInstallFlavour,
 ) -> (Option<String>, Option<bool>, Option<bool>) {
-    let Some(dir) = roomler_agent::updater::install_dir_with_name(
-        flavour,
-        roomler_agent::updater::INSTALL_FOLDER_NAME,
-    ) else {
+    let Some(dir) =
+        roomlerd::updater::install_dir_with_name(flavour, roomlerd::updater::INSTALL_FOLDER_NAME)
+    else {
         return (None, Some(false), None);
     };
     let cli = dir.join("roomler.exe");
@@ -747,7 +742,7 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
     Ok(())
 }
 
-/// Projection of [`roomler_agent::win_service::system_context_attempt::Attempt`]
+/// Projection of [`roomlerd::win_service::system_context_attempt::Attempt`]
 /// into the shape `ProgressEvent::SystemContextError` consumes. Kept
 /// local to this module so the orchestrator doesn't leak the agent's
 /// telemetry type into the SPA wire format.
@@ -774,7 +769,7 @@ struct SystemContextAttemptView {
 fn read_last_system_context_attempt() -> Option<SystemContextAttemptView> {
     #[cfg(target_os = "windows")]
     {
-        use roomler_agent::win_service::system_context_attempt::{Stage, read_last};
+        use roomlerd::win_service::system_context_attempt::{Stage, read_last};
         match read_last() {
             Ok(Some(attempt)) => {
                 // Surface failures only — a successful prior attempt
@@ -888,7 +883,7 @@ fn msi_exit_code(decoded: &MsiExitDecoded) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roomler_agent::install_detect::InstallInfo;
+    use roomlerd::install_detect::InstallInfo;
 
     fn info(version: &str) -> InstallInfo {
         InstallInfo {

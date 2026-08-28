@@ -500,7 +500,7 @@ no blank row can render).
 
 | Area | Tests |
 |---|---|
-| Config v2 + enrollment dispatch | `agents/roomler-agent/src/config.rs`, `enrollment.rs` units; the two-tenant integration test driving ONE agent lib into TWO TestApps |
+| Config v2 + enrollment dispatch | `agents/roomlerd/src/config.rs`, `enrollment.rs` units; the two-tenant integration test driving ONE agent lib into TWO TestApps |
 | Block grid + allocator | `crates/remote_control/src/models.rs` units (grid rendering, prefix→width, buddy-alignment property, in-block leases) |
 | Renumber planner + version floor | `crates/api/src/routes/overlay_block.rs` units (preservation, compaction ordering, determinism, capacity refusal, numeric rc compare, fail-closed unknowns) |
 | Renumber end-to-end | `crates/tests/src/overlay_tests.rs` — inert dry run, apply + invertibility + next lease, double renumber ⇒ quarantine trail, cross-tenant disjointness over mixed widths, floor refusal + force, permission gate, carve-new-networks-only |
