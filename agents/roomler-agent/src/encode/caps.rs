@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Codec capability detection.
 //!
 //! Probes which video codecs the local host can encode and reports

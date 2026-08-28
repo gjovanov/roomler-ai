@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent-side `roomler-tunnel` plumbing.
 //!
 //! The server-side ACL gate in `crates/api/src/ws/tunnel.rs` is the

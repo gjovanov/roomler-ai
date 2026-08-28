@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 /*
  * Onboarding view: enroll this device into a tenant.
  *   1. Operator pastes an enrollment token (from the Roomler admin UI).

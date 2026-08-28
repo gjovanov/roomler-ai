@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent-side `/derp` WebSocket owner (NAT-traversal Phase D, DERP).
 //!
 //! When DERP is enabled (`ROOMLER_NODE_OVERLAY_DERP=1`) the agent opens ONE

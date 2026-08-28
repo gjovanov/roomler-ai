@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! WebSocket handler for `roomler-tunnel` clients (`role=tunnel-client`).
 //!
 //! T2.5 wires the server-side ACL gate. Lifecycle:

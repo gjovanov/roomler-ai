@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Persist agent crash reports to disk for later upload.
 //!
 //! Three callers feed in (panic hook in `logging.rs`, watchdog stall

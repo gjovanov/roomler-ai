@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { ref, watch, onBeforeUnmount, computed, type Ref, type ComputedRef } from 'vue'
 import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'

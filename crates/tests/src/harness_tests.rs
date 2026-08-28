@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Tests of the test harness itself.
 //!
 //! Everything else in this crate tests the product. This module tests

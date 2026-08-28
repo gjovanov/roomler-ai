@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Embeds a Windows VERSIONINFO resource into `roomlerd.exe`.
 //!
 //! Authenticode says *who* signed a binary. VERSIONINFO is what Explorer's

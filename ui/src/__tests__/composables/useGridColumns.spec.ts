@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { beforeEach, describe, expect, it } from 'vitest'
 import { computed, ref } from 'vue'
 import { useGridColumns } from '@/composables/useGridColumns'

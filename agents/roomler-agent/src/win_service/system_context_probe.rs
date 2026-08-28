@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! M3 A1 derisking probes (Pre-flight #2 / #3 / #5 from the M3 A1 plan).
 //!
 //! Three orthogonal questions about the SYSTEM-context worker

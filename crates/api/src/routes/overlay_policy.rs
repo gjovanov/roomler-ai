@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Admin CRUD for the overlay L3 ACL.
 //!
 //! Mirrors the tunnel-policy admin surface (`routes/tunnel.rs`) but drives a
