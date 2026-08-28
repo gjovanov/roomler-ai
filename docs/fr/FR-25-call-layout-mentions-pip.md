@@ -13,7 +13,12 @@ missing affordances (double-click to spotlight, per-tile fullscreen).
 
 ## Root causes
 
-### 1. Mentions crash the editor — prosemirror-model shipped twice
+### 1. Mentions crash the editor — prosemirror-model installed five times
+
+> ⚠️ **This section was wrong when first written, and the first fix did not
+> work.** Both are kept below rather than rewritten away, because the mistake
+> is the reusable lesson. Corrected 2026-08-29 (#859) after field-testing the
+> deployed build.
 
 `@` opened the popup, Enter threw:
 
@@ -41,9 +46,45 @@ string appeared in **both** `tiptap-BIJn1zU9.js` (4×) **and**
 ⚠️ This was never call-specific — `MessageEditor` is shared by `MessageBubble`,
 `ChatView` and `ConferenceView`, so **room chat was equally broken**.
 
-**Fix:** function-form `manualChunks` matching the whole family by path
-(`@tiptap/*`, `prosemirror-*`, `tiptap-markdown`, `y-prosemirror`), so a future
-import of any tiptap package cannot split prosemirror again.
+**First fix (#842), which did NOT work:** function-form `manualChunks`
+matching the whole family by path. It grouped the packages into one chunk and
+the crash survived it, because *grouping copies is not removing them*.
+
+#### The measurement error
+
+`grep -c "multiple versions of prosemirror-model" dist/assets/*.js` returning
+"2 chunks before, 1 chunk after" was read as proof. That string occurs **once
+per copy** of the library, so the honest reading of the same numbers is
+**`4+1 = 5` copies before, `5+0 = 5` copies after** — the count that mattered
+never moved. A proxy for placement was reported as a count of instances. ⚠️ The
+only sound version of that check is the **TOTAL across every chunk**, and it
+must be exactly 1.
+
+#### The actual cause — the install tree, not the bundler
+
+| package | `prosemirror-model` it vendors |
+|---|---|
+| (root) | **1.25.11** |
+| `prosemirror-`{`commands`,`markdown`,`schema-list`,`state`,`tables`} | **1.25.4** each |
+
+`prosemirror-transform` and `prosemirror-view` are nested the same way. Every
+requirer's range — `^1.0.0`, `^1.25.0`, `^1.25.4` — accepts the root version,
+so this is **installer duplication, not a version conflict**, and no bundler
+arrangement can fix it.
+
+**Real fix (#859):** `resolve.dedupe` over the whole prosemirror family in
+`ui/vite.config.ts`, which forces one instance regardless of how the install
+tree nests. Measured after: **1 copy total, was 5.**
+
+#### The test that should have caught it
+
+`ui/e2e/mention.spec.ts` stopped at *"the autocomplete list is visible"* — which
+is precisely why it stayed green through a total outage: opening the popup was
+never broken, **picking an item was**. #859 adds the case that presses Enter,
+asserts a mention node lands, and asserts on the console **first** so a
+regression reports its cause rather than a missing element. ⚠️ Only an e2e can
+observe this class at all — the unit tests import a single module graph, where
+the duplicate cannot exist by construction.
 
 ### 2. PiP did nothing — the attribute it looks up was never rendered
 
@@ -91,9 +132,10 @@ false (iOS Safari) rather than shipping a dead control.
 
 ## Acceptance criteria
 
-- [x] The prosemirror duplicate-guard appears in exactly ONE built chunk
-      (verified: 2 chunks before, 1 after)
-- [ ] `@` → Enter inserts a mention with no console error, in call chat and room chat
+- [x] Exactly ONE copy of prosemirror-model in the served bundle — the TOTAL
+      across all chunks, not the number of chunks holding it (prod: 1, was 5)
+- [x] `@` → Enter inserts a mention with no console error — proven by e2e in
+      room chat; the in-call chat mounts the same `MessageEditor`
 - [ ] PiP opens from the toolbar and from a tile; solo call falls back to self-view;
       refusals say why
 - [ ] Self-view cropped/uncropped visibly changes all three layouts
@@ -116,4 +158,19 @@ false (iOS Safari) rather than shipping a dead control.
   real call — a chunk containing the code is not the code working.
 - ⚠️ #839 was auto-closed by the merge of #842 (a closing keyword in the PR
   body) one second after it landed, i.e. **before any field verification**. The
-  workflow closes an FR on verified criteria, not on a merge; reopened.
+  workflow closes an FR on verified criteria, not on a merge; reopened — and
+  the field test then showed the fix did not work, so the auto-close had been
+  hiding a live defect.
+- **2026-08-29 — mentions A/B on the standing e2e stack**, `ui/e2e/mention.spec.ts`
+  unchanged between runs, one variable (the image):
+
+  | stack image | new insert test | old popup test |
+  |---|---|---|
+  | `v20260825-18b9c16c429b` (before #842) | **FAIL** — `Can not convert <mention, " "> to a Fragment` | pass |
+  | `v20260829-dbef86e67d8b` (with #842) | **FAIL** — identical | pass |
+  | `v20260829-ae6bfa254495` (with #859) | **PASS** (3/3) | pass |
+
+  The middle row is the point: the shipped "fix" was indistinguishable from no
+  fix, and only a test that had been **shown to fail first** could reveal it.
+  Prod is on `v20260829-ae6bfa254495`, `/health` 200, and its served bundle
+  carries **1** copy of prosemirror-model (`tiptap-KeNVj9jG.js`).
