@@ -70,6 +70,51 @@ windows-sys = { version = "0.59", features = [
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# FR-27 — the Linux companion, as its OWN Debian package.
+#
+# Deliberately NOT folded into the `roomlerd` .deb. That package installs on
+# every headless node in the fleet — k8s workers, build hosts, relays — and
+# adding webkit2gtk + GTK + an app-indicator library to their dependency graph
+# to ship a menu-bar app none of them can display would be a real regression
+# for pillar 2. A separate package means a desktop gets the panel and a server
+# never hears about it. A CI guard asserts the daemon package's `depends`
+# gains no GTK/webkit entry.
+#
+# `roomlerd` is a hard dependency: this app is a thin client over the daemon's
+# LocalAPI and does nothing at all without one.
+#
+# ⚠️ The runtime deps are the SONAME packages, not the `-dev` ones CI installs
+# to build. `libwebkit2gtk-4.1-0` is what Ubuntu 22.04+ ships;
+# `libayatana-appindicator3-1` is what `tray-icon` dlopens for the tray on
+# Linux, and without it the app starts with no tray at all — the exact failure
+# this FR is fixing on Windows, re-created on another platform.
+[package.metadata.deb]
+name = "roomler-desktop"
+maintainer = "G ROX LTD <goran.jovanov@gmail.com>"
+copyright = "2026, G ROX LTD"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Roomler desktop — the menu-bar companion for the Roomler daemon: device \
+status, network peers, tunnel routes, and the on-screen consent prompt and \
+"being viewed" banner for remote-control sessions."""
+depends = "libc6, libwebkit2gtk-4.1-0, libgtk-3-0, libayatana-appindicator3-1, roomlerd"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/roomler-desktop", "usr/bin/", "755"],
+    ["packaging/linux/roomler-desktop.desktop", "usr/share/applications/", "644"],
+    # Autostart, because the companion is the device's consent PROMPT surface:
+    # a device set to "Prompt on host" whose companion is not running has no
+    # way to ask anyone, and the operator finds out by a session mysteriously
+    # timing out. `Hidden=true` in the file is the documented per-user opt-out.
+    [
+        "packaging/linux/roomler-desktop.desktop",
+        "etc/xdg/autostart/roomler-desktop.desktop",
+        "644",
+    ],
+    ["icons/icon.png", "usr/share/icons/hicolor/512x512/apps/roomler-desktop.png", "644"],
+]
+
 # cargo-wix metadata — the tray ships as its own perUser MSI alongside
 # the agent's MSI(s). Operators install both: agent does the work,
 # tray surfaces the onboarding GUI + status.

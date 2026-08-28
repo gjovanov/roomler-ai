@@ -31,8 +31,11 @@
 #   --no-enroll       install without enrolling (no token needed); prints the
 #                     enroll command to run later.
 #
-# The desktop companion (roomler-desktop) ships for Windows only today — this
-# script notes that and moves on.
+# The desktop companion (roomler-desktop) rides IN the macOS .pkg. On Linux it
+# is a SEPARATE .deb (FR-27) — installed automatically when this box has a
+# graphical session, since the companion is the device's consent PROMPT
+# surface and a device set to "Prompt on host" without one cannot ask anybody.
+#   --desktop / --no-desktop   force that decision either way.
 #
 # Conventions: POSIX sh (no bashisms), curl -fsSL, /tmp staging, sudo only
 # where the target dir demands it. The enrollment token is single-use and is
@@ -59,11 +62,20 @@ MACOS_DAEMON_CONFIG="/etc/roomler-agent/config.toml"
 MACOS_DAEMON_MARKER="/etc/roomler-agent/enable-daemon"
 DAEMON_TOKEN=""
 NO_ENROLL=0
+# FR-27 — the Linux desktop companion. Empty = decide by probing for a
+# graphical session; --desktop / --no-desktop force it either way.
+DESKTOP=""
 
 usage() {
     sed -n '2,30p' "$0" 2>/dev/null || true
     echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT] [--name NAME]"
     echo "                  [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
+    echo "                  [--desktop|--no-desktop]"
+    echo
+    echo "  --desktop       Linux only. Force the roomler-desktop companion on or off."
+    echo "                  Default: installed when a graphical session is detected. It is"
+    echo "                  the device's on-screen consent prompt, so a host set to"
+    echo "                  'Prompt on host' without it cannot ask anybody."
     echo
     echo "  --daemon-token  macOS only. Installs the privileged half as well (overlay/mesh)."
     echo "                  macOS needs TWO processes: a per-user LaunchAgent for screen"
@@ -86,6 +98,8 @@ while [ $# -gt 0 ]; do
         --system) SYSTEM=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --no-enroll) NO_ENROLL=1; shift ;;
+        --desktop) DESKTOP=1; shift ;;
+        --no-desktop) DESKTOP=0; shift ;;
         -h|--help) usage ;;
         *) echo "unknown flag: $1" >&2; usage ;;
     esac
@@ -485,17 +499,78 @@ enroll_tunnel() {
     "$cli" enroll --server "$SERVER" --token "$TOKEN" --name "$NAME"
 }
 
+# FR-27 — the Linux desktop companion, from its OWN .deb.
+#
+# A SEPARATE package on purpose: the daemon .deb installs on headless nodes
+# across the fleet, and folding webkit2gtk + GTK into it to ship a menu-bar app
+# they cannot display would be a real regression for them.
+#
+# Installed by default when this box has a graphical session, because the
+# companion IS the consent prompt surface — a device set to "Prompt on host"
+# without one cannot ask anybody, and the operator only finds out when a
+# session times out for no stated reason.
+#
+# Never fatal. A daemon with no companion is still a working daemon; it just
+# has no on-screen way to answer a prompt, which this says out loud.
+#
+# Reads `arch` and `releases` from install_daemon_linux, which always runs
+# first (the case dispatch below calls them in that order).
+install_desktop_linux() {
+    if [ "$DESKTOP" = 0 ]; then
+        say "skipping the desktop companion (--no-desktop)"
+        return 0
+    fi
+    if [ -z "$DESKTOP" ]; then
+        # Probe, don't ask. A display or a login session is the honest signal
+        # that someone could SEE a prompt on this box.
+        if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] &&
+            ! { command -v loginctl >/dev/null 2>&1 &&
+                loginctl list-sessions --no-legend 2>/dev/null | grep -q .; }; then
+            say "no graphical session detected — skipping the desktop companion (--desktop forces it)"
+            return 0
+        fi
+    fi
+    if ! command -v dpkg >/dev/null 2>&1; then
+        say "no dpkg here — the desktop companion ships as a .deb only; skipping"
+        return 0
+    fi
+
+    desktop_pattern="roomler-desktop-.*${arch}-unknown-linux-gnu\\.deb"
+    desktop_url="$(asset_field_for "$releases" "$desktop_pattern" browser_download_url)"
+    if [ -z "$desktop_url" ]; then
+        say "no roomler-desktop .deb for ${arch} in this release — skipping the companion"
+        return 0
+    fi
+    desktop_digest="$(asset_field_for "$releases" "$desktop_pattern" digest)"
+    desktop_pkg="$STAGE/roomler-desktop.deb"
+    download "$desktop_url" "$desktop_pkg"
+    verify_sha256 "$desktop_pkg" "$desktop_digest"
+
+    if [ "$DOWNLOAD_ONLY" = 1 ]; then
+        say "download-only: would run: sudo dpkg -i $desktop_pkg"
+        return 0
+    fi
+    say "installing the roomler-desktop companion (.deb — sudo required)"
+    # `apt-get -f install` pulls webkit2gtk / GTK / appindicator when dpkg
+    # reports them missing, which on a fresh desktop it usually will.
+    if sudo dpkg -i "$desktop_pkg" || sudo apt-get -f install -y; then
+        say "desktop companion installed — starts at your next login, or now: roomler-desktop &"
+    else
+        warn "the desktop companion did not install; the daemon is unaffected."
+        warn "  Without it this device has no on-screen consent prompt — use"
+        warn "  'roomler consent --list' / '--approve', or set it to email/push consent."
+    fi
+}
+
 # ─── main ───────────────────────────────────────────────────────────────────
 
 say "roomler install.sh — role=$ROLE os=$OS server=$SERVER"
-# The companion rides IN the macOS .pkg (and the Windows MSI); only Linux has
-# none, and there it is the daemon + CLI without a desktop surface.
-if [ "$ROLE" = daemon ] && [ "$OS" = Linux ]; then
-    say "note: the roomler-desktop companion is not available on Linux — not installed here"
-fi
 
 case "$ROLE/$OS" in
-    daemon/Linux)  install_daemon_linux ;;
+    # FR-27 — the companion AFTER the daemon: it depends on `roomlerd` (the
+    # package literally Depends on it), and it reuses the release listing the
+    # daemon step already fetched.
+    daemon/Linux)  install_daemon_linux; install_desktop_linux ;;
     daemon/Darwin) install_daemon_macos ;;
     tunnel/Linux)  install_tunnel_linux ;;
     tunnel/Darwin) install_tunnel_macos ;;
