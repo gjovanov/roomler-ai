@@ -32,6 +32,10 @@ pub struct TunnelConfig {
 /// `%APPDATA%\roomler\roomler-tunnel\config.toml`; on Linux/macOS the
 /// `directories` crate's `ProjectDirs::config_dir()` is honoured.
 pub fn default_config_path() -> Result<PathBuf> {
+    // RETIRED-NAME-ANCHOR(2): tunnel-only hosts keep their ENROLLED config here.
+    // Renaming the segment orphans it, exactly as it would for appdirs::OLD_APP.
+    // Migrating it needs the same new-then-old resolution appdirs has — P4, not a
+    // drive-by. See docs/fr/FR-21.
     let dirs = directories::ProjectDirs::from("ai", "roomler", "roomler-tunnel")
         .context("no platform config dir available for roomler-tunnel")?;
     Ok(dirs.config_dir().join("config.toml"))

@@ -6,7 +6,7 @@
 //! CLI binary finds its config on first run.
 //!
 //! Moved here (P4a) from the legacy tunnel wizard's enroll.rs (crate
-//! retired in P4c-2). The `roomler_tunnel`-coupled `write_config`
+//! retired in P4c-2). The `roomler_cli`-coupled `write_config`
 //! half lives with the dep holders (the setup app's tunnel
 //! orchestrator) — this crate stays free of the tunnel dep.
 //! Original rationale for not calling

@@ -656,8 +656,7 @@ async fn main() -> Result<()> {
     // main(): everything below is daemon-startup setup that a CLI invocation
     // has no business performing. See `embedded_cli_args`.
     if let Some(argv) = embedded_cli_args() {
-        return roomler_tunnel::cli::run_from(argv, roomler_tunnel::cli::Origin::EmbeddedInDaemon)
-            .await;
+        return roomler_cli::cli::run_from(argv, roomler_cli::cli::Origin::EmbeddedInDaemon).await;
     }
 
     // Set per-monitor-V2 DPI awareness as the very first thing on

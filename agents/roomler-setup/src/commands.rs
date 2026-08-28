@@ -115,7 +115,7 @@ pub fn cmd_detect_install() -> Result<DetectResult, String> {
 /// the platform-default path, read + TOML-parse best-effort for the
 /// machine_name.
 fn probe_tunnel_install() -> TunnelDetect {
-    let Ok(path) = roomler_tunnel::config::default_config_path() else {
+    let Ok(path) = roomler_cli::config::default_config_path() else {
         return TunnelDetect {
             installed: false,
             machine_name: None,
@@ -131,7 +131,7 @@ fn probe_tunnel_install() -> TunnelDetect {
     }
     let machine_name = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|s| toml::from_str::<roomler_tunnel::config::TunnelConfig>(&s).ok())
+        .and_then(|s| toml::from_str::<roomler_cli::config::TunnelConfig>(&s).ok())
         .map(|c| c.machine_name);
     TunnelDetect {
         installed: true,
