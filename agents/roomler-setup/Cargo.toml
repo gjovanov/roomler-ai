@@ -45,7 +45,7 @@ roomler-setup-core = { path = "../../crates/roomler-setup-core" }
 # lib calls. Transitively pulls the agent's heavy deps (webrtc-rs
 # etc.) — same trade-off the legacy wizards accepted: a fatter EXE,
 # but the install pipeline stays lib-driven with no CLI shelling.
-roomler-agent = { path = "../roomler-agent" }
+roomler-agent = { path = "../roomlerd" }
 
 # Lib dep on the tunnel CLI — the tunnel orchestrator reuses
 # `config::{TunnelConfig, save, default_config_path}` for the
@@ -56,7 +56,7 @@ roomler-tunnel = { path = "../roomler-tunnel" }
 # foreground window, exits on Finish/Cancel. `custom-protocol` is
 # REQUIRED for `cargo build --release` to embed the front-end assets
 # rather than loading from `devUrl` (same lesson as the rc.20 tray
-# hotfix; see `agents/roomler-agent-tray/Cargo.toml` for the full
+# hotfix; see `agents/roomler-desktop/Cargo.toml` for the full
 # rationale).
 tauri = { version = "2", features = ["custom-protocol"] }
 tauri-plugin-shell = "2"

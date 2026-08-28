@@ -17,7 +17,7 @@ regenerating is a command rather than an afternoon in a paint program.
 
     python3 scripts/gen-tray-icons.py
 
-Requires Pillow. Writes into agents/roomler-agent-tray/icons/.
+Requires Pillow. Writes into agents/roomler-desktop/icons/.
 """
 
 import pathlib
@@ -28,7 +28,7 @@ try:
 except ImportError:  # pragma: no cover - developer tooling
     sys.exit("this needs Pillow:  pip install pillow")
 
-OUT = pathlib.Path(__file__).resolve().parent.parent / "agents/roomler-agent-tray/icons"
+OUT = pathlib.Path(__file__).resolve().parent.parent / "agents/roomler-desktop/icons"
 BRAND = (21, 101, 192, 255)  # #1565C0, from favicon.svg
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
