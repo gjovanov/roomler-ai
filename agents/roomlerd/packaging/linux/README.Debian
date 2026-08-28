@@ -79,7 +79,7 @@ persists its WireGuard key on the first overlay-enabled start.
 
 The OS TUN needs CAP_NET_ADMIN, so this works under roomlerd.service (root)
 and not under roomler.service. On a host that cannot run as root, set
-ROOMLER_NODE_OVERLAY_NETSTACK_SOCKS=<port> for the userspace netstack
+ROOMLERD_OVERLAY_NETSTACK_SOCKS=<port> for the userspace netstack
 instead: outbound mesh access through a loopback SOCKS5 proxy, no TUN and no
 routes — but other nodes cannot reach services on this host.
 

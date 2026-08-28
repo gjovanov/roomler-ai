@@ -191,7 +191,7 @@ fn dispatch(enigo: &mut Enigo, msg: InputMsg) -> Result<()> {
             // legacy console (Windows PowerShell 5.1 / cmd in conhost) silently
             // drops (field: REGAL-112500982 — letters vanished in elevated
             // Windows PowerShell but worked in pwsh 7 / Windows Terminal). The
-            // `ROOMLER_AGENT_UNICODE_TEXT=1` kill switch reverts to enigo.text().
+            // `ROOMLERD_UNICODE_TEXT=1` kill switch reverts to enigo.text().
             #[cfg(target_os = "windows")]
             {
                 if super::win_text::unicode_only() {
@@ -226,7 +226,7 @@ fn map_button(b: Button) -> EnigoButton {
 
 /// Whether the virtual-screen-aware `to_pixels` path is enabled.
 ///
-/// Opt-in via `ROOMLER_AGENT_VIRTUAL_SCREEN=1` (also accepts `true`,
+/// Opt-in via `ROOMLERD_VIRTUAL_SCREEN=1` (also accepts `true`,
 /// `yes`, `on` — case-insensitive). Default off — the legacy
 /// `enigo.main_display()` path is preserved verbatim.
 ///
@@ -277,7 +277,7 @@ pub(crate) fn map_normalised_to_virtual(
 /// Resolve the monitor we map normalised `(x, y)` against. Returns
 /// `(origin_x, origin_y, width_px, height_px)`.
 ///
-/// Path resolution (when `ROOMLER_AGENT_VIRTUAL_SCREEN=1`):
+/// Path resolution (when `ROOMLERD_VIRTUAL_SCREEN=1`):
 ///   1. `win32_monitors::target_monitor(mon)` — looks up the cached
 ///      enumerate() result by browser-supplied index, falls back to
 ///      the primary monitor when out of range. Today's browser sends
@@ -319,7 +319,7 @@ fn resolve_target_monitor(enigo: &Enigo, mon: u8) -> (i32, i32, i32, i32) {
 /// The first 50 events surface the actual numbers in agent logs;
 /// remaining events drop to debug level to avoid spam.
 ///
-/// rc.54 — when `ROOMLER_AGENT_VIRTUAL_SCREEN=1` is set, the new path
+/// rc.54 — when `ROOMLERD_VIRTUAL_SCREEN=1` is set, the new path
 /// queries `win32_monitors::primary()` for the OS-designated primary
 /// monitor's virtual-screen origin and applies the offset to the
 /// computed pixel coords. Closes the orthogonal mouse-offset bug on

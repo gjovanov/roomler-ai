@@ -150,7 +150,7 @@ pub const FPS_PACE_MIN: u32 = 15;
 /// Pure and hysteretic: quantized to 5 fps steps, engages only when the
 /// sustainable rate sits ≥5 under target, moves only by ≥5, floors at
 /// [`FPS_PACE_MIN`] (beyond that the tier layer shrinks pixels). Kill
-/// switch `ROOMLER_AGENT_FPS_PACE=0` / config `fps_pace`.
+/// switch `ROOMLERD_FPS_PACE=0` / config `fps_pace`.
 pub struct FpsPace {
     paced: Option<u32>,
     enabled: bool,
@@ -225,7 +225,7 @@ pub const TIER_CHANGE_COOLDOWN: std::time::Duration = std::time::Duration::from_
 /// WINHOST-H-class hosts whose 4K panel saturates the encoder even at the
 /// bitrate floor). Pure: step once per heartbeat window with the current
 /// [`TierSignal`]; emits `Some(new_long_edge_cap)` exactly when the tier
-/// changes. Kill switch `ROOMLER_AGENT_AUTO_DOWNSCALE=0`.
+/// changes. Kill switch `ROOMLERD_AUTO_DOWNSCALE=0`.
 pub struct DownscaleTier {
     tier: usize,
     down_run: u32,

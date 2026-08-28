@@ -259,7 +259,7 @@ orgs' meshes stay up.
 Still primary-only, deliberately: **exit-node roles** (split-defaults and the
 NRPT "." steer are host-global) and **netstack mode** (its SOCKS front and
 handle channel are process-global singletons — with `overlay_multi_org` on,
-the OS TUN is used regardless of `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`).
+the OS TUN is used regardless of `ROOMLERD_OVERLAY_NETSTACK_SOCKS`).
 
 ---
 
@@ -270,7 +270,7 @@ stable port base, deconflicted only by the blind band walk — so which org
 held 43648 was a spawn-order race that re-ran on every restart and swapped
 ports between orgs (NAT-mapping churn on the org that lost).
 
-With `overlay_shared_carrier` on (`ROOMLER_NODE_OVERLAY_SHARED_CARRIER`,
+With `overlay_shared_carrier` on (`ROOMLERD_OVERLAY_SHARED_CARRIER`,
 config key `overlay_shared_carrier`), the daemon binds **ONE process-wide
 socket set** (`crates/tunnel-core/src/overlay/carrier_plane.rs`) that every
 org's engine attaches to:
@@ -296,7 +296,7 @@ re-binds ONCE, and every org re-establishes on `Ready`.
 ### Per-org TUN adapters (`overlay_tun_per_org`, default ON since rc.339)
 
 The second half of multi-org v2: with
-`overlay_tun_per_org` on (`ROOMLER_NODE_OVERLAY_TUN_PER_ORG`; requires
+`overlay_tun_per_org` on (`ROOMLERD_OVERLAY_TUN_PER_ORG`; requires
 `overlay_multi_org`), each org gets its **own adapter** instead of a facade
 over the shared one:
 
@@ -356,7 +356,7 @@ Two-layer fix:
   destination on matching replies so the OS delivers them to the socket
   still anchored to the original address (`overlay/mux_nat.rs` +
   `tun_mux.rs` hooks). Kill switch: `overlay_mux_nat`
-  (`ROOMLER_NODE_OVERLAY_MUX_NAT`), default **on**.
+  (`ROOMLERD_OVERLAY_MUX_NAT`), default **on**.
 
 Accepted limitations (all narrow): no port translation — sockets on BOTH org
 addresses colliding on an identical (proto, local port, remote, remote port)
@@ -378,7 +378,7 @@ could kill it or inject SDP/ICE. The cross-pod terminate is authz'd and no
 longer a silent pod-local no-op that returned `{"terminated": true}`.
 
 Then capacity (#323): `rc_max_sessions` (1–8, default 2;
-`ROOMLER_AGENT_RC_MAX_SESSIONS`) plus the five latent single-session
+`ROOMLERD_RC_MAX_SESSIONS`) plus the five latent single-session
 assumptions that made >1 unsafe — clipboard's single watcher slot, display-match
 restore firing on any session close, per-tx controller unregistration, the
 viewer's one-handler-per-type registry, and ungated INPUT/FILES data channels.
@@ -554,7 +554,7 @@ no blank row can render).
   front, so two orgs in netstack mode both get a mesh. What genuinely
   cannot be shared is the PORT (one TCP listener): it keeps an owner, and a
   second org configured onto the same one withholds with an actionable
-  message. The primary reads `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`; a
+  message. The primary reads `ROOMLERD_OVERLAY_NETSTACK_SOCKS`; a
   secondary sets `netstack_socks_port` on its `[[orgs]]` entry and
   deliberately does not inherit the env key.
 - **Block reclaim** — `POST /api/admin/overlay-block/reclaim`, platform

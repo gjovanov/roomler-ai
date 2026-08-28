@@ -85,7 +85,7 @@ for the sublayer above) and a reverse-direction ping/curl.
 
 ## Disabling it
 
-Set `ROOMLER_AGENT_WFP_PERMIT=0` (or `false`/`no`/`off`) to skip WFP
+Set `ROOMLERD_WFP_PERMIT=0` (or `false`/`no`/`off`) to skip WFP
 programming entirely — e.g. on a host where IT installed a managed
 exception, or to silence an AV "firewall tampering" alert. Default is **ON**
 whenever `overlay-l3` is active.
@@ -101,7 +101,7 @@ overrides a GPO firewall block is exactly the pattern some EDRs flag as
   created.
 - **Additive permit only** — never shields-up, never a discard/block.
 - Runs as **LocalSystem** (the service privilege that makes BFE writable).
-- **Break-glass disable** via `ROOMLER_AGENT_WFP_PERMIT=0` — an IT/security
+- **Break-glass disable** via `ROOMLERD_WFP_PERMIT=0` — an IT/security
   team can neutralize it without rebuilding.
 
 Implementation: `crates/tunnel-core/src/overlay/wfp.rs` (raw `windows-sys`

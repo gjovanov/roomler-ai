@@ -513,7 +513,7 @@ pub enum ClientMsg {
         /// `"yuv420"` (VP9 profile 0; ~30% lower bandwidth; slight
         /// ClearType softening) and `"yuv444"` (VP9 profile 1; sharpest
         /// text; current default). `None` / unset means "use the
-        /// agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default". Only
+        /// agent's `ROOMLERD_VP9_CHROMA` env-var default". Only
         /// applies when `preferred_transport` is `data-channel-vp9-444`;
         /// ignored otherwise. Forwarded verbatim to the agent in the
         /// matching server-side [`ServerMsg::SessionRequest`].
@@ -876,20 +876,20 @@ pub enum ClientMsg {
         #[serde(default)]
         endpoints: Vec<String>,
         /// rc.142 — the node can carry WG over a QUIC-over-TURN relay carrier
-        /// (`ROOMLER_AGENT_OVERLAY_QUIC=1`). The server persists it and echoes it
+        /// (`ROOMLERD_OVERLAY_QUIC=1`). The server persists it and echoes it
         /// per-peer in the netmap so QUIC is only attempted when BOTH ends
         /// advertise it (a QUIC/raw split would silently break the pair).
         #[serde(default)]
         supports_quic: bool,
         /// Phase D — the node can carry WG over the v1 single-relay carrier (ONE
-        /// anchor allocation + a raw dialer, `ROOMLER_NODE_OVERLAY_RELAY_SINGLE=1`).
+        /// anchor allocation + a raw dialer, `ROOMLERD_OVERLAY_RELAY_SINGLE=1`).
         /// Persisted + echoed per-peer like `supports_quic`, so single-relay is
         /// only chosen when BOTH ends advertise it (a mixed pair stays on the
         /// both-allocate relay). Absent from a pre-Phase-D node ⇒ `false`.
         #[serde(default)]
         supports_relay_single: bool,
         /// Phase D (DERP) — the node can carry WG over the pubkey-addressed
-        /// `/derp` WS relay (`ROOMLER_NODE_OVERLAY_DERP=1`), the last-resort
+        /// `/derp` WS relay (`ROOMLERD_OVERLAY_DERP=1`), the last-resort
         /// carrier for two BOTH-UDP-blocked peers. Persisted + echoed per-peer
         /// like `supports_relay_single`, so DERP is only chosen when BOTH ends
         /// advertise it. Absent from a pre-DERP node ⇒ `false`.
@@ -1092,7 +1092,7 @@ pub enum ServerMsg {
         /// rc.62 — per-session VP9 chroma override forwarded verbatim
         /// from the controller's [`ClientMsg::SessionRequest::chroma_pref`].
         /// `None` / unset means "use the agent's
-        /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
+        /// `ROOMLERD_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
         /// Opt-in system/desktop audio, forwarded verbatim from the

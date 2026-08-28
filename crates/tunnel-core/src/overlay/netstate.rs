@@ -29,7 +29,7 @@
 //!
 //! Config: `overlay_netmon` (default ON) + `overlay_netmon_debounce_ms`
 //! (default 750, clamped 100–5000) via the standard env bridge
-//! (`ROOMLER_NODE_OVERLAY_NETMON*`).
+//! (`ROOMLERD_OVERLAY_NETMON*`).
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -39,7 +39,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
-/// Master switch (`ROOMLER_NODE_OVERLAY_NETMON`, default ON).
+/// Master switch (`ROOMLERD_OVERLAY_NETMON`, default ON).
 pub(crate) fn netmon_enabled() -> bool {
     crate::env::flag("OVERLAY_NETMON", true)
 }
@@ -48,7 +48,7 @@ pub(crate) fn netmon_enabled() -> bool {
 /// the runtime's net-change arm; formerly `route_events`').
 pub(crate) const ROUTE_WAVE_MIN_INTERVAL: Duration = Duration::from_secs(3);
 
-/// `ROOMLER_NODE_OVERLAY_ROUTE_EVENTS` — the legacy per-runtime consumer
+/// `ROOMLERD_OVERLAY_ROUTE_EVENTS` — the legacy per-runtime consumer
 /// kill-switch, still honored (default ON; `0`/`false`/`off` = the runtime
 /// ignores net deltas and keeps the 2 s tick-only route guard, the pre-P4
 /// behaviour). The subsystem-wide switch is [`netmon_enabled`].
@@ -62,7 +62,7 @@ pub(crate) fn route_events_enabled() -> bool {
 }
 
 /// Debounce window: further raw signals inside this quiet period are
-/// absorbed into one delta (`ROOMLER_NODE_OVERLAY_NETMON_DEBOUNCE_MS`).
+/// absorbed into one delta (`ROOMLERD_OVERLAY_NETMON_DEBOUNCE_MS`).
 fn debounce() -> Duration {
     let ms = crate::env::node_env("OVERLAY_NETMON_DEBOUNCE_MS")
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -322,7 +322,7 @@ pub fn handle() -> Option<&'static NetstateHandle> {
 
 fn spawn() -> Option<NetstateHandle> {
     if !netmon_enabled() {
-        debug!("netstate: disabled (ROOMLER_NODE_OVERLAY_NETMON=0)");
+        debug!("netstate: disabled (ROOMLERD_OVERLAY_NETMON=0)");
         return None;
     }
     let (raw_tx, raw_rx) = mpsc::unbounded_channel();
