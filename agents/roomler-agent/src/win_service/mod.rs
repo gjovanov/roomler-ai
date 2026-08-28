@@ -58,6 +58,8 @@ pub const NEW_SERVICE_NAME: &str = "Roomler";
 /// Pre-rename SCM short name. A host installed before the P3D migration
 /// still has a `RoomlerAgentService` entry; the takeover install starts
 /// the new service first, then retires this one.
+// RETIRED-NAME-ANCHOR: without this the takeover install cannot find the running
+// pre-rename service to retire, leaving two services or none. See docs/fr/FR-21.
 pub const LEGACY_SERVICE_NAME: &str = "RoomlerAgentService";
 
 /// The SCM service to operate on: the NEW `Roomler` service if registered,
