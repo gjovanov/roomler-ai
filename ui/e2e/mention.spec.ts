@@ -114,4 +114,64 @@ test.describe('Mentions', () => {
       memberUser.displayName.split(' ')[0].toLowerCase(),
     )
   })
+
+  // FR-25 (#839). The test above stops at "the list is visible", and that is
+  // exactly why it stayed green through a total outage of the feature:
+  // opening the popup was never broken — PICKING an item was. `vite.config.ts`
+  // chunked only two of the nine tiptap packages together, so
+  // `prosemirror-model` shipped TWICE and the node built by the mention
+  // extension was rejected by the editor's own schema:
+  //
+  //   RangeError: Can not convert <mention, " "> to a Fragment
+  //   (looks like multiple versions of prosemirror-model were loaded)
+  //
+  // ⚠️ Only an e2e can catch this class. The unit tests import source modules
+  // through one module graph, where the duplicate cannot exist; the defect
+  // lives in how the BUILT bundle is split, so it is only observable against a
+  // served build. ⚠️ It was never call-specific either — the editor is shared
+  // with room chat, which is what this exercises.
+  test('picking a mention actually inserts it (bundle-duplication guard)', async ({ page }) => {
+    const thrown: string[] = []
+    page.on('pageerror', (e) => thrown.push(`pageerror: ${e.message}`))
+    page.on('console', (m) => {
+      if (m.type() === 'error') thrown.push(`console: ${m.text()}`)
+    })
+
+    await loginViaUi(page, adminUser.username, adminUser.password)
+    await page.goto(`/tenant/${tenantId}/room/${roomId}`)
+    await page.waitForLoadState('networkidle', { timeout: 30000 })
+
+    const editor = page.locator('.ProseMirror[contenteditable="true"]').first()
+    await expect(editor).toBeVisible({ timeout: 30000 })
+    await editor.click()
+
+    await editor.pressSequentially('@')
+    const mentionList = page.locator('.mention-list')
+    await expect(mentionList).toBeVisible({ timeout: 5000 })
+    await editor.pressSequentially(memberUser.displayName.split(' ')[0])
+    await expect(mentionList.locator('.mention-item').first()).toBeVisible({ timeout: 5000 })
+
+    // The step the outage lived in.
+    await page.keyboard.press('Enter')
+    await page.waitForTimeout(500)
+
+    // Assert on what THREW before asserting on what is missing: the regression
+    // names itself in the console, so a future failure reads as the cause
+    // rather than as "an element was not found". Filtered to its own words so
+    // an unrelated network error in a browser-vs-cluster e2e cannot flake it.
+    const fatal = thrown.filter((e) => /prosemirror|Fragment|RangeError/i.test(e))
+    expect(fatal, `editor threw while inserting a mention: ${fatal.join(' | ')}`).toEqual([])
+
+    // A real mention NODE must exist in the document — not the literal text
+    // that a failed insert leaves behind.
+    const mention = editor.locator('.mention').first()
+    await expect(mention).toBeVisible({ timeout: 5000 })
+    expect((await mention.textContent())?.toLowerCase()).toContain(
+      memberUser.displayName.split(' ')[0].toLowerCase(),
+    )
+
+    // The popup must be gone: it closes on a successful insert and stays open
+    // when the transaction throws.
+    await expect(mentionList).toBeHidden({ timeout: 5000 })
+  })
 })
