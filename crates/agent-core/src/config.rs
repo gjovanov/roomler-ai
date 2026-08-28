@@ -721,6 +721,16 @@ pub struct AgentConfig {
     /// gate). Env: ROOMLER_NODE_RELAY_AGE_FEEDBACK. Restart required.
     #[serde(default)]
     pub relay_age_feedback: Option<bool>,
+    /// How long ONE frame may sit inside the DataChannel send call before
+    /// the pump treats it as congestion, ms (default 250; 0 disables).
+    ///
+    /// `send_wait` measures the pipe's refusal to drain directly — no clock,
+    /// no viewer, both transports — so it is the one congestion signal that
+    /// still works on a relay, where the goodput clamp is off and the age
+    /// loop rides a probe the congestion itself biases. Acted on for
+    /// CONSTRAINED sessions only. Env: ROOMLER_NODE_SEND_STALL_MS.
+    #[serde(default)]
+    pub send_stall_ms: Option<u32>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
     /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
@@ -1676,6 +1686,7 @@ pub fn test_fixture() -> AgentConfig {
         fps_pace: None,
         relay_idr_thrift: None,
         relay_age_feedback: None,
+        send_stall_ms: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -1861,7 +1872,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 22] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 23] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1886,6 +1897,7 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
         ("DIRECT_QUEUE_MS", cfg.direct_queue_ms),
         ("DIRECT_HRD_PCT", cfg.direct_hrd_pct),
+        ("SEND_STALL_MS", cfg.send_stall_ms),
         ("SMOOTHER_RATE_PCT", cfg.smoother_rate_pct),
         ("BALANCED_RATE_PCT", cfg.balanced_rate_pct),
         ("SCALE_THREADS", cfg.scale_threads),
