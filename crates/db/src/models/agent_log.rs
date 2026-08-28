@@ -14,7 +14,7 @@
 //! [`crate::indexes`].
 //!
 //! See `crates/api/src/routes/agent_log.rs` for the route + validation;
-//! see `agents/roomler-agent/src/logs_upload.rs` for the agent-side
+//! see `agents/roomlerd/src/logs_upload.rs` for the agent-side
 //! `tracing` layer that produces these batches.
 
 use bson::{DateTime, Document, oid::ObjectId};

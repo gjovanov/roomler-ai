@@ -51,7 +51,7 @@ roomler-agent-<version>-<arch>-unknown-linux-gnu.tar.gz.sha256
 ```
 
 Tarball layout — a prefix dir so extraction is never a surprise, mirroring the
-`.deb` asset map in `agents/roomler-agent/Cargo.toml`:
+`.deb` asset map in `agents/roomlerd/Cargo.toml`:
 
 ```
 roomler-agent-<version>-<arch>-unknown-linux-gnu/

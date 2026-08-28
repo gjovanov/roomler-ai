@@ -72,7 +72,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import sys, struct, pathlib
-          icons = pathlib.Path("agents/roomler-agent-tray/icons")
+          icons = pathlib.Path("agents/roomler-desktop/icons")
           bad = []
           for name in ("tray.png", "icon.png"):
               p = icons / name
@@ -221,7 +221,7 @@ jobs:
         #     Rust on Linux (X11 headers already installed above).
         #   - roomler SSH (`ssh-server`, which implies `overlay-netstack`):
         #     same trap the clipboard note above describes, and it had already
-        #     sprung — `agents/roomler-agent/src/ssh.rs`'s suite (host key,
+        #     sprung — `agents/roomlerd/src/ssh.rs`'s suite (host key,
         #     auth accept/deny, grant redemption, single-use, expiry) is
         #     `#[cfg(feature = "ssh-server")]` and was in NO CI lane, so none
         #     of it ran here. It also puts the Unix half of the privilege drop
@@ -362,10 +362,10 @@ jobs:
         # Both checks are free here.
         run: |
           set -euo pipefail
-          for p in agents/roomler-agent/packaging/macos/*.plist; do
+          for p in agents/roomlerd/packaging/macos/*.plist; do
             plutil -lint "$p"
           done
-          bash -n agents/roomler-agent/packaging/macos/postinstall
+          bash -n agents/roomlerd/packaging/macos/postinstall
           # The daemon plist must point at a path the .pkg actually creates,
           # and must NOT reuse the LaunchAgent's Label — launchctl would
           # refuse the second bootstrap and the failure reads as "already
@@ -377,7 +377,7 @@ jobs:
           # Globbed on `com.roomler.*` — the launchd jobs — rather than every
           # .plist in the directory, which also holds entitlements.plist (a
           # codesign input with no Label at all).
-          labels=$(for p in agents/roomler-agent/packaging/macos/com.roomler.*.plist; do
+          labels=$(for p in agents/roomlerd/packaging/macos/com.roomler.*.plist; do
                      plutil -extract Label raw "$p" \
                        || { echo "::error::$p has no Label"; exit 1; }
                    done)
@@ -391,7 +391,7 @@ jobs:
           # RETIRED-NAME-ANCHOR(2): asserts the frozen bundle path. Its name keys the
           # macOS TCC grants; FR-21 D5 freezes it. docs/fr/FR-21
           grep -q '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent' \
-            agents/roomler-agent/packaging/macos/com.roomler.daemon.plist
+            agents/roomlerd/packaging/macos/com.roomler.daemon.plist
 
       - name: macOS overlay against a real utun
         # The macOS arms of add_address_sync / add_peer_route /

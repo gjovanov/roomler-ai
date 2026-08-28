@@ -48,7 +48,7 @@ set(FFMPEG_REF "n7.1")
 message(FATAL_ERROR
     "ffmpeg-roomler is documentation-only in rc.64 — the port is not yet wired into CI.\n"
     "rc.65 implements + tests this port. Until then, the agent's Cargo.toml `ffmpeg-encoder` feature is header-only:\n"
-    "  see agents/roomler-agent/src/encode/ffmpeg/mod.rs (returns available()=false).\n"
+    "  see agents/roomlerd/src/encode/ffmpeg/mod.rs (returns available()=false).\n"
     "Build the agent without `ffmpeg-encoder` for rc.64.")
 
 # -----------------------------------------------------------------------------

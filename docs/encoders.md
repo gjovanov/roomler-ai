@@ -2,7 +2,7 @@
 
 Everything between the remote host's framebuffer and the viewer's canvas: capture
 backends, the encoder cascade, codecs per platform, rate control, and the browser
-decode paths. Agent side lives in `agents/roomler-agent/src/{capture,encode}/`;
+decode paths. Agent side lives in `agents/roomlerd/src/{capture,encode}/`;
 viewer side in `ui/src/composables/useRemoteControl.ts` + `ui/src/workers/`.
 *As of 0.3.0-rc.381.*
 
