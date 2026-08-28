@@ -47,10 +47,13 @@ export type RcPhase =
 
 import {
   beginAttempt,
+  describeConnectTiming,
+  STALL_SNACK_MIN_GAP_MS,
   formatConnectTiming,
   type RcConnectMark,
   type RcConnectRecorder,
 } from './rcConnectTiming'
+import { useSnackbar } from './useSnackbar'
 
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
@@ -2834,6 +2837,13 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  viewer HUD and the field can read a NUMBER instead of an anecdote:
    *  "sometimes 10-15 s" is not something a fix can be measured against. */
   const lastTtffMs = ref<number | null>(null)
+  // FR-22 - the operator-facing half of the connect timing. The snackbar
+  // store is a module singleton, so this is the same surface every other
+  // part of the app already writes to.
+  const { showSnackbar } = useSnackbar()
+  /** Last time a STALL snackbar was shown, so a flapping path cannot
+   *  bury its own message under repeats. */
+  let lastStallSnackAtMs = -Infinity
 
   /** FR-22 - per-attempt connect timing. Null outside an attempt; a
    *  retry replaces it wholesale so the ladder's second attempt cannot
@@ -2855,13 +2865,41 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       return
     }
     connectTiming = null
-    const line = formatConnectTiming(t.snapshot())
+    const snap = t.snapshot()
+    const line = formatConnectTiming(snap)
     if (reason === 'first-frame') {
-      lastTtffMs.value = t.snapshot().marks.first_frame ?? null
+      lastTtffMs.value = snap.marks.first_frame ?? null
       console.info('[rc] connect', line)
     } else {
       console.warn('[rc] connect', reason, line)
     }
+    // FR-22 - tell the OPERATOR, not just the console. A devtools line
+    // is invisible during exactly the sessions this exists to explain,
+    // and "it was slow again" is not a report anyone can act on. The
+    // verdict names which wait dominated in plain words, so a slow
+    // connect becomes a fact someone can pass on without opening
+    // devtools - which is what turns this from telemetry into the route
+    // to the root cause.
+    //
+    // Cancellation is excluded on purpose: the operator pressed the
+    // button, so telling them their own action interrupted a connect is
+    // noise, not information.
+    if (reason === 'closed') return
+    const verdict = describeConnectTiming(snap)
+    if (!verdict.notable) return
+    // Throttle the STALL warnings only. A flapping path abandons an
+    // attempt every few seconds, and one snackbar per abandonment is
+    // spam that buries the message it is trying to deliver. The
+    // resolution ("connected after N failed attempts") is never
+    // throttled: suppressing the line that says it finally worked, while
+    // having shown the one that said it was failing, would leave the
+    // operator with a warning and no ending.
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now()
+    if (reason === 'abandoned') {
+      if (nowMs - lastStallSnackAtMs < STALL_SNACK_MIN_GAP_MS) return
+      lastStallSnackAtMs = nowMs
+    }
+    showSnackbar(verdict.text, verdict.color, 8000)
   }
 
   /** Mark a connect milestone on the live attempt, if any. A no-op
