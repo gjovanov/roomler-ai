@@ -107,7 +107,8 @@ port as decided "on the strength of §2b". That overreads the instrument in two 
 - The probe is not even a port test in the general case — see
   [§5](#5-port-selection--a-hypothesis-e2e-3-must-settle).
 
-So: 3478 is the **starting hypothesis**, and **E2E-3 decides**, before P2.
+So: 3478 was the **starting hypothesis**, and **E2E-3 has now decided it — confirmed**. See
+[§5](#5-port-selection--settled-by-e2e-3-3478) and the field log.
 
 ### 2c. jupiter and zeus will repeat the FR-4 failure if we let them
 
@@ -464,22 +465,57 @@ field, routing it through remote config requires `MANAGE_AGENTS` **and** `RELAY_
 and the "survives a compromised server" claim for gate 4 must then be dropped rather than
 kept as a property the delivery mechanism contradicts.
 
-### 5. Port selection — a hypothesis E2E-3 must settle
+### 5. Port selection — **SETTLED by E2E-3: 3478**
 
-- **Starting hypothesis: `relay_server_port = 3478`**, on the reasoning at
-  `signaling.rs:2063`. Not a finding — see [§2b](#2b-what-the-sweep-does-and-does-not-establish).
-- ⚠️ **3478 has an unexamined downside.** Middleboxes that whitelist it often do so via a
-  **STUN/TURN ALG that requires well-formed STUN on that port**. Geneve is not STUN-shaped
-  (byte 0 = `0x00`, no magic cookie at 4..8), so an ALG-enforcing egress may pass 3478 for
-  STUN and drop it for us. **E2E-3 must therefore probe with Geneve-shaped payloads**, not a
-  generic UDP echo, or it measures the wrong thing entirely.
-- **443/UDP** is the other candidate and may pass strictly more egresses.
-- ⚠️ **mars already runs coturn on 3478.** The daemon must **refuse to start the relay and
-  log why** rather than silently binding nothing — compare `ssh_port`'s 2222 default.
-- ⚠️ **40000 is not testable on jupiter/zeus.** `coturn_dnat_rules[*].port_ranges` includes
-  `"40000:49999"` DNAT'd to the worker VM on every roomler-ai-hosting node (`CLAUDE.md`;
-  FR-4). Host UDP/40000 there is redirected before the host stack sees it. Use **41641** for
-  the high-port cell.
+**`relay_server_port = 3478`.** Field-measured 2026-08-28, not inferred. Geneve-shaped
+64-byte frames (`Opt Len = 0`, pinned protocol `0x7788`, deliberately **not** STUN-shaped)
+sent to a responder on mars:
+
+| host | netcheck | **3478** | 11000 (coturn's relay band) | 41641 (high port) |
+|---|---|---|---|---|
+| **clk00017265** — symmetric NAT, corp-managed, permanently on `relay:derp/tcp` | `relay band/udp: BLOCKED` | ✅ **PASS** | ❌ FAIL | ❌ FAIL |
+| **pc50045** — Check Point corp, cone | band reachable | ✅ PASS | ✅ PASS | ✅ PASS |
+| **pc55331** | `stun/udp: NO MAPPING` | ❌ FAIL | ❌ FAIL | ❌ FAIL |
+
+Arrivals were confirmed at the responder, not merely inferred from a client timeout —
+clk's frame landed from `192.164.201.1:10400`, matching the `MEASURED PATH` its own
+`roomler why` reports.
+
+Three results, in order of consequence:
+
+1. **3478 is the only port the motivating host can use.** `clk00017265` reaches 3478 on an
+   *arbitrary public IP* and **nothing else**. A relay on any other port cannot serve it.
+2. **The STUN-ALG worry did not materialise** — a non-STUN-shaped payload passed on 3478.
+   The test was still run Geneve-shaped, because a generic UDP echo would not have
+   distinguished the two and the risk was real until measured.
+3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
+   population.
+
+⚠️ **This narrows the codebase's own claim.** `signaling.rs:2063` says a corp egress
+*"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, clk drops **11000
+and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
+but the relay band".
+
+**443/UDP** stays the documented fallback for hosts where 3478 is unavailable — which,
+per the next warning, includes our own.
+
+⚠️⚠️ **A relay host must be checked for DNAT, not just for a free socket — and `ss` will
+lie to you.** The first probe of this matrix *failed* on 3478 and nearly produced the
+opposite conclusion. The cause was not the corp egress: mars's `COTURN_DNAT` chain
+redirects UDP/3478 on **both** public IPs to the coturn VM in `PREROUTING`, before any
+local socket is consulted. `ss -ulnp` showed 3478 free, `HOST_FW_INPUT` showed it
+ACCEPTed, and a bound listener still received nothing. The same chain consumes
+**10000–13000** and **443 on `.74`**. Consequences:
+
+- **mars cannot host an org relay on 3478** without displacing coturn — the one port the
+  target population can reach is already taken on the fleet's most natural relay host.
+  E2E-1 must therefore either pick a host without coturn DNAT or move coturn first.
+- This is the FR-4 class recurring: a host-level DNAT eating a port silently. Add a
+  `iptables -t nat -S | grep <port>` check to the relay-host preflight, not just a bind
+  attempt, and make the daemon **refuse to start the relay and log why** rather than
+  binding a port it will never receive on.
+- ⚠️ **40000 is likewise not testable on jupiter/zeus** — `coturn_dnat_rules[*].port_ranges`
+  includes `"40000:49999"` on every roomler-ai-hosting node. Use 41641 there.
 
 **Reachability is new plumbing, not a generalised probe.** ⚠️ The first draft said the
 existing `relay_band_udp` probe *"generalises"* and *"becomes a `CapVector` field"*. Both
@@ -858,7 +894,7 @@ driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_r
 **E2E-2 — the floor holds.** `pc55331` still `relay:derp/tcp`, reconnects unchanged. The
 regression test for the whole feature.
 
-**E2E-3 — port matrix, before P2.** {3478, 443, **41641**} × {mars, zeus, jupiter} ×
+**E2E-3 — port matrix. ✅ RUN 2026-08-28 (§5); open decision #3 closed.** {3478, 443, **41641**} × {mars, zeus, jupiter} ×
 {clk00017265, pc55331, pc50045}. ⚠️ **Probe with Geneve-shaped payloads**, not a generic UDP
 echo, or a STUN-ALG egress is measured wrong (§5). ⚠️ **41641, not 40000** — the latter is
 DNAT'd on jupiter/zeus. Decides open decision #3.
@@ -1036,8 +1072,10 @@ property to test (E2E-2, E2E-4), not to assert.
 1. **Where the mint lives** — the API (consistent with "the server verdict decides") or the
    relay node against a server-signed token (fewer round trips, survives a control-plane
    blip). Leaning API for P3.
-2. **Default port: 3478 vs 443** — **E2E-3 decides, before P2**, probing with Geneve-shaped
-   payloads (§5).
+2. ~~**Default port: 3478 vs 443**~~ — **CLOSED 2026-08-28 by E2E-3: 3478** (§5). The
+   motivating host reaches 3478 on an arbitrary public IP and no other port tested. Newly
+   opened by the same run, and now the harder question: **which host can actually serve
+   it**, given mars's `COTURN_DNAT` already consumes 3478 on both its public IPs.
 3. Does a relay **advertise capacity** for server-side load-balancing, or simply refuse at
    the cap? Refusal is simpler; advertisement is better for an HQ node serving many devices.
 4. **Per-session byte-counter granularity** (§12a) — coarse by default is taken; is
@@ -1053,3 +1091,4 @@ property to test (E2E-2, E2E-4), not to assert.
 |---|---|---|
 | 2026-08-28 | 0.4.10 | **Pre-implementation evidence sweep.** Fleet-wide `netcheck` + `peers` + `why` from mars over Fleet RPC. 3/12 online peers on `relay:derp/tcp`, **all TCP**. `relay band/udp` **BLOCKED** on `clk00017265` (symmetric NAT), jupiter and zeus; `stun/udp: NO MAPPING` on `pc55331` (whose relay-band cell is **derived, not probed**). Live tier ladder captured for `100.65.4.30`. ⇒ cluster-host firewall provisioning promoted to its own phase (P5); default port set to **3478 as a hypothesis**, with E2E-3 to settle it. ⚠️ Also found while specifying: `blocked_by: "peer-relays-instead"` (`path.rs:590`) already uses "peer relay" for nearly the opposite thing — the product keeps the industry term, the wire uses `relay_kind:"org"`. |
 | 2026-08-28 | — | **Independent review, three lenses, before publication.** Three material corrections, each retained inline as a warning rather than silently fixed: (1) **§6 inverted** — a fifth carrier tier was the wrong design; `RelayKind::Org` plus a fourth `RelayConn` impl needs zero changes to `send_ip_packet`/`SendPeer`/`Router`/`CarrierPlane`, and avoids four hazards in `path.rs`/`lifecycle.rs`, three of them silent. The first draft's own "30 points of headroom" blocker was a **misreading** of `weight() = 2×(base − B_RELAY)` and is retracted. (2) **§4 was insecure** — the bind proved return-routability only; it now carries a per-member `bind_secret` delivered over the authenticated control WS, plus nonce, domain separation, constant-time compare and anti-amplification padding. (3) **§2b overread its instrument** — `relay_band_udp` probes coturn's ~10–13k band and never touches 40000, so the port choice is a hypothesis for E2E-3, which must additionally use Geneve-shaped payloads because a STUN ALG on 3478 may pass STUN and drop us. Also corrected: gate 2 is inert (`OverlayAclMode` defaults `Off`), "fail closed" is unreachable through `load_acl`'s `AclCtx` return, VNI scoping was self-contradictory, P1 was not inert, `roomler config set` is not live outside a two-key allowlist, `three_node_relay_roundtrip` was not implementable (overlay isn't compiled into `crates/tests`), and several acceptance criteria named instruments that do not exist. |
+| 2026-08-28 | 0.4.11 | **E2E-3 RUN — open decision #3 CLOSED: the default port is 3478.** Geneve-shaped 64-byte frames (`Opt Len 0`, pinned proto `0x7788`, deliberately not STUN-shaped) from three clients to a non-amplifying responder on mars; arrivals verified server-side, not inferred from client timeouts. **clk00017265 — symmetric NAT, corp-managed, the host this FR exists for — reached 3478 and NOTHING else** (11000 ✗, 41641 ✗); pc50045 reached all three; pc55331 reached none, confirming the DERP floor. ⇒ 3478 confirmed, 41641 dead as a fallback, 443 retained only as a documented alternative. Two corrections fell out: the codebase's *"drops the ~10-13k relay band"* is **narrower than measured** (clk allows *only* 3478, not "all but the band"), and the STUN-ALG risk §5 flagged **did not materialise**. ⚠️ The run's first probe FAILED on 3478 and nearly produced the opposite conclusion — the cause was mars's own `COTURN_DNAT` redirecting udp/3478 on both public IPs in `PREROUTING`, invisible to `ss -ulnp` and downstream of an ACCEPTing `HOST_FW_INPUT`. Isolated by a STUN-shaped control (also blocked ⇒ not payload inspection), then by reading the nat table. **mars therefore cannot host an org relay on 3478 without displacing coturn** — a new open question for E2E-1. Test rig fully torn down and verified: DNAT restored, temp accepts removed, nothing bound, mesh carriers unchanged. |
