@@ -375,6 +375,10 @@ impl AgentPeer {
         // webrtc-rs's default H.265 registration is PT 126, no fmtp
         // line, same rtcp feedback as H.264 — matches Chrome
         // Canary/Beta/Stable 127+ which accept the same shape.
+        // RETIRED-NAME-ANCHOR(4): this is the WebRTC STREAM ID, which travels in the
+        // SDP as the msid. No viewer code keys on it today, but it is a wire value
+        // and a rename would be observable to any consumer that does. Frozen until
+        // something proves nothing reads it. See docs/fr/FR-21.
         let video_track = Arc::new(TrackLocalStaticSample::new(
             build_video_codec_cap(&chosen_codec),
             "video".to_string(),
@@ -396,6 +400,7 @@ impl AgentPeer {
         // backward-compatible with controllers that never request audio).
         #[cfg(feature = "audio")]
         let audio_pump_handle: Option<JoinHandle<()>> = if audio_enabled {
+            // RETIRED-NAME-ANCHOR(4): wire-visible stream id, as above.
             let audio_track = Arc::new(TrackLocalStaticSample::new(
                 build_audio_codec_cap(),
                 "audio".to_owned(),

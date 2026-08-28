@@ -71,7 +71,7 @@ pub struct TunnelDetect {
 /// compile-time platform check.
 #[tauri::command]
 pub fn cmd_detect_install() -> Result<DetectResult, String> {
-    use roomler_agent::install_detect::{ExistingInstall, detect_existing_install};
+    use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
     let agent = match detect_existing_install() {
         ExistingInstall::Clean => AgentDetect {
             supported: cfg!(target_os = "windows"),
@@ -195,7 +195,7 @@ pub struct TokenValidation {
 /// `cmd_install` for the field repro that motivates the attribute).
 #[tauri::command(rename_all = "camelCase")]
 pub fn cmd_validate_token(token: String, role: Option<Role>) -> Result<TokenValidation, String> {
-    use roomler_agent::jwt_introspect::{is_likely_expired, parse_unverified};
+    use roomlerd::jwt_introspect::{is_likely_expired, parse_unverified};
     let view = parse_unverified(&token).map_err(|e| e.to_string())?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
