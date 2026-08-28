@@ -56,6 +56,17 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 gethostname = "0.5"
 
+# FR-27 — `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on the two panel
+# windows, so the "Being viewed by …" banner never appears in the video going
+# back to the viewer (the recursive-picture-frame the daemon's native overlay
+# has always avoided). Windows-only, and deliberately the narrowest possible
+# feature set — P3e lever E exists to keep this crate's graph small.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -718,6 +718,8 @@ pub struct ConsentRequest {
     /// pre-FR-27 daemon means "unknown"; fall back to `timeout_secs`.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub expires_at_ms: u64,
+    // NOTE: `org` stays LAST; the struct is built field-by-field at three call
+    // sites and keeping the multi-org line at the end matches how it reads.
     /// Multi-org — the organization the request comes from, so the modal can
     /// say WHO is asking. On a device enrolled in two orgs, "Alice wants to
     /// control this machine" is not enough to decide on: Alice may be a
@@ -727,6 +729,36 @@ pub struct ConsentRequest {
     /// (`#[serde(default)]` — the desktop app simply shows no org line).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub org: String,
+}
+
+/// FR-27 — one remote-control session currently LIVE on this device.
+///
+/// The device side of "who is watching my screen". Distinct from
+/// [`ConsentRequest`], which is about sessions not yet allowed to start: this
+/// is what the "Being viewed by …" banner renders, and what its Disconnect
+/// button acts on.
+///
+/// There was no LocalAPI verb for this at all before, which is why the banner
+/// existed only as the Windows-native overlay inside the daemon — no thin
+/// client could see a session, let alone end one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RcSessionInfo {
+    /// Hex `ObjectId` — the handle [`Request::RcDisconnect`] takes.
+    pub session_id: String,
+    /// Display name of whoever is controlling.
+    #[serde(default)]
+    pub controller_name: String,
+    /// Pipe-separated permission names — what they were actually granted, so
+    /// a view-only watcher is distinguishable from someone typing.
+    #[serde(default)]
+    pub permissions: String,
+    /// Asking organization on a multi-org device; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub org: String,
+    /// Unix millis when the session started, for an "N min" age in the banner.
+    /// `0` = unknown.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub started_at_ms: u64,
 }
 
 /// A LocalAPI request. P1 exposed read-only verbs; P2b adds the (mutating)
@@ -744,6 +776,12 @@ pub enum Request {
     ConsentPending,
     /// Approve (`allow=true`) or deny a pending consent, by session id.
     ConsentDecide { session_id: String, allow: bool },
+    /// FR-27 — remote-control sessions currently LIVE on this device.
+    RcSessions,
+    /// FR-27 — end a live remote-control session from the device side. This is
+    /// the Disconnect the "Being viewed by …" banner offers; mutating, and the
+    /// pipe/socket ACL is the trust boundary, like [`Self::ConsentDecide`].
+    RcDisconnect { session_id: String },
     /// ICMP-ping an overlay peer (by name or IP) over the userspace netstack —
     /// the OS-free reachability probe. `timeout_ms` 0 ⇒ the daemon's default.
     Ping {
@@ -926,6 +964,13 @@ pub enum Response {
     ConsentDecided {
         ok: bool,
     },
+    /// FR-27 — live remote-control sessions.
+    RcSessions(Vec<RcSessionInfo>),
+    /// FR-27 — result of [`Request::RcDisconnect`]; `ok` = a session with that
+    /// id was found and asked to stop.
+    RcDisconnected {
+        ok: bool,
+    },
     /// Round-trip result of [`Request::Ping`] — the resolved overlay IP + RTT.
     Pong {
         target: String,
@@ -1102,6 +1147,18 @@ pub trait LocalApiState: Send + Sync {
     fn consent_decide(&self, _session_id: &str, _allow: bool) -> bool {
         false
     }
+    /// FR-27 — remote-control sessions currently LIVE on this device. Distinct
+    /// from [`Self::consent_pending`], which is about sessions not yet allowed
+    /// to start. Default: none.
+    fn rc_sessions(&self) -> Vec<RcSessionInfo> {
+        Vec::new()
+    }
+    /// FR-27 — tear down a live remote-control session from the device side.
+    /// Returns whether a session with that id was found and asked to stop.
+    /// Default: no-op `false`.
+    fn rc_disconnect(&self, _session_id: &str) -> bool {
+        false
+    }
     /// ICMP-ping an overlay peer by name/IP over the userspace netstack, and
     /// return a [`Response::Pong`] (or [`Response::Error`]). Async — awaited by
     /// [`serve_connection`], not the sync [`handle`]. `prefer_v6` resolves a
@@ -1238,6 +1295,10 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         Request::ConsentPending => Response::ConsentPending(state.consent_pending()),
         Request::ConsentDecide { session_id, allow } => Response::ConsentDecided {
             ok: state.consent_decide(session_id, *allow),
+        },
+        Request::RcSessions => Response::RcSessions(state.rc_sessions()),
+        Request::RcDisconnect { session_id } => Response::RcDisconnected {
+            ok: state.rc_disconnect(session_id),
         },
         Request::KillFlow { id } => Response::FlowKilled {
             ok: state.kill_flow(id),
@@ -1929,6 +1990,27 @@ impl Client {
     pub async fn consent_pending(&mut self) -> std::io::Result<Vec<ConsentRequest>> {
         match self.request(&Request::ConsentPending).await? {
             Response::ConsentPending(v) => Ok(v),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-27 — `Request::RcSessions` → remote-control sessions currently live
+    /// on this device.
+    pub async fn rc_sessions(&mut self) -> std::io::Result<Vec<RcSessionInfo>> {
+        match self.request(&Request::RcSessions).await? {
+            Response::RcSessions(v) => Ok(v),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    /// FR-27 — `Request::RcDisconnect` → end a live session from the device
+    /// side. `false` = no session with that id (already gone, or never here).
+    pub async fn rc_disconnect(&mut self, session_id: &str) -> std::io::Result<bool> {
+        let req = Request::RcDisconnect {
+            session_id: session_id.to_string(),
+        };
+        match self.request(&req).await? {
+            Response::RcDisconnected { ok } => Ok(ok),
             other => Err(unexpected_response(other)),
         }
     }
