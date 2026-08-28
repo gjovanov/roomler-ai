@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 /// <reference lib="webworker" />
 // P7 (Parsec-class plan, 2026-08-20) — FSR sharpening upscale for the DC
 // video workers.

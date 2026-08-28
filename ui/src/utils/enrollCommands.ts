@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 /**
  * Enrollment command templates — ONE source for every "how do I enroll
  * this machine" string the UI renders (unified EnrollmentDialog, S4).

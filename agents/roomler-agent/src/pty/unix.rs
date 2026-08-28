@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! The Unix half of [`crate::pty`] — `openpty`, a login shell, and two pumps.
 //!
 //! # Why `openpty` and not `posix_openpt`

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Peer-establishment half of [`OverlayRuntime`] — split out of `runtime.rs`
 //! (rc.284, pure move): the direct-tier LAN context, the netmap
 //! install/evict pipeline, make-before-break upgrade probes, the

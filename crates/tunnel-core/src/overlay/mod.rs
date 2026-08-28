@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay L3 data plane — userspace WireGuard mesh (Phase 2+).
 //!
 //! Feature-gated behind `overlay`. Pulls in `boringtun` for the Noise

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! DERP relay tickets — EdDSA-signed admission for the standalone regional
 //! relays (`crates/derp-relay`).
 //!

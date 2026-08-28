@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use base64::Engine;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

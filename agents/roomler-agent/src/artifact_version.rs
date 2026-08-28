@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Bind the version a release manifest CLAIMS to the version the downloaded
 //! artifact actually IS.
 //!

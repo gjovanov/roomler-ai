@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Auto-detection of local IPv4 subnets for the tunnel mesh subnet-router.
 //!
 //! The agent advertises the CIDRs it can route (`rc:agent.hello`

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler-tunnel forward` — open one TCP forward through an enrolled
 //! agent. The TeamViewer-shaped flow:
 //!

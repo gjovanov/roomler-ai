@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Device naming: admin rename (fleet + overlay/MagicDNS propagation),
 //! display_name, tags — and the rehydrate-clobber rule.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Multi-region relay probing — the client half of `rc:relay.regions`.
 //!
 //! The server pushes the region probe-target list (capability-gated on the

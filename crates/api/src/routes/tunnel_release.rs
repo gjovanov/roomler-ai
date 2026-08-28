@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `/api/tunnel/{latest-release,installer/{platform}}` — cached
 //! GitHub-Releases proxy for the `roomler-tunnel` binary. Mirrors
 //! [`routes::agent_release`] but targets `tunnel-v*` tags and
