@@ -14,6 +14,10 @@ all-features = true
 # Anything not listed is denied. `confidence-threshold` is the default 0.8.
 allow = [
     "MIT",
+    # MIT-0 (MIT No Attribution): `dcv-color-primitives`, the agent's colour
+    # conversion. MIT minus even the attribution clause — strictly more
+    # permissive than MIT, OSI-approved.
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
