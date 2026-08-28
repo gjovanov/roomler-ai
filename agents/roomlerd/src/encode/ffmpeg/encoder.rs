@@ -2,7 +2,7 @@
 //!
 //! rc.72 scope: BGRA→NV12 CPU path + encoder dispatch
 //! (`hevc_nvenc` → `hevc_qsv` → `hevc_amf`). Behind
-//! `ROOMLER_AGENT_USE_FFMPEG=1` env var. MF cascade still default.
+//! `ROOMLERD_USE_FFMPEG=1` env var. MF cascade still default.
 //!
 //! rc.73+: D3D11VA zero-copy (capture's D3D11 texture fed directly to
 //! NVENC / QSV / AMF without CPU readback). Defers Phase 8's critique
@@ -166,7 +166,7 @@ fn ffmpeg_cq() -> u32 {
 /// 1920×1200; 0.07 bpp/s puts our 1920×1200 cap at ~4.8 Mbps, leaving
 /// headroom for genuine motion without the 6-7 Mbps idle-ish bursts
 /// the field saw on the old uncapped 13.8 Mbps target.
-/// Env override `ROOMLER_AGENT_FFMPEG_MAXRATE_KBPS` for field tuning.
+/// Env override `ROOMLERD_FFMPEG_MAXRATE_KBPS` for field tuning.
 ///
 /// `constrained` is THIS session's detected transport (Phase B). Pre-Phase-B
 /// this read the process-wide `transport_is_constrained()` env flag, which
@@ -289,7 +289,7 @@ fn encoder_options(
         // Same reason the libvpx screen path pins VP9E_SET_AQ_MODE=0
         // (libvpx.rs — "AQ mis-fires on desktop and softens text").
         // temporal-aq is not an alternative: it needs rc-lookahead>0 and
-        // we run 0 for latency. `ROOMLER_AGENT_NVENC_SPATIAL_AQ=1`
+        // we run 0 for latency. `ROOMLERD_NVENC_SPATIAL_AQ=1`
         // restores the pre-P7 behaviour for camera-heavy hosts
         // (video-in-a-window content).
         //
@@ -726,7 +726,7 @@ impl FfmpegEncoder {
     }
 
     /// P4 — resolve the (gop, low_power) a vp9_qsv open should use from the
-    /// cached probe verdict + the `ROOMLER_AGENT_QSV_LOW_POWER` override.
+    /// cached probe verdict + the `ROOMLERD_QSV_LOW_POWER` override.
     /// Mapping lives in `encode::rate_profile::vp9_qsv_config` (pure,
     /// default-build tested); falls back to the rc.219 containment (GOP 60 +
     /// VDEnc) when unprobed.
@@ -1316,7 +1316,7 @@ impl FfmpegEncoder {
 
     /// P5 — band count for the threaded convert: single-call under 2 MPix
     /// (thread spawn overhead beats the win there) or when hatched off
-    /// (`ROOMLER_AGENT_PAR_CONVERT=0` / config `par_convert`); else
+    /// (`ROOMLERD_PAR_CONVERT=0` / config `par_convert`); else
     /// min(4, cores).
     fn convert_bands(plane_pixels: usize) -> usize {
         if plane_pixels < 2_000_000 || !crate::encode::par_convert_enabled() {
