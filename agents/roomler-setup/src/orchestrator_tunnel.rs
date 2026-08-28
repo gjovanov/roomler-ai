@@ -276,20 +276,20 @@ async fn run_install_inner(
 
 /// Persist the enroll result to the tunnel CLI's config path. Returns
 /// the path written so the orchestrator can surface it in the Done
-/// step. Thin `roomler_tunnel`-coupled half of enrollment (the HTTP
+/// step. Thin `roomler_cli`-coupled half of enrollment (the HTTP
 /// half lives in `wizard_shared::tunnel_enroll` — the shared core
 /// stays free of the tunnel dep).
 ///
 /// `override_path` lets unit tests redirect the write to a tempdir
 /// without touching the operator's real %APPDATA% layout.
 fn write_config(result: &EnrollResult, override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    let cfg = roomler_tunnel::config::TunnelConfig {
+    let cfg = roomler_cli::config::TunnelConfig {
         server_url: result.server_url.clone(),
         tunnel_client_token: result.tunnel_client_token.clone(),
         machine_name: result.machine_name.clone(),
     };
     let path =
-        roomler_tunnel::config::save(&cfg, override_path).context("writing tunnel config.toml")?;
+        roomler_cli::config::save(&cfg, override_path).context("writing tunnel config.toml")?;
     Ok(path)
 }
 
@@ -312,13 +312,13 @@ fn check_cancel() -> Result<(), String> {
 /// Probe the tunnel CLI's config path to surface "clean" vs "already
 /// installed" on the Welcome step.
 fn detect_existing_install_label() -> String {
-    let Ok(path) = roomler_tunnel::config::default_config_path() else {
+    let Ok(path) = roomler_cli::config::default_config_path() else {
         return "clean".to_string();
     };
     if path.exists() {
         match std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| toml::from_str::<roomler_tunnel::config::TunnelConfig>(&s).ok())
+            .and_then(|s| toml::from_str::<roomler_cli::config::TunnelConfig>(&s).ok())
         {
             Some(cfg) => format!("installed ({} @ {})", cfg.machine_name, path.display()),
             None => format!("installed (config at {} unreadable)", path.display()),
@@ -352,6 +352,8 @@ pub fn default_install_root() -> anyhow::Result<PathBuf> {
         Ok(dirs
             .data_local_dir()
             .join("Programs")
+            // RETIRED-NAME-ANCHOR: the tunnel CLI's enrolled-config segment; see
+            // agents/roomler-cli/src/config.rs. Frozen together. docs/fr/FR-21
             .join("roomler-tunnel"))
     }
     #[cfg(target_os = "linux")]
