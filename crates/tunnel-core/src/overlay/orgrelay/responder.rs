@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::wire::{is_org_relay_shaped, parse_probe};
+use super::wire::{PROBE_FRAME_LEN, is_org_relay_shaped, parse_probe};
 
 /// Probes admitted per source per window. Low on purpose: a reachability probe
 /// is a once-per-measurement question, not a stream.
@@ -215,12 +215,47 @@ impl ProbeResponder {
     pub fn tracked_sources(&self) -> usize {
         self.gate.tracked_sources()
     }
+
+    /// Own `sock` and answer probes until the socket dies.
+    ///
+    /// ⚠️ **A successful bind does not prove reachability, and the log line
+    /// says so on purpose.** On a host with a coturn DNAT the port can be
+    /// consumed in `PREROUTING` while `ss -ulnp` shows it free and this loop
+    /// receives nothing — measured on mars during E2E-3, where exactly that
+    /// confound nearly inverted the result. The probe exists because binding
+    /// is not evidence.
+    pub async fn serve(mut self, sock: Arc<tokio::net::UdpSocket>) {
+        let local = sock.local_addr().ok();
+        tracing::info!(
+            ?local,
+            "org-relay probe responder listening (answers probes, forwards nothing; \
+             a successful bind does NOT prove reachability -- a DNAT can eat this port \
+             upstream of the socket)"
+        );
+        // One frame's worth. A larger read buffer would let a big datagram in
+        // only to be refused on length; this refuses it at the socket.
+        let mut buf = [0u8; PROBE_FRAME_LEN];
+        loop {
+            let (n, src) = match sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(?local, error = %e, "org-relay responder socket closed");
+                    return;
+                }
+            };
+            if let Some(reply) = self.handle(src, &buf[..n], Instant::now())
+                && let Err(e) = sock.send_to(&reply, src).await
+            {
+                tracing::debug!(%src, error = %e, "org-relay probe reply failed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overlay::orgrelay::{PROBE_FRAME_LEN, PROBE_TOKEN_LEN, build_probe};
+    use crate::overlay::orgrelay::{PROBE_TOKEN_LEN, build_probe};
 
     fn src(n: u16) -> SocketAddr {
         format!("198.51.100.{}:{}", n % 250 + 1, 40000 + n)
