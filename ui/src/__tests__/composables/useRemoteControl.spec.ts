@@ -41,7 +41,8 @@ import {
   parseNativeClipPayload,
   bytesToBase64,
   VP9_444_DC_LABEL,
-  VP9_444_DC_OPTIONS,
+  videoDcOptions,
+  storedUnorderedVideo,
   readStoredAudioEnabled,
   persistAudioEnabled,
   audioRequestFields,
@@ -1570,7 +1571,7 @@ describe('buildClipboardImageFrames (clipboard v2)', () => {
   })
 })
 
-describe('VP9_444_DC_LABEL + VP9_444_DC_OPTIONS', () => {
+describe('VP9_444_DC_LABEL + videoDcOptions', () => {
   // The agent's `on_data_channel` arm matches on `"video-bytes"`
   // exactly (see agents/roomler-agent/src/peer.rs:494). A typo on
   // either side silently turns the entire VP9-444 path into a
@@ -1579,12 +1580,49 @@ describe('VP9_444_DC_LABEL + VP9_444_DC_OPTIONS', () => {
     expect(VP9_444_DC_LABEL).toBe('video-bytes')
   })
 
-  // Reliable + ordered: SCTP retransmits dropped chunks (a P-frame
-  // hole would force the decoder to wait for the next IDR), and
-  // libvpx wants frames in encode order. Don't relax these without
-  // also bumping the worker assembler tests.
-  it('uses the reliable + ordered DC profile', () => {
-    expect(VP9_444_DC_OPTIONS).toEqual({ ordered: true })
+  // FR-17 stage B. The historical profile stays the default: reliable +
+  // ordered, because without framing SCTP's arrival order IS the
+  // reassembly and nothing else can recover it.
+  it('defaults to the reliable + ordered profile', () => {
+    expect(videoDcOptions(false, false)).toEqual({ ordered: true })
+    expect(videoDcOptions(true, false)).toEqual({ ordered: true })
+  })
+
+  // ⚠️ The invariant this function exists for. An unframed stream
+  // delivered out of order is not a degraded picture — it is garbage the
+  // decoder reports as corruption, because a bare byte stream has no way
+  // to tell "rest of this frame" from "start of the next". Asking for
+  // unordered without framing must therefore be REFUSED, not honoured.
+  it('refuses to go unordered without framing', () => {
+    expect(videoDcOptions(false, true)).toEqual({ ordered: true })
+  })
+
+  it('goes unordered with no retransmits once framing is negotiated', () => {
+    // maxRetransmits: 0 is coupled to stage A's assembler, which treats a
+    // chunk-index jump as unrecoverable. A retransmitted chunk arriving
+    // an RTT late would be discarded as a gap — so 1-2 retransmits
+    // (stage C) needs a reorder buffer first and is NOT a number that
+    // can be turned up on its own.
+    expect(videoDcOptions(true, true)).toEqual({ ordered: false, maxRetransmits: 0 })
+  })
+})
+
+describe('FR-17 stage B opt-in', () => {
+  beforeEach(() => {
+    globalThis.localStorage?.clear()
+  })
+
+  it('is off unless explicitly enabled', () => {
+    expect(storedUnorderedVideo()).toBe(false)
+    globalThis.localStorage?.setItem('roomler-rc-unordered-video', '0')
+    expect(storedUnorderedVideo()).toBe(false)
+    globalThis.localStorage?.setItem('roomler-rc-unordered-video', 'true')
+    expect(storedUnorderedVideo()).toBe(false)
+  })
+
+  it('turns on for exactly the documented value', () => {
+    globalThis.localStorage?.setItem('roomler-rc-unordered-video', '1')
+    expect(storedUnorderedVideo()).toBe(true)
   })
 })
 
