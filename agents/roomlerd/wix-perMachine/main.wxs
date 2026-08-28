@@ -154,6 +154,9 @@
                          before cargo-wix runs. Keys off the file itself
                          like its siblings (system-scoped dir). -->
                     <Component Id='TunnelExe' Guid='833F7BA5-4323-403A-BBC5-B77C42E9F27A' Win64='yes'>
+                        <!-- RETIRED-NAME-ANCHOR(3): roomler_tunnel_cli_exe is installer IDENTITY;
+                             upgrades key off the FileKey, so it is frozen deliberately even though
+                             the crate is `roomler-cli` now. docs/fr/FR-21 -->
                         <File
                             Id='roomler_tunnel_cli_exe'
                             Name='roomler.exe'

@@ -4,14 +4,14 @@
 //!
 //! Both MSI flavours used to bundle the full standalone tunnel CLI next to the
 //! daemon (P4b). Measured on rc.361 that was 22.1 MiB of which only ~1.2 MiB
-//! was CLI-specific code: `cargo bloat` puts `roomler_tunnel` + its bin at
+//! was CLI-specific code: `cargo bloat` puts `roomler_cli` + its bin at
 //! 1.16 MiB of a 15.0 MiB `.text`, and everything else (std, the webrtc
 //! family, tunnel_core, tokio, rustls, reqwest, quinn, clap) is a second copy
 //! of crates `roomlerd.exe` already links. It also cost the Windows MSI job a
-//! serial 143 s `cargo build -p roomler-tunnel` with a different feature set.
+//! serial 143 s `cargo build -p roomler-cli` with a different feature set.
 //!
 //! So the daemon now owns that command surface (`roomlerd cli <args>` →
-//! `roomler_tunnel::cli::run_from`), and this ~150 KB launcher keeps the
+//! `roomler_cli::cli::run_from`), and this ~150 KB launcher keeps the
 //! user-facing `roomler` command, its PATH entry, and the installer-smoke
 //! payload assertions exactly where they were. Tunnel-ONLY hosts are
 //! unaffected — they still install the real standalone binary from
