@@ -915,7 +915,7 @@ pub struct AgentConfig {
     /// Operators on org-controlled hosts narrow further by populating
     /// `forward_acl.allowlist` in the TOML or disable forwards
     /// entirely with `forward_acl.enabled = false`. See
-    /// `agents/roomler-agent/src/tunnel/acl.rs` for the matching
+    /// `agents/roomlerd/src/tunnel/acl.rs` for the matching
     /// semantics.
     #[serde(default)]
     pub forward_acl: AgentForwardAcl,
@@ -924,7 +924,7 @@ pub struct AgentConfig {
     /// enabled with a seeded bash/tmux entry so a headless VD host offers
     /// "New bash session" out of the box. Operators add htop/mc/… per host
     /// in the TOML. The browser only ever sends an allowlist KEY, never a
-    /// command line. See `agents/roomler-agent/src/apps/`.
+    /// command line. See `agents/roomlerd/src/apps/`.
     #[serde(default)]
     pub virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig,
 

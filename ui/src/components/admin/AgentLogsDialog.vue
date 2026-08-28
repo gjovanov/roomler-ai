@@ -254,7 +254,7 @@ function fmtFields(fields: Record<string, unknown> | undefined): string {
 }
 
 /** Strip the leading module path so the target column stays narrow —
- *  e.g. `tunnel_core::forward` → `forward`, `roomler_agent::tunnel::
+ *  e.g. `tunnel_core::forward` → `forward`, `roomlerd::tunnel::
  *  acceptor` → `acceptor`. Full target is still searchable via the
  *  filter box (which matches the un-shortened string). */
 function shortTarget(target: string): string {

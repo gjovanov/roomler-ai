@@ -6,7 +6,7 @@
 # deterministic name makes the look-up cheap.
 #
 # Each Pod's bootstrap script (baked into the image — see
-# Dockerfile.agent-e2e) calls `roomler-agent enroll` on every start,
+# Dockerfile.agent-e2e) calls `roomlerd enroll` on every start,
 # which mints a fresh agent_id per restart. Tests poll
 # `GET /api/tenant/<tid>/agent?name=<hostname>` to resolve the
 # current id before issuing rc:session.request.
@@ -80,7 +80,7 @@ spec:
               cpu: 500m
               memory: 512Mi
           # No HTTP listener on the agent — it's an outbound WS
-          # client. Liveness via `roomler-agent service status`
+          # client. Liveness via `roomlerd service status`
           # would need wiring through a tiny health-port; skip for
           # the initial Chunk 1B and rely on the watchdog's own
           # process-exit on stall (the supervisor — implicitly the
