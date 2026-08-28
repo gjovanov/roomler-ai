@@ -147,7 +147,25 @@ pub struct ArbiterState {
     last_injector: Option<ObjectId>,
     /// Whether the device-policy mode hint was already applied (first
     /// session only; later joins must not stomp an in-session toggle).
+    ///
+    /// FR-27 — CLEARED when the last session leaves. Before that it was set
+    /// once for the life of the daemon, so an in-session toggle outlived every
+    /// session that could have justified it: set a device to `exclusive`, let
+    /// one viewer flip it to `free`, let everyone disconnect, and the next
+    /// session still came up `free` — the device policy silently stopped
+    /// applying until the daemon restarted. "Later joins must not stomp a
+    /// toggle" is about a LIVE conversation between concurrent viewers; with
+    /// nobody left there is no conversation to preserve.
     mode_seeded: bool,
+    /// FR-27 — an outstanding exclusive-mode floor request, when the holder
+    /// was active and the request could not be auto-granted.
+    ///
+    /// `request_floor` used to just return `false` and drop it: the holder
+    /// never learned anyone had asked, and the requester saw nothing at all,
+    /// so "Request control" looked broken unless you happened to click it
+    /// during the holder's idle window. Carried in the snapshot so both ends
+    /// can render it.
+    pending_request: Option<ObjectId>,
     sessions: HashMap<ObjectId, SessCore>,
 }
 
@@ -157,6 +175,9 @@ pub struct Snapshot {
     pub mode: Mode,
     pub holder: Option<ObjectId>,
     pub participants: Vec<Participant>,
+    /// FR-27 — who is waiting for the floor, if anyone. `None` in free mode
+    /// and whenever nothing is outstanding.
+    pub pending_request: Option<Participant>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -173,6 +194,7 @@ impl Default for ArbiterState {
             holder: None,
             last_injector: None,
             mode_seeded: false,
+            pending_request: None,
             sessions: HashMap::new(),
         }
     }
@@ -219,13 +241,27 @@ impl ArbiterState {
         if self.last_injector == Some(session) {
             self.last_injector = None;
         }
+        if self.pending_request == Some(session) {
+            self.pending_request = None;
+        }
         if self.holder == Some(session) {
-            // Hand the floor to any remaining INPUT-capable session.
+            // Hand the floor to a remaining INPUT-capable session — the
+            // LOWEST session id, not whatever `HashMap` iteration happened to
+            // yield first. Two viewers watching the same handover should see
+            // the same outcome, and a nondeterministic one is untestable.
             self.holder = self
                 .sessions
                 .iter()
-                .find(|(_, c)| c.can_input)
-                .map(|(id, _)| *id);
+                .filter(|(_, c)| c.can_input)
+                .map(|(id, _)| *id)
+                .min();
+        }
+        // FR-27 — with the last session gone there is no in-session decision
+        // left to preserve, so let the device policy seed the next one. See
+        // the field on `mode_seeded`.
+        if self.sessions.is_empty() {
+            self.mode_seeded = false;
+            self.pending_request = None;
         }
         core.held.iter().map(Held::release_msg).collect()
     }
@@ -334,9 +370,13 @@ impl ArbiterState {
         match self.holder {
             None => {
                 self.holder = Some(session);
+                self.pending_request = None;
                 (true, Vec::new())
             }
-            Some(h) if h == session => (true, Vec::new()),
+            Some(h) if h == session => {
+                self.pending_request = None;
+                (true, Vec::new())
+            }
             Some(h) => {
                 let idle = self
                     .sessions
@@ -354,12 +394,66 @@ impl ArbiterState {
                         })
                         .unwrap_or_default();
                     self.holder = Some(session);
+                    self.pending_request = None;
                     (true, releases)
                 } else {
+                    // FR-27 — REMEMBER the refusal. Dropping it on the floor
+                    // made "Request control" indistinguishable from a dead
+                    // button: the holder was never told anyone wanted the
+                    // floor, and the requester got no acknowledgement, so the
+                    // only way to succeed was to happen to click during the
+                    // holder's idle window. The snapshot broadcast that
+                    // follows tells both ends.
+                    self.pending_request = Some(session);
                     (false, Vec::new())
                 }
             }
         }
+    }
+
+    /// FR-27 — the holder hands the floor over on request, without waiting for
+    /// the idle timer. The courteous half of [`Self::request_floor`]: once you
+    /// can SEE that someone is waiting, you need a way to say yes.
+    ///
+    /// Only the current holder may grant, and only to the session that
+    /// actually asked — a stale click after the requester left, or after the
+    /// floor moved, must not hand control to whoever asked last.
+    pub fn grant_floor(&mut self, holder: ObjectId, to: ObjectId) -> (bool, Vec<InputMsg>) {
+        if self.mode != Mode::Exclusive
+            || self.holder != Some(holder)
+            || self.pending_request != Some(to)
+        {
+            return (false, Vec::new());
+        }
+        if !self.sessions.get(&to).map(|c| c.can_input).unwrap_or(false) {
+            self.pending_request = None;
+            return (false, Vec::new());
+        }
+        let releases = self
+            .sessions
+            .get_mut(&holder)
+            .map(|c| {
+                let r: Vec<InputMsg> = c.held.iter().map(Held::release_msg).collect();
+                c.held.clear();
+                r
+            })
+            .unwrap_or_default();
+        self.holder = Some(to);
+        self.pending_request = None;
+        (true, releases)
+    }
+
+    /// FR-27 — the holder declines, or the requester withdraws. Clearing the
+    /// request is what stops a refused chip from sitting on the toolbar
+    /// forever; the requester may always ask again.
+    pub fn clear_floor_request(&mut self, by: ObjectId) -> bool {
+        let mine = self.pending_request == Some(by);
+        let im_the_holder = self.holder == Some(by);
+        if self.pending_request.is_some() && (mine || im_the_holder) {
+            self.pending_request = None;
+            return true;
+        }
+        false
     }
 
     /// In-session mode toggle (INPUT-granted sessions only). Returns whether
@@ -383,24 +477,32 @@ impl ArbiterState {
             Mode::Exclusive => Some(session),
             Mode::Free => None,
         };
+        // Either direction settles the floor, so nothing can still be waiting
+        // for it: exclusive just handed it to the toggler, free abolished it.
+        self.pending_request = None;
         true
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let mut participants: Vec<Participant> = self
-            .sessions
-            .iter()
-            .map(|(id, c)| Participant {
+        let participant = |id: &ObjectId| -> Option<Participant> {
+            self.sessions.get(id).map(|c| Participant {
                 session: *id,
                 name: c.name.clone(),
                 input: c.can_input,
             })
-            .collect();
+        };
+        let mut participants: Vec<Participant> =
+            self.sessions.keys().filter_map(participant).collect();
         participants.sort_by_key(|p| p.session);
         Snapshot {
             mode: self.mode,
             holder: self.holder,
             participants,
+            // Free mode has no floor, so a leftover request there would render
+            // a "waiting for control" chip nobody can act on.
+            pending_request: (self.mode == Mode::Exclusive)
+                .then(|| self.pending_request.as_ref().and_then(participant))
+                .flatten(),
         }
     }
 
@@ -441,6 +543,15 @@ enum Cmd {
         msg: InputMsg,
     },
     RequestFloor {
+        session: ObjectId,
+    },
+    /// FR-27 — the holder hands the floor to whoever is waiting.
+    GrantFloor {
+        holder: ObjectId,
+        to: ObjectId,
+    },
+    /// FR-27 — the holder declines, or the requester withdraws.
+    ClearFloorRequest {
         session: ObjectId,
     },
     SetMode {
@@ -516,6 +627,14 @@ impl Arbiter {
     }
     pub fn request_floor(&self, session: ObjectId) {
         let _ = self.tx.try_send(Cmd::RequestFloor { session });
+    }
+    /// FR-27 — the holder grants the floor to the waiting session.
+    pub fn grant_floor(&self, holder: ObjectId, to: ObjectId) {
+        let _ = self.tx.try_send(Cmd::GrantFloor { holder, to });
+    }
+    /// FR-27 — the holder declines, or the requester withdraws.
+    pub fn clear_floor_request(&self, session: ObjectId) {
+        let _ = self.tx.try_send(Cmd::ClearFloorRequest { session });
     }
     pub fn set_mode(&self, session: ObjectId, mode: Mode) {
         let _ = self.tx.try_send(Cmd::SetMode { session, mode });
@@ -617,6 +736,22 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 }
                 broadcast_state(&state, &sinks, &handle);
             }
+            Cmd::GrantFloor { holder, to } => {
+                let (granted, releases) = state.grant_floor(holder, to);
+                tracing::info!(%holder, %to, granted, "input arbiter: floor grant");
+                if !releases.is_empty() {
+                    inject_all(&mut injector, &releases);
+                }
+                // Broadcast even on a refusal: the requester may have left, or
+                // the floor may have moved, and both ends need the truth.
+                broadcast_state(&state, &sinks, &handle);
+            }
+            Cmd::ClearFloorRequest { session } => {
+                if state.clear_floor_request(session) {
+                    tracing::info!(%session, "input arbiter: floor request cleared");
+                    broadcast_state(&state, &sinks, &handle);
+                }
+            }
             Cmd::SetMode { session, mode } => {
                 if state.set_mode(session, mode) {
                     tracing::info!(%session, mode = mode.as_str(), "input arbiter: mode changed");
@@ -657,6 +792,12 @@ fn broadcast_state(
                 "input": p.input,
             }))
             .collect::<Vec<_>>(),
+        // FR-27 — who is waiting for the floor. Omitted when nothing is, so a
+        // viewer that ignores the key behaves exactly as before.
+        "pending_request": snap.pending_request.as_ref().map(|p| serde_json::json!({
+            "session": p.session.to_hex(),
+            "name": p.name,
+        })),
     })
     .to_string();
     for s in sinks.values() {
@@ -971,5 +1112,184 @@ mod tests {
         assert_eq!(Mode::parse("nope"), None);
         assert_eq!(Mode::Free.as_str(), "free");
         assert_eq!(Mode::Exclusive.as_str(), "exclusive");
+    }
+
+    // ─── FR-27 ──────────────────────────────────────────────────────────
+
+    /// The device policy must apply to EVERY fresh occupancy, not just the
+    /// first one since the daemon booted. `mode_seeded` used to latch for the
+    /// process lifetime, so one viewer's in-session toggle silently disabled
+    /// the policy forever.
+    #[test]
+    fn the_device_policy_re_seeds_once_everyone_has_left() {
+        let (a, b) = (sid(), sid());
+        let mut st = ArbiterState::default();
+        let now = Instant::now();
+
+        st.open(a, "A".into(), true, Some(Mode::Exclusive), now);
+        assert_eq!(st.snapshot().mode, Mode::Exclusive);
+
+        // A viewer overrides it mid-session — legitimate, and it must stick
+        // while anyone is still connected.
+        assert!(st.set_mode(a, Mode::Free));
+        st.open(b, "B".into(), true, Some(Mode::Exclusive), now);
+        assert_eq!(
+            st.snapshot().mode,
+            Mode::Free,
+            "a later JOIN must not stomp a live in-session toggle"
+        );
+
+        // Everyone leaves. There is no conversation left to preserve.
+        st.close(a);
+        st.close(b);
+        st.open(sid(), "C".into(), true, Some(Mode::Exclusive), now);
+        assert_eq!(
+            st.snapshot().mode,
+            Mode::Exclusive,
+            "the device policy must apply again once the device is idle"
+        );
+    }
+
+    /// A refused floor request has to be VISIBLE. Dropping it made "Request
+    /// control" indistinguishable from a dead button.
+    #[test]
+    fn a_refused_floor_request_is_remembered_and_broadcast() {
+        let (holder, asker) = (sid(), sid());
+        let mut st = ArbiterState::default();
+        let t0 = Instant::now();
+        st.open(holder, "Holder".into(), true, Some(Mode::Exclusive), t0);
+        st.open(asker, "Asker".into(), true, None, t0);
+        assert_eq!(st.snapshot().holder, Some(holder));
+
+        // The holder is ACTIVE, so no auto-takeover…
+        st.plan(holder, &key(0x04, true), t0);
+        let (granted, _) = st.request_floor(asker, t0);
+        assert!(!granted);
+
+        // …but both ends can now see who is waiting.
+        let snap = st.snapshot();
+        assert_eq!(
+            snap.pending_request.as_ref().map(|p| p.session),
+            Some(asker)
+        );
+        assert_eq!(snap.pending_request.unwrap().name, "Asker");
+    }
+
+    /// The holder can hand over without waiting out the idle timer — and
+    /// handing over releases whatever they were holding down, exactly as an
+    /// idle takeover does.
+    #[test]
+    fn the_holder_can_grant_the_floor_and_their_keys_are_released() {
+        let (holder, asker) = (sid(), sid());
+        let mut st = ArbiterState::default();
+        let t0 = Instant::now();
+        st.open(holder, "Holder".into(), true, Some(Mode::Exclusive), t0);
+        st.open(asker, "Asker".into(), true, None, t0);
+
+        st.plan(holder, &key(0xe0, true), t0); // holding Ctrl
+        st.plan(holder, &click(true), t0); // and the left button
+        assert!(!st.request_floor(asker, t0).0);
+
+        let (granted, releases) = st.grant_floor(holder, asker);
+        assert!(granted);
+        assert_eq!(st.snapshot().holder, Some(asker));
+        assert_eq!(
+            releases.len(),
+            2,
+            "the outgoing holder's chord must not be left down"
+        );
+        assert!(st.snapshot().pending_request.is_none());
+        // The new holder can actually inject now.
+        assert!(matches!(
+            st.plan(asker, &key(0x04, true), t0),
+            EventPlan::Inject { .. }
+        ));
+    }
+
+    /// Only the CURRENT holder may grant, and only to the session that asked.
+    /// A stale click must not hand control to whoever asked last.
+    #[test]
+    fn granting_is_refused_from_a_non_holder_or_to_a_non_requester() {
+        let (holder, asker, third) = (sid(), sid(), sid());
+        let mut st = ArbiterState::default();
+        let t0 = Instant::now();
+        st.open(holder, "Holder".into(), true, Some(Mode::Exclusive), t0);
+        st.open(asker, "Asker".into(), true, None, t0);
+        st.open(third, "Third".into(), true, None, t0);
+        st.plan(holder, &key(0x04, true), t0);
+        assert!(!st.request_floor(asker, t0).0);
+
+        assert!(!st.grant_floor(third, asker).0, "a non-holder cannot grant");
+        assert!(
+            !st.grant_floor(holder, third).0,
+            "the holder cannot grant to someone who never asked"
+        );
+        assert_eq!(st.snapshot().holder, Some(holder));
+        assert_eq!(
+            st.snapshot().pending_request.map(|p| p.session),
+            Some(asker),
+            "a refused grant must leave the real request standing"
+        );
+    }
+
+    /// A request must not outlive the thing it was about: the requester
+    /// leaving, the mode being abolished, or a decline.
+    #[test]
+    fn a_pending_request_is_cleared_by_departure_mode_change_or_decline() {
+        let (holder, asker) = (sid(), sid());
+        let t0 = Instant::now();
+
+        // …the requester disconnects.
+        let mut st = ArbiterState::default();
+        st.open(holder, "H".into(), true, Some(Mode::Exclusive), t0);
+        st.open(asker, "A".into(), true, None, t0);
+        st.plan(holder, &key(0x04, true), t0);
+        st.request_floor(asker, t0);
+        st.close(asker);
+        assert!(st.snapshot().pending_request.is_none());
+
+        // …the holder declines.
+        let mut st = ArbiterState::default();
+        st.open(holder, "H".into(), true, Some(Mode::Exclusive), t0);
+        st.open(asker, "A".into(), true, None, t0);
+        st.plan(holder, &key(0x04, true), t0);
+        st.request_floor(asker, t0);
+        assert!(st.clear_floor_request(holder));
+        assert!(st.snapshot().pending_request.is_none());
+
+        // …the mode goes free, so there is no floor left to want.
+        let mut st = ArbiterState::default();
+        st.open(holder, "H".into(), true, Some(Mode::Exclusive), t0);
+        st.open(asker, "A".into(), true, None, t0);
+        st.plan(holder, &key(0x04, true), t0);
+        st.request_floor(asker, t0);
+        assert!(st.set_mode(holder, Mode::Free));
+        assert!(st.snapshot().pending_request.is_none());
+    }
+
+    /// Handover on close must be deterministic — two viewers watching the same
+    /// disconnect have to agree on who got the floor.
+    #[test]
+    fn floor_handover_on_close_is_deterministic() {
+        let mut ids = [sid(), sid(), sid()];
+        ids.sort();
+        let (low, high, holder) = (ids[0], ids[1], ids[2]);
+        let t0 = Instant::now();
+
+        // Run it repeatedly: HashMap iteration order varies per process AND
+        // per insertion history, so a single pass could pass by luck.
+        for _ in 0..8 {
+            let mut st = ArbiterState::default();
+            st.open(holder, "H".into(), true, Some(Mode::Exclusive), t0);
+            st.open(high, "High".into(), true, None, t0);
+            st.open(low, "Low".into(), true, None, t0);
+            assert_eq!(st.snapshot().holder, Some(holder));
+            st.close(holder);
+            assert_eq!(
+                st.snapshot().holder,
+                Some(low),
+                "the lowest surviving INPUT session must take the floor"
+            );
+        }
     }
 }
