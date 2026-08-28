@@ -1,6 +1,7 @@
 [package]
 name = "roomler-agent-tray"
 license = "MPL-2.0"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "Roomler desktop — tray-resident control surface: overview, devices, tunnels, settings, onboarding, consent."
