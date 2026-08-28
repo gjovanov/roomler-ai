@@ -815,6 +815,16 @@ pub enum SshAccountMode {
 /// set it could raise its own ceiling and the setting would mean nothing. This
 /// list is an allowlist, so leaving it out is sufficient; the trap is a later
 /// change that adds "the rest of the ssh_* surface" for symmetry.
+///
+/// ⚠️ **The whole `relay_*` surface (FR-19) is ABSENT**, and unlike the two
+/// above this is enforced by a test that matches on the PREFIX rather than on
+/// a name. `relay_server_enabled` is gate 4 — the refusal that survives a
+/// compromised server — and `relay_server_port` is just as load-bearing: a
+/// server able to move the port could point the listener somewhere the
+/// operator never opened, or away from one they did. The prefix rule exists
+/// because the feature will grow more keys (`relay_max_sessions`,
+/// `relay_static_endpoints`), and a per-name test would silently fail to cover
+/// the one someone adds later.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct DesiredConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2690,6 +2700,51 @@ pub fn block_align_slot(after: u32, slots: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-19 gate 4: **no `relay_*` key may ever be server-pushable.**
+    ///
+    /// Matches on the PREFIX, not on a name, and that is the whole point. A
+    /// per-name assertion would pass forever while covering nothing new, and
+    /// this surface is going to grow (`relay_max_sessions`,
+    /// `relay_static_endpoints`, …).
+    ///
+    /// ⚠️ The struct literal below is spelled out in full **on purpose** — no
+    /// `..Default::default()`. Every field is populated so the serialised form
+    /// cannot pass merely because a value was `None` and got skipped; and,
+    /// more importantly, adding any field to [`DesiredConfig`] makes this test
+    /// stop compiling, which forces whoever adds it to come here and read why
+    /// a `relay_*` key must not be the field they are adding. A tolerant
+    /// literal would let that change land silently.
+    #[test]
+    fn no_relay_key_is_server_pushable_via_desired_config() {
+        let full = DesiredConfig {
+            exec_enabled: Some(true),
+            ssh_enabled: Some(true),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA".into()]),
+            ssh_account_mode: Some("console_user".into()),
+            ssh_port: Some(2222),
+            revision: 7,
+            updated_by: None,
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&full).unwrap();
+        assert!(
+            !json.contains("relay_"),
+            "a relay_* key reached DesiredConfig -- that is gate 4 becoming \
+             server-settable, which is the one move FR-19's design exists to \
+             prevent: {json}"
+        );
+        // And the round trip cannot smuggle one in either.
+        let back: DesiredConfig = serde_json::from_str(
+            r#"{"exec_enabled":true,"relay_server_enabled":true,"relay_server_port":9,"revision":1}"#,
+        )
+        .expect("unknown keys must be ignored, not fail the frame");
+        assert_eq!(back.exec_enabled, Some(true));
+        assert!(
+            !serde_json::to_string(&back).unwrap().contains("relay_"),
+            "a relay_* key survived a decode/encode round trip"
+        );
+    }
 
     /// WIRE LOCK. These exact strings are what every deployed agent already
     /// sends and what the server gates on; changing one does not fail loudly,
