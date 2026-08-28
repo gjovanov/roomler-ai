@@ -1,0 +1,51 @@
+version = 1
+SPDX-PackageName = "roomler-ai"
+SPDX-PackageSupplier = "G ROX EOOD <legal@roomler.ai>"
+SPDX-PackageDownloadLocation = "https://github.com/gjovanov/roomler-ai"
+
+# Files that carry their own SPDX header (all first-party source) need no entry
+# here — scripts/apply-spdx.sh writes those, and licensing.yml enforces them.
+# These annotations cover what a header cannot live in: docs, assets, data, and
+# the vendored subtrees whose upstream terms must stay untouched.
+
+[[annotations]]
+path = "docs/**"
+SPDX-FileCopyrightText = "2026 G ROX EOOD"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+[[annotations]]
+path = ["*.md", "*.toml", "*.json", "*.yml", "*.yaml"]
+SPDX-FileCopyrightText = "2026 G ROX EOOD"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+[[annotations]]
+path = ["ui/public/**", "ui/src/assets/**", "docs/assets/**"]
+SPDX-FileCopyrightText = "2026 G ROX EOOD"
+SPDX-License-Identifier = "CC-BY-4.0"
+
+# Upstream forks. Patched in `crates/vendored/`, but the LICENCE is upstream's
+# and must not be rewritten — see THIRD-PARTY-NOTICES.md.
+[[annotations]]
+path = "crates/vendored/rtp/**"
+SPDX-FileCopyrightText = "The webrtc-rs authors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "crates/vendored/webrtc/**"
+SPDX-FileCopyrightText = "The webrtc-rs authors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "crates/vendored/webrtc-ice/**"
+SPDX-FileCopyrightText = "The webrtc-rs authors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "crates/vendored/wintun-bindings/**"
+SPDX-FileCopyrightText = "The wintun-bindings authors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "crates/vendored/scrap/**"
+SPDX-FileCopyrightText = "The scrap authors"
+SPDX-License-Identifier = "MIT"

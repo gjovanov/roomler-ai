@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! rc.58 — centralized log uploader.
 //!
 //! A `tracing-subscriber::Layer` that captures every emitted event,

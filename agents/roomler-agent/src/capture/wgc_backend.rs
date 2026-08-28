@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows.Graphics.Capture (WGC) screen-capture backend.
 //!
 //! Preferred on Windows 10 1803+. Advantages over the `scrap` /

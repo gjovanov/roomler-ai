@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! macOS TCC (privacy-permission) probes.
 //!
 //! macOS never *errors* when a permission is missing — CGDisplayStream

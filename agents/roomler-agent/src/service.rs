@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Cross-platform auto-start-on-boot / login plumbing.
 //!
 //! `roomler-agent service install` registers the agent so it launches

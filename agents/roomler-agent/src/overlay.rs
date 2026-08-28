@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent-side overlay-network glue (Phase 3b).
 //!
 //! Bridges the agent's WS signaling loop to the shared

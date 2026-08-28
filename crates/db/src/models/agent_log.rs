@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Centralized log-batch model — rc.58.
 //!
 //! Stores tracing/console batches from:

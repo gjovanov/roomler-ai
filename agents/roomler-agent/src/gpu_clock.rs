@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Session-scoped NVIDIA GPU clock pin (NVML) — kills the idle-P-state
 //! encode-latency ramp on NVENC senders.
 //!

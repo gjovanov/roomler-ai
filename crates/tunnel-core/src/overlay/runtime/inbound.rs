@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Inbound direct-handshake adoption (Phase A) — split out of `runtime.rs`
 //! (rc.284, pure move). An authenticated unknown-source WG init forwarded by
 //! a demux loop either re-points a known peer (restart/roam), installs the

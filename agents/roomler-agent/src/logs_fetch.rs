@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Diagnostic helper for the `rc:logs-fetch` control-DC message
 //! (added in rc.23). Reads the tail of the agent's current rolling
 //! log file and serialises it as JSON the browser can render in the

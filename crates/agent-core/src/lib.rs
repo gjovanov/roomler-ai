@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Daemon-free agent building blocks (P3e lever E).
 //!
 //! Everything a THIN client needs to cohabit with the daemon — config
