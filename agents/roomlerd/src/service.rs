@@ -1,6 +1,6 @@
 //! Cross-platform auto-start-on-boot / login plumbing.
 //!
-//! `roomler-agent service install` registers the agent so it launches
+//! `roomlerd service install` registers the agent so it launches
 //! automatically on the next interactive login:
 //!
 //!   - **Windows**: Scheduled Task named `Roomler` (pre-P3D-rename hosts

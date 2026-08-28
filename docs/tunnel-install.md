@@ -243,7 +243,7 @@ Do not ship that to production — it disables the policy gate.
 In a regular (non-elevated) PowerShell on `OPERATOR-LAPTOP`:
 
 ```powershell
-roomler-tunnel forward `
+roomler forward `
   --agent <AGENT-CORP-hex from Admin → Agents> `
   --local 5432 `
   --remote db.intranet.corp:5432
@@ -346,7 +346,7 @@ longest-prefix LAN routing, transports): [tunnels.md](tunnels.md).
 
 ```powershell
 $env:RUST_LOG = "roomler_cli=debug,tunnel_core=info"   # pre-FR-21 builds: roomler_tunnel=debug
-roomler-tunnel forward --agent … --local 5432 --remote db.intranet:5432
+roomler forward --agent … --local 5432 --remote db.intranet:5432
 ```
 
 **Per-flow debug logs on the agent**: tail the existing log file:
@@ -385,7 +385,7 @@ The HTTP listing from python's server should appear via the tunnel. Bytes flow: 
 
 ## 9. Tear down / revoke
 
-**Stop the forward**: Ctrl-C on `roomler-tunnel forward`. The agent's side closes automatically; audit row recorded.
+**Stop the forward**: Ctrl-C on `roomler forward`. The agent's side closes automatically; audit row recorded.
 
 **Revoke a tunnel-client** (operator left the team, laptop lost, etc.): **Admin → Tenant → Tunnels → click client → Revoke**. The next WS read on that client gets a `rc:tunnel.revoked` message and the WS closes; further enrollment attempts with the same `machine_id` are rejected.
 
