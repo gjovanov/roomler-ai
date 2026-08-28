@@ -43,6 +43,38 @@ It also explains the non-linear degradation with drag speed the operator reporte
 dropping. This is the structural difference from RustDesk, which owns its transport and
 drops frames instead of queueing them.
 
+## Viability: CONFIRMED in the stack we already ship (checked 2026-08-28)
+
+The open risk in the first draft was whether our SCTP actually implements
+abandonment on the SEND path — negotiating a partial-reliability channel type and
+then never abandoning would fix head-of-line blocking at the receiver while leaving
+ exactly where it is. It does implement it:
+
+-  carries , , chunk-level 
+  flags shared across fragments, and ; the abandonment
+  branch runs in  (~2022-2037).
+-  () maps every DCEP channel type,
+  including , onto .
+
+So the browser sets it in , the DCEP OPEN carries it, and the
+agent applies it automatically — **no agent-side transport change is needed at all.**
+
+### This changes the recommended knob
+
+Prefer **** (→ ) over 
+(→ ). A deadline says the thing we actually mean — *this frame is worthless if
+it has not arrived within N ms* — which is the same principle FR-18 applied one layer
+down at the DERP queue, and it removes the guesswork in direction C.
+
+It is also **self-scaling, which retires the constrained-only gating in direction B**:
+on a 7 ms direct path nothing is ever abandoned because delivery is three orders of
+magnitude inside the deadline, while on a 90-210 ms relay it abandons exactly what is
+stale. One setting, correct on both transports, no carrier plumbing.
+
+⚠️ What remains genuinely hard is therefore NOT the transport — it is the RECEIVER.
+The worker assembler assumes ordered, complete delivery, so stage A (framing + gap
+detection) is the whole engineering cost and the whole risk.
+
 ## Design directions (staged, each behind its own kill switch)
 
 **A. Explicit frame framing, still ordered — zero behaviour change.** Add sequence +
