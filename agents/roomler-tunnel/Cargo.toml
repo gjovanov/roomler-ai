@@ -86,7 +86,7 @@ socket2 = "0.5"
 libc = "0.2"
 
 # build.rs embeds a Windows VERSIONINFO resource into roomler.exe. See
-# agents/roomler-agent/Cargo.toml for why this is embed-resource rather than
+# agents/roomlerd/Cargo.toml for why this is embed-resource rather than
 # winres/winresource (per-binary scoping vs. a link-lib that leaks into
 # roomler-setup.exe, which depends on this crate).
 [target.'cfg(windows)'.build-dependencies]

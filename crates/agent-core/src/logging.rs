@@ -100,6 +100,56 @@ fn log_basename() -> &'static str {
     }
 }
 
+/// Mirror a legacy `roomler_agent=<level>` directive onto `roomlerd=<level>`.
+///
+/// FR-21 P2a renamed the daemon LIB `roomler_agent` -> `roomlerd`, and a tracing
+/// target IS the crate name — so every `RUST_LOG` that names the old target stopped
+/// matching the daemon's own events the moment the rename shipped. That is not a
+/// theoretical concern: five places set an explicit override that BEATS the dual
+/// default above, three of them shipped units already on disk in the field
+/// (`packaging/linux/{roomler,roomlerd}.service`, `com.roomler.agent.plist`) plus the
+/// two units `service.rs` generates. A host whose unit is not rewritten would keep
+/// running and log nothing but `warn` from the daemon — a silent, fleet-wide
+/// observability blackout with no error anywhere.
+///
+/// So the new target is ADDED rather than substituted: an operator who deliberately
+/// set `roomler_agent=debug` gets `roomlerd=debug` too, and anyone already naming
+/// `roomlerd` is left alone. Directives for other targets, and the bare global level,
+/// pass through untouched.
+///
+/// RETIRED-NAME-ANCHOR(2): `roomler_agent` is the retired target this exists to keep
+/// working. Deleting it re-creates the blackout described above.
+fn mirror_legacy_log_target(spec: &str) -> String {
+    const LEGACY: &str = "roomler_agent";
+    const CURRENT: &str = "roomlerd";
+    if !spec.contains(LEGACY) {
+        return spec.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut saw_current = spec
+        .split(',')
+        .any(|d| d.trim().split('=').next().map(str::trim) == Some(CURRENT));
+    for directive in spec.split(',') {
+        out.push(directive.to_string());
+        if saw_current {
+            continue;
+        }
+        let (target, level) = match directive.split_once('=') {
+            Some((t, l)) => (t.trim(), Some(l.trim())),
+            // A bare word is a global level (`info`), not a target directive.
+            None => (directive.trim(), None),
+        };
+        if target == LEGACY {
+            out.push(match level {
+                Some(l) => format!("{CURRENT}={l}"),
+                None => CURRENT.to_string(),
+            });
+            saw_current = true;
+        }
+    }
+    out.join(",")
+}
+
 /// Initialise tracing subscribers. Always installs a stdout layer; adds
 /// a daily-rolling file layer + panic hook when the platform log dir
 /// is writeable. Infallible — file logging failure falls back to
@@ -128,12 +178,14 @@ pub fn init() {
     // admin-UI log viewer, so they belong on by default. Everything
     // else in `tunnel_core` is debug/trace and stays suppressed; the
     // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
-    let env_filter = EnvFilter::try_from_default_env()
-        // S1b follow-up: `roomlerd=info` — events emitted from the BIN
-        // (target = the binary crate name) were silently capped at warn,
-        // hiding the migration notes + DPI/timer diagnostics the code
-        // clearly intended to be visible.
-        .unwrap_or_else(|_| {
+    let env_filter = std::env::var("RUST_LOG")
+        .ok()
+        .map(|spec| EnvFilter::new(mirror_legacy_log_target(&spec)))
+        .unwrap_or_else(|| {
+            // S1b follow-up: `roomlerd=info` — events emitted from the BIN
+            // (target = the binary crate name) were silently capped at warn,
+            // hiding the migration notes + DPI/timer diagnostics the code
+            // clearly intended to be visible.
             EnvFilter::new("roomler_agent=info,roomlerd=info,tunnel_core=info,warn")
         })
         // rc.181 — silence the `turn` crate's periodic refresh-failure warns
@@ -242,6 +294,8 @@ pub fn active_log_path() -> Option<PathBuf> {
     // Own basename first so the Host process's crash sidecars attach the
     // Host log tail; then the standard + legacy names.
     let mut bases = vec![log_basename()];
+    // RETIRED-NAME-ANCHOR: legacy rolled logs on an upgraded host. Dropping the old
+    // prefix makes them invisible to crash sidecars. See docs/fr/FR-21.
     for b in ["roomlerd.log", "roomlerd-service.log", "roomler-agent.log"] {
         if !bases.contains(&b) {
             bases.push(b);
@@ -309,6 +363,7 @@ pub fn tail_source_path(source: &str) -> Option<PathBuf> {
         "daemon" => active_log_path().or_else(|| {
             let dir = resolve_log_dir()?;
             newest_file_matching(&[dir], |name| {
+                // RETIRED-NAME-ANCHOR: see above -- legacy rolled logs stay findable.
                 name.starts_with("roomlerd.log") || name.starts_with("roomler-agent.log")
             })
         }),
@@ -437,6 +492,8 @@ fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
         let lossy = name.to_string_lossy();
         let is_ours = lossy.starts_with("roomlerd.log")
             || lossy.starts_with("roomlerd-service.log")
+            // RETIRED-NAME-ANCHOR: legacy rolled logs must still AGE OUT; dropping this
+            // leaks them forever on an upgraded host. See docs/fr/FR-21.
             || lossy.starts_with("roomler-agent.log")
             || lossy.starts_with("panic-");
         if is_ours && mtime < cutoff {
@@ -518,6 +575,74 @@ fn format_panic(
 
 #[cfg(test)]
 mod tests {
+    // ── FR-21 P2a: the lib rename must not blank a deployed unit's logs ──
+
+    #[test]
+    fn legacy_log_target_is_mirrored_onto_the_new_one() {
+        // Exactly what packaging/linux/roomlerd.service ships today.
+        assert_eq!(
+            mirror_legacy_log_target("roomler_agent=info,warn"),
+            "roomler_agent=info,roomlerd=info,warn"
+        );
+        // And what service.rs generates.
+        assert_eq!(
+            mirror_legacy_log_target("roomler_agent=info,tunnel_core=info,warn"),
+            "roomler_agent=info,roomlerd=info,tunnel_core=info,warn"
+        );
+    }
+
+    #[test]
+    fn the_operators_chosen_level_is_carried_over_not_defaulted() {
+        // A hand-set `debug` must reach the renamed target, or the rename
+        // silently downgrades exactly the person who asked for more detail.
+        assert_eq!(
+            mirror_legacy_log_target("roomler_agent=debug,webrtc=info"),
+            "roomler_agent=debug,roomlerd=debug,webrtc=info"
+        );
+    }
+
+    #[test]
+    fn a_spec_already_naming_the_new_target_is_left_alone() {
+        // Idempotence: the shim must not accumulate duplicates when the
+        // shipped units are eventually rewritten to name both.
+        let both = "roomler_agent=info,roomlerd=info,warn";
+        assert_eq!(mirror_legacy_log_target(both), both);
+        assert_eq!(
+            mirror_legacy_log_target(&mirror_legacy_log_target(both)),
+            both
+        );
+    }
+
+    #[test]
+    fn specs_without_the_legacy_target_pass_through_untouched() {
+        for spec in [
+            "info",
+            "warn",
+            "roomlerd=debug,warn",
+            "tunnel_core=info,warn",
+        ] {
+            assert_eq!(mirror_legacy_log_target(spec), spec, "spec: {spec}");
+        }
+    }
+
+    #[test]
+    fn a_bare_legacy_target_with_no_level_still_mirrors() {
+        assert_eq!(
+            mirror_legacy_log_target("roomler_agent"),
+            "roomler_agent,roomlerd"
+        );
+    }
+
+    #[test]
+    fn a_target_merely_containing_the_legacy_name_is_not_mistaken_for_it() {
+        // `roomler_agent_core` starts with `roomler_agent`; a `starts_with`
+        // or `contains` match would wrongly mirror it onto `roomlerd`.
+        assert_eq!(
+            mirror_legacy_log_target("roomler_agent_core=debug,warn"),
+            "roomler_agent_core=debug,warn"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -74,10 +74,10 @@
 
 use crate::fixtures::test_app::TestApp;
 use futures::{SinkExt, StreamExt};
-use roomler_agent::config::AgentConfig;
-use roomler_agent::encode::EncoderPreference;
-use roomler_agent::tunnel::client_mgr::TunnelClientHub;
-use roomler_agent::{enrollment, signaling};
+use roomlerd::config::AgentConfig;
+use roomlerd::encode::EncoderPreference;
+use roomlerd::tunnel::client_mgr::TunnelClientHub;
+use roomlerd::{enrollment, signaling};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -762,8 +762,8 @@ fn spawn_origin_signaling(
     tokio::spawn(async move {
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (view_tx, _view_rx) = tokio::sync::watch::channel(Default::default());
-        let broker = roomler_agent::consent::ConsentBroker::new(
-            roomler_agent::consent::Mode::AutoGrant,
+        let broker = roomlerd::consent::ConsentBroker::new(
+            roomlerd::consent::Mode::AutoGrant,
             std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
         )
         .expect("consent broker init");
@@ -786,7 +786,7 @@ fn spawn_origin_signaling(
             // must still be SEEDED from the config this agent was handed —
             // which is exactly what `main.rs` does. See agent_exec_tests for
             // the failure hardcoding `false` produced.
-            roomler_agent::remote_config::RemoteConfigServices::new(
+            roomlerd::remote_config::RemoteConfigServices::new(
                 std::path::PathBuf::from("unused-in-tests.toml"),
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
                 exec_enabled,
