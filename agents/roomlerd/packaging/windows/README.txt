@@ -91,7 +91,7 @@ overwrite the binary. The Scheduled Task registered by
 
 Disable for air-gapped deployments with:
 
-    setx ROOMLER_AGENT_AUTO_UPDATE 0
+    setx ROOMLERD_AUTO_UPDATE 0
 
 Manual check without installing:
 

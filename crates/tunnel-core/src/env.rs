@@ -6,10 +6,15 @@
 //! `ROOMLER_AGENT_OVERLAY_DIRECT`), and those MUST keep working across the
 //! rename: silently dropping a prefix is the MajorUpgrade-drops-env-vars class
 //! of bug that already bit the fleet. So every node env read goes through
-//! [`node_env`], which prefers the new `ROOMLER_NODE_<SUFFIX>` and falls back
-//! to the legacy `ROOMLER_AGENT_<SUFFIX>`. New code + docs use `ROOMLER_NODE_*`;
-//! the legacy prefix stays readable indefinitely (cheap, and it's a contract
-//! with hosts already in the field).
+//! [`node_env`], which tries `ROOMLERD_<SUFFIX>` first, then the interim
+//! `ROOMLER_NODE_<SUFFIX>`, then the original `ROOMLER_AGENT_<SUFFIX>`.
+//!
+//! FR-21 P3 (decision D1) makes `ROOMLERD_*` the spelling new code and docs
+//! use — it matches the binary. Both older prefixes stay readable
+//! INDEFINITELY: they are a contract with hosts already in the field, and the
+//! cost of honouring them is one `or_else` arm. Adding a preferred prefix is a
+//! change to this one function, never to the 166 call sites, because every
+//! caller passes a bare SUFFIX.
 //!
 //! S2 adds a THIRD source: config-backed fallbacks. The daemon registers the
 //! operator-grade knobs from its `config.toml` once at startup
@@ -38,12 +43,29 @@ fn config_fallback(suffix: &str) -> Option<String> {
     CONFIG_FALLBACKS.get().and_then(|m| m.get(suffix).cloned())
 }
 
-/// Read a Roomler node env var by suffix, preferring `ROOMLER_NODE_<suffix>`,
-/// falling back to the legacy `ROOMLER_AGENT_<suffix>`, then to a registered
-/// config-backed fallback (S2). Returns `None` if none of the three is set
-/// (or the env value isn't valid Unicode).
+/// Read a Roomler node env var by suffix. Precedence, highest first:
+///
+///   1. `ROOMLERD_<suffix>`      — the current spelling (FR-21 P3, decision D1)
+///   2. `ROOMLER_NODE_<suffix>`  — the previous "new" spelling, still honoured
+///   3. `ROOMLER_AGENT_<suffix>` — the original, still honoured
+///   4. a registered config-backed fallback (S2)
+///
+/// Returns `None` if none is set (or the env value isn't valid Unicode).
+///
+/// Every knob in the daemon reads through here and passes a SUFFIX, never a
+/// full name, so adding a preferred prefix is one arm in this chain rather than
+/// an edit at 166 call sites.
+///
+/// RETIRED-NAME-ANCHOR(4): arms 2 and 3 are the reason a rename here costs
+/// nothing in the field. Both spellings are set on real hosts today — mars,
+/// jupiter and zeus each carry four `ROOMLER_AGENT_*` entries in an
+/// operator-authored `/etc/systemd/system/roomlerd.service.d/` drop-in, which a
+/// package upgrade never rewrites. Dropping either arm silently un-configures
+/// those hosts: the daemon starts fine and simply ignores what it was told.
+/// See docs/fr/FR-21.
 pub fn node_env(suffix: &str) -> Option<String> {
-    std::env::var(format!("ROOMLER_NODE_{suffix}"))
+    std::env::var(format!("ROOMLERD_{suffix}"))
+        .or_else(|_| std::env::var(format!("ROOMLER_NODE_{suffix}")))
         .or_else(|_| std::env::var(format!("ROOMLER_AGENT_{suffix}")))
         .ok()
         .or_else(|| config_fallback(suffix))
@@ -77,17 +99,98 @@ pub fn flag(suffix: &str, default: bool) -> bool {
 }
 
 /// OsString twin of [`node_env`] for reads that must tolerate non-Unicode
-/// values (`std::env::var_os` semantics). Prefers `ROOMLER_NODE_<suffix>`,
-/// falls back to the legacy `ROOMLER_AGENT_<suffix>`, then to a registered
-/// config-backed fallback. Returns `None` if none is set.
+/// values (`std::env::var_os` semantics). Same precedence, and it MUST stay the
+/// same: two readers of one knob that disagree about which prefix wins is a
+/// bug nobody would think to look for.
+///
+/// RETIRED-NAME-ANCHOR(5): the legacy arms, as in [`node_env`]. See docs/fr/FR-21.
 pub fn node_env_os(suffix: &str) -> Option<std::ffi::OsString> {
-    std::env::var_os(format!("ROOMLER_NODE_{suffix}"))
+    std::env::var_os(format!("ROOMLERD_{suffix}"))
+        .or_else(|| std::env::var_os(format!("ROOMLER_NODE_{suffix}")))
         .or_else(|| std::env::var_os(format!("ROOMLER_AGENT_{suffix}")))
         .or_else(|| config_fallback(suffix).map(std::ffi::OsString::from))
 }
 
 #[cfg(test)]
 mod tests {
+    // ── FR-21 P3 (D1): ROOMLERD_* wins, and NOTHING in the field stops working ──
+
+    const S3: &str = "UNIFY_TEST_P3_PRECEDENCE";
+
+    fn dk() -> String {
+        format!("ROOMLERD_{S3}")
+    }
+    fn nk3() -> String {
+        format!("ROOMLER_NODE_{S3}")
+    }
+    fn ak3() -> String {
+        format!("ROOMLER_AGENT_{S3}")
+    }
+
+    #[test]
+    fn roomlerd_prefix_wins_but_both_legacy_spellings_still_work() {
+        // SAFETY (edition 2024): suffix is unique to this test, no concurrency.
+        unsafe {
+            std::env::remove_var(dk());
+            std::env::remove_var(nk3());
+            std::env::remove_var(ak3());
+        }
+        assert_eq!(node_env(S3), None, "none set -> None");
+
+        // The ORIGINAL spelling alone must still be honoured. This is the case
+        // that is live on mars/jupiter/zeus right now, in a drop-in no package
+        // upgrade rewrites.
+        unsafe { std::env::set_var(ak3(), "from-agent") };
+        assert_eq!(node_env(S3).as_deref(), Some("from-agent"));
+
+        // The interim spelling outranks it.
+        unsafe { std::env::set_var(nk3(), "from-node") };
+        assert_eq!(node_env(S3).as_deref(), Some("from-node"));
+
+        // And the current spelling outranks both.
+        unsafe { std::env::set_var(dk(), "from-roomlerd") };
+        assert_eq!(node_env(S3).as_deref(), Some("from-roomlerd"));
+
+        // Removing the winner falls back down the chain rather than to None.
+        unsafe { std::env::remove_var(dk()) };
+        assert_eq!(node_env(S3).as_deref(), Some("from-node"));
+        unsafe { std::env::remove_var(nk3()) };
+        assert_eq!(node_env(S3).as_deref(), Some("from-agent"));
+
+        unsafe { std::env::remove_var(ak3()) };
+        assert_eq!(node_env(S3), None);
+    }
+
+    #[test]
+    fn the_os_twin_agrees_with_node_env_on_precedence() {
+        // Two readers of one knob that disagree about which prefix wins is a
+        // bug nobody would think to look for, so it is asserted rather than
+        // assumed.
+        const S4: &str = "UNIFY_TEST_P3_OS_TWIN";
+        unsafe {
+            std::env::set_var(format!("ROOMLER_AGENT_{S4}"), "agent");
+            std::env::set_var(format!("ROOMLER_NODE_{S4}"), "node");
+            std::env::set_var(format!("ROOMLERD_{S4}"), "roomlerd");
+        }
+        assert_eq!(node_env(S4).as_deref(), Some("roomlerd"));
+        assert_eq!(
+            node_env_os(S4).as_deref(),
+            Some(std::ffi::OsStr::new("roomlerd"))
+        );
+        unsafe {
+            std::env::remove_var(format!("ROOMLERD_{S4}"));
+        }
+        assert_eq!(node_env(S4).as_deref(), Some("node"));
+        assert_eq!(
+            node_env_os(S4).as_deref(),
+            Some(std::ffi::OsStr::new("node"))
+        );
+        unsafe {
+            std::env::remove_var(format!("ROOMLER_NODE_{S4}"));
+            std::env::remove_var(format!("ROOMLER_AGENT_{S4}"));
+        }
+    }
+
     use super::*;
 
     // A unique suffix no other code/test touches, so setting these process-wide

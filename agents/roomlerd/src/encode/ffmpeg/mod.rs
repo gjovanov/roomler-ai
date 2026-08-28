@@ -18,7 +18,7 @@
 //!   ffmpeg-next link verification, DLL staging — 7 RCs of CI iteration
 //!   to land a working FFmpeg 8.1.1 bundle in the agent MSI).
 //! - **rc.72 (this RC)**: `FfmpegEncoder` lands in `encoder.rs`. Hooks
-//!   into `open_for_codec_hevc` behind `ROOMLER_AGENT_USE_FFMPEG=1` env
+//!   into `open_for_codec_hevc` behind `ROOMLERD_USE_FFMPEG=1` env
 //!   var. CPU BGRA→NV12 conversion via dcv_color_primitives. MF cascade
 //!   still default.
 //! - rc.73: D3D11VA zero-copy (capture's D3D11 texture fed directly to
@@ -57,7 +57,7 @@ pub fn linked_libavcodec_version() -> u32 {
 ///
 /// **rc.107: DEFAULT ON.** HEVC-over-DataChannel is the primary remote-video
 /// path now, so the FFmpeg backend is enabled UNLESS explicitly disabled with
-/// `ROOMLER_AGENT_USE_FFMPEG=0` (or `false`/`no`/`off`/empty). The rc.72 opt-IN
+/// `ROOMLERD_USE_FFMPEG=0` (or `false`/`no`/`off`/empty). The rc.72 opt-IN
 /// gate flipped this default because an MSI MajorUpgrade WIPES the operator's
 /// service env block, and since 6bc9d58 every `agent-v*` bump is a MajorUpgrade
 /// → the dropped `USE_FFMPEG=1` silently disabled HEVC FLEET-WIDE (caps stopped
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn available_default_on_when_env_unset() {
         // SAFETY: tests share the process env; this module is the only
-        // one touching ROOMLER_AGENT_USE_FFMPEG so no concurrent reads.
+        // one touching ROOMLERD_USE_FFMPEG so no concurrent reads.
         unsafe { std::env::remove_var("ROOMLER_AGENT_USE_FFMPEG") };
         // rc.107 — DEFAULT ON in the ffmpeg-encoder build (HEVC-over-DC is
         // the primary path); the feature-off build hardwires available()=false.

@@ -1050,7 +1050,7 @@ async fn connect_once(
     // rc.62: same lifecycle as `pending_transports` but for the
     // per-session VP9 chroma override forwarded from the controller's
     // `rc:session.request.chroma_pref`. `None` → fall back to the
-    // agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default.
+    // agent's `ROOMLERD_VP9_CHROMA` env-var default.
     let mut pending_chroma: HashMap<bson::oid::ObjectId, Option<String>> = HashMap::new();
     // Same lifecycle as `pending_transports`/`pending_chroma` but for the
     // opt-in system-audio flag forwarded from the controller's
@@ -1937,7 +1937,7 @@ async fn handle_server_msg(
             let negotiated_transport = pending_transports.remove(&session_id).unwrap_or(None);
             // rc.62 — pull the per-session chroma override stashed by
             // the Request handler. `None` → AgentPeer falls back to
-            // `ROOMLER_AGENT_VP9_CHROMA` env-var default.
+            // `ROOMLERD_VP9_CHROMA` env-var default.
             let chroma_pref = pending_chroma.remove(&session_id).unwrap_or(None);
             // Pull the opt-in audio flag stashed by the Request handler.
             // Missing (session skipped rc:request in a test harness) →
@@ -2019,7 +2019,7 @@ async fn handle_server_msg(
             .map_err(|e| ConnectError::Transient(e.context("sending answer")))?;
             peers.insert(session_id, peer);
             // 2026-07-27 — first live session engages the GPU-clock pin
-            // (opt-in, `ROOMLER_AGENT_GPU_CLOCK_PIN`; no-op otherwise).
+            // (opt-in, `ROOMLERD_GPU_CLOCK_PIN`; no-op otherwise).
             crate::gpu_clock::on_sessions_changed(peers.len());
             info!(%session_id, "rc:sdp.answer sent; peer is live");
         }
@@ -2549,7 +2549,7 @@ async fn handle_server_msg(
             if !crate::updater::request_update_now(pin) {
                 warn!(
                     "update trigger dropped — auto-updater not running \
-                     (ROOMLER_AGENT_AUTO_UPDATE=0?) or a trigger is already queued"
+                     (ROOMLERD_AUTO_UPDATE=0?) or a trigger is already queued"
                 );
             }
         }
@@ -3058,7 +3058,7 @@ static TUNNEL_QUIC_SURVIVAL: std::sync::LazyLock<
 /// Max surviving QUIC sessions stashed per tenant (orphan-leak bound).
 const TUNNEL_QUIC_SURVIVAL_CAP: usize = 32;
 
-/// The R3 agent gate (`ROOMLER_NODE_TUNNEL_PEERS_SURVIVE_REATTACH`, default
+/// The R3 agent gate (`ROOMLERD_TUNNEL_PEERS_SURVIVE_REATTACH`, default
 /// off). Read per exit so a live `roomler config set` + restart flips it.
 fn tunnel_peers_survive_enabled() -> bool {
     tunnel_core::env::flag("TUNNEL_PEERS_SURVIVE_REATTACH", false)
