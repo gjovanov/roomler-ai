@@ -3673,7 +3673,7 @@ describe('P7 — FSR sharpening sizing policy (computeRenderTarget)', () => {
     expect(normalizeSharpenMode('auto')).toBe('auto')
     expect(normalizeSharpenMode('on')).toBe('on')
     expect(normalizeSharpenMode('off')).toBe('off')
-    expect(normalizeSharpenMode('banana')).toBe('on') // FR-24: default is now ON
+    expect(normalizeSharpenMode('banana')).toBe('on') // FR-26: default is now ON
     expect(normalizeSharpenMode(null)).toBe('on')
     expect(normalizeSharpness('0.25')).toBe(0.25)
     expect(normalizeSharpness(1.5)).toBe(1.5)
@@ -3708,7 +3708,7 @@ describe('P7 — FSR localStorage knobs', () => {
     localStorage.removeItem('roomler-rc-fsr-sharpness')
   })
 
-  // FR-24 flipped the default from 'auto' (sharpen only when upscaling) to
+  // FR-26 flipped the default from 'auto' (sharpen only when upscaling) to
   // 'on' — the viewer is used for text far more than for video.
   it('storedSharpenMode defaults to ON and honours auto/off', () => {
     expect(storedSharpenMode()).toBe('on')
@@ -3720,7 +3720,7 @@ describe('P7 — FSR localStorage knobs', () => {
     expect(storedSharpenMode()).toBe('on')
   })
 
-  // FR-24 — per-pill toolbar toggles.
+  // FR-26 — per-pill toolbar toggles.
   it('storedMetricToggles: everything on except the pipeline HUD', () => {
     const m = storedMetricToggles()
     expect(m).toEqual({
