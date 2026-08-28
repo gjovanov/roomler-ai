@@ -668,6 +668,7 @@ impl Hub {
         browser_caps: Vec<String>,
         preferred_transport: Option<String>,
         chroma_pref: Option<String>,
+        chunk_framing: Option<bool>,
         audio_enabled: bool,
         consent_mode: ConsentMode,
         override_reason: Option<String>,
@@ -832,6 +833,7 @@ impl Hub {
             browser_caps,
             preferred_transport,
             chroma_pref,
+            chunk_framing,
             audio_enabled,
             // Server-authoritative directive: the agent obeys this rather than
             // its local `auto_grant_session`. `Auto` → immediate grant;
@@ -1491,6 +1493,7 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    chunk_framing,
                     audio_enabled,
                     // Ignored here — the Hub can't validate admin; the API gate
                     // validates the wire field and re-supplies it via `ctx`.
@@ -1521,6 +1524,7 @@ impl Hub {
                     browser_caps,
                     preferred_transport,
                     chroma_pref,
+                    chunk_framing,
                     audio_enabled,
                     ctx.consent_mode,
                     ctx.override_reason.clone(),
@@ -1641,6 +1645,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1666,6 +1671,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1724,6 +1730,7 @@ mod tests {
             Vec::new(),
             None,
             None,  // chroma_pref
+            None,  // chunk_framing
             false, // audio_enabled
             ConsentMode::Prompt,
             None, // override_reason
@@ -1758,6 +1765,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,  // chroma_pref
+                None,  // chunk_framing
                 false, // audio_enabled
                 ConsentMode::Prompt,
                 None, // override_reason
@@ -1805,6 +1813,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1867,6 +1876,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1916,6 +1926,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -1968,6 +1979,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2107,6 +2119,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2181,6 +2194,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2246,6 +2260,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2264,6 +2279,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2320,6 +2336,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2342,6 +2359,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None, // chunk_framing
             false,
             ConsentMode::Prompt,
             None,
@@ -2384,6 +2402,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None, // chunk_framing
             false,
             ConsentMode::Prompt,
             None,
@@ -2426,6 +2445,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
@@ -2487,6 +2507,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                None, // chunk_framing
                 false,
                 ConsentMode::Prompt,
                 None,
