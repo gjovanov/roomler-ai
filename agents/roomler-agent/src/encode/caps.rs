@@ -737,6 +737,11 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
         supports_file_transfer: true,
         max_simultaneous_sessions: rc_max_sessions(),
         transports,
+        // FR-17 — this build frames every DataChannel message, so a
+        // receiver can reassemble without relying on the channel being
+        // ordered. Advertised unconditionally: it is a property of the
+        // code, not of the host or its hardware.
+        video: vec!["chunk-framing".to_string()],
         files,
         vp9_chroma,
         hevc_chroma,

@@ -519,6 +519,16 @@ pub enum ClientMsg {
         /// matching server-side [`ServerMsg::SessionRequest`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// FR-17 — the controller can parse the framed DataChannel wire
+        /// format (every message prefixed with
+        /// `[frame_seq | chunk_idx | chunk_count]`). Sent only when the
+        /// agent advertised `chunk-framing` in `AgentCaps.video`, so the
+        /// two ends can never disagree about bytes already in flight.
+        /// `None` / unset (older controllers) means the legacy unframed
+        /// format, which is reassemblable only because the channel is
+        /// reliable + ordered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_framing: Option<bool>,
         /// Opt-in system/desktop audio. When `true` the controller wants
         /// the agent to add a WebRTC Opus audio track (the agent must
         /// also advertise `"opus"` in `AgentCaps.audio` and be built with
@@ -1095,6 +1105,12 @@ pub enum ServerMsg {
         /// `ROOMLER_AGENT_VP9_CHROMA` env-var default".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chroma_pref: Option<String>,
+        /// FR-17 — forwarded verbatim from the controller's
+        /// [`ClientMsg::SessionRequest::chunk_framing`]. `Some(true)` means
+        /// the controller can parse the framed wire format; anything else
+        /// keeps the legacy unframed one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_framing: Option<bool>,
         /// Opt-in system/desktop audio, forwarded verbatim from the
         /// controller's [`ClientMsg::SessionRequest::audio_enabled`]. When
         /// `true` the agent adds a WebRTC Opus audio track (if built with
@@ -2602,6 +2618,7 @@ mod tests {
             browser_caps: vec!["h264".into(), "h265".into()],
             preferred_transport: None,
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: false,
             override_reason: None,
             local_relay: None,
@@ -2624,6 +2641,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: Some("data-channel-vp9-444".into()),
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: true,
             override_reason: None,
             local_relay: None,
@@ -2644,6 +2662,7 @@ mod tests {
             browser_caps: vec![],
             preferred_transport: None,
             chroma_pref: None,
+            chunk_framing: None,
             audio_enabled: false,
             override_reason: None,
             local_relay: Some(LocalRelayDescriptor {
