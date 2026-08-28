@@ -574,6 +574,11 @@ keyboard component.*
 3. **Recording storage**: piggyback on the existing MinIO setup, or push to S3-compatible per-org bucket? Existing MinIO is fine for v1.
 4. **Mobile controller** keyboard UX is genuinely hard (no physical keys, lots of host-OS shortcuts to send). v1 should be view + tap-to-click only on mobile, full input on desktop browsers.
 
+<!-- RETIRED-NAME-ANCHOR-BEGIN: §17-19 are historical appendices. They record what the
+     product was called and what operators actually typed at the time (0.1.32 - rc.26),
+     so rewriting `roomler-agent` to `roomlerd` here would falsify the record rather
+     than update it. The CURRENT encoder reference is docs/encoders.md. docs/fr/FR-21 -->
+
 ## 17. Hardware encoder backends
 
 > **Current reference: [encoders.md](encoders.md)** — the codec × platform matrix,
@@ -1381,3 +1386,5 @@ SystemContext capture (rc.1–rc.7, hardened through rc.26 behind
 `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`), M5 field verification, and the perMachine
 MSI flavour (`wix-perMachine/`). The operator-facing verification procedure lives
 in [operator-systemcontext-smoke.md](operator-systemcontext-smoke.md).
+
+<!-- RETIRED-NAME-ANCHOR-END: end of the historical appendices (§17-19). -->

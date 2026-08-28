@@ -133,7 +133,7 @@ Two ways to get there:
 
 The SCM service supervises a per-session worker via WTSQueryUserToken
 + CreateProcessAsUserW: when a user logs in, the service spawns
-`roomler-agent run` in their session; on logoff / fast-user-switch
+`roomlerd run` in their session; on logoff / fast-user-switch
 the worker is replaced; on Stop the worker is terminated.
 
 Service-mode and Scheduled-Task-mode are independent — installing the
