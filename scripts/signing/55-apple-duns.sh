@@ -45,7 +45,7 @@
 #     Goran Jovanov is 100% owner + CEO, so select "I am the owner/founder"
 #     when asked.
 #   * Apple's verification team may call the company phone number on file.
-#     Use a number that is actually answered: +359 87 771 1888.
+#     Use a number that is actually answered: +359 87 711 8883.
 
 set -euo pipefail
 
@@ -60,7 +60,7 @@ field_sheet() {
     info 'City:                Pazardzhik'
     info 'ZIP:                 4400'
     info 'Country:             Bulgaria'
-    info 'Phone:               +359877711888'
+    info 'Phone:               +359877118883'
     info 'Registration (UIC):  205174895        (Bulgarian commercial register)'
     info 'VAT:                 BG205174895'
     info 'Website:             https://roomler.ai'
