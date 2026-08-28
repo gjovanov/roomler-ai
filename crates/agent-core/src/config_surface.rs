@@ -500,6 +500,11 @@ const KEYS: &[(&str, &str, &str)] = &[
         "Relay IDR thrift (2026-08-27, FR-10). Default ON: constrained (relay) sessions suppress the idle-settle keyframe (a quality refresh, not a correctness need on a reliable DataChannel - the request-driven resync stays) and space deferred bitrate re-opens to >=15s unless the move is >=40%. Each such IDR was a single ~300 KB frame = 1.2-1.5s of a ~2 Mbps relay (the CORPLAP-3 bulky lumps). false = previous relay behaviour. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_IDR_THRIFT. Restart required.",
     ),
     (
+        "send_stall_ms",
+        "number",
+        "Blocked-send congestion threshold in ms (2026-08-28, FR-15 P2 follow-up). Default 250; 0 disables. A frame that sat longer than this inside the DataChannel send call is unambiguous congestion - the pipe refused to drain - and the pump feeds the AIMD a congestion sample. This is the one congestion signal that needs NO clock sync and NO viewer and works on both transports, which matters on a relay where the measured-rate clamp is direct-only and the age loop rides a probe the congestion itself biases. Acted on for CONSTRAINED sessions only; direct keeps the measured ceiling. Env: ROOMLER_NODE_SEND_STALL_MS. Restart required.",
+    ),
+    (
         "relay_age_feedback",
         "tribool",
         "Relay age feedback (2026-08-27, FR-15). Default ON: the viewer reports the true paint AGE of the frames it showed (the FR-1 P7 clock probe) on its rc:decodestat window; the agent learns the session's age FLOOR and treats sustained excess (>=70ms over floor for 2 consecutive windows) on a CONSTRAINED transport as over-rate - capping send-fps and feeding the AIMD a congestion sample, so the decrease lands through the normal (FR-10-deferred) apply path. It exists because a relay backlog sits BELOW every agent counter: the field measured 1000ms of viewer age against a 26KB agent queue. false = open-loop 0.4.7 relay posture. Direct sessions unaffected. Env: ROOMLER_NODE_RELAY_AGE_FEEDBACK. Restart required.",
@@ -718,6 +723,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "fps_pace" => cfg.fps_pace.map(fmt_bool),
         "relay_idr_thrift" => cfg.relay_idr_thrift.map(fmt_bool),
         "relay_age_feedback" => cfg.relay_age_feedback.map(fmt_bool),
+        "send_stall_ms" => cfg.send_stall_ms.map(|v| v.to_string()),
         "priority_res_cap" => cfg.priority_res_cap.map(fmt_bool),
         "smoother_rate_pct" => cfg.smoother_rate_pct.map(|p| p.to_string()),
         "balanced_rate_pct" => cfg.balanced_rate_pct.map(|p| p.to_string()),
@@ -1074,6 +1080,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "fps_pace" => cfg.fps_pace = parse_tribool(value)?,
         "relay_idr_thrift" => cfg.relay_idr_thrift = parse_tribool(value)?,
         "relay_age_feedback" => cfg.relay_age_feedback = parse_tribool(value)?,
+        "send_stall_ms" => cfg.send_stall_ms = parse_u32_range(key, value, 0, 10_000)?,
         "priority_res_cap" => cfg.priority_res_cap = parse_tribool(value)?,
         "smoother_rate_pct" => cfg.smoother_rate_pct = parse_u32_range(key, value, 30, 100)?,
         "balanced_rate_pct" => cfg.balanced_rate_pct = parse_u32_range(key, value, 30, 100)?,

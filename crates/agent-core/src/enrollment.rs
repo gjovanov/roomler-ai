@@ -174,6 +174,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         fps_pace: None,
         relay_idr_thrift: None,
         relay_age_feedback: None,
+        send_stall_ms: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
