@@ -2945,7 +2945,7 @@ mod tests {
         // `rc:goodbye` frame, the old agent's `serde_json::from_str`
         // returns `Err` and the existing `Err(e) => debug!(…,
         // "ignoring non-rc:* frame")` arm at
-        // `agents/roomler-agent/src/signaling.rs:333` swallows it
+        // `agents/roomlerd/src/signaling.rs:333` swallows it
         // silently — no panic, no fatal exit.
         //
         // We simulate the rc.52 ServerMsg shape via a stripped local
