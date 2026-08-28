@@ -12,6 +12,17 @@ export type ConsentMode = 'auto' | 'prompt' | 'email' | 'push' | 'prompt_then_em
 
 export interface AccessPolicy {
   consent_mode: ConsentMode | null
+  /** FR-27 — apply `consent_mode` to the device's OWNER too.
+   *
+   *  `null`/`false` (the default) keeps the historical shortcut: controlling
+   *  your own device auto-consents, because unattended access to your own
+   *  headless boxes is the common case.
+   *
+   *  That shortcut is applied server-side BEFORE the policy is read, which is
+   *  why the consent picker appeared to do nothing on a fleet where one person
+   *  owns every device. Turning this on makes the mode authoritative for the
+   *  owner as well. */
+  prompt_owner?: boolean | null
   allowed_role_ids: string[]
   allowed_user_ids: string[]
   auto_terminate_idle_minutes: number | null

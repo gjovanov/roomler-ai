@@ -690,7 +690,7 @@ pub fn cmd_default_device_name() -> String {
         .unwrap_or_else(|_| "my-device".to_string())
 }
 
-/// Spawn `roomler-agent self-update --check-only` and parse the
+/// Spawn `roomlerd self-update --check-only` and parse the
 /// stdout — looks for the "Update available" sentinel line and
 /// extracts the version pair.
 #[tauri::command]
@@ -714,16 +714,41 @@ pub fn cmd_check_update() -> Result<String, String> {
 /// surfaces UAC (Feature 1 from the rc.18 plan). The agent exits
 /// after spawning msiexec so subsequent status polls show "service
 /// not running" briefly while the installer runs.
+///
+/// FR-27 — returns what the daemon said, instead of nothing.
+///
+/// On Windows the daemon spawns msiexec and exits, so there is nothing to wait
+/// for and the detached spawn is right. Everywhere else the command RETURNS,
+/// and on macOS what it returns is the part that matters: a non-root
+/// invocation queues the root update helper (`com.roomler.update`) and prints
+/// where to watch. Discarding that left the button looking like it had done
+/// nothing — on the one platform where it had in fact done the right thing.
 #[tauri::command]
-pub fn cmd_apply_update() -> Result<(), String> {
+pub fn cmd_apply_update() -> Result<String, String> {
     let exe = agent_exe_path()?;
-    // Detached spawn — agent does its own self-update + exits; we
-    // don't want to block the tray's event loop.
-    no_window_command(&exe)
-        .arg("self-update")
-        .spawn()
-        .map_err(|e| format!("Spawning self-update: {e}"))?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        // Detached — the daemon hands off to msiexec and exits; blocking the
+        // tray's event loop on that would freeze the UI mid-install.
+        no_window_command(&exe)
+            .arg("self-update")
+            .spawn()
+            .map_err(|e| format!("Spawning self-update: {e}"))?;
+        Ok("Update started. The device service will restart when it finishes.".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let out = no_window_command(&exe)
+            .arg("self-update")
+            .output()
+            .map_err(|e| format!("Spawning self-update ({}): {e}", exe.display()))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(if stderr.is_empty() { stdout } else { stderr });
+        }
+        Ok(stdout)
+    }
 }
 
 /// Register the agent for auto-start via either Scheduled Task
@@ -1092,8 +1117,10 @@ fn agent_exe_path() -> Result<PathBuf, String> {
     } else {
         ("roomlerd", "roomler-agent")
     };
-    // Prefer same dir as the tray (production layout): new name first, then
-    // the legacy alias so a mixed install still resolves.
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    // Prefer same dir as the tray (the Windows / MSI layout): new name first,
+    // then the legacy alias so a mixed install still resolves.
     if let Ok(tray_exe) = std::env::current_exe()
         && let Some(dir) = tray_exe.parent()
     {
@@ -1102,11 +1129,71 @@ fn agent_exe_path() -> Result<PathBuf, String> {
             if candidate.exists() {
                 return Ok(candidate);
             }
+            tried.push(candidate);
         }
     }
-    // Fall back to the bare new name — relies on PATH (dev runs / Linux
-    // installs that put roomlerd in /usr/bin).
-    Ok(PathBuf::from(new_name))
+
+    // FR-27 — the INSTALLED locations, which on macOS and Linux are nowhere
+    // near this app.
+    //
+    // The sibling probe above is a Windows assumption. The macOS .pkg puts the
+    // companion in `/Applications/Roomler.app/Contents/MacOS/` and the daemon
+    // in `/Library/Roomler/…` with a `/usr/local/bin/roomlerd` symlink, so the
+    // probe always missed — and the PATH fallback missed too, because a
+    // LaunchAgent inherits launchd's minimal PATH (`/usr/bin:/bin:/usr/sbin:
+    // /sbin`), which does NOT include `/usr/local/bin`. That is the whole of
+    // the reported `Spawning self-update: No such file or directory (os error
+    // 2)`, and with it went service status, apply-update, service
+    // install/uninstall and the log-dir probe — i.e. most of the app on macOS.
+    for candidate in installed_daemon_candidates() {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        tried.push(candidate);
+    }
+
+    // Last resort: the bare name on PATH (dev runs; a distro install that put
+    // roomlerd somewhere we don't know about). Only reachable when nothing
+    // above existed, so name what we looked at — a bare "not found" from the
+    // spawn is what made this take so long to see.
+    let bare = PathBuf::from(new_name);
+    tracing::warn!(
+        tried = ?tried,
+        "no installed roomlerd found at any known path — falling back to {new_name} on PATH"
+    );
+    Ok(bare)
+}
+
+/// Where a packaged daemon lives on each platform. Ordered most- to
+/// least-specific; every entry is a real path from `release-agent.yml` or the
+/// .deb layout, not a guess.
+fn installed_daemon_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            // The pkg's symlink into the bundle. Preferred: every launchd
+            // plist and TCC grant keys on the bundle path it points at.
+            PathBuf::from("/usr/local/bin/roomlerd"),
+            // The bundle itself, if the symlink is missing. The .app name is
+            // FROZEN — it keys the macOS TCC grants (FR-21 D5).
+            PathBuf::from("/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent"),
+        ]
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // The .deb installs to /usr/bin; a tarball install lands in
+        // /usr/local/bin.
+        vec![
+            PathBuf::from("/usr/bin/roomlerd"),
+            PathBuf::from("/usr/local/bin/roomlerd"),
+        ]
+    }
+    #[cfg(windows)]
+    {
+        // Windows genuinely ships them side by side, so the sibling probe
+        // above is the whole answer; PATH remains the dev fallback.
+        Vec::new()
+    }
 }
 
 fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {

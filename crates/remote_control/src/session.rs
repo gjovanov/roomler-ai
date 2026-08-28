@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::consent::ConsentSlot;
 use crate::error::{Error, Result};
-use crate::models::{EndReason, SessionPhase, SessionStats};
+use crate::models::{ConsentMode, EndReason, SessionPhase, SessionStats};
 use crate::permissions::Permissions;
 use crate::signaling::{LocalRelayDescriptor, ServerMsg};
 
@@ -31,6 +31,16 @@ pub struct LiveSession {
 
     /// One-shot consent slot, taken when the agent replies.
     pub consent_slot: Option<ConsentSlot>,
+
+    /// FR-27 — the consent mode this session was created under.
+    ///
+    /// Needed at DELIVERY time, not just at request time: under
+    /// `prompt_then_email` a host-side timeout must NOT resolve the slot,
+    /// because the owner's emailed link is still live and is the whole point of
+    /// the mode. Without the mode here, `deliver_consent` cannot tell that case
+    /// from an ordinary attended timeout, and would end the session the moment
+    /// the on-host modal closed.
+    pub consent_mode: ConsentMode,
 
     /// Watchers (view-only). user_id → tx
     pub watchers: HashMap<ObjectId, ClientTx>,
@@ -90,6 +100,9 @@ impl LiveSession {
             started_at: None,
             stats: SessionStats::default(),
             consent_slot: Some(slot),
+            // `create_session` overwrites this with the resolved directive.
+            // The attended default is the safe one to be wrong in.
+            consent_mode: ConsentMode::Prompt,
             watchers: HashMap::new(),
             controller_tx: Some(controller_tx),
             local_relay: None,

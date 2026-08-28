@@ -514,6 +514,25 @@ textarea {
   font-size: 13px;
 }
 
+/* FR-27 - the command an `exec` prompt would run, or what an SSH session
+   wants. Boxed and wrapping rather than truncated: this is the line the
+   decision actually rests on, and a command clipped at the card edge is one
+   an operator would approve without having read. Capped so a long one
+   scrolls instead of pushing the buttons off-screen. */
+.consent-detail {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.14));
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.08);
+  font-size: 12px;
+  line-height: 1.45;
+  max-height: 8.5em;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .consent-actions {
   display: flex;
   justify-content: flex-end;
