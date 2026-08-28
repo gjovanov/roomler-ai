@@ -4297,6 +4297,12 @@ async fn media_pump_ffmpeg_dc(
     let send_wait_us_sum = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_wait_us_max = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let send_wait_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The longest blocked send the task has seen since the pump last
+    // looked, µs. A separate cell from the heartbeat's max because this
+    // one is a CONTROL input drained every loop, while that one is a
+    // report drained every 2 s — sharing it would make the rate loop's
+    // reaction depend on the logging cadence.
+    let send_stall_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // The direct byte gate's reference rate: the last policy ceiling (the
     // AIMD's applied target takes over once it exists). One-shot log the
     // first time the direct gate actually sheds, so a field read can tell
@@ -4311,6 +4317,9 @@ async fn media_pump_ffmpeg_dc(
     // applies on constrained sessions (each such IDR was a 1.2-1.5 s lump
     // on CORPLAP-3's ~2 Mbps relay).
     let relay_idr_thrift = crate::encode::relay_idr_thrift_enabled();
+    // Resolved once: a per-frame env read would sit in the hot path.
+    let send_stall_threshold = crate::encode::send_stall_threshold();
+    let mut send_stalls: u64 = 0;
     let mut last_deferred_apply_at: Option<std::time::Instant> = None;
     let mut settle_kf_suppressed: u64 = 0;
 
@@ -4385,6 +4394,7 @@ async fn media_pump_ffmpeg_dc(
         let send_wait_us_sum = send_wait_us_sum.clone();
         let send_wait_us_max = send_wait_us_max.clone();
         let send_wait_frames = send_wait_frames.clone();
+        let send_stall_us = send_stall_us.clone();
         let task_session = session_id;
         let goodput_sink = governor.goodput_sink();
         tokio::spawn(async move {
@@ -4443,6 +4453,7 @@ async fn media_pump_ffmpeg_dc(
                             send_wait_us_sum.fetch_add(waited_us, Relaxed);
                             send_wait_us_max.fetch_max(waited_us, Relaxed);
                             send_wait_frames.fetch_add(1, Relaxed);
+                            send_stall_us.fetch_max(waited_us, Relaxed);
                         }
                     }
                     // Byte-budget ledger: the frame left the queue (delivered
@@ -5284,6 +5295,25 @@ async fn media_pump_ffmpeg_dc(
             continue;
         };
 
+        // A frame that sat inside the DataChannel send call longer than the
+        // threshold is unambiguous congestion — the pipe refused to drain.
+        // It needs no clock sync and no viewer, so it is the one signal that
+        // works on a relay, where the goodput clamp is switched off and the
+        // age loop depends on a probe the congestion itself biases.
+        //
+        // Constrained only: on direct the measured ceiling already owns this,
+        // and a stall there is the FR-14 episodic case, which wants a
+        // different response. Feeding the SAMPLE rather than taking the move
+        // lets `pre_encode_tick` below apply it through the normal arms one
+        // frame later.
+        if let Some(threshold) = send_stall_threshold {
+            let stalled_us = send_stall_us.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if constrained && stalled_us >= threshold.as_micros() as u64 {
+                send_stalls += 1;
+                governor.note_send_stall(std::time::Instant::now());
+            }
+        }
+
         // Phase B — drive the AIMD off send-channel occupancy (the real DC
         // backpressure signal) each frame. Ceiling = the per-resolution,
         // relay-aware maxrate cap; the controller starts there and tracks the
@@ -5751,6 +5781,7 @@ async fn media_pump_ffmpeg_dc(
                 frames_skipped_backpressure, frames_empty, settle_kf_suppressed,
                 avg_capture_ms, avg_scale_ms, avg_encode_ms, avg_send_ms,
                 send_wait_avg_ms, send_wait_max_ms,
+                send_stalls,
                 paced_fps = ?governor.paced_fps(),
                 encode_factor = governor.encode_factor(),
                 avg_qp = ?avg_qp,
