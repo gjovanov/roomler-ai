@@ -134,7 +134,7 @@ where
         // Skip our own uploader's failure logs to avoid feedback loops
         // ("upload failed" → another event → "upload failed" → ...).
         // Target prefix matches this module's tracing::span! site.
-        if target == "roomler_agent::logs_upload" {
+        if target == "roomlerd::logs_upload" {
             return;
         }
 
@@ -240,7 +240,7 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
         Err(e) => {
             // Without a client we can't upload anything. Drain the
             // channel forever so the layer doesn't backpressure.
-            tracing::warn!(target: "roomler_agent::logs_upload", %e, "reqwest client build failed; logs upload disabled");
+            tracing::warn!(target: "roomlerd::logs_upload", %e, "reqwest client build failed; logs upload disabled");
             while rx.recv().await.is_some() {}
             return;
         }
@@ -311,7 +311,7 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
                 // WARN lets us spot persistent malformed batches without
                 // a tight retry loop.
                 let status = resp.status();
-                tracing::warn!(target: "roomler_agent::logs_upload", %status, "logs upload non-success");
+                tracing::warn!(target: "roomlerd::logs_upload", %status, "logs upload non-success");
                 tokio::time::sleep(std::time::Duration::from_secs(
                     backoff_secs.saturating_sub(FLUSH_INTERVAL_SECS),
                 ))
@@ -324,7 +324,7 @@ pub async fn run_uploader(mut rx: mpsc::Receiver<LogLine>, config: UploadConfig)
                 // re-fire on every tick when offline. Suppress to
                 // tracing::debug so the rolling log stays useful but
                 // doesn't flood.
-                tracing::debug!(target: "roomler_agent::logs_upload", %e, "logs upload error");
+                tracing::debug!(target: "roomlerd::logs_upload", %e, "logs upload error");
                 tokio::time::sleep(std::time::Duration::from_secs(
                     backoff_secs.saturating_sub(FLUSH_INTERVAL_SECS),
                 ))

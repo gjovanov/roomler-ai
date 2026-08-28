@@ -144,7 +144,7 @@ So: native agent for the *host*, browser for the *controller*. This is the same 
 ### 4.2 Agent crate layout
 
 ```
-agents/roomler-agent/
+agents/roomlerd/
 ├── Cargo.toml                 # workspace member of the main repo
 ├── src/
 │   ├── main.rs                # tray/CLI entry
@@ -664,7 +664,7 @@ keyframe comes out or the cascade bottoms at `NoopEncoder`.
 
 To reproduce locally:
 
-    cargo build -p roomler-agent --release --features full-hw
+    cargo build -p roomlerd --release --features full-hw
     target\release\roomler-agent.exe encoder-smoke --encoder hardware
 
 With the `full-hw` build, the MF backend code is present but only
@@ -1029,7 +1029,7 @@ P0 cut.
 
 The five P0 phases that made the agent stop dying silently.
 
-**Persistent file logging + panic hook** (`agents/roomler-agent/src/
+**Persistent file logging + panic hook** (`agents/roomlerd/src/
 logging.rs`): daily-rolling appender via `tracing-appender` at the
 platform data-local dir (`%LOCALAPPDATA%\roomler\roomler-agent\
 data\logs\` on Win; `~/.local/share/roomler-agent/logs/` on Linux;
@@ -1042,7 +1042,7 @@ output BEFORE delegating to the previous hook — the sync write
 is the belt-and-braces against the non-blocking appender's worker
 not draining the queue before the OS reaps a panicking process.
 
-**Windows Scheduled Task XML rewrite** (`agents/roomler-agent/src/
+**Windows Scheduled Task XML rewrite** (`agents/roomlerd/src/
 service.rs::render_task_xml`): replaced `schtasks /Create /SC
 ONLOGON ...` with `schtasks /Create /XML <utf-16-le-bom-tempfile>`.
 Schema 1.2 (broadest universally-supported version, Win 7+).
@@ -1062,7 +1062,7 @@ Brings Windows to parity with systemd `Restart=on-failure` (already
 in `packaging/linux/roomler-agent.service`) and macOS launchd
 `KeepAlive` (already in `packaging/macos/com.roomler.agent.plist`).
 
-**Single-instance lock** (`agents/roomler-agent/src/instance_lock.rs`):
+**Single-instance lock** (`agents/roomlerd/src/instance_lock.rs`):
 prevents an interactive `roomler-agent run` from racing the
 Scheduled-Task / systemd-launched copy in the same user session.
 Win: `CreateMutexW` named `Local\RoomlerAgent-<sha-prefix12-of-
@@ -1075,7 +1075,7 @@ after `kill -9`. Only `run` gates on the lock — `enroll`,
 `service install/uninstall`, `caps`, `displays`, `encoder-smoke`,
 `self-update` stay runnable alongside a live agent.
 
-**Internal liveness watchdog** (`agents/roomler-agent/src/watchdog.
+**Internal liveness watchdog** (`agents/roomlerd/src/watchdog.
 rs`): process-singleton via `OnceLock<Arc<Watchdog>>`; pumps tick
 via global `watchdog::tick("name")` free helpers (no parameter
 threading). Per-pump thresholds — signaling: 90s (keepalive cadence
@@ -1092,7 +1092,7 @@ wakes every 30s, force-exits if the async watchdog hasn't bumped
 its `AtomicU64` heartbeat in 60s — catches a fully-deadlocked
 tokio runtime.
 
-**Token revocation grace** (`agents/roomler-agent/src/signaling.rs`):
+**Token revocation grace** (`agents/roomlerd/src/signaling.rs`):
 replaced the `AuthRejected → hard exit` branch with a backoff ladder
 (`auth_backoff_for`): 30s → 60s → 5min → 1h capped. Server-side
 JWT cache flushes during a deploy used to permanently break every
@@ -1111,7 +1111,7 @@ Pure resolver `resolve_check_interval_with(env_value, cfg_value)`
 extracted so tests don't race on process env. Defaults to the
 existing 24 h built-in.
 
-**Post-install watcher** (`agents/roomler-agent/src/post_install.rs`):
+**Post-install watcher** (`agents/roomlerd/src/post_install.rs`):
 new hidden CLI subcommand `roomler-agent post-install-watch
 --installer-pid <pid> --installer-path <path> --expected-version
 <tag>`. Spawned by `updater::spawn_installer_with_watch` as a
@@ -1195,7 +1195,7 @@ so a future "let me bump these back in" diff fails CI.
 
 ### 19.5 MSI auto-registers Scheduled Task (0.1.54)
 
-WiX custom actions in `agents/roomler-agent/wix/main.wxs`:
+WiX custom actions in `agents/roomlerd/wix/main.wxs`:
 
 - `RegisterAutostart`: `FileKey='roomler_agent_exe'
   ExeCommand='service install' Execute='deferred' Impersonate='yes'
@@ -1289,7 +1289,7 @@ dropping the WS. With this in place, "agent online" can be defined as
 `last_seen_at > now − 90 s` (3× cadence tolerance for one missed
 tick).
 
-Agent (`agents/roomler-agent/src/signaling.rs`) adds a 30 s
+Agent (`agents/roomlerd/src/signaling.rs`) adds a 30 s
 `tokio::time::interval` arm to the connect_once `select!`. v1 sends
 `rss_mb=0`, `cpu_pct=0.0` (process-self metrics deferred to a follow-
 up that adds the `sysinfo` crate); `active_sessions = peers.len()`
@@ -1320,7 +1320,7 @@ Optional opt-in alternative to the Scheduled Task auto-start, for
 fleet / unattended deployments. Two milestones landed; M3 + M4 + M5
 are deferred (see §19.8.5).
 
-**M1 — service host skeleton** (`agents/roomler-agent/src/win_service/
+**M1 — service host skeleton** (`agents/roomlerd/src/win_service/
 mod.rs`):
 
   - `install(exe_path)` registers `RoomlerAgentService` with the SCM

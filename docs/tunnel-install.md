@@ -101,11 +101,11 @@ sudo installer -pkg /tmp/roomler-agent.pkg -target /
 In the Roomler admin UI:
 
 1. **Admin → Tenant → Agents**.
-2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomler-agent enroll …` command.
+2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomlerd enroll …` command.
 3. Run that command on `AGENT-CORP` (the enrollment token is single-use, embedded in the command):
 
 ```powershell
-roomler-agent enroll `
+roomlerd enroll `
   --server https://roomler.ai `
   --token <jwt-from-admin-ui> `
   --name "AGENT-CORP"
@@ -114,15 +114,15 @@ roomler-agent enroll `
 4. Start the agent. Either foreground for testing:
 
 ```powershell
-roomler-agent run
+roomlerd run
 ```
 
 …or register as an auto-start service for production:
 
 ```powershell
-roomler-agent service install               # perUser scheduled task
+roomlerd service install               # perUser scheduled task
 # or:
-roomler-agent service install --as-service  # SCM service, runs as LocalSystem (requires the perMachine MSI)
+roomlerd service install --as-service  # SCM service, runs as LocalSystem (requires the perMachine MSI)
 ```
 
 Verify in **Admin → Tenant → Agents** that the row turned green (`status: online`).
@@ -187,11 +187,11 @@ roomler-tunnel --version   # → roomler-tunnel 0.3.0-rc.46
 In the admin UI:
 
 1. **Admin → Tenant → Tunnels**.
-2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomler-tunnel enroll …` command.
+2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomler enroll …` command.
 3. Paste-and-run on `OPERATOR-LAPTOP`:
 
 ```powershell
-roomler-tunnel enroll `
+roomler enroll `
   --server https://roomler.ai `
   --token <jwt-from-admin-ui> `
   --name "Operator laptop"
@@ -372,9 +372,9 @@ If you want to validate the wire end-to-end before involving the corp network:
 # Shell 1 — start a TCP listener on the local machine
 python -m http.server 9999
 # Shell 2 — agent (already installed + enrolled per §2)
-roomler-agent run
+roomlerd run
 # Shell 3 — tunnel-client (already installed + enrolled per §4)
-roomler-tunnel forward --agent <same-machine agent hex> --local 8000 --remote 127.0.0.1:9999
+roomler forward --agent <same-machine agent hex> --local 8000 --remote 127.0.0.1:9999
 # Shell 4 — test
 curl.exe http://127.0.0.1:8000/
 ```

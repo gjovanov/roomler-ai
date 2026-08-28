@@ -113,10 +113,10 @@ flowchart BT
     derprelay["crates/derp-relay<br/>standalone DERP PoP"]
     setupcore["crates/roomler-setup-core<br/>installer mechanics"]
 
-    roomlerd["agents/roomler-agent → roomlerd<br/>the daemon"]
+    roomlerd["agents/roomlerd → roomlerd<br/>the daemon"]
     tunnel["agents/roomler-tunnel → roomler<br/>tunnel CLI (surface lives in its lib)"]
     shim["agents/roomler-cli-shim<br/>roomler.exe on daemon hosts → re-execs roomlerd cli"]
-    tray["agents/roomler-agent-tray → roomler-desktop"]
+    tray["agents/roomler-desktop → roomler-desktop"]
     setup["agents/roomler-setup<br/>install wizard (Tauri)"]
 
     db --> config
