@@ -92,7 +92,10 @@ describe('FR-22 connect timing recorder', () => {
     // distinguishes a half-open agent WS from a cross-pod split.
     const t: RcConnectTiming = {
       attempt: 2,
-      marks: { request_sent: 0, session_created: 35, ready: 50, offer_sent: 55 },
+      marks: {
+        ws_ready: 0, turn_ready: 0, probes_ready: 0,
+        request_sent: 0, session_created: 35, ready: 50, offer_sent: 55,
+      },
     }
     const line = formatConnectTiming(t)
     expect(line).toContain('attempt 2 INCOMPLETE (stalled waiting for answer)')
@@ -184,6 +187,7 @@ describe('FR-22 operator-facing connect verdict', () => {
 
   it('leads with the stalled step on an abandoned attempt', () => {
     const v = describeConnectTiming(marks({
+      ws_ready: 0, turn_ready: 0, probes_ready: 0,
       request_sent: 0, session_created: 35, ready: 50, offer_sent: 55,
     }))
     expect(v.notable).toBe(true)
@@ -210,5 +214,50 @@ describe('FR-22 stall-warning throttle', () => {
     // allows, so the gap must exceed that or a flap storm produces one
     // snackbar per abandonment.
     expect(STALL_SNACK_MIN_GAP_MS).toBeGreaterThan(RC_REQUEST_TIMEOUT_MS)
+  })
+})
+
+describe('FR-22 pre-flight is inside the measured window', () => {
+  it('names a slow signalling-socket pre-flight as the dominant wait', () => {
+    // The reproduced miss: the connect spent its wait re-keying and
+    // redialling the WS, which happens BEFORE `rc:session.request`. With
+    // the clock starting at the request, TTFF read small, the verdict
+    // said "normal", and no snackbar appeared while the operator waited.
+    const v = describeConnectTiming({
+      attempt: 1,
+      marks: {
+        ws_ready: 8000, turn_ready: 8100, probes_ready: 8150,
+        request_sent: 8160, session_created: 8200, ready: 8220,
+        offer_sent: 8230, answer: 8400, pc_connected: 9000,
+        dc_open: 9200, first_frame: 10500,
+      },
+    })
+    expect(v.notable).toBe(true)
+    expect(v.text).toContain('connecting to the signalling server')
+    expect(v.text).toContain('8.0 s')
+  })
+
+  it('counts the pre-flight toward the total, not just the tail', () => {
+    // A connect whose post-request half is fast is still a slow connect
+    // if the operator waited 9 s to get there.
+    const v = describeConnectTiming({
+      attempt: 1,
+      marks: {
+        ws_ready: 200, turn_ready: 9000, probes_ready: 9100,
+        request_sent: 9110, first_frame: 11000,
+      },
+    })
+    expect(v.notable).toBe(true)
+    expect(v.text).toContain('11.0 s')
+    expect(v.text).toContain('fetching relay credentials')
+  })
+
+  it('reports a stall in the pre-flight rather than blaming the device', () => {
+    // Before this, an attempt abandoned during the pre-flight had NO
+    // marks at all, so the first missing one was `request_sent` and the
+    // message pointed at the wrong half of the system.
+    const v = describeConnectTiming({ attempt: 1, marks: {} })
+    expect(v.text).toContain('connecting to the signalling server')
+    expect(v.text).toContain('stalled at ws_ready')
   })
 })
