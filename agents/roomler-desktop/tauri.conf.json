@@ -8,6 +8,7 @@
   },
   "app": {
     "trayIcon": {
+      "id": "roomler",
       "iconPath": "icons/tray.png",
       "iconAsTemplate": true
     },
