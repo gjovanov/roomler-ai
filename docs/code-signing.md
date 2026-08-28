@@ -331,7 +331,7 @@ name in the UAC prompt and another in Add/Remove Programs. Current sweep
 (all `G ROX LTD`):
 
 - `agents/roomlerd/wix/main.wxs` + `wix-perMachine/main.wxs` — `Manufacturer` (2× each)
-- `agents/roomlerd/build.rs` + `agents/roomler-tunnel/build.rs` — `CompanyName`, `LegalCopyright`
+- `agents/roomlerd/build.rs` + `agents/roomler-cli/build.rs` — `CompanyName`, `LegalCopyright`
 - `agents/roomler-desktop/tauri.conf.json` + `agents/roomler-setup/tauri.conf.json` — `bundle.publisher`, `bundle.copyright`
 - both `[package.metadata.deb]` blocks — `maintainer`, `copyright`
 
