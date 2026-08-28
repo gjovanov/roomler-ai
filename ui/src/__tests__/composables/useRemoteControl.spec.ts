@@ -98,6 +98,9 @@ import {
   diagHudEnabled,
   remoteCursorCssFor,
   storedSharpenMode,
+  storedMetricToggles,
+  persistMetricToggles,
+  DEFAULT_RC_METRICS,
   storedSharpness,
   HEVC_REXT_CODEC_STRING,
   translateModifierForHost,
@@ -3670,8 +3673,8 @@ describe('P7 — FSR sharpening sizing policy (computeRenderTarget)', () => {
     expect(normalizeSharpenMode('auto')).toBe('auto')
     expect(normalizeSharpenMode('on')).toBe('on')
     expect(normalizeSharpenMode('off')).toBe('off')
-    expect(normalizeSharpenMode('banana')).toBe('auto')
-    expect(normalizeSharpenMode(null)).toBe('auto')
+    expect(normalizeSharpenMode('banana')).toBe('on') // FR-24: default is now ON
+    expect(normalizeSharpenMode(null)).toBe('on')
     expect(normalizeSharpness('0.25')).toBe(0.25)
     expect(normalizeSharpness(1.5)).toBe(1.5)
     expect(normalizeSharpness('9')).toBe(2)
@@ -3705,14 +3708,69 @@ describe('P7 — FSR localStorage knobs', () => {
     localStorage.removeItem('roomler-rc-fsr-sharpness')
   })
 
-  it('storedSharpenMode defaults to auto and honours on/off', () => {
-    expect(storedSharpenMode()).toBe('auto')
+  // FR-24 flipped the default from 'auto' (sharpen only when upscaling) to
+  // 'on' — the viewer is used for text far more than for video.
+  it('storedSharpenMode defaults to ON and honours auto/off', () => {
+    expect(storedSharpenMode()).toBe('on')
     localStorage.setItem('roomler-rc-sharpen', 'off')
     expect(storedSharpenMode()).toBe('off')
-    localStorage.setItem('roomler-rc-sharpen', 'on')
-    expect(storedSharpenMode()).toBe('on')
-    localStorage.setItem('roomler-rc-sharpen', 'banana')
+    localStorage.setItem('roomler-rc-sharpen', 'auto')
     expect(storedSharpenMode()).toBe('auto')
+    localStorage.setItem('roomler-rc-sharpen', 'banana')
+    expect(storedSharpenMode()).toBe('on')
+  })
+
+  // FR-24 — per-pill toolbar toggles.
+  it('storedMetricToggles: everything on except the pipeline HUD', () => {
+    const m = storedMetricToggles()
+    expect(m).toEqual({
+      codec: true,
+      bitrate: true,
+      fps: true,
+      resolution: true,
+      age: true,
+      paint: false,
+    })
+    expect(m).toEqual(DEFAULT_RC_METRICS)
+  })
+
+  it('storedMetricToggles falls back PER KEY, so a stored older shape still works', () => {
+    // Written by a build that only knew three pills: the keys it never
+    // heard of must read as their defaults, not as false.
+    localStorage.setItem(
+      'roomler-rc-metrics',
+      JSON.stringify({ codec: false, bitrate: true, paint: true }),
+    )
+    expect(storedMetricToggles()).toEqual({
+      codec: false,
+      bitrate: true,
+      fps: true,
+      resolution: true,
+      age: true,
+      paint: true,
+    })
+  })
+
+  it('storedMetricToggles survives corrupt or hostile storage', () => {
+    for (const junk of ['{not json', '[]', 'null', '42', '"nope"']) {
+      localStorage.setItem('roomler-rc-metrics', junk)
+      expect(storedMetricToggles()).toEqual(DEFAULT_RC_METRICS)
+    }
+  })
+
+  it('paint inherits the legacy roomler-rc-diag-hud flag exactly once', () => {
+    // Anyone who set the undiscoverable flag by hand keeps their HUD; once
+    // the checkbox is used, the stored object wins.
+    localStorage.setItem('roomler-rc-diag-hud', '1')
+    expect(storedMetricToggles().paint).toBe(true)
+    persistMetricToggles({ ...DEFAULT_RC_METRICS, paint: false })
+    expect(storedMetricToggles().paint).toBe(false)
+  })
+
+  it('persistMetricToggles round-trips through storage', () => {
+    const wanted = { ...DEFAULT_RC_METRICS, fps: false, age: false, paint: true }
+    persistMetricToggles(wanted)
+    expect(storedMetricToggles()).toEqual(wanted)
   })
 
   it('storedSharpness defaults to 0.25 and clamps overrides', () => {
