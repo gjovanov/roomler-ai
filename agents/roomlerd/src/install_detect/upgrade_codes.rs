@@ -1,8 +1,8 @@
 //! Roomler-agent MSI UpgradeCode constants.
 //!
 //! Mirror the values in the WiX sources at
-//! `agents/roomler-agent/wix/main.wxs` (per-user) and
-//! `agents/roomler-agent/wix-perMachine/main.wxs` (per-machine). The
+//! `agents/roomlerd/wix/main.wxs` (per-user) and
+//! `agents/roomlerd/wix-perMachine/main.wxs` (per-machine). The
 //! parity tests below `include_str!` both `.wxs` files and assert the
 //! Rust constants match — if anyone ever edits an UpgradeCode without
 //! updating the constant here (or vice versa), `cargo test --lib`

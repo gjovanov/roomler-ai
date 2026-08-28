@@ -1,6 +1,6 @@
 //! Embeds a Windows VERSIONINFO resource into `roomler.exe`.
 //!
-//! Same rationale as `agents/roomler-agent/build.rs` -- see that file for the
+//! Same rationale as `agents/roomlerd/build.rs` -- see that file for the
 //! full explanation of why this uses `embed-resource`'s per-binary
 //! `compile_for` rather than `winres` / `winresource` (whose
 //! `cargo:rustc-link-lib=dylib=resource` would leak a second RT_VERSION
