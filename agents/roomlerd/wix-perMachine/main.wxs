@@ -182,7 +182,7 @@
                             Name='README.txt'
                             DiskId='1'
                             KeyPath='yes'
-                            Source='agents\roomler-agent\packaging\windows\README.txt' />
+                            Source='agents\roomlerd\packaging\windows\README.txt' />
                     </Component>
 
                     <!-- Phase 3b: Wintun TUN driver DLL for the overlay-l3
