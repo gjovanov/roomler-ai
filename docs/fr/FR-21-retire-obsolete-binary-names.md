@@ -277,7 +277,7 @@ order and it is wrong, because in a rename the docs are only wrong *after* the c
 ```rust
 -#[command(name = "roomlerd", version, about, long_about = None)]   // agents/roomlerd/src/main.rs:39
 +#[command(name = "roomlerd",      version, about, long_about = None)]
--#[command(name = "roomler-tunnel", ...)]                                // agents/roomler-tunnel/src/cli.rs:60
+-#[command(name = "roomler-cli", ...)]                                // agents/roomler-cli/src/cli.rs:60
 +#[command(name = "roomler",        ...)]
 ```
 
@@ -414,7 +414,7 @@ the bundle without a human. The lock already exists on both sides —
 sub-phase **P2b**, landing after P2a (the agent-side packages), so each rename stays separately
 revertible and `release-tunnel.yml` moves in a diff a reviewer can hold in their head.
 Package `roomler-tunnel` → **`roomler-cli`** (lib `roomler_cli`): the emitted bin is already
-`roomler`, and the command surface lives in the lib (`roomler_tunnel::cli`, P3e lever D), so
+`roomler`, and the command surface lives in the lib (`roomler_cli::cli`, P3e lever D), so
 "cli" names what the crate now is — the tunnel client is one of the things it drives, not the
 whole of it.
 

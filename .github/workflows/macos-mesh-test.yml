@@ -59,7 +59,7 @@ jobs:
         # ROOT daemon, which is the thing the system socket exists for.
         run: |
           cargo build -p roomlerd --release --features overlay-l3
-          cargo build -p roomler-tunnel --release
+          cargo build -p roomler-cli --release
 
       - name: Enroll
         id: enroll

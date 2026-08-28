@@ -675,7 +675,7 @@ Verified against `origin/master`, 2026-08-28.
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:716-717` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
 | Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:133` |
-| CLI surfaces | `agents/roomler-tunnel/src/localclient.rs:1028` (`relay_qualified_label`), `:252` (`print_why`), `:141` (`netcheck`) |
+| CLI surfaces | `agents/roomler-cli/src/localclient.rs:1028` (`relay_qualified_label`), `:252` (`print_why`), `:141` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:34-38`: field on `AgentConfig`; `const KEYS` entry
@@ -1043,7 +1043,7 @@ property to test (E2E-2, E2E-4), not to assert.
   Geneve's 8 bytes is +4 over TURN's ChannelData and costs nothing against DERP (WS over
   TCP). Re-check only if the overlay MTU is ever raised. ⚠️ And do **not** cite
   `roomler diagnose` as the path-MTU instrument — it is
-  `bail!("T3: diagnose not yet wired")` (`agents/roomler-tunnel/src/cli.rs:587`); only its
+  `bail!("T3: diagnose not yet wired")` (`agents/roomler-cli/src/cli.rs:587`); only its
   doc comment describes the probe.
 
 ---
