@@ -1,7 +1,14 @@
-# FR-24 — Remote-desktop viewer: display name, quality-metric toggles, FSR default, settings reorg
+# FR-26 — Remote-desktop viewer: display name, quality-metric toggles, FSR default, settings reorg
 
 **Issue:** [#840](https://github.com/gjovanov/roomler-ai/issues/840)
-**Status:** implemented — awaiting field verification on prod
+**Status:** shipped in #845, live on prod — awaiting the operator's own read
+
+> **Renumbered from FR-24.** #838 (licensing split) claimed FR-24 in the same
+> hours from a parallel session, and its ledger row lived on an unmerged branch
+> while this one merged first — so the table could not arbitrate. Repaired by
+> the standing rule: the **lower issue id keeps the number**, so #838 keeps
+> FR-24 and this one moved to the next free N. FR-25 is #839, hence FR-26.
+> Numbers already settled stay settled.
 
 ## Goal
 
@@ -90,4 +97,12 @@ sections except the new Metrics pane; FSR stays in **Display**, where it belongs
 
 ## Field-verification log
 
-- (pending prod deploy)
+- **2026-08-28 — deployed and verified in the shipped bundle.** Prod
+  `v20260828-f98ca7c0b356`, `/health` 200. The live `RemoteControl` chunk
+  (`RemoteControl-AWwCL_GH.js`, reached from the current `index-peS0x4jI.js`)
+  carries `roomler-rc-metrics`, `roomler-rc-sharpen` and `display_name` — i.e.
+  all four items are in the code the browser actually runs, not merely on
+  master. ⚠️ This is a **deployment** check, not a field result: it proves the
+  build reached prod, and says nothing about whether a renamed device reads
+  correctly or a checkbox survives a reload. Those three remain open below and
+  need a real session.
