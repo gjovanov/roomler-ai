@@ -8,7 +8,7 @@
 //! Scope: the agent exits after spawning the installer so the installer
 //! can overwrite the binary without `ERROR_SHARING_VIOLATION`. The
 //! Scheduled Task / systemd unit / LaunchAgent registered via
-//! `roomler-agent service install` re-launches the new version on
+//! `roomlerd service install` re-launches the new version on
 //! the next login (Windows) or immediately (Restart=on-failure on
 //! Linux, KeepAlive on macOS).
 //!
@@ -993,7 +993,7 @@ pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
 
 /// Spawn the installer for `installer_path` AND, when an
 /// `expected_version` tag is provided, spawn a sibling
-/// `roomler-agent post-install-watch` process that captures the
+/// `roomlerd post-install-watch` process that captures the
 /// installer's exit code + verifies the new binary's `--version`.
 ///
 /// The watcher must be spawned *before* this function returns so the
@@ -1145,7 +1145,7 @@ pub fn spawn_installer_inner(installer_path: &std::path::Path) -> Result<u32> {
 /// `ENABLE_SYSTEM_CONTEXT` property defaults to `'0'` and the
 /// CA is conditioned on `ENABLE_SYSTEM_CONTEXT="0" AND NOT
 /// (REMOVE="ALL")` (see `wix-perMachine/main.wxs:344-346`).
-/// The CA runs `roomler-agent disable-system-context` which
+/// The CA runs `roomlerd disable-system-context` which
 /// strips `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` from the SCM
 /// Environment block and restarts the service. After auto-update
 /// the supervisor sees env-var-off, doesn't perform the M3 A1
@@ -2191,7 +2191,7 @@ async fn macos_forward_triggers(
     }
 }
 
-/// `roomler-agent update-helper` — the body of `com.roomler.update`.
+/// `roomlerd update-helper` — the body of `com.roomler.update`.
 ///
 /// Root-only, single-shot: consume the wake file, honour the opt-out marker
 /// and the install-storm cooldown, then check → download → verify →
@@ -2209,7 +2209,7 @@ pub async fn run_update_helper() -> anyhow::Result<()> {
         bail!(
             "update-helper must run as root (launchd system domain); euid={euid}. \
              This subcommand is the body of com.roomler.update — it is not meant \
-             to be run by hand except as `sudo roomler-agent update-helper`."
+             to be run by hand except as `sudo roomlerd update-helper`."
         );
     }
 
@@ -3284,7 +3284,7 @@ mod tests {
         // SCM read error (e.g. service masked or missing): fall back to
         // pre-rc.56 behaviour rather than blocking the auto-update.
         // Operator can re-enable SystemContext manually via
-        // `roomler-agent enable-system-context` if needed.
+        // `roomlerd enable-system-context` if needed.
         assert_eq!(
             preserve_system_context_property_for(
                 WindowsInstallFlavour::PerMachine,

@@ -15,7 +15,7 @@
 
   Autostart: registered automatically on every install + upgrade via the
   RegisterAutostart custom action below. The action shells out to
-  `roomler-agent service install` which writes a Schema 1.2 Task
+  `roomlerd service install` which writes a Schema 1.2 Task
   Scheduler XML with restart-on-failure + battery-defeat settings (see
   agents/roomlerd/src/service.rs::render_task_xml). Symmetric
   UnregisterAutostart hook runs `service uninstall` before the EXE is
@@ -36,7 +36,7 @@
   CreateService requires admin elevation, which conflicts with the
   perUser install scope. Operators who want the service-mode autostart
   (fleet / pre-logon scenarios) install the MSI normally, then run
-  `roomler-agent service install` with the `as-service` flag from an
+  `roomlerd service install` with the `as-service` flag from an
   elevated shell. A future per-machine MSI flavour can revisit
   auto-registering the SCM service via a deferred non-impersonated
   custom action.

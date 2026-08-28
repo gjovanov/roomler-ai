@@ -1057,8 +1057,8 @@ pub struct AgentConfig {
     /// machine-scoped and shared by every org (the server dedupes per tenant
     /// via the `agents.{tenant_id, machine_id}` unique index).
     ///
-    /// Managed by `roomler-agent enroll` (appends when the enrollment
-    /// resolves to a NEW (server, tenant) pair) and the `roomler-agent org`
+    /// Managed by `roomlerd enroll` (appends when the enrollment
+    /// resolves to a NEW (server, tenant) pair) and the `roomlerd org`
     /// verbs. Deliberately NOT on the S2 config surface — same policy as
     /// `[[tunnel_routes]]`: identity + secrets live behind dedicated verbs.
     ///
@@ -1291,7 +1291,7 @@ impl AgentConfig {
 /// `OrgOverlayMode::Off` until P2's per-org overlay lands.
 pub fn promote_org_to_primary(cfg: &mut AgentConfig, label: &str) -> Result<()> {
     let Some(idx) = cfg.orgs.iter().position(|o| o.label == label) else {
-        anyhow::bail!("no org labelled {label:?} — see `roomler-agent org ls`");
+        anyhow::bail!("no org labelled {label:?} — see `roomlerd org ls`");
     };
     let entry = cfg.orgs.remove(idx);
     let demoted = OrgEntry {

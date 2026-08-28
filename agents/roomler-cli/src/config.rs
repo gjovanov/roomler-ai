@@ -1,7 +1,7 @@
 //! On-disk config for `roomler-tunnel`.
 //!
 //! Mirrors `roomler-agent`'s pattern: TOML file at the platform-specific
-//! per-user config dir, populated by `roomler-tunnel enroll` and read
+//! per-user config dir, populated by `roomler enroll` and read
 //! by `forward` / `run` / `diagnose`. Env vars `ROOMLER_TUNNEL_SERVER`
 //! and `ROOMLER_TUNNEL_TOKEN` override the file when both are set, so
 //! CI / smoke tests don't need to drop a real file.
@@ -63,7 +63,7 @@ pub fn load(path: Option<PathBuf>) -> Result<TunnelConfig> {
     };
     if !resolved.exists() {
         bail!(
-            "tunnel-client config not found at {}. Run `roomler-tunnel enroll --server <url> --token <jwt> --name <label>` first.",
+            "tunnel-client config not found at {}. Run `roomler enroll --server <url> --token <jwt> --name <label>` first.",
             resolved.display()
         );
     }
@@ -73,7 +73,7 @@ pub fn load(path: Option<PathBuf>) -> Result<TunnelConfig> {
         .with_context(|| format!("parsing tunnel config {}", resolved.display()))?;
     if cfg.tunnel_client_token.is_empty() {
         bail!(
-            "tunnel-client config at {} has empty tunnel_client_token. Re-run `roomler-tunnel enroll`.",
+            "tunnel-client config at {} has empty tunnel_client_token. Re-run `roomler enroll`.",
             resolved.display()
         );
     }
@@ -193,6 +193,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nonexistent.toml");
         let err = load(Some(path)).unwrap_err();
-        assert!(err.to_string().contains("roomler-tunnel enroll"));
+        assert!(err.to_string().contains("roomler enroll"));
     }
 }

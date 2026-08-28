@@ -50,7 +50,7 @@
 //!
 //! 1. Updater downloads installer.
 //! 2. Updater spawns msiexec / dpkg / installer(8) as a child.
-//! 3. Updater spawns `roomler-agent post-install-watch
+//! 3. Updater spawns `roomlerd post-install-watch
 //!    --installer-pid <pid> --installer-path <path>
 //!    --expected-version <tag>` — on Windows from a staged COPY of
 //!    the EXE with `--origin-exe <install-dir exe>` appended (see
