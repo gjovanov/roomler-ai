@@ -1,6 +1,6 @@
-//! Cross-platform single-instance lock for `roomler-agent run`.
+//! Cross-platform single-instance lock for `roomlerd run`.
 //!
-//! Prevents an interactive `roomler-agent run` from racing the
+//! Prevents an interactive `roomlerd run` from racing the
 //! Scheduled-Task / systemd-launched copy in the same user session.
 //! Two simultaneous agents would compete for the same agent JWT and
 //! stomp each other every ~25 s as one's keepalive forces the
@@ -8,7 +8,7 @@
 //!
 //! - **Windows**: a pair of per-session named mutexes,
 //!   `Local\Roomler-<sha>` (post-P3D-rename) AND `Local\RoomlerAgent-<sha>`
-//!   (pre-rename). Acquiring both means an OLD `roomler-agent run` and a
+//!   (pre-rename). Acquiring both means an OLD `roomlerd run` and a
 //!   NEW one can't both run during the rename window — either one already
 //!   holding either name blocks the other. The `Local\` namespace scopes
 //!   each mutex to one Terminal Services session, so on a multi-user host

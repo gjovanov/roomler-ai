@@ -43,7 +43,7 @@ pub struct EnrollResult {
     /// into `config.toml` by the caller's `write_config`. NEVER
     /// logged or echoed in error messages.
     pub tunnel_client_token: String,
-    /// Echoed back into config.toml so `roomler-tunnel forward …`
+    /// Echoed back into config.toml so `roomler forward …`
     /// derives the same WS URL on first run.
     pub server_url: String,
     /// Echoed back into config.toml. Server-side `tunnel_clients`
