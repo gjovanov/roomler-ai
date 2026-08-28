@@ -1,7 +1,7 @@
 //! Remote **app selection & launch** for virtual-desktop hosts.
 //!
 //! When a browser controls a headless agent that runs in built-in
-//! virtual-desktop mode (`ROOMLER_AGENT_VIRTUAL_DESKTOP=1` →
+//! virtual-desktop mode (`ROOMLERD_VIRTUAL_DESKTOP=1` →
 //! Xvfb + WM + startup apps, see [`crate::virtual_desktop`]), the
 //! operator has no way to see what's running on that desktop, focus a
 //! specific window, **attach to an existing shell session**, or **start
