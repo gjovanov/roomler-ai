@@ -1044,7 +1044,7 @@ jobs:
           # P4b put the tunnel CLI inside both MSIs so daemon installs subsume
           # it and the MSI stays the ONE updater for the node stack. That is
           # unchanged — what changed (P3e lever D) is HOW: the daemon now owns
-          # the command surface (`roomlerd cli` → roomler_tunnel::cli) and the
+          # the command surface (`roomlerd cli` → roomler_cli::cli) and the
           # MSI carries a ~150 KB shim instead of a second full binary.
           #
           # rc.361 measurements that motivated it: roomler.exe was 22.1 MiB of
