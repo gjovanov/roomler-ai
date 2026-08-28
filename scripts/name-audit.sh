@@ -121,6 +121,17 @@ scan() {
                 # Comment syntaxes across the tree: Rust/TS //, shell/YAML/systemd #,
                 # block-comment continuation *, /*, XML <!--, ini ;.
                 is_comment = (bare ~ /^(\/\/|#|\*|\/\*|<!--|;)/)
+                # An XML/HTML comment spans lines whose continuations start with
+                # ordinary prose, so prefix-matching alone ends the block at the
+                # first wrapped line and the marker stops short of the code it
+                # explains. Track the open comment explicitly instead.
+                if (in_xml_comment) {
+                    is_comment = 1
+                    if (line ~ /-->/) in_xml_comment = 0
+                } else if (line ~ /<!--/ && line !~ /-->/) {
+                    in_xml_comment = 1
+                    is_comment = 1
+                }
 
                 if (is_marker) {
                     # A marker covers its whole (possibly multi-line) comment block plus

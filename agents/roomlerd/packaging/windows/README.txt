@@ -40,7 +40,7 @@ Open PowerShell (no need to run as administrator) and run:
         --name $env:COMPUTERNAME
 
     # 3. Run the agent (foreground — confirm capture + signalling work):
-    $env:RUST_LOG = "roomler_agent=debug,webrtc=info"
+    $env:RUST_LOG = "roomlerd=debug,webrtc=info"
     & $agent run
 
 You should see log lines like:
@@ -195,7 +195,7 @@ The agent writes to stderr. To capture a log file for troubleshooting:
 
     & $agent run 2>&1 | Tee-Object -FilePath "$env:TEMP\roomler-agent.log"
 
-Set `RUST_LOG=roomler_agent=debug,webrtc=debug` for verbose output.
+Set `RUST_LOG=roomlerd=debug,webrtc=debug` for verbose output.
 
 Support
 -------

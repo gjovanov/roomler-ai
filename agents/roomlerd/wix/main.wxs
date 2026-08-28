@@ -104,6 +104,9 @@
                                  still resolves to THIS (the real daemon) file. The
                                  component Id + Guid are unchanged for stable
                                  component identity across upgrade. -->
+                            <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY; five
+                                 CustomActions reference it and upgrades key off it, so it is frozen
+                                 deliberately. docs/fr/FR-21 -->
                             <File
                                 Id='roomler_agent_exe'
                                 Name='roomlerd.exe'
