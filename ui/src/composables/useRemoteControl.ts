@@ -440,6 +440,16 @@ export interface RcControlState {
   mode: 'free' | 'exclusive'
   holder: string | null
   participants: RcParticipant[]
+  /** FR-27 — who is waiting for the exclusive-mode floor, when a request was
+   *  refused because the holder was active. `null` when nothing is pending,
+   *  and always `null` in free mode.
+   *
+   *  Before this the refusal was dropped silently: the holder never learned
+   *  anyone had asked, and the requester saw nothing, so "Request control"
+   *  only appeared to work if you happened to click during the holder's idle
+   *  window. Absent from pre-FR-27 agents, which is indistinguishable from
+   *  "nothing pending" — the correct degradation. */
+  pendingRequest: { session: string; name: string } | null
 }
 
 /** P6 — a ghost cursor: another session's pointer, rebroadcast by the
@@ -565,12 +575,21 @@ export function parseControlInbound(data: unknown): RcControlInbound {
         },
       ]
     })
+    const rawPending = obj.pending_request as Record<string, unknown> | null | undefined
+    const pendingRequest =
+      rawPending && typeof rawPending.session === 'string'
+        ? {
+            session: rawPending.session,
+            name: typeof rawPending.name === 'string' ? rawPending.name : '',
+          }
+        : null
     return {
       kind: 'control_state',
       state: {
         mode: obj.mode === 'exclusive' ? 'exclusive' : 'free',
         holder: typeof obj.holder === 'string' ? obj.holder : null,
         participants,
+        pendingRequest,
       },
     }
   }
@@ -4701,10 +4720,31 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  reply is the next `rc:control.state` broadcast (granted = we become
    *  the holder; an ACTIVE holder keeps it and state shows who). */
   function requestControl() {
+    sendControl({ t: 'rc:control.request' })
+  }
+
+  /** FR-27 — the holder hands the floor to whoever is waiting, without making
+   *  them wait out the idle timer. The agent validates both ends (only the
+   *  current holder may grant, and only to the session that actually asked),
+   *  so a stale click cannot hand control to whoever asked last. */
+  function grantControl(session: string) {
+    sendControl({ t: 'rc:control.grant', session })
+  }
+
+  /** FR-27 — the holder declines, or the requester withdraws. The agent
+   *  accepts it from either, so one verb clears the chip on both toolbars. */
+  function dismissControlRequest() {
+    sendControl({ t: 'rc:control.dismiss' })
+  }
+
+  /** Fire-and-forget on the control DC. No-op while it is closed — every
+   *  caller here is a UI affordance whose reply is the next
+   *  `rc:control.state` broadcast, so a dropped send self-corrects. */
+  function sendControl(msg: Record<string, unknown>) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
-      ch.send(JSON.stringify({ t: 'rc:control.request' }))
+      ch.send(JSON.stringify(msg))
     } catch {
       /* drop */
     }
@@ -9808,6 +9848,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     controlState,
     peerCursors,
     requestControl,
+    grantControl,
+    dismissControlRequest,
     setInputMode,
     /**
      * Name of the input desktop the agent is currently bound to,

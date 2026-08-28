@@ -2908,6 +2908,37 @@ describe('parseControlInbound — rc:video-info native dims (rc.199)', () => {
     }
   })
 
+  it('FR-27: carries a pending floor request, and degrades to null without one', () => {
+    const waiting = parseControlInbound(
+      '{"t":"rc:control.state","mode":"exclusive","holder":"aabbccdd00112233aabbccdd","participants":[],"pending_request":{"session":"ffeeddcc00112233aabbccdd","name":"Ana"}}',
+    )
+    expect(waiting?.kind).toBe('control_state')
+    if (waiting?.kind === 'control_state') {
+      expect(waiting.state.pendingRequest).toEqual({
+        session: 'ffeeddcc00112233aabbccdd',
+        name: 'Ana',
+      })
+    }
+
+    // A pre-FR-27 agent omits the key entirely. That is indistinguishable from
+    // "nothing pending", which is the correct degradation: the whole chip
+    // self-hides rather than rendering an empty one.
+    const older = parseControlInbound(
+      '{"t":"rc:control.state","mode":"exclusive","holder":null,"participants":[]}',
+    )
+    if (older?.kind === 'control_state') expect(older.state.pendingRequest).toBeNull()
+
+    // An explicit null, and a malformed object, must not throw either.
+    for (const raw of [
+      '{"t":"rc:control.state","mode":"free","holder":null,"participants":[],"pending_request":null}',
+      '{"t":"rc:control.state","mode":"free","holder":null,"participants":[],"pending_request":{"name":"no session id"}}',
+    ]) {
+      const p = parseControlInbound(raw)
+      expect(p?.kind).toBe('control_state')
+      if (p?.kind === 'control_state') expect(p.state.pendingRequest).toBeNull()
+    }
+  })
+
   it('defaults native dims to 0 for older agents that omit them (back-compat)', () => {
     const parsed = parseControlInbound(
       '{"t":"rc:video-info","codec":"h265","encoder":"hevc_nvenc","hardware":true,"chroma":"yuv420","transport":"direct"}',
