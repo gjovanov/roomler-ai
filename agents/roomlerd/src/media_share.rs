@@ -36,7 +36,7 @@
 //!
 //! WebRTC-track sessions are excluded by design (mediasoup-style per-track
 //! REMB rate control stays per-session). Escape hatch:
-//! `ROOMLER_AGENT_SHARED_ENCODER=0` (config key `shared_encoder`) restores
+//! `ROOMLERD_SHARED_ENCODER=0` (config key `shared_encoder`) restores
 //! the rc.302 pump-per-session behaviour without a rebuild.
 //!
 //! Everything stateful here is abort-safe: both the owner's [`Pipeline`]
@@ -86,7 +86,7 @@ pub enum PipelineKey {
 }
 
 /// Whether shared pipelines are enabled (default ON;
-/// `ROOMLER_AGENT_SHARED_ENCODER=0` / `false` reverts to pump-per-session).
+/// `ROOMLERD_SHARED_ENCODER=0` / `false` reverts to pump-per-session).
 pub fn sharing_enabled() -> bool {
     !matches!(
         tunnel_core::env::node_env("SHARED_ENCODER").as_deref(),
@@ -1092,7 +1092,7 @@ mod tests {
     /// (Sharper anywhere; Balanced on direct) never block.
     ///
     /// Env hygiene: `idle_refine_applies` consults
-    /// ROOMLER_AGENT_IDLE_REFINE_BALANCED for the Balanced rows — cleared
+    /// ROOMLERD_IDLE_REFINE_BALANCED for the Balanced rows — cleared
     /// up front so the table asserts the DEFAULT (ON since P7c) semantics,
     /// then set to "0" for the blocked-Balanced rows and removed again
     /// before the serial guard drops. (The env flip itself is locked by

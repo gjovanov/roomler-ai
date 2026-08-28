@@ -23,7 +23,7 @@
 //! behaviour change — `to_pixels` still uses the legacy path.
 //!
 //! When the data confirms the hypothesis: a follow-up rc adds a
-//! virtual-screen-aware `to_pixels` behind `ROOMLER_AGENT_VIRTUAL_SCREEN=1`.
+//! virtual-screen-aware `to_pixels` behind `ROOMLERD_VIRTUAL_SCREEN=1`.
 
 #![cfg(target_os = "windows")]
 
@@ -118,7 +118,7 @@ pub fn primary() -> Option<MonitorInfo> {
 ///      sensible input dispatch.
 ///
 /// rc.55 — wired into `enigo_backend::resolve_target_monitor` when the
-/// `ROOMLER_AGENT_VIRTUAL_SCREEN` gate is on. Today's browser only
+/// `ROOMLERD_VIRTUAL_SCREEN` gate is on. Today's browser only
 /// streams the primary monitor and sends `mon=0`, so this collapses to
 /// the primary lookup; the per-index path is future-proofing for when
 /// the agent's video pipeline gains multi-monitor streams.

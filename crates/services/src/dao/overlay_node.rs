@@ -262,7 +262,7 @@ impl OverlayNodeDao {
                         // allocation; its heartbeats re-mirror a fresh one.
                         "warm_relay_endpoint": bson::Bson::Null,
                         // rc.142 — refresh the QUIC capability on each re-join
-                        // (an operator may flip ROOMLER_AGENT_OVERLAY_QUIC).
+                        // (an operator may flip ROOMLERD_OVERLAY_QUIC).
                         "supports_quic": supports_quic,
                         // Phase D — refresh the single-relay capability on each
                         // re-join (an operator may flip OVERLAY_RELAY_SINGLE).

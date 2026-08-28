@@ -99,7 +99,7 @@ use crate::capture::{Damage, DirtyRect};
 use crate::fp16;
 
 /// Phase B — kill switch for the GPU scale-before-readback path.
-/// `ROOMLER_AGENT_GPU_SCALE=0` (config key `gpu_scale`) reverts to the
+/// `ROOMLERD_GPU_SCALE=0` (config key `gpu_scale`) reverts to the
 /// Phase-A CPU resample per session — a field A/B is one env flip.
 fn gpu_scale_enabled() -> bool {
     !matches!(

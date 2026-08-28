@@ -414,11 +414,9 @@ fn worker_main(
     // browser renders either the native OS cursor (via the CSS keyword
     // hint) or the shape bitmap. Baking it in too would double the
     // cursor (baked one lags at video latency behind the low-latency
-    // overlay). Escape hatch: ROOMLER_AGENT_WGC_CURSOR=1 re-bakes it
+    // overlay). Escape hatch: ROOMLERD_WGC_CURSOR=1 re-bakes it
     // without a rebuild if a field regression appears.
-    let bake_cursor = std::env::var("ROOMLER_AGENT_WGC_CURSOR")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let bake_cursor = tunnel_core::env::flag("WGC_CURSOR", false);
     let _ = session.SetIsCursorCaptureEnabled(bake_cursor);
 
     // Size is known now — ack to the constructor so it can return.

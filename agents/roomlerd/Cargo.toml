@@ -433,7 +433,7 @@ full = ["media", "enigo-input", "clipboard", "audio"]
 full-hw = ["full", "mf-encoder", "wgc-capture", "viewer-indicator"]
 # Phase 1 — deterministic synthetic frame source for the headless
 # Linux CI / agent-e2e Pod. Replaces scrap-capture when the runtime
-# env var `ROOMLER_AGENT_SYNTHETIC_FRAMES=1` is set, so a Pod with
+# env var `ROOMLERD_SYNTHETIC_FRAMES=1` is set, so a Pod with
 # no X server / no display can still drive encode + WebRTC end-to-
 # end. Production agents (`full` / `full-hw`) DO NOT compile this in;
 # the agent-e2e Dockerfile selects `--features synthetic-frame-source,
@@ -495,7 +495,7 @@ overlay-l3 = ["roomler-ai-tunnel-core/overlay-l3", "roomler-core/overlay-l3"]
 # real TUN, the node terminates the overlay CIDR in a userspace smoltcp stack
 # and exposes a loopback SOCKS5 front, so a locked-down host (full-tunnel VPN)
 # reaches the mesh with NO OS routing. Opt in per-run with the env var
-# `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>` (see `overlay.rs`). Independent
+# `ROOMLERD_OVERLAY_NETSTACK_SOCKS=<port>` (see `overlay.rs`). Independent
 # of `overlay-l3`; a build may carry either or both (config picks at runtime).
 overlay-netstack = ["roomler-ai-tunnel-core/overlay-netstack", "roomler-core/overlay-netstack"]
 

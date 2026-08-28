@@ -1,6 +1,6 @@
 //! Agent-side `/derp` WebSocket owner (NAT-traversal Phase D, DERP).
 //!
-//! When DERP is enabled (`ROOMLER_NODE_OVERLAY_DERP=1`) the agent opens ONE
+//! When DERP is enabled (`ROOMLERD_OVERLAY_DERP=1`) the agent opens ONE
 //! persistent WSS to the server's `/derp` relay, registers its WG pubkey, and
 //! bridges it to the node's [`DerpMux`]: outbound carrier frames drain to the
 //! socket, inbound frames are demuxed by source pubkey to the right peer's

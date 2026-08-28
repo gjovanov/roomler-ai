@@ -36,7 +36,7 @@ const FRAME_INTERLEAVED: usize = SAMPLES_PER_CH * OUT_CHANNELS;
 const MAX_PACKET: usize = 4000;
 
 /// Default target bitrate (bits/s). Overridable via
-/// `ROOMLER_AGENT_AUDIO_BITRATE_BPS`.
+/// `ROOMLERD_AUDIO_BITRATE_BPS`.
 const DEFAULT_BITRATE_BPS: i32 = 96_000;
 
 pub struct OpusEncoder {
@@ -50,7 +50,7 @@ pub struct OpusEncoder {
 
 impl OpusEncoder {
     /// Build a 48 kHz stereo Opus encoder tuned for general audio.
-    /// Bitrate from `ROOMLER_AGENT_AUDIO_BITRATE_BPS` (default 96000).
+    /// Bitrate from `ROOMLERD_AUDIO_BITRATE_BPS` (default 96000).
     pub fn new() -> Result<Self> {
         let mut enc = OpusCoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio)
             .context("create opus encoder")?;
@@ -112,14 +112,14 @@ fn bitrate_from_env() -> i32 {
             Ok(n) => {
                 tracing::warn!(
                     value = n,
-                    "audio: ROOMLER_AGENT_AUDIO_BITRATE_BPS out of range (6000..=510000) — using default"
+                    "audio: ROOMLERD_AUDIO_BITRATE_BPS out of range (6000..=510000) — using default"
                 );
                 DEFAULT_BITRATE_BPS
             }
             Err(_) => {
                 tracing::warn!(
                     value = %v,
-                    "audio: ROOMLER_AGENT_AUDIO_BITRATE_BPS not an integer — using default"
+                    "audio: ROOMLERD_AUDIO_BITRATE_BPS not an integer — using default"
                 );
                 DEFAULT_BITRATE_BPS
             }

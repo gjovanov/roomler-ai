@@ -94,7 +94,7 @@ privilege ladder (root direct; otherwise `sudo -n`, then `pkexec`).
 4. Same for `/usr/bin/roomler` and each `/usr/lib/roomler-agent/*.so.*`.
 5. **Systemd units: write only if absent.** An update must never clobber a unit
    the operator edited — the field-test host carries a hand-written unit with
-   `ROOMLER_AGENT_VIRTUAL_DESKTOP=1`, and silently reverting that on upgrade
+   `ROOMLERD_VIRTUAL_DESKTOP=1`, and silently reverting that on upgrade
    would be a data-loss-class bug. First install places them; upgrades leave
    them alone.
 6. Exit and let the service manager restart, exactly as the `.deb` path does.

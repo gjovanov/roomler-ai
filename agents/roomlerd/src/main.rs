@@ -131,7 +131,7 @@ enum Command {
         /// `auto` (default — picks HW on Windows, SW elsewhere),
         /// `hardware` (force MF; falls back to SW only on init failure),
         /// `software` (force openh264). Also honours the
-        /// `ROOMLER_AGENT_ENCODER` env var.
+        /// `ROOMLERD_ENCODER` env var.
         #[arg(long)]
         encoder: Option<String>,
     },
@@ -325,7 +325,7 @@ enum Command {
     #[command(hide = true)]
     Netd,
     /// Enable SystemContext mode on a perMachine install. Writes
-    /// `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1` into the `RoomlerAgentService`
+    /// `ROOMLERD_ENABLE_SYSTEM_SWAP=1` into the `RoomlerAgentService`
     /// SCM `Environment` REG_MULTI_SZ block and restarts the service so
     /// the supervisor picks up the new env on its next worker spawn.
     /// Requires admin (HKLM write + SCM Stop/Start). Idempotent: re-runs
@@ -341,7 +341,7 @@ enum Command {
         no_restart: bool,
     },
     /// Disable SystemContext mode on a perMachine install. Removes
-    /// `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP` from the `RoomlerAgentService`
+    /// `ROOMLERD_ENABLE_SYSTEM_SWAP` from the `RoomlerAgentService`
     /// SCM `Environment` block and restarts the service. The supervisor
     /// reverts to the user-context worker on next spawn. Requires admin.
     DisableSystemContext {
@@ -359,12 +359,12 @@ enum Command {
     /// any rc.28+ wizard EXE in the field. Requires admin (HKLM write).
     ///
     /// Typical use:
-    ///   roomlerd set-service-env-var --name ROOMLER_AGENT_VP9_FPS --value 60
+    ///   roomlerd set-service-env-var --name ROOMLERD_VP9_FPS --value 60
     ///   roomlerd restart-service
     #[command(name = "set-service-env-var")]
     SetServiceEnvVar {
-        /// Env var name (e.g. `ROOMLER_AGENT_VP9_FPS`,
-        /// `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP`).
+        /// Env var name (e.g. `ROOMLERD_VP9_FPS`,
+        /// `ROOMLERD_ENABLE_SYSTEM_SWAP`).
         #[arg(long)]
         name: String,
         /// Env var value. Empty string is allowed (stored as
@@ -776,7 +776,7 @@ async fn main() -> Result<()> {
         // can confirm or reject before writing a fix.
         win32_monitors::log_monitor_diagnostic();
 
-        // rc.54 — surface the ROOMLER_AGENT_VIRTUAL_SCREEN gate at
+        // rc.54 — surface the ROOMLERD_VIRTUAL_SCREEN gate at
         // startup so the operator sees which `to_pixels` path is live.
         // The env var is also captured at first call inside the input
         // worker via LazyLock; this line is the canonical "is the
@@ -1093,7 +1093,7 @@ async fn post_install_watch_cmd(
 }
 
 /// Resolution order for `encoder_preference`: CLI flag → env var
-/// `ROOMLER_AGENT_ENCODER` → config file field → default (Auto).
+/// `ROOMLERD_ENCODER` → config file field → default (Auto).
 /// Invalid values fall through to Auto with a warning, so a typo can't
 /// prevent the agent from starting.
 fn rollback_attention_msg(
@@ -1567,7 +1567,7 @@ fn set_org_enabled(cfg: &mut config::AgentConfig, label: &str, enable: bool) -> 
     Ok(())
 }
 
-/// True if virtual-desktop mode was requested (`ROOMLER_AGENT_VIRTUAL_DESKTOP`).
+/// True if virtual-desktop mode was requested (`ROOMLERD_VIRTUAL_DESKTOP`).
 fn virtual_desktop_requested() -> bool {
     node_env("VIRTUAL_DESKTOP")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1578,7 +1578,7 @@ fn virtual_desktop_requested() -> bool {
 /// `DISPLAY`, and — only on a hostile-NAT host with no public IPv4 — auto-enable
 /// relay-over-TCP media (WSL / corp NAT flap the UDP TURN relay otherwise; a
 /// public-IP server uses normal ICE). Returns a handle to keep alive for the
-/// process lifetime. Config comes from env (`ROOMLER_AGENT_VIRTUAL_DESKTOP_*`).
+/// process lifetime. Config comes from env (`ROOMLERD_VIRTUAL_DESKTOP_*`).
 #[cfg(target_os = "linux")]
 fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDesktop>> {
     if !virtual_desktop_requested() {
@@ -1611,7 +1611,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     // forcing TURNS/TCP-only there wastes the direct path AND, against a
     // co-located / dual-public-IP coturn, can strand ICE with no usable
     // candidate ("pingAllCandidates: no candidate pairs"). Either way an operator
-    // overrides with an EXPLICIT `ROOMLER_AGENT_ICE_RELAY_TCP=0|1` (`=1` on a
+    // overrides with an EXPLICIT `ROOMLERD_ICE_RELAY_TCP=0|1` (`=1` on a
     // cloud-NAT VM whose public IP isn't on a local iface; `=0` for WSL
     // mirrored-mode with native UDP).
     let relay_forced = node_env_os("ICE_RELAY_TCP").is_some();
@@ -1938,7 +1938,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // Wire the file-DC v2 `files:dir` browse capability. Default
     // tracks `cfg.enable_remote_browse` (true unless the operator
     // disabled it in config.toml); env var
-    // `ROOMLER_AGENT_DISABLE_BROWSE=1` is an escape hatch for
+    // `ROOMLERD_DISABLE_BROWSE=1` is an escape hatch for
     // emergency in-field disable without a config reload.
     let browse_enabled = cfg.enable_remote_browse
         && !matches!(
@@ -2253,12 +2253,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
 
     // 2026-07-27 — heal GPU clocks a crashed predecessor left pinned: the
     // session-scoped pin resets on Drop, but a SIGKILL'd/crashed agent never
-    // runs Drop. No-op unless `ROOMLER_AGENT_GPU_CLOCK_PIN` is enabled.
+    // runs Drop. No-op unless `ROOMLERD_GPU_CLOCK_PIN` is enabled.
     roomlerd::gpu_clock::reset_stale_pins();
 
     // rc.58 — start the centralized log uploader BEFORE signaling
     // moves cfg out of scope. Default ON; opt out with
-    // `ROOMLER_AGENT_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
+    // `ROOMLERD_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
     let logs_upload_disabled =
         roomlerd::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
     if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
@@ -2278,10 +2278,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         tracing::info!(
             tenant_id = %cfg.tenant_id,
             agent_id = %cfg.agent_id,
-            "logs upload task spawned (default ON; set ROOMLER_AGENT_LOGS_UPLOAD_DISABLED=1 to opt out)"
+            "logs upload task spawned (default ON; set ROOMLERD_LOGS_UPLOAD_DISABLED=1 to opt out)"
         );
     } else if logs_upload_disabled {
-        tracing::info!("logs upload disabled via ROOMLER_AGENT_LOGS_UPLOAD_DISABLED env var");
+        tracing::info!("logs upload disabled via ROOMLERD_LOGS_UPLOAD_DISABLED env var");
     }
 
     // Unification P1 — LocalAPI: expose read-only node / peer / flow state on a
@@ -2487,7 +2487,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     });
 
     // Loopback-TURN corp-relay (Phase 2b): when opted in via
-    // ROOMLER_AGENT_LOCAL_TURN, serve the browser's loopback probe with a
+    // ROOMLERD_LOCAL_TURN, serve the browser's loopback probe with a
     // descriptor for a locally-hosted TURN bound to this host's overlay IP — so
     // a co-located corp-Chrome controller (which can't punch direct) relays
     // through the overlay instead of the capped far coturn. Default-OFF; inert
@@ -2817,11 +2817,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
 
     // Background auto-updater — checks GitHub Releases on startup and
     // every `update_check_interval_h` hours (default 24, configurable
-    // via the AgentConfig field or `ROOMLER_AGENT_UPDATE_INTERVAL_H`
+    // via the AgentConfig field or `ROOMLERD_UPDATE_INTERVAL_H`
     // env var). Writes to `shutdown_tx` when a newer version is
     // downloaded and the installer is spawned, so the signalling task
     // tears down cleanly before the running binary gets overwritten.
-    // Disable entirely with `ROOMLER_AGENT_AUTO_UPDATE=0` for air-
+    // Disable entirely with `ROOMLERD_AUTO_UPDATE=0` for air-
     // gapped / operator-managed deployments.
     let upd_task = if auto_update_enabled {
         tracing::info!(
@@ -2834,7 +2834,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             async move { updater::run_periodic(rx, tx, update_interval, update_trigger_rx).await }
         }))
     } else {
-        tracing::info!("auto-update disabled via ROOMLER_AGENT_AUTO_UPDATE");
+        tracing::info!("auto-update disabled via ROOMLERD_AUTO_UPDATE");
         None
     };
 
@@ -2970,7 +2970,7 @@ fn service_status_as_service() -> Result<()> {
 
 /// Env var the supervisor reads to gate the SystemContext worker swap.
 /// Single source of truth; do NOT inline this string elsewhere — the
-/// supervisor reads it from `std::env::var("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP")`
+/// supervisor reads it via `tunnel_core::env::node_env("ENABLE_SYSTEM_SWAP")`
 /// in `win_service::supervisor::system_swap_enabled()` and any drift
 /// would silently break the gate.
 ///
@@ -2980,7 +2980,7 @@ fn service_status_as_service() -> Result<()> {
 /// match (else CI's `cargo clippy --workspace -- -D warnings` on the
 /// Ubuntu runner errors with "constant is never used").
 #[cfg(target_os = "windows")]
-const SYSTEM_CONTEXT_ENV_VAR: &str = "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP";
+const SYSTEM_CONTEXT_ENV_VAR: &str = "ROOMLERD_ENABLE_SYSTEM_SWAP";
 
 /// Default per-transition timeout for the post-write service restart.
 /// 120 s covers Windows Defender real-time-scan delay on a fresh EXE
@@ -3503,6 +3503,45 @@ mod tests {
     //! hands.
 
     use super::*;
+    /// FR-21 P3 (D1) — the acceptance case taken from the LIVE fleet, not invented.
+    ///
+    /// mars, jupiter and zeus each carry these exact four entries in an
+    /// operator-authored `/etc/systemd/system/roomlerd.service.d/virtual-desktop.conf`,
+    /// which a package upgrade never rewrites. If the prefix migration ever stops
+    /// honouring the original spelling, the daemon starts perfectly and quietly
+    /// ignores every one of them — the virtual desktop simply never comes up.
+    #[test]
+    fn the_live_drop_in_still_configures_the_virtual_desktop() {
+        const KEYS: [&str; 4] = [
+            "ROOMLER_AGENT_VIRTUAL_DESKTOP",
+            "ROOMLER_AGENT_VIRTUAL_DESKTOP_RESOLUTION",
+            "ROOMLER_AGENT_VIRTUAL_DESKTOP_WM",
+            "ROOMLER_AGENT_VIRTUAL_DESKTOP_STARTUP",
+        ];
+        // SAFETY (edition 2024): these four suffixes are touched by no other test.
+        unsafe {
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
+        }
+        assert!(
+            !virtual_desktop_requested(),
+            "unset must not request the virtual desktop"
+        );
+
+        unsafe { std::env::set_var(KEYS[0], "1") };
+        assert!(
+            virtual_desktop_requested(),
+            "the legacy ROOMLER_AGENT_ spelling in the live drop-in MUST still be honoured"
+        );
+
+        // And the current spelling works too, so a migrated host behaves the same.
+        unsafe { std::env::remove_var(KEYS[0]) };
+        unsafe { std::env::set_var("ROOMLERD_VIRTUAL_DESKTOP", "1") };
+        assert!(virtual_desktop_requested());
+        unsafe { std::env::remove_var("ROOMLERD_VIRTUAL_DESKTOP") };
+    }
+
     use clap::Parser;
 
     #[test]
@@ -3539,14 +3578,14 @@ mod tests {
             "roomler-agent",
             "set-service-env-var",
             "--name",
-            "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+            "ROOMLERD_ENABLE_SYSTEM_SWAP",
             "--value",
             "1",
         ])
         .unwrap();
         match cli.command {
             Some(Command::SetServiceEnvVar { name, value }) => {
-                assert_eq!(name, "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP");
+                assert_eq!(name, "ROOMLERD_ENABLE_SYSTEM_SWAP");
                 assert_eq!(value.as_deref(), Some("1"));
             }
             other => panic!("expected SetServiceEnvVar, got {other:?}"),
@@ -3559,12 +3598,12 @@ mod tests {
             "roomler-agent",
             "set-service-env-var",
             "--name",
-            "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+            "ROOMLERD_ENABLE_SYSTEM_SWAP",
         ])
         .unwrap();
         match cli.command {
             Some(Command::SetServiceEnvVar { name, value }) => {
-                assert_eq!(name, "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP");
+                assert_eq!(name, "ROOMLERD_ENABLE_SYSTEM_SWAP");
                 assert!(value.is_none(), "expected None (unset), got {value:?}");
             }
             other => panic!("expected SetServiceEnvVar, got {other:?}"),
@@ -3631,7 +3670,7 @@ mod tests {
             "roomler-agent",
             "set-service-env-var",
             "--name",
-            "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP",
+            "ROOMLERD_ENABLE_SYSTEM_SWAP",
             "--value",
             "1",
         ]);
