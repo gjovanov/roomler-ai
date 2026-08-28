@@ -237,3 +237,5 @@ human answering mail.
 | 2026-08-28 | `cargo check` agent crates (native) / server crates (WSL) | both clean |
 | 2026-08-28 | `ui`: `vue-tsc` + `vite build` + `vitest` | green; 858/858 |
 | 2026-08-28 | `dist/.well-known/security.txt` after build | present |
+| 2026-08-28 | First CI run of `licensing.yml` | manifest audit ✓ · SPDX check ✓ · **AGPL-in-agent graph check ✓** · `cargo deny` ✗ |
+| 2026-08-28 | `cargo deny` failure triaged | two real findings: our own AGPL members were checked as "dependencies", and `tun` 0.8.10 is **WTFPL** (unvetted). The invented `ring` clarify never matched and was removed. |
