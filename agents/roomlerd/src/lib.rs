@@ -71,6 +71,7 @@ pub mod preflight;
 /// the module gates itself, so the `cfg` here would be redundant).
 pub mod pty;
 pub mod rc_local_turn;
+pub mod rc_sessions;
 pub mod relay_probe;
 /// FR-19 P1d — the org-relay reachability responder (process-wide, opt-in).
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]

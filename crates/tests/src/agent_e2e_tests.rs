@@ -76,6 +76,11 @@ fn spawn_agent_signaling(
                 exec_enabled,
                 remote_config_enabled,
             ),
+            // FR-27 — the live remote-control session registry. Tests never
+            // read it back, but the signalling loop registers into it, so a
+            // fresh one per harness is the honest value (not a shared global
+            // that would leak sessions between tests).
+            roomlerd::rc_sessions::RcSessionRegistry::new(),
         )
         .await;
     })
