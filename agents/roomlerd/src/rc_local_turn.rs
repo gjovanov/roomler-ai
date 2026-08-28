@@ -22,7 +22,7 @@
 //! `set-service-env-var` from inside a UDP-blocked corp VPN). Hosting the
 //! TURN + probe is inert infrastructure: nothing uses it until the BROWSER
 //! opts in (`localRelayEnabled`, still default-OFF pending the first real
-//! UDP-blocked field proof). `ROOMLER_AGENT_LOCAL_TURN=0` disables. Compiles
+//! UDP-blocked field proof). `ROOMLERD_LOCAL_TURN=0` disables. Compiles
 //! in the default build; without an overlay IP the probe answers 503 and no
 //! TURN is hosted.
 
@@ -86,12 +86,12 @@ const ALLOWED_ORIGINS: &[&str] = &[
     "http://localhost:5173",
 ];
 
-/// Default-ON (rc.220); `ROOMLER_AGENT_LOCAL_TURN=0` (or `false`/`no`/`off`)
+/// Default-ON (rc.220); `ROOMLERD_LOCAL_TURN=0` (or `false`/`no`/`off`)
 /// disables — the DERP-style escape-hatch convention.
 pub fn enabled() -> bool {
     !matches!(
         // S2: dual-prefix + config-fallback read (was a direct
-        // ROOMLER_AGENT_LOCAL_TURN-only env::var).
+        // ROOMLERD_LOCAL_TURN-only env::var).
         tunnel_core::env::node_env("LOCAL_TURN").as_deref(),
         Some("0" | "false" | "no" | "off")
     )
@@ -100,7 +100,7 @@ pub fn enabled() -> bool {
 /// v2.2 — the loopback CLIPBOARD BRIDGE half (`/rc-clipboard`): lets the
 /// roomler.ai page on THIS machine read/write the machine's NATIVE clipboard
 /// formats (RTF with embedded images) that no browser API exposes. Default-ON;
-/// `ROOMLER_AGENT_CLIPBOARD_BRIDGE=0` disables. Only meaningful on builds with
+/// `ROOMLERD_CLIPBOARD_BRIDGE=0` disables. Only meaningful on builds with
 /// the `clipboard` feature — the routes 404 otherwise.
 ///
 /// Trust model (same as the TURN probe): loopback-only bind + strict
@@ -111,9 +111,7 @@ pub fn enabled() -> bool {
 pub fn bridge_enabled() -> bool {
     cfg!(feature = "clipboard")
         && !matches!(
-            std::env::var("ROOMLER_AGENT_CLIPBOARD_BRIDGE")
-                .ok()
-                .as_deref(),
+            tunnel_core::env::node_env("CLIPBOARD_BRIDGE").as_deref(),
             Some("0" | "false" | "no" | "off")
         )
 }
@@ -229,7 +227,7 @@ async fn serve(
         .unwrap_or(PROBE_PORT);
     info!(
         port = bound_port,
-        "loopback-TURN: probe on 127.0.0.1 (ROOMLER_AGENT_LOCAL_TURN)"
+        "loopback-TURN: probe on 127.0.0.1 (ROOMLERD_LOCAL_TURN)"
     );
 
     // Per-run TURN secret (32 random bytes). The host both mints AND validates

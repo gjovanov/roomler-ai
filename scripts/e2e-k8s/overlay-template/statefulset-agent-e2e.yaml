@@ -58,14 +58,14 @@ spec:
                   name: agent-e2e-bootstrap
                   key: tenant_id
             # Capture cascade short-circuit — see capture/mod.rs:open_default.
-            - name: ROOMLER_AGENT_SYNTHETIC_FRAMES
+            - name: ROOMLERD_SYNTHETIC_FRAMES
               value: "1"
             # Image carries the version we want to test; don't let
             # the auto-updater swap it mid-test.
-            - name: ROOMLER_AGENT_AUTO_UPDATE
+            - name: ROOMLERD_AUTO_UPDATE
               value: "0"
             # AutoGrant consent — no operator-prompt in CI.
-            - name: ROOMLER_AGENT_AUTO_GRANT_SESSION
+            - name: ROOMLERD_AUTO_GRANT_SESSION
               value: "1"
           volumeMounts:
             - name: config

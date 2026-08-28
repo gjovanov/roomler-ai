@@ -56,7 +56,7 @@ mod child {
 
     /// Set in the child's environment. A belt-and-braces recursion guard:
     /// `detect()` in a process carrying this must never spawn again.
-    const CHILD_ENV: &str = "ROOMLER_AGENT_CAPS_CHILD";
+    const CHILD_ENV: &str = "ROOMLERD_CAPS_CHILD";
 
     /// Generous, because a cold GPU driver init on a loaded corp laptop is
     /// genuinely slow (~300 ms per codec, several codecs, plus process
@@ -387,7 +387,7 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
 
     // rc.77 — FFmpeg HEVC over DataChannel.
     //
-    // Gated behind `ROOMLER_AGENT_USE_FFMPEG=1` env var so that an
+    // Gated behind `ROOMLERD_USE_FFMPEG=1` env var so that an
     // accidental FFmpeg dep in the build doesn't change negotiation
     // for existing field sessions. When the env var IS set, probe
     // `FfmpegEncoder::new_hevc` at the standard probe resolution; on
@@ -432,7 +432,7 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
                     // do get GOP 64800 + on-demand-only keys (kills the
                     // residual ~1 Hz natural-key pulse on VP9-over-DC);
                     // hosts that don't keep the rc.219 containment. Escape
-                    // hatch ROOMLER_AGENT_VP9_QSV_IDR_PROBE=0.
+                    // hatch ROOMLERD_VP9_QSV_IDR_PROBE=0.
                     if tunnel_core::env::node_env("VP9_QSV_IDR_PROBE").as_deref() != Some("0") {
                         let t_idr = std::time::Instant::now();
                         if let Some((lp1, lp0)) =
@@ -447,7 +447,7 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
                         }
                     } else {
                         tracing::info!(
-                            "caps probe: vp9_qsv IDR probe disabled (ROOMLER_AGENT_VP9_QSV_IDR_PROBE=0) — keeping GOP-60 containment"
+                            "caps probe: vp9_qsv IDR probe disabled (ROOMLERD_VP9_QSV_IDR_PROBE=0) — keeping GOP-60 containment"
                         );
                     }
                 }
@@ -538,7 +538,7 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
         // WebCodecs decodes description-less). The "h264" codec entry is
         // already pushed by the openh264/MF blocks above — only the
         // transport + hw_encoders entries are new. Escape hatch
-        // ROOMLER_AGENT_DC_H264=0 stops the advertisement without a rebuild
+        // ROOMLERD_DC_H264=0 stops the advertisement without a rebuild
         // (browsers then negotiate the legacy RTP H.264 path).
         if tunnel_core::env::node_env("DC_H264").as_deref() != Some("0") {
             let start_h264 = std::time::Instant::now();
@@ -564,7 +564,7 @@ fn compute_caps(run_hw_probes: bool) -> AgentCaps {
             }
         } else {
             tracing::info!(
-                "caps probe: data-channel-h264 advertisement disabled (ROOMLER_AGENT_DC_H264=0)"
+                "caps probe: data-channel-h264 advertisement disabled (ROOMLERD_DC_H264=0)"
             );
         }
     }
@@ -826,7 +826,7 @@ fn rpc_caps() -> Vec<String> {
 /// Concurrent-INPUT chaos is prevented server-side (one INPUT holder per
 /// agent until the P6 arbitration modes land).
 ///
-/// `ROOMLER_AGENT_RC_MAX_SESSIONS` env > `rc_max_sessions` config key
+/// `ROOMLERD_RC_MAX_SESSIONS` env > `rc_max_sessions` config key
 /// (bridged via the S2 fallback map) > built-in 2.
 pub(crate) fn rc_max_sessions() -> u8 {
     tunnel_core::env::node_env("RC_MAX_SESSIONS")
@@ -897,7 +897,7 @@ fn activates(codec: CodecProbe) -> ProbeResult {
                 tracing::warn!(
                     codec = ?codec,
                     elapsed_ms,
-                    "caps probe: codec activates only on SW — NOT advertising (H.264 HW likely better). Set ROOMLER_AGENT_ALLOW_SW_HEAVY=1 to override."
+                    "caps probe: codec activates only on SW — NOT advertising (H.264 HW likely better). Set ROOMLERD_ALLOW_SW_HEAVY=1 to override."
                 );
                 ProbeResult::SoftwareOnly
             }

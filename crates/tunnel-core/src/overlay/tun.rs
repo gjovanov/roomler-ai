@@ -1378,7 +1378,7 @@ mod system {
         /// WFP hard-permit guard. Holds a dynamic WFP session whose `Drop`
         /// reaps the `roomler`-adapter permit filters, so it must live as
         /// long as the device. `None` when disabled
-        /// (`ROOMLER_AGENT_WFP_PERMIT=0`) or when install failed
+        /// (`ROOMLERD_WFP_PERMIT=0`) or when install failed
         /// (best-effort — the overlay still works on non-locked hosts).
         #[cfg(windows)]
         _wfp: Option<crate::overlay::wfp::WfpGuard>,
@@ -1455,7 +1455,7 @@ mod system {
     }
 
     /// P9 — is the Windows net-hygiene pass disabled? Only an explicit
-    /// `0`/`false`/`no`/`off` disables (`ROOMLER_NODE_TUN_HYGIENE`); unset /
+    /// `0`/`false`/`no`/`off` disables (`ROOMLERD_TUN_HYGIENE`); unset /
     /// anything else keeps the default ON. Pure so the parse is testable.
     #[cfg(windows)]
     fn hygiene_disabled(v: Option<&str>) -> bool {
@@ -1492,7 +1492,7 @@ mod system {
     #[cfg(windows)]
     fn spawn_windows_net_hygiene(if_name: String) {
         if hygiene_disabled(crate::env::node_env("TUN_HYGIENE").as_deref()) {
-            tracing::info!("overlay: Windows net hygiene disabled via ROOMLER_NODE_TUN_HYGIENE");
+            tracing::info!("overlay: Windows net hygiene disabled via ROOMLERD_TUN_HYGIENE");
             return;
         }
         std::thread::spawn(move || {
@@ -1644,7 +1644,7 @@ mod system {
 
     /// rc.279 — kill-switch for the stable adapter identity (constant
     /// requested GUID + boot stray-adapter sweep):
-    /// `ROOMLER_NODE_OVERLAY_TUN_STABLE_GUID` (legacy `ROOMLER_AGENT_…`
+    /// `ROOMLERD_OVERLAY_TUN_STABLE_GUID` (legacy `ROOMLER_AGENT_…`
     /// honoured; config key `overlay_tun_stable_guid`). Default **ON**;
     /// `0`/`false`/`no`/`off` reverts to the pre-rc.279 random-GUID
     /// adapters if the undocumented requested-GUID path ever misbehaves on
@@ -1655,7 +1655,7 @@ mod system {
     }
 
     /// rc.279 — kill-switch for the route-war eviction (peer `/32`s since
-    /// rc.208, our own `/32` since rc.278): `ROOMLER_NODE_OVERLAY_ROUTE_EVICT`
+    /// rc.208, our own `/32` since rc.278): `ROOMLERD_OVERLAY_ROUTE_EVICT`
     /// (legacy `ROOMLER_AGENT_…` honoured; config key `overlay_route_evict`).
     /// Default **ON** — without it the overlay is unusable under a hostile
     /// full-tunnel VPN — but managed sites whose security tooling alarms on
@@ -1671,7 +1671,7 @@ mod system {
     /// is what fed the route-flap → netstate-Major → forced-poke treadmill;
     /// with reclaim covering genuine theft on demand, the blind wave only
     /// needs to fire when the foreign row SET changes).
-    /// `ROOMLER_NODE_OVERLAY_ROUTE_RECLAIM` (config key
+    /// `ROOMLERD_OVERLAY_ROUTE_RECLAIM` (config key
     /// `overlay_route_reclaim`). Default **ON**; OFF restores the pre-rc.409
     /// behaviour exactly (evict every wave, never pin). Subordinate to
     /// [`route_evict_enabled`] — reclaim deletes foreign rows, so the master
@@ -1683,7 +1683,7 @@ mod system {
 
     /// rc.287 — install defended peer `/32`s (and assert the ULA `/96` + the
     /// connected `/10`) at route metric **0** instead of 1:
-    /// `ROOMLER_NODE_OVERLAY_ROUTE_METRIC0` (config key
+    /// `ROOMLERD_OVERLAY_ROUTE_METRIC0` (config key
     /// `overlay_route_metric0`).
     ///
     /// **rc.289: default flipped to OFF.** Field result on the only host that
@@ -1719,7 +1719,7 @@ mod system {
     }
 
     /// rc.410 (#23) — the overlay NIC's IPv4 INTERFACE metric.
-    /// `ROOMLER_NODE_OVERLAY_IFACE_METRIC` (config key
+    /// `ROOMLERD_OVERLAY_IFACE_METRIC` (config key
     /// `overlay_iface_metric`), default **0**.
     ///
     /// This is the route war's decisive lever, and the one a corp endpoint
@@ -2185,7 +2185,7 @@ mod system {
                     }
                 }
             } else {
-                tracing::info!("overlay: WFP permit disabled via ROOMLER_AGENT_WFP_PERMIT");
+                tracing::info!("overlay: WFP permit disabled via ROOMLERD_WFP_PERMIT");
                 None
             };
 
