@@ -13,7 +13,7 @@
 //! * **`overlay-netstack`** — a userspace smoltcp stack + a loopback SOCKS5
 //!   front, the OS-free twin: on a locked-down host (full-tunnel VPN) the mesh
 //!   is reachable with NO OS routing. Opt in with the env var
-//!   `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS=<port>`.
+//!   `ROOMLERD_OVERLAY_NETSTACK_SOCKS=<port>`.
 //!
 //! Default-OFF regardless: `overlay_enabled` config **and** a build carrying
 //! the relevant feature are both required to join the mesh.
@@ -287,7 +287,7 @@ pub async fn maybe_start(
     let (evt_tx, evt_rx) = mpsc::channel::<OverlayEvent>(64);
 
     // Pick the overlay surface: the userspace netstack (+ loopback SOCKS front)
-    // when `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS` names a port, else the OS TUN.
+    // when `ROOMLERD_OVERLAY_NETSTACK_SOCKS` names a port, else the OS TUN.
     // Either surface can be absent at build time; the helper warns + `None`s,
     // and `?` aborts the (mis)configured start.
     //
@@ -485,7 +485,7 @@ async fn resolve_server_ips(server_url: &str) -> Vec<std::net::IpAddr> {
 /// This org's loopback SOCKS5 port for **netstack mode**. `None` (the
 /// default) selects OS-TUN mode; a zero value is treated as unset.
 ///
-/// The PRIMARY reads `ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS`, exactly as
+/// The PRIMARY reads `ROOMLERD_OVERLAY_NETSTACK_SOCKS`, exactly as
 /// before. A SECONDARY gets whatever its `[[orgs]]` entry declares and
 /// deliberately does NOT fall back to the env key: the port is one TCP
 /// listener, so inheriting it would put two orgs on one front — the very
@@ -527,7 +527,7 @@ static SYSTUN_CACHE: std::sync::Mutex<
 
 /// OS-TUN factory (`overlay-l3`). The agent is privileged, so the device +
 /// routes come up directly in `SystemTun::up`. Kill-switch for the cache:
-/// `overlay_tun_persist` / `ROOMLER_NODE_OVERLAY_TUN_PERSIST`, default ON —
+/// `overlay_tun_persist` / `ROOMLERD_OVERLAY_TUN_PERSIST`, default ON —
 /// `0` restores the per-session create/remove cycle.
 #[cfg(feature = "overlay-l3")]
 fn systun_tun_factory() -> Option<TunFactory> {
@@ -556,7 +556,7 @@ fn systun_tun_factory() -> Option<TunFactory> {
 fn systun_tun_factory() -> Option<TunFactory> {
     warn!(
         "overlay: OS-TUN mode requested but this build lacks `overlay-l3` \
-         (set ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS for netstack mode); not joining"
+         (set ROOMLERD_OVERLAY_NETSTACK_SOCKS for netstack mode); not joining"
     );
     None
 }
@@ -833,7 +833,7 @@ static SOCKS_BOUND: std::sync::Mutex<Option<std::collections::BTreeSet<u16>>> =
 
 /// The netstack ICMP backend for the `roomler ping` LocalAPI verb, watching the
 /// shared handle channel. `None` unless this node is in netstack mode
-/// (`ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS` set) — an OS-TUN node has no OS-free
+/// (`ROOMLERD_OVERLAY_NETSTACK_SOCKS` set) — an OS-TUN node has no OS-free
 /// ICMP path (the OS `ping` works there).
 #[cfg(feature = "overlay-netstack")]
 pub fn netstack_pinger(
@@ -875,7 +875,7 @@ fn netstack_tun_factory(
     _org_key: &str,
 ) -> Option<TunFactory> {
     warn!(
-        "overlay: netstack mode requested (ROOMLER_AGENT_OVERLAY_NETSTACK_SOCKS set) \
+        "overlay: netstack mode requested (ROOMLERD_OVERLAY_NETSTACK_SOCKS set) \
          but this build lacks `overlay-netstack`; not joining"
     );
     None

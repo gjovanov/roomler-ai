@@ -20,7 +20,7 @@ pub mod wgc_backend;
 /// 320×240 BGRA frame source for scrap-capture so a headless Pod
 /// without an X server can still drive the encode + WebRTC pipeline.
 /// `open_default` short-circuits to this backend when the runtime
-/// env var `ROOMLER_AGENT_SYNTHETIC_FRAMES=1` is set AND the binary
+/// env var `ROOMLERD_SYNTHETIC_FRAMES=1` is set AND the binary
 /// was compiled with `--features synthetic-frame-source`.
 #[cfg(feature = "synthetic-frame-source")]
 pub mod synthetic_backend;
@@ -336,7 +336,7 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
             tracing::info!(
                 width = synthetic_backend::FRAME_W,
                 height = synthetic_backend::FRAME_H,
-                "capture: backend=synthetic (ROOMLER_AGENT_SYNTHETIC_FRAMES=1, CI / agent-e2e Pod)"
+                "capture: backend=synthetic (ROOMLERD_SYNTHETIC_FRAMES=1, CI / agent-e2e Pod)"
             );
             return Box::new(cap);
         }
@@ -387,7 +387,7 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
     // Windows: prefer WGC (captures HW cursors + supports dirty rects
     // on Win 11 22000+). Fall back to scrap (DXGI) if WGC init fails
     // — e.g. on Windows versions without the Graphics.Capture runtime
-    // or broken WinRT. Escape hatch: `ROOMLER_AGENT_CAPTURE=scrap` forces
+    // or broken WinRT. Escape hatch: `ROOMLERD_CAPTURE=scrap` forces
     // the DXGI path without a rebuild.
     #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
     {
@@ -409,7 +409,7 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
                 }
             }
         } else {
-            tracing::info!("ROOMLER_AGENT_CAPTURE=scrap — skipping WGC, using DXGI via scrap");
+            tracing::info!("ROOMLERD_CAPTURE=scrap — skipping WGC, using DXGI via scrap");
         }
     }
     #[cfg(feature = "scrap-capture")]
@@ -441,7 +441,7 @@ pub fn open_default(_target_fps: u32, _downscale: DownscalePolicy) -> Box<dyn Sc
     Box::new(NoopCapture)
 }
 
-/// Escape hatch: `ROOMLER_AGENT_CAPTURE=scrap` (case-insensitive) forces
+/// Escape hatch: `ROOMLERD_CAPTURE=scrap` (case-insensitive) forces
 /// the DXGI path even on builds that include WGC. Useful for diagnosing
 /// WGC-specific regressions in the field without a rebuild.
 #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
@@ -453,7 +453,7 @@ fn capture_env_prefers_scrap() -> bool {
 }
 
 /// Phase 1 — runtime gate for the synthetic-frame-source backend.
-/// True iff `ROOMLER_AGENT_SYNTHETIC_FRAMES` parses as truthy
+/// True iff `ROOMLERD_SYNTHETIC_FRAMES` parses as truthy
 /// (`1` / `true` / `yes` / `on`, case-insensitive). Anything else
 /// (unset, `0`, garbage) falls back to the normal cascade.
 #[cfg(feature = "synthetic-frame-source")]
@@ -499,7 +499,7 @@ mod synthetic_env_tests {
 
     #[test]
     fn unset_returns_false() {
-        with_env("ROOMLER_AGENT_SYNTHETIC_FRAMES", None, || {
+        with_env("ROOMLERD_SYNTHETIC_FRAMES", None, || {
             assert!(!synthetic_env_enabled());
         });
     }
@@ -507,7 +507,7 @@ mod synthetic_env_tests {
     #[test]
     fn truthy_values_accepted() {
         for v in &["1", "true", "TRUE", "yes", "On"] {
-            with_env("ROOMLER_AGENT_SYNTHETIC_FRAMES", Some(v), || {
+            with_env("ROOMLERD_SYNTHETIC_FRAMES", Some(v), || {
                 assert!(synthetic_env_enabled(), "value {v:?} should be truthy");
             });
         }
@@ -516,7 +516,7 @@ mod synthetic_env_tests {
     #[test]
     fn explicit_zero_or_garbage_is_false() {
         for v in &["0", "false", "no", "off", "anything-else"] {
-            with_env("ROOMLER_AGENT_SYNTHETIC_FRAMES", Some(v), || {
+            with_env("ROOMLERD_SYNTHETIC_FRAMES", Some(v), || {
                 assert!(!synthetic_env_enabled(), "value {v:?} should be falsy");
             });
         }
