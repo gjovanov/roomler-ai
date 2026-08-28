@@ -182,7 +182,7 @@ pub(crate) const PARTIAL_ORPHAN_TTL_SECS: i64 = 24 * 3600;
 pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 256 * 1024;
 
 /// rc.22 — staging-strategy flag. When `true`, all upload staging on
-/// Windows happens under `%PROGRAMDATA%\roomler\roomler-agent\staging\`
+/// Windows happens under `%PROGRAMDATA%\roomler\<segment>\staging\`
 /// regardless of the upload's `dest_dir`. When `false`, staging lives
 /// under `<dest_dir>/.roomler-partial/` (rc.19–rc.21 legacy layout).
 ///
@@ -197,7 +197,7 @@ pub(crate) const FSYNC_THRESHOLD_BYTES: u64 = 256 * 1024;
 /// ESET's hot path narrow.
 ///
 /// Hypothesis-driven, not yet confirmed on the field; the env-var
-/// escape hatch `ROOMLER_AGENT_STAGING_LEGACY_PER_DEST=1` reverts the
+/// escape hatch `ROOMLERD_STAGING_LEGACY_PER_DEST=1` reverts the
 /// behavior without a rebuild if Option B turns out wrong. Cycles
 /// back to `Option D` (escalate corporate-AV exclusion request) if
 /// rc.22 still fails.
@@ -217,9 +217,7 @@ pub(crate) static STAGE_IN_PROGRAMDATA: std::sync::LazyLock<bool> =
             return false;
         }
         if node_env_os("STAGING_LEGACY_PER_DEST").is_some() {
-            tracing::info!(
-                "files: ROOMLER_AGENT_STAGING_LEGACY_PER_DEST set; reverting to per-dest staging"
-            );
+            tracing::info!("files: STAGING_LEGACY_PER_DEST set; reverting to per-dest staging");
             return false;
         }
         cfg!(target_os = "windows")
@@ -231,7 +229,13 @@ pub(crate) fn stage_in_programdata() -> bool {
     *STAGE_IN_PROGRAMDATA
 }
 
-/// Windows-only staging root: `%PROGRAMDATA%\roomler\roomler-agent\staging\`.
+/// Windows-only staging root: `%PROGRAMDATA%\roomler\<segment>\staging\`,
+/// where `<segment>` is resolved per host by `appdirs::machine_global_dir()`
+// RETIRED-NAME-ANCHOR(3): names the pre-rename segment because explaining the
+// conditional resolution requires naming both halves. docs/fr/FR-21
+/// (the `roomler` segment on a fresh install; the pre-rename `roomler-agent`
+/// one only where that tree already exists). Do NOT restate it as a literal —
+/// FR-21 P4 fixed a viewer that did exactly that.
 /// SYSTEM-writable, persistent across reboots, present on every Windows
 /// install. Falls back to `C:\ProgramData` when the env var is unset
 /// (matches the rc.21 download_dir() fallback shape).
@@ -241,8 +245,8 @@ pub(crate) fn staging_root_windows() -> PathBuf {
 }
 
 /// Compute the canonical staging dir path for an upload `id`. On
-/// Windows in production this is `%PROGRAMDATA%\roomler\roomler-agent\
-/// staging\<id>` (rc.22, ESET fix). On other platforms or when the
+/// Windows in production this is `%PROGRAMDATA%\roomler\<segment>\
+/// staging\<id>` (rc.22, ESET fix; segment per `machine_global_dir()`). On other platforms or when the
 /// legacy-per-dest escape hatch is set, falls back to the rc.19 layout
 /// at `<dest_dir>/.roomler-partial/<id>`.
 pub(crate) fn partial_dir_for(dest_dir: &std::path::Path, id: &str) -> PathBuf {
@@ -338,7 +342,7 @@ pub async fn sweep_orphans() -> (usize, usize) {
 }
 
 /// rc.22 — sweep a directory whose CHILDREN are per-id staging dirs.
-/// Used when the staging root is `%PROGRAMDATA%\roomler\roomler-agent\
+/// Used when the staging root is `%PROGRAMDATA%\roomler\<segment>\
 /// staging\` (no `.roomler-partial` parent). Mirror of [`sweep_orphans_in`]
 /// minus the parent-join — the contents-of-directory loop is identical.
 pub async fn sweep_orphans_root(dir: &std::path::Path) -> (usize, usize) {
@@ -360,7 +364,7 @@ pub async fn sweep_orphans_in(root: &std::path::Path) -> (usize, usize) {
 /// `<id>/{meta.json,data}` triples, removes those older than
 /// [`PARTIAL_ORPHAN_TTL_SECS`] and registers survivors. Used by both
 /// the legacy `<Downloads>/.roomler-partial/` layout and the rc.22
-/// `%PROGRAMDATA%\roomler\roomler-agent\staging\` layout.
+/// `%PROGRAMDATA%\roomler\<segment>\staging\` layout.
 async fn sweep_orphans_dir(dir: &std::path::Path) -> (usize, usize) {
     let now = chrono::Utc::now().timestamp();
     let mut kept = 0usize;
@@ -1449,11 +1453,27 @@ fn guess_mime(name: &str) -> Option<&'static str> {
 /// `dir-error` rather than blocking the entire pump.
 const DIR_LIST_TIMEOUT_SECS: u64 = 3;
 
+/// Sentinel meaning "wherever THIS host stages in-flight uploads". The caller
+/// sends the token; the agent resolves it.
+///
+/// FR-21 P4. The viewer used to hardcode
+/// `C:\ProgramData\roomler\roomler-agent\staging`, but `machine_global_dir()`
+/// resolves the `roomler` segment on a fresh install and only falls back to the
+/// pre-rename `roomler-agent` segment when that tree already exists — so the
+/// literal was correct on exactly one class of host and silently wrong on the
+/// rest. Confirmed on a real SYSTEM-mode Windows host, where
+/// `%PROGRAMDATA%\roomler\roomler-agent` does not exist at all.
+///
+/// A hardcoded copy of a path that a resolver made conditional is a defect
+/// waiting for the resolver to take its other branch. The fix is not a better
+/// literal — it is removing the caller's ability to hold one.
+pub const STAGING_SENTINEL: &str = "<staging>";
+
 /// List a directory. Empty / `~` / `/` enumerates roots (logical
-/// drives on Windows; `/` on Unix). Returns at most 10000 entries —
-/// a directory with more is a degenerate case (deeply nested
-/// `node_modules` on a dev box) that we'd rather refuse than
-/// stream a 1 MiB JSON listing.
+/// drives on Windows; `/` on Unix); [`STAGING_SENTINEL`] resolves to this
+/// host's staging root. Returns at most 10000 entries — a directory with more
+/// is a degenerate case (deeply nested `node_modules` on a dev box) that we'd
+/// rather refuse than stream a 1 MiB JSON listing.
 pub async fn list_dir(path: &str) -> Result<DirListing> {
     if path.is_empty() || path == "~" || path == "/" {
         return Ok(DirListing {
@@ -1462,9 +1482,18 @@ pub async fn list_dir(path: &str) -> Result<DirListing> {
             entries: enumerate_roots(),
         });
     }
-    let pb = PathBuf::from(path);
+    if path == STAGING_SENTINEL {
+        return list_staging().await;
+    }
+    list_canonical(&PathBuf::from(path)).await
+}
+
+/// Canonicalise, enumerate and shape one directory. Shared by the plain path
+/// arm and the staging sentinel so the two can never drift in timeout, entry
+/// cap or error wording.
+async fn list_canonical(pb: &std::path::Path) -> Result<DirListing> {
     let canon =
-        std::fs::canonicalize(&pb).with_context(|| format!("canonicalising {}", pb.display()))?;
+        std::fs::canonicalize(pb).with_context(|| format!("canonicalising {}", pb.display()))?;
     let parent = canon.parent().map(|p| p.to_string_lossy().to_string());
     let read = tokio::time::timeout(
         std::time::Duration::from_secs(DIR_LIST_TIMEOUT_SECS),
@@ -1480,6 +1509,35 @@ pub async fn list_dir(path: &str) -> Result<DirListing> {
         parent,
         entries,
     })
+}
+
+/// Resolve [`STAGING_SENTINEL`] against THIS host's layout.
+///
+/// The staging dir is created per update and removed after, so it is absent
+/// most of the time. Erroring then would make the quick-access button useless
+/// except during the few seconds an update is in flight, so an absent staging
+/// dir lists its parent — the machine-global root, which always exists and
+/// holds `crashes/`, `service-logs/` and `uploads/` besides.
+#[cfg(target_os = "windows")]
+async fn list_staging() -> Result<DirListing> {
+    let staging = staging_root_windows();
+    let target = if staging.is_dir() {
+        staging
+    } else {
+        crate::appdirs::machine_global_dir()
+    };
+    list_canonical(&target).await
+}
+
+/// Non-Windows hosts stage per-destination (`<dest>/.roomler-partial/<id>`),
+/// so there is no single staging root to open. Say so rather than inventing a
+/// path that would then be wrong in a new way.
+#[cfg(not(target_os = "windows"))]
+async fn list_staging() -> Result<DirListing> {
+    Err(anyhow!(
+        "this host has no single staging root — non-Windows agents stage \
+         alongside each destination"
+    ))
 }
 
 async fn collect_dir_entries(mut read: tokio::fs::ReadDir) -> Vec<DirEntryView> {
@@ -1967,6 +2025,58 @@ fn download_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-21 P4 — the sentinel must resolve on the AGENT, never in the viewer.
+    ///
+    /// The viewer used to hardcode `C:\ProgramData\roomler\roomler-agent\staging`,
+    /// which `machine_global_dir()` only resolves to on a host that already
+    /// carries the pre-rename tree. Verified broken on a real SYSTEM-mode
+    /// Windows host, where that parent does not exist at all.
+    #[tokio::test]
+    async fn the_staging_sentinel_resolves_on_the_agent_and_never_errors() {
+        let listing = list_dir(STAGING_SENTINEL).await;
+
+        #[cfg(target_os = "windows")]
+        {
+            // Staging is transient, so the contract is "always lands somewhere
+            // real": the staging dir when an update is in flight, otherwise the
+            // machine-global root. Never an error, or the button is useless
+            // except during the seconds an update is running.
+            let listing = listing.expect("the sentinel must always resolve on Windows");
+            let root = crate::appdirs::machine_global_dir();
+            let root_s = root.to_string_lossy().to_lowercase();
+            let got = listing.path.to_lowercase();
+            assert!(
+                got.contains(root_s.trim_start_matches(r"\\?\")),
+                "resolved {got} is outside the machine-global root {root_s}"
+            );
+            // And it must NOT be the literal the viewer used to hold.
+            assert!(
+                !got.contains("roomler-agent") || root_s.contains("roomler-agent"),
+                "resolved {got} used the pre-rename segment on a host whose root is {root_s}"
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // No single staging root off Windows — saying so beats inventing a
+            // path that would be wrong in a new way.
+            let err = listing.expect_err("non-Windows hosts have no staging root");
+            assert!(
+                err.to_string().contains("no single staging root"),
+                "unhelpful error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sentinel_is_not_a_path_anything_could_canonicalise() {
+        // If this ever became a real path the viewer could send, the resolver
+        // arm would be dead and the defect would come back silently.
+        assert!(STAGING_SENTINEL.starts_with('<') && STAGING_SENTINEL.ends_with('>'));
+        assert!(!STAGING_SENTINEL.contains(char::from(92)));
+        assert!(!STAGING_SENTINEL.contains('/'));
+    }
 
     /// Serializes every test that mutates the process-global HOME /
     /// USERPROFILE (`begin()` resolves the Downloads dir through them, and
