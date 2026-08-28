@@ -288,6 +288,27 @@ impl RateGovernor {
         Some(self.record_applied(bps))
     }
 
+    /// Feed the AIMD a congestion sample from a BLOCKED SEND, without
+    /// consuming the move.
+    ///
+    /// `send_wait` measures the pipe's refusal to drain directly: no clock
+    /// sync, no viewer, and it works on both transports — a frame that sat
+    /// seconds inside the DataChannel send call is unambiguous congestion.
+    /// It was telemetry-only on relay because the goodput clamp is
+    /// direct-only (the FR-1 P2 relay regression), so the one signal that
+    /// always works was the one nothing acted on.
+    ///
+    /// Deliberately NOT `on_send_overflow`: that one calls `take_pending`,
+    /// which marks the move applied while the encoder is never told. The
+    /// pump's own `pre_encode_tick` picks this up one frame later and
+    /// routes it through the normal apply arms — the same discipline the
+    /// FR-15 age loop follows.
+    pub fn note_send_stall(&mut self, now: Instant) {
+        if let Some(ctrl) = self.aimd.as_mut() {
+            ctrl.note_buffer_overflow(now);
+        }
+    }
+
     /// A fresh encoder starts at its constructor's full-ceiling
     /// maxrate; force the AIMD to re-apply its current (possibly
     /// lower) target so the stream doesn't snap back up after a dim
