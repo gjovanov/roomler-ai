@@ -1259,6 +1259,9 @@ mod tests {
                 controller_name: "x".into(),
                 permissions: "VIEW_SCREEN".into(),
                 timeout_secs: 30,
+                kind: "rc".into(),
+                detail: String::new(),
+                expires_at_ms: 0,
                 org: String::new(),
             };
             std::fs::write(

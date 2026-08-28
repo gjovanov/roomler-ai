@@ -67,11 +67,19 @@ Every line below was read on `origin/master` at `861d4557`.
    `Spawning self-update: No such file or directory (os error 2)`. The same
    failure kills apply-update, `probe_service_state`, service install/uninstall
    and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1086`
-8. **macOS "Check for updates" targets the wrong mechanism.** A per-user macOS
-   agent *deliberately refuses* to self-update; updates belong to the root
-   `com.roomler.update` helper, woken by touching
-   `/private/var/tmp/roomler-update-check`.
-   — `agents/roomlerd/src/updater.rs:1588-1626`
+8. ~~**macOS "Check for updates" targets the wrong mechanism.**~~ **Wrong —
+   corrected during implementation.** The reported
+   `Spawning self-update: No such file or directory (os error 2)` made this
+   look like a second, independent macOS defect. It is not: `self_update_cmd`
+   has queued the root `com.roomler.update` helper for a non-root macOS caller
+   since FR-5 (`main.rs:3251`), so the mechanism was already correct and
+   finding 7 alone accounts for the error. What WAS wrong is that
+   `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
+   "Queued for the root update helper — watch /var/log/roomler-agent/update.log"
+   never reached the operator: on the one platform where the button did the
+   right thing, it looked inert. Fixed by returning the output on non-Windows
+   (Windows keeps the detached spawn — there the daemon hands off to msiexec
+   and exits, so there is nothing to wait for).
 9. **`companion::refresh_if_stale` is Windows-only** and nothing reports the
    companion's version to the server, so "Update all" cannot tell anyone the
    desktop stayed behind. — `agents/roomlerd/src/companion.rs:65`
@@ -161,9 +169,9 @@ is why it is sequenced last, behind its own feature and the probe.
 
 | # | Phase | Kill switch | Status |
 |---|---|---|---|
-| 0 | FR + issue + ledger (incl. the FR-24 collision repair) | n/a | in progress |
-| 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomler consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | not started |
-| 2 | Desktop companion — one tray with an icon, daemon-path resolution, macOS update trigger, version honesty, `ensure_running()` | each item independent; no wire change | not started |
+| 0 | FR + issue + ledger | n/a | **done** — the FR-24 collision was already repaired on master by #850 |
+| 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomler consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — field pending |
+| 2 | Desktop companion — one tray with an icon, daemon-path resolution, update-output surfacing, version honesty, `ensure_running()` | each item independent; no wire change | **implemented** (version honesty deferred to a follow-up) — field pending |
 | 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent badge, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back | not started |
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | not started |
 | 5 | Input arbitration — mode re-seed, visible floor requests, single-viewer rail, deterministic handover | none needed (bug fixes) | not started |

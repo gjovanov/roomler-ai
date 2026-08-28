@@ -327,6 +327,34 @@ export function friendlyRcError(code: unknown, serverMessage: unknown): string {
   }
 }
 
+/**
+ * FR-27 - user-facing text for a session that ended before it started.
+ *
+ * These used to render as the raw enum name (`user_denied`,
+ * `consent_timeout`), which is unhelpful on its own and was, until FR-27,
+ * frequently WRONG: the agent's own prompt timeout came back as a bare
+ * `granted: false`, so "nobody was at the machine" reached the controller as
+ * "the user denied your request". The agent now says which it was, and the
+ * three outcomes need three different next steps from whoever reads this.
+ *
+ * Returns `null` for a nominal end (hangups, idle timeouts) so the caller can
+ * stay silent - an alert on a normal disconnect is noise.
+ */
+export function friendlyEndReason(reason: unknown): string | null {
+  switch (reason) {
+    case 'user_denied':
+      return 'Someone at that device declined the request.'
+    case 'consent_timeout':
+      return 'Nobody answered the prompt on that device in time. Nothing was declined - try again, or ask the person there to approve it.'
+    case 'no_prompt_surface':
+      return 'That device could not show a prompt to anyone - nobody is signed in at its screen, or the Roomler desktop app is not running there. Start it on the device, or set this device to email/push consent.'
+    case 'error':
+      return 'The session could not be established.'
+    default:
+      return null
+  }
+}
+
 /** Degraded classification Ã¢ÂÂ pure so the priority order is testable. */
 export function classifyDegraded(inp: {
   pcState: string | null
@@ -6091,10 +6119,11 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       phase.value = 'closed'
       if (msg.reason) {
-        // Reason is informational; UI surfaces it when non-nominal.
-        if (msg.reason === 'error' || msg.reason === 'consent_timeout' || msg.reason === 'user_denied') {
-          error.value = msg.reason
-        }
+        // FR-27 - a non-nominal end gets a sentence, not the enum name. The
+        // mapping returns null for every nominal reason, so the set of
+        // reasons that surface is the set that has something to say.
+        const friendly = friendlyEndReason(msg.reason)
+        if (friendly) error.value = friendly
       }
       teardown()
     })
