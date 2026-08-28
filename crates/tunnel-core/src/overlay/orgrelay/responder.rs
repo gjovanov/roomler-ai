@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! FR-19 P1 — the bind-only reachability responder.
 //!
 //! Answers org-relay **probe** frames and forwards nothing. There is no session

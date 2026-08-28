@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler-tunnel` library surface.
 //!
 //! Re-export of `tunnel_core` so consumers of the binary have one

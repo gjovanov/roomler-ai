@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! cpal-backed system-audio capture (Linux + Windows).
 //!
 //! * **Windows** — WASAPI loopback. cpal 0.15 lets you open the default

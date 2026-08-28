@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler` — the standalone tunnel-client CLI binary.
 //!
 //! The command surface itself lives in `roomler_tunnel::cli` (the LIB), not

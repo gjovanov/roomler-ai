@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Consent flow.
 //!
 //! When a controller requests a session, the server creates a oneshot channel

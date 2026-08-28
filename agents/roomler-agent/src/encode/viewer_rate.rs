@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Viewer-reported sustainable-rate controller for the DataChannel video pumps.
 //!
 //! Replaces the rc.184 keyframe-request-*rate* `DecodePressure` heuristic. That

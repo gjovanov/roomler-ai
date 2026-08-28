@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! The Windows half of [`crate::pty`] — ConPTY.
 //!
 //! Windows has no pty pair to open. Instead the console host owns the terminal:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! OS-native cursor capture (position + shape).
 //!
 //! The capture backend delivers screen pixels but historically omitted

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Clipboard data-channel handler.
 //!
 //! Round-trip clipboard content between the browser controller and

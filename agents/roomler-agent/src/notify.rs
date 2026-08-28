@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Needs-attention sentinel — daemon-side surface.
 //!
 //! P3e lever E: the sentinel machinery (paths, raise/read/clear, reasons)

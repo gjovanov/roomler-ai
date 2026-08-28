@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Sweep obsolete same-flavour roomler-agent MSI products.
 //!
 //! ## Why this exists

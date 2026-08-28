@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! P4 — per-source ingress rules: the finest tier of the overlay ACL.
 //!
 //! [`LocalScope`](super::router::LocalScope) already limits every peer to the

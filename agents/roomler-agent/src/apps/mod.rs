@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Remote **app selection & launch** for virtual-desktop hosts.
 //!
 //! When a browser controls a headless agent that runs in built-in

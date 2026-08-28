@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Pseudo-terminals for Roomler SSH interactive sessions (P4).
 //!
 //! Everything before this ran through [`crate::exec`], which buffers a

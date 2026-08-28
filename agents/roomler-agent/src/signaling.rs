@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! WebSocket signaling loop against `/ws?role=agent&token=...`.
 //!
 //! Handles the full rc:* handshake and owns a map of per-session
