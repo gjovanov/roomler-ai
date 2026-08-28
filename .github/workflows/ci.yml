@@ -572,12 +572,19 @@ jobs:
     # pre-rename host at its next update. The macOS `.app` anchor is the worst
     # case -- its name keys the TCC grants.
     #
-    # `continue-on-error` is DELIBERATE for now: the real property is
-    # "unclassified == 0", which is only reachable once P1-P4 have landed, and a
-    # job that is red for the whole program trains people to ignore it. P5 flips
-    # this job to blocking and swaps `--check` for `--check --strict`.
-    # Until then the ratchet still does real work on every PR.
-    continue-on-error: true
+    # P5: this job now BLOCKS. It was `continue-on-error` while P1-P4 were in
+    # flight, because a job that is red for a whole program trains people to
+    # ignore it — but an advisory guard nobody ever flips is a guard that does
+    # nothing, so the flip is the phase.
+    #
+    # It blocks on `--check`, NOT on `--check --strict`. My own spec conflated
+    # those two, and they are different steps: `--strict` demands
+    # "unclassified == 0" and master sits at ~1006, so enabling it today would
+    # make this job red on every PR for work that has not happened yet. The
+    # pair below is enforceable NOW and is what actually protects the field:
+    # nobody may add a retired name, and nobody may delete a dual-read fallback.
+    # `--strict` becomes reachable when the remaining occurrences are resolved,
+    # and flipping to it is a one-word change here.
     steps:
       - uses: actions/checkout@v4
       - name: Audit retired product names
