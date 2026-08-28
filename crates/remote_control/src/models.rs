@@ -75,6 +75,25 @@ pub struct AgentCaps {
     /// `files:get` / `files:dir`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// FR-17 — video DATA-CHANNEL wire options the agent supports, as
+    /// opposed to which transport it offers (that is `transports`).
+    /// Recognised values:
+    ///
+    /// * `chunk-framing` — every 16 KiB DataChannel message carries an
+    ///   8-byte `[frame_seq | chunk_idx | chunk_count]` prefix, so a
+    ///   receiver can tell WHICH frame a message belongs to and notice a
+    ///   missing one. Without it the stream is only reassemblable because
+    ///   the channel is reliable+ordered, which is the property FR-17
+    ///   exists to give up: on a lossy relay that ordering costs seconds
+    ///   of head-of-line blocking (measured: one frame blocked 10 263 ms).
+    ///
+    /// Empty / unset (older agents) deserialises to `[]` and the browser
+    /// keeps the legacy unframed format. The capability is what makes the
+    /// negotiation race-free: the viewer knows before it connects, so
+    /// there is never a window where the two ends disagree about how to
+    /// parse bytes already in flight.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video: Vec<String>,
     /// P6 — multi-user input capabilities. Recognised values:
     ///
     /// * `arbiter` — the agent runs the InputArbiter (single fenced
