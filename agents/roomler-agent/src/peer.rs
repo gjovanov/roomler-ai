@@ -5312,8 +5312,36 @@ async fn media_pump_ffmpeg_dc(
             } else if bg_rebuild && !constrained {
                 swap_wanted = Some(applied.bps);
             } else if last_motion_at.elapsed() >= DEFER_QUIET {
-                deferred_bps = None;
-                enc.set_bitrate(applied.bps);
+                // FR-10 follow-up (field 2026-08-28): the spacing below
+                // guarded only the DEFERRED flush, so this arm — "the
+                // scene is quiet, apply now" — rebuilt on EVERY rung the
+                // AIMD crossed. At session start nothing has moved yet, so
+                // it is always quiet here, and the startup ramp became two
+                // or three blocking QSV re-opens inside the first 15 s,
+                // each shipping a fresh IDR onto a ~3 Mbps pipe. That is
+                // the "always slow right after connecting, then it
+                // settles" the operator reported, and the 2 658 ms age
+                // spike measured on CORPLAP-3 at 07:29:02Z.
+                //
+                // The spacing belongs to the ENCODER and the TRANSPORT
+                // (this one rebuilds on set_bitrate, and the pipe is thin),
+                // not to the arm we happened to arrive through. A large
+                // move still lands promptly; a small one is held in
+                // `deferred_bps`, which re-evaluates every loop.
+                let allow = crate::encode::rebuild_apply_allowed(
+                    constrained,
+                    relay_idr_thrift,
+                    last_deferred_apply_at.map(|t| t.elapsed()),
+                    enc.current_maxrate_bps(),
+                    applied.bps,
+                );
+                if allow {
+                    deferred_bps = None;
+                    last_deferred_apply_at = Some(std::time::Instant::now());
+                    enc.set_bitrate(applied.bps);
+                } else {
+                    deferred_bps = Some(applied.bps);
+                }
             } else {
                 deferred_bps = Some(applied.bps);
             }
@@ -5336,12 +5364,13 @@ async fn media_pump_ffmpeg_dc(
             // sessions space small moves to ≥15 s; a ≥40 % move (genuine
             // collapse/recovery) still lands promptly. Held targets stay in
             // `deferred_bps` and re-evaluate every loop.
-            let allow = !(constrained && relay_idr_thrift)
-                || crate::encode::relay_deferred_apply_allowed(
-                    last_deferred_apply_at.map(|t| t.elapsed()),
-                    enc.current_maxrate_bps(),
-                    bps,
-                );
+            let allow = crate::encode::rebuild_apply_allowed(
+                constrained,
+                relay_idr_thrift,
+                last_deferred_apply_at.map(|t| t.elapsed()),
+                enc.current_maxrate_bps(),
+                bps,
+            );
             if allow {
                 // Quiet flush: the held QSV/AMF target applies now, while the
                 // scene is static — the rebuild stalls a frozen image nobody
