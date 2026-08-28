@@ -37,8 +37,9 @@
 //! per command (rare, user-clicked) with the same desktop-rebind
 //! preamble.
 //!
-//! Kill switch: `ROOMLER_AGENT_AUTO_LAYOUT=0` (or the `ROOMLER_NODE_`
-//! prefix) disables the per-char auto-switch without a redeploy;
+//! Kill switch: `ROOMLERD_AUTO_LAYOUT=0` (the older `ROOMLER_NODE_` and
+//! `ROOMLER_AGENT_` prefixes are still honoured) disables the per-char
+//! auto-switch without a redeploy;
 //! status reporting + manual set stay active.
 
 #![cfg(all(target_os = "windows", feature = "enigo-input"))]
@@ -83,7 +84,7 @@ static LAST_PUBLISHED_HKL: AtomicUsize = AtomicUsize::new(0);
 static COARSE_SAMPLE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the per-char auto-switch is enabled. Default ON;
-/// `ROOMLER_AGENT_AUTO_LAYOUT=0|false|no|off` disables.
+/// `ROOMLERD_AUTO_LAYOUT=0|false|no|off` disables.
 pub fn auto_layout_enabled() -> bool {
     static ENABLED: LazyLock<bool> =
         LazyLock::new(|| parse_auto_layout_flag(node_env("AUTO_LAYOUT").as_deref()));

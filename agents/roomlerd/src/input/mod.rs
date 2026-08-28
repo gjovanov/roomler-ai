@@ -36,7 +36,7 @@ pub fn reset_input_diag_counter() {
     INPUT_DIAG_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Parse the `ROOMLER_AGENT_VIRTUAL_SCREEN` env-var value into a
+/// Parse the `ROOMLERD_VIRTUAL_SCREEN` env-var value into a
 /// `bool`. Accepts `1`, `true`, `yes`, `on` (case-insensitive, trimmed)
 /// as truthy; anything else (including `None`) is false.
 ///

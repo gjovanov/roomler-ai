@@ -119,7 +119,7 @@ impl FlipTracker {
 /// visibly smoother than HEVC on the same direct path (13.1 vs 8.7 Mbps;
 /// encode times were fine for both).
 ///
-/// Operator override per codec: `ROOMLER_NODE_RATE_FACTOR_<LABEL>` (legacy
+/// Operator override per codec: `ROOMLERD_RATE_FACTOR_<LABEL>` (legacy
 /// `ROOMLER_AGENT_` prefix + the `rate_factor_*` config keys accepted via
 /// [`tunnel_core::env::node_env`]). Clamped to 50–400; garbage falls back
 /// to the built-in. The pump re-reads per frame, so a REAL env var applies
@@ -208,7 +208,7 @@ pub fn h264_cq_adjust(encoder_name: &str, cq: u32) -> u32 {
 /// `verdict` = `Some((honors_lp1, honors_lp0))` from the startup probe
 /// (does the encoder emit a key-flagged packet after a runtime force, per
 /// `low_power` mode?), `None` when the probe is disabled or never ran.
-/// `forced_lp` = the `ROOMLER_AGENT_QSV_LOW_POWER` operator override.
+/// `forced_lp` = the `ROOMLERD_QSV_LOW_POWER` operator override.
 ///
 /// The long GOP (on-demand-only keys — kills the residual ~1 Hz natural-key
 /// pulse on VP9-over-DC Intel hosts) is granted ONLY for a mode the probe
@@ -263,7 +263,7 @@ pub fn scale_cq_bias(enc_w: u32, enc_h: u32, native_w: u32, native_h: u32, max_s
 }
 
 /// Env-resolved `max_steps` for [`scale_cq_bias`]:
-/// `ROOMLER_AGENT_SCALE_CQ_BOOST`, default 4, `0` disables the bias.
+/// `ROOMLERD_SCALE_CQ_BOOST`, default 4, `0` disables the bias.
 pub fn scale_cq_boost_steps() -> u32 {
     tunnel_core::env::node_env("SCALE_CQ_BOOST")
         .and_then(|v| v.trim().parse().ok())
@@ -292,7 +292,7 @@ pub fn apply_cq_bias(cq: u32, steps: i32) -> u32 {
 /// viewer-rate divisor at 3 (the reported "9 fps, not fully smooth").
 /// Softer motion frames are the fluidity lever the dial promises; the
 /// at-rest image is untouched (native ⇒ bias 0 ⇒ base CQ + polish).
-/// Env `ROOMLER_AGENT_CONSTRAINED_CQ_RELIEF` / config
+/// Env `ROOMLERD_CONSTRAINED_CQ_RELIEF` / config
 /// `constrained_cq_relief` (default 4, 0 = no relief, max 12).
 pub fn constrained_cq_relief() -> i32 {
     tunnel_core::env::node_env("CONSTRAINED_CQ_RELIEF")
@@ -309,7 +309,7 @@ pub fn constrained_cq_relief() -> i32 {
 /// freeze) and the "window drags seconds behind" lag. Budgeting the
 /// in-flight bytes to a fraction of a second converts queue-lag into an
 /// immediate production skip the viewer perceives as a lower — but
-/// current — frame rate. Env `ROOMLER_AGENT_CONSTRAINED_QUEUE_MS` /
+/// current — frame rate. Env `ROOMLERD_CONSTRAINED_QUEUE_MS` /
 /// config `constrained_queue_ms` (default 450, 0 = unbounded, max 2000).
 pub fn constrained_queue_ms() -> u64 {
     tunnel_core::env::node_env("CONSTRAINED_QUEUE_MS")
@@ -343,7 +343,7 @@ pub fn constrained_queue_budget_bytes(ceiling_bps: u32) -> usize {
 /// forced IDR rather than QP-clamping), and the follow-on encode call
 /// hung in the driver. corplap had run av1_qsv all day on rc.441's 2×
 /// window with zero errors. Sub-100 values remain available per-host
-/// for experiments (env `ROOMLER_AGENT_CONSTRAINED_HRD_PCT` / config
+/// for experiments (env `ROOMLERD_CONSTRAINED_HRD_PCT` / config
 /// `constrained_hrd_pct`, clamp [25, 200]) but the DEFAULT must not
 /// undercut a codec's forced-IDR floor; bounding IDR transit properly
 /// is the measured-rate program's job (derive the window per codec
@@ -363,7 +363,7 @@ pub fn constrained_hrd_pct() -> usize {
 /// immediate production skip, exactly the rc.442 constrained rationale.
 /// Tighter default than the relay's 450 (a LAN's round trip is ~1 ms —
 /// there is no transit to hide the queue behind). Env
-/// `ROOMLER_AGENT_DIRECT_QUEUE_MS` / config `direct_queue_ms`
+/// `ROOMLERD_DIRECT_QUEUE_MS` / config `direct_queue_ms`
 /// (default 150, 0 = unbounded, max 2000).
 pub fn direct_queue_ms() -> u64 {
     tunnel_core::env::node_env("DIRECT_QUEUE_MS")
@@ -401,7 +401,7 @@ pub fn direct_queue_budget_bytes(rate_bps: u32) -> usize {
 /// window at 200 regardless: Intel's AV1 VDENC ERRORS (then hangs the
 /// driver) on a forced IDR that exceeds the reservoir instead of
 /// QP-clamping like the H.264/HEVC paths — the rc.443 incident. Env
-/// `ROOMLER_AGENT_DIRECT_HRD_PCT` / config `direct_hrd_pct`
+/// `ROOMLERD_DIRECT_HRD_PCT` / config `direct_hrd_pct`
 /// (clamp [25, 200]).
 pub fn direct_hrd_pct() -> usize {
     tunnel_core::env::node_env("DIRECT_HRD_PCT")
@@ -413,7 +413,7 @@ pub fn direct_hrd_pct() -> usize {
 /// Real frames since the last settle that make a motion episode "a burst"
 /// worth an idle-settle resync IDR. A window-drag produces hundreds; a caret
 /// blink, a clock tick, or a couple of keystrokes produce 1-3 and must NOT
-/// qualify. Env `ROOMLER_AGENT_SETTLE_KF_MIN_BURST` overrides; `0` restores
+/// qualify. Env `ROOMLERD_SETTLE_KF_MIN_BURST` overrides; `0` restores
 /// the legacy rc.187 fire-on-every-settle behaviour.
 pub const SETTLE_KF_MIN_BURST: u32 = 10;
 
@@ -455,7 +455,7 @@ impl SettleKeyframeGate {
         }
     }
 
-    /// Defaults + the `ROOMLER_AGENT_SETTLE_KF_MIN_BURST` override. `0` =
+    /// Defaults + the `ROOMLERD_SETTLE_KF_MIN_BURST` override. `0` =
     /// legacy (fire on the first settle of every episode, no cooldown).
     pub fn from_env() -> Self {
         let min_burst = tunnel_core::env::node_env("SETTLE_KF_MIN_BURST")
@@ -603,7 +603,7 @@ pub const REFINE_MIN_BYTES_FLOOR: usize = 2048;
 /// mechanisms (maxrate, AIMD, send-channel shedding, viewer-rate
 /// divisor) own link protection, not the rung. Untracked backends keep
 /// the byte leg unchanged. Env
-/// `ROOMLER_AGENT_IDLE_REFINE_MAJOR_AREA_PERMILLE` (0 = any non-empty
+/// `ROOMLERD_IDLE_REFINE_MAJOR_AREA_PERMILLE` (0 = any non-empty
 /// tracked damage counts, i.e. the pre-P8a-2 posture).
 pub const REFINE_MAJOR_AREA_PERMILLE: u32 = 400;
 
@@ -730,12 +730,12 @@ impl IdleRefine {
         }
     }
 
-    /// Kill switch `ROOMLER_AGENT_IDLE_REFINE=0` (or `false`); byte floor
-    /// `ROOMLER_AGENT_IDLE_REFINE_MIN_FRAME_KB` (0 = count every real
+    /// Kill switch `ROOMLERD_IDLE_REFINE=0` (or `false`); byte floor
+    /// `ROOMLERD_IDLE_REFINE_MIN_FRAME_KB` (0 = count every real
     /// frame); major-area floor
-    /// `ROOMLER_AGENT_IDLE_REFINE_MAJOR_AREA_PERMILLE` (0 = any non-empty
+    /// `ROOMLERD_IDLE_REFINE_MAJOR_AREA_PERMILLE` (0 = any non-empty
     /// tracked damage restores the cap — the pre-P8a-2 posture); tracked
-    /// settle `ROOMLER_AGENT_IDLE_REFINE_SETTLE_MS` (clamped 100-5000).
+    /// settle `ROOMLERD_IDLE_REFINE_SETTLE_MS` (clamped 100-5000).
     /// node_env so the config-surface keys reach every read.
     pub fn from_env() -> Self {
         let enabled = !matches!(
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(chroma_rate_factor_pct(false), 100);
         // The pump's compose rule at the HEVC built-in (125): 4:4:4 → 187 %
         // of the base band; 4:2:0 leaves it unchanged. Literals only — the
-        // codec-factor env test above mutates ROOMLER_AGENT_RATE_FACTOR_HEVC
+        // codec-factor env test above mutates ROOMLERD_RATE_FACTOR_HEVC
         // and cargo runs tests in parallel threads.
         assert_eq!(125 * chroma_rate_factor_pct(true) / 100, 187);
         assert_eq!(125 * chroma_rate_factor_pct(false) / 100, 125);
