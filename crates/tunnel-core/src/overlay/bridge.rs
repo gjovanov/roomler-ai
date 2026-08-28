@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! TUN ↔ WireGuard bridge (Phase 3).
 //!
 //! Joins the OS TUN device ([`super::tun::TunIo`]) to the userspace

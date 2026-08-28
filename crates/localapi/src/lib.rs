@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Roomler **LocalAPI** — the local control surface (P1: read-only).
 //!
 //! The unified daemon (`roomlerd`) will expose this over a local-only channel

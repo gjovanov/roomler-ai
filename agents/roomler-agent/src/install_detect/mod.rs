@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Detect existing `roomler-agent` installs on a Windows host.
 //!
 //! Used by the rc.28 installation wizard (and any future CLI tooling)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `derp-relay` — the standalone regional DERP relay (one per relay PoP).
 //!
 //! A pubkey-addressed WebSocket forwarder for the overlay's both-UDP-blocked

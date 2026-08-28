@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `--virtual-desktop` mode (Linux): bring up a headless X display (Xvfb)
 //! plus a minimal window manager that the agent captures, turning a
 //! Linux/WSL node into a browser-remotable desktop.

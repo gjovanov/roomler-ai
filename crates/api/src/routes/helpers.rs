@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 use bson::oid::ObjectId;
 use roomler_ai_db::models::{Message, NotificationSource, NotificationType, Room};
 

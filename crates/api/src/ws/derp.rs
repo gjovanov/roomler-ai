@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! `/derp` — a pubkey-addressed WebSocket relay for the both-UDP-blocked
 //! overlay carrier tier (NAT-traversal Phase D, DERP).
 //!

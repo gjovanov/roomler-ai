@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Overlay-ACL gate for the `/derp` relay tier.
 //!
 //! # Why this exists

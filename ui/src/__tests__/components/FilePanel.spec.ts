@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import { mount, flushPromises } from '@vue/test-utils'

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Windows Service deployment mode (Effort 2).
 //!
 //! Optional alternative to the Scheduled Task model (`service install`,

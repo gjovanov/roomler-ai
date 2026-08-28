@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Cross-flavour install cleanup (Plan rc.18 P2).
 //!
 //! Removes stale artifacts left behind when an operator switches

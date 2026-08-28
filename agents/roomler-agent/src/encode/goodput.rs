@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Measured-rate v2 — estimate what the session is ACTUALLY delivering,
 //! and (stage 1) derive the bitrate ceiling from it.
 //!

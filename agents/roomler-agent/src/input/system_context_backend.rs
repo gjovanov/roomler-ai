@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! M3 A1 SYSTEM-context input injection backend.
 //!
 //! Same shape as [`super::enigo_backend::EnigoInjector`] (dedicated

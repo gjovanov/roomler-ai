@@ -218,4 +218,24 @@ Start with [Use cases](docs/use-cases.md).
 
 ## License
 
-MIT
+Roomler is open source under a **split licence**:
+
+| | |
+|---|---|
+| **The server you would host** — `crates/api`, `services`, `db`, `config`, `derp-relay`, `ui/` | [AGPL-3.0-only](LICENSE-AGPL-3.0) |
+| **Everything you install on a machine** — `roomlerd`, the `roomler` CLI, desktop + setup apps, and the transport crates they share with the server | [MPL-2.0](LICENSE-MPL-2.0) |
+| Documentation (`docs/`) | CC-BY-4.0 |
+
+**Self-host all of it, free, on unlimited devices, forever.** The agent you
+deploy to your own or your clients' machines is MPL-2.0 and imposes no copyleft
+on anything you build around it — that matters if you are an MSP, and it is why
+the agent is deliberately not AGPL.
+
+→ [**LICENSING.md**](LICENSING.md) answers the practical questions ·
+[COMMERCIAL.md](COMMERCIAL.md) for an AGPL exception ·
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for third-party obligations
+
+Releases up to the commit that introduced the split were MIT, retained in
+[LICENSE-MIT](LICENSE-MIT). That grant is irrevocable.
+
+© 2026 G ROX EOOD

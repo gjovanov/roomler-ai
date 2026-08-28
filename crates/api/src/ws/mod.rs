@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 /// Ceiling on a single inbound WebSocket frame/message.
 ///
 /// axum inherits tungstenite's defaults (64 MiB message, 16 MiB frame), and

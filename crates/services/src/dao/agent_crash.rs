@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! DAO for the `agent_crashes` MongoDB collection.
 //!
 //! Backs the Task 9 crash-log feature. The agent's `crash_uploader`

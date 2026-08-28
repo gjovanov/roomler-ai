@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Encode-pressure controller — auto-reduces the encoder's bitrate ceiling
 //! when the *encoder itself* can't keep up, so a weak sender GPU stops
 //! saturating and the periodic freeze goes away.

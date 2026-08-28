@@ -1,5 +1,6 @@
 [package]
 name = "roomler-ai-remote-control"
+license = "MPL-2.0"
 version.workspace = true
 edition.workspace = true
 

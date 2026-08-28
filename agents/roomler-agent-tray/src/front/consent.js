@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 // Phase 3 — remote-control consent popup.
 //
 // Polls the tray backend for `.pending` markers the agent drops when a remote

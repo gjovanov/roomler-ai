@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! DXGI adapter + output enumeration for the SystemContext capture path.
 //!
 //! Phase 0 (rc.105) — DIAGNOSTICS for the hybrid-GPU ("Optimus")

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! L3 TUN surface for the overlay (Phase 3).
 //!
 //! [`TunIo`] is the seam between the WireGuard bridge ([`super::bridge`])

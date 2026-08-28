@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Port-correct TURN URL parsing + transport-variant expansion.
 //!
 //! One implementation for every place that fans a single `turn:host[:port]`

@@ -1,5 +1,6 @@
 [package]
 name = "roomler-tunnel"
+license = "MPL-2.0"
 version.workspace = true
 edition.workspace = true
 description = "Roomler AI tunnel client — TeamViewer-style native CLI that forwards local TCP ports to a roomler-agent's intranet via the existing Roomler WebRTC plane."

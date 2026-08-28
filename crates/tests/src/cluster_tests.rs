@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! C-1 — cluster foundation: ownership directory + per-pod bus, exercised
 //! across two in-process "pods" sharing one Redis.
 

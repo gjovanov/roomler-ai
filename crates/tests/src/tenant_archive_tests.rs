@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Archiving an organization.
 //!
 //! `Tenant.is_archived` existed from the beginning and nothing read it, so

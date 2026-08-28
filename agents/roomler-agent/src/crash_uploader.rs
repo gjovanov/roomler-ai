@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Drain pending crash sidecars to the roomler.ai ingest endpoint.
 //!
 //! Phase 1C of the agent-crash-upload feature (Task 9). The recorder

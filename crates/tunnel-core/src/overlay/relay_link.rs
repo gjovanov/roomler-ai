@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Coturn-relay carrier coordination for the overlay runtime (Phase 3b).
 //!
 //! **Deterministic worker (rc.127).** The relay-to-relay leg must hairpin on

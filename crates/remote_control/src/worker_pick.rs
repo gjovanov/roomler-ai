@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! The ONE worker-pick implementation (overlay-consolidation invariant I6).
 //!
 //! Three subsystems must deterministically map a key onto one coturn worker so

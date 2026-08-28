@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Config shapes for the remote app-launch feature (`[virtual_desktop_apps]`
 //! in the agent config.toml).
 //!
