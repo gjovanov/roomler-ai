@@ -3405,7 +3405,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
   /** rc.62 Ã¢ÂÂ VP9 chroma preference (per-browser, persisted). When set
    *  to `'yuv420'` or `'yuv444'` the value is sent as `chroma_pref` in
    *  the `rc:session.request` payload; the agent's VP9-444 encoder
-   *  uses it instead of its `ROOMLER_AGENT_VP9_CHROMA` env var. When
+   *  uses it instead of its `ROOMLERD_VP9_CHROMA` env var. When
    *  `'auto'` (default), the field is omitted and the agent uses its
    *  own configured default. */
   const vp9Chroma = ref<Vp9ChromaPref>(readStoredVp9Chroma())
@@ -4917,7 +4917,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  next `connect()` Ã¢ÂÂ the choice is baked into the
    *  `rc:session.request.chroma_pref` field. Older agents that don't
    *  understand the field ignore it and fall back to their own
-   *  `ROOMLER_AGENT_VP9_CHROMA` default (= no-op). */
+   *  `ROOMLERD_VP9_CHROMA` default (= no-op). */
   function setVp9Chroma(c: Vp9ChromaPref) {
     vp9Chroma.value = c
     persistVp9Chroma(c)

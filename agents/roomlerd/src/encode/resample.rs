@@ -21,7 +21,7 @@
 //! deliberately NOT pooled — it moves into an `Arc<Frame>` that
 //! `last_good_frame`/the encoder/the send path may hold arbitrarily long.
 //!
-//! `ROOMLER_AGENT_SCALE_THREADS` (config key `scale_threads`, default 1)
+//! `ROOMLERD_SCALE_THREADS` (config key `scale_threads`, default 1)
 //! row-bands both passes across N scoped threads — both are
 //! embarrassingly parallel, and on HW-encode hosts the cores are idle
 //! during motion. Off by default; a lever for the field, not a policy.
@@ -41,11 +41,11 @@ use crate::peer::TargetResolution;
 const Q12_ONE: i32 = 4096;
 
 /// rc.191 — kill switch for the Lanczos-3 downscale path.
-/// `ROOMLER_AGENT_LANCZOS=0` (or `false`) reverts every downscale to the
+/// `ROOMLERD_LANCZOS=0` (or `false`) reverts every downscale to the
 /// box filter without a rebuild.
 fn lanczos_enabled() -> bool {
     !matches!(
-        std::env::var("ROOMLER_AGENT_LANCZOS").ok().as_deref(),
+        tunnel_core::env::node_env("LANCZOS").as_deref(),
         Some("0") | Some("false")
     )
 }
@@ -75,7 +75,7 @@ fn use_lanczos_for_scale(scale: f32, min_scale: f32, enabled: bool) -> bool {
 
 /// Phase A — worker count for the row-banded passes. Read once per
 /// [`Resampler`] (per pump instance), clamped 1..=8; 1 = inline, no
-/// threads spawned. Env `ROOMLER_AGENT_SCALE_THREADS` / config key
+/// threads spawned. Env `ROOMLERD_SCALE_THREADS` / config key
 /// `scale_threads`.
 fn scale_threads() -> usize {
     node_env("SCALE_THREADS")
@@ -378,8 +378,8 @@ fn downscale_bgra_box(
 /// ratio (rc.191 field: relay 0.67× and fit 0.75× "blurred/pixely" — and
 /// the Smoother 1024 cap, 1920→1024 = 0.533×, fell straight through the
 /// old `> 0.55` gate onto box: the exact text-mush case Lanczos was added
-/// for). Kill switches: `ROOMLER_AGENT_LANCZOS=0` (box everywhere),
-/// `ROOMLER_AGENT_LANCZOS_MIN_PCT=56` (restore the pre-P7 gate).
+/// for). Kill switches: `ROOMLERD_LANCZOS=0` (box everywhere),
+/// `ROOMLERD_LANCZOS_MIN_PCT=56` (restore the pre-P7 gate).
 pub(crate) fn apply_target_resolution(
     rs: &mut Resampler,
     frame: Arc<Frame>,
