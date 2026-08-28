@@ -43,7 +43,8 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key>
-        <string>roomler_agent=info,warn</string>
+        <!-- RETIRED-NAME-ANCHOR: pre-FR-21 tracing target, kept beside the new one. -->
+        <string>roomler_agent=info,roomlerd=info,warn</string>
     </dict>
 </dict>
 </plist>

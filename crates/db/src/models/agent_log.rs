@@ -69,7 +69,7 @@ pub struct AgentLogBatch {
 pub struct LogLine {
     pub ts: DateTime,
     pub level: LogLevel,
-    /// `tracing` target on the agent side (e.g. `roomler_agent::peer`)
+    /// `tracing` target on the agent side (e.g. `roomlerd::peer`)
     /// or the JS module / `console` site on the browser side.
     pub target: String,
     pub msg: String,
@@ -181,7 +181,7 @@ mod tests {
         let line = LogLine {
             ts: DateTime::now(),
             level: LogLevel::Info,
-            target: "roomler_agent::peer".to_string(),
+            target: "roomlerd::peer".to_string(),
             msg: "input dispatch".to_string(),
             fields: bson::doc! { "norm_x": 0.615, "px": 1181 },
         };

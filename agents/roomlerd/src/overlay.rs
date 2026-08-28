@@ -945,7 +945,7 @@ pub fn intercept(evt_tx: &mpsc::Sender<OverlayEvent>, msg: ServerMsg) -> Option<
 mod derived_port_layout_lock {
     #[test]
     fn agent_core_layout_matches_tunnel_core() {
-        use roomler_agent_core::config as c;
+        use roomler_core::config as c;
         use tunnel_core::overlay::direct as d;
         assert_eq!(c::DERIVED_PORT_BASE, u32::from(d::DEFAULT_DIRECT_PORT));
         assert_eq!(c::DERIVED_PORT_STRIDE, u32::from(d::DIRECT_PORT_BAND));
