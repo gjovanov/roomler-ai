@@ -8058,6 +8058,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-cli"
+version = "0.4.13"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bson",
+ "clap",
+ "directories",
+ "embed-resource",
+ "futures",
+ "hex",
+ "ipnet",
+ "libc",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "roomler-ai-remote-control",
+ "roomler-ai-tunnel-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2 0.5.10",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite 0.28.0",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "webrtc",
+ "zip",
+]
+
+[[package]]
 name = "roomler-cli-shim"
 version = "0.4.13"
 dependencies = [
@@ -8130,8 +8166,8 @@ dependencies = [
  "anyhow",
  "directories",
  "gethostname 0.5.0",
+ "roomler-cli",
  "roomler-setup-core",
- "roomler-tunnel",
  "roomlerd",
  "serde",
  "serde_json",
@@ -8172,42 +8208,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roomler-tunnel"
-version = "0.4.13"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bson",
- "clap",
- "directories",
- "embed-resource",
- "futures",
- "hex",
- "ipnet",
- "libc",
- "rand 0.9.4",
- "reqwest 0.12.28",
- "roomler-ai-remote-control",
- "roomler-ai-tunnel-core",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "socket2 0.5.10",
- "ssh-key",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tokio-tungstenite 0.28.0",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "webrtc",
- "zip",
-]
-
-[[package]]
 name = "roomlerd"
 version = "0.4.13"
 dependencies = [
@@ -8244,8 +8244,8 @@ dependencies = [
  "ring",
  "roomler-ai-remote-control",
  "roomler-ai-tunnel-core",
+ "roomler-cli",
  "roomler-core",
- "roomler-tunnel",
  "russh",
  "scrap",
  "serde",

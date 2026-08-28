@@ -160,6 +160,9 @@
                                 Type='integer'
                                 Value='1'
                                 KeyPath='yes' />
+                            <!-- RETIRED-NAME-ANCHOR(3): roomler_tunnel_cli_exe is installer IDENTITY;
+                                 upgrades key off the FileKey, so it is frozen deliberately even though
+                                 the crate is `roomler-cli` now. docs/fr/FR-21 -->
                             <File
                                 Id='roomler_tunnel_cli_exe'
                                 Name='roomler.exe'

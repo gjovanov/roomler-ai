@@ -114,7 +114,7 @@ flowchart BT
     setupcore["crates/roomler-setup-core<br/>installer mechanics"]
 
     roomlerd["agents/roomlerd → roomlerd<br/>the daemon"]
-    tunnel["agents/roomler-tunnel → roomler<br/>tunnel CLI (surface lives in its lib)"]
+    tunnel["agents/roomler-cli → roomler<br/>tunnel CLI (surface lives in its lib)"]
     shim["agents/roomler-cli-shim<br/>roomler.exe on daemon hosts → re-execs roomlerd cli"]
     tray["agents/roomler-desktop → roomler-desktop"]
     setup["agents/roomler-setup<br/>install wizard (Tauri)"]
@@ -153,7 +153,7 @@ is documented at the top of the root `Cargo.toml`):
 | Binary | Role |
 |---|---|
 | **`roomlerd`** | The daemon: WS signalling, per-session WebRTC peers, capture → encode → RTP/DC, input injection, clipboard/file/apps/audio channels, tunnel *target* and tunnel *client* sides, overlay node runtime, LocalAPI server, loopback TURN host, watchdog, self-updater, Windows SCM/SystemContext machinery |
-| **`roomler`** | The CLI. On tunnel-only hosts it is the full standalone binary; on daemon hosts the MSI/.deb installs a ~150 KB shim that re-execs `roomlerd cli` — one command surface (`roomler_tunnel::cli`), never version-skewed against the daemon |
+| **`roomler`** | The CLI. On tunnel-only hosts it is the full standalone binary; on daemon hosts the MSI/.deb installs a ~150 KB shim that re-execs `roomlerd cli` — one command surface (`roomler_cli::cli`), never version-skewed against the daemon |
 | **`roomler-desktop`** | Tauri tray companion: node status, peers, tunnels, consent prompts — a thin LocalAPI client with zero transport crates |
 | **`roomler-setup`** | The unified install wizard ([installation.md](installation.md)) |
 
