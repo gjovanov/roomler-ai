@@ -9,12 +9,13 @@ name = "roomlerd"
 path = "src/lib.rs"
 
 [[bin]]
-# P3d Slice B: the OUTPUT binary is `roomlerd` (daemon). The package
-# (`roomler-agent`) + lib (`roomler_agent`) names are UNCHANGED — only
-# the emitted exe filename moves. CI stages a `roomler-agent.exe` alias
-# copy next to it so the installed field fleet (which references the old
-# name via the WiX AgentExe File + the tray spawn fallback) is never
-# orphaned. See wix/main.wxs `AgentExeAlias` + release-agent.yml Copy-Item.
+# The daemon. P3d Slice B moved the OUTPUT binary to `roomlerd`; FR-21 P2a
+# then brought the package and lib names into line, so all three now agree.
+# CI still stages a `roomler-agent.exe` alias copy next to it — the installed
+# field fleet references the old name via the WiX AgentExe File and the
+# desktop companion's spawn fallback, so the alias is a compatibility
+# surface, not a leftover. See wix/main.wxs `AgentExeAlias` +
+# release-agent.yml Copy-Item.
 name = "roomlerd"
 path = "src/main.rs"
 
@@ -546,7 +547,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # cargo-deb (Linux .deb)
 #   cargo deb -p roomlerd --no-build
-# Produces target/debian/roomler-agent_<version>_amd64.deb
+# Produces target/debian/roomlerd_<version>_amd64.deb
 [package.metadata.deb]
 maintainer = "G ROX LTD <goran.jovanov@gmail.com>"
 copyright = "2026, G ROX LTD"
