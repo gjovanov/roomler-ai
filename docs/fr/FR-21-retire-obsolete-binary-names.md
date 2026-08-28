@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#809](https://github.com/gjovanov/roomler-ai/issues/809) |
-| **Status** | in progress — P0/P1/P2a shipped (#812 #813 #814); P2b next; P6 field verification outstanding |
+| **Status** | P0–P5 on master; **field-verified on Linux, Windows and macOS**; the `--check` guard blocks. Open: `--strict` (needs the remaining ~1006 occurrences resolved) |
 | **Opened** | 2026-08-28 |
 | **Baseline** | master `fa364b12` (0.4.11) — every count and anchor below was measured against it |
 | **Scope** | Windows · Linux · macOS — code, comments, docs, `CLAUDE.md`, file names, folder names, env vars |
@@ -443,7 +443,9 @@ whole of it.
 | 2026-08-28 | Full release lane under the renamed packages (dispatch). | **PASS** — both `.deb`s, `.msi`, `.pkg`, companion EXE all build. |
 | 2026-08-28 | **P6 Linux, on three REAL hosts** — mars, jupiter, zeus, each with `roomler-agent 0.4.11-1` genuinely installed and the daemon running. `.deb` from run `33150602388`, moved to each host over the roomler mesh itself (`100.65.4.2` → node). Primary path `apt-get install ./…deb`, not the fallback. | **PASS.** `Replacing files in old package roomler-agent`, exit 0, no conflict, on all three. `/usr/bin/roomlerd`, `/usr/bin/roomler` and the bundled FFmpeg `.so`s transferred owner; `ldd` 0 not-found; node id + overlay ip UNCHANGED; service active on the new binary; `roomlerd --version` now `roomlerd 0.4.11` (production printed `roomler-agent 0.4.11`). |
 | 2026-08-28 | **The RUST_LOG shim, forced onto the legacy spec** — a `.deb` upgrade replaces the packaged unit, so a plain upgrade tests the FILE, not the fallback. Drop-in pinned `RUST_LOG=roomler_agent=info,warn` on mars, then restart. | **PASS.** INFO 40 → 75: 35 new lines from the renamed lib under a spec naming ONLY the retired target. Without the shim it stays 40 and the daemon goes dark above `warn`. Drop-in removed; the operator's own `virtual-desktop.conf` untouched. |
-| — | P6 Windows + macOS: the install/upgrade matrix in §9.4. | *not started* |
+| 2026-08-29 | **P6 Windows** — `CORPLAP-1`, a real corp Windows 11 host, carried onto `agent-v0.4.15` (the first release containing the rename) by the FLEET UPDATER, not by hand. Driven over Fleet RPC. | **PASS.** Service `Roomler` RUNNING from `"C:\Program Files\Roomler\roomlerd.exe" service-run`; `roomlerd --version` -> `roomlerd 0.4.15`; the legacy `RoomlerAgentService` is **not installed** (`OpenService` 1060) — retired, not duplicated. |
+| 2026-08-29 | **P6 macOS** — `MacBook-1`, Apple Silicon (Darwin 25.6 arm64), same updater-driven path. | **PASS, including the TCC assertion.** The bundle is still the frozen `/Library/Roomler/roomler-agent.app` (D5). The 0.4.15 process started `21:36:32Z` — 30 s after the release was published at `21:36:02Z` — and logged `macOS permissions: Screen Recording + Accessibility both granted` at `21:36:34Z`. The highest-risk claim in this FR, checked against a real Mac rather than reasoned about. |
+| 2026-08-29 | **§5 confirmed a SECOND time, independently.** `%PROGRAMDATA%\roomler` on `CORPLAP-1` holds `roomler` and **no** `roomler-agent`. | **PASS.** The literal the viewer used to hardcode is wrong on that host too — two independent Windows hosts now, not one. |
 
 ⚠️ The isolated-dpkg-root row above used `--force-depends` + `--force-script-chrootless` and
 exercised only `dpkg -i`. Its caveat — *"no real host has taken this upgrade"* — **no longer
@@ -452,12 +454,16 @@ install` primary path, with the daemon running and the old package genuinely ins
 tests are complementary rather than redundant — the isolated one covers the stricter `dpkg -i`
 fallback, the fleet one covers the path the self-updater actually tries first.
 
-⚠️ **The rename is a ONE-WAY DOOR, and this is the open risk.** The released `roomler-agent`
-package carries `Replaces: roomler-tunnel` only, so a `.deb` still packaged as `roomler-agent`
-**cannot install** over a converted host — it would overwrite `/usr/bin/roomlerd`, which
-`roomlerd` now owns. Three fleet hosts are converted. Land P2a before the next agent release, or
-add `Replaces: roomlerd` + `Provides: roomlerd` to master's package. The failure is visible and
-non-destructive (the update fails, the host keeps running), but it is a stuck fleet until fixed.
+⚠️ **The one-way-door risk is CLOSED, and it got field-tested by accident — which is better
+than the test I designed.** P2a landed before the next release, so `agent-v0.4.15` shipped as
+`roomlerd` and the fleet updater carried all three converted hosts across on its own. They did
+not take the clean path either: each received a pre-rename `roomler-agent 0.4.13` in between, so
+the sequence actually exercised was *converted → pre-rename release → post-rename release*. End
+state on all three: `/usr/bin/roomlerd` and `/usr/bin/roomler` owned by `roomlerd`, running
+process `/usr/bin/roomlerd`, version `roomlerd 0.4.15`, and `roomler-agent` surviving as a
+file-less entry owning exactly the 11 vestigial paths the design predicted. A one-time
+`apt-get remove roomler-agent` clears those and is safe because `replaces` transferred every
+file — deliberately NOT run here, because that is a fleet action, not a test side effect.
 
 ⚠️ Not a regression, chased rather than assumed: jupiter/zeus sat on `relay:derp/tcp` from the
 dev box after their restarts. From mars both were `direct 0 ms` throughout — only the long-haul
