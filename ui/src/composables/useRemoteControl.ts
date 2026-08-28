@@ -1222,7 +1222,7 @@ export function diagHudEnabled(): boolean {
   }
 }
 
-// FR-24 — which quality pills the toolbar readout shows, per user.
+// FR-26 — which quality pills the toolbar readout shows, per user.
 //
 // The readout grew one pill at a time until it was six wide, and the only
 // way to influence it was an undiscoverable `roomler-rc-diag-hud=1`
@@ -1302,7 +1302,7 @@ export function storedSharpenMode(): SharpenMode {
   try {
     return normalizeSharpenMode(globalThis.localStorage?.getItem(SHARPEN_STORAGE_KEY))
   } catch {
-    // FR-24 - unreadable storage gets the same default a fresh profile does.
+    // FR-26 - unreadable storage gets the same default a fresh profile does.
     return 'on'
   }
 }

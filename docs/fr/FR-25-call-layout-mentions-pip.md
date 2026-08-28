@@ -1,7 +1,7 @@
 # FR-25 — Call UX: layout controls that honour their labels, mentions, PiP, spotlight
 
 **Issue:** [#839](https://github.com/gjovanov/roomler-ai/issues/839)
-**Status:** implemented — awaiting field verification on prod
+**Status:** shipped in #842, live on prod — awaiting the operator's own read
 
 ## Goal
 
@@ -104,4 +104,16 @@ false (iOS Safari) rather than shipping a dead control.
 
 ## Field-verification log
 
-- (pending prod deploy)
+- **2026-08-28 — deployed; the mentions fix is verified against the live
+  bundle.** Prod `v20260828-f98ca7c0b356`, `/health` 200. The prosemirror
+  duplicate-guard string now appears in **exactly one** served chunk —
+  `tiptap-CKsT6A5v.js` (5 hits) with **0** in `MessageBubble-kza3Ixuv.js` —
+  where before the fix it was in two (`tiptap-BIJn1zU9.js` ×4 **and**
+  `MessageBubble-od6guLWD.js` ×1). Same measurement that identified the bug,
+  re-run against what prod serves, so this criterion is genuinely closed.
+  `ConferenceView-Doy6qIeS.js` carries `data-stream-key`, `spotlight` and
+  `fullscreen`. ⚠️ Everything else below is a **behaviour** claim and needs a
+  real call — a chunk containing the code is not the code working.
+- ⚠️ #839 was auto-closed by the merge of #842 (a closing keyword in the PR
+  body) one second after it landed, i.e. **before any field verification**. The
+  workflow closes an FR on verified criteria, not on a merge; reopened.
