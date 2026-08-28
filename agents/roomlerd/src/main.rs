@@ -315,6 +315,17 @@ enum Command {
         #[arg(long, conflicts_with = "approve")]
         deny: bool,
     },
+    /// FR-27 — list, or end, remote-control sessions currently LIVE on this
+    /// device. The headless twin of the desktop app's "Being viewed by …"
+    /// banner, and the only such view on a host with no GUI at all.
+    ///
+    /// `--disconnect <id>` takes exactly the same teardown path as the
+    /// on-screen Disconnect: the daemon closes the peer and tells the server.
+    Rc {
+        /// End this session (hex id from the plain listing).
+        #[arg(long, value_name = "SESSION")]
+        disconnect: Option<String>,
+    },
     /// (internal) Entry point invoked by the Windows Service Control
     /// Manager when `RoomlerAgentService` starts. Hands the process
     /// over to `windows-service`'s dispatcher; the agent main loop
@@ -891,6 +902,7 @@ async fn main() -> Result<()> {
                 consent_cmd(&session, approve, deny).await
             }
         }
+        Command::Rc { disconnect } => rc_cmd(disconnect.as_deref()).await,
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
         Command::EnableSystemContext { no_restart } => enable_system_context_cmd(no_restart),
         Command::DisableSystemContext { no_restart } => disable_system_context_cmd(no_restart),
@@ -1025,6 +1037,64 @@ fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
 /// The direct filesystem write survives as an explicit FALLBACK for a
 /// console-run agent in THIS profile when no daemon is listening on the
 /// local pipe/socket.
+/// FR-27 — list, or end, the remote-control sessions live on this device.
+///
+/// LocalAPI-only, like [`consent_list_cmd`] and for the same reason: a listing
+/// read from the wrong profile would confidently print "nobody is viewing this
+/// device" while someone was.
+async fn rc_cmd(disconnect: Option<&str>) -> Result<()> {
+    let mut client = tunnel_core::localapi::connect()
+        .await
+        .context("connecting to the device service")?;
+
+    if let Some(session) = disconnect {
+        let ok = client
+            .rc_disconnect(session)
+            .await
+            .context("asking the device service to end the session")?;
+        if !ok {
+            anyhow::bail!(
+                "no live remote-control session {session} on this device \
+                 (or the id is not a 24-char hex ObjectId)"
+            );
+        }
+        println!("asked the device service to end session {session}");
+        return Ok(());
+    }
+
+    let sessions = client
+        .rc_sessions()
+        .await
+        .context("asking the device service for live remote-control sessions")?;
+    if sessions.is_empty() {
+        println!("nobody is viewing this device");
+        return Ok(());
+    }
+    for s in &sessions {
+        let who = if s.controller_name.is_empty() {
+            "(unnamed)"
+        } else {
+            &s.controller_name
+        };
+        // Say what they can DO, not just that they are there: "watching" and
+        // "typing on this machine" are different things to be told about.
+        let grant = if s.permissions.to_uppercase().contains("INPUT") {
+            "keyboard + mouse"
+        } else {
+            "view only"
+        };
+        println!("{}  {}  [{}]", s.session_id, who, grant);
+        if !s.org.is_empty() {
+            println!("    org:        {}", s.org);
+        }
+        if !s.permissions.is_empty() {
+            println!("    granted:    {}", s.permissions);
+        }
+        println!("    disconnect: roomler rc --disconnect {}", s.session_id);
+    }
+    Ok(())
+}
+
 /// FR-27 — list every prompt the daemon is currently waiting on.
 ///
 /// Before this the id existed only in a log line, and had to be found inside
@@ -2490,6 +2560,11 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         std::sync::Arc::new(std::sync::Mutex::new(rows))
     };
 
+    // FR-27 — ONE registry for the whole daemon; each signalling loop stores
+    // its own kill channel per session, so a multi-org host routes a Disconnect
+    // to the loop that actually owns that session.
+    let rc_sessions = roomlerd::rc_sessions::RcSessionRegistry::new();
+
     let localapi_state: std::sync::Arc<dyn tunnel_core::localapi::LocalApiState> =
         std::sync::Arc::new(
             localapi_state::DaemonState::new(
@@ -2512,6 +2587,10 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             // as fast as a pushed one (docs/remote-config.md).
             .with_remote_config(remote_cfg.clone())
             // Multi-org P1 — live per-enrollment rows for `roomler status`.
+            // FR-27 — live remote-control sessions, so the desktop app can
+            // render "Being viewed by ..." and offer a Disconnect. Written by
+            // every signalling loop through its ViewerIndicator.
+            .with_rc_sessions(rc_sessions.clone())
             .with_orgs(org_registry.clone())
             .with_org_views(org_views.clone()),
         );
@@ -2578,6 +2657,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         // One clone per org task: each spawn MOVES its capture, so a shared
         // binding would be consumed by the first iteration.
         let remote_cfg_org = remote_cfg.clone();
+        let rc_sessions_org = rc_sessions.clone();
         let org_cfg = cfg.for_org(&org);
         let (org_view_tx, org_view_rx) =
             tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
@@ -2605,6 +2685,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                     broker,
                     org_hub,
                     remote_cfg_org,
+                    rc_sessions_org,
                 )
                 .await
                 {
@@ -2643,6 +2724,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         // Cloned for the org-join closure: it is an `Fn` (called per join), so
         // it must not consume the captured services.
         let remote_cfg2 = remote_cfg.clone();
+        let rc_sessions2 = rc_sessions.clone();
         roomlerd::org_join::install(roomlerd::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
@@ -2749,6 +2831,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 // Per-spawn clone: the async block below MOVES its capture,
                 // and this closure runs once per join.
                 let remote_cfg_join = remote_cfg2.clone();
+                let rc_sessions_join = rc_sessions2.clone();
                 let span = tracing::info_span!("org", label = %org.label);
                 tokio::spawn(tracing::Instrument::instrument(
                     async move {
@@ -2763,6 +2846,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                             broker,
                             org_hub,
                             remote_cfg_join,
+                            rc_sessions_join,
                         )
                         .await
                         {
@@ -2816,6 +2900,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         let connected = localapi_connected.clone();
         let view_tx = overlay_view_tx.clone();
         let sample_slot = rtt_sample_slot.clone();
+        let rc_sessions_primary = rc_sessions.clone();
         async move {
             signaling::run(
                 primary_ctx,
@@ -2828,6 +2913,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                 consent_broker,
                 tunnel_hub,
                 remote_cfg,
+                rc_sessions_primary,
             )
             .await
         }
