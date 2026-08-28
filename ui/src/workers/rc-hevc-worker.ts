@@ -54,10 +54,19 @@ import {
   type RenderPass,
   type SharpenMode,
 } from './rc-fsr-render'
+import {
+  createChunkFraming,
+  stripChunkPrefix,
+} from './rc-chunk-framing'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
   canvas: OffscreenCanvas
+  /** FR-17 — true when the controller negotiated per-chunk framing for
+   *  this session (the agent advertised `chunk-framing` in
+   *  `AgentCaps.video`). Absent/false keeps the pre-FR-17 bare byte
+   *  stream, which is what every agent below 0.4.14 still sends. */
+  chunkFraming?: boolean
   /** Optional codec override. Default is HEVC Main profile, L3.1
    *  (1080p) which covers Gate 0's test resolutions. Bump to
    *  `hev1.1.6.L120.90` (L4.0) for 4K or `hev1.1.6.L150.90` (L5.0)
@@ -299,6 +308,15 @@ function maybeEmitStats(): void {
     bytesReceivedTotal: statsBytesTotal,
     decodeQueueSize: decoder?.decodeQueueSize ?? 0,
     framesDroppedBacklog,
+    // FR-17 - the framing counters, surfaced rather than left
+    // internal: a rising `chunkStragglers` with steady fps is the
+    // unordered transport WORKING (late chunks discarded without
+    // harming the frames after them), while a rising `chunkGaps`
+    // is real loss costing an IDR each. Told apart only if both
+    // are readable - FR-18 shipped a counter nothing read and its
+    // acceptance criterion became unmeasurable.
+    chunkGaps: framingState.gaps,
+    chunkStragglers: framingState.stragglers,
     paint: paintStats.snapshotAndReset(),
     fwd: fwdStats.snapshotAndReset(),
     decode: decodeStats.snapshotAndReset(),
@@ -328,10 +346,26 @@ const assembler = {
   pendingTimestampUs: 0n,
 }
 
+/** FR-17 — reset the byte assembler after a chunk gap. Its header/size
+ *  state describes a frame that can no longer be completed, so leaving it
+ *  in place would make the next good chunk 0 look like payload. */
+function resetAssembler(): void {
+  assembler.headerHave = 0
+  assembler.payloadBuf = null
+  assembler.payloadHave = 0
+}
+
+/** FR-17 — per-session, set by `init-canvas`. Default false so an agent
+ *  that never advertised `chunk-framing` (or a viewer that didn't ask)
+ *  keeps the pre-FR-17 bare byte stream exactly. */
+let chunkFraming = false
+const framingState = createChunkFraming()
+
 workerScope.onmessage = (e) => {
   const msg = e.data
   if (!msg) return
   if (msg.type === 'init-canvas') {
+    if (typeof msg.chunkFraming === 'boolean') chunkFraming = msg.chunkFraming
     canvas = msg.canvas
     // P1 — ctx mode sticks across the idempotent visible-canvas re-init.
     if (msg.ctxMode !== undefined) ctxMode = normalizeCtxMode(msg.ctxMode)
@@ -369,7 +403,27 @@ workerScope.onmessage = (e) => {
     statsBytesInWindow += u8.byteLength
     statsBytesTotal += u8.byteLength
     noteChunkForStallCheck()
-    consumeBytes(u8)
+    // FR-17 — when the session negotiated framing, every message carries
+    // an 8-byte prefix and a gap in it means the frame under assembly can
+    // never complete. Feeding its surviving chunks to `consumeBytes`
+    // would splice two frames into one bitstream, which the decoder
+    // reports as corruption rather than loss, so the assembler is reset
+    // and a fresh IDR requested instead.
+    if (chunkFraming) {
+      const { payload, gap } = stripChunkPrefix(framingState, u8)
+      if (gap) {
+        resetAssembler()
+        workerScope.postMessage({
+          type: 'frame-rejected',
+          reason: 'chunk-gap',
+          gaps: framingState.gaps,
+        })
+        requestKeyframeResync()
+      }
+      if (payload) consumeBytes(payload)
+    } else {
+      consumeBytes(u8)
+    }
     maybeEmitStats()
   } else if (msg.type === 'close') {
     teardown()
