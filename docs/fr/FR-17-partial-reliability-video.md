@@ -1,6 +1,6 @@
 # FR-17: Video rides a reliable + ordered DataChannel
 
-Status: **proposed** (2026-08-27). Tracking issue: `FR-17` (#799). Sibling of FR-16
+Status: **stage A shipped** (2026-08-28; proposed 2026-08-27). Tracking issue: `FR-17` (#799). Sibling of FR-16
 (#798, the harness that must gate it); the architectural half of the FR-1 program.
 
 ## The measurement
@@ -78,10 +78,39 @@ detection) is the whole engineering cost and the whole risk.
 
 ## Design directions (staged, each behind its own kill switch)
 
-**A. Explicit frame framing, still ordered — zero behaviour change.** Add sequence +
-chunk index/count to the wire header so the receiver can detect a gap at all. Landing
-this first lets the assembler's gap handling be validated while the channel is still
-reliable, so stage B flips one property instead of debugging two.
+**A. Explicit frame framing, still ordered — zero behaviour change.** ✅ **SHIPPED**
+(PR #820). Add sequence + chunk index/count to the wire header so the receiver can
+detect a gap at all. Landing this first lets the assembler's gap handling be validated
+while the channel is still reliable, so stage B flips one property instead of debugging
+two.
+
+Wire, when negotiated: an 8-byte prefix per DataChannel message —
+`frame_seq` u32 LE, `chunk_idx` u16 LE, `chunk_count` u16 LE, then the 16 KiB slice.
+Cost 8 bytes on 16 KiB (0.05 %) and one small copy per message; **zero** otherwise.
+
+**Negotiated, never assumed.** The agent advertises `chunk-framing` in the new
+`AgentCaps.video`; the viewer sends `chunk_framing: true` in `rc:session.request` only
+when the agent advertised it AND the session uses a DataChannel transport; the flag is
+resolved immediately before the worker starts, because `init-canvas` carries it. An
+unframed stream parsed as framed is garbage rather than a degraded picture, so the
+request side and the parse side must not be able to move independently.
+
+**Kill switch**: don't send `chunk_framing` — every layer defaults to the pre-FR-17
+bare byte stream, and old agents/servers/viewers are byte-identical to today.
+
+Two receive decisions worth stating, because the opposite reading is defensible until
+you see the cost:
+- A frame that starts while the previous one is still incomplete is **delivered**, with
+  the truncation reported alongside it. Dropping it too would turn one lost chunk into
+  two lost frames.
+- A break is reported **once**, not once per discarded message. Each gap costs a
+  keyframe request, so a long resync must not read as a burst of independent losses.
+
+⚠️ The receive rule lives in ONE module (`ui/src/workers/rc-chunk-framing.ts`) shared by
+both workers rather than copied into each. FR-10 shipped a spacing rule that lived in
+one of its two call sites and silently wasn't in the other (#817), and FR-18 shipped a
+counter that was incremented and never read (#804) — the same shape of hazard, closed
+structurally this time.
 
 **B. Unordered / bounded-retransmit on CONSTRAINED transports only.** The receiver
 discards an incomplete frame and requests an IDR — the `rc:keyframe` resync path
@@ -102,8 +131,14 @@ what makes the reassembler independent of that assumption.
 
 ## Acceptance criteria
 
-- [ ] Stage A ships with the assembler proving gap detection on a synthetic gap, and
-      byte-identical behaviour on the wire otherwise.
+- [x] Stage A ships with the assembler proving gap detection on a synthetic gap, and
+      byte-identical behaviour on the wire otherwise. **Done** (PR #820): 3 agent-side
+      tests (byte layout, reassembly transparent, empty frame = one chunk not zero) and
+      7 viewer-side (in-order, gap-once, resync on chunk 0, truncated-then-new-frame,
+      out-of-spec prefixes, single-chunk frames, `frame_seq` wrap). The single-chunk
+      test caught a real bug pre-merge — a one-chunk frame left `expectSeq` set, so the
+      NEXT frame's chunk 0 read as a truncation: a false gap plus an IDR request on
+      every frame small enough to fit one message.
 - [ ] On the CORPLAP-1 ↔ CORPLAP-3 relay pair under FR-16's deterministic fast-motion profile:
       `send_wait` p99 drops below 250 ms (was: 10 263 ms max), and age p99 drops below
       300 ms.
@@ -127,3 +162,4 @@ what makes the reassembler independent of that assumption.
 | date | build | result |
 |---|---|---|
 | 2026-08-27 | 0.4.9 | Baseline measurements above; FR filed. |
+| 2026-08-28 | — | Stage A merged (#820). Inert by construction: the channel is still `{ ordered: true }`, so a gap cannot fire in production — that is the point of landing it first. **Not a field result**, and deliberately so; the measurable claim belongs to stage B. |
