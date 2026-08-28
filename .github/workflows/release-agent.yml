@@ -1262,8 +1262,8 @@ jobs:
           # to disambiguate. Different UpgradeCode + the mutually-
           # exclusive LaunchConditions ensure a host can only ever
           # have one of the two installed at a time.
-          $wixDir = "agents\roomler-agent\wix"
-          $pmSrc  = "agents\roomler-agent\wix-perMachine\main.wxs"
+          $wixDir = "agents\roomlerd\wix"
+          $pmSrc  = "agents\roomlerd\wix-perMachine\main.wxs"
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
