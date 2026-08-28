@@ -453,6 +453,11 @@ pub async fn run(
     // write lock and the LIVE `exec_enabled` as one value. Machine-wide, so the
     // SAME instance is shared by every org loop; only the primary ever applies.
     remote_cfg: crate::remote_config::RemoteConfigServices,
+    // FR-27 — the daemon-wide live-session registry, so a thin client can see
+    // "Being viewed by …" and end a session. Each loop registers its OWN kill
+    // channel per session, which is what makes a Disconnect on a multi-org
+    // daemon reach the loop that actually owns that session.
+    rc_sessions: crate::rc_sessions::RcSessionRegistry,
 ) -> Result<()> {
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
@@ -471,11 +476,16 @@ pub async fn run(
     // One overlay handle, reused across reconnects. Failing to bring up
     // the indicator is non-fatal — the session still works, the user
     // just doesn't get the visual "you're being watched" cue.
-    let indicator = match ViewerIndicator::new(kill_tx.clone()) {
+    let indicator = match ViewerIndicator::new(kill_tx.clone(), rc_sessions.clone()) {
         Ok(v) => v,
         Err(e) => {
             warn!(%e, "viewer-indicator init failed; continuing without overlay");
-            ViewerIndicator::disabled()
+            // FR-27 — an overlay that could not start must NOT also cost the
+            // device its session registry: `disabled()` carries a private one,
+            // so rebuild the real handle around it. This is the ordinary case
+            // on macOS and Linux, where there is no native overlay at all and
+            // the companion's banner is the only one.
+            ViewerIndicator::disabled().with_registry(kill_tx.clone(), rc_sessions.clone())
         }
     };
     // Keep the sender alive for the loop's lifetime (see above).
@@ -1826,7 +1836,16 @@ async fn handle_server_msg(
             // grant) so an in-prompt operator sees the visual cue
             // alongside the prompt — defence-in-depth against a sneaky
             // unattended grant.
-            indicator.show_session(session_id.to_hex(), controller_name.clone());
+            // FR-27 — the same call also publishes the session to the LocalAPI
+            // registry, so the companion's "Being viewed by …" banner and its
+            // Disconnect exist on every platform, not just the one with a
+            // native overlay.
+            indicator.show_session_full(
+                session_id,
+                controller_name.clone(),
+                permissions.wire_names(),
+                asking_org.clone().unwrap_or_default(),
+            );
             // Spawn a task to run the broker decision in the
             // background; auto-grant resolves <1ms, prompt mode can
             // take up to 30s — we MUST NOT block the WS read loop.

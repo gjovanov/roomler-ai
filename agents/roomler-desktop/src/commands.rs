@@ -962,6 +962,39 @@ pub async fn cmd_get_pending_consents() -> Vec<ConsentRequest> {
     }
 }
 
+/// FR-27 — remote-control sessions currently LIVE on this device, for the
+/// "Being viewed by …" banner.
+///
+/// Never errors, for the same reason as [`cmd_get_pending_consents`]: an empty
+/// list and a daemon-down are the same *render* (no banner), and the Overview
+/// already surfaces daemon-down properly.
+#[tauri::command]
+pub async fn cmd_rc_sessions() -> Vec<roomler_localapi::RcSessionInfo> {
+    match localapi::connect().await {
+        Ok(mut c) => c.rc_sessions().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// FR-27 — the banner's Disconnect. Ends a live session from the DEVICE side;
+/// the daemon closes the peer and tells the server, exactly as the Windows
+/// overlay's own button does.
+#[tauri::command]
+pub async fn cmd_rc_disconnect(session: String) -> Result<(), String> {
+    let mut client = localapi::connect()
+        .await
+        .map_err(|e| format!("Device service unreachable: {e}"))?;
+    let ok = client
+        .rc_disconnect(&session)
+        .await
+        .map_err(|e| format!("LocalAPI error: {e}"))?;
+    if ok {
+        Ok(())
+    } else {
+        Err("That session is no longer active.".into())
+    }
+}
+
 // ─── declared routes (P6 — the Tunnels pane) ───────────────────────
 
 /// Declared routes + live state for the Tunnels pane. NEVER errors —

@@ -41,6 +41,17 @@ pub type KillSender = tokio::sync::mpsc::Sender<bson::oid::ObjectId>;
 #[derive(Clone)]
 pub struct ViewerIndicator {
     inner: Inner,
+    /// FR-27 — the LocalAPI-visible mirror of what this overlay shows.
+    ///
+    /// Maintained HERE rather than at the signalling call sites because
+    /// `show_session` / `hide_session` already are the session lifecycle, and
+    /// there are four of them: keeping the registry in step by hand would be
+    /// four chances to drift, and a banner that outlives its session is worse
+    /// than no banner.
+    registry: crate::rc_sessions::RcSessionRegistry,
+    /// The channel a registry-driven Disconnect fires through — the same one
+    /// the native overlay's own button uses, so both take one teardown path.
+    kill_tx: Option<KillSender>,
 }
 
 impl ViewerIndicator {
@@ -51,9 +62,14 @@ impl ViewerIndicator {
     /// "Disconnect" control that fires through `kill_tx`. Everywhere
     /// else this is a no-op constructor — the returned handle accepts
     /// `show_session` / `hide_session` calls and drops them.
-    pub fn new(kill_tx: KillSender) -> Result<Self> {
+    pub fn new(
+        kill_tx: KillSender,
+        registry: crate::rc_sessions::RcSessionRegistry,
+    ) -> Result<Self> {
         Ok(Self {
-            inner: Inner::new(kill_tx)?,
+            inner: Inner::new(kill_tx.clone())?,
+            registry,
+            kill_tx: Some(kill_tx),
         })
     }
 
@@ -63,7 +79,29 @@ impl ViewerIndicator {
     pub fn disabled() -> Self {
         Self {
             inner: Inner::disabled(),
+            // A disabled OVERLAY is not a disabled session list. Everything
+            // outside Windows lands here today, and those are exactly the
+            // hosts whose only banner is the companion's — reading an empty
+            // registry there would be the bug, not the safe default.
+            registry: crate::rc_sessions::RcSessionRegistry::new(),
+            kill_tx: None,
         }
+    }
+
+    /// FR-27 — attach the shared registry + kill channel to a handle built by
+    /// [`Self::disabled`].
+    ///
+    /// The two capabilities are independent and were conflated: "no native
+    /// overlay on this platform" is the NORMAL state on macOS and Linux, and
+    /// it must not also mean "this device cannot report who is viewing it".
+    pub fn with_registry(
+        mut self,
+        kill_tx: KillSender,
+        registry: crate::rc_sessions::RcSessionRegistry,
+    ) -> Self {
+        self.registry = registry;
+        self.kill_tx = Some(kill_tx);
+        self
     }
 
     /// Announce that a session has started. The overlay redraws to
@@ -71,12 +109,34 @@ impl ViewerIndicator {
     /// times with the same `session_id` (idempotent — the name is
     /// replaced rather than appended).
     pub fn show_session(&self, session_id: String, controller_name: String) {
-        self.inner.show(session_id, controller_name);
+        self.inner.show(session_id.clone(), controller_name);
+    }
+
+    /// FR-27 — the registry-aware form. Same lifecycle point as
+    /// [`Self::show_session`], plus the fields a remote banner needs (the
+    /// grant, the asking org) and the kill channel its Disconnect fires
+    /// through. Callers with that context should prefer it.
+    pub fn show_session_full(
+        &self,
+        session_id: bson::oid::ObjectId,
+        controller_name: String,
+        permissions: String,
+        org: String,
+    ) {
+        self.inner
+            .show(session_id.to_hex(), controller_name.clone());
+        if let Some(kill) = &self.kill_tx {
+            self.registry
+                .insert(session_id, controller_name, permissions, org, kill.clone());
+        }
     }
 
     /// Announce that a session has ended. When the last session drops,
     /// the overlay is hidden.
     pub fn hide_session(&self, session_id: String) {
+        if let Ok(oid) = bson::oid::ObjectId::parse_str(&session_id) {
+            self.registry.remove(&oid);
+        }
         self.inner.hide(session_id);
     }
 }
