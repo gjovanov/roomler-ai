@@ -75,6 +75,8 @@ Every line below was read on `origin/master` at `861d4557`.
    since FR-5 (`main.rs:3251`), so the mechanism was already correct and
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
+   <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is
+        real on every Mac in the field and FR-21 froze it. docs/fr/FR-21 -->
    "Queued for the root update helper — watch /var/log/roomler-agent/update.log"
    never reached the operator: on the one platform where the button did the
    right thing, it looked inert. Fixed by returning the output on non-Windows
