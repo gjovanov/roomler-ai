@@ -565,5 +565,3 @@ mod tests {
         );
     }
 }
-
-// a stray roomler-agent mention, to prove the guard blocks
