@@ -431,9 +431,9 @@ jobs:
             **First-use:**
             1. Extract the archive.
             2. From the Roomler admin UI → Tenant → Tunnels, click "Issue enrollment token".
-            3. Run the copied `roomler-tunnel enroll …` command.
+            3. Run the copied `roomler enroll …` command.
             4. From Admin → Tunnel ACL, create at least one policy authorising your subject + agent + destination.
-            5. Run `roomler-tunnel forward --agent <hex> --local <port> --remote <host:port>`.
+            5. Run `roomler forward --agent <hex> --local <port> --remote <host:port>`.
           files: release/*
 
   # ---------------------------------------------------------------------------

@@ -578,7 +578,7 @@ pub enum ClientMsg {
     // Plan v2 §"What changed from v1" #1 + #2:
     //   * Wire types fold into the existing `rc:*` namespace, NOT a
     //     separate `rc-tunnel:*` namespace or WS endpoint.
-    //   * Each `roomler-tunnel forward` invocation owns ONE peer; many
+    //   * Each `roomler forward` invocation owns ONE peer; many
     //     TCP flows multiplex onto a fixed DC pool via `flow_id`
     //     framing (see `tunnel-core::mux`). No per-flow DC creation.
     //   * Server is the auth boundary — `TcpForwardRequest` rides the
