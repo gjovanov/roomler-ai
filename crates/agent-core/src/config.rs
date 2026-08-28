@@ -295,6 +295,28 @@ pub struct AgentConfig {
     /// (`ROOMLER_NODE_OVERLAY_NETCHECK`). Built-in default: on.
     #[serde(default)]
     pub overlay_netcheck: Option<bool>,
+    /// FR-19 — offer this node as an **org relay**: bind `relay_server_port`
+    /// and answer reachability probes. Opt-IN, default **off**
+    /// (`ROOMLER_NODE_RELAY_SERVER_ENABLED`).
+    ///
+    /// ⚠️ This is FR-19's gate 4 — the refusal that survives a compromised
+    /// server — so it is deliberately device-local and must **never** become
+    /// server-pushable: it is structurally absent from `DesiredConfig`, and a
+    /// test asserts no `relay_*` key ever appears in one.
+    #[serde(default)]
+    pub relay_server_enabled: Option<bool>,
+    /// FR-19 — UDP port for the org-relay listener. Built-in default **3478**,
+    /// which is not a guess: E2E-3 measured the corp-managed target host
+    /// reaching 3478 on an arbitrary public IP and **no other port** (11000 and
+    /// 41641 both failed), so any other default is unreachable by the
+    /// population the feature exists for.
+    ///
+    /// ⚠️ A successful bind does NOT prove reachability. On a host with a
+    /// coturn DNAT the port can be fully consumed in `PREROUTING` while
+    /// `ss -ulnp` shows it free and the listener receives nothing — measured on
+    /// mars, where this exact confound nearly inverted E2E-3's result.
+    #[serde(default)]
+    pub relay_server_port: Option<u32>,
     /// R4 — tunnel `quic-derp-v1` fallback: after repeated quick tunnel
     /// session deaths (a corp capture window killing fresh TURN/TLS legs),
     /// lead the next attempt with QUIC over the ESTABLISHED `/derp` WS
@@ -721,6 +743,16 @@ pub struct AgentConfig {
     /// gate). Env: ROOMLER_NODE_RELAY_AGE_FEEDBACK. Restart required.
     #[serde(default)]
     pub relay_age_feedback: Option<bool>,
+    /// How long ONE frame may sit inside the DataChannel send call before
+    /// the pump treats it as congestion, ms (default 250; 0 disables).
+    ///
+    /// `send_wait` measures the pipe's refusal to drain directly — no clock,
+    /// no viewer, both transports — so it is the one congestion signal that
+    /// still works on a relay, where the goodput clamp is off and the age
+    /// loop rides a probe the congestion itself biases. Acted on for
+    /// CONSTRAINED sessions only. Env: ROOMLER_NODE_SEND_STALL_MS.
+    #[serde(default)]
+    pub send_stall_ms: Option<u32>,
     /// rc.445 — restore the pre-rc.445 Priority-dial resolution caps
     /// (Smoother 1024 everywhere / Balanced 1280 on relay;
     /// `ROOMLER_NODE_PRIORITY_RES_CAP`). Default OFF: every mid-motion
@@ -1612,6 +1644,8 @@ pub fn test_fixture() -> AgentConfig {
         overlay_server_relay_strategy: None,
         overlay_derp_floor: None,
         overlay_netcheck: None,
+        relay_server_enabled: None,
+        relay_server_port: None,
         tunnel_derp_fallback: None,
         tunnel_peers_survive_reattach: None,
         overlay_mbb: None,
@@ -1676,6 +1710,7 @@ pub fn test_fixture() -> AgentConfig {
         fps_pace: None,
         relay_idr_thrift: None,
         relay_age_feedback: None,
+        send_stall_ms: None,
         priority_res_cap: None,
         smoother_rate_pct: None,
         balanced_rate_pct: None,
@@ -1791,7 +1826,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 55] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -1815,6 +1850,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54]
         ),
         ("OVERLAY_DERP_FLOOR", cfg.overlay_derp_floor),
         ("OVERLAY_NETCHECK", cfg.overlay_netcheck),
+        ("RELAY_SERVER_ENABLED", cfg.relay_server_enabled),
         ("TUNNEL_DERP_FALLBACK", cfg.tunnel_derp_fallback),
         (
             "TUNNEL_PEERS_SURVIVE_REATTACH",
@@ -1861,7 +1897,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 54]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 22] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 24] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -1886,11 +1922,13 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 2
         ("CONSTRAINED_HRD_PCT", cfg.constrained_hrd_pct),
         ("DIRECT_QUEUE_MS", cfg.direct_queue_ms),
         ("DIRECT_HRD_PCT", cfg.direct_hrd_pct),
+        ("SEND_STALL_MS", cfg.send_stall_ms),
         ("SMOOTHER_RATE_PCT", cfg.smoother_rate_pct),
         ("BALANCED_RATE_PCT", cfg.balanced_rate_pct),
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
+        ("RELAY_SERVER_PORT", cfg.relay_server_port),
     ]
 }
 
