@@ -1,4 +1,4 @@
-//! `roomler-tunnel self-update` — check the server's tunnel latest-release,
+//! `roomler self-update` — check the server's tunnel latest-release,
 //! download the newer binary through the roomler.ai installer proxy (corp-AV-
 //! friendly, same origin as the manifest), verify its SHA-256, and self-replace
 //! the running executable.
