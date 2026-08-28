@@ -210,6 +210,12 @@
           <p class="text-body-1 legal-muted mt-2">
             <strong>Email:</strong> <a href="mailto:legal@roomler.ai" class="text-primary">legal@roomler.ai</a>
           </p>
+          <p class="text-body-1 legal-muted mt-2">
+            Roomler is operated by <strong>G ROX EOOD</strong>, registered in the Bulgarian Commercial Register
+            under UIC 205174895, with its registered office at Plovdivska 110, 4400 Pazardzhik, Bulgaria, and
+            represented by Goran Jovanov, Manager. Full company details are set out in our
+            <router-link to="/imprint" class="text-primary">Imprint</router-link>.
+          </p>
         </section>
       </v-container>
     </div>
