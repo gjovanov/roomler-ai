@@ -66,34 +66,53 @@ const OLD_SUFFIX: &str = "roomler-desktop.exe.old";
 /// a burst of `launchctl kickstart` / `CreateProcessAsUserW` calls; one attempt
 /// per [`ENSURE_COOLDOWN`] is plenty, since a launch that works is visible
 /// within a second and one that doesn't will not work any better on retry.
-pub async fn ensure_running() {
+/// Returns whether a human can now, in fact, be shown a prompt on this host.
+///
+/// The caller reports `no_prompt_surface` on `false`, which is why this is a
+/// verdict and not a fire-and-forget: without it the agent could only ever
+/// report a TIMEOUT, and "nobody answered in 30 s" and "there is nobody to
+/// ask, and there never was" need different things done about them.
+pub async fn ensure_running() -> bool {
     use std::sync::Mutex;
     use std::time::Instant;
-    static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+    // Both halves of the rate limit: when we last tried, and what we concluded.
+    // A cooldown that returned an optimistic default would report a surface
+    // that does not exist — worse than not rate-limiting at all.
+    static LAST: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
 
+    if let Some((at, verdict)) = *LAST.lock().unwrap()
+        && at.elapsed() < ENSURE_COOLDOWN
     {
-        let mut last = LAST_ATTEMPT.lock().unwrap();
-        if let Some(t) = *last
-            && t.elapsed() < ENSURE_COOLDOWN
-        {
-            return;
-        }
-        *last = Some(Instant::now());
+        return verdict;
     }
 
-    match ensure_running_inner().await {
+    let verdict = match ensure_running_inner().await {
         Ok(EnsureOutcome::AlreadyRunning) => {
-            tracing::debug!("desktop companion is already running")
+            tracing::debug!("desktop companion is already running");
+            true
         }
-        Ok(EnsureOutcome::Started) => tracing::info!("started the desktop companion for a prompt"),
-        Ok(EnsureOutcome::Unsupported) => tracing::debug!(
-            "no desktop companion on this platform — a prompt has no on-screen surface here"
-        ),
-        Err(e) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "could not start the desktop companion — an on-screen prompt is not possible"
-        ),
-    }
+        Ok(EnsureOutcome::Started) => {
+            tracing::info!("started the desktop companion for a prompt");
+            true
+        }
+        Ok(EnsureOutcome::Unsupported) => {
+            tracing::info!(
+                "no desktop companion on this host — an on-screen prompt is not possible; \
+                 answer with `roomler consent --list` / `--approve`, or set this device to \
+                 email/push consent"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "could not start the desktop companion — an on-screen prompt is not possible"
+            );
+            false
+        }
+    };
+    *LAST.lock().unwrap() = Some((Instant::now(), verdict));
+    verdict
 }
 
 /// One attempt per this interval, process-wide.
