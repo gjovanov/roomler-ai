@@ -388,6 +388,8 @@ jobs:
           [ "$count" -ge 3 ] || { echo "::error::expected >=3 launchd jobs, found $count"; exit 1; }
           dupes=$(echo "$labels" | sort | uniq -d)
           [ -z "$dupes" ] || { echo "::error::duplicate launchd Label(s): $dupes"; exit 1; }
+          # RETIRED-NAME-ANCHOR(2): asserts the frozen bundle path. Its name keys the
+          # macOS TCC grants; FR-21 D5 freezes it. docs/fr/FR-21
           grep -q '/Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent' \
             agents/roomler-agent/packaging/macos/com.roomler.daemon.plist
 
@@ -554,6 +556,35 @@ jobs:
         # that is invisible until a device silently falls back to software.
         # They need the library present, not a GPU.
         run: cargo test -p roomler-agent --features ffmpeg-encoder --lib
+
+  name-audit:
+    name: Retired-name audit (FR-21)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # FR-21 (#809). Two assertions, and the PAIR is what makes it sound while the
+    # migration is still in flight:
+    #
+    #   1. unclassified must not RISE   -> nobody adds a fresh retired name
+    #   2. anchors must not FALL        -> nobody deletes a dual-read fallback
+    #
+    # (2) is the half a plain ratchet misses, and it is the half that matters:
+    # deleting an anchor fails no build and no test, it just strands every
+    # pre-rename host at its next update. The macOS `.app` anchor is the worst
+    # case -- its name keys the TCC grants.
+    #
+    # `continue-on-error` is DELIBERATE for now: the real property is
+    # "unclassified == 0", which is only reachable once P1-P4 have landed, and a
+    # job that is red for the whole program trains people to ignore it. P5 flips
+    # this job to blocking and swaps `--check` for `--check --strict`.
+    # Until then the ratchet still does real work on every PR.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit retired product names
+        run: bash scripts/name-audit.sh --check
+      - name: Report (always, so a red run shows WHAT moved)
+        if: always()
+        run: bash scripts/name-audit.sh --summary
 
   frontend:
     name: Frontend checks

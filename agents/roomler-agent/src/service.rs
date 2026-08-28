@@ -148,6 +148,8 @@ mod windows {
     pub const NEW_TASK_NAME: &str = "Roomler";
     /// Pre-rename scheduled-task name, retired best-effort by `install()`
     /// and deleted by `uninstall()`.
+    // RETIRED-NAME-ANCHOR: without this the pre-rename scheduled task survives an
+    // upgrade forever, so the host runs TWO daemons. See docs/fr/FR-21.
     pub const LEGACY_TASK_NAME: &str = "RoomlerAgent";
 
     pub fn install() -> Result<()> {

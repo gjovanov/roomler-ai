@@ -242,6 +242,8 @@ pub fn active_log_path() -> Option<PathBuf> {
     // Own basename first so the Host process's crash sidecars attach the
     // Host log tail; then the standard + legacy names.
     let mut bases = vec![log_basename()];
+    // RETIRED-NAME-ANCHOR: legacy rolled logs on an upgraded host. Dropping the old
+    // prefix makes them invisible to crash sidecars. See docs/fr/FR-21.
     for b in ["roomlerd.log", "roomlerd-service.log", "roomler-agent.log"] {
         if !bases.contains(&b) {
             bases.push(b);
@@ -309,6 +311,7 @@ pub fn tail_source_path(source: &str) -> Option<PathBuf> {
         "daemon" => active_log_path().or_else(|| {
             let dir = resolve_log_dir()?;
             newest_file_matching(&[dir], |name| {
+                // RETIRED-NAME-ANCHOR: see above -- legacy rolled logs stay findable.
                 name.starts_with("roomlerd.log") || name.starts_with("roomler-agent.log")
             })
         }),
@@ -437,6 +440,8 @@ fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
         let lossy = name.to_string_lossy();
         let is_ours = lossy.starts_with("roomlerd.log")
             || lossy.starts_with("roomlerd-service.log")
+            // RETIRED-NAME-ANCHOR: legacy rolled logs must still AGE OUT; dropping this
+            // leaks them forever on an upgraded host. See docs/fr/FR-21.
             || lossy.starts_with("roomler-agent.log")
             || lossy.starts_with("panic-");
         if is_ours && mtime < cutoff {
