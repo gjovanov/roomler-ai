@@ -4,7 +4,7 @@
 //! block from the `REG_MULTI_SZ` value `Environment` under
 //! `HKLM\SYSTEM\CurrentControlSet\Services\<SERVICE_NAME>\`. This
 //! module reads + writes that value, so the installer wizard's
-//! SystemContext mode can flip `ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1`
+//! SystemContext mode can flip `ROOMLERD_ENABLE_SYSTEM_SWAP=1`
 //! (and similar) without an operator shell.
 //!
 //! **NOT** in [`crate::service`] — that module wraps the cross-platform
@@ -358,9 +358,9 @@ mod tests {
 
     #[test]
     fn single_pair_round_trips() {
-        let original = pairs(&[("ROOMLER_AGENT_ENABLE_SYSTEM_SWAP", "1")]);
+        let original = pairs(&[("ROOMLERD_ENABLE_SYSTEM_SWAP", "1")]);
         let encoded = encode_multi_sz(&original);
-        // expected wire: "ROOMLER_AGENT_ENABLE_SYSTEM_SWAP=1\0\0"
+        // expected wire: "ROOMLERD_ENABLE_SYSTEM_SWAP=1\0\0"
         assert_eq!(*encoded.last().unwrap(), 0);
         assert_eq!(encoded[encoded.len() - 2], 0);
         let decoded = decode_multi_sz(&encoded);

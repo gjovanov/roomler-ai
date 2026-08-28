@@ -264,7 +264,7 @@ impl AgentPeer {
     /// rc.62 — `chroma_pref` is the per-session VP9 chroma override
     /// forwarded from `ClientMsg::SessionRequest::chroma_pref`. When
     /// `Some("yuv420" | "yuv444")` the VP9-444 pump uses it instead
-    /// of the agent's `ROOMLER_AGENT_VP9_CHROMA` env var. `None` →
+    /// of the agent's `ROOMLERD_VP9_CHROMA` env var. `None` →
     /// fall back to env var (= operator default).
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -338,7 +338,7 @@ impl AgentPeer {
         // rc.162: hostile-NAT hosts (WSL2 + wsl-vpnkit, other userspace-VPN
         // stacks) mangle UDP source ports, breaking the TURN allocation
         // refresh — the media peer flaps Connected/Disconnected and the
-        // desktop freezes. `ROOMLER_AGENT_ICE_RELAY_TCP=1` pins the media to
+        // desktop freezes. `ROOMLERD_ICE_RELAY_TCP=1` pins the media to
         // the TURNS/TCP relay (the vendored webrtc-ice TCP branch), a single
         // stable TCP connection that survives it — the same escape hatch the
         // tunnel uses on corp VPNs. Opt-in: the default path is unchanged.
@@ -841,7 +841,7 @@ impl AgentPeer {
         // CONNECT_DEADLINE, or (b) sits in Disconnected past
         // DISCONNECTED_GRACE. `Failed` needs no handling here — the
         // state-change handler above already Terminates on it. Kill switch:
-        // `ROOMLER_AGENT_SESSION_WATCHDOG=0`.
+        // `ROOMLERD_SESSION_WATCHDOG=0`.
         {
             let pc_watch = std::sync::Arc::downgrade(&pc);
             let tx_watch = outbound.clone();
@@ -849,9 +849,7 @@ impl AgentPeer {
                 const CONNECT_DEADLINE: Duration = Duration::from_secs(45);
                 const DISCONNECTED_GRACE: Duration = Duration::from_secs(20);
                 if matches!(
-                    std::env::var("ROOMLER_AGENT_SESSION_WATCHDOG")
-                        .ok()
-                        .as_deref(),
+                    tunnel_core::env::node_env("SESSION_WATCHDOG").as_deref(),
                     Some("0") | Some("false")
                 ) {
                     return;
@@ -1335,7 +1333,7 @@ impl Drop for AgentPeer {
 /// especially over TCP on WSL / corp-UDP-blocked nets) is bandwidth- and
 /// head-of-line-constrained, so the DC pumps clamp their bitrate ceiling to
 /// `relay_max_bps()` for it. Unlike the process-wide
-/// `ROOMLER_AGENT_ICE_RELAY_TCP` env flag, this is PER SESSION — the same
+/// `ROOMLERD_ICE_RELAY_TCP` env flag, this is PER SESSION — the same
 /// agent process serves both direct-local and cross-host-relay controllers
 /// (e.g. the WSL virtual-desktop agent advertises a direct mirrored-network
 /// path to a LAN browser AND a TURN-relayed path to a remote one), so the
@@ -1520,12 +1518,12 @@ async fn current_pair_is_relay(
 /// Fail-OPEN by design: hatch off, non-overlay remote, daemon unreachable,
 /// peer unknown, or a slow pipe (>400 ms) → `false`, i.e. exactly today's
 /// behaviour — a broken LocalAPI can never degrade a healthy direct session.
-/// Escape hatch: `ROOMLER_AGENT_OVERLAY_TIER_DETECT=0`.
+/// Escape hatch: `ROOMLERD_OVERLAY_TIER_DETECT=0`.
 #[cfg(any(feature = "vp9-444", feature = "ffmpeg-encoder"))]
 async fn overlay_remote_is_relay_tier(remote_addr: &str, session_id: bson::oid::ObjectId) -> bool {
     use tunnel_core::localapi::ConnectionType;
 
-    // node_env: accepts ROOMLER_NODE_/ROOMLER_AGENT_ prefixes + the
+    // node_env: accepts ROOMLERD_/ROOMLER_NODE_/ROOMLER_AGENT_ prefixes + the
     // `overlay_tier_detect` config key via the S2 fallback map.
     if tunnel_core::env::node_env("OVERLAY_TIER_DETECT").as_deref() == Some("0") {
         return false;
@@ -1614,7 +1612,7 @@ async fn media_pump(
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     // Adaptive bitrate — the peer connection, so the DC pumps can detect
     // THIS session's actual ICE path (relay vs direct) at runtime instead
-    // of the process-wide `ROOMLER_AGENT_ICE_RELAY_TCP` env flag.
+    // of the process-wide `ROOMLERD_ICE_RELAY_TCP` env flag.
     pc: Arc<RTCPeerConnection>,
     // Published each frame with the native (pre-downscale) capture dims so
     // the cursor pump can scale the OS cursor position into the encoded
@@ -1671,7 +1669,7 @@ async fn media_pump(
     // the `video-bytes` channel, route to the FFmpeg-encoder DC pump.
     // Falls through to the VP9-444 path or legacy track-based pump
     // when not selected — including when the feature is compiled in
-    // but `ROOMLER_AGENT_USE_FFMPEG=1` isn't set on this process
+    // but `ROOMLERD_USE_FFMPEG=1` isn't set on this process
     // (caps probe wouldn't have advertised the transport, but a
     // mismatched / old controller could still ask for it).
     // rc.190 — AV1 over DataChannel. Mirrors the HEVC block below; the
@@ -1707,7 +1705,7 @@ async fn media_pump(
             }
             tracing::warn!(
                 %session_id,
-                "negotiated_transport=data-channel-av1 but ROOMLER_AGENT_USE_FFMPEG isn't set — falling back to WebRTC video track"
+                "negotiated_transport=data-channel-av1 but ROOMLERD_USE_FFMPEG isn't set — falling back to WebRTC video track"
             );
         }
         #[cfg(not(feature = "ffmpeg-encoder"))]
@@ -1749,7 +1747,7 @@ async fn media_pump(
             }
             tracing::warn!(
                 %session_id,
-                "negotiated_transport=data-channel-hevc but ROOMLER_AGENT_USE_FFMPEG isn't set — falling back to WebRTC video track"
+                "negotiated_transport=data-channel-hevc but ROOMLERD_USE_FFMPEG isn't set — falling back to WebRTC video track"
             );
         }
         #[cfg(not(feature = "ffmpeg-encoder"))]
@@ -1788,7 +1786,7 @@ async fn media_pump(
             }
             tracing::warn!(
                 %session_id,
-                "negotiated_transport=data-channel-h264 but ROOMLER_AGENT_USE_FFMPEG isn't set — falling back to WebRTC video track"
+                "negotiated_transport=data-channel-h264 but ROOMLERD_USE_FFMPEG isn't set — falling back to WebRTC video track"
             );
         }
         #[cfg(not(feature = "ffmpeg-encoder"))]
@@ -2727,7 +2725,7 @@ async fn run_vp9_444_dc_session(
 /// - DC backpressure AIMD: `dc.buffered_amount` over 1 MiB cuts the
 ///   target by 20% (MD); under 64 KiB for ≥ 5 s adds 10% (AI). Replaces
 ///   the absent REMB feedback path for the DC-transport.
-/// - Optional 60 fps via `ROOMLER_AGENT_VP9_FPS` env var (operator
+/// - Optional 60 fps via `ROOMLERD_VP9_FPS` env var (operator
 ///   opt-in escape hatch — full warmup-probe / control-DC plumbing
 ///   deferred to a follow-up).
 #[cfg(feature = "vp9-444")]
@@ -2776,7 +2774,7 @@ async fn media_pump_vp9_444_dc(
 
     // rc.33: opt-in 60 fps via env var. Default 30 (the pre-rc.33
     // behaviour). Operators on hosts that can sustain SW VP9 encode at
-    // 4K@60 with cpu-used 6 can flip `ROOMLER_AGENT_VP9_FPS=60` to
+    // 4K@60 with cpu-used 6 can flip `ROOMLERD_VP9_FPS=60` to
     // halve perceptual motion latency. No warmup probe in rc.33 — the
     // env var is operator-acknowledged; a CPU-starved host will see
     // frame drops surface in the heartbeat log (`frames_encoded /
@@ -2818,7 +2816,7 @@ async fn media_pump_vp9_444_dc(
 
     // rc.166 freeze fix — relay-aware bitrate clamp + tighter backpressure.
     // The WSL / corp path forces all media over a single TURN-TCP relay
-    // (ROOMLER_AGENT_ICE_RELAY_TCP=1), which carries only ~1-4 Mbps and is
+    // (ROOMLERD_ICE_RELAY_TCP=1), which carries only ~1-4 Mbps and is
     // head-of-line-blocked. The 0.20-bpp VP9-444 target (~12 Mbps at
     // 2560×1600) collapses it. Clamp the encoder to relay_max_bps (3 Mbps
     // default) and, per Change D, trip AIMD at a shallower 256 KiB buffered
@@ -2950,7 +2948,7 @@ async fn media_pump_vp9_444_dc(
     // repainted the "blur pulse on every scroll / window switch" the whole
     // rc.234 round exists to kill. The encoder codes an uncovered region as
     // intra blocks within the same budget anyway. The DETECTOR stays live —
-    // the rc.45 cpu-used motion boost rides it. `ROOMLER_AGENT_SCENE_KF=1`
+    // the rc.45 cpu-used motion boost rides it. `ROOMLERD_SCENE_KF=1`
     // restores the rc.39/43 forcing.
     let scene_kf_enabled = node_env("SCENE_KF").as_deref() == Some("1");
 
@@ -3372,7 +3370,7 @@ async fn media_pump_vp9_444_dc(
             // rc.61 — resolve chroma format. Priority order:
             //   1. Per-session `chroma_pref` from `rc:session.request`
             //      (rc.62 — controller's UI choice).
-            //   2. `ROOMLER_AGENT_VP9_CHROMA` env var (rc.61, operator
+            //   2. `ROOMLERD_VP9_CHROMA` env var (rc.61, operator
             //      default at the host).
             //   3. Yuv444 (pre-rc.61 default, sharpest text).
             // Read at every rebuild so a mid-session env-var flip
@@ -3773,7 +3771,7 @@ async fn media_pump_vp9_444_dc(
 
         if frames_encoded.is_multiple_of(30) {
             // rc.36 — surface target_fps so field operators can verify
-            // ROOMLER_AGENT_VP9_FPS env-var was honored. If target_fps
+            // ROOMLERD_VP9_FPS env-var was honored. If target_fps
             // shows 30 when the operator set 60, the env var didn't
             // reach the agent process (wrong service-block scope, or
             // process wasn't restarted to inherit the new block).
@@ -4115,7 +4113,7 @@ async fn media_pump_ffmpeg_dc(
     // to direct (fps was baked into the capture pacer at pump start). The
     // live AIMD ceiling clamp still follows EVERY flip immediately; the
     // tracker only gates the heavyweight rebuild. Escape hatch
-    // `ROOMLER_AGENT_RATE_PROFILE_REBUILD=0` restores the AIMD-only
+    // `ROOMLERD_RATE_PROFILE_REBUILD=0` restores the AIMD-only
     // behaviour.
     let mut flip_tracker = crate::encode::rate_profile::FlipTracker::new(constrained);
     let rate_profile_rebuild = node_env("RATE_PROFILE_REBUILD").as_deref() != Some("0");
@@ -4169,7 +4167,7 @@ async fn media_pump_ffmpeg_dc(
     // plumbed: rebuild-on-dims-change → guaranteed IDR of the settled
     // native `last_good_frame` (stored pre-downscale), aimd.force_reapply,
     // video_info resend, encoded_dims → cursor scale. Kill switch
-    // `ROOMLER_AGENT_IDLE_REFINE=0`; see rate_profile::IdleRefine.
+    // `ROOMLERD_IDLE_REFINE=0`; see rate_profile::IdleRefine.
     let mut idle_refine = crate::encode::rate_profile::IdleRefine::from_env();
     // rc.130 — 60 ms (was 1 s). Doubles as the SPARSE-INPUT DRAIN. With the
     // HW encoder's output queue capped to ~1 frame (encoder.rs delay=0 /
@@ -4328,7 +4326,7 @@ async fn media_pump_ffmpeg_dc(
     // frame-skip divisor; keyframes never skipped), the rc.186
     // encode-pressure maxrate factor (stepped once per heartbeat), and
     // the 2026-07-27 encode-bound auto-downscale tier (soft slot of the
-    // dims plan; kill `ROOMLER_AGENT_AUTO_DOWNSCALE=0`). The governor
+    // dims plan; kill `ROOMLERD_AUTO_DOWNSCALE=0`). The governor
     // emits continuous bitrate targets; `FfmpegEncoder::set_bitrate`
     // coarsens them to a ladder and applies in-place (NVENC reconfigure)
     // or as a debounced QSV/AMF rebuild whose first frame is an IDR.
@@ -5760,7 +5758,7 @@ async fn media_pump_ffmpeg_dc(
     }
 }
 
-/// Read the `ROOMLER_AGENT_VP9_FPS` env var. Default 30 (pre-rc.33
+/// Read the `ROOMLERD_VP9_FPS` env var. Default 30 (pre-rc.33
 /// behaviour). Accepts 30 or 60 — any other value rounds to the
 /// nearest of those two. Operator-opt-in escape hatch for 4K capable
 /// hosts; default stays at 30 so CPU-starved boxes keep working
@@ -5778,13 +5776,13 @@ fn vp9_444_target_fps_from_env() -> u32 {
 /// Target fps for the FFmpeg HW DC pump (HEVC / vp9_qsv): explicit env wins,
 /// else pick per-session by transport (Phase B).
 ///
-/// An explicit `ROOMLER_AGENT_FFMPEG_FPS` ALWAYS wins (clamped 1..=240) — a
+/// An explicit `ROOMLERD_FFMPEG_FPS` ALWAYS wins (clamped 1..=240) — a
 /// high-refresh host can force 60 even on a relay, or pin 30 on a direct link.
 /// With no override: a direct/LAN link defaults to **60** (HW encode sustains
 /// it and the capture backend caps the real delivered rate anyway); a
 /// constrained relay-TCP link defaults to **30**, because 60 fps of HEVC
 /// overruns the ~1-4 Mbps pipe and just sheds frames. Deliberately distinct
-/// from the libvpx VP9-444 pump's `ROOMLER_AGENT_VP9_FPS` (default 30 — SW
+/// from the libvpx VP9-444 pump's `ROOMLERD_VP9_FPS` (default 30 — SW
 /// 4:4:4 can't keep up at 60).
 ///
 /// Pre-rc.93 the pump hardcoded 30, which throttled the scrap backend's
@@ -6601,15 +6599,14 @@ pub(crate) fn aspect_preserved_target(src_w: u32, src_h: u32, cap_long_edge: u32
 /// near-1:1 NON-INTEGER resample is the worst case for any filter —
 /// text mush + "pixely" form aliasing — while saving almost no bits.
 /// Snapping to Native keeps the chain 1:1 (crisp) whenever the request
-/// is within ~15% of the source. Env `ROOMLER_AGENT_SNAP_NATIVE_PCT`
+/// is within ~15% of the source. Env `ROOMLERD_SNAP_NATIVE_PCT`
 /// (percent, default 85; `0` disables snapping).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
 fn snap_native_scale() -> f32 {
-    let pct = std::env::var("ROOMLER_AGENT_SNAP_NATIVE_PCT")
-        .ok()
+    let pct = tunnel_core::env::node_env("SNAP_NATIVE_PCT")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .unwrap_or(85);
     (pct.min(100) as f32) / 100.0
@@ -8412,7 +8409,7 @@ fn map_ice_servers(servers: &[IceServer]) -> Vec<RTCIceServer> {
 }
 
 /// Filter mapped ICE servers to the TURNS-over-TCP relay only, for
-/// `ROOMLER_AGENT_ICE_RELAY_TCP` mode. Hostile-NAT hosts (WSL2 +
+/// `ROOMLERD_ICE_RELAY_TCP` mode. Hostile-NAT hosts (WSL2 +
 /// wsl-vpnkit, other userspace-VPN stacks) mangle UDP source ports so the
 /// TURN allocation refresh fails and the media peer flaps; a single
 /// TURNS/TCP connection (handled by the vendored `webrtc-ice` TCP branch)
