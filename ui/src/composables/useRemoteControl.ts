@@ -3116,6 +3116,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  misleading noise on DC sessions (the track is a dormant placeholder
    *  there â the DC worker path IS WebCodecs; field 2026-07-28). */
   let sessionDcTransport: string | null = null
+  /** FR-17 — true when THIS session negotiated per-chunk framing: the
+   *  agent advertised `chunk-framing` in `AgentCaps.video` and we asked
+   *  for it in `rc:session.request`. Read by `startVp9_444Path` /
+   *  `startHevcPath` when they hand the worker its `init-canvas`, so the
+   *  parse side can never be enabled without the request side having
+   *  been sent — an unframed stream parsed as framed is garbage, not a
+   *  degraded picture, so the two must move together. */
+  let sessionChunkFraming = false
   // rc.190 (A1) Ã¢ÂÂ true once the USER changed resolution this session, so
   // connect()'s per-agent restore doesn't clobber a pre-connect pick.
   let resolutionUserPickedThisSession = false
@@ -5254,6 +5262,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
           maxQueue: flowParams.maxQueue,
+          // FR-17 — negotiated per session; see `sessionChunkFraming`.
+          chunkFraming: sessionChunkFraming,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -5488,6 +5498,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
           maxQueue: flowParams.maxQueue,
+          // FR-17 — negotiated per session; see `sessionChunkFraming`.
+          chunkFraming: sessionChunkFraming,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -7397,6 +7409,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
 
+    // FR-17 — per-chunk framing is negotiated, never assumed: only when
+    // the agent advertised `chunk-framing` AND this session actually uses
+    // a DataChannel transport (the RTP track has no chunks to frame).
+    // Resolved HERE, immediately before the worker starts, because the
+    // `init-canvas` below carries it — the parse side must not be armed
+    // ahead of the request side.
+    sessionChunkFraming =
+      preferredTransport !== null
+      && (agent?.value?.capabilities?.video ?? []).includes('chunk-framing')
+
     // If we're advertising the data-channel transport, open the DC +
     // worker NOW so the channel lands in the SDP offer. The agent
     // will only actually pump bytes through it when its caps include
@@ -7468,6 +7490,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // older agents ignore the field entirely.
       if (preferredTransport === 'data-channel-hevc' && hevcRextPick) {
         requestPayload.chroma_pref = 'yuv444'
+      }
+      // FR-17 — ask the agent to prefix every `video-bytes` message with
+      // {frame_seq, chunk_idx, chunk_count}. Sent only when the agent's
+      // caps say it understands the field; a pre-FR-17 agent would ignore
+      // it via `#[serde(default)]` anyway, but not sending it keeps the
+      // request wire identical for the fleet that can't use it.
+      if (sessionChunkFraming) {
+        requestPayload.chunk_framing = true
       }
     }
     // Opt-in host audio Ã¢ÂÂ `audio_enabled: true` (omitted when off so

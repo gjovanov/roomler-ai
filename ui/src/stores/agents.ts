@@ -42,6 +42,14 @@ export interface AgentCapabilities {
    *  it's optional here; the auto-rank falls back to deriving from
    *  `hw_encoders` for older agent rows. */
   transports?: string[]
+  /** FR-17 — opt-in `video-bytes` wire extensions the agent understands.
+   *  Today the only value is `'chunk-framing'`: every 16 KiB DataChannel
+   *  message carries an 8-byte {frame_seq, chunk_idx, chunk_count}
+   *  prefix so a receiver can tell a gap from a boundary. Absent on
+   *  agents below 0.4.14, which is exactly why the viewer must ASK for
+   *  it rather than assume it — an unframed stream parsed as a framed
+   *  one is garbage, not a degraded picture. */
+  video?: string[]
   has_input_permission: boolean
   /** Host permissions the OS has actually GRANTED (rc.454+):
    *  'screen-capture', 'input'. macOS is the only platform that gates
