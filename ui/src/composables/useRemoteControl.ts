@@ -6295,6 +6295,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     error.value = null
     sessionId.value = null
+    // FR-22 - the clock starts HERE, not at `rc:session.request`.
+    // Everything between this point and the request is a wait the
+    // operator experiences: re-keying and redialling the signalling
+    // socket (up to RC_PREFLIGHT_WS_WAIT_MS on its own), an HTTP fetch
+    // for TURN credentials, the local-relay probe and the browser's
+    // codec-capability probes. Starting at the request measured none of
+    // it, so a connect that spent its whole wait in the pre-flight
+    // reported a small TTFF and was reported as healthy - which is
+    // exactly the case that reproduced with no snackbar.
+    connectTiming = beginAttempt(reconnectAttempt.value + 1)
     // Per-ATTEMPT, not per-user-connect: each retry has to earn "media
     // flowed" again, otherwise one good session would excuse every frameless
     // one that followed it.
@@ -6329,6 +6339,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.warn('[rc] pre-flight: signalling socket not ready; proceeding (ladder will retry)')
       }
     }
+    markConnect('ws_ready')
 
     // Restore the per-agent resolution preference. This has to live
     // here (not at composable-init) because `useRemoteControl()` runs
@@ -6397,6 +6408,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // Fall back to a public STUN if the server has none configured.
       iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }]
     }
+    markConnect('turn_ready')
 
     // loopback-TURN corp-relay (Phase 2): if opted-in AND this host runs a
     // local enrolled agent serving a loopback TURN, prepend it as an ICE server
@@ -7560,6 +7572,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       preferredTransport !== null
       && (agent?.value?.capabilities?.video ?? []).includes('chunk-framing')
 
+    // Everything above this point - the local-relay probe and the
+    // browser's MediaCapabilities decode probes - runs before a single
+    // byte goes to the server, and on a cold profile the probes are not
+    // free.
+    markConnect('probes_ready')
+
     // If we're advertising the data-channel transport, open the DC +
     // worker NOW so the channel lands in the SDP offer. The agent
     // will only actually pump bytes through it when its caps include
@@ -7653,12 +7671,6 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (overrideReason.value.trim()) {
       requestPayload.override_reason = overrideReason.value.trim()
     }
-    // FR-22 - the attempt clock starts at the request, because that is
-    // the moment the user is waiting from. `reconnectAttempt` is 0 on a
-    // fresh connect and advances with the ladder, so the log line says
-    // whether a slow connect was one slow attempt or a lost one plus a
-    // fast retry - the whole question this instrumentation exists for.
-    connectTiming = beginAttempt(reconnectAttempt.value + 1)
     ws.sendRaw(requestPayload)
     markConnect('request_sent')
     overrideReason.value = ''

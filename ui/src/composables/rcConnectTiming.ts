@@ -27,6 +27,17 @@
  *  being WAITED ON, not which code assigns it, because the diagnostic
  *  question is always "who didn't answer". */
 export type RcConnectMark =
+  /** The signalling socket was open (or the pre-flight gave up waiting).
+   *  ⚠️ This runs BEFORE the request is sent and can legitimately take
+   *  seconds — the socket is re-keyed and redialled when the device's org
+   *  differs from the page's. Leaving it unmeasured was a real defect:
+   *  a connect that spent its whole wait here reported a small TTFF and
+   *  looked healthy. */
+  | 'ws_ready'
+  /** TURN credentials fetched (an HTTP round-trip to the API). */
+  | 'turn_ready'
+  /** Local-relay probe + the browser's codec-capability probes finished. */
+  | 'probes_ready'
   /** `rc:session.request` handed to the WS. */
   | 'request_sent'
   /** Server answered `rc:session.created` — it reached a live hub. */
@@ -45,6 +56,9 @@ export type RcConnectMark =
   | 'first_frame'
 
 const MARK_ORDER: RcConnectMark[] = [
+  'ws_ready',
+  'turn_ready',
+  'probes_ready',
   'request_sent',
   'session_created',
   'ready',
@@ -144,6 +158,9 @@ export function formatConnectTiming(t: RcConnectTiming): string {
  * back to a mark without asking the operator to open devtools.
  */
 const WAIT_LABEL: Record<RcConnectMark, string> = {
+  ws_ready: 'connecting to the signalling server',
+  turn_ready: 'fetching relay credentials',
+  probes_ready: 'checking what this browser can decode',
   request_sent: 'sending the request',
   session_created: 'the server accepting the session',
   ready: 'someone at the device approving the session',
