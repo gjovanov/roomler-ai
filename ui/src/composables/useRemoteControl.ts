@@ -45,6 +45,13 @@ export type RcPhase =
   | 'closed'
   | 'error'
 
+import {
+  beginAttempt,
+  formatConnectTiming,
+  type RcConnectMark,
+  type RcConnectRecorder,
+} from './rcConnectTiming'
+
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
  * (250 ms / 500 ms / 1 s) are tuned for desktop-transition recovery Ã¢ÂÂ
@@ -116,9 +123,19 @@ export function deadAirDelayMs(streak: number): number {
  *   the session. ICE flaps recover in ~1-2 s; a VPN flip on the host
  *   never does Ã¢ÂÂ 4 s separates the two without a visible false-positive
  *   window.
- * - `RC_SIGNALING_TIMEOUT_MS`: max time in `'requesting'` or
- *   `'negotiating'` before the attempt is abandoned and the ladder
- *   advances. `awaiting_consent` is exempt Ã¢ÂÂ the SERVER owns that
+ * - `RC_SIGNALING_TIMEOUT_MS`: max time in `'negotiating'` before the
+ *   attempt is abandoned and the ladder advances. ICE legitimately
+ *   varies by network here (a corp-VPN host reaching a DERP relay is
+ *   nothing like a LAN pair), so this stays generous.
+ * - `RC_REQUEST_TIMEOUT_MS` (FR-22): the same bound applied to
+ *   `'requesting'`, which is a different question - *did the server
+ *   answer at all?* That is one hop, measured sub-second across ten
+ *   consecutive sessions, so guarding it with the ICE-sized number meant
+ *   a lost request cost 15 s before the 250 ms ladder retried and
+ *   succeeded on the normal ~3 s path: about 18 s total, which is
+ *   exactly the "sometimes 10-15 seconds" the operator reported. The bad
+ *   case is now ~7 s; the good case is untouched.
+ *   `awaiting_consent` is exempt from both - the SERVER owns that
  *   timeout (consent_timeout), and a human on a Prompt-mode org device
  *   may legitimately take longer than any client-side number.
  * - Watchdog: ticks every `RC_WATCHDOG_TICK_MS` while connected. After
@@ -131,6 +148,28 @@ export function deadAirDelayMs(streak: number): number {
  */
 export const RC_PC_DISCONNECTED_GRACE_MS = 4000
 export const RC_SIGNALING_TIMEOUT_MS = 15000
+export const RC_REQUEST_TIMEOUT_MS = 4000
+
+/**
+ * FR-22 - how long an attempt may sit in `phase` before the ladder
+ * abandons it. `null` means "do not arm": `awaiting_consent` is
+ * human-paced and server-owned, and the terminal phases have nothing
+ * left to wait for.
+ *
+ * Exported and total over `RcPhase` so the table is unit-lockable and a
+ * new phase must declare its own bound rather than silently inheriting
+ * the ICE-sized one.
+ */
+export function signalingTimeoutFor(phase: RcPhase): number | null {
+  switch (phase) {
+    case 'requesting':
+      return RC_REQUEST_TIMEOUT_MS
+    case 'negotiating':
+      return RC_SIGNALING_TIMEOUT_MS
+    default:
+      return null
+  }
+}
 
 /**
  * PR-1 pre-flight: how long connect() waits for the signalling socket
@@ -2790,6 +2829,46 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    */
   let lastConnectArgs: { agentId: string; permissions: string; orgId?: string } | null = null
   const reconnectAttempt = ref(0)
+  /** FR-22 - ms from `rc:session.request` to the first painted frame on
+   *  the attempt that succeeded. Null until one does. Exposed so the
+   *  viewer HUD and the field can read a NUMBER instead of an anecdote:
+   *  "sometimes 10-15 s" is not something a fix can be measured against. */
+  const lastTtffMs = ref<number | null>(null)
+
+  /** FR-22 - per-attempt connect timing. Null outside an attempt; a
+   *  retry replaces it wholesale so the ladder's second attempt cannot
+   *  overwrite the first one's marks and make a two-attempt connect read
+   *  as one fast one. */
+  let connectTiming: RcConnectRecorder | null = null
+
+  /** Emit the current attempt's timing once, then release it. `reason`
+   *  distinguishes the success line from the abandonment line, because
+   *  an INCOMPLETE record is the diagnostically valuable one - the
+   *  missing mark names the step that never completed. */
+  function logConnectTiming(reason: 'first-frame' | 'abandoned' | 'closed') {
+    const t = connectTiming
+    if (!t) return
+    // A successful attempt reports exactly once, at first paint. Later
+    // teardown must not re-log it as if it were a second connect.
+    if (reason !== 'first-frame' && t.done()) {
+      connectTiming = null
+      return
+    }
+    connectTiming = null
+    const line = formatConnectTiming(t.snapshot())
+    if (reason === 'first-frame') {
+      lastTtffMs.value = t.snapshot().marks.first_frame ?? null
+      console.info('[rc] connect', line)
+    } else {
+      console.warn('[rc] connect', reason, line)
+    }
+  }
+
+  /** Mark a connect milestone on the live attempt, if any. A no-op
+   *  outside an attempt, so callers never have to guard. */
+  function markConnect(name: RcConnectMark) {
+    connectTiming?.mark(name)
+  }
   /** Consecutive sessions that connected but never delivered a frame —
    *  drives `deadAirDelayMs`. Cleared the moment media actually moves. */
   const deadAirStreak = ref(0)
@@ -2834,20 +2913,30 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
-  /** (Re-)arm the signalling stuck-detector. Covers 'requesting'
-   *  (no rc:session.created yet) and 'negotiating' (SDP exchange
-   *  through pc-connected). NOT 'awaiting_consent' Ã¢ÂÂ the server owns
-   *  that timeout. */
+  /** (Re-)arm the signalling stuck-detector for the CURRENT phase.
+   *  FR-22 - the bound is per-phase (`signalingTimeoutFor`): 'requesting'
+   *  waits on ONE server hop, 'negotiating' waits on ICE, and guarding
+   *  the first with the second's number is what made a lost request cost
+   *  15 s. NOT 'awaiting_consent' - the server owns that timeout.
+   *  Call AFTER assigning `phase.value`, so the bound matches the wait. */
   function armSignalingTimeout() {
     clearSignalingTimeout()
+    const stuckIn = phase.value
+    const bound = signalingTimeoutFor(stuckIn)
+    if (bound === null) return
     signalingTimer = setTimeout(() => {
       signalingTimer = null
-      if (phase.value === 'requesting' || phase.value === 'negotiating') {
-        console.warn('[rc] signalling stuck in', phase.value, 'Ã¢ÂÂ retrying')
-        if (lastConnectArgs) scheduleReconnect()
-        else failWith('connection timed out')
-      }
-    }, RC_SIGNALING_TIMEOUT_MS)
+      // Re-read the phase: it may have advanced since we armed, in which
+      // case a later arm owns that wait and this timer is stale.
+      if (phase.value !== stuckIn) return
+      console.warn('[rc] signalling stuck in', stuckIn, 'for', bound, 'ms - retrying')
+      // FR-22 - an abandoned attempt is the informative one: its MISSING
+      // mark names the exact step that never completed, which is what
+      // distinguishes a half-open agent WS from a cross-pod split.
+      logConnectTiming('abandoned')
+      if (lastConnectArgs) scheduleReconnect()
+      else failWith('connection timed out')
+    }, bound)
   }
 
   function stopMediaWatchdog() {
@@ -4834,6 +4923,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
+        markConnect('first_frame')
+        logConnectTiming('first-frame')
         console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height)
       } else if (msg.type === 'transform-active') {
         console.info('[rc] webcodecs transform active', msg)
@@ -5125,6 +5216,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
         vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
+        markConnect('first_frame')
+        logConnectTiming('first-frame')
         console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height)
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
@@ -5302,6 +5395,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
     dc.onopen = () => {
+      markConnect('dc_open')
       console.info('[rc] vp9-444 DC opened')
     }
     dc.onclose = () => {
@@ -5382,6 +5476,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
         hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, 1)
+        markConnect('first_frame')
+        logConnectTiming('first-frame')
         // rc.100 Ã¢ÂÂ the worker now reports the CODED size as width/height and
         // forwards coded/display/visibleRect for field diagnosis. Logging the
         // gap localises the NVDEC HEVC dim mismatch (DEVBOX: agent
@@ -5540,6 +5636,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
     dc.onopen = () => {
+      markConnect('dc_open')
       console.info('[rc] hevc DC opened')
     }
     dc.onclose = () => {
@@ -5719,6 +5816,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           '[rc] session is VIEW-EFFECTIVE: another session already holds input on this host',
         )
       }
+      markConnect('session_created')
       phase.value = 'awaiting_consent'
       // Consent is human-paced on Prompt-mode devices; the SERVER owns
       // that timeout (consent_timeout). Ours only covers requesting/
@@ -5751,6 +5849,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       const livePc = pc
       if (!livePc) return // unreachable: 'proceed' implies pc exists (TS narrowing only)
+      markConnect('ready')
       phase.value = 'negotiating'
       armSignalingTimeout()
       try {
@@ -5761,6 +5860,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           session_id: msg.session_id,
           sdp: offer.sdp,
         })
+        markConnect('offer_sent')
       } catch (e) {
         failWith((e as Error).message || 'createOffer failed')
       }
@@ -5768,6 +5868,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     on('rc:sdp.answer', async (msg) => {
       if (!pc) return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      markConnect('answer')
       try {
         await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
         remoteDescriptionSet = true
@@ -5903,6 +6004,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     error.value = message
     phase.value = 'error'
     cancelReconnect()
+    logConnectTiming('closed')
     lastConnectArgs = null
     teardown()
   }
@@ -6390,6 +6492,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const state = pc?.connectionState
       if (!state) return
       if (state === 'connected') {
+        markConnect('pc_connected')
         phase.value = 'connected'
         // Stand down the pending retry timer, but KEEP the attempt counters:
         // reaching `connected` is not proof the session works. A pair with no
@@ -7512,7 +7615,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     if (overrideReason.value.trim()) {
       requestPayload.override_reason = overrideReason.value.trim()
     }
+    // FR-22 - the attempt clock starts at the request, because that is
+    // the moment the user is waiting from. `reconnectAttempt` is 0 on a
+    // fresh connect and advances with the ladder, so the log line says
+    // whether a slow connect was one slow attempt or a lost one plus a
+    // fast retry - the whole question this instrumentation exists for.
+    connectTiming = beginAttempt(reconnectAttempt.value + 1)
     ws.sendRaw(requestPayload)
+    markConnect('request_sent')
     overrideReason.value = ''
     // Abandon-and-retry if the server never answers the request (WS
     // died mid-send, pod restart, ...). Cleared by rc:session.created.
@@ -7525,6 +7635,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // user already dismissed the viewer, racing the WS rc:terminate
     // we just sent.
     cancelReconnect()
+    // FR-22 - an attempt the operator cancelled mid-connect still has a
+    // story: which step it was waiting on when they gave up is the same
+    // evidence a timeout would have produced.
+    logConnectTiming('closed')
     lastConnectArgs = null
     // End of this agent's session: later picker changes are global-only
     // until the next connect() names an agent again.
@@ -9456,6 +9570,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      * `phase === 'reconnecting'`.
      */
     reconnectAttempt,
+    lastTtffMs,
     /**
      * S3 Ã¢ÂÂ sub-connected health. Non-null while `phase ===
      * 'connected'` but something is off: 'transport_unstable' (pc
