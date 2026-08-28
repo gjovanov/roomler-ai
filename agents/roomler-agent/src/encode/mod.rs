@@ -297,6 +297,20 @@ pub fn relay_deferred_apply_allowed(
     big_move || since_last_apply.is_none_or(|d| d >= MIN_INTERVAL)
 }
 
+/// How long ONE frame may sit inside the DataChannel send call before the
+/// pump treats it as congestion, ms. `0` disables the signal.
+///
+/// Default 250: a healthy relay's send wait sits at ~0.2 ms p50 and, since
+/// FR-18 bounded the carrier queue, ~200 ms p99 — so this fires on the tail
+/// that FR-18 could not reach (SCTP's own window), not on ordinary jitter.
+#[cfg_attr(not(feature = "ffmpeg-encoder"), allow(dead_code))]
+pub fn send_stall_threshold() -> Option<std::time::Duration> {
+    let ms = tunnel_core::env::node_env("SEND_STALL_MS")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(250);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
 /// FR-10 follow-up — MAY a rebuild-bound bitrate apply land right now?
 ///
 /// One named rule for both apply paths. It exists because the spacing was
@@ -1104,6 +1118,15 @@ mod tests {
             1_500_000,
             3_000_000
         ));
+    }
+
+    /// The stall threshold is on by default and sits above the post-FR-18
+    /// p99, so it fires on the SCTP tail rather than on ordinary jitter.
+    #[test]
+    fn send_stall_threshold_defaults_above_the_healthy_tail() {
+        let d = send_stall_threshold().expect("on by default");
+        assert!(d >= std::time::Duration::from_millis(200));
+        assert!(d <= std::time::Duration::from_millis(1000));
     }
 
     /// FR-10 follow-up — the startup ramp must not become a rebuild storm.
