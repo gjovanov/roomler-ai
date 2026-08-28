@@ -46,43 +46,89 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         ],
     )?;
 
-    let _tray = TrayIconBuilder::with_id("roomler-agent-tray")
+    let on_menu = |app: &AppHandle<R>, event: tauri::menu::MenuEvent| match event.id.as_ref() {
+        "open_status" => show_window(app, "/overview"),
+        "open_web" => open_roomler_web(app),
+        "onboarding" => show_window(app, "/onboarding"),
+        "check_updates" => check_updates(app),
+        "open_logs" => {
+            // The resolve probes the service flavour (CLI spawns) — keep
+            // it off the menu/UI thread.
+            tauri::async_runtime::spawn_blocking(|| {
+                let _ = crate::commands::open_log_dir_blocking();
+            });
+        }
+        "quit" => {
+            app.exit(0);
+        }
+        _ => {}
+    };
+    let on_icon = |tray: &tauri::tray::TrayIcon<R>, event: tauri::tray::TrayIconEvent| {
+        // Left-click on the tray icon opens the status window for parity with
+        // operators who expect the icon itself to do something useful.
+        if let tauri::tray::TrayIconEvent::Click {
+            button: tauri::tray::MouseButton::Left,
+            button_state: tauri::tray::MouseButtonState::Up,
+            ..
+        } = event
+        {
+            show_window(tray.app_handle(), "/overview");
+        }
+    };
+
+    // FR-27 — ADOPT the tray Tauri already created from `app.trayIcon` in
+    // tauri.conf.json instead of building a second one.
+    //
+    // Tauri 2 auto-creates a tray from that config block during `build()`,
+    // carrying the icon and NO menu. This function then built its own with
+    // `TrayIconBuilder` — menu, handlers, and (because nothing ever called
+    // `.icon()`) no image at all. The result was two tray entries: one that
+    // looked right and did nothing, and one that was blank and held the whole
+    // menu. That blank one is what the operator was clicking.
+    //
+    // Adopting also keeps ONE source of truth for the image: `iconPath` in the
+    // config, embedded at build time by `tauri-build`.
+    if let Some(tray) = app.tray_by_id(CONFIG_TRAY_ID) {
+        tray.set_menu(Some(menu))?;
+        tray.set_show_menu_on_left_click(false)?;
+        tray.on_menu_event(on_menu);
+        tray.on_tray_icon_event(on_icon);
+        return Ok(());
+    }
+
+    // Fallback: the config block is missing or its id changed. Build one, but
+    // give it an EXPLICIT icon — a tray with no image is indistinguishable
+    // from a broken install, and that is precisely the bug above.
+    tracing::warn!(
+        id = CONFIG_TRAY_ID,
+        "no config-declared tray icon found — building one with the embedded fallback image"
+    );
+    let mut builder = TrayIconBuilder::with_id("roomler-desktop-tray")
         .tooltip("Roomler")
         .menu(&menu)
-        .show_menu_on_left_click(false) // left-click brings up the main window; right-click is the menu
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "open_status" => show_window(app, "/overview"),
-            "open_web" => open_roomler_web(app),
-            "onboarding" => show_window(app, "/onboarding"),
-            "check_updates" => check_updates(app),
-            "open_logs" => {
-                // The resolve probes the service flavour (CLI spawns) — keep
-                // it off the menu/UI thread.
-                tauri::async_runtime::spawn_blocking(|| {
-                    let _ = crate::commands::open_log_dir_blocking();
-                });
-            }
-            "quit" => {
-                app.exit(0);
-            }
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            // Left-click on the tray icon opens the status window
-            // for parity with operators who expect the icon itself
-            // to do something useful.
-            if let tauri::tray::TrayIconEvent::Click {
-                button: tauri::tray::MouseButton::Left,
-                button_state: tauri::tray::MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_window(tray.app_handle(), "/overview");
-            }
-        })
-        .build(app)?;
+        .show_menu_on_left_click(false)
+        .on_menu_event(on_menu)
+        .on_tray_icon_event(on_icon);
+    // The app icon is already embedded (`bundle.icon`) and needs no PNG
+    // decoder at runtime, unlike `Image::from_bytes`, which is behind tauri's
+    // `image-png` feature. Wrong shape for a macOS menu bar — it is not a
+    // template — but VISIBLE, which is the entire job of a fallback here.
+    match app.default_window_icon() {
+        Some(icon) => builder = builder.icon(icon.clone()),
+        // Never silently ship a blank tray. The symptom reads to a user as
+        // "the app did not start", which is how this went unnoticed.
+        None => tracing::error!(
+            "no embedded app icon either — the tray will be BLANK; \
+             check `app.trayIcon` and `bundle.icon` in tauri.conf.json"
+        ),
+    }
+    builder.build(app)?;
     Ok(())
 }
+
+/// The id Tauri gives the tray it creates from `app.trayIcon`. Set explicitly
+/// in `tauri.conf.json` so this lookup does not depend on Tauri's default.
+const CONFIG_TRAY_ID: &str = "roomler";
 
 /// Show + focus the main window and route the SPA to `path` (a hash-router
 /// path like `/overview`). The router treats an unknown hash as `/overview`,

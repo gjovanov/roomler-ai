@@ -675,11 +675,18 @@ pub struct RouteInfo {
     pub state: RouteState,
 }
 
-/// One remote-control session awaiting an operator consent decision (rc.46).
+/// One request awaiting an operator consent decision (rc.46).
 /// Surfaced by [`Request::ConsentPending`] so the desktop app renders its
 /// Approve/Deny modal over the LocalAPI instead of reading the daemon's private
 /// sentinel dir — which lives in the daemon's profile and is unreachable to the
 /// interactive-user app when the daemon runs as SYSTEM (P2b bug fix).
+///
+/// FR-27 — no longer remote-control only. Fleet-RPC `exec` and Roomler SSH have
+/// always prompted through the same broker, but never wrote a marker, so their
+/// prompts were invisible to every UI and answerable only by someone who greped
+/// the daemon log for a request id inside 30 s. [`Self::kind`] is what lets one
+/// modal serve all three without lying about which is which — "approve this"
+/// means something very different for a screen share and for a root shell.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ConsentRequest {
     pub session_id: String,
@@ -690,6 +697,27 @@ pub struct ConsentRequest {
     pub permissions: String,
     #[serde(default)]
     pub timeout_secs: u64,
+    /// FR-27 — which subsystem is asking: `rc` (screen control), `exec` (a
+    /// command) or `ssh` (a shell). `#[serde(default)]` yields `""` from a
+    /// pre-FR-27 daemon, which a reader should treat as `rc` — the only kind
+    /// that existed then.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// FR-27 — the one line that makes the decision answerable: the redacted
+    /// command for `exec`, the principal + account mode for `ssh`, empty for
+    /// `rc` (where `controller_name` and `permissions` already say everything).
+    ///
+    /// ⚠️ Redacted BY THE DAEMON before it is written. A consent prompt is
+    /// rendered by a GUI process and can be screenshotted, and `exec` payloads
+    /// routinely carry tokens — `exec::redactor()` runs first, as it does for
+    /// exec output leaving the host.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// FR-27 — unix-millis deadline, so a panel can show a real countdown
+    /// instead of restarting one every time it re-reads the list. `0` from a
+    /// pre-FR-27 daemon means "unknown"; fall back to `timeout_secs`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub expires_at_ms: u64,
     /// Multi-org — the organization the request comes from, so the modal can
     /// say WHO is asking. On a device enrolled in two orgs, "Alice wants to
     /// control this machine" is not enough to decide on: Alice may be a
@@ -2202,6 +2230,9 @@ mod tests {
                 controller_name: "alice".into(),
                 permissions: "view|control".into(),
                 timeout_secs: 30,
+                kind: "rc".into(),
+                detail: String::new(),
+                expires_at_ms: 0,
                 org: "Acme".into(),
             }]
         }
@@ -2992,6 +3023,9 @@ mod tests {
             controller_name: "Alice".into(),
             permissions: "VIEW_SCREEN".into(),
             timeout_secs: 30,
+            kind: String::new(),
+            detail: String::new(),
+            expires_at_ms: 0,
             org: String::new(),
         };
         let json = serde_json::to_string(&single).unwrap();
@@ -3008,5 +3042,59 @@ mod tests {
         let round: ConsentRequest =
             serde_json::from_str(&serde_json::to_string(&multi).unwrap()).unwrap();
         assert_eq!(round.org, "Acme GmbH");
+    }
+
+    /// FR-27 — `kind` / `detail` / `expires_at_ms` are additive in exactly the
+    /// same way, and for the same reason: the desktop app and the daemon do not
+    /// step forward in the same instant.
+    ///
+    /// The empty defaults are load-bearing, not incidental. A pre-FR-27 daemon
+    /// wrote only remote-control prompts, so an absent `kind` MUST read as
+    /// `rc` at the UI — an empty string rendered literally would label a real
+    /// screen-control request with a blank type.
+    #[test]
+    fn consent_request_kind_and_detail_are_additive() {
+        let legacy: ConsentRequest = serde_json::from_str(
+            r#"{"session_id":"abc","controller_name":"Alice","permissions":"VIEW_SCREEN","timeout_secs":30}"#,
+        )
+        .expect("a pre-FR-27 payload must still parse");
+        assert_eq!(legacy.kind, "");
+        assert_eq!(legacy.detail, "");
+        assert_eq!(legacy.expires_at_ms, 0);
+
+        // An rc prompt carries no detail and must not ship empty keys.
+        let rc = ConsentRequest {
+            session_id: "abc".into(),
+            controller_name: "Alice".into(),
+            permissions: "VIEW".into(),
+            timeout_secs: 30,
+            kind: "rc".into(),
+            detail: String::new(),
+            expires_at_ms: 0,
+            org: String::new(),
+        };
+        let json = serde_json::to_string(&rc).unwrap();
+        assert!(
+            !json.contains("\"detail\""),
+            "empty detail must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("\"expires_at_ms\""),
+            "an unknown deadline must be omitted, not sent as 0: {json}"
+        );
+
+        // An exec prompt carries the whole point of the change: what is about
+        // to run, and until when.
+        let exec = ConsentRequest {
+            kind: "exec".into(),
+            detail: "systemctl restart roomlerd".into(),
+            expires_at_ms: 1_700_000_000_000,
+            ..rc
+        };
+        let round: ConsentRequest =
+            serde_json::from_str(&serde_json::to_string(&exec).unwrap()).unwrap();
+        assert_eq!(round.kind, "exec");
+        assert_eq!(round.detail, "systemctl restart roomlerd");
+        assert_eq!(round.expires_at_ms, 1_700_000_000_000);
     }
 }

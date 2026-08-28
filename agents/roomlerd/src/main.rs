@@ -287,21 +287,27 @@ enum Command {
         #[arg(long)]
         flavour: Option<String>,
     },
-    /// Approve or deny a pending operator-consent prompt for a remote-
-    /// control session. Used when the agent's `auto_grant_session` is
-    /// `false` (org-controlled fleets). Prefers the running device
-    /// service over its LocalAPI (works regardless of which profile the
-    /// service runs under — incl. SYSTEM/SCM installs); falls back to a
-    /// sentinel file under `<log_dir>/consent/` in THIS profile when no
-    /// service is listening (console-run agent). 30 s timeout from the
-    /// agent's POV, after which the broker auto-denies. Read the
-    /// agent's log line to find the session id awaiting approval.
+    /// List, approve or deny pending operator-consent prompts (remote
+    /// control, `exec`, SSH). Used when the device prompts rather than
+    /// auto-granting. Prefers the running device service over its LocalAPI
+    /// (works regardless of which profile the service runs under — incl.
+    /// SYSTEM/SCM installs); falls back to a sentinel file under
+    /// `<log_dir>/consent/` in THIS profile when no service is listening
+    /// (console-run agent). 30 s from the agent's POV, after which the
+    /// broker auto-denies.
+    ///
+    /// `--list` is FR-27: the id was previously obtainable only by grepping
+    /// the daemon log, inside the same 30 s the operator had to answer in,
+    /// which made the headless path close to unusable.
     Consent {
-        /// Hex `session_id` from the agent's log line
-        /// "operator consent required" — typically a 24-character
+        /// Show every prompt currently awaiting a decision, and exit.
+        #[arg(long, short = 'l', conflicts_with_all = ["approve", "deny"])]
+        list: bool,
+        /// Hex `session_id` (or exec request id) from `--list` or the
+        /// agent's "operator consent required" log line — a 24-character
         /// MongoDB ObjectId hex string.
-        #[arg(long)]
-        session: String,
+        #[arg(long, required_unless_present = "list")]
+        session: Option<String>,
         /// Approve the session.
         #[arg(long, conflicts_with = "deny")]
         approve: bool,
@@ -872,10 +878,19 @@ async fn main() -> Result<()> {
             sweep_old_versions_cmd(dry_run, flavour.as_deref())
         }
         Command::Consent {
+            list,
             session,
             approve,
             deny,
-        } => consent_cmd(&session, approve, deny).await,
+        } => {
+            if list {
+                consent_list_cmd().await
+            } else {
+                // `required_unless_present = "list"` makes this infallible.
+                let session = session.unwrap_or_default();
+                consent_cmd(&session, approve, deny).await
+            }
+        }
         Command::SelfUpdate { check_only } => self_update_cmd(check_only).await,
         Command::EnableSystemContext { no_restart } => enable_system_context_cmd(no_restart),
         Command::DisableSystemContext { no_restart } => disable_system_context_cmd(no_restart),
@@ -1010,6 +1025,51 @@ fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
 /// The direct filesystem write survives as an explicit FALLBACK for a
 /// console-run agent in THIS profile when no daemon is listening on the
 /// local pipe/socket.
+/// FR-27 — list every prompt the daemon is currently waiting on.
+///
+/// Before this the id existed only in a log line, and had to be found inside
+/// the same 30 s window the operator had to answer in. That made the headless
+/// consent path close to unusable, which in turn is part of why every device in
+/// the field is left on `auto`.
+///
+/// Deliberately LocalAPI-only: the sentinel-file fallback in [`consent_cmd`]
+/// exists because a decision written to the wrong profile is silently inert,
+/// but a LISTING read from the wrong profile is worse — it would confidently
+/// print "nothing pending" while the daemon waits.
+async fn consent_list_cmd() -> Result<()> {
+    let mut client = tunnel_core::localapi::connect()
+        .await
+        .context("connecting to the device service")?;
+    let pending = client
+        .consent_pending()
+        .await
+        .context("asking the device service for pending consent prompts")?;
+    if pending.is_empty() {
+        println!("no consent prompt is waiting for a decision");
+        return Ok(());
+    }
+    for p in &pending {
+        // Pre-FR-27 daemons write no `kind`; the only kind that existed then
+        // was remote control.
+        let kind = if p.kind.is_empty() { "rc" } else { &p.kind };
+        println!("{}  [{}]  from {}", p.session_id, kind, p.controller_name);
+        if !p.org.is_empty() {
+            println!("    org:         {}", p.org);
+        }
+        if !p.permissions.is_empty() {
+            println!("    permissions: {}", p.permissions);
+        }
+        if !p.detail.is_empty() {
+            println!("    request:     {}", p.detail);
+        }
+        println!(
+            "    approve:     roomler consent --session {} --approve",
+            p.session_id
+        );
+    }
+    Ok(())
+}
+
 async fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()> {
     let kind = roomlerd::consent::SentinelKind::from_flags(approve, deny)?;
     let allow = matches!(kind, roomlerd::consent::SentinelKind::Approve);
