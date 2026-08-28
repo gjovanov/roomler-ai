@@ -80,14 +80,18 @@
           </p>
         </section>
 
+        <!--
+          Deliberately no EU "Online Dispute Resolution platform" link here.
+          Regulation (EU) 2024/3228 repealed Regulation (EU) No 524/2013 and
+          the ODR platform ceased operating on 20 July 2025, so the link that
+          still appears in most imprint boilerplate is dead. Do not re-add it.
+        -->
         <section class="mb-8">
-          <h2 class="text-h5 font-weight-bold mb-3">8. Online Dispute Resolution</h2>
+          <h2 class="text-h5 font-weight-bold mb-3">8. Consumer Disputes</h2>
           <p class="text-body-1 legal-muted">
-            The European Commission provides a platform for online dispute resolution at
-            <a href="https://ec.europa.eu/consumers/odr" class="text-primary" rel="noopener" target="_blank">ec.europa.eu/consumers/odr</a>.
             We are neither obliged nor willing to participate in dispute resolution proceedings before a
-            consumer arbitration board, and prefer to resolve any concern directly — please write to
-            <a href="mailto:legal@roomler.ai" class="text-primary">legal@roomler.ai</a>.
+            consumer arbitration board. We would much rather resolve any concern directly — please write to
+            <a href="mailto:legal@roomler.ai" class="text-primary">legal@roomler.ai</a> and we will respond.
           </p>
         </section>
       </v-container>
