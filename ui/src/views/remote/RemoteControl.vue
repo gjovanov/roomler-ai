@@ -1738,18 +1738,24 @@ async function onFilePicked(ev: Event) {
   }
 }
 
-// --- rc.23 hotfix #6: staging quick-access path ---
+// --- staging quick-access ---
 //
-// rc.22 always-PROGRAMDATA staging puts in-flight upload partials
-// under this fixed path on every Windows agent. Defining the path
-// as a JS string here (rather than inlining in the @click handler)
-// avoids the Vue-template / HTML-attribute / JS-string escaping
-// stack that produced double-backslashes in the literal sent to
-// the agent ("canonicalising C:\\ProgramData\\..." error). The
-// string below contains exactly one backslash per separator after
-// JS string-literal evaluation; the agent's path resolver handles
-// it natively.
-const STAGING_PATH = 'C:\\ProgramData\\roomler\\roomler-agent\\staging'
+// A SENTINEL, not a path. The agent resolves it against its own layout
+// (`files::STAGING_SENTINEL` -> `machine_global_dir().join("staging")`,
+// falling back to the machine-global root while no update is in flight).
+//
+// FR-21 P4: this was a hardcoded
+// RETIRED-NAME-ANCHOR: quotes the defective literal this fix removed; the old
+// spelling is the evidence, not a stale reference. docs/fr/FR-21
+// `C:\ProgramData\roomler\roomler-agent\staging`, which was right only on
+// hosts carrying the pre-rename tree — `machine_global_dir()` resolves the
+// `roomler` segment on a fresh install. Confirmed broken on a real
+// SYSTEM-mode Windows host, where that parent directory does not exist.
+//
+// Sending a token instead of a path also retires the Vue-template /
+// HTML-attribute / JS-string escaping stack that produced the doubled
+// backslashes behind the old "canonicalising C:..." error.
+const STAGING_PATH = '<staging>'
 
 // --- rc.23 agent log viewer state ---
 //
