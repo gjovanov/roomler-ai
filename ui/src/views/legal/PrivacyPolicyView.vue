@@ -245,9 +245,12 @@
             We implement industry-standard security measures, including encrypted connections (TLS/HTTPS),
             secure WebSocket connections, encrypted media streams, modern encryption between devices on the
             private network, signed and verified agent updates, and access controls that deny by default. Access
-            to devices is gated independently at several layers, including a setting on the device itself that a
-            compromise of our servers could not override. While we strive to protect your information, no method
-            of electronic transmission or storage is 100% secure, and we cannot guarantee absolute security.
+            to devices is gated independently at several layers, and the last of them is a setting held on the
+            device itself: by default our servers cannot change it, so a compromise of our systems does not by
+            itself open a device. A device's administrator may choose to delegate that setting to us, but that is
+            their decision to make and it is off unless they make it. While we strive to protect your information,
+            no method of electronic transmission or storage is 100% secure, and we cannot guarantee absolute
+            security.
           </p>
         </section>
 
