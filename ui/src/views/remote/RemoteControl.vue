@@ -21,11 +21,17 @@
         <v-icon :color="statusColor" size="small" class="mr-2 flex-shrink-0">
           mdi-circle
         </v-icon>
-        <span class="text-truncate">{{ agent?.name || 'Agent' }}</span>
+        <!-- FR-24 — the admin-set display name wins, as it does on /devices
+             and the dashboard mesh; the machine name rides the subtitle so
+             the mapping stays visible. -->
+        <span class="text-truncate">{{ agent?.display_name || agent?.name || 'Agent' }}</span>
         <!-- OS + version subtitle hidden on phone-sized viewports;
              they're useful context on a desktop but on mobile they
              push Connect/Disconnect off the right edge. -->
         <span v-if="agent" class="text-caption text-medium-emphasis ml-2 d-none d-sm-inline">
+          <template v-if="agent.display_name && agent.display_name !== agent.name">
+            {{ agent.name }} ·
+          </template>
           {{ agent.os }} · {{ agent.agent_version || '—' }}
         </span>
       </v-toolbar-title>
@@ -178,14 +184,14 @@
         role="status"
         aria-live="polite"
       >
-        <span class="stats-pill">{{ statsCodecLabel }}</span>
-        <span class="stats-pill">{{ statsBitrateLabel }}</span>
-        <span class="stats-pill">{{ statsFpsLabel }}</span>
-        <span v-if="statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
+        <span v-if="metrics.codec" class="stats-pill">{{ statsCodecLabel }}</span>
+        <span v-if="metrics.bitrate" class="stats-pill">{{ statsBitrateLabel }}</span>
+        <span v-if="metrics.fps" class="stats-pill">{{ statsFpsLabel }}</span>
+        <span v-if="metrics.resolution && statsResolutionLabel" class="stats-pill">{{ statsResolutionLabel }}</span>
         <!-- FR-1 P7 — end-to-end frame age (agent framing → canvas paint),
              the RustDesk-"Delay" analogue. Appears once the rc:clock probe
              locks; absent on old agents and the classic video-tag path. -->
-        <span v-if="statsAgeLabel" class="stats-pill">{{ statsAgeLabel }}</span>
+        <span v-if="metrics.age && statsAgeLabel" class="stats-pill">{{ statsAgeLabel }}</span>
         <!-- P1 — per-hop pipeline diagnostics (paint / fwd / decode ms,
              output gap, queue, drops, main-thread long tasks). Opt-in via
              localStorage roomler-rc-diag-hud=1; the numbers that decide
@@ -856,7 +862,19 @@
             <v-icon>mdi-close</v-icon>
           </v-btn>
         </v-toolbar>
+        <!-- FR-24 — four tabs instead of one long scroll. The dialog is
+             fullscreen on a phone, where ~8 stacked buttons plus three
+             sections meant the Session tools were below two screenfuls. -->
+        <v-tabs v-model="settingsTab" density="comfortable" color="primary" grow>
+          <v-tab value="video" prepend-icon="mdi-video-outline">Video</v-tab>
+          <v-tab value="display" prepend-icon="mdi-monitor-screenshot">Display</v-tab>
+          <v-tab value="metrics" prepend-icon="mdi-speedometer">Metrics</v-tab>
+          <v-tab value="session" prepend-icon="mdi-tools">Session</v-tab>
+        </v-tabs>
+        <v-divider />
         <v-card-text class="pa-3 pa-md-4">
+          <v-tabs-window v-model="settingsTab">
+          <v-tabs-window-item value="video">
           <!-- A. VIDEO — host-side capture/encode; applies on next Connect -->
           <div class="d-flex align-center ga-2 mb-3">
             <v-icon size="small" color="primary">mdi-video-outline</v-icon>
@@ -903,9 +921,10 @@
           </v-btn-toggle>
           <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ priorityHint }}</div>
 
-          <v-divider class="my-4" />
+          </v-tabs-window-item>
 
-          <!-- B. DISPLAY — viewer-side scaling; live -->
+          <v-tabs-window-item value="display">
+          <!-- B. DISPLAY — viewer-side scaling + sharpening; live -->
           <div class="d-flex align-center ga-2 mb-3">
             <v-icon size="small" color="primary">mdi-fit-to-screen-outline</v-icon>
             <span class="text-subtitle-2 font-weight-medium">Display</span>
@@ -962,8 +981,64 @@
           </v-btn-toggle>
           <div class="text-caption text-medium-emphasis mb-2 ml-1">{{ sharpenHint }}</div>
 
-          <v-divider class="my-4" />
+          </v-tabs-window-item>
 
+          <v-tabs-window-item value="metrics">
+          <!-- FR-24 — one checkbox per pill in the toolbar readout. All on
+               except `paint`: the per-hop numbers answer a question you only
+               ask while chasing an fps ceiling. -->
+          <div class="d-flex align-center ga-2 mb-1">
+            <v-icon size="small" color="primary">mdi-speedometer</v-icon>
+            <span class="text-subtitle-2 font-weight-medium">Quality metrics</span>
+          </div>
+          <div class="text-caption text-medium-emphasis mb-2 ml-1">
+            Shown in the toolbar while a session is connected.
+          </div>
+          <v-checkbox
+            v-model="metrics.codec"
+            density="compact"
+            hide-details
+            label="Codec, transport and decoder"
+            :messages="statsCodecLabel || 'e.g. AV1 4:2:0 HW (av1_qsv) · direct · dec HW · FSR'"
+          />
+          <v-checkbox
+            v-model="metrics.bitrate"
+            density="compact"
+            hide-details
+            label="Bitrate"
+            :messages="statsBitrateLabel || 'e.g. 1.8 Mbps'"
+          />
+          <v-checkbox
+            v-model="metrics.fps"
+            density="compact"
+            hide-details
+            label="Frame rate"
+            :messages="statsFpsLabel || 'e.g. 13 fps'"
+          />
+          <v-checkbox
+            v-model="metrics.resolution"
+            density="compact"
+            hide-details
+            label="Resolution"
+            :messages="statsResolutionLabel || 'e.g. 2880×1800'"
+          />
+          <v-checkbox
+            v-model="metrics.age"
+            density="compact"
+            hide-details
+            label="Frame age (end to end)"
+            :messages="statsAgeLabel || 'e.g. ~4 ms — needs agent 0.4.9+'"
+          />
+          <v-checkbox
+            v-model="metrics.paint"
+            density="compact"
+            hide-details
+            label="Pipeline diagnostics"
+            messages="paint / forward / decode milliseconds — for chasing an fps ceiling"
+          />
+          </v-tabs-window-item>
+
+          <v-tabs-window-item value="session">
           <!-- C. SESSION — host audio + connected-only tools -->
           <div class="d-flex align-center ga-2 mb-3">
             <v-icon size="small" color="primary">mdi-cog-outline</v-icon>
@@ -1099,6 +1174,8 @@
               Agent logs
             </v-btn>
           </template>
+          </v-tabs-window-item>
+          </v-tabs-window>
         </v-card-text>
       </v-card>
     </v-dialog>
@@ -1412,6 +1489,8 @@ import {
   nextDirPath,
   isKeyboardLockSupported,
   diagHudEnabled,
+  storedMetricToggles,
+  persistMetricToggles,
   remoteCursorCssFor,
   type RcScaleMode,
   type RcResolutionSetting,
@@ -2447,7 +2526,12 @@ const isHevcRender = computed<boolean>(() => rc.hevcActive.value)
 // P1 — per-hop diagnostics pill (opt-in localStorage roomler-rc-diag-hud=1).
 // Read once at mount: flipping the flag is a reload-scoped A/B, matching the
 // other roomler-rc-* diagnosis knobs.
-const showDiagHud = diagHudEnabled()
+// FR-24 - per-pill visibility, persisted per user. `paint` inherits the
+// legacy roomler-rc-diag-hud flag on first read (see storedMetricToggles).
+const settingsTab = ref<'video' | 'display' | 'metrics' | 'session'>('video')
+const metrics = ref(storedMetricToggles())
+watch(metrics, (m) => persistMetricToggles(m), { deep: true })
+const showDiagHud = computed(() => metrics.value.paint)
 const diagLabel = computed(() => {
   const d = rc.decodeDiag.value
   if (!d) return ''
