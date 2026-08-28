@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Lock-screen detection for the user-context worker (M3 Z-path).
 //!
 //! Background. The M5 verification on the field-test host + operator confirmed

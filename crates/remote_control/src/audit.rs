@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Audit log writer + the `remote_sessions` row projection.
 //!
 //! Audit writes must never block a session-control path. We fan them through

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 G ROX EOOD
 //! Multi-org — add an ALREADY-ENROLLED device to a second organization from
 //! the admin UI, without touching the machine.
 //!

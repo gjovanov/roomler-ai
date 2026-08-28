@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Agent-side forward allowlist — the second gate after the
 //! server-side ACL in `api/ws/tunnel.rs`.
 //!

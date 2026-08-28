@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! DERP client carrier — a pubkey-addressed relay for the both-UDP-blocked
 //! overlay tier (NAT-traversal Phase D).
 //!

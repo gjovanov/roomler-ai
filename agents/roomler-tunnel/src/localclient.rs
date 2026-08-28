@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `roomler status | peers | flows` — the thin-client read verbs.
 //!
 //! These connect to the **local** daemon's LocalAPI (the ACL-gated named pipe /

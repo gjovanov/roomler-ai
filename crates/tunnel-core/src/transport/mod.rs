@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Pluggable data-plane transport.
 //!
 //! v1 ships [`webrtc_dc::TunnelPeer`] (SCTP DataChannels over the

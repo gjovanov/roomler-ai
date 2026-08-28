@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! Self-update against GitHub Releases.
 //!
 //! Polls `https://api.github.com/repos/gjovanov/roomler-ai/releases/latest`

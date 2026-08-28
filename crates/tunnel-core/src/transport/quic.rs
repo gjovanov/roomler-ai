@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MPL-2.0
+// Copyright (C) 2026 G ROX EOOD
 //! `quic-v1` transport — opportunistic QUIC P2P data plane (quinn).
 //!
 //! This is the Phase-1a *core*: a [`QuicPeer`] that builds a quinn
