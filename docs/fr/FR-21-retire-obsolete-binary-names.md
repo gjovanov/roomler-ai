@@ -94,7 +94,7 @@ cargo build -p roomler-agent --release --features full
 ./target/release/roomler-agent run
 ```
 
-That block is **wrong today**: the emitted binary is `roomlerd`
+That block was **wrong** (fixed in P1): the emitted binary is `roomlerd`
 (`agents/roomler-agent/Cargo.toml:18`), so the documented `run` command does not exist at the
 documented path. This is the cheapest possible demonstration that the residue costs something.
 
@@ -239,13 +239,66 @@ P2 is wrong and stops.
 | # | Phase | Deliverable | Kill switch |
 |---|---|---|---|
 | **P0** | Classifier + advisory guard | `scripts/name-audit.sh`; CI job `name-audit` in `ci.yml` with `continue-on-error: true`; `RETIRED-NAME-ANCHOR:` markers on every Class-C site | the job is advisory — it cannot fail a PR |
-| **P1** | Prose sweep | `docs/**` (17 files, 121 hits), `CLAUDE.md` (17 lines incl. the wrong Commands block), all code comments | `git revert` — no runtime surface touched |
+| **P1** | Everything FALSE today | the two clap program names; the `CLAUDE.md` Commands block; the copy-paste install steps in `docs/tunnel-install.md`; script/manifest comments | `git revert` — no runtime surface touched |
+| **P1b** | The bulk prose sweep | the ~1 700 remaining prose hits, *after* P2 has moved what they describe; historical appendices keep the retired name behind a block anchor | `git revert` |
 | **P2a** | Build-graph identity, agent side | packages `roomler-agent`→`roomlerd`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; libs `roomler_agent`→`roomlerd`, `roomler_agent_core`→`roomler_core`; dirs `agents/roomler-agent`→`agents/roomlerd`, `agents/roomler-agent-tray`→`agents/roomler-desktop`; every `-p` selector in the workflows + `Dockerfile.agent-e2e` + `scripts/` | one atomic PR, `git revert`; gated on an **empty artifact-name diff** |
 | **P2b** | Build-graph identity, CLI side | package `roomler-tunnel`→`roomler-cli`, lib `roomler_tunnel`→`roomler_cli`, dir `agents/roomler-tunnel`→`agents/roomler-cli`; `release-tunnel.yml` | same; separate PR so `release-tunnel.yml` moves in a reviewable diff |
 | **P3** | Env-var namespace | 107 vars `ROOMLER_AGENT_<REST>` → **`ROOMLERD_<REST>`** (D1), **dual-read**: new spelling wins, old spelling honoured and logged once at WARN | the old spelling never stops working; the WARN is the only new behaviour |
 | **P4** | Residual live paths | fix the §5 staging defect by calling a resolver instead of a constant (expose `machine_global_dir()` over LocalAPI); sweep the remaining hardcoded `roomler-agent` paths | every path keeps a new-then-old fallback, exactly like `appdirs` |
 | **P5** | Ratify + enforce | freeze list reviewed and justified in-tree; `name-audit --check` flips to **blocking**; a deliberately-red run proves it fails | revert the `continue-on-error` removal |
 | **P6** | Field verification | the §9.4 matrix on Windows / Linux / macOS, fresh **and** upgrade-from-0.4.x, including a pre-rename host | n/a — verification, not a change |
+
+### 7a. Resequencing, measured during P1 — P1 was specced too large
+
+The original plan put a ~1 400-hit "prose sweep" before the build-graph rename. **That is not
+possible, and the measurement says so plainly.** Classifying the prose by whether it is *false
+today*:
+
+```
+command forms (`roomler-agent run`, `roomler-tunnel enroll`)   26   <- FALSE today
+path refs (`agents/roomler-agent/...`)                         55   <- TRUE today
+cargo -p refs (`cargo build -p roomler-agent`)                 12   <- TRUE today
+```
+
+Almost all prose correctly describes the *current* build graph: the package really is called
+`roomler-agent`, and the directory really is `agents/roomler-agent/`. Rewriting it before P2
+would replace accurate documentation with a description of a state that does not exist yet.
+
+So P1 shrank to *everything that is false today*, and the bulk sweep moved to **P1b, after P2**
+— where it is no longer judgement work but a mechanical follow-on from the rename it describes.
+The dead end is worth recording: "sweep the docs first, it's the safe phase" is the intuitive
+order and it is wrong, because in a rename the docs are only wrong *after* the code moves.
+
+**What P1 actually found and fixed** — the most valuable single line in the FR so far:
+
+```rust
+-#[command(name = "roomler-agent", version, about, long_about = None)]   // agents/roomler-agent/src/main.rs:39
++#[command(name = "roomlerd",      version, about, long_about = None)]
+-#[command(name = "roomler-tunnel", ...)]                                // agents/roomler-tunnel/src/cli.rs:60
++#[command(name = "roomler",        ...)]
+```
+
+Both binaries **misnamed themselves in every `--help`, usage line and argument error**. Nothing
+tested it, because clap's program name is display-only. Verified by running the built binary,
+not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler-agent.exe`.
+
+### 7b. Two hazards found while executing, both blocking their phase
+
+1. **P2a would silently rename the Debian package.** `[package.metadata.deb]` in
+   `agents/roomler-agent/Cargo.toml:550` sets no `name`, so cargo-deb derives `Package:` from the
+   crate name — and `docs/installation.md:240` documents `apt remove roomler-agent`, confirming
+   it. Renaming the crate therefore makes dpkg see a *different* package: the old one stays
+   installed beside the new one, or the upgrade simply does not happen. **P2a must either pin
+   `[package.metadata.deb] name = "roomler-agent"` as an anchor, or ship
+   `Provides`/`Conflicts`/`Replaces` so dpkg performs a real takeover** — and whichever is
+   chosen has to be proven by an actual `apt upgrade` on a host installed from the previous
+   release, not by inspection.
+2. **Historical appendices must keep the retired name.** `docs/remote-control.md` §17–19 are
+   explicitly historical (`## 19. Appendix — resilience cycle (0.1.50 → 0.1.54, historical)`),
+   and passages like *"anyone who tried `roomler-agent service install` after 0.1.50–0.1.52 saw
+   the error"* are records of what people actually typed. Rewriting them falsifies the record.
+   P1b marks those regions with a block anchor instead — which needs a
+   `RETIRED-NAME-ANCHOR-BEGIN`/`-END` pair, since a line-counted span is too brittle for prose.
 
 ---
 

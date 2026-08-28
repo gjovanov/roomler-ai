@@ -1084,6 +1084,8 @@ fn probe_service_state() -> (String, bool) {
 /// new daemon), then falls back to the legacy `roomler-agent[.exe]` (which the
 /// MSI still ships as the inert `AgentExeAlias`, so a mixed / in-flight install
 /// still resolves), then finally the bare new name relying on PATH.
+// RETIRED-NAME-ANCHOR(5): the legacy pair is the fallback that lets a mixed or
+// in-flight install still resolve a daemon. See docs/fr/FR-21.
 fn agent_exe_path() -> Result<PathBuf, String> {
     let (new_name, old_name) = if cfg!(windows) {
         ("roomlerd.exe", "roomler-agent.exe")

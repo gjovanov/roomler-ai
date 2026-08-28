@@ -57,7 +57,7 @@ impl CliTransport {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "roomler-tunnel", version, about, long_about = None)]
+#[command(name = "roomler", version, about, long_about = None)]
 struct Cli {
     /// Override config file location. Defaults to the platform config dir
     /// (`%APPDATA%\roomler\roomler-tunnel\config.toml` on Windows,
