@@ -1872,6 +1872,13 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         tracing::warn!("virtual-desktop mode is Linux-only — ignoring on this platform");
     }
 
+    // FR-19 P1d — the org-relay reachability responder. Process-wide and
+    // started once (one UDP socket), so deliberately NOT inside the per-org
+    // `overlay::maybe_start`. Opt-in and default off: a device that has not
+    // set `relay_server_enabled` binds nothing and logs nothing.
+    #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
+    roomlerd::relay_server::maybe_start();
+
     // Phase 3b: generate + persist this node's WireGuard identity on the
     // first overlay-enabled startup. The public key is what the netmap
     // distributes; the secret never leaves the host. Kept here (not in
