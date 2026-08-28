@@ -20,7 +20,7 @@
 //!   enrol → enrol again with the same `machine_id` → assert the
 //!   second response carries the same `tunnel_client_id`. Locks the
 //!   `find_by_tenant_and_machine` + `rehydrate` path. Without this
-//!   the operator who re-runs `roomler-tunnel enroll` after a config
+//!   the operator who re-runs `roomler enroll` after a config
 //!   loss would mint a fresh row each time and the listing UI would
 //!   show ghosts.
 //!
