@@ -50,7 +50,7 @@ roomlerd = { path = "../roomlerd" }
 # Lib dep on the tunnel CLI — the tunnel orchestrator reuses
 # `config::{TunnelConfig, save, default_config_path}` for the
 # config-write half of enrollment and the Welcome-step detect probe.
-roomler-tunnel = { path = "../roomler-cli" }
+roomler-cli = { path = "../roomler-cli" }
 
 # Tauri 2.x runtime. NO `tray-icon` feature — the wizard is a
 # foreground window, exits on Finish/Cancel. `custom-protocol` is
@@ -81,7 +81,7 @@ gethostname = "0.5"
 directories = { workspace = true }
 
 # The Welcome-step tunnel probe parses the CLI's config.toml
-# (`toml::from_str::<roomler_tunnel::config::TunnelConfig>`).
+# (`toml::from_str::<roomler_cli::config::TunnelConfig>`).
 toml = { workspace = true }
 
 # (windows-sys deliberately absent — roomler-setup-core owns every
