@@ -89,7 +89,7 @@ Concentration, for `roomler-agent` alone:
 including the **Commands** block a new session copy-pastes (`CLAUDE.md:85-92`):
 
 ```bash
-cargo build -p roomler-agent --release --features full
+cargo build -p roomlerd --release --features full
 ./target/release/roomler-agent enroll --server <url> --token <jwt> --name <label>
 ./target/release/roomler-agent run
 ```
@@ -109,7 +109,7 @@ documented path. This is the cheapest possible demonstration that the residue co
 | bin (already correct) | `roomler-desktop` | `agents/roomler-desktop/Cargo.toml:11` |
 | package | `roomler-agent-core` | `crates/agent-core/Cargo.toml:2` |
 | lib | `roomler_agent_core` | `crates/agent-core/Cargo.toml:8` |
-| dependency edge | `roomler-agent = { path = "../../agents/roomlerd" }` | `crates/tests/Cargo.toml:17` |
+| dependency edge | `roomlerd = { path = "../../agents/roomlerd" }` | `crates/tests/Cargo.toml:17` |
 | **directories** | `agents/roomlerd/`, `agents/roomler-desktop/` | — |
 
 The `[[bin]]` comments state the intent plainly, and are the reason this half was left:
@@ -257,7 +257,7 @@ today*:
 ```
 command forms (`roomler-agent run`, `roomler-tunnel enroll`)   26   <- FALSE today
 path refs (`agents/roomlerd/...`)                         55   <- TRUE today
-cargo -p refs (`cargo build -p roomler-agent`)                 12   <- TRUE today
+cargo -p refs (`cargo build -p roomlerd`)                 12   <- TRUE today
 ```
 
 Almost all prose correctly describes the *current* build graph: the package really is called
@@ -272,7 +272,7 @@ order and it is wrong, because in a rename the docs are only wrong *after* the c
 **What P1 actually found and fixed** — the most valuable single line in the FR so far:
 
 ```rust
--#[command(name = "roomler-agent", version, about, long_about = None)]   // agents/roomlerd/src/main.rs:39
+-#[command(name = "roomlerd", version, about, long_about = None)]   // agents/roomlerd/src/main.rs:39
 +#[command(name = "roomlerd",      version, about, long_about = None)]
 -#[command(name = "roomler-tunnel", ...)]                                // agents/roomler-tunnel/src/cli.rs:60
 +#[command(name = "roomler",        ...)]
@@ -289,7 +289,7 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
    crate name — and `docs/installation.md:240` documents `apt remove roomler-agent`, confirming
    it. Renaming the crate therefore makes dpkg see a *different* package: the old one stays
    installed beside the new one, or the upgrade simply does not happen. **P2a must either pin
-   `[package.metadata.deb] name = "roomler-agent"` as an anchor, or ship
+   `[package.metadata.deb] name = "roomlerd"` as an anchor, or ship
    `Provides`/`Conflicts`/`Replaces` so dpkg performs a real takeover** — and whichever is
    chosen has to be proven by an actual `apt upgrade` on a host installed from the previous
    release, not by inspection.

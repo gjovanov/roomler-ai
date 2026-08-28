@@ -45,7 +45,7 @@ roomler-setup-core = { path = "../../crates/roomler-setup-core" }
 # lib calls. Transitively pulls the agent's heavy deps (webrtc-rs
 # etc.) — same trade-off the legacy wizards accepted: a fatter EXE,
 # but the install pipeline stays lib-driven with no CLI shelling.
-roomler-agent = { path = "../roomlerd" }
+roomlerd = { path = "../roomlerd" }
 
 # Lib dep on the tunnel CLI — the tunnel orchestrator reuses
 # `config::{TunnelConfig, save, default_config_path}` for the

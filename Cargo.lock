@@ -7848,114 +7848,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roomler-agent"
-version = "0.4.11"
-dependencies = [
- "anyhow",
- "arboard",
- "async-trait",
- "async_zip",
- "audiopus",
- "base64 0.22.1",
- "bson",
- "bytes",
- "chrono",
- "clap",
- "clipboard-win",
- "cpal",
- "dashmap",
- "dcv-color-primitives",
- "directories",
- "embed-resource",
- "enigo",
- "env-libvpx-sys",
- "ffmpeg-next",
- "futures",
- "hex",
- "if-addrs",
- "ipnet",
- "libc",
- "libloading 0.8.9",
- "openh264",
- "openh264-sys2",
- "png 0.18.1",
- "rand 0.9.4",
- "reqwest 0.12.28",
- "ring",
- "roomler-agent-core",
- "roomler-ai-remote-control",
- "roomler-ai-tunnel-core",
- "roomler-tunnel",
- "russh",
- "scrap",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "socket2 0.5.10",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tokio-tungstenite 0.28.0",
- "tokio-util",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "webrtc",
- "windows 0.58.0",
- "windows-service",
- "windows-sys 0.59.0",
- "zip",
-]
-
-[[package]]
-name = "roomler-agent-core"
-version = "0.4.11"
-dependencies = [
- "anyhow",
- "bson",
- "directories",
- "hex",
- "libc",
- "reqwest 0.12.28",
- "roomler-ai-remote-control",
- "roomler-ai-tunnel-core",
- "roomler-localapi",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "roomler-agent-tray"
-version = "0.4.11"
-dependencies = [
- "anyhow",
- "gethostname 0.5.0",
- "roomler-agent-core",
- "roomler-localapi",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-shell",
- "tauri-plugin-single-instance",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "roomler-ai-api"
 version = "0.4.11"
 dependencies = [
@@ -8105,12 +7997,12 @@ dependencies = [
  "jsonwebtoken",
  "mongodb",
  "reqwest 0.12.28",
- "roomler-agent",
  "roomler-ai-api",
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-remote-control",
  "roomler-ai-services",
+ "roomlerd",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -8175,6 +8067,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "roomler-core"
+version = "0.4.11"
+dependencies = [
+ "anyhow",
+ "bson",
+ "directories",
+ "hex",
+ "libc",
+ "reqwest 0.12.28",
+ "roomler-ai-remote-control",
+ "roomler-ai-tunnel-core",
+ "roomler-localapi",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "roomler-desktop"
+version = "0.4.11"
+dependencies = [
+ "anyhow",
+ "gethostname 0.5.0",
+ "roomler-core",
+ "roomler-localapi",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-shell",
+ "tauri-plugin-single-instance",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "roomler-localapi"
 version = "0.4.11"
 dependencies = [
@@ -8193,9 +8130,9 @@ dependencies = [
  "anyhow",
  "directories",
  "gethostname 0.5.0",
- "roomler-agent",
  "roomler-setup-core",
  "roomler-tunnel",
+ "roomlerd",
  "serde",
  "serde_json",
  "tauri",
@@ -8267,6 +8204,69 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "zip",
+]
+
+[[package]]
+name = "roomlerd"
+version = "0.4.11"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-trait",
+ "async_zip",
+ "audiopus",
+ "base64 0.22.1",
+ "bson",
+ "bytes",
+ "chrono",
+ "clap",
+ "clipboard-win",
+ "cpal",
+ "dashmap",
+ "dcv-color-primitives",
+ "directories",
+ "embed-resource",
+ "enigo",
+ "env-libvpx-sys",
+ "ffmpeg-next",
+ "futures",
+ "hex",
+ "if-addrs",
+ "ipnet",
+ "libc",
+ "libloading 0.8.9",
+ "openh264",
+ "openh264-sys2",
+ "png 0.18.1",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "ring",
+ "roomler-ai-remote-control",
+ "roomler-ai-tunnel-core",
+ "roomler-core",
+ "roomler-tunnel",
+ "russh",
+ "scrap",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2 0.5.10",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-tungstenite 0.28.0",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "webrtc",
+ "windows 0.58.0",
+ "windows-service",
+ "windows-sys 0.59.0",
  "zip",
 ]
 

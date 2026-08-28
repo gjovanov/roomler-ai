@@ -11,7 +11,7 @@
 // layers the daemon-only worker-aware wrappers over the core primitives);
 // `apps` re-exports the moved config shapes; the ACL is re-exported inside
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
-pub use roomler_agent_core::{
+pub use roomler_core::{
     appdirs, config, config_surface, crash_recorder, enrollment, logging, logs_upload, machine,
 };
 
@@ -91,7 +91,7 @@ pub mod system_context;
 /// companion can use them without depending on the agent (P3e lever E). Every
 /// `crate::tcc::…` call site here is unchanged.
 #[cfg(target_os = "macos")]
-pub use roomler_agent_core::tcc;
+pub use roomler_core::tcc;
 pub mod telemetry;
 pub mod tunnel;
 pub mod updater;

@@ -65,7 +65,7 @@ const RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 /// Extra patience for a device whose policy PROMPTS: the agent waits for a
 /// human before the command's own budget even starts.
 ///
-/// Mirrors `roomler_agent::consent::DEFAULT_PROMPT_TIMEOUT` (30 s), duplicated
+/// Mirrors `roomlerd::consent::DEFAULT_PROMPT_TIMEOUT` (30 s), duplicated
 /// rather than imported because the API crate must not depend on the agent
 /// binary's crate. Without it, an attended device would routinely report a
 /// false "no answer within Ns" while the command was in fact running — the

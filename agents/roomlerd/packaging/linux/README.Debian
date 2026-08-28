@@ -33,7 +33,7 @@ Desktop host (systemd --user)
 
   # 3. Optional smoke test — needs an active X11 session; a tty login
   #    won't capture anything.
-  RUST_LOG=roomler_agent=debug,webrtc=info roomlerd run
+  RUST_LOG=roomlerd=debug,webrtc=info roomlerd run
 
   systemctl --user daemon-reload
   systemctl --user enable --now roomler.service

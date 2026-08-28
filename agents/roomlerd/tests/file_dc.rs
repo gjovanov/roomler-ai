@@ -2,7 +2,7 @@
 //!
 //! These tests stand up two `webrtc-rs` `RTCPeerConnection`s in
 //! loopback, negotiate a `files` DataChannel between them, attach
-//! the production `roomler_agent::peer::attach_files_handler` to the
+//! the production `roomlerd::peer::attach_files_handler` to the
 //! "agent" side, then drive the wire from the "browser" side and
 //! assert the JSON envelopes + binary payloads round-trip exactly
 //! as the protocol specifies.
@@ -249,7 +249,7 @@ async fn open_files_dc() -> Result<DcSide> {
         .map_err(|_| anyhow!("agent on_data_channel timed out"))?
         .map_err(|e| anyhow!("agent_dc_rx: {e}"))?;
     let session_id = bson::oid::ObjectId::new();
-    roomler_agent::peer::attach_files_handler(agent_dc, session_id);
+    roomlerd::peer::attach_files_handler(agent_dc, session_id);
 
     // Wait for the browser-side DC to reach `Open`. webrtc-rs reports
     // this via `on_open`. Poll-via-callback to a oneshot.

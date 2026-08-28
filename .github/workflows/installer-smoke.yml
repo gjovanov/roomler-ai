@@ -132,7 +132,7 @@ jobs:
         # runtime behaviour only.
         shell: pwsh
         run: |
-          cargo build -p roomler-agent --release `
+          cargo build -p roomlerd --release `
             --features "mf-encoder,scrap-capture,openh264-encoder,enigo-input,clipboard,viewer-indicator,system-context"
 
       - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
@@ -240,7 +240,7 @@ jobs:
           # who finds it on a machine knows it's a smoke artifact.
           SMOKE_VERSION: 0.0.0-smoke.1
         run: |
-          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:SMOKE_VERSION
+          cargo wix -p roomlerd --nocapture --no-build --install-version $env:SMOKE_VERSION
           $msi = Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1
           if (-not $msi) { throw 'MSI not produced by cargo-wix' }
           'MSI_PATH=' + $msi.FullName | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -593,7 +593,7 @@ jobs:
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
-            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:SMOKE_VERSION
+            cargo wix -p roomlerd --nocapture --no-build --install-version $env:SMOKE_VERSION
           } finally {
             Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
           }
@@ -649,11 +649,11 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           set -euo pipefail
-          cargo build -p roomler-agent --release \
+          cargo build -p roomlerd --release \
             --features "media,vp9-444,vp9-444-bindgen,overlay-l3" \
             --target aarch64-apple-darwin
           cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
-          cargo build -p roomler-agent-tray --release --target aarch64-apple-darwin
+          cargo build -p roomler-desktop --release --target aarch64-apple-darwin
 
       - name: Stage + build the pkg
         run: |

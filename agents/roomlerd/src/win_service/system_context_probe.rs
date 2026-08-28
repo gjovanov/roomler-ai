@@ -560,7 +560,7 @@ fn current_window_station_name() -> String {
 fn run_dxgi_cadence() -> Result<()> {
     bail!(
         "`system-context-probe dxgi-cadence` requires the `scrap-capture` feature. \
-         Rebuild with `cargo build -p roomler-agent --release --features full`."
+         Rebuild with `cargo build -p roomlerd --release --features full`."
     );
 }
 
