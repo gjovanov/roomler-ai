@@ -1,4 +1,4 @@
-//! `roomler-tunnel forward` — open one TCP forward through an enrolled
+//! `roomler forward` — open one TCP forward through an enrolled
 //! agent. The TeamViewer-shaped flow:
 //!
 //! 1. WS-connect to `wss://<server>/ws?role=tunnel-client&token=<jwt>`.
@@ -146,7 +146,7 @@ impl TunnelSignalingSource for WsSource {
     }
 }
 
-/// `roomler-tunnel forward` — one static local→remote TCP forward.
+/// `roomler forward` — one static local→remote TCP forward.
 pub async fn run(
     cfg: TunnelConfig,
     agent_hex: &str,
@@ -165,7 +165,7 @@ pub async fn run(
     .await
 }
 
-/// `roomler-tunnel socks5` — the userspace-mode SOCKS5 proxy. Same transport +
+/// `roomler socks5` — the userspace-mode SOCKS5 proxy. Same transport +
 /// server policy + agent allowlist as a static forward; the destination is taken
 /// from each connection's SOCKS5 CONNECT instead of a fixed `--remote`.
 pub async fn run_socks5(
@@ -198,7 +198,7 @@ async fn run_forward(
         local,
         ?target,
         ?transport,
-        "roomler-tunnel forward starting"
+        "roomler forward starting"
     );
 
     let mut backoff = RECONNECT_BACKOFF_MIN;
