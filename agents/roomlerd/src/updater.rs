@@ -503,6 +503,31 @@ fn host_has_debian_tooling() -> bool {
     })
 }
 
+/// Is this release asset the DAEMON's own package, as opposed to something
+/// else in the same release that happens to be a `.deb` for the same arch?
+///
+/// FR-27 made this necessary: the Linux desktop companion now ships as its own
+/// `roomler-desktop-…-x86_64-unknown-linux-gnu.deb`, so a release carries two
+/// arch-matching `.deb`s and asset order is GitHub's, not ours. Without this
+/// the daemon could download the COMPANION, `dpkg -i` it — which succeeds —
+/// and never update itself: a silent, permanent freeze that looks like a
+/// working update. Exactly the shape the arch guard in [`pick_linux_asset`]
+/// was added for, one axis over.
+///
+/// Positive match, not a denylist of names we happen to know today. The
+/// daemon's published asset names are a deliberately immutable surface
+/// (`roomler-agent-…`, plus cargo-deb's `roomlerd_…` spelling on old
+/// releases), so naming them is safe and a new sibling asset cannot creep
+/// through by being unlisted. Locked by
+/// `pick_linux_asset_never_takes_the_desktop_companion`.
+///
+/// Gated like its only caller: a Windows build has no Linux picker to call it.
+#[cfg(any(not(target_os = "windows"), test))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+fn is_daemon_asset(lower_name: &str) -> bool {
+    lower_name.starts_with("roomler-agent") || lower_name.starts_with("roomlerd")
+}
+
 /// Choose the Linux asset: the right ARCH always, and the format this host
 /// can actually install.
 ///
@@ -513,29 +538,6 @@ fn host_has_debian_tooling() -> bool {
 /// a dead end. See `docs/linux-self-update.md`.
 #[cfg(any(not(target_os = "windows"), test))]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
-/// Is this release asset the DAEMON's own package, as opposed to something
-/// else in the same release that happens to be a `.deb` for the same arch?
-///
-/// FR-27 made this necessary: the Linux desktop companion now ships as its own
-/// `roomler-desktop-…-x86_64-unknown-linux-gnu.deb`, so a release carries two
-/// arch-matching `.deb`s and asset order is GitHub's, not ours. Without this
-/// the daemon could download the COMPANION, `dpkg -i` it — which succeeds —
-/// and never update itself: a silent, permanent freeze that looks like a
-/// working update. Exactly the shape the arch guard above was added for, one
-/// axis over.
-///
-/// Positive match, not a denylist of names we happen to know today. The
-/// daemon's published asset names are a deliberately immutable surface
-/// (`roomler-agent-…`, plus cargo-deb's `roomlerd_…` spelling on old
-/// releases), so naming them is safe and a new sibling asset cannot creep
-/// through by being unlisted. Locked by
-/// `pick_linux_asset_never_takes_the_desktop_companion`.
-#[cfg(any(not(target_os = "windows"), test))]
-#[cfg_attr(target_os = "windows", allow(dead_code))]
-fn is_daemon_asset(lower_name: &str) -> bool {
-    lower_name.starts_with("roomler-agent") || lower_name.starts_with("roomlerd")
-}
-
 fn pick_linux_asset<'a>(
     assets: &'a [GithubAsset],
     arch_tokens: &[&str],

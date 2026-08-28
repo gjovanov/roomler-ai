@@ -91,6 +91,17 @@ const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
 /// unreachable anyway.
 const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
+/// FR-27 — how long to wait for `companion::ensure_running` before deciding
+/// this host has no on-screen prompt surface.
+///
+/// Bounded because the probe shells out (`launchctl`, `loginctl`,
+/// `systemd-run`, `tasklist`) and the attended prompt is already counting down
+/// against a 30 s window the controller shares: spending a large slice of it
+/// waiting on a wedged helper would turn a slow answer into no answer. A
+/// timeout is treated as "no surface", which is the same thing the operator
+/// experiences.
+const COMPANION_START_BUDGET: Duration = Duration::from_secs(3);
+
 /// Pong-RTT degradation bound for the control WS. Field winhost-a 2026-08-15
 /// ~20:00Z: a WS that SURVIVED a corp-VPN route capture kept "working"
 /// with application round-trips over 60 s — every send completed into the
@@ -1930,9 +1941,29 @@ async fn handle_server_msg(
                 // Nothing used to start the companion, so a device set to
                 // "Prompt on host" whose operator had quit the menu-bar app
                 // showed nothing, waited out its window, and reported a deny.
-                // Fire-and-forget: it is rate-limited internally, and the
-                // prompt below is already counting down.
-                tokio::spawn(crate::companion::ensure_running());
+                //
+                // AWAITED, not spawned: its verdict is what separates "nobody
+                // answered" from "there is nobody to ask, and there never
+                // was" — two outcomes with different fixes, and the caller
+                // cannot tell them apart afterwards. Bounded so a wedged
+                // `launchctl` / `systemd-run` cannot eat the prompt window;
+                // a timeout means we could not confirm a surface, which is
+                // the same answer as not having one.
+                //
+                // ⚠️ Windows keeps its own native overlay regardless: the
+                // daemon draws that itself, so a missing companion there is
+                // not a missing surface. Answering otherwise would report
+                // `no_prompt_surface` on the one platform that always has one.
+                let companion_up = tokio::time::timeout(
+                    COMPANION_START_BUDGET,
+                    crate::companion::ensure_running(),
+                )
+                .await
+                .unwrap_or(false);
+                if !companion_up && !cfg!(all(target_os = "windows", feature = "viewer-indicator"))
+                {
+                    have_surface = false;
+                }
             }
             if owner_side_consent {
                 info!(
