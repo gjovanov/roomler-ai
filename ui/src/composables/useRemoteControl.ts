@@ -1222,6 +1222,72 @@ export function diagHudEnabled(): boolean {
   }
 }
 
+// FR-24 — which quality pills the toolbar readout shows, per user.
+//
+// The readout grew one pill at a time until it was six wide, and the only
+// way to influence it was an undiscoverable `roomler-rc-diag-hud=1`
+// localStorage flag. Now every pill has a checkbox in Viewer settings.
+// Everything is ON by default except `paint`: the per-hop numbers answer a
+// question ("is the fps ceiling paint-, decode- or main-thread-bound?")
+// that only matters while you are chasing it.
+const METRICS_STORAGE_KEY = 'roomler-rc-metrics'
+
+export interface RcMetricToggles {
+  codec: boolean
+  bitrate: boolean
+  fps: boolean
+  resolution: boolean
+  age: boolean
+  paint: boolean
+}
+
+export const DEFAULT_RC_METRICS: RcMetricToggles = {
+  codec: true,
+  bitrate: true,
+  fps: true,
+  resolution: true,
+  age: true,
+  paint: false,
+}
+
+/**
+ * Read the per-pill preference. Anything unreadable, corrupt or partial
+ * falls back **per key**, so a stored object written by an older build
+ * (fewer pills) keeps working and newly added pills appear rather than
+ * silently reading as `false`.
+ *
+ * ⚠️ `paint` additionally inherits the legacy `roomler-rc-diag-hud=1` flag
+ * the first time, so anyone who set it by hand keeps their HUD.
+ */
+export function storedMetricToggles(): RcMetricToggles {
+  let parsed: Partial<RcMetricToggles> = {}
+  try {
+    const raw = globalThis.localStorage?.getItem(METRICS_STORAGE_KEY)
+    const obj = raw ? JSON.parse(raw) : null
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) parsed = obj
+  } catch {
+    /* privacy mode / corrupt JSON — defaults */
+  }
+  const pick = (k: keyof RcMetricToggles): boolean =>
+    typeof parsed[k] === 'boolean' ? (parsed[k] as boolean) : DEFAULT_RC_METRICS[k]
+  return {
+    codec: pick('codec'),
+    bitrate: pick('bitrate'),
+    fps: pick('fps'),
+    resolution: pick('resolution'),
+    age: pick('age'),
+    paint: typeof parsed.paint === 'boolean' ? parsed.paint : diagHudEnabled(),
+  }
+}
+
+export function persistMetricToggles(m: RcMetricToggles): void {
+  try {
+    globalThis.localStorage?.setItem(METRICS_STORAGE_KEY, JSON.stringify(m))
+  } catch {
+    /* non-fatal — the toggles just won't survive this session */
+  }
+}
+
 // P7 (Parsec-class plan) — FSR sharpening knobs (see rc-fsr-render.ts).
 //  - roomler-rc-sharpen: 'auto' | 'on' | 'off'. Default 'auto' — the EASU+
 //    RCAS upscale engages only when the decoded stream is SMALLER than the
@@ -1236,7 +1302,8 @@ export function storedSharpenMode(): SharpenMode {
   try {
     return normalizeSharpenMode(globalThis.localStorage?.getItem(SHARPEN_STORAGE_KEY))
   } catch {
-    return 'auto'
+    // FR-24 - unreadable storage gets the same default a fresh profile does.
+    return 'on'
   }
 }
 
