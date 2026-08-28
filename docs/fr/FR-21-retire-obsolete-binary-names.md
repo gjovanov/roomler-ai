@@ -240,8 +240,9 @@ P2 is wrong and stops.
 |---|---|---|---|
 | **P0** | Classifier + advisory guard | `scripts/name-audit.sh`; CI job `name-audit` in `ci.yml` with `continue-on-error: true`; `RETIRED-NAME-ANCHOR:` markers on every Class-C site | the job is advisory — it cannot fail a PR |
 | **P1** | Prose sweep | `docs/**` (17 files, 121 hits), `CLAUDE.md` (17 lines incl. the wrong Commands block), all code comments | `git revert` — no runtime surface touched |
-| **P2** | Build-graph identity | packages `roomler-agent`→`roomlerd`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→(D3); libs; dirs `agents/roomler-agent`→`agents/roomlerd`, `agents/roomler-agent-tray`→`agents/roomler-desktop`; every `-p` selector in 6 workflows + `Dockerfile.agent-e2e` + `scripts/` | one atomic PR, `git revert`; gated on an **empty artifact-name diff** |
-| **P3** | Env-var namespace | 107 vars → the D1 namespace, **dual-read**: new spelling wins, old spelling honoured and logged once at WARN | the old spelling never stops working; the WARN is the only new behaviour |
+| **P2a** | Build-graph identity, agent side | packages `roomler-agent`→`roomlerd`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; libs `roomler_agent`→`roomlerd`, `roomler_agent_core`→`roomler_core`; dirs `agents/roomler-agent`→`agents/roomlerd`, `agents/roomler-agent-tray`→`agents/roomler-desktop`; every `-p` selector in the workflows + `Dockerfile.agent-e2e` + `scripts/` | one atomic PR, `git revert`; gated on an **empty artifact-name diff** |
+| **P2b** | Build-graph identity, CLI side | package `roomler-tunnel`→`roomler-cli`, lib `roomler_tunnel`→`roomler_cli`, dir `agents/roomler-tunnel`→`agents/roomler-cli`; `release-tunnel.yml` | same; separate PR so `release-tunnel.yml` moves in a reviewable diff |
+| **P3** | Env-var namespace | 107 vars `ROOMLER_AGENT_<REST>` → **`ROOMLERD_<REST>`** (D1), **dual-read**: new spelling wins, old spelling honoured and logged once at WARN | the old spelling never stops working; the WARN is the only new behaviour |
 | **P4** | Residual live paths | fix the §5 staging defect by calling a resolver instead of a constant (expose `machine_global_dir()` over LocalAPI); sweep the remaining hardcoded `roomler-agent` paths | every path keeps a new-then-old fallback, exactly like `appdirs` |
 | **P5** | Ratify + enforce | freeze list reviewed and justified in-tree; `name-audit --check` flips to **blocking**; a deliberately-red run proves it fails | revert the `continue-on-error` removal |
 | **P6** | Field verification | the §9.4 matrix on Windows / Linux / macOS, fresh **and** upgrade-from-0.4.x, including a pre-rename host | n/a — verification, not a change |
@@ -317,38 +318,49 @@ Field verification runs through `roomler exec` after the roll, per the standing 
 
 ---
 
-## 10. Open decisions
+## 10. Decisions
 
 **D1 — target namespace for the 107 env vars: `ROOMLERD_*` or `ROOMLER_*`?**
-*Recommendation: `ROOMLERD_*`.* The precedent exists already (`ROOMLERD_CONFIG`, used by
-`packaging/linux/roomlerd.service:48`), and `ROOMLER_*` sits one underscore from the **server's**
-`ROOMLER__` double-underscore config prefix — `ROOMLER_OVERLAY_DEMOTE` beside
-`ROOMLER__OVERLAY__…` is a confusion this FR would be *creating*, not removing.
+**RESOLVED 2026-08-28 (operator): `ROOMLERD_*`.** The precedent exists already
+(`ROOMLERD_CONFIG`, used by `packaging/linux/roomlerd.service:48`), and `ROOMLER_*` sits one
+underscore from the **server's** `ROOMLER__` double-underscore config prefix —
+`ROOMLER_OVERLAY_DEMOTE` beside `ROOMLER__OVERLAY__…` is a confusion this FR would be
+*creating*, not removing.
+
+The full mapping is therefore mechanical: `ROOMLER_AGENT_<REST>` → `ROOMLERD_<REST>`, for all
+107, with the old spelling honoured forever (D2).
 
 **D2 — do the 107 vars move at all?** They are the largest Class-B block and the lowest
-reader-value: almost none appear in docs. *Recommendation: yes, but last (P3), dual-read, and
-never remove the old spelling* — the cost of keeping it is one match arm.
+reader-value: almost none appear in docs. **RESOLVED: yes, but last (P3), dual-read, and the old
+spelling is never removed** — the cost of keeping it is one match arm, and the alternative is
+breaking shell history and runbooks nobody has an inventory of.
 
 **D3 — what does `roomler-agent-core` become?** `roomlerd-core` reads as daemon-only, but the
 crate exists **because** the desktop companion deps it *without* the daemon (P3e lever E).
-*Recommendation: `roomler-core`* — it is the node's shared core, not the daemon's.
+**RESOLVED: `roomler-core`** (lib `roomler_core`) — it is the node's shared core, not the
+daemon's.
 
 **D4 — rename the directories, or only the package names?** Renaming `agents/roomler-agent/`
-costs `git log` legibility for the naive reader. *Recommendation: rename, in a commit that
-changes **only** paths so `git log --follow` and `git blame` track cleanly — never mixed with
-content edits.*
+costs `git log` legibility for the naive reader. **RESOLVED: rename, in a commit that changes
+*only* paths** so `git log --follow` and `git blame` track cleanly — never mixed with content
+edits.
 
 **D5 — the macOS bundle.** Freeze, or migrate with a paired TCC re-grant campaign? Freezing
 leaves `roomler-agent` visible at `/Library/Roomler/roomler-agent.app` and in both launchd labels
 forever. That is ugly, and it is still right: the alternative asks every Mac user to re-grant
 Screen Recording and Accessibility, and a missed re-grant is a device that looks enrolled and
-cannot be controlled. *Recommendation: freeze*, and revisit only with an installer that can
-re-register the bundle without a human. The lock already exists on both sides —
+cannot be controlled. **RESOLVED: freeze** — revisit only with an installer that can re-register
+the bundle without a human. The lock already exists on both sides —
 `ui/src/__tests__/utils/enrollCommands.spec.ts:129-147` and `.github/workflows/ci.yml:391`.
 
 **D6 — `roomler-tunnel`.** 269 hits, and the enroll-command test already treats it as retired
-(`enrollCommands.spec.ts:143`). Fold into this FR (*recommended* — same sweep, same guard) or
-split into a sibling FR?
+(`enrollCommands.spec.ts:143`). **RESOLVED: fold in** — same sweep, same guard — but as its own
+sub-phase **P2b**, landing after P2a (the agent-side packages), so each rename stays separately
+revertible and `release-tunnel.yml` moves in a diff a reviewer can hold in their head.
+Package `roomler-tunnel` → **`roomler-cli`** (lib `roomler_cli`): the emitted bin is already
+`roomler`, and the command surface lives in the lib (`roomler_tunnel::cli`, P3e lever D), so
+"cli" names what the crate now is — the tunnel client is one of the things it drives, not the
+whole of it.
 
 ---
 
