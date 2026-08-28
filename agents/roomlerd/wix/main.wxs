@@ -17,7 +17,7 @@
   RegisterAutostart custom action below. The action shells out to
   `roomler-agent service install` which writes a Schema 1.2 Task
   Scheduler XML with restart-on-failure + battery-defeat settings (see
-  agents/roomler-agent/src/service.rs::render_task_xml). Symmetric
+  agents/roomlerd/src/service.rs::render_task_xml). Symmetric
   UnregisterAutostart hook runs `service uninstall` before the EXE is
   removed during uninstall. Both actions Return="ignore" so an
   individual machine where the existing task has a tightened ACL (rare

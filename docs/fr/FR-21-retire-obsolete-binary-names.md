@@ -46,11 +46,11 @@ the field is still on the old segment, silently, at the next update:
 | anchor | file:line | what breaks if a sweep "fixes" it |
 |---|---|---|
 | `OLD_APP = "roomler-agent"` | `crates/agent-core/src/appdirs.rs:37` | a pre-rename host's enrolled `config.toml` is orphaned — the device drops off the mesh and re-enrolls as a stranger |
-| `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomler-agent/src/win_service/mod.rs:61` | the takeover install cannot find the running service to retire; two services, or none |
-| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomler-agent/src/service.rs:151` | the pre-rename scheduled task survives forever → two daemons |
-| legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:245,312,440`; `agents/roomler-agent/src/logs_fetch.rs:54` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
-| `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomler-agent/src/updater.rs:367` | the vacated install dir is never swept |
-| `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomler-agent/packaging/linux/roomler.service:39` | systemd denies the daemon its own legacy tree mid-migration |
+| `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomlerd/src/win_service/mod.rs:61` | the takeover install cannot find the running service to retire; two services, or none |
+| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:151` | the pre-rename scheduled task survives forever → two daemons |
+| legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:245,312,440`; `agents/roomlerd/src/logs_fetch.rs:54` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
+| `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:367` | the vacated install dir is never swept |
+| `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:39` | systemd denies the daemon its own legacy tree mid-migration |
 | **the macOS `.app` bundle** — see §5, D5 | `packaging/macos/com.roomler.{agent,daemon}.plist`; `.github/workflows/ci.yml:391` | **TCC grants are voided** — every Mac silently loses Screen Recording + Accessibility until a human re-grants them |
 
 So the deliverable is not a diff. It is **a classifier plus a guard**: an inventory that assigns
@@ -78,10 +78,10 @@ union                      1765 hits / 233 files
 Concentration, for `roomler-agent` alone:
 
 ```
-61  agents/roomler-agent       13  docs                6  .github/workflows
+61  agents/roomlerd       13  docs                6  .github/workflows
 11  crates/agent-core           8  scripts             5  crates/tunnel-core
  7  ui/src                      6  agents/roomler-tunnel
- 4  agents/roomler-agent-tray   3  crates/tests        3  docs/fr
+ 4  agents/roomler-desktop   3  crates/tests        3  docs/fr
  3  crates/roomler-setup-core   3  agents/roomler-setup
 ```
 
@@ -95,22 +95,22 @@ cargo build -p roomler-agent --release --features full
 ```
 
 That block was **wrong** (fixed in P1): the emitted binary is `roomlerd`
-(`agents/roomler-agent/Cargo.toml:18`), so the documented `run` command does not exist at the
+(`agents/roomlerd/Cargo.toml:18`), so the documented `run` command does not exist at the
 documented path. This is the cheapest possible demonstration that the residue costs something.
 
 ### Still-unmigrated build-graph identity
 
 | where | current value | file:line |
 |---|---|---|
-| package | `roomler-agent` | `agents/roomler-agent/Cargo.toml:2` |
-| lib | `roomler_agent` | `agents/roomler-agent/Cargo.toml:8` |
-| bin (already correct) | `roomlerd` | `agents/roomler-agent/Cargo.toml:18` |
-| package | `roomler-agent-tray` | `agents/roomler-agent-tray/Cargo.toml:2` |
-| bin (already correct) | `roomler-desktop` | `agents/roomler-agent-tray/Cargo.toml:11` |
+| package | `roomler-agent` | `agents/roomlerd/Cargo.toml:2` |
+| lib | `roomler_agent` | `agents/roomlerd/Cargo.toml:8` |
+| bin (already correct) | `roomlerd` | `agents/roomlerd/Cargo.toml:18` |
+| package | `roomler-agent-tray` | `agents/roomler-desktop/Cargo.toml:2` |
+| bin (already correct) | `roomler-desktop` | `agents/roomler-desktop/Cargo.toml:11` |
 | package | `roomler-agent-core` | `crates/agent-core/Cargo.toml:2` |
 | lib | `roomler_agent_core` | `crates/agent-core/Cargo.toml:8` |
-| dependency edge | `roomler-agent = { path = "../../agents/roomler-agent" }` | `crates/tests/Cargo.toml:17` |
-| **directories** | `agents/roomler-agent/`, `agents/roomler-agent-tray/` | — |
+| dependency edge | `roomler-agent = { path = "../../agents/roomlerd" }` | `crates/tests/Cargo.toml:17` |
+| **directories** | `agents/roomlerd/`, `agents/roomler-desktop/` | — |
 
 The `[[bin]]` comments state the intent plainly, and are the reason this half was left:
 
@@ -140,7 +140,7 @@ Anything a deployed host — or a deployed *operator runbook* — already depend
   people's shell history.
 - residual on-disk paths not yet behind `appdirs` (§5).
 - the HTTP `user_agent("roomler-agent/…")` sent by the updater
-  (`agents/roomler-agent/src/updater.rs:588,671,873`). It is **recorded** into device/session
+  (`agents/roomlerd/src/updater.rs:588,671,873`). It is **recorded** into device/session
   telemetry at `crates/api/src/ws/handler.rs:69` — confirm nothing *dispatches* on it before
   changing it, because changing it also changes what historical rows mean.
 
@@ -241,7 +241,7 @@ P2 is wrong and stops.
 | **P0** | Classifier + advisory guard | `scripts/name-audit.sh`; CI job `name-audit` in `ci.yml` with `continue-on-error: true`; `RETIRED-NAME-ANCHOR:` markers on every Class-C site | the job is advisory — it cannot fail a PR |
 | **P1** | Everything FALSE today | the two clap program names; the `CLAUDE.md` Commands block; the copy-paste install steps in `docs/tunnel-install.md`; script/manifest comments | `git revert` — no runtime surface touched |
 | **P1b** | The bulk prose sweep | the ~1 700 remaining prose hits, *after* P2 has moved what they describe; historical appendices keep the retired name behind a block anchor | `git revert` |
-| **P2a** | Build-graph identity, agent side | packages `roomler-agent`→`roomlerd`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; libs `roomler_agent`→`roomlerd`, `roomler_agent_core`→`roomler_core`; dirs `agents/roomler-agent`→`agents/roomlerd`, `agents/roomler-agent-tray`→`agents/roomler-desktop`; every `-p` selector in the workflows + `Dockerfile.agent-e2e` + `scripts/` | one atomic PR, `git revert`; gated on an **empty artifact-name diff** |
+| **P2a** | Build-graph identity, agent side | packages `roomler-agent`→`roomlerd`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; libs `roomler_agent`→`roomlerd`, `roomler_agent_core`→`roomler_core`; dirs `agents/roomlerd`→`agents/roomlerd`, `agents/roomler-desktop`→`agents/roomler-desktop`; every `-p` selector in the workflows + `Dockerfile.agent-e2e` + `scripts/` | one atomic PR, `git revert`; gated on an **empty artifact-name diff** |
 | **P2b** | Build-graph identity, CLI side | package `roomler-tunnel`→`roomler-cli`, lib `roomler_tunnel`→`roomler_cli`, dir `agents/roomler-tunnel`→`agents/roomler-cli`; `release-tunnel.yml` | same; separate PR so `release-tunnel.yml` moves in a reviewable diff |
 | **P3** | Env-var namespace | 107 vars `ROOMLER_AGENT_<REST>` → **`ROOMLERD_<REST>`** (D1), **dual-read**: new spelling wins, old spelling honoured and logged once at WARN | the old spelling never stops working; the WARN is the only new behaviour |
 | **P4** | Residual live paths | fix the §5 staging defect by calling a resolver instead of a constant (expose `machine_global_dir()` over LocalAPI); sweep the remaining hardcoded `roomler-agent` paths | every path keeps a new-then-old fallback, exactly like `appdirs` |
@@ -256,12 +256,12 @@ today*:
 
 ```
 command forms (`roomler-agent run`, `roomler-tunnel enroll`)   26   <- FALSE today
-path refs (`agents/roomler-agent/...`)                         55   <- TRUE today
+path refs (`agents/roomlerd/...`)                         55   <- TRUE today
 cargo -p refs (`cargo build -p roomler-agent`)                 12   <- TRUE today
 ```
 
 Almost all prose correctly describes the *current* build graph: the package really is called
-`roomler-agent`, and the directory really is `agents/roomler-agent/`. Rewriting it before P2
+`roomler-agent`, and the directory really is `agents/roomlerd/`. Rewriting it before P2
 would replace accurate documentation with a description of a state that does not exist yet.
 
 So P1 shrank to *everything that is false today*, and the bulk sweep moved to **P1b, after P2**
@@ -272,7 +272,7 @@ order and it is wrong, because in a rename the docs are only wrong *after* the c
 **What P1 actually found and fixed** — the most valuable single line in the FR so far:
 
 ```rust
--#[command(name = "roomler-agent", version, about, long_about = None)]   // agents/roomler-agent/src/main.rs:39
+-#[command(name = "roomler-agent", version, about, long_about = None)]   // agents/roomlerd/src/main.rs:39
 +#[command(name = "roomlerd",      version, about, long_about = None)]
 -#[command(name = "roomler-tunnel", ...)]                                // agents/roomler-tunnel/src/cli.rs:60
 +#[command(name = "roomler",        ...)]
@@ -285,7 +285,7 @@ not by reading the diff: `Usage: roomlerd.exe` where it previously said `roomler
 ### 7b. Two hazards found while executing, both blocking their phase
 
 1. **P2a would silently rename the Debian package.** `[package.metadata.deb]` in
-   `agents/roomler-agent/Cargo.toml:550` sets no `name`, so cargo-deb derives `Package:` from the
+   `agents/roomlerd/Cargo.toml:550` sets no `name`, so cargo-deb derives `Package:` from the
    crate name — and `docs/installation.md:240` documents `apt remove roomler-agent`, confirming
    it. Renaming the crate therefore makes dpkg see a *different* package: the old one stays
    installed beside the new one, or the upgrade simply does not happen. **P2a must either pin
@@ -393,7 +393,7 @@ crate exists **because** the desktop companion deps it *without* the daemon (P3e
 **RESOLVED: `roomler-core`** (lib `roomler_core`) — it is the node's shared core, not the
 daemon's.
 
-**D4 — rename the directories, or only the package names?** Renaming `agents/roomler-agent/`
+**D4 — rename the directories, or only the package names?** Renaming `agents/roomlerd/`
 costs `git log` legibility for the naive reader. **RESOLVED: rename, in a commit that changes
 *only* paths** so `git log --follow` and `git blame` track cleanly — never mixed with content
 edits.
@@ -421,7 +421,7 @@ whole of it.
 
 - **Published GitHub release assets.** Already-published names are immutable. The updater's
   pickers key on extension + arch + the `-permachine-` infix, **not** on the `roomler-agent-`
-  prefix (`agents/roomler-agent/src/updater.rs:414-484`) — verified, not assumed. This is why P2
+  prefix (`agents/roomlerd/src/updater.rs:414-484`) — verified, not assumed. This is why P2
   is low-risk and why no asset rename is forced.
 - The `ROOMLER__` **server** config prefix — a different product surface, not a retired name.
 - `roomler-setup`'s own naming, including the UAC lib-naming rule (`wizard_app` / `wizard_shared`
