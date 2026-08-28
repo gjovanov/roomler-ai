@@ -28,7 +28,7 @@
 
       <p v-if="!store.loading && store.policies.length === 0" class="text-medium-emphasis">
         No tunnel policies defined yet. Server-side ACL is default-deny — until
-        you add at least one policy, every <code>roomler-tunnel forward</code>
+        you add at least one policy, every <code>roomler forward</code>
         request will be rejected with <code>acl_denied</code>.
       </p>
 

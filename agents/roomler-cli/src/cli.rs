@@ -7,12 +7,12 @@
 //!
 //! CLI surface:
 //!
-//!   roomler-tunnel enroll --server <url> --token <enrollment-jwt> --name <label>
-//!   roomler-tunnel forward --agent <agent_id> --local <port> --remote <host:port>
+//!   roomler enroll --server <url> --token <enrollment-jwt> --name <label>
+//!   roomler forward --agent <agent_id> --local <port> --remote <host:port>
 //!   roomler-tunnel run [--config <path>]
 //!   roomler-tunnel diagnose [--agent <agent_id>]
-//!   roomler-tunnel status [--json]     # local daemon's node state (LocalAPI)
-//!   roomler-tunnel peers  [--json]     # peers + connection types (LocalAPI)
+//!   roomler status [--json]     # local daemon's node state (LocalAPI)
+//!   roomler peers  [--json]     # peers + connection types (LocalAPI)
 //!   roomler-tunnel flows  [--json]     # active forwards / SOCKS5 (LocalAPI)
 
 use anyhow::{Context, Result, bail};
@@ -74,7 +74,7 @@ struct Cli {
 enum Command {
     /// Enroll this laptop against a Roomler server using an admin-issued
     /// tunnel-enrollment token. Writes the long-lived `TunnelClient` JWT
-    /// to the config file. Mirrors `roomler-agent enroll`.
+    /// to the config file. Mirrors `roomlerd enroll`.
     Enroll {
         /// Base URL of the Roomler API (e.g. https://roomler.ai).
         #[arg(long)]
@@ -670,7 +670,7 @@ where
     }
 }
 
-/// `roomler-tunnel enroll` — exchange a tunnel-enrollment JWT for a
+/// `roomler enroll` — exchange a tunnel-enrollment JWT for a
 /// long-lived `TunnelClient` JWT via the server, then persist server
 /// URL + token to the local config file.
 async fn enroll_cmd(

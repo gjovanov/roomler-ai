@@ -119,7 +119,7 @@ pub fn default_log_dir() -> Option<PathBuf> {
 /// earlier install/repair), we open it and (re)start it rather than fail.
 ///
 /// Requires elevation (admin token). The MSI's custom action is the
-/// natural caller; manual install via `roomler-agent service install
+/// natural caller; manual install via `roomlerd service install
 /// --as-service` will surface `Access is denied (os error 5)` from a
 /// filtered token.
 pub fn install(exe_path: &std::path::Path) -> Result<()> {

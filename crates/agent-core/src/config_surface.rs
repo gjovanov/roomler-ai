@@ -12,7 +12,7 @@
 //! `overlay_wg_secret_key`), identity (`machine_id`; `machine_name` has
 //! its own `SetDeviceName` verb), `[[tunnel_routes]]` (the `Route*`
 //! verbs + Routes pane own those), `[[orgs]]` (multi-org P1 — identity +
-//! per-org secrets managed by `roomler-agent enroll` / the `org` CLI
+//! per-org secrets managed by `roomlerd enroll` / the `org` CLI
 //! verbs, same policy as `tunnel_routes`; a future desktop org pane gets
 //! dedicated LocalAPI verbs, not surface keys), and the crash-bookkeeping
 //! fields. Every key is read at daemon startup, so the whole surface is
