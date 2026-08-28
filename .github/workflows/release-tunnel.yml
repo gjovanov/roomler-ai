@@ -142,7 +142,7 @@ jobs:
         # agent release died on exactly this).
         run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
       - name: Build roomler-tunnel (release)
-        run: cargo build -p roomler-tunnel --release
+        run: cargo build -p roomler-cli --release
       - name: Strip binary
         # P3d Slice B: CLI OUTPUT binary is now `roomler` (was `roomler-tunnel`).
         run: strip target/release/roomler
@@ -165,7 +165,7 @@ jobs:
           mv "/tmp/${name}.tar.gz" "/tmp/${name}.tar.gz.sha256" .
           echo "artifact=${name}.tar.gz" >> "$GITHUB_OUTPUT"
       - name: Build .deb
-        working-directory: agents/roomler-tunnel
+        working-directory: agents/roomler-cli
         run: cargo deb --no-build --no-strip
       - name: Rename .deb + checksum
         id: deb
@@ -173,7 +173,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ needs.validate-version.outputs.version }}"
-          src=$(ls target/debian/roomler-tunnel_*_amd64.deb | head -n1)
+          # FR-21 P2b: cargo-deb emits `<package>_…`, and the package is
+          # `roomler-cli` now. The DESTINATION asset name deliberately stays
+          # `roomler-tunnel-…` — a published, immutable surface that every prior
+          # release carries, and the updater matches on extension + arch, not
+          # the prefix.
+          src=$(ls target/debian/roomler-cli_*_amd64.deb | head -n1)
           dst="roomler-tunnel-${version}-x86_64-unknown-linux-gnu.deb"
           mv "$src" "$dst"
           sha256sum "$dst" | awk '{print $1"  "$2}' > "${dst}.sha256"
@@ -214,9 +219,9 @@ jobs:
           # non-tag runs (dispatch rehearsals on master) save.
           save-if: ${{ github.ref_type != 'tag' }}
       - name: Build roomler-tunnel x86_64
-        run: cargo build -p roomler-tunnel --release --target x86_64-apple-darwin
+        run: cargo build -p roomler-cli --release --target x86_64-apple-darwin
       - name: Build roomler-tunnel aarch64
-        run: cargo build -p roomler-tunnel --release --target aarch64-apple-darwin
+        run: cargo build -p roomler-cli --release --target aarch64-apple-darwin
       - name: Lipo into universal
         run: |
           # P3d Slice B: per-target CLI binary is now `roomler` (was
@@ -310,7 +315,7 @@ jobs:
         # sits beside the MSI's app-local CRT DLLs.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build -p roomler-tunnel --release
+        run: cargo build -p roomler-cli --release
       # Sign before zipping so the EXE the operator extracts is signed. A zip
       # cannot itself carry an Authenticode signature, so the binary inside is
       # the only thing that can vouch for the download.
