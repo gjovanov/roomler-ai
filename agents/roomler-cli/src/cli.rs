@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn parses_forward() {
         let cli = Cli::try_parse_from([
-            "roomler-tunnel",
+            "roomler",
             "forward",
             "--agent",
             "507f1f77bcf86cd799439011",
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn parses_forward_transport_quic() {
         let cli = Cli::try_parse_from([
-            "roomler-tunnel",
+            "roomler",
             "forward",
             "--agent",
             "507f1f77bcf86cd799439011",
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn parses_forward_transport_auto() {
         let cli = Cli::try_parse_from([
-            "roomler-tunnel",
+            "roomler",
             "forward",
             "--agent",
             "507f1f77bcf86cd799439011",
@@ -844,7 +844,7 @@ mod tests {
     #[test]
     fn parses_socks5() {
         let cli = Cli::try_parse_from([
-            "roomler-tunnel",
+            "roomler",
             "socks5",
             "--agent",
             "507f1f77bcf86cd799439011",
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn parses_socks5_mesh_without_agent() {
-        let cli = Cli::try_parse_from(["roomler-tunnel", "socks5", "--local", "1080"]).unwrap();
+        let cli = Cli::try_parse_from(["roomler", "socks5", "--local", "1080"]).unwrap();
         match cli.command {
             Command::Socks5 { agent, local, .. } => {
                 assert_eq!(agent, None); // mesh mode
@@ -883,7 +883,7 @@ mod tests {
     #[test]
     fn parses_forward_daemon_flag() {
         let cli = Cli::try_parse_from([
-            "roomler-tunnel",
+            "roomler",
             "forward",
             "--agent",
             "507f1f77bcf86cd799439011",
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn parses_kill_verb() {
-        let cli = Cli::try_parse_from(["roomler-tunnel", "kill", "fl-7"]).unwrap();
+        let cli = Cli::try_parse_from(["roomler", "kill", "fl-7"]).unwrap();
         match cli.command {
             Command::Kill { id } => assert_eq!(id, "fl-7"),
             other => panic!("expected Kill, got {other:?}"),
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn parses_enroll() {
         let cli = Cli::try_parse_from([
-            "roomler-tunnel",
+            "roomler",
             "enroll",
             "--server",
             "https://roomler.ai",
@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn parses_status_peers_flows() {
         for verb in ["status", "peers", "flows"] {
-            let cli = Cli::try_parse_from(["roomler-tunnel", verb]).unwrap();
+            let cli = Cli::try_parse_from(["roomler", verb]).unwrap();
             match (verb, cli.command) {
                 ("status", Command::Status { fmt }) => assert!(!fmt.json),
                 ("peers", Command::Peers { fmt }) => assert!(!fmt.json),
@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn parses_status_json_flag() {
-        let cli = Cli::try_parse_from(["roomler-tunnel", "status", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["roomler", "status", "--json"]).unwrap();
         match cli.command {
             Command::Status { fmt } => assert!(fmt.json),
             other => panic!("expected Status, got {other:?}"),
@@ -983,7 +983,7 @@ mod tests {
         // A fully-valid `forward` + `--json` must fail: `--json` belongs only to
         // the read verbs (flattened there), not globally.
         let r = Cli::try_parse_from([
-            "roomler-tunnel",
+            "roomler",
             "forward",
             "--agent",
             "507f1f77bcf86cd799439011",

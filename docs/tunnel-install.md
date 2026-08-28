@@ -345,7 +345,7 @@ longest-prefix LAN routing, transports): [tunnels.md](tunnels.md).
 **Per-flow debug logs on the tunnel-client:**
 
 ```powershell
-$env:RUST_LOG = "roomler_tunnel=debug,tunnel_core=info"
+$env:RUST_LOG = "roomler_cli=debug,tunnel_core=info"   # pre-FR-21 builds: roomler_tunnel=debug
 roomler-tunnel forward --agent … --local 5432 --remote db.intranet:5432
 ```
 
