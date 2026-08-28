@@ -26,7 +26,10 @@ ExecStart=/usr/bin/roomlerd run
 Restart=always
 RestartSec=5
 RestartPreventExitStatus=7 8
-Environment=RUST_LOG=roomler_agent=info,warn
+# RETIRED-NAME-ANCHOR: `roomler_agent` is the pre-FR-21 tracing target. Kept
+# alongside the new one so this unit reads correctly on a daemon from either
+# side of the rename; agent-core::logging mirrors it for units already on disk.
+Environment=RUST_LOG=roomler_agent=info,roomlerd=info,warn
 
 # Sandboxing — conservative defaults appropriate for a user unit.
 NoNewPrivileges=true

@@ -107,6 +107,9 @@
                          stable identity across upgrade; perMachine keys off the
                          file itself (KeyPath='yes'), Win64='yes' like siblings. -->
                     <Component Id='AgentExe' Guid='6E4F5B23-7A3D-4F2C-8E5D-9F2C3E5F7A04' Win64='yes'>
+                        <!-- RETIRED-NAME-ANCHOR(3): an MSI FileKey is installer IDENTITY; five
+                             CustomActions reference it and upgrades key off it, so it is frozen
+                             deliberately. docs/fr/FR-21 -->
                         <File
                             Id='roomler_agent_exe'
                             Name='roomlerd.exe'

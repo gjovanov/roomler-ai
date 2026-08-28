@@ -213,7 +213,7 @@ jobs:
           # genuinely-signed OLDER build. The two copies MUST change
           # together: if they diverge, every agent refuses every update and
           # the symptom is a silent fleet-wide update freeze, not an error.
-          # `cargo test -p roomler-agent --lib -- --ignored real_published_msi`
+          # `cargo test -p roomlerd --lib -- --ignored real_published_msi`
           # re-checks the Rust side against a real published MSI.
           if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)$ ]]; then
             vmajor="${BASH_REMATCH[1]}"; vminor="${BASH_REMATCH[2]}"
@@ -381,7 +381,7 @@ jobs:
           # cmake_minimum_required(VERSION < 3.5); CMake 3.31+ errors without
           # this policy shim.
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server"
 
       # P3e Phase 2: the .deb's `roomler` is now the CLI SHIM (re-execs
       # `roomlerd cli`) — the Linux twin of the rc.365 MSI change. It must
@@ -612,7 +612,7 @@ jobs:
       - name: Build agent (release, full + vp9-444, no ffmpeg-encoder)
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server"
 
       - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
         run: |
@@ -1024,7 +1024,7 @@ jobs:
         # extra lib on Windows) + audiopus (bundled libopus via CMake).
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
+        run: cargo build -p roomlerd --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
 
       - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
         shell: pwsh
@@ -1231,7 +1231,7 @@ jobs:
         run: |
           # cargo-wix reads agents/roomlerd/wix/main.wxs and sets the
           # Version preprocessor variable from --install-version.
-          cargo wix -p roomler-agent --nocapture --no-build --install-version $env:MSI_VERSION
+          cargo wix -p roomlerd --nocapture --no-build --install-version $env:MSI_VERSION
 
       - name: Locate + rename per-User MSI
         id: locate
@@ -1267,7 +1267,7 @@ jobs:
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
-            cargo wix -p roomler-agent --nocapture --no-build --install-version $env:MSI_VERSION
+            cargo wix -p roomlerd --nocapture --no-build --install-version $env:MSI_VERSION
           } finally {
             Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
           }
@@ -1620,7 +1620,7 @@ jobs:
         # +crt-static is safe; link-verified against the Tauri 2 stack.
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-        run: cargo build -p roomler-agent-tray --release
+        run: cargo build -p roomler-desktop --release
 
       - name: Locate + rename tray EXE
         id: locate_tray
@@ -1907,7 +1907,7 @@ jobs:
         # links, which is why adding a library here required no change there.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomler-agent --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder" --target aarch64-apple-darwin
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder" --target aarch64-apple-darwin
 
       # The `roomler` CLI. macOS shipped WITHOUT one until rc.454 — the pkg
       # payload was the .app and nothing else — so `roomler peers` was
@@ -1922,7 +1922,7 @@ jobs:
       # `cargo build` embeds the frontend and no Tauri toolchain is needed on
       # the runner (the same reason the Windows lane uses `cargo build`).
       - name: Build the desktop companion
-        run: cargo build -p roomler-agent-tray --release --target aarch64-apple-darwin
+        run: cargo build -p roomler-desktop --release --target aarch64-apple-darwin
 
       # ── The STABLE self-signed code-signing identity ────────────────────
       # TCC keys Screen Recording / Accessibility grants on the code-signing

@@ -14,18 +14,18 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "windows")]
-use roomler_agent::dpi;
+use roomlerd::dpi;
 #[cfg(target_os = "macos")]
-use roomler_agent::tcc;
+use roomlerd::tcc;
 #[cfg(target_os = "linux")]
-use roomler_agent::virtual_desktop;
+use roomlerd::virtual_desktop;
 #[cfg(target_os = "windows")]
-use roomler_agent::win_service;
+use roomlerd::win_service;
 #[cfg(target_os = "windows")]
-use roomler_agent::win_timer;
+use roomlerd::win_timer;
 #[cfg(target_os = "windows")]
-use roomler_agent::win32_monitors;
-use roomler_agent::{
+use roomlerd::win32_monitors;
+use roomlerd::{
     config, crash_uploader, encode, enrollment, instance_lock, localapi_state, logging, machine,
     notify, post_install, preflight, service, signaling, updater, watchdog,
 };
@@ -528,7 +528,7 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
 
     #[cfg(all(feature = "system-context", target_os = "windows"))]
     {
-        use roomler_agent::system_context::{user_profile, worker_role};
+        use roomlerd::system_context::{user_profile, worker_role};
         let is_sc = matches!(
             worker_role::probe_self(),
             Ok(worker_role::WorkerRole::SystemContext)
@@ -600,7 +600,7 @@ fn should_self_heal_config(
 /// rights to write `%PROGRAMDATA%`.
 #[cfg(all(feature = "system-context", target_os = "windows"))]
 fn self_heal_machine_global_config(loaded_path: &std::path::Path, cfg: &config::AgentConfig) {
-    use roomler_agent::system_context::worker_role;
+    use roomlerd::system_context::worker_role;
     let is_sc = matches!(
         worker_role::probe_self(),
         Ok(worker_role::WorkerRole::SystemContext)
@@ -694,10 +694,10 @@ async fn main() -> Result<()> {
     // open handles in the tree; the read-both resolution keeps everything
     // working until the next start retries.
     #[cfg(target_os = "windows")]
-    let companion_running = roomler_agent::companion::desktop_running();
+    let companion_running = roomlerd::companion::desktop_running();
     #[cfg(not(target_os = "windows"))]
     let companion_running = false;
-    roomler_agent::appdirs::migrate_legacy_trees(companion_running);
+    roomlerd::appdirs::migrate_legacy_trees(companion_running);
 
     // Same one-shot, same reason, different axis: a Linux SYSTEM install's
     // config belongs at `/etc/roomler/config.toml` (what the packaged unit
@@ -705,7 +705,7 @@ async fn main() -> Result<()> {
     // or any config read, and before logging::init, so it collects notes the
     // same way.
     #[cfg(target_os = "linux")]
-    roomler_agent::appdirs::migrate_system_config();
+    roomlerd::appdirs::migrate_system_config();
 
     let cli = Cli::parse();
 
@@ -725,7 +725,7 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "system-context")]
         if matches!(cli.command, Some(Command::Run { .. }) | None) {
-            use roomler_agent::system_context::worker_role;
+            use roomlerd::system_context::worker_role;
             if matches!(
                 worker_role::probe_self(),
                 Ok(worker_role::WorkerRole::SystemContext)
@@ -736,13 +736,13 @@ async fn main() -> Result<()> {
     }
 
     logging::init();
-    for note in roomler_agent::appdirs::migration_notes() {
+    for note in roomlerd::appdirs::migration_notes() {
         tracing::info!(%note, "appdirs legacy-tree migration");
     }
     // WARN, not INFO: this one moves the file that holds this host's identity,
     // and "where is my config now?" is the first question after an upgrade.
     #[cfg(target_os = "linux")]
-    for note in roomler_agent::appdirs::system_config_notes() {
+    for note in roomlerd::appdirs::system_config_notes() {
         tracing::warn!(%note, "system-config migration");
     }
     if let Some(dir) = logging::log_dir() {
@@ -783,7 +783,7 @@ async fn main() -> Result<()> {
         // worker via LazyLock; this line is the canonical "is the
         // virtual-screen-aware path live?" data point.
         let vscreen =
-            roomler_agent::input::parse_virtual_screen_flag(node_env("VIRTUAL_SCREEN").as_deref());
+            roomlerd::input::parse_virtual_screen_flag(node_env("VIRTUAL_SCREEN").as_deref());
         tracing::info!(
             virtual_screen_enabled = vscreen,
             "input mapping — rc.54 ROOMLER_AGENT_VIRTUAL_SCREEN gate (false = legacy enigo.main_display path; true = win32_monitors::primary virtual-screen offset)"
@@ -835,7 +835,7 @@ async fn main() -> Result<()> {
         Command::Org { action } => org_cmd(&config_path, action),
         Command::Run { encoder } => run_cmd(&config_path, encoder.as_deref()).await,
         Command::CapsProbe => {
-            roomler_agent::encode::caps::print_probe_result();
+            roomlerd::encode::caps::print_probe_result();
             Ok(())
         }
         Command::UpdateHelper => {
@@ -921,15 +921,15 @@ async fn main() -> Result<()> {
 /// suppressed by the 30 s rate-limit).
 #[cfg(target_os = "windows")]
 fn record_worker_exit_failure(err: &anyhow::Error) {
-    use roomler_agent::crash_recorder::{self, Reason, WriterContext};
+    use roomlerd::crash_recorder::{self, Reason, WriterContext};
 
     // Choose the writer context the user-context uploader will scan.
     // Under LocalSystem (SystemContext worker): use PROGRAMDATA via
     // WriterContext::Supervisor. Under user-context worker: use the
     // worker's own LOCALAPPDATA via WriterContext::Worker.
     #[cfg(feature = "system-context")]
-    let ctx = match roomler_agent::system_context::worker_role::probe_self() {
-        Ok(roomler_agent::system_context::worker_role::WorkerRole::SystemContext) => {
+    let ctx = match roomlerd::system_context::worker_role::probe_self() {
+        Ok(roomlerd::system_context::worker_role::WorkerRole::SystemContext) => {
             WriterContext::Supervisor
         }
         _ => WriterContext::Worker,
@@ -947,7 +947,7 @@ fn record_worker_exit_failure(err: &anyhow::Error) {
 /// summary print. Always exits 0 so the MSI's `Return="ignore"` on
 /// the custom action is belt-and-suspenders, not load-bearing.
 fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()> {
-    let target = match roomler_agent::install_cleanup::TargetFlavour::parse(target_flavour) {
+    let target = match roomlerd::install_cleanup::TargetFlavour::parse(target_flavour) {
         Some(t) => t,
         None => {
             eprintln!(
@@ -957,7 +957,7 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
             return Ok(());
         }
     };
-    let report = roomler_agent::install_cleanup::run_cleanup(target, dry_run)?;
+    let report = roomlerd::install_cleanup::run_cleanup(target, dry_run)?;
     // Always print the one-line summary so the MSI's session log
     // (msiexec /l*v) shows what happened. Exit 0 even on errors —
     // a cleanup failure shouldn't sink the install.
@@ -971,12 +971,12 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
 }
 
 /// Uninstall roomler-agent MSI versions older than the running one
-/// (see [`roomler_agent::version_sweep`] for why they pile up). Prints
+/// (see [`roomlerd::version_sweep`] for why they pile up). Prints
 /// a one-line summary; exits 0 even on partial failure (best-effort,
 /// like `cleanup-legacy-install`). Use `--dry-run` to preview.
 fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
     let flavour_override = match flavour {
-        Some(s) => match roomler_agent::install_detect::Flavour::parse(s) {
+        Some(s) => match roomlerd::install_detect::Flavour::parse(s) {
             Some(f) => Some(f),
             None => {
                 eprintln!(
@@ -988,7 +988,7 @@ fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
         },
         None => None,
     };
-    let report = roomler_agent::version_sweep::run_sweep(dry_run, flavour_override)?;
+    let report = roomlerd::version_sweep::run_sweep(dry_run, flavour_override)?;
     println!("{}", report.summary());
     if !report.errors.is_empty() {
         for e in &report.errors {
@@ -1012,8 +1012,8 @@ fn sweep_old_versions_cmd(dry_run: bool, flavour: Option<&str>) -> Result<()> {
 /// console-run agent in THIS profile when no daemon is listening on the
 /// local pipe/socket.
 async fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()> {
-    let kind = roomler_agent::consent::SentinelKind::from_flags(approve, deny)?;
-    let allow = matches!(kind, roomler_agent::consent::SentinelKind::Approve);
+    let kind = roomlerd::consent::SentinelKind::from_flags(approve, deny)?;
+    let allow = matches!(kind, roomlerd::consent::SentinelKind::Approve);
 
     match tunnel_core::localapi::connect().await {
         Ok(mut client) => {
@@ -1045,21 +1045,20 @@ async fn consent_cmd(session_hex: &str, approve: bool, deny: bool) -> Result<()>
         }
     }
 
-    let dir = roomler_agent::consent::ConsentBroker::default_sentinel_dir()
+    let dir = roomlerd::consent::ConsentBroker::default_sentinel_dir()
         .context("resolving consent sentinel dir")?;
     // `Mode::AutoGrant` here is irrelevant — we're not running the
     // broker, just borrowing its sentinel-path layout. Using
     // AutoGrant skips the directory existence check so the CLI
     // works even before the agent's first session.
-    let broker =
-        roomler_agent::consent::ConsentBroker::new(roomler_agent::consent::Mode::AutoGrant, dir)
-            .context("opening consent broker for CLI")?;
+    let broker = roomlerd::consent::ConsentBroker::new(roomlerd::consent::Mode::AutoGrant, dir)
+        .context("opening consent broker for CLI")?;
     let path = broker.write_sentinel(session_hex, kind)?;
     println!(
         "operator consent {} for session {}\n  sentinel: {}",
         match kind {
-            roomler_agent::consent::SentinelKind::Approve => "APPROVED",
-            roomler_agent::consent::SentinelKind::Deny => "DENIED",
+            roomlerd::consent::SentinelKind::Approve => "APPROVED",
+            roomlerd::consent::SentinelKind::Deny => "DENIED",
         },
         session_hex,
         path.display()
@@ -1339,7 +1338,7 @@ fn enroll_user_context_warning_due() -> bool {
     // — mirrors the existing call sites at :404, :476, :637, :1032, :1792.
     // Local cargo test caught this only via the bin-tests build path
     // because the test binary doesn't exercise the system-context feature.
-    use roomler_agent::system_context::worker_role::{WorkerRole, probe_self};
+    use roomlerd::system_context::worker_role::{WorkerRole, probe_self};
     !matches!(probe_self(), Ok(WorkerRole::SystemContext))
 }
 
@@ -1619,7 +1618,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
     // cloud-NAT VM whose public IP isn't on a local iface; `=0` for WSL
     // mirrored-mode with native UDP).
     let relay_forced = node_env_os("ICE_RELAY_TCP").is_some();
-    let host_public = roomler_agent::subnet_detect::host_has_public_ipv4();
+    let host_public = roomlerd::subnet_detect::host_has_public_ipv4();
     unsafe {
         std::env::set_var("DISPLAY", vd.display());
         if !relay_forced && !host_public {
@@ -1802,7 +1801,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         // can resolve the right DERP mux for the quic-derp-v1 flavor
         // (declared routes are primary-org-scoped by the reconciler).
         #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
-        let _ = roomler_agent::overlay::PRIMARY_TENANT_ID.set(cfg.tenant_id.clone());
+        let _ = roomlerd::overlay::PRIMARY_TENANT_ID.set(cfg.tenant_id.clone());
     }
 
     // ICE env bridge: the media-ICE hatches live in the VENDORED webrtc-ice
@@ -1905,7 +1904,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // identity every restart.
     #[cfg(feature = "ssh-server")]
     if cfg.ssh_enabled && cfg.ssh_host_key.is_none() {
-        match roomler_agent::ssh::generate_host_key() {
+        match roomlerd::ssh::generate_host_key() {
             Ok(pem) => {
                 cfg.ssh_host_key = Some(pem);
                 match config::save(config_path, &cfg) {
@@ -1935,7 +1934,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // routing was active when it died — then had overlay disabled — is still
     // healed (else a persisted Windows Wintun `/1` blackholes egress to a dead
     // NIC until reboot). No-op on non-`overlay-l3` builds.
-    roomler_agent::purge_exit_routes();
+    roomlerd::purge_exit_routes();
 
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
 
@@ -1949,14 +1948,14 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             node_env("DISABLE_BROWSE").as_deref(),
             Some("1") | Some("true") | Some("yes")
         );
-    roomler_agent::files::set_remote_browse_enabled(browse_enabled);
+    roomlerd::files::set_remote_browse_enabled(browse_enabled);
     tracing::info!(browse_enabled, "file-DC remote browse capability");
 
     // Remote app selection & launch (virtual-desktop hosts). Same
     // process-global install as the browse flag above; the caps builder's
     // `apps::apps_supported()` additionally gates on VD mode (a DISPLAY
     // being set), so this is inert on non-VD hosts.
-    roomler_agent::apps::set_apps_config(cfg.virtual_desktop_apps.clone());
+    roomlerd::apps::set_apps_config(cfg.virtual_desktop_apps.clone());
     tracing::info!(
         apps_enabled = cfg.virtual_desktop_apps.enabled,
         apps_allowlist = cfg.virtual_desktop_apps.allowlist.len(),
@@ -1976,14 +1975,14 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // (matches the pre-M3 behaviour). The error is logged at warn
     // so the next pass through the supervisor flags it.
     #[cfg(all(feature = "system-context", target_os = "windows"))]
-    let worker_role = match roomler_agent::system_context::worker_role::probe_self() {
+    let worker_role = match roomlerd::system_context::worker_role::probe_self() {
         Ok(role) => {
             tracing::info!(?role, "worker role probed");
             role
         }
         Err(e) => {
             tracing::warn!(error = %e, "worker role probe failed — defaulting to User");
-            roomler_agent::system_context::worker_role::WorkerRole::User
+            roomlerd::system_context::worker_role::WorkerRole::User
         }
     };
     #[cfg(all(feature = "system-context", target_os = "windows"))]
@@ -2135,19 +2134,19 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         // in a user session.
         #[cfg(all(target_os = "windows", feature = "system-context"))]
         let respawn_ctx = {
-            use roomler_agent::system_context::worker_role;
+            use roomlerd::system_context::worker_role;
             if matches!(
                 worker_role::probe_self(),
                 Ok(worker_role::WorkerRole::SystemContext)
             ) {
-                roomler_agent::companion::RespawnContext::SystemService
+                roomlerd::companion::RespawnContext::SystemService
             } else {
-                roomler_agent::companion::RespawnContext::UserSession
+                roomlerd::companion::RespawnContext::UserSession
             }
         };
         #[cfg(not(all(target_os = "windows", feature = "system-context")))]
-        let respawn_ctx = roomler_agent::companion::RespawnContext::UserSession;
-        tokio::spawn(roomler_agent::companion::refresh_if_stale(respawn_ctx));
+        let respawn_ctx = roomlerd::companion::RespawnContext::UserSession;
+        tokio::spawn(roomlerd::companion::refresh_if_stale(respawn_ctx));
     }
 
     // Install the liveness watchdog. Pumps tick after every iteration;
@@ -2208,7 +2207,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // failure (e.g. Downloads inaccessible under SYSTEM context)
     // logs a debug message and continues — same-process resume via
     // `begin()`-time registry writes still works.
-    let (kept, swept) = roomler_agent::files::sweep_orphans().await;
+    let (kept, swept) = roomlerd::files::sweep_orphans().await;
     if kept + swept > 0 {
         tracing::info!(kept, swept, "rc19: partial-registry warm-up");
     }
@@ -2258,27 +2257,27 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // 2026-07-27 — heal GPU clocks a crashed predecessor left pinned: the
     // session-scoped pin resets on Drop, but a SIGKILL'd/crashed agent never
     // runs Drop. No-op unless `ROOMLER_AGENT_GPU_CLOCK_PIN` is enabled.
-    roomler_agent::gpu_clock::reset_stale_pins();
+    roomlerd::gpu_clock::reset_stale_pins();
 
     // rc.58 — start the centralized log uploader BEFORE signaling
     // moves cfg out of scope. Default ON; opt out with
     // `ROOMLER_AGENT_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
     let logs_upload_disabled =
-        roomler_agent::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
+        roomlerd::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
     if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
-        let host_hash = roomler_agent::logs_upload::hash_hostname(
-            &roomler_agent::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
+        let host_hash = roomlerd::logs_upload::hash_hostname(
+            &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
         );
-        let upload_cfg = roomler_agent::logs_upload::UploadConfig {
+        let upload_cfg = roomlerd::logs_upload::UploadConfig {
             server_url: cfg.server_url.clone(),
             tenant_id: cfg.tenant_id.clone(),
             agent_id: cfg.agent_id.clone(),
             agent_jwt: cfg.agent_token.clone(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id_hash: host_hash,
-            source: roomler_agent::logs_upload::LogSource::Agent,
+            source: roomlerd::logs_upload::LogSource::Agent,
         };
-        tokio::spawn(roomler_agent::logs_upload::run_uploader(rx, upload_cfg));
+        tokio::spawn(roomlerd::logs_upload::run_uploader(rx, upload_cfg));
         tracing::info!(
             tenant_id = %cfg.tenant_id,
             agent_id = %cfg.agent_id,
@@ -2301,20 +2300,20 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // signaling::run) so the LocalAPI's DaemonState shares the SAME instance the
     // signaling loop prompts on; its live `pending` set gates LocalAPI consent
     // decisions (a decision is honoured only for an actively-prompting session).
-    let consent_mode = roomler_agent::consent::Mode::from_config(cfg.auto_grant_session);
+    let consent_mode = roomlerd::consent::Mode::from_config(cfg.auto_grant_session);
     let consent_dir =
-        roomler_agent::consent::ConsentBroker::default_sentinel_dir().unwrap_or_else(|e| {
+        roomlerd::consent::ConsentBroker::default_sentinel_dir().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "could not resolve consent sentinel dir; using temp dir");
             std::env::temp_dir().join("roomler-agent-consent")
         });
-    let consent_broker = roomler_agent::consent::ConsentBroker::new(consent_mode, consent_dir)
+    let consent_broker = roomlerd::consent::ConsentBroker::new(consent_mode, consent_dir)
         .unwrap_or_else(|e| {
             // FAIL CLOSED for prompt-mode fleets: keep the CONFIGURED mode on the
             // temp dir rather than downgrading to AutoGrant. A Prompt broker whose
             // dir doesn't match the tray's simply times out → deny (safe), instead
             // of the pre-P2b fail-OPEN that auto-granted every session on a glitch.
             tracing::error!(error = %e, ?consent_mode, "consent broker init failed; retrying on temp dir with the SAME mode (prompt-mode fails closed)");
-            roomler_agent::consent::ConsentBroker::new(consent_mode, std::env::temp_dir())
+            roomlerd::consent::ConsentBroker::new(consent_mode, std::env::temp_dir())
                 .expect("consent broker init cannot fail with temp_dir")
         });
     tracing::info!(
@@ -2328,7 +2327,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // The netstack ICMP backend for `roomler ping` — Some only on a node running
     // the userspace stack (netstack mode); None otherwise (OS-TUN / non-overlay).
     #[cfg(feature = "overlay-netstack")]
-    let netstack_pinger = roomler_agent::overlay::netstack_pinger(&cfg);
+    let netstack_pinger = roomlerd::overlay::netstack_pinger(&cfg);
     #[cfg(not(feature = "overlay-netstack"))]
     let netstack_pinger: Option<std::sync::Arc<dyn localapi_state::NetstackPinger>> = None;
     // S1b — ONE pinger for BOTH the interactive `Ping` verb and the RTT
@@ -2344,13 +2343,12 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // P3b-2 PR-C: the tunnel-client hub, created ONCE here (stable across WS
     // reconnects) and SHARED between the LocalAPI's DaemonState (create/kill/
     // flows verbs) and the signaling loop (publish the live egress + demux).
-    let tunnel_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
-        env!("CARGO_PKG_VERSION").to_string(),
-    );
+    let tunnel_hub =
+        roomlerd::tunnel::client_mgr::TunnelClientHub::new(env!("CARGO_PKG_VERSION").to_string());
     // P3b-3: shared RTT cache — filled by the prober task (below), read by
     // `peers()`. Clone the pinger for the prober; the original moves into
     // `DaemonState` for the `ping` verb.
-    let rtt_cache: roomler_agent::localapi_state::RttCache =
+    let rtt_cache: roomlerd::localapi_state::RttCache =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let pinger_for_prober = pinger.clone();
     // P6: the daemon-wide config-WRITE lock. Every daemon-side runtime
@@ -2361,7 +2359,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // Remote config (docs/remote-config.md) — machine-wide, so ONE instance
     // shared by every org loop. Seeds the live `exec_enabled` from the config
     // this daemon actually loaded.
-    let remote_cfg = roomler_agent::remote_config::RemoteConfigServices::new(
+    let remote_cfg = roomlerd::remote_config::RemoteConfigServices::new(
         config_path.clone(),
         cfg_write_lock.clone(),
         cfg.exec_enabled,
@@ -2370,7 +2368,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // P6: the declared-route reconciler — converges `[[tunnel_routes]]`
     // from the loaded config into live hub flows, and backs the LocalAPI
     // Route* verbs (persisting through the write lock).
-    let route_reconciler = roomler_agent::tunnel::route_reconciler::RouteReconciler::new(
+    let route_reconciler = roomlerd::tunnel::route_reconciler::RouteReconciler::new(
         tunnel_hub.clone(),
         config_path.clone(),
         cfg_write_lock.clone(),
@@ -2466,7 +2464,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // connection's runtime alive). Without overlay features the slot
     // stays `None` forever and the hook is inert.
     let rtt_sample_slot: signaling::RttSampleSlot = Default::default();
-    let rtt_hook: roomler_agent::localapi_state::RttSampleHook = {
+    let rtt_hook: roomlerd::localapi_state::RttSampleHook = {
         let slot = rtt_sample_slot.clone();
         std::sync::Arc::new(move |node_hex: &str, rtt_ms: u32| {
             let inner = slot.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -2475,7 +2473,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             }
         })
     };
-    roomler_agent::localapi_state::spawn_rtt_prober(
+    roomlerd::localapi_state::spawn_rtt_prober(
         pinger_for_prober,
         overlay_view_tx.subscribe(),
         rtt_cache,
@@ -2497,7 +2495,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
     // a co-located corp-Chrome controller (which can't punch direct) relays
     // through the overlay instead of the capped far coturn. Default-OFF; inert
     // without an overlay IP. Spawned before `cfg` moves into the signaling task.
-    roomler_agent::rc_local_turn::spawn(
+    roomlerd::rc_local_turn::spawn(
         overlay_view_tx.subscribe(),
         cfg.agent_id.clone(),
         shutdown_rx.clone(),
@@ -2524,7 +2522,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
             v.push((org.label.clone(), org_view_rx));
         }
         let org_slot: signaling::RttSampleSlot = Default::default();
-        let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
+        let org_hub = roomlerd::tunnel::client_mgr::TunnelClientHub::new(
             env!("CARGO_PKG_VERSION").to_string(),
         );
         let rx = shutdown_rx.clone();
@@ -2581,7 +2579,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
         // Cloned for the org-join closure: it is an `Fn` (called per join), so
         // it must not consume the captured services.
         let remote_cfg2 = remote_cfg.clone();
-        roomler_agent::org_join::install(roomler_agent::org_join::JoinRuntime {
+        roomlerd::org_join::install(roomlerd::org_join::JoinRuntime {
             config_path: config_path.clone(),
             write_lock: cfg_write_lock.clone(),
             spawn_org: Box::new(move |org: config::OrgEntry| {
@@ -2664,7 +2662,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                     v.push((org.label.clone(), org_view_rx));
                 }
                 let org_slot: signaling::RttSampleSlot = Default::default();
-                let org_hub = roomler_agent::tunnel::client_mgr::TunnelClientHub::new(
+                let org_hub = roomlerd::tunnel::client_mgr::TunnelClientHub::new(
                     env!("CARGO_PKG_VERSION").to_string(),
                 );
                 // The PER-ORG shutdown, not the global one — that is what
@@ -2738,7 +2736,7 @@ async fn run_cmd(config_path: &PathBuf, cli_encoder: Option<&str>) -> Result<()>
                             // an overlay surface; without one there is no
                             // shared TUN to release.
                             #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
-                            roomler_agent::overlay::release_org(&cleanup_tenant);
+                            roomlerd::overlay::release_org(&cleanup_tenant);
                             #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
                             let _ = &cleanup_tenant;
                         }
@@ -2996,7 +2994,7 @@ const DEFAULT_RESTART_TIMEOUT_SECS: u64 = 120;
 
 #[cfg(target_os = "windows")]
 fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
-    use roomler_agent::win_service::{environment, system_context_attempt as attempt};
+    use roomlerd::win_service::{environment, system_context_attempt as attempt};
     use std::time::Duration;
 
     const COMMAND: &str = "enable-system-context";
@@ -3053,7 +3051,7 @@ fn enable_system_context_cmd(_no_restart: bool) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
-    use roomler_agent::win_service::{environment, system_context_attempt as attempt};
+    use roomlerd::win_service::{environment, system_context_attempt as attempt};
     use std::time::Duration;
 
     const COMMAND: &str = "disable-system-context";
@@ -3102,7 +3100,7 @@ fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
-    use roomler_agent::win_service::environment;
+    use roomlerd::win_service::environment;
     match value {
         Some(v) => {
             environment::set_service_env_var(name, v)
@@ -3129,7 +3127,7 @@ fn set_service_env_var_cmd(_name: &str, _value: Option<&str>) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn restart_service_cmd(timeout_secs: u64) -> Result<()> {
-    use roomler_agent::win_service::environment;
+    use roomlerd::win_service::environment;
     use std::time::Duration;
     environment::restart_service(Duration::from_secs(timeout_secs))
         .context("restarting RoomlerAgentService")?;
@@ -3243,7 +3241,7 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
             // P5/A2 — this process::exit bypasses RAII; drop any exit-node
             // split-default so the update window can't blackhole egress (the new
             // binary's boot reconciler heals it too, but close the gap now).
-            roomler_agent::purge_exit_routes();
+            roomlerd::purge_exit_routes();
             std::process::exit(0);
         }
         updater::CheckOutcome::Skipped(reason) => {
@@ -3258,7 +3256,7 @@ async fn self_update_cmd(check_only: bool) -> Result<()> {
 /// regressions before shipping an MSI. Exits with a non-zero code on
 /// any failure so a failed smoke check fails the release build.
 async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
-    use roomler_agent::encode::{open_default, open_for_codec};
+    use roomlerd::encode::{open_default, open_for_codec};
 
     // The CI release lane runs `encoder-smoke` on the freshly built EXE, so
     // assert the FFmpeg link contract here instead of paying a separate
@@ -3269,7 +3267,7 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
     // `libavcodec_version_is_ffmpeg_7_or_newer` unit test in encode::ffmpeg.
     #[cfg(feature = "ffmpeg-encoder")]
     {
-        let v = roomler_agent::encode::ffmpeg::linked_libavcodec_version();
+        let v = roomlerd::encode::ffmpeg::linked_libavcodec_version();
         let major = (v >> 16) & 0xFF;
         let raw = format!("0x{v:06X}");
         tracing::info!(libavcodec_major = major, raw = %raw, "encoder smoke: FFmpeg link check");
@@ -3322,15 +3320,15 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
             px[2] = r;
             px[3] = 255;
         }
-        let frame = std::sync::Arc::new(roomler_agent::capture::Frame {
+        let frame = std::sync::Arc::new(roomlerd::capture::Frame {
             width: w,
             height: h,
             stride: w * 4,
-            pixel_format: roomler_agent::capture::PixelFormat::Bgra,
+            pixel_format: roomlerd::capture::PixelFormat::Bgra,
             data,
             monotonic_us: (i as u64) * 33_333,
             monitor: 0,
-            damage: roomler_agent::capture::Damage::Unknown,
+            damage: roomlerd::capture::Damage::Unknown,
             source: None,
         });
         if i == 5 {
@@ -3364,7 +3362,7 @@ async fn encoder_smoke_cmd(pref_raw: &str, codec_raw: &str) -> Result<()> {
 /// their own (default) desktop attachment.
 #[cfg(all(target_os = "windows", feature = "wgc-capture"))]
 fn system_capture_smoke_cmd(desktop_raw: &str, frames: u32, timeout_ms: u32) -> Result<()> {
-    use roomler_agent::win_service::capture_smoke::{self, DesktopTarget};
+    use roomlerd::win_service::capture_smoke::{self, DesktopTarget};
     use std::str::FromStr;
     let target = DesktopTarget::from_str(desktop_raw)
         .map_err(|e| anyhow::anyhow!("bad --desktop {desktop_raw:?}: {e}"))?;
@@ -3375,7 +3373,7 @@ fn system_capture_smoke_cmd(desktop_raw: &str, frames: u32, timeout_ms: u32) -> 
 fn system_capture_smoke_cmd(_desktop_raw: &str, _frames: u32, _timeout_ms: u32) -> Result<()> {
     bail!(
         "`system-capture-smoke` requires Windows + the `wgc-capture` feature. \
-         Rebuild with `cargo build -p roomler-agent --release --features full-hw`."
+         Rebuild with `cargo build -p roomlerd --release --features full-hw`."
     );
 }
 
@@ -3384,7 +3382,7 @@ fn system_capture_smoke_cmd(_desktop_raw: &str, _frames: u32, _timeout_ms: u32) 
 /// Win32 desktop / token state that is per-thread.
 #[cfg(target_os = "windows")]
 fn system_context_probe_cmd(mode_raw: &str) -> Result<()> {
-    use roomler_agent::win_service::system_context_probe::{self, ProbeMode};
+    use roomlerd::win_service::system_context_probe::{self, ProbeMode};
     use std::str::FromStr;
     let mode = ProbeMode::from_str(mode_raw)
         .map_err(|e| anyhow::anyhow!("bad probe mode {mode_raw:?}: {e}"))?;
@@ -3397,7 +3395,7 @@ fn system_context_probe_cmd(_mode_raw: &str) -> Result<()> {
 }
 
 async fn caps_cmd() -> Result<()> {
-    let caps = roomler_agent::encode::caps::detect();
+    let caps = roomlerd::encode::caps::detect();
     println!("codecs: {:?}", caps.codecs);
     println!("hw_encoders: {:?}", caps.hw_encoders);
     println!("transports: {:?}", caps.transports);
@@ -3412,7 +3410,7 @@ async fn caps_cmd() -> Result<()> {
 }
 
 async fn displays_cmd() -> Result<()> {
-    let list = roomler_agent::displays::enumerate();
+    let list = roomlerd::displays::enumerate();
     println!("displays ({}):", list.len());
     for d in &list {
         println!(
@@ -3430,7 +3428,7 @@ async fn displays_cmd() -> Result<()> {
 
 #[cfg(feature = "system-context")]
 fn peer_presence_status_cmd() -> Result<()> {
-    use roomler_agent::system_context::peer_presence;
+    use roomlerd::system_context::peer_presence;
 
     let snap = peer_presence::snapshot();
     println!("== peer-presence marker status ==========================");

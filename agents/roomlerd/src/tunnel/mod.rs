@@ -27,7 +27,7 @@ pub mod acceptor;
 // P3e lever E: the agent-side forward allowlist moved to
 // `roomler-agent-core::acl` (AgentConfig embeds its types, and AgentConfig
 // lives there now). Re-exported so `crate::tunnel::acl::…` stays valid.
-pub use roomler_agent_core::acl;
+pub use roomler_core::acl;
 pub mod client_mgr;
 pub mod dialer;
 pub(crate) mod netwatch;

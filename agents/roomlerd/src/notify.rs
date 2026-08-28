@@ -8,7 +8,7 @@
 //! [`crate::system_context::worker_role`], which is winlogon-token machinery
 //! gated on the daemon-only `system-context` feature.
 
-pub use roomler_agent_core::notify::*;
+pub use roomler_core::notify::*;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

@@ -122,7 +122,7 @@ pub trait WindowManager: Send + Sync {
 // (AgentConfig embeds them, and AgentConfig lives there now); the launch
 // machinery around them stays HERE. Re-exported under the old paths so
 // `crate::apps::VirtualDesktopAppsConfig` remains valid everywhere.
-pub use roomler_agent_core::apps_config::{AppSpec, VirtualDesktopAppsConfig};
+pub use roomler_core::apps_config::{AppSpec, VirtualDesktopAppsConfig};
 
 // ---------------------------------------------------------------------------
 // Process-global config install (mirrors `files::set_remote_browse_enabled`)
