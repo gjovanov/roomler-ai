@@ -109,6 +109,28 @@ frame. The three fail in different phases; a single total cannot tell them apart
 ⚠️ Deltas rather than absolute offsets — the actionable quantity is *which wait was
 long*, and with offsets every step after a 9 s stall looks equally late.
 
+**3b. Say it to the OPERATOR, not the console** (PR #822). The console line is invisible
+during exactly the sessions this exists to explain — nobody has devtools open when a
+connect takes 15 s, so the report that comes back is still *"it was slow again"*.
+`describeConnectTiming()` turns the marks into one sentence in the existing app
+snackbar, naming which wait dominated in plain words, with the short mark name in the
+tail so a reported snackbar is traceable without devtools.
+
+⚠️ **Consent is never named as "what was slow".** `ready` is human-paced BY DESIGN — the
+server owns its timeout for that exact reason — so it is excluded from the verdict while
+still advancing the clock for the steps after it. Reporting "most of the wait was
+someone approving the prompt" is true, useless, and points the operator at themselves
+instead of at the slow step. Locked by a test, because getting this wrong yields a
+CONFIDENTLY WRONG message rather than a missing one.
+⚠️ **A normal connect says nothing** (`CONNECT_SLOW_MS` 7 s — above the measured healthy
+band, below the reported 10–15 s). A message on every success is noise, and a threshold
+inside the healthy band would train people to dismiss it.
+⚠️ **A retry is always notable even when the total looks fine** — that is the FR-22
+signature, and the operator waited through it either way.
+⚠️ **Stall warnings throttle (20 s), resolutions never.** A flapping path would otherwise
+bury its own message; but showing "it is failing" and suppressing "it finally connected"
+leaves a warning with no ending.
+
 ## Acceptance criteria
 
 - [x] Instrumented TTFF exists and a normal connect reports it. **Built** (#821);
@@ -140,3 +162,5 @@ long*, and with offsets every step after a 9 s stall looks equally late.
 |---|---|---|
 | 2026-08-28 | 0.4.12 | Investigated. Agent-side spans measured across 10 sessions (above); ICE trickle ruled out; 15 s signalling timeout identified as the cost mechanism. Trigger not yet proven. |
 | 2026-08-28 | — | Parts 1 + 3 merged (#821): phase-aware bound (`requesting` 4 s) and eight-mark connect timing. Part 2 measured against the tree and found ALREADY PRESENT — recorded rather than rebuilt. **No field reading yet**; the p50 and the root cause both need a deployed build, so nothing here is a result. |
+| 2026-08-28 | `v20260828-afeb977584f0` | Parts 1 + 3 DEPLOYED. Verified in the SERVED bundle, not just the rollout: `/assets/RemoteControl-*.js` carries the markers. Awaiting a field connect. |
+| 2026-08-28 | — | 3b merged (#822): the verdict reaches the operator through the snackbar. Console-only reporting could not produce a root cause, because the console is closed during the sessions that stall. |
