@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Issue** | [#809](https://github.com/gjovanov/roomler-ai/issues/809) |
-| **Status** | design |
+| **Status** | in progress — P0/P1/P2a shipped (#812 #813 #814); P2b next; P6 field verification outstanding |
 | **Opened** | 2026-08-28 |
 | **Baseline** | master `fa364b12` (0.4.11) — every count and anchor below was measured against it |
 | **Scope** | Windows · Linux · macOS — code, comments, docs, `CLAUDE.md`, file names, folder names, env vars |
@@ -45,13 +45,13 @@ the field is still on the old segment, silently, at the next update:
 
 | anchor | file:line | what breaks if a sweep "fixes" it |
 |---|---|---|
-| `OLD_APP = "roomler-agent"` | `crates/agent-core/src/appdirs.rs:37` | a pre-rename host's enrolled `config.toml` is orphaned — the device drops off the mesh and re-enrolls as a stranger |
-| `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomlerd/src/win_service/mod.rs:61` | the takeover install cannot find the running service to retire; two services, or none |
-| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:151` | the pre-rename scheduled task survives forever → two daemons |
-| legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:245,312,440`; `agents/roomlerd/src/logs_fetch.rs:54` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
-| `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:367` | the vacated install dir is never swept |
-| `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:39` | systemd denies the daemon its own legacy tree mid-migration |
-| **the macOS `.app` bundle** — see §5, D5 | `packaging/macos/com.roomler.{agent,daemon}.plist`; `.github/workflows/ci.yml:391` | **TCC grants are voided** — every Mac silently loses Screen Recording + Accessibility until a human re-grants them |
+| `OLD_APP = "roomler-agent"` | `crates/agent-core/src/appdirs.rs:40` | a pre-rename host's enrolled `config.toml` is orphaned — the device drops off the mesh and re-enrolls as a stranger |
+| `LEGACY_SERVICE_NAME = "RoomlerAgentService"` | `agents/roomlerd/src/win_service/mod.rs:63` | the takeover install cannot find the running service to retire; two services, or none |
+| `LEGACY_TASK_NAME = "RoomlerAgent"` | `agents/roomlerd/src/service.rs:153` | the pre-rename scheduled task survives forever → two daemons |
+| legacy log prefix `roomler-agent.log` | `crates/agent-core/src/logging.rs:245,312,440`; `agents/roomlerd/src/logs_fetch.rs:56` | `rc:logs-fetch` returns "no log file" on an upgraded host that has not rolled yet |
+| `LEGACY_INSTALL_FOLDER_NAME = "roomler-agent"` | `agents/roomlerd/src/updater.rs:369` | the vacated install dir is never swept |
+| `%h/.config/roomler-agent` in `ReadWritePaths` | `agents/roomlerd/packaging/linux/roomler.service:44` | systemd denies the daemon its own legacy tree mid-migration |
+| **the macOS `.app` bundle** — see §5, D5 | `packaging/macos/com.roomler.{agent,daemon}.plist`; `.github/workflows/ci.yml:393` | **TCC grants are voided** — every Mac silently loses Screen Recording + Accessibility until a human re-grants them |
 
 So the deliverable is not a diff. It is **a classifier plus a guard**: an inventory that assigns
 every occurrence to `migrate` / `freeze`, a CI job that fails on an unclassified occurrence, and
@@ -89,7 +89,7 @@ Concentration, for `roomler-agent` alone:
 including the **Commands** block a new session copy-pastes (`CLAUDE.md:85-92`):
 
 ```bash
-cargo build -p roomlerd --release --features full
+cargo build -p roomler-agent --release --features full
 ./target/release/roomler-agent enroll --server <url> --token <jwt> --name <label>
 ./target/release/roomler-agent run
 ```
@@ -98,19 +98,22 @@ That block was **wrong** (fixed in P1): the emitted binary is `roomlerd`
 (`agents/roomlerd/Cargo.toml:18`), so the documented `run` command does not exist at the
 documented path. This is the cheapest possible demonstration that the residue costs something.
 
-### Still-unmigrated build-graph identity
+### Build-graph identity — **migrated in P2a**
 
-| where | current value | file:line |
+Recorded as it stood at the baseline, with what it became. The `bin` rows were already
+correct before this FR; everything else moved in P2a.
+
+| where | was | is now |
 |---|---|---|
-| package | `roomler-agent` | `agents/roomlerd/Cargo.toml:2` |
-| lib | `roomler_agent` | `agents/roomlerd/Cargo.toml:8` |
-| bin (already correct) | `roomlerd` | `agents/roomlerd/Cargo.toml:18` |
-| package | `roomler-agent-tray` | `agents/roomler-desktop/Cargo.toml:2` |
-| bin (already correct) | `roomler-desktop` | `agents/roomler-desktop/Cargo.toml:11` |
-| package | `roomler-agent-core` | `crates/agent-core/Cargo.toml:2` |
-| lib | `roomler_agent_core` | `crates/agent-core/Cargo.toml:8` |
-| dependency edge | `roomlerd = { path = "../../agents/roomlerd" }` | `crates/tests/Cargo.toml:17` |
-| **directories** | `agents/roomlerd/`, `agents/roomler-desktop/` | — |
+| package | `roomler-agent` | **`roomlerd`** |
+| lib | `roomler_agent` | **`roomlerd`** |
+| bin | `roomlerd` | unchanged — was already right |
+| package | `roomler-agent-tray` | **`roomler-desktop`** |
+| bin | `roomler-desktop` | unchanged — was already right |
+| package | `roomler-agent-core` | **`roomler-core`** |
+| lib | `roomler_agent_core` | **`roomler_core`** |
+| directories | `agents/roomler-agent/`, `agents/roomler-agent-tray/` | **`agents/roomlerd/`, `agents/roomler-desktop/`** |
+| Debian `Package:` | derived `roomler-agent` | **explicit `roomlerd`** + `provides`/`replaces` takeover |
 
 The `[[bin]]` comments state the intent plainly, and are the reason this half was left:
 
@@ -238,10 +241,10 @@ P2 is wrong and stops.
 
 | # | Phase | Deliverable | Kill switch |
 |---|---|---|---|
-| **P0** | Classifier + advisory guard | `scripts/name-audit.sh`; CI job `name-audit` in `ci.yml` with `continue-on-error: true`; `RETIRED-NAME-ANCHOR:` markers on every Class-C site | the job is advisory — it cannot fail a PR |
-| **P1** | Everything FALSE today | the two clap program names; the `CLAUDE.md` Commands block; the copy-paste install steps in `docs/tunnel-install.md`; script/manifest comments | `git revert` — no runtime surface touched |
+| **P0** ✅ | Classifier + advisory guard | `scripts/name-audit.sh`; CI job `name-audit` in `ci.yml` with `continue-on-error: true`; `RETIRED-NAME-ANCHOR:` markers on every Class-C site | the job is advisory — it cannot fail a PR |
+| **P1** ✅ | Everything FALSE today | the two clap program names; the `CLAUDE.md` Commands block; the copy-paste install steps in `docs/tunnel-install.md`; script/manifest comments | `git revert` — no runtime surface touched |
 | **P1b** | The bulk prose sweep | the ~1 700 remaining prose hits, *after* P2 has moved what they describe; historical appendices keep the retired name behind a block anchor | `git revert` |
-| **P2a** | Build-graph identity, agent side | packages `roomler-agent`→`roomlerd`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; libs `roomler_agent`→`roomlerd`, `roomler_agent_core`→`roomler_core`; dirs `agents/roomlerd`→`agents/roomlerd`, `agents/roomler-desktop`→`agents/roomler-desktop`; every `-p` selector in the workflows + `Dockerfile.agent-e2e` + `scripts/` | one atomic PR, `git revert`; gated on an **empty artifact-name diff** |
+| **P2a** ✅ | Build-graph identity, agent side | packages `roomler-agent`→`roomlerd`, `roomler-agent-tray`→`roomler-desktop`, `roomler-agent-core`→`roomler-core`; libs `roomler_agent`→`roomlerd`, `roomler_agent_core`→`roomler_core`; dirs `agents/roomlerd`→`agents/roomlerd`, `agents/roomler-desktop`→`agents/roomler-desktop`; every `-p` selector in the workflows + `Dockerfile.agent-e2e` + `scripts/` | one atomic PR, `git revert`; gated on an **empty artifact-name diff** |
 | **P2b** | Build-graph identity, CLI side | package `roomler-tunnel`→`roomler-cli`, lib `roomler_tunnel`→`roomler_cli`, dir `agents/roomler-tunnel`→`agents/roomler-cli`; `release-tunnel.yml` | same; separate PR so `release-tunnel.yml` moves in a reviewable diff |
 | **P3** | Env-var namespace | 107 vars `ROOMLER_AGENT_<REST>` → **`ROOMLERD_<REST>`** (D1), **dual-read**: new spelling wins, old spelling honoured and logged once at WARN | the old spelling never stops working; the WARN is the only new behaviour |
 | **P4** | Residual live paths | fix the §5 staging defect by calling a resolver instead of a constant (expose `machine_global_dir()` over LocalAPI); sweep the remaining hardcoded `roomler-agent` paths | every path keeps a new-then-old fallback, exactly like `appdirs` |
@@ -404,7 +407,7 @@ forever. That is ugly, and it is still right: the alternative asks every Mac use
 Screen Recording and Accessibility, and a missed re-grant is a device that looks enrolled and
 cannot be controlled. **RESOLVED: freeze** — revisit only with an installer that can re-register
 the bundle without a human. The lock already exists on both sides —
-`ui/src/__tests__/utils/enrollCommands.spec.ts:129-147` and `.github/workflows/ci.yml:391`.
+`ui/src/__tests__/utils/enrollCommands.spec.ts:129-147` and `.github/workflows/ci.yml:393`.
 
 **D6 — `roomler-tunnel`.** 269 hits, and the enroll-command test already treats it as retired
 (`enrollCommands.spec.ts:143`). **RESOLVED: fold in** — same sweep, same guard — but as its own
