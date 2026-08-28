@@ -25,6 +25,7 @@ fifth even after this ledger existed (see the row-is-the-claim warning below).
 | `FR-5` — three sessions within minutes | → FR-4 / FR-5 / FR-6 |
 | `FR-7` (#778, 10:07:14) vs `FR-7` (#780, 10:09:41) | #780 → FR-8 |
 | `FR-10` (#783, 11:45:34) vs `FR-10` (#784, 11:47:18) | #784 → FR-11 |
+| `FR-24` (#838, licensing) vs `FR-24` (#840, viewer) | #840 → FR-26 |
 
 The tie-break when one slips through anyway is **deterministic, and it is not "the younger
 one"**: the **LOWER issue number keeps `FR-N`; the HIGHER renumbers** to the next free N —
@@ -49,6 +50,16 @@ discipline as the release-tag race.
 
 ⚠️ A number is never reused, including by a withdrawn or superseded FR. Mark the row
 instead: a reader who meets `FR-4` in an old commit message must land on the right document.
+
+⚠️ **A row that is still in an open PR is not a claim either — only master arbitrates.**
+The sixth collision (`FR-24`, 2026-08-28) had *both* sessions do the protocol right: each
+wrote its row in the same commit as its spec. But #838's row sat on an unmerged branch
+(#844) while #840's merged, so at no point did a push get rejected — git arbitrates at
+merge, and one side had not reached it yet. A number is therefore only yours once the row
+is **on master**; park the claiming commit in a long-lived PR and someone can take it from
+under you, with the repair falling due later and costing more (here: a rename across a
+shipped spec, a ledger row, an issue title and ten code comments). Land the claim first,
+then take your time with the implementation.
 
 ⚠️ **The row IS the claim — a spec file alone is not.** `FR-10`'s spec reached master on
 2026-08-27 (`2366859d`) without a row here, so this table still read `max = FR-9` and the
@@ -83,5 +94,6 @@ exactly the hole the row closes.
 | [FR-22](FR-22-time-to-first-frame.md) | [#819](https://github.com/gjovanov/roomler-ai/issues/819) | Time-to-first-frame — connecting sometimes takes 10-15 s | **parts 1 + 3 shipped** (#821) — phase-aware bound (`requesting` 4 s vs ICE's 15 s) cuts the bad case ~18 s to ~7 s, plus eight-mark connect timing so "sometimes 10-15 s" can become a distribution. Part 2 was found ALREADY IMPLEMENTED and recorded, not rebuilt. **3b (#822)** puts the verdict in a SNACKBAR — the console is shut during the sessions that stall, so console-only reporting could never yield a root cause. Root cause still open |
 | [FR-23](FR-23-company-identity-and-domain-consolidation.md) | [#827](https://github.com/gjovanov/roomler-ai/issues/827) | Company identity on the site, and one product on both domains | in progress — phases 0–3, **5 and 6 shipped + field-verified**; phase 4 (teardown) **skipped** by the operator, since `janus`/`coturn` on roomler.live still depend on that namespace. #828 #830 #831 #835 #837 #841. Imprint live (`grep imprint` on the shipped bundle 0→1); `roomler.live` now **301s to roomler.ai** (apex only — the domain hosts live unrelated services); Terms + Privacy rewritten to cover all three pillars. ⚠️ **Three false claims were found in legal copy** — the Privacy Policy said the session JWT lives in `localStorage` (untrue since #680), the imprint cited the **repealed** EU ODR platform, and I wrote an absolute security guarantee that has a documented exception: *legal copy invites template drafting; check every claim against code*. ⚠️ `ROOMLER__APP__CORS_ORIGINS` cannot be set from a configmap at all (no `list_separator` ⇒ **boot crash**), which is why the 301 beat serving the app. Open: send Apple the correction. Unblocks the Apple half of FR-7 |
 | FR-20 | [#807](https://github.com/gjovanov/roomler-ai/issues/807) | Per-tenant relay cost metering | in progress — row backfilled by FR-25 |
-| [FR-24](FR-24-rc-viewer-settings-and-metrics.md) | [#840](https://github.com/gjovanov/roomler-ai/issues/840) | Remote-desktop viewer: display name, quality-metric toggles, FSR default, settings reorg | in progress |
-| [FR-25](FR-25-call-layout-mentions-pip.md) | [#839](https://github.com/gjovanov/roomler-ai/issues/839) | Call UX: layout controls that honour their labels, mentions, PiP, spotlight + fullscreen | in progress |
+| FR-24 | [#838](https://github.com/gjovanov/roomler-ai/issues/838) | Licensing split — AGPL-3.0 control plane, MPL-2.0 everything the customer runs | in progress — **row reserved here by the collision repair**; the spec (`FR-24-licensing-split.md`) and this row's full text land with #844. #838 keeps the number as the lower issue id; the viewer FR that had merged into this slot moved to FR-26 |
+| [FR-25](FR-25-call-layout-mentions-pip.md) | [#839](https://github.com/gjovanov/roomler-ai/issues/839) | Call UX: layout controls that honour their labels, mentions, PiP, spotlight + fullscreen | shipped (#842), live on prod `v20260828-f98ca7c0b356` — mentions criterion **closed against the served bundle** (the prosemirror duplicate-guard went 2 chunks → 1); the behaviour criteria need a real call. ⚠️ The issue was auto-closed by the merge and reopened: a merge is not a field result |
+| [FR-26](FR-26-rc-viewer-settings-and-metrics.md) | [#840](https://github.com/gjovanov/roomler-ai/issues/840) | Remote-desktop viewer: display name, quality-metric toggles, FSR default, settings reorg | shipped (#845), live on prod `v20260828-f98ca7c0b356` (the served `RemoteControl` chunk carries `roomler-rc-metrics`); **renumbered from FR-24** by the lower-issue-id rule vs #838, whose claiming row was parked in an unmerged PR |
