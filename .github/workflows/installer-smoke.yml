@@ -588,8 +588,8 @@ jobs:
           # above, so clobbering is fine but a stale file would make
           # the produced-MSI assert vacuous.
           Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
-          $wixDir = "agents\roomler-agent\wix"
-          $pmSrc  = "agents\roomler-agent\wix-perMachine\main.wxs"
+          $wixDir = "agents\roomlerd\wix"
+          $pmSrc  = "agents\roomlerd\wix-perMachine\main.wxs"
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item $pmSrc "$wixDir\main.wxs" -Force
           try {
