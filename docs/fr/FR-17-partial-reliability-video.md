@@ -1,6 +1,7 @@
 # FR-17: Video rides a reliable + ordered DataChannel
 
-Status: **stage A shipped** (2026-08-28; proposed 2026-08-27). Tracking issue: `FR-17` (#799). Sibling of FR-16
+Status: **stages A + B shipped, B not yet field-measured** (2026-08-28; proposed
+2026-08-27). Tracking issue: `FR-17` (#799). Sibling of FR-16
 (#798, the harness that must gate it); the architectural half of the FR-1 program.
 
 ## The measurement
@@ -112,13 +113,59 @@ one of its two call sites and silently wasn't in the other (#817), and FR-18 shi
 counter that was incremented and never read (#804) — the same shape of hazard, closed
 structurally this time.
 
-**B. Unordered / bounded-retransmit on CONSTRAINED transports only.** The receiver
-discards an incomplete frame and requests an IDR — the `rc:keyframe` resync path
-already exists and is min-gap clamped (500 ms). Direct carriers keep today's posture
-until the harness says otherwise.
+**B. Unordered on framed sessions.** ✅ **SHIPPED** (PR #834), opt-in, default OFF.
+`video-bytes` opens `{ ordered: false, maxRetransmits: 0 }`; the receiver discards an
+incomplete frame and requests an IDR via the existing min-gap-clamped `rc:keyframe`
+path.
+
+**Stack verified rather than assumed**: `webrtc-data`'s `server()` adopts the browser's
+DCEP `channel_type` and commits it to the SCTP stream; `webrtc-sctp` stamps `unordered`
+per chunk on send with `abandoned` driving partial reliability. **The agent needs no
+change** — the browser creates the channel and the agent's send path inherits its
+guarantees.
+
+⚠️ **Deviation from this plan, recorded**: "CONSTRAINED transports only" was NOT
+implemented, because it is not implementable as written. The channel's ordering is fixed
+at `createDataChannel`, which must happen before the offer — and whether the session is
+relayed is only known after ICE nominates a pair. Doing it properly needs either a
+second channel the agent selects at runtime, or a renegotiation; both are new failure
+modes. Instead the flag is a per-viewer opt-in (`roomler-rc-unordered-video=1`) so the
+relay pair can be measured first. Revisit once FR-16's harness can say what direct
+carriers actually cost.
+
+⚠️ **`maxRetransmits: 0` is coupled to the RECEIVER, not chosen for aggressiveness.**
+Stage A's assembler treats a chunk-index jump as unrecoverable. That is right when a
+lost chunk never arrives and WRONG once retransmits are allowed — a chunk arriving an
+RTT late would be discarded as a gap, converting a recoverable frame into a lost one
+plus a keyframe. **Stage C is therefore not just a bigger number** (see below).
+
+⚠️ Two receiver defects exist ONLY under unordered delivery, both fixed in #834 and
+unreachable while the channel is ordered:
+- **Stragglers cascade.** Chunk 3 of frame N can arrive after chunk 0 of frame N+1. The
+  stage-A rule broke N+1 on that, so one lost frame became TWO, each costing an IDR —
+  precisely the storm this FR says to design against. Late chunks of a frame already
+  passed are now discarded quietly, checked BEFORE the chunk-0 branch (a late chunk 0
+  can restart assembly on a dead frame just as a late chunk 3 can break a live one).
+- **An unbounded "older than what we have" rule DEADLOCKS.** If the sender's counter
+  ever restarts at 1, every frame looks ancient, all are straggled, and the picture
+  stops for good with NO gap reported and nothing in the logs. `STRAGGLER_WINDOW = 64`
+  (~1 s at 60 fps) turns that into one resync.
+
+⚠️ The unordered/framing pairing is enforced in ONE function (`videoDcOptions`): an
+unframed stream delivered out of order is not a degraded picture, it is garbage the
+decoder reports as corruption.
+
+⚠️ Stage B **cannot engage until an agent advertising `chunk-framing` ships** — the
+correct interlock, and why it is inert on merge.
 
 **C. Measure the retransmit budget rather than assume it.** `maxRetransmits: 0` versus
 1–2 is an empirical question on these paths; FR-16 answers it per pair.
+
+⚠️ **Blocked on a reorder buffer, not on the harness.** Raising the retransmit count
+without one makes things WORSE, not better: a retransmitted chunk arrives an RTT late,
+stage A's assembler sees an index jump, and discards a frame that had in fact been
+recovered — spending an IDR to reject data already paid for. The worker must buffer
+out-of-order chunks within a frame before 1-2 is even testable.
 
 ⚠️ **The risk to design against is an IDR storm.** On a lossy path, "drop the frame and
 ask for a keyframe" can cost more than the stall it replaces — each IDR is the largest
@@ -163,3 +210,4 @@ what makes the reassembler independent of that assumption.
 |---|---|---|
 | 2026-08-27 | 0.4.9 | Baseline measurements above; FR filed. |
 | 2026-08-28 | — | Stage A merged (#820). Inert by construction: the channel is still `{ ordered: true }`, so a gap cannot fire in production — that is the point of landing it first. **Not a field result**, and deliberately so; the measurable claim belongs to stage B. |
+| 2026-08-28 | — | Stage B merged (#834). Also inert on merge: opt-in default OFF, and unable to engage until an agent advertising `chunk-framing` ships. **No measurement yet** — the acceptance criteria below stay unchecked, and the A/B needs an agent release rolled to the CORPLAP-1 ↔ CORPLAP-3 pair. |
