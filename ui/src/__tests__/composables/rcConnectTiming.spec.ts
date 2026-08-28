@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import {
   beginAttempt,
+  CONNECT_SLOW_MS,
+  describeConnectTiming,
   formatConnectTiming,
+  STALL_SNACK_MIN_GAP_MS,
   type RcConnectTiming,
 } from '@/composables/rcConnectTiming'
 import { signalingTimeoutFor, RC_REQUEST_TIMEOUT_MS, RC_SIGNALING_TIMEOUT_MS }
@@ -108,5 +111,104 @@ describe('FR-22 connect timing recorder', () => {
     b.mark('first_frame')
     expect(formatConnectTiming(a.snapshot())).toContain('attempt 1 INCOMPLETE')
     expect(formatConnectTiming(b.snapshot())).toContain('attempt 2 ttff')
+  })
+})
+
+describe('FR-22 operator-facing connect verdict', () => {
+  const marks = (o: Partial<Record<string, number>>) =>
+    ({ attempt: 1, marks: o } as RcConnectTiming)
+
+  it('says nothing about a normal connect', () => {
+    // A notification on every successful connect is noise, and noise is
+    // how the real signal gets ignored.
+    const v = describeConnectTiming(marks({
+      request_sent: 0, session_created: 40, ready: 60, offer_sent: 70,
+      answer: 300, pc_connected: 1200, dc_open: 1400, first_frame: 3200,
+    }))
+    expect(v.notable).toBe(false)
+  })
+
+  it('names the dominant wait in plain words when a connect is slow', () => {
+    const v = describeConnectTiming(marks({
+      request_sent: 0, session_created: 40, ready: 60, offer_sent: 70,
+      answer: 300, pc_connected: 9000, dc_open: 9200, first_frame: 11000,
+    }))
+    expect(v.notable).toBe(true)
+    expect(v.color).toBe('warning')
+    expect(v.text).toContain('11.0 s')
+    expect(v.text).toContain('opening a network path to the device')
+    // The operator gets meaning, not jargon.
+    expect(v.text).not.toContain('pc_connected')
+    expect(v.text).not.toContain('ICE')
+  })
+
+  it('never blames a human for taking their time over the consent prompt', () => {
+    // `ready` is human-paced by design — the SERVER owns its timeout for
+    // exactly that reason. Reporting "most of the wait was someone
+    // approving" would be both true and useless, and would point the
+    // operator at themselves instead of at the slow step.
+    const v = describeConnectTiming(marks({
+      request_sent: 0, session_created: 40,
+      ready: 20000,          // a person took 20 s to click Allow
+      offer_sent: 20010, answer: 20200, pc_connected: 21000,
+      dc_open: 21200, first_frame: 26000,
+    }))
+    expect(v.text).not.toContain('approving')
+    // The real dominant non-human wait is the last leg to first frame.
+    expect(v.text).toContain('the first video frame arriving')
+  })
+
+  it('reports a retry even when the total looks acceptable', () => {
+    // This is the FR-22 signature. One slow connect and a lost attempt
+    // plus a fast retry are indistinguishable to everyone not reading
+    // devtools — and telling them apart is the whole point.
+    const v = describeConnectTiming({
+      attempt: 2,
+      marks: {
+        request_sent: 0, session_created: 30, ready: 45, offer_sent: 50,
+        answer: 200, pc_connected: 900, dc_open: 1100, first_frame: 2600,
+      },
+    })
+    expect(v.notable).toBe(true)
+    expect(v.text).toContain('after 1 failed attempt')
+    expect(v.text).not.toContain('attempts')
+  })
+
+  it('pluralises multiple failed attempts', () => {
+    const v = describeConnectTiming({
+      attempt: 3,
+      marks: { request_sent: 0, first_frame: 2600 },
+    })
+    expect(v.text).toContain('after 2 failed attempts')
+  })
+
+  it('leads with the stalled step on an abandoned attempt', () => {
+    const v = describeConnectTiming(marks({
+      request_sent: 0, session_created: 35, ready: 50, offer_sent: 55,
+    }))
+    expect(v.notable).toBe(true)
+    expect(v.text).toContain('the device answering')
+    expect(v.text).toContain('Retrying automatically')
+    // The short technical name rides along so a reported snackbar is
+    // traceable back to a mark without asking for devtools.
+    expect(v.text).toContain('stalled at answer')
+  })
+
+  it('puts the slow threshold above the measured healthy band', () => {
+    // Measured: request -> first pump heartbeat 2.5-4.7 s, plus decode.
+    // A threshold inside that band would fire on healthy sessions and
+    // train people to dismiss the message.
+    expect(CONNECT_SLOW_MS).toBeGreaterThan(5000)
+    // ...and below the 10-15 s actually being complained about.
+    expect(CONNECT_SLOW_MS).toBeLessThan(10000)
+  })
+})
+
+describe('FR-22 stall-warning throttle', () => {
+  it('is long enough that a flapping path cannot bury its own message', () => {
+    // The ladder abandons an attempt as fast as the `requesting` bound
+    // allows, so the gap must exceed that or a flap storm produces one
+    // snackbar per abandonment.
+    expect(STALL_SNACK_MIN_GAP_MS).toBeGreaterThan(RC_REQUEST_TIMEOUT_MS)
   })
 })
