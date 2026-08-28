@@ -1730,6 +1730,7 @@ async fn handle_server_msg(
             chunk_framing,
             audio_enabled,
             consent_mode,
+            host_prompt_timeout_secs,
             input_mode,
             tenant_name,
         } => {
@@ -1833,6 +1834,17 @@ async fn handle_server_msg(
             // Phase 2 — obey the server's per-session consent directive when
             // present; fall back to the broker's startup mode (local
             // `auto_grant_session`) for an older server that sends none.
+            //
+            // FR-27 — the ON-HOST window is `host_prompt_timeout_secs`, not
+            // `consent_timeout_secs`. They coincide for a plain attended
+            // prompt and diverge for `prompt_then_email`, whose session waits
+            // minutes for the owner's emailed link while the modal on this
+            // screen has no business standing there that long. An older server
+            // sends no split, and then the two are the same thing — the
+            // pre-FR-27 behaviour, byte for byte.
+            let host_window = std::time::Duration::from_secs(
+                host_prompt_timeout_secs.unwrap_or(consent_timeout_secs) as u64,
+            );
             let directed_mode: Option<crate::consent::Mode> = consent_mode.map(|m| match m {
                 roomler_ai_remote_control::models::ConsentMode::Auto => {
                     crate::consent::Mode::AutoGrant
@@ -1841,14 +1853,17 @@ async fn handle_server_msg(
                 // PromptThenEmail) all resolve to an on-host prompt at the
                 // agent: the server drives the owner channels itself (Phase 4)
                 // and asks the agent to prompt as the on-console path/fallback.
-                // Bound the wait by the server-sent timeout.
                 _ => crate::consent::Mode::Prompt {
-                    timeout: std::time::Duration::from_secs(consent_timeout_secs as u64),
+                    timeout: host_window,
                 },
             });
-            // Resolve to a concrete mode (directive, else the broker's startup
-            // mode) so the .pending write and the request use the same decision.
-            let effective_mode = directed_mode.unwrap_or_else(|| consent_broker.mode());
+            // FR-27 — resolve directive AGAINST the local setting, taking the
+            // stricter. This used to be `directed_mode.unwrap_or(local)`, i.e.
+            // the directive simply won — so a device that had set
+            // `auto_grant_session = false` was silently overridden by a server
+            // `Auto`, inverting the gate-4 property exec and SSH are built on.
+            let effective_mode =
+                crate::consent::strictest_of(directed_mode, consent_broker.mode(), host_window);
             let session_hex = session_id.to_hex();
             // Phase 4 — Email/Push are OWNER-side modes: the SERVER obtains
             // consent from the device owner (email link / push), so the agent
@@ -1866,24 +1881,39 @@ async fn handle_server_msg(
             // (the agent→tray signal). Auto grants + owner-side modes write
             // nothing. The broker's poll loop removes it when the decision
             // resolves. Best-effort; a failure falls back to the CLI path.
-            if !owner_side_consent && matches!(effective_mode, crate::consent::Mode::Prompt { .. })
-            {
-                let body = serde_json::json!({
-                    "session_id": session_hex,
-                    "controller_name": controller_name,
-                    "permissions": permissions,
-                    "timeout_secs": consent_timeout_secs,
-                    // Multi-org — the tray/desktop modal renders this so the
+            //
+            // FR-27 — whether the marker landed is REMEMBERED. It is the only
+            // prompt surface this daemon has besides the CLI, so a failure to
+            // write it means no human can ever be asked, and that has to reach
+            // the controller as "nobody could be asked" rather than as a deny.
+            let will_prompt = !owner_side_consent
+                && matches!(effective_mode, crate::consent::Mode::Prompt { .. });
+            let mut have_surface = true;
+            if will_prompt {
+                let prompt = crate::consent::PendingPrompt {
+                    kind: crate::consent::PromptKind::RemoteControl,
+                    asked_by: &controller_name,
+                    permissions: permissions.wire_names(),
+                    detail: String::new(),
+                    // Multi-org — the desktop modal renders this so the
                     // operator can tell WHICH organization is asking. On a
                     // device enrolled in two orgs, "Alice wants to control
                     // this machine" is not enough to decide on. Absent for a
                     // single-org device (nothing useful to add).
-                    "org": asking_org,
-                })
-                .to_string();
-                if let Err(e) = consent_broker.write_pending(&session_hex, &body) {
-                    tracing::warn!(session = %session_hex, %e, "could not write .pending consent marker for tray");
+                    org: asking_org.clone().unwrap_or_default(),
+                    timeout: host_window,
+                };
+                if let Err(e) = consent_broker.write_prompt(&session_hex, &prompt) {
+                    have_surface = false;
+                    tracing::warn!(session = %session_hex, %e, "could not write the .pending consent marker — no on-screen prompt is possible for this session");
                 }
+                // FR-27 — the marker only helps if something is READING it.
+                // Nothing used to start the companion, so a device set to
+                // "Prompt on host" whose operator had quit the menu-bar app
+                // showed nothing, waited out its window, and reported a deny.
+                // Fire-and-forget: it is rate-limited internally, and the
+                // prompt below is already counting down.
+                tokio::spawn(crate::companion::ensure_running());
             }
             if owner_side_consent {
                 info!(
@@ -1896,17 +1926,33 @@ async fn handle_server_msg(
                 tokio::spawn(async move {
                     let decision = broker.request_with_mode(&session_hex, effective_mode).await;
                     let granted = decision.granted();
+                    // FR-27 — say WHY, when the answer is no. A bare `false`
+                    // reaches the controller as "the user denied your request",
+                    // which is a lie whenever the truth is that the prompt
+                    // stood unanswered, or that nothing could raise one.
+                    let reason = match decision {
+                        crate::consent::Decision::Granted => None,
+                        crate::consent::Decision::Denied => None,
+                        crate::consent::Decision::Timeout if !have_surface => Some(
+                            roomler_ai_remote_control::consent::ConsentDenyReason::NoPromptSurface,
+                        ),
+                        crate::consent::Decision::Timeout => {
+                            Some(roomler_ai_remote_control::consent::ConsentDenyReason::HostTimeout)
+                        }
+                    };
                     tracing::info!(
                         session = %session_hex,
                         ?decision,
                         ?effective_mode,
                         granted,
+                        reason = reason.map(|r| r.wire()),
                         "consent decision → sending rc:consent"
                     );
                     if let Err(e) = outbound
                         .send(ClientMsg::Consent {
                             session_id,
                             granted,
+                            reason: reason.map(|r| r.wire().to_string()),
                         })
                         .await
                     {
@@ -2729,13 +2775,54 @@ async fn handle_server_msg(
                 consent_mode,
                 Some(roomler_ai_remote_control::models::ConsentMode::Auto)
             );
-            let consent_mode = if auto {
+            let directive = if auto {
                 crate::consent::Mode::AutoGrant
             } else {
                 crate::consent::Mode::Prompt {
                     timeout: crate::consent::DEFAULT_PROMPT_TIMEOUT,
                 }
             };
+            // FR-27 — same floor as the RC path: a device that set
+            // `auto_grant_session = false` is not overridden into auto-granting
+            // a command that runs as SYSTEM/root.
+            let consent_mode = crate::consent::strictest_of(
+                Some(directive),
+                consent_broker.mode(),
+                crate::consent::DEFAULT_PROMPT_TIMEOUT,
+            );
+
+            // FR-27 — exec has ALWAYS prompted through this broker and NEVER
+            // written a marker, so its prompt reached no UI: the only way to
+            // answer one was to find the request id in the daemon log and run
+            // the CLI inside 30 s. In practice that made a non-`auto`
+            // `exec_policy` unusable rather than strict.
+            //
+            // ⚠️ The command is redacted BEFORE it goes anywhere near a marker
+            // file that a GUI will render — same redactor that scrubs exec
+            // output leaving the host, for the same reason.
+            if matches!(consent_mode, crate::consent::Mode::Prompt { .. }) {
+                let shown = crate::exec::redactor().apply(&command);
+                let prompt = crate::consent::PendingPrompt {
+                    kind: crate::consent::PromptKind::Exec,
+                    asked_by: &caller,
+                    permissions: String::new(),
+                    detail: shown.chars().take(512).collect(),
+                    // Same multi-org rule as the RC prompt: name the asking org
+                    // only on a device that serves more than one, since on a
+                    // single-org device there is nothing to disambiguate.
+                    // `rc:rpc.exec` carries no tenant display name, so this
+                    // loop's own label is the best available.
+                    org: if !ctx.is_primary || !agent_cfg.orgs.is_empty() {
+                        ctx.label.clone()
+                    } else {
+                        String::new()
+                    },
+                    timeout: crate::consent::DEFAULT_PROMPT_TIMEOUT,
+                };
+                if let Err(e) = consent_broker.write_prompt(&request_id, &prompt) {
+                    tracing::warn!(%request_id, %e, "could not write the .pending consent marker — no on-screen prompt is possible for this command");
+                }
+            }
 
             let broker = consent_broker.clone();
             let outbound = outbound_tx.clone();
