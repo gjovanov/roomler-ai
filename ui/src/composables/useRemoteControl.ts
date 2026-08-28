@@ -45,6 +45,16 @@ export type RcPhase =
   | 'closed'
   | 'error'
 
+import {
+  beginAttempt,
+  describeConnectTiming,
+  STALL_SNACK_MIN_GAP_MS,
+  formatConnectTiming,
+  type RcConnectMark,
+  type RcConnectRecorder,
+} from './rcConnectTiming'
+import { useSnackbar } from './useSnackbar'
+
 /**
  * Backoff ladder for the auto-reconnect path. The first three steps
  * (250 ms / 500 ms / 1 s) are tuned for desktop-transition recovery Ã¢ÂÂ
@@ -116,9 +126,19 @@ export function deadAirDelayMs(streak: number): number {
  *   the session. ICE flaps recover in ~1-2 s; a VPN flip on the host
  *   never does Ã¢ÂÂ 4 s separates the two without a visible false-positive
  *   window.
- * - `RC_SIGNALING_TIMEOUT_MS`: max time in `'requesting'` or
- *   `'negotiating'` before the attempt is abandoned and the ladder
- *   advances. `awaiting_consent` is exempt Ã¢ÂÂ the SERVER owns that
+ * - `RC_SIGNALING_TIMEOUT_MS`: max time in `'negotiating'` before the
+ *   attempt is abandoned and the ladder advances. ICE legitimately
+ *   varies by network here (a corp-VPN host reaching a DERP relay is
+ *   nothing like a LAN pair), so this stays generous.
+ * - `RC_REQUEST_TIMEOUT_MS` (FR-22): the same bound applied to
+ *   `'requesting'`, which is a different question - *did the server
+ *   answer at all?* That is one hop, measured sub-second across ten
+ *   consecutive sessions, so guarding it with the ICE-sized number meant
+ *   a lost request cost 15 s before the 250 ms ladder retried and
+ *   succeeded on the normal ~3 s path: about 18 s total, which is
+ *   exactly the "sometimes 10-15 seconds" the operator reported. The bad
+ *   case is now ~7 s; the good case is untouched.
+ *   `awaiting_consent` is exempt from both - the SERVER owns that
  *   timeout (consent_timeout), and a human on a Prompt-mode org device
  *   may legitimately take longer than any client-side number.
  * - Watchdog: ticks every `RC_WATCHDOG_TICK_MS` while connected. After
@@ -131,6 +151,28 @@ export function deadAirDelayMs(streak: number): number {
  */
 export const RC_PC_DISCONNECTED_GRACE_MS = 4000
 export const RC_SIGNALING_TIMEOUT_MS = 15000
+export const RC_REQUEST_TIMEOUT_MS = 4000
+
+/**
+ * FR-22 - how long an attempt may sit in `phase` before the ladder
+ * abandons it. `null` means "do not arm": `awaiting_consent` is
+ * human-paced and server-owned, and the terminal phases have nothing
+ * left to wait for.
+ *
+ * Exported and total over `RcPhase` so the table is unit-lockable and a
+ * new phase must declare its own bound rather than silently inheriting
+ * the ICE-sized one.
+ */
+export function signalingTimeoutFor(phase: RcPhase): number | null {
+  switch (phase) {
+    case 'requesting':
+      return RC_REQUEST_TIMEOUT_MS
+    case 'negotiating':
+      return RC_SIGNALING_TIMEOUT_MS
+    default:
+      return null
+  }
+}
 
 /**
  * PR-1 pre-flight: how long connect() waits for the signalling socket
@@ -2621,7 +2663,54 @@ export function isChromeWithBrokenScriptTransform(): boolean {
  *  worker to wait for the next IDR Ã¢ÂÂ far worse than a few ms of
  *  retransmit latency. */
 export const VP9_444_DC_LABEL = 'video-bytes'
-export const VP9_444_DC_OPTIONS: RTCDataChannelInit = { ordered: true }
+
+/**
+ * FR-17 stage B — how the `video-bytes` channel is opened.
+ *
+ * Historically `{ ordered: true }`, justified as "SCTP is doing the
+ * reassembly anyway, and dropping a P-frame is far worse than a few ms
+ * of retransmit latency". True on a LAN; falsified on a 90-210 ms relay,
+ * where one lost chunk head-of-line-blocks everything behind it and the
+ * backlog has no bound — measured `send_wait_max` 10,263 ms on an agent
+ * whose encoder was idle at 8-12 ms/frame.
+ *
+ * `maxRetransmits: 0` rather than a bounded retransmit is deliberate and
+ * is coupled to the RECEIVER. Stage A's assembler treats a chunk-index
+ * jump as an unrecoverable gap: it drops the frame and asks for an IDR.
+ * That is exactly right when a lost chunk never arrives, and WRONG the
+ * moment retransmits are allowed — a chunk that arrives one RTT late
+ * would be discarded as a gap, converting a recoverable frame into a
+ * lost one plus a keyframe request. Testing 1-2 retransmits (stage C)
+ * therefore requires a reorder buffer in the worker first; it is not a
+ * number that can be turned up on its own.
+ *
+ * ⚠️ Unordered is only legal WITH framing. An unframed stream is a bare
+ * byte sequence whose reassembly depends entirely on arrival order, so
+ * delivering it out of order does not degrade the picture — it produces
+ * garbage the decoder reports as corruption. This function is the single
+ * place that pairing is enforced, so the two can never be set
+ * independently by a caller who has not thought about it.
+ */
+export function videoDcOptions(
+  chunkFraming: boolean,
+  unordered: boolean,
+): RTCDataChannelInit {
+  if (!chunkFraming || !unordered) return { ordered: true }
+  return { ordered: false, maxRetransmits: 0 }
+}
+
+/** Field opt-in for stage B, mirroring `storedDecodePref`'s A/B knob.
+ *  Default OFF: this changes the delivery guarantee of the video path,
+ *  and the FR's own acceptance bar is a measured relay-pair improvement,
+ *  not a plausible argument. Pure + exported for tests. */
+export function storedUnorderedVideo(): boolean {
+  try {
+    return globalThis.localStorage?.getItem('roomler-rc-unordered-video') === '1'
+  } catch {
+    /* privacy mode - default off */
+    return false
+  }
+}
 
 /** Short codec name to pass into `new RTCRtpScriptTransform(worker,
  *  { codec })`. Reads the first negotiated codec off
@@ -2790,6 +2879,81 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    */
   let lastConnectArgs: { agentId: string; permissions: string; orgId?: string } | null = null
   const reconnectAttempt = ref(0)
+  /** FR-22 - ms from `rc:session.request` to the first painted frame on
+   *  the attempt that succeeded. Null until one does. Exposed so the
+   *  viewer HUD and the field can read a NUMBER instead of an anecdote:
+   *  "sometimes 10-15 s" is not something a fix can be measured against. */
+  const lastTtffMs = ref<number | null>(null)
+  // FR-22 - the operator-facing half of the connect timing. The snackbar
+  // store is a module singleton, so this is the same surface every other
+  // part of the app already writes to.
+  const { showSnackbar } = useSnackbar()
+  /** Last time a STALL snackbar was shown, so a flapping path cannot
+   *  bury its own message under repeats. */
+  let lastStallSnackAtMs = -Infinity
+
+  /** FR-22 - per-attempt connect timing. Null outside an attempt; a
+   *  retry replaces it wholesale so the ladder's second attempt cannot
+   *  overwrite the first one's marks and make a two-attempt connect read
+   *  as one fast one. */
+  let connectTiming: RcConnectRecorder | null = null
+
+  /** Emit the current attempt's timing once, then release it. `reason`
+   *  distinguishes the success line from the abandonment line, because
+   *  an INCOMPLETE record is the diagnostically valuable one - the
+   *  missing mark names the step that never completed. */
+  function logConnectTiming(reason: 'first-frame' | 'abandoned' | 'closed') {
+    const t = connectTiming
+    if (!t) return
+    // A successful attempt reports exactly once, at first paint. Later
+    // teardown must not re-log it as if it were a second connect.
+    if (reason !== 'first-frame' && t.done()) {
+      connectTiming = null
+      return
+    }
+    connectTiming = null
+    const snap = t.snapshot()
+    const line = formatConnectTiming(snap)
+    if (reason === 'first-frame') {
+      lastTtffMs.value = snap.marks.first_frame ?? null
+      console.info('[rc] connect', line)
+    } else {
+      console.warn('[rc] connect', reason, line)
+    }
+    // FR-22 - tell the OPERATOR, not just the console. A devtools line
+    // is invisible during exactly the sessions this exists to explain,
+    // and "it was slow again" is not a report anyone can act on. The
+    // verdict names which wait dominated in plain words, so a slow
+    // connect becomes a fact someone can pass on without opening
+    // devtools - which is what turns this from telemetry into the route
+    // to the root cause.
+    //
+    // Cancellation is excluded on purpose: the operator pressed the
+    // button, so telling them their own action interrupted a connect is
+    // noise, not information.
+    if (reason === 'closed') return
+    const verdict = describeConnectTiming(snap)
+    if (!verdict.notable) return
+    // Throttle the STALL warnings only. A flapping path abandons an
+    // attempt every few seconds, and one snackbar per abandonment is
+    // spam that buries the message it is trying to deliver. The
+    // resolution ("connected after N failed attempts") is never
+    // throttled: suppressing the line that says it finally worked, while
+    // having shown the one that said it was failing, would leave the
+    // operator with a warning and no ending.
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now()
+    if (reason === 'abandoned') {
+      if (nowMs - lastStallSnackAtMs < STALL_SNACK_MIN_GAP_MS) return
+      lastStallSnackAtMs = nowMs
+    }
+    showSnackbar(verdict.text, verdict.color, 8000)
+  }
+
+  /** Mark a connect milestone on the live attempt, if any. A no-op
+   *  outside an attempt, so callers never have to guard. */
+  function markConnect(name: RcConnectMark) {
+    connectTiming?.mark(name)
+  }
   /** Consecutive sessions that connected but never delivered a frame —
    *  drives `deadAirDelayMs`. Cleared the moment media actually moves. */
   const deadAirStreak = ref(0)
@@ -2834,20 +2998,30 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
   }
 
-  /** (Re-)arm the signalling stuck-detector. Covers 'requesting'
-   *  (no rc:session.created yet) and 'negotiating' (SDP exchange
-   *  through pc-connected). NOT 'awaiting_consent' Ã¢ÂÂ the server owns
-   *  that timeout. */
+  /** (Re-)arm the signalling stuck-detector for the CURRENT phase.
+   *  FR-22 - the bound is per-phase (`signalingTimeoutFor`): 'requesting'
+   *  waits on ONE server hop, 'negotiating' waits on ICE, and guarding
+   *  the first with the second's number is what made a lost request cost
+   *  15 s. NOT 'awaiting_consent' - the server owns that timeout.
+   *  Call AFTER assigning `phase.value`, so the bound matches the wait. */
   function armSignalingTimeout() {
     clearSignalingTimeout()
+    const stuckIn = phase.value
+    const bound = signalingTimeoutFor(stuckIn)
+    if (bound === null) return
     signalingTimer = setTimeout(() => {
       signalingTimer = null
-      if (phase.value === 'requesting' || phase.value === 'negotiating') {
-        console.warn('[rc] signalling stuck in', phase.value, 'Ã¢ÂÂ retrying')
-        if (lastConnectArgs) scheduleReconnect()
-        else failWith('connection timed out')
-      }
-    }, RC_SIGNALING_TIMEOUT_MS)
+      // Re-read the phase: it may have advanced since we armed, in which
+      // case a later arm owns that wait and this timer is stale.
+      if (phase.value !== stuckIn) return
+      console.warn('[rc] signalling stuck in', stuckIn, 'for', bound, 'ms - retrying')
+      // FR-22 - an abandoned attempt is the informative one: its MISSING
+      // mark names the exact step that never completed, which is what
+      // distinguishes a half-open agent WS from a cross-pod split.
+      logConnectTiming('abandoned')
+      if (lastConnectArgs) scheduleReconnect()
+      else failWith('connection timed out')
+    }, bound)
   }
 
   function stopMediaWatchdog() {
@@ -3116,6 +3290,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
    *  misleading noise on DC sessions (the track is a dormant placeholder
    *  there â the DC worker path IS WebCodecs; field 2026-07-28). */
   let sessionDcTransport: string | null = null
+  /** FR-17 — true when THIS session negotiated per-chunk framing: the
+   *  agent advertised `chunk-framing` in `AgentCaps.video` and we asked
+   *  for it in `rc:session.request`. Read by `startVp9_444Path` /
+   *  `startHevcPath` when they hand the worker its `init-canvas`, so the
+   *  parse side can never be enabled without the request side having
+   *  been sent — an unframed stream parsed as framed is garbage, not a
+   *  degraded picture, so the two must move together. */
+  let sessionChunkFraming = false
   // rc.190 (A1) Ã¢ÂÂ true once the USER changed resolution this session, so
   // connect()'s per-agent restore doesn't clobber a pre-connect pick.
   let resolutionUserPickedThisSession = false
@@ -4826,6 +5008,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (msg.type === 'first-frame' && typeof msg.width === 'number' && typeof msg.height === 'number') {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
+        markConnect('first_frame')
+        logConnectTiming('first-frame')
         console.info('[rc] webcodecs first frame', msg.width, 'x', msg.height)
       } else if (msg.type === 'transform-active') {
         console.info('[rc] webcodecs transform active', msg)
@@ -5117,6 +5301,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
         vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
+        markConnect('first_frame')
+        logConnectTiming('first-frame')
         console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height)
       } else if (msg.type === 'decoder-configured') {
         // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
@@ -5254,6 +5440,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
           maxQueue: flowParams.maxQueue,
+          // FR-17 — negotiated per session; see `sessionChunkFraming`.
+          chunkFraming: sessionChunkFraming,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -5269,7 +5457,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // worker as ArrayBuffer chunks (transferred, not copied).
     let dc: RTCDataChannel
     try {
-      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+      // FR-17 stage B - unordered ONLY when this session negotiated
+      // framing; `videoDcOptions` enforces that pairing.
+      dc = pc.createDataChannel(
+        VP9_444_DC_LABEL,
+        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
+      )
     } catch (err) {
       console.warn('[rc] vp9-444 DC creation failed', err)
       try { worker.terminate() } catch { /* ignore */ }
@@ -5292,6 +5485,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
     dc.onopen = () => {
+      markConnect('dc_open')
       console.info('[rc] vp9-444 DC opened')
     }
     dc.onclose = () => {
@@ -5372,6 +5566,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         mediaIntrinsicW.value = msg.width
         mediaIntrinsicH.value = msg.height
         hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, 1)
+        markConnect('first_frame')
+        logConnectTiming('first-frame')
         // rc.100 Ã¢ÂÂ the worker now reports the CODED size as width/height and
         // forwards coded/display/visibleRect for field diagnosis. Logging the
         // gap localises the NVDEC HEVC dim mismatch (DEVBOX: agent
@@ -5488,6 +5684,8 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
           maxQueue: flowParams.maxQueue,
+          // FR-17 — negotiated per session; see `sessionChunkFraming`.
+          chunkFraming: sessionChunkFraming,
           // P7 — FSR knobs (sticky across the visible-canvas re-init).
           sharpen: sharpenMode.value,
           sharpness: storedSharpness(),
@@ -5505,7 +5703,12 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // agent stays silent if it picked the WebRTC track instead.
     let dc: RTCDataChannel
     try {
-      dc = pc.createDataChannel(VP9_444_DC_LABEL, VP9_444_DC_OPTIONS)
+      // FR-17 stage B - unordered ONLY when this session negotiated
+      // framing; `videoDcOptions` enforces that pairing.
+      dc = pc.createDataChannel(
+        VP9_444_DC_LABEL,
+        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
+      )
     } catch (err) {
       console.warn('[rc] hevc DC creation failed', err)
       try { worker.terminate() } catch { /* ignore */ }
@@ -5528,6 +5731,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
     dc.onopen = () => {
+      markConnect('dc_open')
       console.info('[rc] hevc DC opened')
     }
     dc.onclose = () => {
@@ -5707,6 +5911,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           '[rc] session is VIEW-EFFECTIVE: another session already holds input on this host',
         )
       }
+      markConnect('session_created')
       phase.value = 'awaiting_consent'
       // Consent is human-paced on Prompt-mode devices; the SERVER owns
       // that timeout (consent_timeout). Ours only covers requesting/
@@ -5739,6 +5944,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
       const livePc = pc
       if (!livePc) return // unreachable: 'proceed' implies pc exists (TS narrowing only)
+      markConnect('ready')
       phase.value = 'negotiating'
       armSignalingTimeout()
       try {
@@ -5749,6 +5955,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
           session_id: msg.session_id,
           sdp: offer.sdp,
         })
+        markConnect('offer_sent')
       } catch (e) {
         failWith((e as Error).message || 'createOffer failed')
       }
@@ -5756,6 +5963,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     on('rc:sdp.answer', async (msg) => {
       if (!pc) return
       if (!sessionGateAllows(msg.session_id, sessionId.value)) return
+      markConnect('answer')
       try {
         await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp })
         remoteDescriptionSet = true
@@ -5891,6 +6099,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     error.value = message
     phase.value = 'error'
     cancelReconnect()
+    logConnectTiming('closed')
     lastConnectArgs = null
     teardown()
   }
@@ -6143,6 +6352,16 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     }
     error.value = null
     sessionId.value = null
+    // FR-22 - the clock starts HERE, not at `rc:session.request`.
+    // Everything between this point and the request is a wait the
+    // operator experiences: re-keying and redialling the signalling
+    // socket (up to RC_PREFLIGHT_WS_WAIT_MS on its own), an HTTP fetch
+    // for TURN credentials, the local-relay probe and the browser's
+    // codec-capability probes. Starting at the request measured none of
+    // it, so a connect that spent its whole wait in the pre-flight
+    // reported a small TTFF and was reported as healthy - which is
+    // exactly the case that reproduced with no snackbar.
+    connectTiming = beginAttempt(reconnectAttempt.value + 1)
     // Per-ATTEMPT, not per-user-connect: each retry has to earn "media
     // flowed" again, otherwise one good session would excuse every frameless
     // one that followed it.
@@ -6177,6 +6396,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
         console.warn('[rc] pre-flight: signalling socket not ready; proceeding (ladder will retry)')
       }
     }
+    markConnect('ws_ready')
 
     // Restore the per-agent resolution preference. This has to live
     // here (not at composable-init) because `useRemoteControl()` runs
@@ -6245,6 +6465,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       // Fall back to a public STUN if the server has none configured.
       iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }]
     }
+    markConnect('turn_ready')
 
     // loopback-TURN corp-relay (Phase 2): if opted-in AND this host runs a
     // local enrolled agent serving a loopback TURN, prepend it as an ICE server
@@ -6378,6 +6599,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       const state = pc?.connectionState
       if (!state) return
       if (state === 'connected') {
+        markConnect('pc_connected')
         phase.value = 'connected'
         // Stand down the pending retry timer, but KEEP the attempt counters:
         // reaching `connected` is not proof the session works. A pair with no
@@ -7397,6 +7619,22 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       }
     }
 
+    // FR-17 — per-chunk framing is negotiated, never assumed: only when
+    // the agent advertised `chunk-framing` AND this session actually uses
+    // a DataChannel transport (the RTP track has no chunks to frame).
+    // Resolved HERE, immediately before the worker starts, because the
+    // `init-canvas` below carries it — the parse side must not be armed
+    // ahead of the request side.
+    sessionChunkFraming =
+      preferredTransport !== null
+      && (agent?.value?.capabilities?.video ?? []).includes('chunk-framing')
+
+    // Everything above this point - the local-relay probe and the
+    // browser's MediaCapabilities decode probes - runs before a single
+    // byte goes to the server, and on a cold profile the probes are not
+    // free.
+    markConnect('probes_ready')
+
     // If we're advertising the data-channel transport, open the DC +
     // worker NOW so the channel lands in the SDP offer. The agent
     // will only actually pump bytes through it when its caps include
@@ -7469,6 +7707,14 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       if (preferredTransport === 'data-channel-hevc' && hevcRextPick) {
         requestPayload.chroma_pref = 'yuv444'
       }
+      // FR-17 — ask the agent to prefix every `video-bytes` message with
+      // {frame_seq, chunk_idx, chunk_count}. Sent only when the agent's
+      // caps say it understands the field; a pre-FR-17 agent would ignore
+      // it via `#[serde(default)]` anyway, but not sending it keeps the
+      // request wire identical for the fleet that can't use it.
+      if (sessionChunkFraming) {
+        requestPayload.chunk_framing = true
+      }
     }
     // Opt-in host audio Ã¢ÂÂ `audio_enabled: true` (omitted when off so
     // pre-audio agents/servers keep the silent-by-default behaviour via
@@ -7483,6 +7729,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
       requestPayload.override_reason = overrideReason.value.trim()
     }
     ws.sendRaw(requestPayload)
+    markConnect('request_sent')
     overrideReason.value = ''
     // Abandon-and-retry if the server never answers the request (WS
     // died mid-send, pod restart, ...). Cleared by rc:session.created.
@@ -7495,6 +7742,10 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
     // user already dismissed the viewer, racing the WS rc:terminate
     // we just sent.
     cancelReconnect()
+    // FR-22 - an attempt the operator cancelled mid-connect still has a
+    // story: which step it was waiting on when they gave up is the same
+    // evidence a timeout would have produced.
+    logConnectTiming('closed')
     lastConnectArgs = null
     // End of this agent's session: later picker changes are global-only
     // until the next connect() names an agent again.
@@ -9426,6 +9677,7 @@ export function useRemoteControl(agent?: Ref<Agent | null>) {
      * `phase === 'reconnecting'`.
      */
     reconnectAttempt,
+    lastTtffMs,
     /**
      * S3 Ã¢ÂÂ sub-connected health. Non-null while `phase ===
      * 'connected'` but something is off: 'transport_unstable' (pc

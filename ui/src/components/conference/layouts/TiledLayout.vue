@@ -11,8 +11,10 @@
       :is-active-speaker="p.streamKey === activeSpeakerKey"
       :object-fit="p.isLocal && selfViewMode === 'in-grid-uncropped' ? 'contain' : 'cover'"
       :show-actions="true"
+      :stream-key="p.streamKey"
       @toggle-pin="$emit('toggle-pin', p.streamKey)"
       @request-pip="$emit('request-pip', p.streamKey)"
+      @spotlight="$emit('spotlight', p.streamKey)"
     />
 
     <!-- Floating self-view -->
@@ -51,6 +53,7 @@ const props = defineProps<{
 defineEmits<{
   'toggle-pin': [streamKey: string]
   'request-pip': [streamKey: string]
+  spotlight: [streamKey: string]
 }>()
 
 const visibleParticipants = computed(() => props.participants)
