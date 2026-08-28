@@ -17,7 +17,7 @@
 //!   which inside a Pod means `Xvfb :99` running on the same Pod.
 //!   `synthetic` just produces bytes — no display dependency at all.
 //!
-//! Selected by setting `ROOMLER_AGENT_SYNTHETIC_FRAMES=1` at runtime
+//! Selected by setting `ROOMLERD_SYNTHETIC_FRAMES=1` at runtime
 //! AND building with the `synthetic-frame-source` feature. Production
 //! agents (`full`, `full-hw` feature sets) never opt in.
 

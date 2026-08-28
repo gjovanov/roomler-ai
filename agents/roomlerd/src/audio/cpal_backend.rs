@@ -4,7 +4,7 @@
 //!   *output* device with `build_input_stream`; the WASAPI backend
 //!   detects the output device driven as input and opens a loopback
 //!   client, so we capture exactly what's playing out of the speakers.
-//! * **Linux** — the PulseAudio *monitor* source. `ROOMLER_AGENT_AUDIO_SOURCE`
+//! * **Linux** — the PulseAudio *monitor* source. `ROOMLERD_AUDIO_SOURCE`
 //!   names an explicit input device (e.g.
 //!   `alsa_output.pci-0000_00_1f.3.analog-stereo.monitor`); otherwise we
 //!   look for an input device whose name ends in `.monitor` (Pulse
@@ -237,12 +237,12 @@ fn pick_device(host: &cpal::Host) -> Result<(cpal::Device, bool)> {
         if let Some(name) = node_env("AUDIO_SOURCE") {
             if !name.trim().is_empty() {
                 if let Some(dev) = find_input_by_name(host, &name) {
-                    tracing::info!(source = %name, "audio: using ROOMLER_AGENT_AUDIO_SOURCE monitor");
+                    tracing::info!(source = %name, "audio: using ROOMLERD_AUDIO_SOURCE monitor");
                     return Ok((dev, false));
                 }
                 tracing::warn!(
                     source = %name,
-                    "audio: ROOMLER_AGENT_AUDIO_SOURCE not found among input devices — falling through to auto-detect"
+                    "audio: ROOMLERD_AUDIO_SOURCE not found among input devices — falling through to auto-detect"
                 );
             }
         }
@@ -265,7 +265,7 @@ fn pick_device(host: &cpal::Host) -> Result<(cpal::Device, bool)> {
             .ok_or_else(|| anyhow!("no PulseAudio monitor and no default input device"))?;
         tracing::warn!(
             device = %dev.name().unwrap_or_else(|_| "<unknown>".into()),
-            "audio: no *.monitor source found — capturing the DEFAULT INPUT (likely a microphone, not desktop audio). Set ROOMLER_AGENT_AUDIO_SOURCE=<sink>.monitor to capture system audio."
+            "audio: no *.monitor source found — capturing the DEFAULT INPUT (likely a microphone, not desktop audio). Set ROOMLERD_AUDIO_SOURCE=<sink>.monitor to capture system audio."
         );
         Ok((dev, false))
     }
