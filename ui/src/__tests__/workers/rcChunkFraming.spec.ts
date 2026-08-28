@@ -108,3 +108,79 @@ describe('rc-chunk-framing', () => {
     expect(stripChunkPrefix(st, framed(0, 0, 1, [3])).gap).toBe(false)
   })
 })
+
+describe('rc-chunk-framing under UNORDERED delivery (FR-17 stage B)', () => {
+  it('does not let a late chunk of a lost frame destroy the next one', () => {
+    // The cascade this exists to prevent: frame 1 loses chunk 1, frame 2
+    // starts cleanly, then frame 1's chunk 2 finally arrives. Before the
+    // straggler rule that late chunk broke frame 2 as well — one lost
+    // frame becoming two, and each dropped frame costs an IDR.
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(1, 0, 3, [1]))
+    stripChunkPrefix(st, framed(2, 0, 2, [2]))   // frame 1 truncated, frame 2 opens
+    expect(st.gaps).toBe(1)
+    const late = stripChunkPrefix(st, framed(1, 2, 3, [9]))  // frame 1 straggler
+    expect(late.gap).toBe(false)
+    expect(late.payload).toBeNull()
+    expect(st.stragglers).toBe(1)
+    // Frame 2 must still complete normally.
+    const finish = stripChunkPrefix(st, framed(2, 1, 2, [3]))
+    expect(finish.gap).toBe(false)
+    expect([...(finish.payload ?? [])]).toEqual([3])
+    expect(st.gaps).toBe(1) // no second gap
+  })
+
+  it('treats a late chunk of a COMPLETED frame as a straggler, not a break', () => {
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(5, 0, 2, [1]))
+    stripChunkPrefix(st, framed(5, 1, 2, [2]))   // frame 5 complete
+    const dup = stripChunkPrefix(st, framed(5, 1, 2, [2]))
+    expect(dup.gap).toBe(false)
+    expect(st.stragglers).toBe(1)
+    expect(st.gaps).toBe(0)
+  })
+
+  it('still reports a real break when a new frame loses its chunk 0', () => {
+    // A straggler is "older than what we have"; a mid-chunk of a NEWER
+    // frame means its opening bytes — which carry the frame size — never
+    // arrived, and that is a genuine break.
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(1, 0, 1, [1]))   // frame 1 complete
+    const r = stripChunkPrefix(st, framed(2, 1, 2, [7]))
+    expect(r.gap).toBe(true)
+    expect(st.gaps).toBe(1)
+  })
+
+  it('classifies stragglers correctly across a u32 wrap', () => {
+    // The agent advances frame_seq with `wrapping_add`, so 0 legitimately
+    // follows 0xffffffff. A plain `<` comparison would read that wrap as
+    // a jump backwards and mis-classify every chunk after it.
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(0xfffffffe, 0, 1, [1]))
+    stripChunkPrefix(st, framed(0xffffffff, 0, 2, [2]))
+    // A re-delivered chunk 0 from before the wrap is a straggler, NOT a
+    // reason to restart assembly on a frame already moved past.
+    const late = stripChunkPrefix(st, framed(0xfffffffe, 0, 1, [1]))
+    expect(late.payload).toBeNull()
+    expect(st.stragglers).toBe(1)
+    // ...and a fresh frame after the wrap is accepted, not straggled.
+    const fresh = stripChunkPrefix(st, framed(0, 0, 1, [3]))
+    expect(fresh.payload).not.toBeNull()
+    expect([...(fresh.payload ?? [])]).toEqual([3])
+  })
+
+  it('resyncs instead of stalling forever if the sender restarts its counter', () => {
+    // ⚠️ The failure an UNBOUNDED "older than what we have" rule would
+    // cause: a fresh send task begins again at 1, every frame looks
+    // ancient, everything is straggled, and the picture stops for good
+    // with no gap reported and nothing in the logs. The window turns that
+    // into one resync.
+    const st = createChunkFraming()
+    stripChunkPrefix(st, framed(50_000, 0, 1, [1]))
+    const restarted = stripChunkPrefix(st, framed(1, 0, 1, [2]))
+    expect(restarted.payload).not.toBeNull()
+    expect([...(restarted.payload ?? [])]).toEqual([2])
+    // The next frame of the restarted stream flows normally.
+    expect(stripChunkPrefix(st, framed(2, 0, 1, [3])).payload).not.toBeNull()
+  })
+})
