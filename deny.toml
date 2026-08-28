@@ -26,7 +26,10 @@ allow = [
     "Unlicense",
     "CC0-1.0",
     "BSL-1.0",
-    "OpenSSL",
+    # WTFPL: `tun` 0.8.10, the TUN adapter tunnel-core builds on. FSF-Free and
+    # GPL-compatible; imposes literally no obligation. NOT OSI-approved, so some
+    # corporate policies flag it on sight — allowed knowingly, not by accident.
+    "WTFPL",
     "CDLA-Permissive-2.0",
 ]
 
@@ -45,10 +48,13 @@ allow = [
 
 exceptions = []
 
-[[licenses.clarify]]
-name = "ring"
-expression = "MIT AND ISC AND OpenSSL"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+# Our OWN crates are governed by the split in scripts/licence-classes.sh, not by
+# this dependency policy — without this every AGPL workspace member is reported
+# as a rejected "dependency". It keys on `publish = false`, which all 17 members
+# now set; a THIRD-PARTY AGPL or GPL crate is still rejected.
+[licenses.private]
+ignore = true
+
 
 [bans]
 multiple-versions = "allow"   # tracked separately; not a licence concern
