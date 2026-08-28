@@ -1052,6 +1052,10 @@ async fn connect_once(
     // `rc:session.request.chroma_pref`. `None` → fall back to the
     // agent's `ROOMLER_AGENT_VP9_CHROMA` env-var default.
     let mut pending_chroma: HashMap<bson::oid::ObjectId, Option<String>> = HashMap::new();
+    // FR-17 — whether THIS controller can parse the framed DataChannel wire
+    // format. Same lifecycle as `pending_chroma`: stashed by the Request
+    // handler, consumed when the peer is built, cleared on WS teardown.
+    let mut pending_chunk_framing: HashMap<bson::oid::ObjectId, bool> = HashMap::new();
     // Same lifecycle as `pending_transports`/`pending_chroma` but for the
     // opt-in system-audio flag forwarded from the controller's
     // `rc:session.request.audio_enabled`. `false`/missing → no audio
@@ -1532,6 +1536,7 @@ async fn connect_once(
                                 &mut pending_codecs,
                                 &mut pending_transports,
                                 &mut pending_chroma,
+                                &mut pending_chunk_framing,
                                 &mut pending_audio,
                                 &mut pending_permissions,
                                 &mut pending_session_meta,
@@ -1684,6 +1689,7 @@ async fn handle_server_msg(
     pending_codecs: &mut HashMap<bson::oid::ObjectId, String>,
     pending_transports: &mut HashMap<bson::oid::ObjectId, Option<String>>,
     pending_chroma: &mut HashMap<bson::oid::ObjectId, Option<String>>,
+    pending_chunk_framing: &mut HashMap<bson::oid::ObjectId, bool>,
     pending_audio: &mut HashMap<bson::oid::ObjectId, bool>,
     pending_permissions: &mut HashMap<
         bson::oid::ObjectId,
@@ -1721,6 +1727,7 @@ async fn handle_server_msg(
             browser_caps,
             preferred_transport,
             chroma_pref,
+            chunk_framing,
             audio_enabled,
             consent_mode,
             input_mode,
@@ -1781,6 +1788,7 @@ async fn handle_server_msg(
             // when negotiated_transport == data-channel-vp9-444;
             // ignored otherwise.
             pending_chroma.insert(session_id, chroma_pref.clone());
+            pending_chunk_framing.insert(session_id, chunk_framing.unwrap_or(false));
             // Opt-in system audio. Only honour the controller's request
             // when the agent actually advertises an audio codec
             // (`AgentCaps.audio` non-empty ⇒ the `audio` feature is
@@ -1939,6 +1947,10 @@ async fn handle_server_msg(
             // the Request handler. `None` → AgentPeer falls back to
             // `ROOMLER_AGENT_VP9_CHROMA` env-var default.
             let chroma_pref = pending_chroma.remove(&session_id).unwrap_or(None);
+            // FR-17 — absent (older controller, or a test harness that skipped
+            // rc:request) means the legacy unframed format, which is the only
+            // safe default: framing bytes a peer cannot parse is unrecoverable.
+            let chunk_framing = pending_chunk_framing.remove(&session_id).unwrap_or(false);
             // Pull the opt-in audio flag stashed by the Request handler.
             // Missing (session skipped rc:request in a test harness) →
             // no audio track, the safe default.
@@ -1963,6 +1975,7 @@ async fn handle_server_msg(
                 chosen_codec,
                 negotiated_transport,
                 chroma_pref,
+                chunk_framing,
                 audio_enabled,
                 permissions,
                 controller_name,
@@ -2114,6 +2127,7 @@ async fn handle_server_msg(
             pending_codecs.clear();
             pending_transports.clear();
             pending_chroma.clear();
+            pending_chunk_framing.clear();
             pending_audio.clear();
             pending_permissions.clear();
             return match reason {
