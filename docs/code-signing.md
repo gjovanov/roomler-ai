@@ -305,7 +305,7 @@ gh release download agent-v<version> --repo gjovanov/roomler-ai \
   --pattern '*perMachine*.msi' --dir /tmp
 ROOMLER_TEST_MSI=/tmp/roomler-agent-<version>-perMachine-x86_64-pc-windows-msvc.msi \
 ROOMLER_TEST_MSI_TAG=agent-v<version> \
-  cargo test -p roomler-agent --lib -- --ignored real_published_msi
+  cargo test -p roomlerd --lib -- --ignored real_published_msi
 ```
 
 The same freeze risk applies to the signing gate: a release that ships an

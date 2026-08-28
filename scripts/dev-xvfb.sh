@@ -99,7 +99,7 @@ cd "$PROJECT_DIR"
 
 if (( $# == 0 )); then
     echo "→ running capture smoke test (--features ${AGENT_FEATURES})"
-    cargo test -p roomler-agent --lib \
+    cargo test -p roomlerd --lib \
         --features "$AGENT_FEATURES" \
         capture:: -- --nocapture
     exit 0
@@ -111,7 +111,7 @@ fi
 case "$1" in
     run)
         echo "→ running roomler-agent (--features ${AGENT_FEATURES})"
-        cargo run -p roomler-agent --features "$AGENT_FEATURES" -- run
+        cargo run -p roomlerd --features "$AGENT_FEATURES" -- run
         ;;
     shell)
         echo "→ dropping into a shell with DISPLAY=$DISPLAY (exit to tear down)"

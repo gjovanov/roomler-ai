@@ -358,7 +358,7 @@ mod tests {
     /// Verifies a REAL signed release artifact when one is present.
     ///
     /// Ignored by default because it needs a downloaded MSI; run with
-    /// `ROOMLER_TEST_SIGNED_MSI=<path> cargo test -p roomler-agent --lib
+    /// `ROOMLER_TEST_SIGNED_MSI=<path> cargo test -p roomlerd --lib
     /// signed_release_artifact -- --ignored --nocapture` on Windows.
     #[test]
     #[ignore]
