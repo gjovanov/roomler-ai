@@ -1537,7 +1537,9 @@ pub fn run(
             //
             // Runtime trigger as of 0.3.0: `keep_stream_alive` comes
             // from `peer_presence_is_signaled()` which reads the
-            // RETIRED-NAME-ANCHOR(3): names the PRE-RENAME appdirs segment a host installed before P4b still has; appdirs::app_segment resolves it, so it is an input.
+            // RETIRED-NAME-ANCHOR(3): names the PRE-RENAME appdirs segment a host
+            // installed before P4b still has; appdirs::app_segment resolves it, so it
+            // is an input.
             // `%PROGRAMDATA%\roomler-agent\peer-connected.lock`
             // marker file. The user-context worker writes to that
             // file every 5 s while its WebRTC peer is in `Connected`

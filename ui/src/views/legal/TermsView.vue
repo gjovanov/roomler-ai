@@ -64,7 +64,8 @@
         </section>
 
         <section class="mb-8">
-          <!-- RETIRED-NAME-ANCHOR(4): LEGAL COPY. "The Roomler Agent" is a defined term in the Terms; changing it is a legal-text decision, not a code rename. -->
+          <!-- RETIRED-NAME-ANCHOR(4): LEGAL COPY. "The Roomler Agent" is a defined term
+               in the Terms; changing it is a legal-text decision, not a code rename. -->
           <h2 class="text-h5 font-weight-bold mb-3">4. The Roomler Agent and Enrolled Devices</h2>
           <p class="text-body-1 legal-muted mb-4">
             Remote desktop and private networking work by running our agent software (the "agent") on each
