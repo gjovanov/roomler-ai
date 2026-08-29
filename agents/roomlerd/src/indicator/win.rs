@@ -812,7 +812,7 @@ unsafe fn paint_consent(hwnd: HWND) {
         let btns = consent_approve_rect();
         draw_text(
             hdc,
-            &format!("Expires in {secs}s"),
+            &format!("Expires in {}", super::format_countdown(secs)),
             RECT {
                 left: CONSENT_PAD,
                 top: btns.top,
